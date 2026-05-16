@@ -1456,6 +1456,41 @@ mod tests {
     }
 
     #[test]
+    fn styled_selected_row_pads_trailing_background_without_line_style() {
+        let row = StyledRow {
+            spans: vec![StyledSpan {
+                text: "input".to_string(),
+                style: TerminalStyle {
+                    background: Some(TerminalColor {
+                        red: 10,
+                        green: 20,
+                        blue: 30,
+                    }),
+                    ..TerminalStyle::default()
+                },
+            }],
+        };
+
+        let line = styled_selected_row_to_line(
+            &row,
+            8,
+            0,
+            VisibleSelection {
+                start: TerminalPoint { col: 1, row: 0 },
+                end: TerminalPoint { col: 3, row: 0 },
+            },
+        );
+
+        assert_eq!(line.width(), 8);
+        assert!(line.style.bg.is_none());
+        assert_eq!(
+            line.spans.last().expect("trailing span").content.as_ref(),
+            "   "
+        );
+        assert!(line.spans.last().expect("trailing span").style.bg.is_some());
+    }
+
+    #[test]
     fn styled_rows_preserve_blank_rows() {
         let rows = vec![
             StyledRow {
