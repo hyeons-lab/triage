@@ -823,7 +823,6 @@ fn trailing_cell_style(row: &StyledRow) -> Style {
 
 fn styled_row_to_line(row: &StyledRow, cols: usize) -> Line<'static> {
     let mut width = 0;
-    let line_style = trailing_cell_style(row);
     let mut spans = row
         .spans
         .iter()
@@ -841,9 +840,7 @@ fn styled_row_to_line(row: &StyledRow, cols: usize) -> Line<'static> {
             ratatui_style(&last_span.style),
         ));
     }
-    let mut line = Line::from(spans);
-    line.style = line_style;
-    line
+    Line::from(spans)
 }
 
 fn styled_selected_row_to_line(
@@ -857,7 +854,6 @@ fn styled_selected_row_to_line(
         return styled_row_to_line(row, cols);
     };
 
-    let line_style = trailing_cell_style(row);
     let mut spans = Vec::new();
     let mut offset = 0;
     for span in &row.spans {
@@ -877,9 +873,7 @@ fn styled_selected_row_to_line(
         );
     }
 
-    let mut line = Line::from(spans);
-    line.style = line_style;
-    line
+    Line::from(spans)
 }
 
 fn push_selected_styled_segments(
@@ -1450,10 +1444,50 @@ mod tests {
         let line = styled_row_to_line(&row, 8);
 
         assert_eq!(line.width(), 8);
-        assert!(line.style.bg.is_some());
+        // The trailing background must be carried by explicit spans only, never
+        // by a line-wide base style: a line-wide background bleeds onto leading
+        // cells whose own style has no background (regression seen as a grey
+        // wash over Claude Code's input box).
+        assert!(line.style.bg.is_none());
         assert_eq!(line.spans.len(), 2);
+        assert!(line.spans[0].style.bg.is_some());
         assert_eq!(line.spans[1].content.as_ref(), "   ");
         assert!(line.spans[1].style.bg.is_some());
+    }
+
+    #[test]
+    fn styled_selected_row_pads_trailing_background_without_line_style() {
+        let row = StyledRow {
+            spans: vec![StyledSpan {
+                text: "input".to_string(),
+                style: TerminalStyle {
+                    background: Some(TerminalColor {
+                        red: 10,
+                        green: 20,
+                        blue: 30,
+                    }),
+                    ..TerminalStyle::default()
+                },
+            }],
+        };
+
+        let line = styled_selected_row_to_line(
+            &row,
+            8,
+            0,
+            VisibleSelection {
+                start: TerminalPoint { col: 1, row: 0 },
+                end: TerminalPoint { col: 3, row: 0 },
+            },
+        );
+
+        assert_eq!(line.width(), 8);
+        assert!(line.style.bg.is_none());
+        assert_eq!(
+            line.spans.last().expect("trailing span").content.as_ref(),
+            "   "
+        );
+        assert!(line.spans.last().expect("trailing span").style.bg.is_some());
     }
 
     #[test]
