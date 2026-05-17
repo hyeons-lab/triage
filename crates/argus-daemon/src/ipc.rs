@@ -274,14 +274,14 @@ enum WireRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireResponse {
-    Ok(WireSuccess),
+    Ok(Box<WireSuccess>),
     Err { message: String },
 }
 
 impl WireResponse {
     fn from_result(result: Result<WireSuccess>) -> Self {
         match result {
-            Ok(success) => Self::Ok(success),
+            Ok(success) => Self::Ok(Box::new(success)),
             Err(error) => Self::Err {
                 message: error.to_string(),
             },
@@ -290,7 +290,7 @@ impl WireResponse {
 
     fn into_result(self) -> Result<WireSuccess> {
         match self {
-            Self::Ok(success) => Ok(success),
+            Self::Ok(success) => Ok(*success),
             Self::Err { message } => Err(anyhow!(message)),
         }
     }
@@ -408,7 +408,7 @@ fn handle_subscription(
         after_event_seq,
     }) {
         Ok(events) => {
-            write_json_line(writer, &WireResponse::Ok(WireSuccess::Subscribed))
+            write_json_line(writer, &WireResponse::Ok(Box::new(WireSuccess::Subscribed)))
                 .context("writing subscribe response")?;
             writer.flush().context("flushing subscribe response")?;
 
@@ -417,13 +417,16 @@ fn handle_subscription(
                     Ok(event) => {
                         write_json_line(
                             writer,
-                            &WireResponse::Ok(WireSuccess::SessionEvent(event)),
+                            &WireResponse::Ok(Box::new(WireSuccess::SessionEvent(event))),
                         )
                         .context("writing session event")?;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        write_json_line(writer, &WireResponse::Ok(WireSuccess::Heartbeat))
-                            .context("writing subscription heartbeat")?;
+                        write_json_line(
+                            writer,
+                            &WireResponse::Ok(Box::new(WireSuccess::Heartbeat)),
+                        )
+                        .context("writing subscription heartbeat")?;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
