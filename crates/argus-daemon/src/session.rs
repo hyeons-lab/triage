@@ -1260,7 +1260,7 @@ fn shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
 
 fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
     let cwd = cwd?;
-    let repository_root = git_output(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
+    let repository_root = git_path_output(cwd, &["rev-parse", "--show-toplevel"]);
     let worktree_root = repository_root.clone();
     let branch = git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
 
@@ -1273,20 +1273,50 @@ fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
     )
 }
 
-fn git_output(cwd: &PathBuf, args: &[&str]) -> Option<String> {
+fn git_raw_output(cwd: &PathBuf, args: &[&str]) -> Option<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    output.status.success().then_some(output.stdout)
+}
 
-    let value = String::from_utf8(output.stdout).ok()?;
+/// Decodes git stdout as UTF-8. Use only for textual fields (e.g. branch
+/// names); paths can contain non-UTF-8 bytes and must use `git_path_output`.
+fn git_output(cwd: &PathBuf, args: &[&str]) -> Option<String> {
+    let value = String::from_utf8(git_raw_output(cwd, args)?).ok()?;
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+/// Resolves a path-valued git command without lossy UTF-8 decoding so repos
+/// whose path contains non-UTF-8 bytes still produce a usable `PathBuf`.
+#[cfg(unix)]
+fn git_path_output(cwd: &PathBuf, args: &[&str]) -> Option<PathBuf> {
+    use std::ffi::OsString;
+
+    let bytes = git_raw_output(cwd, args)?;
+    let trimmed = trim_ascii_whitespace(&bytes);
+    (!trimmed.is_empty()).then(|| PathBuf::from(OsString::from_vec(trimmed.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn git_path_output(cwd: &PathBuf, args: &[&str]) -> Option<PathBuf> {
+    git_output(cwd, args).map(PathBuf::from)
 }
 
 struct TerminalOutputSink {
@@ -1797,8 +1827,16 @@ mod tests {
         let context =
             resolve_session_context(Some(&repo.join("nested"))).expect("git session context");
 
-        assert_eq!(context.repository_root, Some(repo.clone()));
-        assert_eq!(context.worktree_root, Some(repo.clone()));
+        // git normalizes its reported toplevel (macOS resolves the /var ->
+        // /private/var symlink; Windows expands 8.3 names and uses forward
+        // slashes), so compare canonicalized paths rather than the raw
+        // temp-dir path.
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path).expect("canonicalize path for comparison")
+        };
+        let expected = Some(canonical(&repo));
+        assert_eq!(context.repository_root.as_deref().map(canonical), expected);
+        assert_eq!(context.worktree_root.as_deref().map(canonical), expected);
         assert_eq!(context.branch.as_deref(), Some("feature/context"));
         let _ = std::fs::remove_dir_all(repo);
     }

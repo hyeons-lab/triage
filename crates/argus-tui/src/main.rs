@@ -23,6 +23,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SIDEBAR_COLS: u16 = 28;
 const UI_EVENT_POLL: Duration = Duration::from_millis(8);
@@ -514,44 +515,69 @@ fn session_context_rows(
     rows
 }
 
+/// Collects the longest leading run of `value` whose terminal display width
+/// fits within `budget` cells.
+fn take_prefix_width(value: &str, budget: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in value.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out
+}
+
+/// Like [`take_prefix_width`] but keeps the trailing run instead.
+fn take_suffix_width(value: &str, budget: usize) -> String {
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0;
+    for ch in value.chars().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        tail.push(ch);
+    }
+    tail.into_iter().rev().collect()
+}
+
 fn truncate_to_width(value: String, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let mut chars = value.chars();
-    if chars.clone().count() <= width {
+    if UnicodeWidthStr::width(value.as_str()) <= width {
         return value;
     }
     if width == 1 {
         return "~".to_string();
     }
 
-    chars.by_ref().take(width - 1).collect::<String>() + "~"
+    let mut truncated = take_prefix_width(&value, width - 1);
+    truncated.push('~');
+    truncated
 }
 
 fn compact_value(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let char_count = value.chars().count();
-    if char_count <= width {
+    if UnicodeWidthStr::width(value) <= width {
         return value.to_string();
     }
     if width <= 3 {
-        return value.chars().take(width).collect();
+        return take_prefix_width(value, width);
     }
 
-    let head_len = (width - 1) / 2;
-    let tail_len = width - 1 - head_len;
-    let head = value.chars().take(head_len).collect::<String>();
-    let tail = value
-        .chars()
-        .rev()
-        .take(tail_len)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
+    let budget = width - 1;
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+    let head = take_prefix_width(value, head_budget);
+    let tail = take_suffix_width(value, tail_budget);
     format!("{head}~{tail}")
 }
 
@@ -591,12 +617,13 @@ fn selected_sidebar_context_overflows(app: &LocalSessionApp, width: usize) -> bo
         })
         .and_then(|(prefix_width, path)| path.file_name().map(|name| (prefix_width, name)))
         .map(|(prefix_width, name)| {
-            name.to_string_lossy().chars().count() > width.saturating_sub(prefix_width)
+            UnicodeWidthStr::width(name.to_string_lossy().as_ref())
+                > width.saturating_sub(prefix_width)
         })
         .unwrap_or(false);
     let branch_overflows = context
         .and_then(|context| context.branch.as_ref())
-        .map(|branch| branch.chars().count() > width.saturating_sub(9))
+        .map(|branch| UnicodeWidthStr::width(branch.as_str()) > width.saturating_sub(9))
         .unwrap_or(false);
     location_overflows || branch_overflows
 }
@@ -1348,6 +1375,31 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     use argus_core::session::{StyledSpan, TerminalStyle};
+
+    #[test]
+    fn truncate_to_width_measures_terminal_cell_width() {
+        // ASCII: one cell per char, behaves like the char-count path.
+        assert_eq!(truncate_to_width("abcdef".to_string(), 4), "abc~");
+        assert_eq!(truncate_to_width("abc".to_string(), 4), "abc");
+
+        // Wide CJK glyphs occupy two cells each, so four of them already
+        // exceed a 5-cell budget and must be truncated.
+        let cjk = "字字字字";
+        assert!(UnicodeWidthStr::width(cjk) > 5);
+        let truncated = truncate_to_width(cjk.to_string(), 5);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 5);
+        assert_eq!(truncated, "字字~");
+    }
+
+    #[test]
+    fn compact_value_keeps_head_and_tail_within_cell_width() {
+        assert_eq!(compact_value("abcdefghij", 7), "abc~hij");
+
+        let wide = "字字字字字字";
+        let compacted = compact_value(wide, 7);
+        assert!(UnicodeWidthStr::width(compacted.as_str()) <= 7);
+        assert!(compacted.contains('~'));
+    }
 
     #[test]
     fn printable_keys_are_forwarded_to_session() {
