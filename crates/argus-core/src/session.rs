@@ -106,8 +106,16 @@ pub struct SessionSnapshot {
     pub styled_rows: Vec<StyledRow>,
     pub cursor: TerminalCursor,
     pub current_working_directory: Option<PathBuf>,
+    pub context: Option<SessionContext>,
     pub bracketed_paste_enabled: bool,
     pub exited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContext {
+    pub repository_root: Option<PathBuf>,
+    pub worktree_root: Option<PathBuf>,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

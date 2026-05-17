@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use argus_core::session::{
@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 const SIDEBAR_COLS: u16 = 28;
 const UI_EVENT_POLL: Duration = Duration::from_millis(8);
@@ -175,15 +175,33 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut terminal_area = Rect::default();
     let mut selection = None;
     let mut needs_draw = true;
+    let mut sidebar_scroll_offset = 0usize;
+    let mut last_sidebar_scroll_tick = Instant::now();
 
     loop {
+        if sidebar_visible
+            && selected_sidebar_context_overflows(app, usize::from(SIDEBAR_COLS.saturating_sub(1)))
+            && last_sidebar_scroll_tick.elapsed() >= Duration::from_millis(250)
+        {
+            sidebar_scroll_offset = sidebar_scroll_offset.saturating_add(1);
+            last_sidebar_scroll_tick = Instant::now();
+            needs_draw = true;
+        }
+
         needs_draw |= app.drain_events();
         if needs_draw {
             if terminal_area.height > 0 {
                 app.ensure_selected_styled_rows(usize::from(terminal_area.height));
             }
             terminal.draw(|frame| {
-                terminal_area = draw(frame, app, sidebar_visible, pending_confirmation, selection);
+                terminal_area = draw(
+                    frame,
+                    app,
+                    sidebar_visible,
+                    pending_confirmation,
+                    selection,
+                    sidebar_scroll_offset,
+                );
             })?;
             needs_draw = false;
         }
@@ -208,6 +226,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             Event::Key(key) => match key_to_command(key) {
                 Some(AppCommand::New) => {
                     needs_draw = true;
+                    sidebar_scroll_offset = 0;
+                    last_sidebar_scroll_tick = Instant::now();
                     pending_confirmation = None;
                     selection = None;
                     app.create_session(current_session_size(sidebar_visible)?);
@@ -222,17 +242,25 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     selection = None;
                     match app.close_selected_session() {
                         CloseSessionOutcome::ClosedLastSession => return Ok(()),
-                        CloseSessionOutcome::Closed | CloseSessionOutcome::NotClosed => {}
+                        CloseSessionOutcome::Closed => {
+                            sidebar_scroll_offset = 0;
+                            last_sidebar_scroll_tick = Instant::now();
+                        }
+                        CloseSessionOutcome::NotClosed => {}
                     }
                 }
                 Some(AppCommand::Next) => {
                     needs_draw = true;
+                    sidebar_scroll_offset = 0;
+                    last_sidebar_scroll_tick = Instant::now();
                     pending_confirmation = None;
                     selection = None;
                     app.select_next_session();
                 }
                 Some(AppCommand::Previous) => {
                     needs_draw = true;
+                    sidebar_scroll_offset = 0;
+                    last_sidebar_scroll_tick = Instant::now();
                     pending_confirmation = None;
                     selection = None;
                     app.select_previous_session();
@@ -313,6 +341,7 @@ fn draw(
     sidebar_visible: bool,
     pending_confirmation: Option<Confirmation>,
     selection: Option<TerminalSelection>,
+    sidebar_scroll_offset: usize,
 ) -> Rect {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -324,7 +353,7 @@ fn draw(
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(SIDEBAR_COLS), Constraint::Min(20)])
             .split(root[0]);
-        draw_sidebar(frame, body[0], app);
+        draw_sidebar(frame, body[0], app, sidebar_scroll_offset);
         draw_terminal(frame, body[1], app.view(), selection);
         body[1]
     } else {
@@ -342,22 +371,44 @@ fn draw(
     terminal_area
 }
 
-fn draw_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &LocalSessionApp) {
+fn draw_sidebar(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &LocalSessionApp,
+    scroll_offset: usize,
+) {
+    let content_width = sidebar_content_width(area);
     let rows = app
         .sessions()
         .enumerate()
-        .flat_map(|(index, view)| session_sidebar_rows(index, app.selected_index(), view))
+        .flat_map(|(index, view)| {
+            session_sidebar_rows(
+                index,
+                app.selected_index(),
+                view,
+                content_width,
+                scroll_offset,
+            )
+        })
         .collect::<Vec<_>>();
 
     frame.render_widget(
-        Paragraph::new(rows)
-            .block(Block::default().borders(Borders::RIGHT))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(rows).block(Block::default().borders(Borders::RIGHT)),
         area,
     );
 }
 
-fn session_sidebar_rows(index: usize, selected: usize, view: &SessionView) -> Vec<Line<'static>> {
+fn sidebar_content_width(area: Rect) -> usize {
+    usize::from(area.width.saturating_sub(1))
+}
+
+fn session_sidebar_rows(
+    index: usize,
+    selected: usize,
+    view: &SessionView,
+    width: usize,
+    scroll_offset: usize,
+) -> Vec<Line<'static>> {
     let holder = view
         .lease
         .holder
@@ -381,17 +432,173 @@ fn session_sidebar_rows(index: usize, selected: usize, view: &SessionView) -> Ve
         Style::default()
     };
 
-    vec![
+    let mut rows = vec![
         Line::from(Span::styled(
-            format!("{marker} {}  {state}", view.session_id),
+            truncate_to_width(format!("{marker} {}  {state}", view.session_id), width),
             style,
         )),
-        Line::from(format!(
-            "  {holder}  {}x{}",
-            view.snapshot.size.cols, view.snapshot.size.rows
+        Line::from(truncate_to_width(
+            format!(
+                "  {holder}  {}x{}",
+                view.snapshot.size.cols, view.snapshot.size.rows
+            ),
+            width,
         )),
-        Line::from(""),
-    ]
+    ];
+    rows.extend(session_context_rows(
+        view,
+        width,
+        index == selected,
+        scroll_offset,
+    ));
+    rows.push(Line::from(""));
+    rows
+}
+
+fn session_context_rows(
+    view: &SessionView,
+    width: usize,
+    selected: bool,
+    scroll_offset: usize,
+) -> Vec<Line<'static>> {
+    let context = view.snapshot.context.as_ref();
+    let location = context
+        .and_then(|context| {
+            context
+                .worktree_root
+                .as_ref()
+                .or(context.repository_root.as_ref())
+                .map(|root| ("repo", root))
+        })
+        .or_else(|| {
+            view.snapshot
+                .current_working_directory
+                .as_ref()
+                .map(|cwd| ("cwd", cwd))
+        });
+
+    let mut rows = Vec::with_capacity(2);
+    if let Some((label, path)) = location {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let value_width = width.saturating_sub(label.len() + 3);
+        let value = if selected {
+            scrolling_value(&name, value_width, scroll_offset)
+        } else {
+            compact_value(&name, value_width)
+        };
+        rows.push(Line::from(truncate_to_width(
+            format!("  {label} {value}"),
+            width,
+        )));
+    } else {
+        rows.push(Line::from(""));
+    }
+
+    if let Some(branch) = context.and_then(|context| context.branch.as_ref()) {
+        let branch_width = width.saturating_sub(9);
+        let branch_name = if selected {
+            scrolling_value(branch, branch_width, scroll_offset)
+        } else {
+            compact_value(branch.rsplit('/').next().unwrap_or(branch), branch_width)
+        };
+        rows.push(Line::from(truncate_to_width(
+            format!("  branch {branch_name}"),
+            width,
+        )));
+    } else {
+        rows.push(Line::from(""));
+    }
+    rows
+}
+
+fn truncate_to_width(value: String, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut chars = value.chars();
+    if chars.clone().count() <= width {
+        return value;
+    }
+    if width == 1 {
+        return "~".to_string();
+    }
+
+    chars.by_ref().take(width - 1).collect::<String>() + "~"
+}
+
+fn compact_value(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let char_count = value.chars().count();
+    if char_count <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return value.chars().take(width).collect();
+    }
+
+    let head_len = (width - 1) / 2;
+    let tail_len = width - 1 - head_len;
+    let head = value.chars().take(head_len).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}~{tail}")
+}
+
+fn scrolling_value(value: &str, width: usize, offset: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= width {
+        return value.to_string();
+    }
+
+    let mut cycle = chars;
+    cycle.extend([' ', ' ', ' ']);
+    let offset = offset % cycle.len();
+    (0..width)
+        .map(|index| cycle[(offset + index) % cycle.len()])
+        .collect()
+}
+
+fn selected_sidebar_context_overflows(app: &LocalSessionApp, width: usize) -> bool {
+    let view = app.view();
+    let context = view.snapshot.context.as_ref();
+    let location_overflows = context
+        .and_then(|context| {
+            context
+                .worktree_root
+                .as_ref()
+                .or(context.repository_root.as_ref())
+                .map(|root| (7, root))
+        })
+        .or_else(|| {
+            view.snapshot
+                .current_working_directory
+                .as_ref()
+                .map(|cwd| (6, cwd))
+        })
+        .and_then(|(prefix_width, path)| path.file_name().map(|name| (prefix_width, name)))
+        .map(|(prefix_width, name)| {
+            name.to_string_lossy().chars().count() > width.saturating_sub(prefix_width)
+        })
+        .unwrap_or(false);
+    let branch_overflows = context
+        .and_then(|context| context.branch.as_ref())
+        .map(|branch| branch.chars().count() > width.saturating_sub(9))
+        .unwrap_or(false);
+    location_overflows || branch_overflows
 }
 
 fn draw_terminal(
@@ -1283,6 +1490,85 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_rows_include_git_session_context() {
+        let view = SessionView {
+            session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: argus_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: Vec::new(),
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: argus_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: Some(PathBuf::from("/workspace/argus/crates")),
+                context: Some(argus_core::session::SessionContext {
+                    repository_root: Some(PathBuf::from("/workspace/argus")),
+                    worktree_root: Some(PathBuf::from("/workspace/argus")),
+                    branch: Some("feat/session-context".to_string()),
+                }),
+                bracketed_paste_enabled: false,
+                exited: false,
+            },
+            lease: argus_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+
+        let rows =
+            session_sidebar_rows(0, 1, &view, usize::from(SIDEBAR_COLS.saturating_sub(1)), 0);
+
+        assert_eq!(rows[2].spans[0].content.as_ref(), "  repo argus");
+        assert_eq!(
+            rows[3].spans[0].content.as_ref(),
+            "  branch session-context"
+        );
+    }
+
+    #[test]
+    fn selected_sidebar_context_scrolls_overflowing_branch_text() {
+        let view = SessionView {
+            session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: argus_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: Vec::new(),
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: argus_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: Some(PathBuf::from("/workspace/argus")),
+                context: Some(argus_core::session::SessionContext {
+                    repository_root: Some(PathBuf::from("/workspace/argus")),
+                    worktree_root: Some(PathBuf::from("/workspace/argus")),
+                    branch: Some("feat/very-long-session-context-label".to_string()),
+                }),
+                bracketed_paste_enabled: false,
+                exited: false,
+            },
+            lease: argus_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+
+        let first = session_sidebar_rows(0, 0, &view, 20, 0);
+        let later = session_sidebar_rows(0, 0, &view, 20, 5);
+
+        assert_ne!(first[3].spans[0].content, later[3].spans[0].content);
+        assert!(first[3].spans[0].content.starts_with("  branch "));
+        assert_eq!(first[3].width(), 20);
+        assert_eq!(later[3].width(), 20);
+    }
+
+    #[test]
     fn terminal_selection_extracts_only_visible_terminal_text() {
         let view = SessionView {
             session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
@@ -1303,6 +1589,7 @@ mod tests {
                     visible: false,
                 },
                 current_working_directory: None,
+                context: None,
                 bracketed_paste_enabled: false,
                 exited: false,
             },
@@ -1341,6 +1628,7 @@ mod tests {
                     visible: false,
                 },
                 current_working_directory: None,
+                context: None,
                 bracketed_paste_enabled: false,
                 exited: false,
             },
@@ -1621,6 +1909,7 @@ mod tests {
                 visible: true,
             },
             current_working_directory: None,
+            context: None,
             bracketed_paste_enabled: false,
             exited: false,
         };

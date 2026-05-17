@@ -5,6 +5,7 @@ use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionEvent,
+    InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionContext, SessionEvent,
     SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSize, SessionSnapshot,
     StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
     SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
@@ -370,6 +371,7 @@ impl SessionActor {
         event_session_id: Option<SessionId>,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
+        let initial_context = resolve_session_context(initial_working_directory.as_ref());
         let runtime = spawn_pty_runtime(config)?;
         let PtyRuntime {
             master,
@@ -399,6 +401,7 @@ impl SessionActor {
                     output_closed: false,
                     exit_broadcasted: false,
                     current_working_directory: initial_working_directory,
+                    context: initial_context,
                     event_session_id,
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
@@ -439,7 +442,7 @@ impl SessionActor {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(ActorCommand::BroadcastEvent {
-                event,
+                event: Box::new(event),
                 response: tx,
             })
             .context("sending session event broadcast command")?;
@@ -534,6 +537,7 @@ struct ActorState {
     output_closed: bool,
     exit_broadcasted: bool,
     current_working_directory: Option<PathBuf>,
+    context: Option<SessionContext>,
     event_session_id: Option<SessionId>,
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
@@ -593,7 +597,7 @@ enum ActorCommand {
         response: Sender<ActorResult<usize>>,
     },
     BroadcastEvent {
-        event: SessionEvent,
+        event: Box<SessionEvent>,
         response: Sender<ActorResult<()>>,
     },
     Shutdown {
@@ -657,6 +661,7 @@ impl ActorState {
             ActorMessage::Output(bytes) => match self.output.ingest(&bytes) {
                 Ok(current_working_directory) => {
                     if let Some(current_working_directory) = current_working_directory {
+                        self.context = resolve_session_context(Some(&current_working_directory));
                         self.current_working_directory = Some(current_working_directory);
                     }
                     if let Some(session_id) = self.event_session_id.clone() {
@@ -721,7 +726,7 @@ impl ActorState {
                 false
             }
             ActorCommand::BroadcastEvent { event, response } => {
-                self.broadcast(event);
+                self.broadcast(*event);
                 let _ = response.send(Ok(()));
                 false
             }
@@ -776,6 +781,7 @@ impl ActorState {
             visible_rows,
             cursor: terminal_cursor(&self.output.terminal),
             current_working_directory: self.current_working_directory.clone(),
+            context: self.context.clone(),
             bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
             exited: self.exited,
         }
@@ -983,9 +989,20 @@ impl ActorState {
 
             match output_rx.recv_timeout(remaining) {
                 Ok(ActorMessage::Output(bytes)) => {
-                    if let Err(error) = self.output.ingest(&bytes) {
-                        tracing::warn!(error = ?error, "failed to ingest PTY output during shutdown");
-                    } else if let Some(session_id) = self.event_session_id.clone() {
+                    match self.output.ingest(&bytes) {
+                        Ok(current_working_directory) => {
+                            if let Some(current_working_directory) = current_working_directory {
+                                self.context =
+                                    resolve_session_context(Some(&current_working_directory));
+                                self.current_working_directory = Some(current_working_directory);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = ?error, "failed to ingest PTY output during shutdown");
+                            continue;
+                        }
+                    }
+                    if let Some(session_id) = self.event_session_id.clone() {
                         self.broadcast(SessionEvent::Output {
                             session_id,
                             output_seq: self.output.output_seq,
@@ -1239,6 +1256,37 @@ fn join_thread_with_timeout(handle: JoinHandle<()>, name: &'static str) {
 
 fn shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
     Arc::new(Mutex::new(writer))
+}
+
+fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
+    let cwd = cwd?;
+    let repository_root = git_output(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
+    let worktree_root = repository_root.clone();
+    let branch = git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
+
+    (repository_root.is_some() || worktree_root.is_some() || branch.is_some()).then_some(
+        SessionContext {
+            repository_root,
+            worktree_root,
+            branch,
+        },
+    )
+}
+
+fn git_output(cwd: &PathBuf, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 struct TerminalOutputSink {
@@ -1737,6 +1785,31 @@ mod tests {
         );
         actor.shutdown().expect("shutdown session actor");
         let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn session_context_discovers_git_worktree_branch_and_root() {
+        let repo = unique_log_dir();
+        std::fs::create_dir_all(repo.join("nested")).expect("create nested repo dir");
+        git_test_command(&repo, &["init"]);
+        git_test_command(&repo, &["checkout", "-b", "feature/context"]);
+
+        let context =
+            resolve_session_context(Some(&repo.join("nested"))).expect("git session context");
+
+        assert_eq!(context.repository_root, Some(repo.clone()));
+        assert_eq!(context.worktree_root, Some(repo.clone()));
+        assert_eq!(context.branch.as_deref(), Some("feature/context"));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn session_context_is_absent_outside_git_worktree() {
+        let dir = unique_log_dir();
+        std::fs::create_dir_all(&dir).expect("create non-git dir");
+
+        assert!(resolve_session_context(Some(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2442,6 +2515,16 @@ mod tests {
             std::thread::current().id()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    fn git_test_command(cwd: &PathBuf, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("run git test command");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     struct RecordingWriter {
