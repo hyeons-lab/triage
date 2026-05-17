@@ -14,3 +14,13 @@ The `git pull` of origin/main merged several branches whose devlogs were authore
 1. `git mv` the `fix-tui-shift-tab-input` devlog and plan from `000016`/`000016-01` to `000019`/`000019-01`.
 2. Add this branch devlog (`000020`) and plan.
 3. Commit devlog + plan + rename together, push, open PR.
+
+## Revision — 2026-05-16T21:51-0700
+
+Targets corrected after fetching all open branches. The open PR #24
+(`feat/session-context`) already holds `000019` and predates this
+branch, so the original target would have recreated the collision.
+Revised mapping:
+
+- `000016-fix-tui-shift-tab-input` (+ plan) → `000020` / `000020-01`
+- this branch's devlog/plan → `000021` / `000021-01`
