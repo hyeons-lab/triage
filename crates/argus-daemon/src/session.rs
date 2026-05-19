@@ -282,13 +282,13 @@ impl SessionApi for SessionManager {
         if let Err(error) = self.persist_manifest(&sessions) {
             let inserted = sessions.remove(&session_id);
             drop(sessions);
-            if let Some(ManagedSession::Live { actor, .. }) = inserted {
-                if let Err(shutdown_error) = actor.shutdown() {
-                    tracing::warn!(
-                        error = ?shutdown_error,
-                        "failed to shut down session after manifest persistence failure"
-                    );
-                }
+            if let Some(ManagedSession::Live { actor, .. }) = inserted
+                && let Err(shutdown_error) = actor.shutdown()
+            {
+                tracing::warn!(
+                    error = ?shutdown_error,
+                    "failed to shut down session after manifest persistence failure"
+                );
             }
             return Err(error);
         }

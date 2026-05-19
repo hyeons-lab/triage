@@ -25,11 +25,13 @@
 - Added daemon tests for manifest creation, log replay recovery, historical input rejection, and session id allocation after restored ids.
 - Added a review regression test covering event subscription for restored historical sessions, then changed historical subscriptions to return a closed receiver instead of an error.
 - Added review fixes for manifest persistence failure handling: manifest replacement now works when `sessions.json` already exists on Windows, the previous manifest is restored if replacement installation fails, `start_session` rolls back and shuts down a spawned actor when manifest persistence fails, and `shutdown_session` keeps the session registered when manifest persistence fails.
+- Collapsed the start-session rollback shutdown guard to satisfy the CI clippy configuration without changing rollback behavior.
 
 ## Commits
 
 - c23e756 — feat: persist session histories
-- HEAD — fix: roll back sessions on manifest failure
+- 160903f — fix: roll back sessions on manifest failure
+- HEAD — fix: satisfy clippy for session rollback
 
 ## Progress
 
@@ -37,6 +39,7 @@
 - 2026-05-18T22:09-0700 — Implemented manifest-backed historical session recovery and validated with `cargo fmt --all` and `cargo test -p argus-daemon`.
 - 2026-05-18T23:25-0700 — Addressed review feedback that TUI startup subscribes to every listed session before attach. Verified the regression failed before the fix, then passed with `cargo test -p argus-daemon session_manager_restores_historical_sessions_from_manifest`, `cargo test -p argus-daemon`, and `cargo fmt --all -- --check`.
 - 2026-05-18T23:42-0700 — Addressed PR review feedback for manifest persistence failures. Added regression tests for replacing an existing manifest, restoring the previous manifest when backup replacement fails, rolling back a spawned session when start persistence fails, and keeping a session registered when shutdown persistence fails; validated with `cargo test -p argus-daemon session_manager_`, `cargo test -p argus-daemon manifest_backup_replace_restores_existing_manifest_when_install_fails`, `cargo test -p argus-daemon`, and `cargo fmt --all -- --check`.
+- 2026-05-18T23:50-0700 — Fixed the CI clippy failure in the start-session rollback path. Validated with `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` and `cargo test -p argus-daemon`.
 
 ## Next Steps
 
