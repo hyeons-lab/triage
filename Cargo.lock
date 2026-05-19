@@ -124,6 +124,13 @@ dependencies = [
 [[package]]
 name = "argus-mcp"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "argus-core",
+ "argus-daemon",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "argus-test-support"
