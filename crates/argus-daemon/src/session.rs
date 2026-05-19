@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -226,13 +226,7 @@ impl SessionManager {
         let json = serde_json::to_vec_pretty(&manifest).context("encoding session manifest")?;
         fs::write(&temp_path, json)
             .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
-        fs::rename(&temp_path, &manifest_path).with_context(|| {
-            format!(
-                "moving session manifest {} to {}",
-                temp_path.display(),
-                manifest_path.display()
-            )
-        })?;
+        replace_manifest(&temp_path, &manifest_path)?;
         Ok(())
     }
 }
@@ -285,7 +279,19 @@ impl SessionApi for SessionManager {
                 launch,
             },
         );
-        self.persist_manifest(&sessions)?;
+        if let Err(error) = self.persist_manifest(&sessions) {
+            let inserted = sessions.remove(&session_id);
+            drop(sessions);
+            if let Some(ManagedSession::Live { actor, .. }) = inserted {
+                if let Err(shutdown_error) = actor.shutdown() {
+                    tracing::warn!(
+                        error = ?shutdown_error,
+                        "failed to shut down session after manifest persistence failure"
+                    );
+                }
+            }
+            return Err(error);
+        }
         Ok(session_id)
     }
 
@@ -448,7 +454,10 @@ impl SessionApi for SessionManager {
             let session = sessions
                 .remove(&session_id)
                 .with_context(|| format!("session {session_id} not found"))?;
-            self.persist_manifest(&sessions)?;
+            if let Err(error) = self.persist_manifest(&sessions) {
+                sessions.insert(session_id, session);
+                return Err(error);
+            }
             session
         };
         match session {
@@ -567,6 +576,85 @@ fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u
         })
         .max()
         .map_or(1, |sequence| sequence.saturating_add(1))
+}
+
+fn replace_manifest(temp_path: &Path, manifest_path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return replace_manifest_with_backup(temp_path, manifest_path);
+    }
+
+    #[cfg(not(windows))]
+    fs::rename(temp_path, manifest_path).with_context(|| {
+        format!(
+            "moving session manifest {} to {}",
+            temp_path.display(),
+            manifest_path.display()
+        )
+    })
+}
+
+#[cfg(any(windows, test))]
+fn replace_manifest_with_backup(temp_path: &Path, manifest_path: &Path) -> Result<()> {
+    if !manifest_path.exists() {
+        return fs::rename(temp_path, manifest_path).with_context(|| {
+            format!(
+                "moving session manifest {} to {}",
+                temp_path.display(),
+                manifest_path.display()
+            )
+        });
+    }
+
+    let backup_path = manifest_path.with_extension("json.bak");
+    remove_path_if_exists(&backup_path).with_context(|| {
+        format!(
+            "removing stale session manifest backup {}",
+            backup_path.display()
+        )
+    })?;
+    fs::rename(manifest_path, &backup_path).with_context(|| {
+        format!(
+            "backing up session manifest {} to {}",
+            manifest_path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    match fs::rename(temp_path, manifest_path) {
+        Ok(()) => {
+            remove_path_if_exists(&backup_path).with_context(|| {
+                format!("removing session manifest backup {}", backup_path.display())
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(restore_error) = fs::rename(&backup_path, manifest_path) {
+                tracing::error!(
+                    error = ?restore_error,
+                    "failed to restore previous session manifest after replacement failure"
+                );
+            }
+            Err(error).with_context(|| {
+                format!(
+                    "moving session manifest {} to {}",
+                    temp_path.display(),
+                    manifest_path.display()
+                )
+            })
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)
+            .with_context(|| format!("removing directory {}", path.display())),
+        Ok(_) => fs::remove_file(path).with_context(|| format!("removing file {}", path.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("reading metadata {}", path.display())),
+    }
 }
 
 fn closed_session_event_receiver() -> SessionEventReceiver {
@@ -2636,6 +2724,125 @@ mod tests {
         manager
             .shutdown_session(session_id)
             .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_manager_replaces_existing_manifest() {
+        let log_dir = unique_log_dir();
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let sessions = std::collections::HashMap::new();
+
+        manager
+            .persist_manifest(&sessions)
+            .expect("write initial manifest");
+        manager
+            .persist_manifest(&sessions)
+            .expect("replace existing manifest");
+
+        let manifest: SessionManifest = serde_json::from_slice(
+            &std::fs::read(config.manifest_path()).expect("read session manifest"),
+        )
+        .expect("decode session manifest");
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.sessions.is_empty());
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn manifest_backup_replace_restores_existing_manifest_when_install_fails() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let manifest_path = log_dir.join("sessions.json");
+        let temp_path = log_dir.join("sessions.json.tmp");
+        std::fs::write(&manifest_path, b"previous manifest").expect("write previous manifest");
+
+        let error = replace_manifest_with_backup(&temp_path, &manifest_path)
+            .expect_err("missing temp manifest should fail replacement");
+
+        assert!(
+            error.to_string().contains("moving session manifest"),
+            "unexpected replacement error: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&manifest_path).expect("read restored manifest"),
+            b"previous manifest"
+        );
+        assert!(!manifest_path.with_extension("json.bak").exists());
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn session_manager_rolls_back_started_session_when_manifest_persist_fails() {
+        let log_dir = unique_log_dir();
+        let config = SessionManagerConfig::new(log_dir.clone());
+        std::fs::create_dir_all(config.manifest_path()).expect("create manifest path directory");
+        let manager = SessionManager::new(config);
+
+        let error = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect_err("start session should fail when manifest cannot be replaced");
+
+        assert!(
+            error.to_string().contains("moving session manifest")
+                || error
+                    .to_string()
+                    .contains("removing existing session manifest"),
+            "unexpected persist error: {error:?}"
+        );
+        assert!(
+            manager
+                .list_sessions()
+                .expect("list sessions after rollback")
+                .is_empty(),
+            "failed manifest persistence should not retain the started session"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn session_manager_keeps_session_when_shutdown_manifest_persist_fails() {
+        let log_dir = unique_log_dir();
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        std::fs::remove_file(config.manifest_path()).expect("remove manifest file");
+        std::fs::create_dir_all(config.manifest_path()).expect("create manifest path directory");
+
+        let error = manager
+            .shutdown_session(session_id.clone())
+            .expect_err("shutdown should fail when manifest cannot be replaced");
+
+        assert!(
+            error.to_string().contains("moving session manifest"),
+            "unexpected persist error: {error:?}"
+        );
+        assert!(
+            manager
+                .list_sessions()
+                .expect("list sessions after failed shutdown")
+                .contains(&session_id),
+            "failed shutdown persistence should keep the session registered"
+        );
+
+        std::fs::remove_dir_all(config.manifest_path()).expect("remove blocking manifest dir");
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown after manifest path restored");
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
