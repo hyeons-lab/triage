@@ -48,12 +48,9 @@ fn run_stdio_with_client(
             continue;
         }
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
+        let response = match decode_json_rpc_request(&line) {
             Ok(request) => server.handle(request),
-            Err(error) => Some(JsonRpcResponse::error(
-                Value::Null,
-                JsonRpcError::parse_error(error.to_string()),
-            )),
+            Err((id, error)) => Some(JsonRpcResponse::error(id, error)),
         };
 
         if let Some(response) = response {
@@ -196,9 +193,33 @@ impl<A: SessionApi> McpServer<A> {
             "snapshot_session" => tool_result(snapshot_session(&self.api, arguments)?),
             "styled_rows" => tool_result(styled_rows(&self.api, arguments)?),
             other => {
-                Err(JsonRpcError::method_not_found(format!("unknown Argus tool {other}")).into())
+                Err(JsonRpcError::invalid_params(format!("unknown Argus tool {other}")).into())
             }
         }
+    }
+}
+
+fn decode_json_rpc_request(
+    line: &str,
+) -> std::result::Result<JsonRpcRequest, (Value, JsonRpcError)> {
+    let value = serde_json::from_str::<Value>(line)
+        .map_err(|error| (Value::Null, JsonRpcError::parse_error(error.to_string())))?;
+    let id = response_id_for_invalid_request(&value);
+    serde_json::from_value::<JsonRpcRequest>(value).map_err(|error| {
+        (
+            id,
+            JsonRpcError::invalid_request(format!("invalid JSON-RPC request: {error}")),
+        )
+    })
+}
+
+fn response_id_for_invalid_request(value: &Value) -> Value {
+    let Some(id) = value.get("id") else {
+        return Value::Null;
+    };
+    match id {
+        Value::Null | Value::String(_) | Value::Number(_) => id.clone(),
+        _ => Value::Null,
     }
 }
 
@@ -515,6 +536,13 @@ impl JsonRpcError {
         }
     }
 
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            code: -32600,
+            message: message.into(),
+        }
+    }
+
     fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             code: -32602,
@@ -705,6 +733,48 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, -32602);
         assert!(error.message.contains("session_id"));
+    }
+
+    #[test]
+    fn unknown_tool_names_are_invalid_params() {
+        let server = McpServer::new(RecordingApi::new());
+
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(3)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "missing_tool",
+                    "arguments": {}
+                })),
+            })
+            .expect("response");
+
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("missing_tool"));
+    }
+
+    #[test]
+    fn stdio_distinguishes_parse_errors_from_invalid_requests() {
+        let input = b"{\n{}\n{\"jsonrpc\":\"2.0\",\"id\":\"bad\",\"params\":{}}\n".as_slice();
+        let mut output = Vec::new();
+
+        run_stdio_with_client(RecordingApi::new(), input, &mut output).expect("stdio run");
+
+        let responses = String::from_utf8(output)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json response"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert_eq!(responses[1]["id"], Value::Null);
+        assert_eq!(responses[1]["error"]["code"], -32600);
+        assert_eq!(responses[2]["id"], "bad");
+        assert_eq!(responses[2]["error"]["code"], -32600);
     }
 
     #[test]

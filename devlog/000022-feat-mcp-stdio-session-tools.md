@@ -24,11 +24,14 @@
 - Added unit coverage for tool listing, read-only tool calls, required argument validation, and notification suppression.
 - Preserved explicit JSON-RPC `null` request IDs while continuing to suppress notifications with omitted IDs.
 - Returned daemon/tool execution failures as MCP tool results with `isError: true` instead of JSON-RPC internal errors.
+- Distinguished JSON syntax parse errors from invalid JSON-RPC request shapes at the stdio boundary.
+- Reported unknown MCP tool names as invalid `tools/call` params instead of JSON-RPC method-not-found errors.
 
 ## Commits
 
 - 07a2747 — feat: add MCP stdio session tools
-- HEAD — fix: align MCP stdio error boundaries
+- b6ee058 — fix: align MCP stdio error boundaries
+- HEAD — fix: validate MCP request boundaries
 
 ## Progress
 
@@ -36,6 +39,7 @@
 - 2026-05-18T20:45-0700 — Implemented the first read-only MCP stdio surface and validated it with `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-mcp`, `cargo check --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, and a real stdio `initialize` smoke request through `cargo run -q -p argus-mcp`.
 - 2026-05-18T20:56-0700 — Addressed review feedback for MCP protocol boundaries: explicit `null` IDs now produce responses, omitted IDs remain notifications, and tool execution failures return displayable MCP tool errors. Validated with `cargo fmt --all` and `cargo test -p argus-mcp`.
 - 2026-05-18T21:18-0700 — Replaced the manual `Default` implementation for JSON-RPC IDs with a derived default so clippy passes with warnings denied.
+- 2026-05-18T22:15-0700 — Addressed live PR #26 review threads by returning invalid request for syntactically valid malformed JSON-RPC request objects and invalid params for unknown tool names.
 
 ## Next Steps
 
