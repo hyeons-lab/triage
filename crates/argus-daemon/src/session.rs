@@ -15,7 +15,7 @@ use std::sync::mpsc::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionContext, SessionEvent,
@@ -24,6 +24,7 @@ use argus_core::session::{
     SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 
@@ -94,6 +95,10 @@ impl SessionManagerConfig {
             log_dir: log_dir.into(),
         }
     }
+
+    fn manifest_path(&self) -> PathBuf {
+        self.log_dir.join("sessions.json")
+    }
 }
 
 pub struct SessionManager {
@@ -102,17 +107,89 @@ pub struct SessionManager {
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
 }
 
-struct ManagedSession {
-    actor: SessionActor,
-    lease: InputLeaseState,
+enum ManagedSession {
+    Live {
+        actor: SessionActor,
+        lease: InputLeaseState,
+        launch: PersistedSessionLaunch,
+    },
+    Historical {
+        session: Box<HistoricalSession>,
+        lease: InputLeaseState,
+    },
+}
+
+struct HistoricalSession {
+    persisted: PersistedSession,
+    output: OutputState,
+    size: SessionSize,
+    current_working_directory: Option<PathBuf>,
+    context: Option<SessionContext>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SessionManifest {
+    version: u32,
+    sessions: Vec<PersistedSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSession {
+    id: SessionId,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    size: SessionSize,
+    log_path: PathBuf,
+    exited: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedSessionLaunch {
+    command: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    size: SessionSize,
+    log_path: PathBuf,
+}
+
+impl From<&SessionConfig> for PersistedSessionLaunch {
+    fn from(config: &SessionConfig) -> Self {
+        Self {
+            command: config.command.clone(),
+            args: config.args.clone(),
+            cwd: config.cwd.clone(),
+            size: config.size.clone(),
+            log_path: config.log_path.clone(),
+        }
+    }
+}
+
+impl PersistedSessionLaunch {
+    fn into_persisted(self, id: SessionId, exited: bool) -> PersistedSession {
+        PersistedSession {
+            id,
+            command: self.command,
+            args: self.args,
+            cwd: self.cwd,
+            size: self.size,
+            log_path: self.log_path,
+            exited,
+        }
+    }
 }
 
 impl SessionManager {
     pub fn new(config: SessionManagerConfig) -> Self {
+        let sessions = restore_sessions(&config).unwrap_or_else(|error| {
+            tracing::warn!(error = ?error, "failed to restore persisted sessions");
+            HashMap::new()
+        });
+        let next_session = next_session_sequence(sessions.keys());
         Self {
             config,
-            next_session: AtomicU64::new(1),
-            sessions: Mutex::new(HashMap::new()),
+            next_session: AtomicU64::new(next_session),
+            sessions: Mutex::new(sessions),
         }
     }
 
@@ -129,6 +206,43 @@ impl SessionManager {
         self.sessions
             .lock()
             .map_err(|_| anyhow!("session manager lock poisoned"))
+    }
+
+    fn persist_manifest(&self, sessions: &HashMap<SessionId, ManagedSession>) -> Result<()> {
+        fs::create_dir_all(&self.config.log_dir).with_context(|| {
+            format!("creating session log dir {}", self.config.log_dir.display())
+        })?;
+        let mut persisted_sessions = sessions
+            .iter()
+            .map(|(session_id, session)| session.persisted(session_id.clone()))
+            .collect::<Vec<_>>();
+        persisted_sessions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        let manifest = SessionManifest {
+            version: 1,
+            sessions: persisted_sessions,
+        };
+        let manifest_path = self.config.manifest_path();
+        let temp_path = manifest_path.with_extension("json.tmp");
+        let json = serde_json::to_vec_pretty(&manifest).context("encoding session manifest")?;
+        fs::write(&temp_path, json)
+            .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
+        fs::rename(&temp_path, &manifest_path).with_context(|| {
+            format!(
+                "moving session manifest {} to {}",
+                temp_path.display(),
+                manifest_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+impl ManagedSession {
+    fn persisted(&self, session_id: SessionId) -> PersistedSession {
+        match self {
+            Self::Live { launch, .. } => launch.clone().into_persisted(session_id, false),
+            Self::Historical { session, .. } => session.persisted.clone(),
+        }
     }
 }
 
@@ -159,16 +273,19 @@ impl SessionApi for SessionManager {
             size: request.size,
             log_path,
         };
+        let launch = PersistedSessionLaunch::from(&config);
         let actor = SessionActor::spawn_managed(config, session_id.clone())?;
 
         let mut sessions = self.sessions()?;
         sessions.insert(
             session_id.clone(),
-            ManagedSession {
+            ManagedSession::Live {
                 actor,
                 lease: InputLeaseState::default(),
+                launch,
             },
         );
+        self.persist_manifest(&sessions)?;
         Ok(session_id)
     }
 
@@ -178,18 +295,26 @@ impl SessionApi for SessionManager {
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
 
-        if let Some(kind) = request.mode.controller_kind() {
-            let change = session.lease.acquire(request.client_id, kind);
-            session.actor.broadcast_event(SessionEvent::LeaseChanged {
-                session_id: request.session_id.clone(),
-                change,
-            })?;
-        }
+        match session {
+            ManagedSession::Live { actor, lease, .. } => {
+                if let Some(kind) = request.mode.controller_kind() {
+                    let change = lease.acquire(request.client_id, kind);
+                    actor.broadcast_event(SessionEvent::LeaseChanged {
+                        session_id: request.session_id.clone(),
+                        change,
+                    })?;
+                }
 
-        Ok(AttachSessionResponse {
-            snapshot: session.actor.snapshot()?,
-            lease: session.lease.clone(),
-        })
+                Ok(AttachSessionResponse {
+                    snapshot: actor.snapshot()?,
+                    lease: lease.clone(),
+                })
+            }
+            ManagedSession::Historical { session, lease } => Ok(AttachSessionResponse {
+                snapshot: session.snapshot(),
+                lease: lease.clone(),
+            }),
+        }
     }
 
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
@@ -207,7 +332,10 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        session.actor.subscribe_events(request.after_event_seq)
+        match session {
+            ManagedSession::Live { actor, .. } => actor.subscribe_events(request.after_event_seq),
+            ManagedSession::Historical { .. } => Ok(closed_session_event_receiver()),
+        }
     }
 
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
@@ -215,12 +343,19 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        let change = session.lease.acquire(request.client_id, request.kind);
-        session.actor.broadcast_event(SessionEvent::LeaseChanged {
-            session_id: request.session_id,
-            change: change.clone(),
-        })?;
-        Ok(change)
+        match session {
+            ManagedSession::Live { actor, lease, .. } => {
+                let change = lease.acquire(request.client_id, request.kind);
+                actor.broadcast_event(SessionEvent::LeaseChanged {
+                    session_id: request.session_id,
+                    change: change.clone(),
+                })?;
+                Ok(change)
+            }
+            ManagedSession::Historical { .. } => {
+                bail!("restored historical sessions cannot acquire input leases")
+            }
+        }
     }
 
     fn release_input_lease(
@@ -232,15 +367,21 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get_mut(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        let change = session
-            .lease
-            .release(&client_id)
-            .with_context(|| format!("client {client_id} does not hold input lease"))?;
-        session.actor.broadcast_event(SessionEvent::LeaseChanged {
-            session_id,
-            change: change.clone(),
-        })?;
-        Ok(change)
+        match session {
+            ManagedSession::Live { actor, lease, .. } => {
+                let change = lease
+                    .release(&client_id)
+                    .with_context(|| format!("client {client_id} does not hold input lease"))?;
+                actor.broadcast_event(SessionEvent::LeaseChanged {
+                    session_id,
+                    change: change.clone(),
+                })?;
+                Ok(change)
+            }
+            ManagedSession::Historical { .. } => {
+                bail!("restored historical sessions cannot hold input leases")
+            }
+        }
     }
 
     fn write_input(&self, request: WriteInputRequest) -> Result<()> {
@@ -248,17 +389,20 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        let holder =
-            session.lease.holder.as_ref().with_context(|| {
-                format!("session {} has no input lease holder", request.session_id)
-            })?;
+        let ManagedSession::Live { actor, lease, .. } = session else {
+            bail!("restored historical sessions cannot accept input");
+        };
+        let holder = lease
+            .holder
+            .as_ref()
+            .with_context(|| format!("session {} has no input lease holder", request.session_id))?;
         ensure!(
             holder.client_id == request.client_id,
             "client {} does not hold input lease for session {}",
             request.client_id,
             request.session_id
         );
-        session.actor.write_input(request.bytes)
+        actor.write_input(request.bytes)
     }
 
     fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
@@ -266,7 +410,12 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        session.actor.resize(request.size)
+        match session {
+            ManagedSession::Live { actor, .. } => actor.resize(request.size),
+            ManagedSession::Historical { .. } => {
+                bail!("restored historical sessions cannot be resized")
+            }
+        }
     }
 
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -274,7 +423,10 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        session.actor.snapshot()
+        match session {
+            ManagedSession::Live { actor, .. } => actor.snapshot(),
+            ManagedSession::Historical { session, .. } => Ok(session.snapshot()),
+        }
     }
 
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
@@ -282,17 +434,27 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        session.actor.styled_rows(request.start, request.end)
+        match session {
+            ManagedSession::Live { actor, .. } => actor.styled_rows(request.start, request.end),
+            ManagedSession::Historical { session, .. } => {
+                session.styled_rows(request.start, request.end)
+            }
+        }
     }
 
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         let session = {
             let mut sessions = self.sessions()?;
-            sessions
+            let session = sessions
                 .remove(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?
+                .with_context(|| format!("session {session_id} not found"))?;
+            self.persist_manifest(&sessions)?;
+            session
         };
-        session.actor.shutdown()
+        match session {
+            ManagedSession::Live { actor, .. } => actor.shutdown(),
+            ManagedSession::Historical { session, .. } => Ok(session.completed_session()),
+        }
     }
 }
 
@@ -355,6 +517,116 @@ fn default_log_dir() -> PathBuf {
             home.join(".local/state")
         })
         .join("argus/sessions")
+}
+
+fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, ManagedSession>> {
+    let manifest_path = config.manifest_path();
+    if !manifest_path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let manifest: SessionManifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .with_context(|| format!("reading session manifest {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("decoding session manifest {}", manifest_path.display()))?;
+    ensure!(
+        manifest.version == 1,
+        "unsupported session manifest version {}",
+        manifest.version
+    );
+
+    let mut sessions = HashMap::new();
+    for persisted in manifest.sessions {
+        match HistoricalSession::restore(persisted) {
+            Ok(session) => {
+                sessions.insert(
+                    session.persisted.id.clone(),
+                    ManagedSession::Historical {
+                        session: Box::new(session),
+                        lease: InputLeaseState::default(),
+                    },
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, "skipping persisted session");
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u64 {
+    sessions
+        .filter_map(|session_id| {
+            session_id
+                .as_str()
+                .strip_prefix("session-")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .map_or(1, |sequence| sequence.saturating_add(1))
+}
+
+fn closed_session_event_receiver() -> SessionEventReceiver {
+    let (_tx, rx) = mpsc::channel();
+    rx
+}
+
+impl HistoricalSession {
+    fn restore(persisted: PersistedSession) -> Result<Self> {
+        let size = persisted.size.clone();
+        let mut output = output_state_for_log(&persisted.log_path, persisted.size.clone())?;
+        let mut current_working_directory = persisted.cwd.clone();
+        let log = fs::read(&persisted.log_path)
+            .with_context(|| format!("reading session log {}", persisted.log_path.display()))?;
+        if !log.is_empty()
+            && let Some(cwd) = output.replay(&log)?
+        {
+            current_working_directory = Some(cwd);
+        }
+        let context = resolve_session_context(current_working_directory.as_ref());
+        Ok(Self {
+            persisted,
+            output,
+            size,
+            current_working_directory,
+            context,
+        })
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        snapshot_from_output(
+            &self.output,
+            &self.size,
+            self.current_working_directory.clone(),
+            self.context.clone(),
+            true,
+        )
+    }
+
+    fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
+        ensure!(start <= end, "styled row start must be before end");
+        let row_count = self.output.terminal.screen().scrollback_rows();
+        ensure!(
+            end <= row_count,
+            "styled row range {start}..{end} exceeds retained row count {row_count}"
+        );
+        Ok(StyledRowsResponse {
+            output_seq: self.output.output_seq,
+            start,
+            rows: styled_visible_rows_for_range(&self.output.terminal, start, end),
+        })
+    }
+
+    fn completed_session(&self) -> CompletedSession {
+        CompletedSession {
+            output_seq: self.output.output_seq,
+            bytes_logged: self.output.bytes_logged,
+            visible_rows: visible_rows(&self.output.terminal),
+        }
+    }
 }
 
 impl SessionActor {
@@ -766,25 +1038,13 @@ impl ActorState {
     }
 
     fn snapshot(&self) -> SessionSnapshot {
-        let visible_rows = visible_rows(&self.output.terminal);
-        let styled_rows_start = visible_rows.len().saturating_sub(self.size.rows);
-        SessionSnapshot {
-            output_seq: self.output.output_seq,
-            bytes_logged: self.output.bytes_logged,
-            size: self.size.clone(),
-            styled_rows: styled_visible_rows_for_range(
-                &self.output.terminal,
-                styled_rows_start,
-                visible_rows.len(),
-            ),
-            styled_rows_start,
-            visible_rows,
-            cursor: terminal_cursor(&self.output.terminal),
-            current_working_directory: self.current_working_directory.clone(),
-            context: self.context.clone(),
-            bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
-            exited: self.exited,
-        }
+        snapshot_from_output(
+            &self.output,
+            &self.size,
+            self.current_working_directory.clone(),
+            self.context.clone(),
+            self.exited,
+        )
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -1042,6 +1302,14 @@ impl OutputState {
         Ok(current_working_directory)
     }
 
+    fn replay(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
+        self.bytes_logged += bytes.len() as u64;
+        self.output_seq += 1;
+        let current_working_directory = self.extract_current_working_directory(bytes);
+        self.terminal.advance_bytes(bytes);
+        Ok(current_working_directory)
+    }
+
     fn extract_current_working_directory(&mut self, bytes: &[u8]) -> Option<PathBuf> {
         if self.cwd_sequence_buffer.is_empty() {
             let start = bytes.iter().position(|byte| *byte == 0x1b)?;
@@ -1119,15 +1387,7 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         .truncate(true)
         .open(&config.log_path)
         .with_context(|| format!("opening session log {}", config.log_path.display()))?;
-    let terminal = Terminal::new(
-        terminal_size(&config.size),
-        Arc::new(ArgusTerminalConfig),
-        "Argus",
-        env!("CARGO_PKG_VERSION"),
-        Box::new(TerminalOutputSink {
-            writer: writer.clone(),
-        }),
-    );
+    let terminal = terminal_with_writer(&config.size, writer.clone());
 
     Ok(PtyRuntime {
         master: pair.master,
@@ -1143,6 +1403,59 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         },
         size: config.size,
     })
+}
+
+fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputState> {
+    let log = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("opening session log {}", log_path.display()))?;
+    Ok(OutputState {
+        log,
+        terminal: terminal_with_writer(&size, shared_pty_writer(Box::new(std::io::sink()))),
+        cwd_sequence_buffer: Vec::new(),
+        bytes_logged: 0,
+        output_seq: 0,
+    })
+}
+
+fn terminal_with_writer(size: &SessionSize, writer: SharedPtyWriter) -> Terminal {
+    Terminal::new(
+        terminal_size(size),
+        Arc::new(ArgusTerminalConfig),
+        "Argus",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(TerminalOutputSink { writer }),
+    )
+}
+
+fn snapshot_from_output(
+    output: &OutputState,
+    size: &SessionSize,
+    current_working_directory: Option<PathBuf>,
+    context: Option<SessionContext>,
+    exited: bool,
+) -> SessionSnapshot {
+    let visible_rows = visible_rows(&output.terminal);
+    let styled_rows_start = visible_rows.len().saturating_sub(size.rows);
+    SessionSnapshot {
+        output_seq: output.output_seq,
+        bytes_logged: output.bytes_logged,
+        size: size.clone(),
+        styled_rows: styled_visible_rows_for_range(
+            &output.terminal,
+            styled_rows_start,
+            visible_rows.len(),
+        ),
+        styled_rows_start,
+        visible_rows,
+        cursor: terminal_cursor(&output.terminal),
+        current_working_directory,
+        context,
+        bracketed_paste_enabled: output.terminal.bracketed_paste_enabled(),
+        exited,
+    }
 }
 
 fn pty_size(size: &SessionSize) -> PtySize {
@@ -2296,6 +2609,132 @@ mod tests {
         windows,
         ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
     )]
+    fn session_manager_persists_manifest_when_session_starts() {
+        let log_dir = unique_log_dir();
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let request = StartSessionRequest::new(long_running_shell_command());
+
+        let session_id = manager.start_session(request).expect("start session");
+
+        let manifest: SessionManifest = serde_json::from_slice(
+            &std::fs::read(config.manifest_path()).expect("read session manifest"),
+        )
+        .expect("decode session manifest");
+        assert_eq!(manifest.version, 1);
+        let persisted = manifest
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("persisted session");
+        assert_eq!(
+            persisted.log_path,
+            log_dir.join(format!("{session_id}.log"))
+        );
+        assert!(!persisted.exited);
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown managed session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_manager_restores_historical_sessions_from_manifest() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"restored-ready\r\n").expect("write session log");
+        let manifest = SessionManifest {
+            version: 1,
+            sessions: vec![PersistedSession {
+                id: session_id.clone(),
+                command: "/bin/sh".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+                log_path,
+                exited: false,
+            }],
+        };
+        std::fs::write(
+            SessionManagerConfig::new(log_dir.clone()).manifest_path(),
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let sessions = manager.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains(&session_id));
+        let snapshot = manager
+            .snapshot_session(session_id.clone())
+            .expect("restored snapshot");
+        assert!(snapshot.exited);
+        assert_eq!(snapshot.bytes_logged, b"restored-ready\r\n".len() as u64);
+        assert!(
+            snapshot
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("restored-ready")),
+            "restored rows did not include replayed log: {:?}",
+            snapshot.visible_rows
+        );
+
+        let rows = manager
+            .styled_rows(StyledRowsRequest {
+                session_id: session_id.clone(),
+                start: 0,
+                end: snapshot.visible_rows.len(),
+            })
+            .expect("restored styled rows");
+        assert_eq!(rows.output_seq, snapshot.output_seq);
+        assert_eq!(rows.rows.len(), snapshot.visible_rows.len());
+        let restored_events = manager
+            .subscribe_session_events(session_id.clone())
+            .expect("subscribe to restored session events");
+        assert!(matches!(
+            restored_events.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert!(
+            manager
+                .write_input(WriteInputRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("client").expect("client id"),
+                    bytes: b"echo nope\n".to_vec(),
+                })
+                .is_err(),
+            "historical sessions should reject input"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn next_session_sequence_advances_past_restored_ids() {
+        let sessions = [
+            SessionId::new("session-7").expect("session id"),
+            SessionId::new("session-41").expect("session id"),
+            SessionId::new("custom").expect("session id"),
+        ];
+
+        assert_eq!(next_session_sequence(sessions.iter()), 42);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
     fn session_manager_fans_out_session_events_to_subscribers() {
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -2398,8 +2837,10 @@ mod tests {
         for index in 0..=EVENT_SUBSCRIBER_BUFFER {
             let sessions = manager.sessions().expect("lock sessions");
             let session = sessions.get(&session_id).expect("managed session");
-            session
-                .actor
+            let ManagedSession::Live { actor, .. } = session else {
+                panic!("expected live session");
+            };
+            actor
                 .broadcast_event(SessionEvent::Output {
                     session_id: session_id.clone(),
                     output_seq: index as u64,
@@ -2417,8 +2858,10 @@ mod tests {
         {
             let sessions = manager.sessions().expect("lock sessions");
             let session = sessions.get(&session_id).expect("managed session");
-            session
-                .actor
+            let ManagedSession::Live { actor, .. } = session else {
+                panic!("expected live session");
+            };
+            actor
                 .broadcast_event(SessionEvent::Output {
                     session_id: session_id.clone(),
                     output_seq: 999,
@@ -2449,18 +2892,17 @@ mod tests {
         {
             let sessions = manager.sessions().expect("lock sessions");
             let session = sessions.get(&session_id).expect("managed session");
-            session
-                .actor
+            let ManagedSession::Live { actor, .. } = session else {
+                panic!("expected live session");
+            };
+            actor
                 .broadcast_event(SessionEvent::Output {
                     session_id: session_id.clone(),
                     output_seq: 1,
                     bytes: b"after-disconnect".to_vec(),
                 })
                 .expect("broadcast output after subscriber disconnect");
-            assert_eq!(
-                session.actor.subscriber_count().expect("subscriber count"),
-                0
-            );
+            assert_eq!(actor.subscriber_count().expect("subscriber count"), 0);
         }
 
         manager
@@ -2483,8 +2925,10 @@ mod tests {
         for index in 0..=EVENT_SUBSCRIBER_BUFFER {
             let sessions = manager.sessions().expect("lock sessions");
             let session = sessions.get(&session_id).expect("managed session");
-            session
-                .actor
+            let ManagedSession::Live { actor, .. } = session else {
+                panic!("expected live session");
+            };
+            actor
                 .broadcast_event(SessionEvent::Output {
                     session_id: session_id.clone(),
                     output_seq: index as u64,
@@ -2496,10 +2940,10 @@ mod tests {
         {
             let sessions = manager.sessions().expect("lock sessions");
             let session = sessions.get(&session_id).expect("managed session");
-            session
-                .actor
-                .write_input(b"exit\n".to_vec())
-                .expect("exit shell");
+            let ManagedSession::Live { actor, .. } = session else {
+                panic!("expected live session");
+            };
+            actor.write_input(b"exit\n".to_vec()).expect("exit shell");
         }
 
         wait_for_exit_event(&subscriber, &session_id);
@@ -2533,13 +2977,7 @@ mod tests {
         let writer = shared_pty_writer(writer);
         OutputState {
             log,
-            terminal: Terminal::new(
-                terminal_size(&size),
-                Arc::new(ArgusTerminalConfig),
-                "Argus",
-                env!("CARGO_PKG_VERSION"),
-                Box::new(TerminalOutputSink { writer }),
-            ),
+            terminal: terminal_with_writer(&size, writer),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
