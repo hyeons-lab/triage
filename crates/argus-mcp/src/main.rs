@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use argus_core::session::{SessionApi, SessionId, StyledRowsRequest};
 #[cfg(unix)]
 use argus_daemon::ipc::{UnixSocketClient, default_socket_path};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -136,8 +136,10 @@ impl<A: SessionApi> McpServer<A> {
     }
 
     fn handle(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        request.id.as_ref()?;
-        let id = request.id.unwrap_or(Value::Null);
+        let id = match request.id {
+            JsonRpcId::Notification => return None,
+            JsonRpcId::Request(id) => id,
+        };
         match self.handle_request(&request.method, request.params) {
             Ok(result) => Some(JsonRpcResponse::result(id, result)),
             Err(error) => Some(JsonRpcResponse::error(id, error)),
@@ -164,16 +166,15 @@ impl<A: SessionApi> McpServer<A> {
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => self
-                .call_tool(
-                    params.ok_or_else(|| {
-                        JsonRpcError::invalid_params("tools/call requires params")
-                    })?,
-                )
-                .map_err(|error| match error {
-                    ToolCallError::Protocol(error) => error,
-                    ToolCallError::Tool(error) => JsonRpcError::internal(error.to_string()),
-                }),
+            "tools/call" => {
+                let params = params
+                    .ok_or_else(|| JsonRpcError::invalid_params("tools/call requires params"))?;
+                match self.call_tool(params) {
+                    Ok(result) => Ok(result),
+                    Err(ToolCallError::Protocol(error)) => Err(error),
+                    Err(ToolCallError::Tool(error)) => Ok(tool_error(error)),
+                }
+            }
             other => Err(JsonRpcError::method_not_found(format!(
                 "unsupported MCP method {other}"
             ))),
@@ -360,6 +361,18 @@ fn tool_result(structured_content: Value) -> std::result::Result<Value, ToolCall
     }))
 }
 
+fn tool_error(error: anyhow::Error) -> Value {
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": format!("{error:#}")
+            }
+        ],
+        "isError": true
+    })
+}
+
 fn arguments_object(
     arguments: &Value,
 ) -> std::result::Result<&serde_json::Map<String, Value>, ToolCallError> {
@@ -435,10 +448,27 @@ impl From<anyhow::Error> for ToolCallError {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    id: Option<Value>,
+    #[serde(default)]
+    id: JsonRpcId,
     method: String,
     #[serde(default)]
     params: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+enum JsonRpcId {
+    #[default]
+    Notification,
+    Request(Value),
+}
+
+impl<'de> Deserialize<'de> for JsonRpcId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Value::deserialize(deserializer).map(Self::Request)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -498,13 +528,6 @@ impl JsonRpcError {
             message: message.into(),
         }
     }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            code: -32603,
-            message: message.into(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -520,6 +543,7 @@ mod tests {
     struct RecordingApi {
         sessions: Vec<SessionId>,
         snapshot: SessionSnapshot,
+        snapshot_error: Option<&'static str>,
     }
 
     impl RecordingApi {
@@ -543,7 +567,13 @@ mod tests {
                     bracketed_paste_enabled: false,
                     exited: false,
                 },
+                snapshot_error: None,
             }
+        }
+
+        fn with_snapshot_error(mut self, message: &'static str) -> Self {
+            self.snapshot_error = Some(message);
+            self
         }
     }
 
@@ -588,6 +618,9 @@ mod tests {
         }
 
         fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
+            if let Some(message) = self.snapshot_error {
+                bail!(message);
+            }
             Ok(self.snapshot.clone())
         }
 
@@ -613,7 +646,7 @@ mod tests {
 
         let response = server
             .handle(JsonRpcRequest {
-                id: Some(json!(1)),
+                id: JsonRpcId::Request(json!(1)),
                 method: "tools/list".to_string(),
                 params: None,
             })
@@ -633,7 +666,7 @@ mod tests {
 
         let response = server
             .handle(JsonRpcRequest {
-                id: Some(json!("call-1")),
+                id: JsonRpcId::Request(json!("call-1")),
                 method: "tools/call".to_string(),
                 params: Some(json!({
                     "name": "list_sessions",
@@ -660,7 +693,7 @@ mod tests {
 
         let response = server
             .handle(JsonRpcRequest {
-                id: Some(json!(2)),
+                id: JsonRpcId::Request(json!(2)),
                 method: "tools/call".to_string(),
                 params: Some(json!({
                     "name": "snapshot_session",
@@ -675,11 +708,55 @@ mod tests {
     }
 
     #[test]
+    fn tool_execution_errors_return_tool_results() {
+        let server = McpServer::new(RecordingApi::new().with_snapshot_error("session exited"));
+
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!("call-2")),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "snapshot_session",
+                    "arguments": {
+                        "session_id": "session-1"
+                    }
+                })),
+            })
+            .expect("response");
+
+        assert!(response.error.is_none());
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("session exited")
+        );
+    }
+
+    #[test]
+    fn explicit_null_ids_get_responses() {
+        let server = McpServer::new(RecordingApi::new());
+        let request = serde_json::from_value::<JsonRpcRequest>(json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "method": "ping"
+        }))
+        .expect("request");
+
+        let response = server.handle(request).expect("response");
+
+        assert_eq!(response.id, Value::Null);
+        assert_eq!(response.result.expect("result"), json!({}));
+    }
+
+    #[test]
     fn notifications_do_not_get_responses() {
         let server = McpServer::new(RecordingApi::new());
 
         let response = server.handle(JsonRpcRequest {
-            id: None,
+            id: JsonRpcId::Notification,
             method: "notifications/initialized".to_string(),
             params: None,
         });

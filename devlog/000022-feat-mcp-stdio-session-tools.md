@@ -22,15 +22,20 @@
 - Added read-only tools: `list_sessions`, `snapshot_session`, and `styled_rows`.
 - Returned both text content and `structuredContent` for tool results so clients can display or parse the same response.
 - Added unit coverage for tool listing, read-only tool calls, required argument validation, and notification suppression.
+- Preserved explicit JSON-RPC `null` request IDs while continuing to suppress notifications with omitted IDs.
+- Returned daemon/tool execution failures as MCP tool results with `isError: true` instead of JSON-RPC internal errors.
 
 ## Commits
 
-- HEAD — feat: add MCP stdio session tools
+- 07a2747 — feat: add MCP stdio session tools
+- HEAD — fix: align MCP stdio error boundaries
 
 ## Progress
 
 - 2026-05-18T20:38-0700 — Created `feat/mcp-stdio-session-tools` worktree from `origin/main`, unset upstream, and confirmed `crates/argus-mcp` is still a stub.
 - 2026-05-18T20:45-0700 — Implemented the first read-only MCP stdio surface and validated it with `cargo fmt --all -- --check`, `/home/dberrios/.cargo/bin/cargo test -p argus-mcp`, `cargo check --workspace`, `cargo clippy --all-targets --all-features -- -D warnings`, and a real stdio `initialize` smoke request through `cargo run -q -p argus-mcp`.
+- 2026-05-18T20:56-0700 — Addressed review feedback for MCP protocol boundaries: explicit `null` IDs now produce responses, omitted IDs remain notifications, and tool execution failures return displayable MCP tool errors. Validated with `cargo fmt --all` and `cargo test -p argus-mcp`.
+- 2026-05-18T21:18-0700 — Replaced the manual `Default` implementation for JSON-RPC IDs with a derived default so clippy passes with warnings denied.
 
 ## Next Steps
 
