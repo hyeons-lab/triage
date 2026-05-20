@@ -317,6 +317,12 @@ pub struct ResizeSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreSessionRequest {
+    pub session_id: SessionId,
+    pub size: SessionSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StyledRowsRequest {
     pub session_id: SessionId,
     pub start: usize,
@@ -399,6 +405,9 @@ pub trait SessionApi {
     ) -> Result<LeaseChange>;
     fn write_input(&self, request: WriteInputRequest) -> Result<()>;
     fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot>;
+    fn restore_session(&self, _request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+        anyhow::bail!("session restore is not supported by this session API")
+    }
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot>;
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse>;
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
