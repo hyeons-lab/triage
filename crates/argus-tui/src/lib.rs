@@ -625,19 +625,40 @@ fn response_matches_snapshot(snapshot_output_seq: u64, response_output_seq: u64)
     response_output_seq >= snapshot_output_seq
 }
 
-fn styled_rows_match_visible_text(styled_rows: &[StyledRow], visible_rows: &[String]) -> bool {
+pub fn styled_rows_match_visible_text(styled_rows: &[StyledRow], visible_rows: &[String]) -> bool {
     styled_rows.len() == visible_rows.len()
         && styled_rows
             .iter()
             .zip(visible_rows)
-            .all(|(styled, visible)| styled_row_text(styled).trim_end() == visible)
+            .all(|(styled, visible)| styled_row_matches_visible_text(styled, visible))
 }
 
-fn styled_row_text(row: &StyledRow) -> String {
-    row.spans
-        .iter()
-        .map(|span| span.text.as_str())
-        .collect::<String>()
+fn styled_row_matches_visible_text(row: &StyledRow, visible: &str) -> bool {
+    let mut end = row.spans.len();
+    let mut end_byte = 0;
+    for (index, span) in row.spans.iter().enumerate().rev() {
+        let trimmed = span.text.trim_end();
+        if !trimmed.is_empty() {
+            end = index + 1;
+            end_byte = trimmed.len();
+            break;
+        }
+    }
+
+    let mut visible_chars = visible.chars();
+    for (index, span) in row.spans[..end].iter().enumerate() {
+        let text = if index + 1 == end {
+            &span.text[..end_byte]
+        } else {
+            span.text.as_str()
+        };
+        for ch in text.chars() {
+            if visible_chars.next() != Some(ch) {
+                return false;
+            }
+        }
+    }
+    visible_chars.next().is_none()
 }
 
 pub fn session_size_from_terminal(rows: u16, cols: u16) -> SessionSize {
@@ -843,6 +864,38 @@ mod tests {
             .expect("check default shell bootstrap syntax");
 
         assert!(status.success());
+    }
+
+    #[test]
+    fn styled_rows_match_visible_text_accepts_trailing_styled_blanks() {
+        let rows = vec![StyledRow {
+            spans: vec![
+                StyledSpan {
+                    text: "submitted".to_string(),
+                    style: TerminalStyle::default(),
+                },
+                StyledSpan {
+                    text: "   ".to_string(),
+                    style: TerminalStyle::default(),
+                },
+            ],
+        }];
+        let visible = vec!["submitted".to_string()];
+
+        assert!(styled_rows_match_visible_text(&rows, &visible));
+    }
+
+    #[test]
+    fn styled_rows_match_visible_text_rejects_stale_span_text() {
+        let rows = vec![StyledRow {
+            spans: vec![StyledSpan {
+                text: "submitted".to_string(),
+                style: TerminalStyle::default(),
+            }],
+        }];
+        let visible = vec!["".to_string()];
+
+        assert!(!styled_rows_match_visible_text(&rows, &visible));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use argus_core::session::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthStr;
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 
@@ -1779,6 +1780,8 @@ fn styled_visible_rows_for_range(terminal: &Terminal, start: usize, end: usize) 
         .map(|line| {
             let mut spans: Vec<StyledSpan> = Vec::new();
             let mut skip_cells = 0;
+            let visible_cols = visible_line_width(&line.as_str());
+            let mut col = 0;
             for cell in line.cells_mut() {
                 if skip_cells > 0 {
                     skip_cells -= 1;
@@ -1787,20 +1790,27 @@ fn styled_visible_rows_for_range(terminal: &Terminal, start: usize, end: usize) 
                 let width = cell.width().max(1);
                 skip_cells = width.saturating_sub(1);
                 let style = terminal_style(cell.attrs(), &palette);
+                let text = if col >= visible_cols {
+                    " ".repeat(width)
+                } else {
+                    cell.str().to_string()
+                };
+                col += width;
                 if let Some(span) = spans.last_mut()
                     && span.style == style
                 {
-                    span.text.push_str(cell.str());
+                    span.text.push_str(&text);
                     continue;
                 }
-                spans.push(StyledSpan {
-                    text: cell.str().to_string(),
-                    style,
-                });
+                spans.push(StyledSpan { text, style });
             }
             StyledRow { spans }
         })
         .collect()
+}
+
+fn visible_line_width(line: &str) -> usize {
+    UnicodeWidthStr::width(line.trim_end())
 }
 
 fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
@@ -2372,6 +2382,40 @@ mod tests {
             })
         );
         let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn styled_rows_do_not_keep_submitted_text_after_line_clear() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 2,
+                cols: 20,
+                pixel_width: 200,
+                pixel_height: 40,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"\x1b[48;2;32;32;32msubmitted prompt\r\x1b[2K\x1b[K")
+            .expect("ingest cleared submitted prompt");
+        let rows = styled_visible_rows(&output.terminal);
+        let text = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(!text.contains("submitted prompt"), "{text:?}");
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn visible_line_width_uses_terminal_columns() {
+        assert_eq!(visible_line_width("e\u{301} "), 1);
+        assert_eq!(visible_line_width("表 "), 2);
     }
 
     #[test]
