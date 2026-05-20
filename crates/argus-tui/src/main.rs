@@ -7,7 +7,10 @@ use anyhow::{Context, Result, bail};
 use argus_core::session::{
     InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
 };
-use argus_tui::{CloseSessionOutcome, LocalSessionApp, SessionView, session_size_from_terminal};
+use argus_tui::{
+    CloseSessionOutcome, LocalSessionApp, SessionView, session_size_from_terminal,
+    styled_rows_match_visible_text,
+};
 use base64::Engine;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -905,7 +908,9 @@ fn styled_rows_for_visible_range(
         return None;
     }
 
-    Some(&snapshot.styled_rows[start - styled_start..end - styled_start])
+    let styled_rows = &snapshot.styled_rows[start - styled_start..end - styled_start];
+    let visible_rows = snapshot.visible_rows.get(start..end)?;
+    styled_rows_match_visible_text(styled_rows, visible_rows).then_some(styled_rows)
 }
 
 fn selected_rows_to_lines(
@@ -1968,6 +1973,34 @@ mod tests {
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_some());
         assert!(styled_rows_for_visible_range(&snapshot, 1, 3).is_some());
+    }
+
+    #[test]
+    fn stale_styled_rows_are_rejected_when_text_no_longer_matches_visible_rows() {
+        let snapshot = argus_core::session::SessionSnapshot {
+            output_seq: 0,
+            bytes_logged: 0,
+            size: SessionSize::default(),
+            visible_rows: vec!["".to_string()],
+            styled_rows_start: 0,
+            styled_rows: vec![StyledRow {
+                spans: vec![StyledSpan {
+                    text: "submitted prompt".to_string(),
+                    style: TerminalStyle::default(),
+                }],
+            }],
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            context: None,
+            bracketed_paste_enabled: false,
+            exited: false,
+        };
+
+        assert!(styled_rows_for_visible_range(&snapshot, 0, 1).is_none());
     }
 
     #[test]

@@ -117,6 +117,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "unicode-width 0.2.0",
  "wezterm-surface",
  "wezterm-term",
 ]
