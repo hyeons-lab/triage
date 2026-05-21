@@ -39,16 +39,17 @@
 - 2026-05-20T20:01-0700 — Fixed daemon-backed TUI reconnect for historical shell sessions. The TUI was attaching to persisted sessions as observers, receiving `exited` snapshots, then refusing input/lease activation. It now restores historical sessions with the current terminal size before subscribing to live events and acquiring the input lease. Validated with `cargo fmt --all -- --check`, `cargo test -p argus-tui`, and `cargo test -p argus-daemon restore`.
 - 2026-05-20T20:12-0700 — Added a `w` sidebar row for linked worktree names so the session pane can show both the repository (`r argus`) and active worktree (`w websocket-session-api`) when they differ.
 - 2026-05-20T20:26-0700 — Addressed review findings for submodule and worktree-row edge cases. `git_repository_root` now only treats `.git/worktrees/<name>` as a linked-worktree common-dir shape and otherwise falls back to `--show-toplevel`; sidebar overflow detection now checks the displayed worktree row as well as repo/cwd and branch rows.
+- 2026-05-20T20:33-0700 — Addressed live PR comments by routing generated WebSocket subscription IDs through `SubscriptionId::new` and trimming completed items from Next Steps.
 
 ## Commits
 
 - 2abff85 — feat: add websocket session api
 - 4922de6 — fix: address websocket transport review comments
 - 6351f3e — fix: show repository name in session sidebar
-- HEAD — fix: restore interactive resumed sessions
+- 0b92df6 — fix: restore interactive resumed sessions
+- HEAD — fix: address websocket PR comments
 
 ## Next Steps
 
-- Define a small request/response/event envelope for WebSocket clients.
-- Implement the transport adapter in `argus-transport-ws` against `SessionApi`.
-- Add focused tests with fake session APIs before wiring daemon runtime entrypoints.
+- Wire the WebSocket transport into the daemon runtime once the hosting/auth boundary is designed.
+- Add remote-client integration coverage after the daemon exposes the transport.

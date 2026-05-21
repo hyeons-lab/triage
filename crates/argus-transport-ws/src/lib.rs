@@ -177,7 +177,8 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
     }
 
     fn next_subscription_id(&mut self) -> SubscriptionId {
-        let subscription_id = SubscriptionId(format!("sub-{}", self.next_subscription_id));
+        let subscription_id = SubscriptionId::new(format!("sub-{}", self.next_subscription_id))
+            .expect("generated subscription id must be valid");
         self.next_subscription_id += 1;
         subscription_id
     }
