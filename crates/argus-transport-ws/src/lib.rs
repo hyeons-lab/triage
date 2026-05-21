@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const PROTOCOL_VERSION: &str = "2026-05-20";
+const MAX_EVENTS_PER_SUBSCRIPTION_DRAIN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubscriptionId(String);
@@ -47,8 +48,17 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
     }
 
     pub fn handle_text_message(&mut self, message: &str) -> String {
-        let response = match serde_json::from_str::<ClientMessage>(message) {
-            Ok(message) => self.handle_message(message),
+        let response = match serde_json::from_str::<Value>(message) {
+            Ok(value) => {
+                let id = request_id_from_value(&value);
+                match serde_json::from_value::<ClientMessage>(value) {
+                    Ok(message) => self.handle_message(message),
+                    Err(error) => ServerMessage::Error {
+                        id,
+                        error: ProtocolError::new("invalid_request", error.to_string()),
+                    },
+                }
+            }
             Err(error) => ServerMessage::Error {
                 id: None,
                 error: ProtocolError::new("invalid_json", error.to_string()),
@@ -74,7 +84,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
         let mut closed_subscriptions = Vec::new();
 
         for (subscription_id, receiver) in &self.subscriptions {
-            loop {
+            for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
                 match receiver.try_recv() {
                     Ok(envelope) => messages.push(ServerMessage::Event {
                         subscription_id: subscription_id.clone(),
@@ -171,6 +181,10 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
         self.next_subscription_id += 1;
         subscription_id
     }
+}
+
+fn request_id_from_value(value: &Value) -> Option<Value> {
+    value.get("id").filter(|id| !id.is_null()).cloned()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -426,6 +440,56 @@ mod tests {
     }
 
     #[test]
+    fn drain_events_caps_each_subscription_per_call() {
+        let api = FakeSessionApi::default();
+        let (tx, rx) = mpsc::channel();
+        api.next_subscription.lock().unwrap().replace(rx);
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        let response = connection.handle_message(ClientMessage {
+            id: None,
+            request: ClientRequest::SubscribeSessionEvents {
+                request: SubscribeSessionEventsRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    after_event_seq: None,
+                },
+            },
+        });
+        assert!(matches!(response, ServerMessage::Response { .. }));
+
+        for event_seq in 1..=MAX_EVENTS_PER_SUBSCRIPTION_DRAIN + 1 {
+            tx.send(test_output_event(event_seq as u64)).unwrap();
+        }
+        drop(tx);
+
+        let first_drain = connection.drain_events();
+        assert_eq!(first_drain.len(), MAX_EVENTS_PER_SUBSCRIPTION_DRAIN);
+        assert!(first_drain.iter().all(|message| {
+            matches!(
+                message,
+                ServerMessage::Event {
+                    subscription_id,
+                    ..
+                } if subscription_id == &SubscriptionId::new("sub-1").unwrap()
+            )
+        }));
+
+        let second_drain = connection.drain_events();
+        assert_eq!(
+            second_drain,
+            vec![
+                ServerMessage::Event {
+                    subscription_id: SubscriptionId::new("sub-1").unwrap(),
+                    envelope: test_output_event((MAX_EVENTS_PER_SUBSCRIPTION_DRAIN + 1) as u64),
+                },
+                ServerMessage::SubscriptionClosed {
+                    subscription_id: SubscriptionId::new("sub-1").unwrap(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn invalid_json_returns_protocol_error() {
         let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
 
@@ -436,6 +500,26 @@ mod tests {
             ServerMessage::Error { id: None, error } => {
                 assert_eq!(error.code, "invalid_json");
                 assert!(error.message.contains("EOF"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_request_preserves_request_id() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+
+        let response = connection.handle_text_message(r#"{"id":"req-1","type":"unknown_request"}"#);
+
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Error {
+                id: Some(id),
+                error,
+            } => {
+                assert_eq!(id, json!("req-1"));
+                assert_eq!(error.code, "invalid_request");
+                assert!(error.message.contains("unknown_request"));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -557,6 +641,17 @@ mod tests {
             context: None,
             bracketed_paste_enabled: false,
             exited: false,
+        }
+    }
+
+    fn test_output_event(event_seq: u64) -> SessionEventEnvelope {
+        SessionEventEnvelope {
+            event_seq,
+            event: SessionEvent::Output {
+                session_id: SessionId::new("session-1").unwrap(),
+                output_seq: event_seq,
+                bytes: vec![b'x'],
+            },
         }
     }
 
