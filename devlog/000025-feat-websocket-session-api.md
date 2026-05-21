@@ -23,6 +23,7 @@
 - Added per-connection subscription tracking with nonblocking event draining and closed-subscription notifications.
 - Preserved request ids on valid-JSON protocol errors and split malformed JSON from invalid request payloads.
 - Capped per-subscription event draining per call to avoid a large backlog monopolizing a transport tick.
+- Updated TUI session context labels to prefer the repository root over linked worktree names and use single-character labels.
 - Covered the protocol with focused fake-API tests for hello, listing, input writes, subscription events, invalid JSON, and attach request encoding.
 
 ## Progress
@@ -31,11 +32,13 @@
 - 2026-05-20T19:26-0700 — Renamed the transport crate and implemented the first JSON protocol handler against `SessionApi`. Validated the touched crate with `cargo test -p argus-transport-ws`.
 - 2026-05-20T19:29-0700 — Completed branch validation with `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and `cargo test --workspace`.
 - 2026-05-20T19:39-0700 — Addressed PR review comments for invalid request classification, request-id preservation, and bounded subscription draining. Revalidated with `cargo fmt --all -- --check` and `cargo test -p argus-transport-ws`.
+- 2026-05-20T19:46-0700 — Adjusted TUI sidebar repository/branch context display so linked worktrees show the real repository name, shortened labels to one character, and covered repository/worktree split detection.
 
 ## Commits
 
 - 2abff85 — feat: add websocket session api
-- HEAD — fix: address websocket transport review comments
+- 4922de6 — fix: address websocket transport review comments
+- HEAD — fix: show repository name in session sidebar
 
 ## Next Steps
 

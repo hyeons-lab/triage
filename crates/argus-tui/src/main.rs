@@ -469,16 +469,16 @@ fn session_context_rows(
     let location = context
         .and_then(|context| {
             context
-                .worktree_root
+                .repository_root
                 .as_ref()
-                .or(context.repository_root.as_ref())
-                .map(|root| ("repo", root))
+                .or(context.worktree_root.as_ref())
+                .map(|root| ("r", root))
         })
         .or_else(|| {
             view.snapshot
                 .current_working_directory
                 .as_ref()
-                .map(|cwd| ("cwd", cwd))
+                .map(|cwd| ("c", cwd))
         });
 
     let mut rows = Vec::with_capacity(2);
@@ -502,14 +502,14 @@ fn session_context_rows(
     }
 
     if let Some(branch) = context.and_then(|context| context.branch.as_ref()) {
-        let branch_width = width.saturating_sub(9);
+        let branch_width = width.saturating_sub(4);
         let branch_name = if selected {
             scrolling_value(branch, branch_width, scroll_offset)
         } else {
             compact_value(branch.rsplit('/').next().unwrap_or(branch), branch_width)
         };
         rows.push(Line::from(truncate_to_width(
-            format!("  branch {branch_name}"),
+            format!("  b {branch_name}"),
             width,
         )));
     } else {
@@ -607,16 +607,16 @@ fn selected_sidebar_context_overflows(app: &LocalSessionApp, width: usize) -> bo
     let location_overflows = context
         .and_then(|context| {
             context
-                .worktree_root
+                .repository_root
                 .as_ref()
-                .or(context.repository_root.as_ref())
-                .map(|root| (7, root))
+                .or(context.worktree_root.as_ref())
+                .map(|root| (4, root))
         })
         .or_else(|| {
             view.snapshot
                 .current_working_directory
                 .as_ref()
-                .map(|cwd| (6, cwd))
+                .map(|cwd| (4, cwd))
         })
         .and_then(|(prefix_width, path)| path.file_name().map(|name| (prefix_width, name)))
         .map(|(prefix_width, name)| {
@@ -626,7 +626,7 @@ fn selected_sidebar_context_overflows(app: &LocalSessionApp, width: usize) -> bo
         .unwrap_or(false);
     let branch_overflows = context
         .and_then(|context| context.branch.as_ref())
-        .map(|branch| UnicodeWidthStr::width(branch.as_str()) > width.saturating_sub(9))
+        .map(|branch| UnicodeWidthStr::width(branch.as_str()) > width.saturating_sub(4))
         .unwrap_or(false);
     location_overflows || branch_overflows
 }
@@ -1565,7 +1565,9 @@ mod tests {
                 current_working_directory: Some(PathBuf::from("/workspace/argus/crates")),
                 context: Some(argus_core::session::SessionContext {
                     repository_root: Some(PathBuf::from("/workspace/argus")),
-                    worktree_root: Some(PathBuf::from("/workspace/argus")),
+                    worktree_root: Some(PathBuf::from(
+                        "/workspace/argus/worktrees/websocket-session-api",
+                    )),
                     branch: Some("feat/session-context".to_string()),
                 }),
                 bracketed_paste_enabled: false,
@@ -1579,11 +1581,8 @@ mod tests {
         let rows =
             session_sidebar_rows(0, 1, &view, usize::from(SIDEBAR_COLS.saturating_sub(1)), 0);
 
-        assert_eq!(rows[2].spans[0].content.as_ref(), "  repo argus");
-        assert_eq!(
-            rows[3].spans[0].content.as_ref(),
-            "  branch session-context"
-        );
+        assert_eq!(rows[2].spans[0].content.as_ref(), "  r argus");
+        assert_eq!(rows[3].spans[0].content.as_ref(), "  b session-context");
     }
 
     #[test]
@@ -1620,7 +1619,7 @@ mod tests {
         let later = session_sidebar_rows(0, 0, &view, 20, 5);
 
         assert_ne!(first[3].spans[0].content, later[3].spans[0].content);
-        assert!(first[3].spans[0].content.starts_with("  branch "));
+        assert!(first[3].spans[0].content.starts_with("  b "));
         assert_eq!(first[3].width(), 20);
         assert_eq!(later[3].width(), 20);
     }
