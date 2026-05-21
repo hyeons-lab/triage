@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{
     self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
 };
@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    InputLeaseState, LeaseChange, ResizeSessionRequest, SessionApi, SessionContext, SessionEvent,
-    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSize, SessionSnapshot,
-    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
-    SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
+    InputLeaseState, LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi,
+    SessionContext, SessionEvent, SessionEventEnvelope, SessionEventReceiver, SessionId,
+    SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
+    StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
+    TerminalStyle, WriteInputRequest,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,10 @@ enum ManagedSession {
         launch: PersistedSessionLaunch,
     },
     Historical {
+        session: Box<HistoricalSession>,
+        lease: InputLeaseState,
+    },
+    Restoring {
         session: Box<HistoricalSession>,
         lease: InputLeaseState,
     },
@@ -230,6 +235,19 @@ impl SessionManager {
         replace_manifest(&temp_path, &manifest_path)?;
         Ok(())
     }
+
+    fn rollback_restoring_session(&self, session_id: SessionId) -> Result<()> {
+        let mut sessions = self.sessions()?;
+        let session = sessions
+            .remove(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        let ManagedSession::Restoring { session, lease } = session else {
+            sessions.insert(session_id.clone(), session);
+            bail!("session {session_id} is not being restored");
+        };
+        sessions.insert(session_id, ManagedSession::Historical { session, lease });
+        Ok(())
+    }
 }
 
 impl ManagedSession {
@@ -237,6 +255,7 @@ impl ManagedSession {
         match self {
             Self::Live { launch, .. } => launch.clone().into_persisted(session_id, false),
             Self::Historical { session, .. } => session.persisted.clone(),
+            Self::Restoring { session, .. } => session.persisted.clone(),
         }
     }
 }
@@ -321,6 +340,9 @@ impl SessionApi for SessionManager {
                 snapshot: session.snapshot(),
                 lease: lease.clone(),
             }),
+            ManagedSession::Restoring { .. } => {
+                bail!("session {} is being restored", request.session_id)
+            }
         }
     }
 
@@ -342,6 +364,9 @@ impl SessionApi for SessionManager {
         match session {
             ManagedSession::Live { actor, .. } => actor.subscribe_events(request.after_event_seq),
             ManagedSession::Historical { .. } => Ok(closed_session_event_receiver()),
+            ManagedSession::Restoring { .. } => {
+                bail!("session {} is being restored", request.session_id)
+            }
         }
     }
 
@@ -361,6 +386,9 @@ impl SessionApi for SessionManager {
             }
             ManagedSession::Historical { .. } => {
                 bail!("restored historical sessions cannot acquire input leases")
+            }
+            ManagedSession::Restoring { .. } => {
+                bail!("session {} is being restored", request.session_id)
             }
         }
     }
@@ -388,6 +416,9 @@ impl SessionApi for SessionManager {
             ManagedSession::Historical { .. } => {
                 bail!("restored historical sessions cannot hold input leases")
             }
+            ManagedSession::Restoring { .. } => {
+                bail!("session {session_id} is being restored")
+            }
         }
     }
 
@@ -397,7 +428,15 @@ impl SessionApi for SessionManager {
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
         let ManagedSession::Live { actor, lease, .. } = session else {
-            bail!("restored historical sessions cannot accept input");
+            match session {
+                ManagedSession::Historical { .. } => {
+                    bail!("restored historical sessions cannot accept input")
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
+                ManagedSession::Live { .. } => unreachable!(),
+            }
         };
         let holder = lease
             .holder
@@ -422,7 +461,107 @@ impl SessionApi for SessionManager {
             ManagedSession::Historical { .. } => {
                 bail!("restored historical sessions cannot be resized")
             }
+            ManagedSession::Restoring { .. } => {
+                bail!("session {} is being restored", request.session_id)
+            }
         }
+    }
+
+    fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+        request.size.validate()?;
+        let (persisted, current_working_directory) = {
+            let mut sessions = self.sessions()?;
+            let existing = sessions
+                .remove(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            let ManagedSession::Historical { session, lease } = existing else {
+                sessions.insert(request.session_id.clone(), existing);
+                bail!(
+                    "session {} is already live or restoring",
+                    request.session_id
+                );
+            };
+            if !is_restorable_shell_launch(&session.persisted) {
+                sessions.insert(
+                    request.session_id.clone(),
+                    ManagedSession::Historical { session, lease },
+                );
+                bail!(
+                    "session {} was not launched as a restorable shell",
+                    request.session_id
+                );
+            }
+            let persisted = session.persisted.clone();
+            let current_working_directory = session.current_working_directory.clone();
+            sessions.insert(
+                request.session_id.clone(),
+                ManagedSession::Restoring { session, lease },
+            );
+            (persisted, current_working_directory)
+        };
+
+        let cwd = restorable_cwd(current_working_directory, persisted.cwd.clone());
+        let config = SessionConfig {
+            command: persisted.command.clone(),
+            args: persisted.args.clone(),
+            cwd,
+            size: request.size,
+            log_path: persisted.log_path.clone(),
+        };
+        let launch = PersistedSessionLaunch::from(&config);
+        let actor = match SessionActor::spawn_restored(config, request.session_id.clone()) {
+            Ok(actor) => actor,
+            Err(error) => {
+                self.rollback_restoring_session(request.session_id)?;
+                return Err(error);
+            }
+        };
+        let snapshot = match actor.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.rollback_restoring_session(request.session_id.clone())?;
+                actor.shutdown()?;
+                return Err(error);
+            }
+        };
+
+        let mut sessions = self.sessions()?;
+        let existing = sessions
+            .remove(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        let ManagedSession::Restoring { session, lease } = existing else {
+            sessions.insert(request.session_id.clone(), existing);
+            drop(sessions);
+            actor.shutdown()?;
+            bail!("session {} is no longer being restored", request.session_id);
+        };
+        sessions.insert(
+            request.session_id.clone(),
+            ManagedSession::Live {
+                actor,
+                lease: InputLeaseState::default(),
+                launch,
+            },
+        );
+        if let Err(error) = self.persist_manifest(&sessions) {
+            let inserted = sessions.remove(&request.session_id);
+            sessions.insert(
+                request.session_id,
+                ManagedSession::Historical { session, lease },
+            );
+            drop(sessions);
+            if let Some(ManagedSession::Live { actor, .. }) = inserted
+                && let Err(shutdown_error) = actor.shutdown()
+            {
+                tracing::warn!(
+                    error = ?shutdown_error,
+                    "failed to shut down restored session after manifest persistence failure"
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(snapshot)
     }
 
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -433,6 +572,7 @@ impl SessionApi for SessionManager {
         match session {
             ManagedSession::Live { actor, .. } => actor.snapshot(),
             ManagedSession::Historical { session, .. } => Ok(session.snapshot()),
+            ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
         }
     }
 
@@ -445,6 +585,9 @@ impl SessionApi for SessionManager {
             ManagedSession::Live { actor, .. } => actor.styled_rows(request.start, request.end),
             ManagedSession::Historical { session, .. } => {
                 session.styled_rows(request.start, request.end)
+            }
+            ManagedSession::Restoring { .. } => {
+                bail!("session {} is being restored", request.session_id)
             }
         }
     }
@@ -464,13 +607,14 @@ impl SessionApi for SessionManager {
         match session {
             ManagedSession::Live { actor, .. } => actor.shutdown(),
             ManagedSession::Historical { session, .. } => Ok(session.completed_session()),
+            ManagedSession::Restoring { session, .. } => Ok(session.completed_session()),
         }
     }
 }
 
 impl PtySession {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        let runtime = spawn_pty_runtime(config)?;
+        let runtime = spawn_pty_runtime(config, LogInitialization::Truncate)?;
 
         Ok(Self {
             _master: runtime.master,
@@ -577,6 +721,43 @@ fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u
         })
         .max()
         .map_or(1, |sequence| sequence.saturating_add(1))
+}
+
+fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
+    let Some(command_name) = Path::new(&persisted.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let command_name = command_name.to_ascii_lowercase();
+    if !matches!(
+        command_name.as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "cmd.exe" | "powershell.exe" | "pwsh"
+    ) {
+        return false;
+    }
+
+    persisted.args.is_empty()
+        || matches!(persisted.args.as_slice(), [flag] if flag == "-l")
+        || is_argus_default_shell_wrapper(&persisted.args)
+}
+
+fn is_argus_default_shell_wrapper(args: &[String]) -> bool {
+    matches!(args, [flag, script]
+        if matches!(flag.as_str(), "-lc" | "-c")
+            && script.contains("PROMPT_COMMAND")
+            && script.contains("exec \"${SHELL:-/bin/sh}\""))
+}
+
+fn restorable_cwd(
+    current_working_directory: Option<PathBuf>,
+    launch_cwd: Option<PathBuf>,
+) -> Option<PathBuf> {
+    [current_working_directory, launch_cwd]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_dir())
 }
 
 fn replace_manifest(temp_path: &Path, manifest_path: &Path) -> Result<()> {
@@ -720,20 +901,24 @@ impl HistoricalSession {
 
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        Self::spawn_with_events(config, None)
+        Self::spawn_with_events(config, None, LogInitialization::Truncate)
     }
 
     fn spawn_managed(config: SessionConfig, session_id: SessionId) -> Result<Self> {
-        Self::spawn_with_events(config, Some(session_id))
+        Self::spawn_with_events(config, Some(session_id), LogInitialization::Truncate)
+    }
+
+    fn spawn_restored(config: SessionConfig, session_id: SessionId) -> Result<Self> {
+        Self::spawn_with_events(config, Some(session_id), LogInitialization::ReplayExisting)
     }
 
     fn spawn_with_events(
         config: SessionConfig,
         event_session_id: Option<SessionId>,
+        log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
-        let initial_context = resolve_session_context(initial_working_directory.as_ref());
-        let runtime = spawn_pty_runtime(config)?;
+        let runtime = spawn_pty_runtime(config, log_initialization)?;
         let PtyRuntime {
             master,
             child,
@@ -741,7 +926,10 @@ impl SessionActor {
             writer,
             output,
             size,
+            current_working_directory,
         } = runtime;
+        let initial_working_directory = current_working_directory.or(initial_working_directory);
+        let initial_context = resolve_session_context(initial_working_directory.as_ref());
 
         let (command_tx, command_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::sync_channel(64);
@@ -917,6 +1105,7 @@ struct PtyRuntime {
     writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
+    current_working_directory: Option<PathBuf>,
 }
 
 struct OutputState {
@@ -1443,7 +1632,16 @@ impl OutputState {
     }
 }
 
-fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogInitialization {
+    Truncate,
+    ReplayExisting,
+}
+
+fn spawn_pty_runtime(
+    config: SessionConfig,
+    log_initialization: LogInitialization,
+) -> Result<PtyRuntime> {
     config.validate()?;
 
     let pty_system = native_pty_system();
@@ -1469,29 +1667,72 @@ fn spawn_pty_runtime(config: SessionConfig) -> Result<PtyRuntime> {
         .master
         .try_clone_reader()
         .context("cloning PTY reader")?;
-    let writer = shared_pty_writer(pair.master.take_writer().context("taking PTY writer")?);
-    let log = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&config.log_path)
-        .with_context(|| format!("opening session log {}", config.log_path.display()))?;
-    let terminal = terminal_with_writer(&config.size, writer.clone());
-
-    Ok(PtyRuntime {
-        master: pair.master,
-        child,
-        reader,
-        writer,
-        output: OutputState {
-            log,
-            terminal,
-            cwd_sequence_buffer: Vec::new(),
-            bytes_logged: 0,
-            output_seq: 0,
-        },
-        size: config.size,
-    })
+    match log_initialization {
+        LogInitialization::Truncate => {
+            let writer = shared_pty_writer(pair.master.take_writer().context("taking PTY writer")?);
+            let terminal = terminal_with_writer(&config.size, writer.clone());
+            let log = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&config.log_path)
+                .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+            Ok(PtyRuntime {
+                master: pair.master,
+                child,
+                reader,
+                writer,
+                output: OutputState {
+                    log,
+                    terminal,
+                    cwd_sequence_buffer: Vec::new(),
+                    bytes_logged: 0,
+                    output_seq: 0,
+                },
+                size: config.size,
+                current_working_directory: None,
+            })
+        }
+        LogInitialization::ReplayExisting => {
+            let (writer, replay_gate) = replay_gated_pty_writer();
+            let terminal = terminal_with_writer(&config.size, writer.clone());
+            let log = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&config.log_path)
+                .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+            let mut output = OutputState {
+                log: log.try_clone().context("cloning restored session log")?,
+                terminal,
+                cwd_sequence_buffer: Vec::new(),
+                bytes_logged: 0,
+                output_seq: 0,
+            };
+            let replay = fs::read(&config.log_path)
+                .with_context(|| format!("reading session log {}", config.log_path.display()))?;
+            let replayed_working_directory = if replay.is_empty() {
+                None
+            } else {
+                output.replay(&replay)?
+            };
+            let current_working_directory =
+                restorable_cwd(replayed_working_directory, config.cwd.clone());
+            let replay_flushes = replay_gate.dropped_flush_count();
+            output.terminal.advance_bytes(b"\x1b[c");
+            replay_gate.wait_for_dropped_flush_after(replay_flushes)?;
+            replay_gate.enable(pair.master.take_writer().context("taking PTY writer")?)?;
+            Ok(PtyRuntime {
+                master: pair.master,
+                child,
+                reader,
+                writer,
+                output,
+                size: config.size,
+                current_working_directory,
+            })
+        }
+    }
 }
 
 fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputState> {
@@ -1658,6 +1899,88 @@ fn join_thread_with_timeout(handle: JoinHandle<()>, name: &'static str) {
 
 fn shared_pty_writer(writer: Box<dyn Write + Send>) -> SharedPtyWriter {
     Arc::new(Mutex::new(writer))
+}
+
+fn replay_gated_pty_writer() -> (SharedPtyWriter, Arc<ReplayGateState>) {
+    let state = Arc::new(ReplayGateState {
+        live_writer: Mutex::new(None),
+        pass_through: AtomicBool::new(false),
+        dropped_flushes: AtomicU64::new(0),
+    });
+    let writer = shared_pty_writer(Box::new(ReplayGateWriter {
+        state: state.clone(),
+    }));
+    (writer, state)
+}
+
+struct ReplayGateState {
+    live_writer: Mutex<Option<Box<dyn Write + Send>>>,
+    pass_through: AtomicBool,
+    dropped_flushes: AtomicU64,
+}
+
+impl ReplayGateState {
+    fn dropped_flush_count(&self) -> u64 {
+        self.dropped_flushes.load(Ordering::SeqCst)
+    }
+
+    fn wait_for_dropped_flush_after(&self, previous_count: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.dropped_flush_count() <= previous_count {
+            ensure!(
+                Instant::now() < deadline,
+                "timed out draining restored terminal replay replies"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn enable(&self, writer: Box<dyn Write + Send>) -> Result<()> {
+        *self
+            .live_writer
+            .lock()
+            .map_err(|_| anyhow!("PTY writer lock poisoned"))? = Some(writer);
+        self.pass_through.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct ReplayGateWriter {
+    state: Arc<ReplayGateState>,
+}
+
+impl Write for ReplayGateWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.state.pass_through.load(Ordering::SeqCst) {
+            return Ok(buf.len());
+        }
+        let mut live_writer = self
+            .state
+            .live_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?;
+        let live_writer = live_writer
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("PTY writer is not installed"))?;
+        live_writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.state.pass_through.load(Ordering::SeqCst) {
+            self.state.dropped_flushes.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
+        let mut live_writer = self
+            .state
+            .live_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?;
+        let live_writer = live_writer
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("PTY writer is not installed"))?;
+        live_writer.flush()
+    }
 }
 
 fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
@@ -2971,6 +3294,295 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn session_manager_restores_historical_shell_as_live_session() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"history-before-restore\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+                log_path: log_path.clone(),
+                exited: false,
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+            })
+            .expect("restore shell session");
+
+        assert!(!snapshot.exited);
+        assert!(
+            snapshot
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("history-before-restore")),
+            "restored live snapshot lost historical rows: {:?}",
+            snapshot.visible_rows
+        );
+        let client_id = ClientId::new("restore-client").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: argus_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach restored session");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: input_that_prints_marker(),
+            })
+            .expect("write restored session input");
+        wait_for_manager_marker(&manager, session_id.clone(), "actor-ready");
+
+        let logged = std::fs::read_to_string(&log_path).expect("read restored log");
+        assert!(logged.contains("history-before-restore"));
+        assert!(logged.contains("actor-ready"));
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn session_manager_restores_shell_in_last_known_cwd() {
+        let log_dir = unique_log_dir();
+        let cwd = log_dir.join("last-cwd");
+        std::fs::create_dir_all(&cwd).expect("create restored cwd");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(
+            &log_path,
+            format!("\x1b]7;file://localhost{}\x1b\\", cwd.display()),
+        )
+        .expect("write OSC 7 session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: Some(log_dir.clone()),
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client_id = ClientId::new("restore-client").expect("client id");
+
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore shell session");
+
+        assert_eq!(snapshot.current_working_directory, Some(cwd.clone()));
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: argus_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach restored session");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: b"pwd\n".to_vec(),
+            })
+            .expect("write pwd");
+        wait_for_manager_marker(&manager, session_id.clone(), &cwd.display().to_string());
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn session_manager_falls_back_when_last_known_cwd_is_unusable() {
+        let log_dir = unique_log_dir();
+        let launch_cwd = log_dir.join("launch-cwd");
+        let stale_cwd = log_dir.join("deleted-cwd");
+        std::fs::create_dir_all(&launch_cwd).expect("create launch cwd");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(
+            &log_path,
+            format!("\x1b]7;file://localhost{}\x1b\\", stale_cwd.display()),
+        )
+        .expect("write stale OSC 7 session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: Some(launch_cwd.clone()),
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client_id = ClientId::new("restore-client").expect("client id");
+
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore shell session");
+
+        assert_eq!(snapshot.current_working_directory, Some(launch_cwd.clone()));
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: argus_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach restored session");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: b"pwd\n".to_vec(),
+            })
+            .expect("write pwd");
+        wait_for_manager_marker(
+            &manager,
+            session_id.clone(),
+            &launch_cwd.display().to_string(),
+        );
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_manager_rejects_restore_already_in_progress() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"history-before-restore\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        {
+            let mut sessions = manager.sessions().expect("lock sessions");
+            let existing = sessions.remove(&session_id).expect("historical session");
+            let ManagedSession::Historical { session, lease } = existing else {
+                panic!("expected historical session");
+            };
+            sessions.insert(
+                session_id.clone(),
+                ManagedSession::Restoring { session, lease },
+            );
+        }
+
+        let error = manager
+            .restore_session(RestoreSessionRequest {
+                session_id,
+                size: SessionSize::default(),
+            })
+            .expect_err("restore in progress should fail");
+
+        assert!(
+            error.to_string().contains("already live or restoring"),
+            "unexpected restore error: {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_manager_rejects_non_shell_historical_restore() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"not-a-shell\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: "python".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let error = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect_err("non-shell restore should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not launched as a restorable shell"),
+            "unexpected restore error: {error:?}"
+        );
+        assert!(
+            manager
+                .snapshot_session(session_id)
+                .expect("historical session remains available")
+                .exited
+        );
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
     fn next_session_sequence_advances_past_restored_ids() {
         let sessions = [
             SessionId::new("session-7").expect("session id"),
@@ -3201,6 +3813,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
+    #[test]
+    fn replay_with_delayed_writer_suppresses_historical_terminal_replies() {
+        let log_path = unique_log_path();
+        let log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .expect("open test log");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let (writer, replay_gate) = replay_gated_pty_writer();
+        let mut output = OutputState {
+            log,
+            terminal: terminal_with_writer(&SessionSize::default(), writer.clone()),
+            cwd_sequence_buffer: Vec::new(),
+            bytes_logged: 0,
+            output_seq: 0,
+        };
+
+        output
+            .replay(b"\x1b[c")
+            .expect("replay historical device attributes query");
+        assert!(
+            captured.lock().expect("captured writer lock").is_empty(),
+            "historical replay should not write terminal replies to the live PTY"
+        );
+
+        let replay_flushes = replay_gate.dropped_flush_count();
+        output.terminal.advance_bytes(b"\x1b[c");
+        replay_gate
+            .wait_for_dropped_flush_after(replay_flushes)
+            .expect("drain replay writer");
+        replay_gate
+            .enable(Box::new(RecordingWriter {
+                bytes: captured.clone(),
+            }))
+            .expect("install live writer");
+        assert!(
+            captured.lock().expect("captured writer lock").is_empty(),
+            "queued historical terminal replies should drain before the live writer is installed"
+        );
+
+        output
+            .ingest(b"\x1b[c")
+            .expect("ingest live device attributes query");
+        wait_for_recorded_bytes(&captured);
+        assert!(
+            !captured.lock().expect("captured writer lock").is_empty(),
+            "live terminal queries should still receive terminal replies after restore"
+        );
+        let _ = std::fs::remove_file(&log_path);
+    }
+
     fn unique_log_path() -> PathBuf {
         let unique = format!(
             "argus-pty-session-{}-{:?}.log",
@@ -3254,6 +3919,19 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn write_manifest(log_dir: &PathBuf, persisted: PersistedSession) {
+        std::fs::create_dir_all(log_dir).expect("create log dir");
+        let manifest = SessionManifest {
+            version: 1,
+            sessions: vec![persisted],
+        };
+        std::fs::write(
+            SessionManagerConfig::new(log_dir.clone()).manifest_path(),
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+    }
+
     struct RecordingWriter {
         bytes: Arc<Mutex<Vec<u8>>>,
     }
@@ -3269,6 +3947,21 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    fn wait_for_recorded_bytes(bytes: &Arc<Mutex<Vec<u8>>>) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            if !bytes.lock().expect("recorded bytes lock").is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for recorded terminal reply"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -3363,7 +4056,9 @@ mod tests {
             let snapshot = manager
                 .snapshot_session(session_id.clone())
                 .expect("snapshot managed session");
-            if snapshot.visible_rows.iter().any(|row| row.contains(marker)) {
+            if snapshot.visible_rows.iter().any(|row| row.contains(marker))
+                || snapshot.visible_rows.join("").contains(marker)
+            {
                 return snapshot;
             }
 

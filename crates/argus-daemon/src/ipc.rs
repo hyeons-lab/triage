@@ -11,9 +11,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    LeaseChange, ResizeSessionRequest, SessionApi, SessionEventEnvelope, SessionEventReceiver,
-    SessionId, SessionSnapshot, StartSessionRequest, StyledRowsRequest, StyledRowsResponse,
-    SubscribeSessionEventsRequest, WriteInputRequest,
+    LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEventEnvelope,
+    SessionEventReceiver, SessionId, SessionSnapshot, StartSessionRequest, StyledRowsRequest,
+    StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -225,6 +225,13 @@ impl SessionApi for UnixSocketClient {
         }
     }
 
+    fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+        match self.round_trip(WireRequest::RestoreSession(request))? {
+            WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
+            other => bail!("unexpected restore_session response: {other:?}"),
+        }
+    }
+
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
         match self.round_trip(WireRequest::SnapshotSession { session_id })? {
             WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
@@ -263,6 +270,7 @@ enum WireRequest {
     },
     WriteInput(WriteInputRequest),
     ResizeSession(ResizeSessionRequest),
+    RestoreSession(RestoreSessionRequest),
     SnapshotSession {
         session_id: SessionId,
     },
@@ -475,6 +483,9 @@ fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<Wire
         WireRequest::ResizeSession(request) => manager
             .resize_session(request)
             .map(WireSuccess::SessionSnapshot),
+        WireRequest::RestoreSession(request) => manager
+            .restore_session(request)
+            .map(WireSuccess::SessionSnapshot),
         WireRequest::SnapshotSession { session_id } => manager
             .snapshot_session(session_id)
             .map(WireSuccess::SessionSnapshot),
@@ -519,7 +530,7 @@ fn is_closed_socket_error(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::session::SessionManagerConfig;
-    use argus_core::session::{AttachMode, SessionEvent, SessionSize};
+    use argus_core::session::{AttachMode, RestoreSessionRequest, SessionEvent, SessionSize};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -640,6 +651,80 @@ mod tests {
         let _ = fs::remove_dir_all(log_dir);
     }
 
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY behavior needs a dedicated Windows lifecycle test"
+    )]
+    fn client_restores_historical_shell_over_unix_socket() {
+        let socket_path = unique_socket_path("restore-shell");
+        let log_dir = unique_dir("restore-shell-logs");
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        fs::write(&log_path, b"socket-history\r\n").expect("write session log");
+        let manifest = serde_json::json!({
+            "version": 1,
+            "sessions": [{
+                "id": session_id,
+                "command": long_running_shell_command(),
+                "args": [],
+                "cwd": null,
+                "size": {
+                    "rows": 6,
+                    "cols": 40,
+                    "pixel_width": 800,
+                    "pixel_height": 240,
+                    "dpi": 96
+                },
+                "log_path": log_path,
+                "exited": false
+            }]
+        });
+        fs::write(
+            log_dir.join("sessions.json"),
+            serde_json::to_vec(&manifest).expect("encode manifest"),
+        )
+        .expect("write manifest");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let server = UnixSocketServer::new(
+            Arc::clone(&manager),
+            UnixSocketConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+        let client = UnixSocketClient::new(socket_path.clone());
+
+        let snapshot = client
+            .restore_session(RestoreSessionRequest {
+                session_id: SessionId::new("session-7").expect("session id"),
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+            })
+            .expect("restore session over socket");
+
+        assert!(!snapshot.exited);
+        assert!(
+            snapshot
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("socket-history")),
+            "restored socket snapshot lost historical rows: {:?}",
+            snapshot.visible_rows
+        );
+        manager
+            .shutdown_session(SessionId::new("session-7").expect("session id"))
+            .expect("shutdown restored socket session");
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_dir_all(log_dir);
+    }
+
     fn spawn_server(server: UnixSocketServer) {
         let socket_path = server.config.socket_path.clone();
         let (tx, rx) = mpsc::channel();
@@ -674,6 +759,16 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[cfg(windows)]
+    fn long_running_shell_command() -> &'static str {
+        "cmd.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn long_running_shell_command() -> &'static str {
+        "/bin/sh"
     }
 
     fn wait_for_output_event(events: &SessionEventReceiver) {
