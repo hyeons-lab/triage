@@ -2007,7 +2007,17 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
     if common_dir.file_name() == Some(OsStr::new(".git")) {
         return common_dir.parent().map(Path::to_path_buf);
     }
-    Some(common_dir)
+    let mut ancestors = common_dir.ancestors();
+    let _worktree_name = ancestors.next()?;
+    let worktrees_dir = ancestors.next()?;
+    if worktrees_dir.file_name() != Some(OsStr::new("worktrees")) {
+        return None;
+    }
+    let git_dir = ancestors.next()?;
+    if git_dir.file_name() != Some(OsStr::new(".git")) {
+        return None;
+    }
+    git_dir.parent().map(Path::to_path_buf)
 }
 
 fn git_raw_output(cwd: &PathBuf, args: &[&str]) -> Option<Vec<u8>> {
@@ -2630,6 +2640,61 @@ mod tests {
         assert_eq!(context.branch.as_deref(), Some("feature/context-worktree"));
         let _ = std::fs::remove_dir_all(worktree);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn session_context_reports_submodule_checkout_as_repository_root() {
+        let super_repo = unique_log_dir();
+        let submodule_repo = super_repo.with_extension("submodule-src");
+        let _ = std::fs::remove_dir_all(&super_repo);
+        let _ = std::fs::remove_dir_all(&submodule_repo);
+        std::fs::create_dir_all(&super_repo).expect("create super repo dir");
+        std::fs::create_dir_all(&submodule_repo).expect("create submodule repo dir");
+
+        git_test_command(&submodule_repo, &["init"]);
+        git_test_command(
+            &submodule_repo,
+            &["config", "user.email", "argus@example.invalid"],
+        );
+        git_test_command(&submodule_repo, &["config", "user.name", "Argus Test"]);
+        std::fs::write(submodule_repo.join("README.md"), "submodule\n")
+            .expect("write submodule file");
+        git_test_command(&submodule_repo, &["add", "README.md"]);
+        git_test_command(&submodule_repo, &["commit", "-m", "initial"]);
+
+        git_test_command(&super_repo, &["init"]);
+        git_test_command(
+            &super_repo,
+            &["config", "user.email", "argus@example.invalid"],
+        );
+        git_test_command(&super_repo, &["config", "user.name", "Argus Test"]);
+        git_test_command(
+            &super_repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule_repo.to_str().expect("utf-8 submodule repo path"),
+                "vendor/submodule",
+            ],
+        );
+        git_test_command(&super_repo, &["commit", "-m", "add submodule"]);
+        std::fs::create_dir_all(super_repo.join("vendor/submodule/nested"))
+            .expect("create nested submodule dir");
+
+        let submodule_checkout = super_repo.join("vendor/submodule");
+        let context = resolve_session_context(Some(&submodule_checkout.join("nested")))
+            .expect("git session context");
+
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path).expect("canonicalize path for comparison")
+        };
+        let expected = Some(canonical(&submodule_checkout));
+        assert_eq!(context.repository_root.as_deref().map(canonical), expected);
+        assert_eq!(context.worktree_root.as_deref().map(canonical), expected);
+        let _ = std::fs::remove_dir_all(super_repo);
+        let _ = std::fs::remove_dir_all(submodule_repo);
     }
 
     #[test]

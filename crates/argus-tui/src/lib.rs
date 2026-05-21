@@ -5,8 +5,9 @@ use std::sync::mpsc::TryRecvError;
 use anyhow::Result;
 use argus_core::session::{
     AttachMode, AttachSessionRequest, ClientId, CompletedSession, InputLeaseState,
-    ResizeSessionRequest, SessionApi, SessionEvent, SessionEventReceiver, SessionId, SessionSize,
-    SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest, WriteInputRequest,
+    ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEvent, SessionEventReceiver,
+    SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
+    WriteInputRequest,
 };
 #[cfg(unix)]
 use argus_daemon::ipc::UnixSocketClient;
@@ -70,7 +71,7 @@ impl LocalSessionApp {
         let mut sessions = if owns_sessions {
             Vec::new()
         } else {
-            attach_existing_sessions(manager.as_ref(), &client_id)?
+            attach_existing_sessions(manager.as_ref(), &client_id, size.clone())?
         };
 
         if sessions.is_empty() {
@@ -456,11 +457,12 @@ impl LocalSessionApp {
 fn attach_existing_sessions(
     manager: &dyn SessionApi,
     client_id: &ClientId,
+    size: SessionSize,
 ) -> Result<Vec<SessionRuntime>> {
     let mut sessions = Vec::new();
 
     for session_id in manager.list_sessions()? {
-        let session = attach_existing_session(manager, client_id, session_id)?;
+        let session = attach_existing_session(manager, client_id, session_id, size.clone())?;
         sessions.push(session);
     }
 
@@ -471,6 +473,7 @@ fn attach_existing_session(
     manager: &dyn SessionApi,
     client_id: &ClientId,
     session_id: SessionId,
+    size: SessionSize,
 ) -> Result<SessionRuntime> {
     let events = manager.subscribe_session_events(session_id.clone())?;
     let attached = manager.attach_session(AttachSessionRequest {
@@ -478,6 +481,26 @@ fn attach_existing_session(
         client_id: client_id.clone(),
         mode: AttachMode::Observer,
     })?;
+
+    if attached.snapshot.exited
+        && let Ok(snapshot) = manager.restore_session(RestoreSessionRequest {
+            session_id: session_id.clone(),
+            size,
+        })
+    {
+        drop(events);
+        let events = manager.subscribe_session_events(session_id.clone())?;
+        return Ok(SessionRuntime {
+            events,
+            view: SessionView {
+                session_id,
+                snapshot,
+                lease: InputLeaseState::default(),
+                last_completed: None,
+                scroll_offset: 0,
+            },
+        });
+    }
 
     Ok(SessionRuntime {
         events,
@@ -1267,6 +1290,39 @@ mod tests {
     }
 
     #[test]
+    fn daemon_backed_app_restores_historical_sessions_before_activation() {
+        let session_id = SessionId::new("session-7").expect("session id");
+        let counts = Arc::new(Mutex::new(RestoreRecordingCounts::default()));
+        let size = SessionSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        };
+
+        let app = LocalSessionApp::start_with_manager(
+            Box::new(RestoreRecordingSessionApi {
+                counts: counts.clone(),
+                session_id: session_id.clone(),
+            }),
+            size.clone(),
+            false,
+        )
+        .expect("start daemon-backed app");
+
+        assert_eq!(app.sessions().len(), 1);
+        assert_eq!(app.view().session_id, session_id);
+        assert!(!app.view().snapshot.exited);
+        assert_eq!(app.view().snapshot.size, size);
+
+        let counts = counts.lock().expect("counts lock");
+        assert_eq!(counts.restores, 1);
+        assert_eq!(counts.acquires, 1);
+        assert_eq!(counts.restore_size, Some(size));
+    }
+
+    #[test]
     fn daemon_backed_app_reacquires_input_lease_after_closing_selected_session() {
         let counts = Arc::new(Mutex::new(RecordingCounts::default()));
         let mut app = LocalSessionApp::start_with_manager(
@@ -1462,6 +1518,18 @@ mod tests {
         session_ids: Vec<SessionId>,
     }
 
+    #[derive(Default)]
+    struct RestoreRecordingCounts {
+        restores: usize,
+        acquires: usize,
+        restore_size: Option<SessionSize>,
+    }
+
+    struct RestoreRecordingSessionApi {
+        counts: Arc<Mutex<RestoreRecordingCounts>>,
+        session_id: SessionId,
+    }
+
     struct ExitSnapshotSessionApi {
         session_id: SessionId,
         event_rx: Mutex<Option<SessionEventReceiver>>,
@@ -1571,6 +1639,87 @@ mod tests {
                 bytes_logged: 0,
                 visible_rows: Vec::new(),
             })
+        }
+    }
+
+    impl SessionApi for RestoreRecordingSessionApi {
+        fn list_sessions(&self) -> Result<Vec<SessionId>> {
+            Ok(vec![self.session_id.clone()])
+        }
+
+        fn start_session(&self, _request: StartSessionRequest) -> Result<SessionId> {
+            unreachable!("test attaches an existing session")
+        }
+
+        fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+            let mut snapshot = test_view(request.session_id).snapshot;
+            snapshot.exited = true;
+            Ok(AttachSessionResponse {
+                snapshot,
+                lease: InputLeaseState::default(),
+            })
+        }
+
+        fn subscribe_session_events(&self, _session_id: SessionId) -> Result<SessionEventReceiver> {
+            Ok(closed_event_receiver())
+        }
+
+        fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+            self.counts.lock().expect("counts lock").acquires += 1;
+            Ok(LeaseChange {
+                generation: 2,
+                previous: None,
+                current: Some(InputLeaseHolder {
+                    client_id: request.client_id,
+                    kind: request.kind,
+                }),
+                action: LeaseChangeAction::Acquired,
+            })
+        }
+
+        fn release_input_lease(
+            &self,
+            _session_id: SessionId,
+            _client_id: ClientId,
+        ) -> Result<LeaseChange> {
+            Ok(LeaseChange {
+                generation: 2,
+                previous: None,
+                current: None,
+                action: LeaseChangeAction::Released,
+            })
+        }
+
+        fn write_input(&self, _request: WriteInputRequest) -> Result<()> {
+            unreachable!("test does not write input")
+        }
+
+        fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+            let mut counts = self.counts.lock().expect("counts lock");
+            counts.restores += 1;
+            counts.restore_size = Some(request.size.clone());
+            drop(counts);
+
+            let mut snapshot = test_view(request.session_id).snapshot;
+            snapshot.size = request.size;
+            snapshot.exited = false;
+            Ok(snapshot)
+        }
+
+        fn resize_session(&self, _request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+            unreachable!("test does not resize sessions")
+        }
+
+        fn snapshot_session(&self, _session_id: SessionId) -> Result<SessionSnapshot> {
+            unreachable!("test does not snapshot sessions")
+        }
+
+        fn styled_rows(&self, _request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+            unreachable!("test does not load styled rows")
+        }
+
+        fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
+            unreachable!("test does not shut down sessions")
         }
     }
 
