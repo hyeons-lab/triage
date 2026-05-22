@@ -33,6 +33,7 @@
 - Extended the Flutter WebSocket client from `hello` to start `/bin/sh -lc cat`, attach as an interactive controller, subscribe to session events, render output event bytes in xterm, and send typed input back to the daemon PTY.
 - Added a TUI prefix session-switching model for terminals, especially macOS terminals, that intercept Option-arrow shortcuts before Argus can receive them.
 - Added Flutter/Dart ignores for the scaffold.
+- Reset connection and client fields to null and print a descriptive error on the terminal pane when the WebSocket connection is closed or errors, or when the session event subscription is closed.
 
 ## Progress
 
@@ -48,6 +49,7 @@
 - 2026-05-22T00:32-0700 — Hosted the WebSocket protocol from `argus-daemon` when `ARGUS_WS_LISTEN` is set and smoke-tested `hello` against `ws://127.0.0.1:8081`. The Flutter default WebSocket URL now derives from `Uri.base.host` and points to port 8081. Revalidated with `cargo test -p argus-transport-ws`, `cargo test -p argus-daemon`, `cargo fmt --all -- --check`, `cargo clippy -p argus-daemon -p argus-transport-ws --all-targets -- -D warnings`, `flutter analyze`, `flutter test`, and `flutter build web`.
 - 2026-05-22T00:36-0700 — Added the first end-to-end remote session lifecycle in Flutter: connect now starts a daemon-backed `cat` PTY, attaches as the controller, subscribes to events, renders output bytes, and routes typed input over `write_input`. Revalidated with `flutter analyze`, `flutter test`, `cargo test -p argus-transport-ws`, and `flutter build web`, then hot-restarted the server.
 - 2026-05-22T09:06-0700 — Added `Ctrl-G` prefix mode to the TUI. After the prefix, `j` or `n` selects the next session and `k` or `p` selects the previous session, while the existing Option-arrow bindings remain. Added status-line guidance and unit coverage for the prefix keys.
+- 2026-05-22T09:18-0700 — Fixed terminal input lock on closed stream: reset `_client`, `_sessionId`, and `_subscriptionId` to null and print error details to the terminal pane when disconnect callbacks (`onDone`, `onError`) or closed messages (`subscription_closed`, `error`) trigger. Validated Rust workspace tests.
 
 ## Research & Discoveries
 
@@ -58,7 +60,8 @@
 
 ## Commits
 
-- HEAD — feat: add flutter web terminal spike
+- 899d67f — feat: add flutter web terminal spike
+- HEAD — fix: reset client state and output error when websocket or stream closes
 
 ## Next Steps
 

@@ -100,12 +100,20 @@ class _TerminalSpikePageState extends State<TerminalSpikePage> {
         onError: (Object error) {
           setState(() {
             _connectionStatus = 'error: $error';
+            _client = null;
+            _sessionId = null;
+            _subscriptionId = null;
           });
+          _terminal.write('\n\n[error] WebSocket error: $error\nready > ');
         },
         onDone: () {
           setState(() {
             _connectionStatus = 'closed';
+            _client = null;
+            _sessionId = null;
+            _subscriptionId = null;
           });
+          _terminal.write('\n\n[error] WebSocket connection closed\nready > ');
         },
       );
       setState(() {
@@ -114,7 +122,11 @@ class _TerminalSpikePageState extends State<TerminalSpikePage> {
     } catch (error) {
       setState(() {
         _connectionStatus = 'error: $error';
+        _client = null;
+        _sessionId = null;
+        _subscriptionId = null;
       });
+      _terminal.write('\n\n[error] Connection failed: $error\nready > ');
     }
   }
 
@@ -133,11 +145,26 @@ class _TerminalSpikePageState extends State<TerminalSpikePage> {
       case 'subscription_closed':
         setState(() {
           _connectionStatus = 'subscription closed';
+          _client = null;
+          _sessionId = null;
+          _subscriptionId = null;
         });
+        _terminal.write('\n\n[error] Session event stream closed\nready > ');
       case 'error':
+        final Object? errObj = decoded['error'];
+        String errMsg = errObj.toString();
+        if (errObj is Map<String, dynamic>) {
+          errMsg = errObj['message']?.toString() ??
+              errObj['code']?.toString() ??
+              errMsg;
+        }
         setState(() {
-          _connectionStatus = 'error: ${decoded['error']}';
+          _connectionStatus = 'error: $errMsg';
+          _client = null;
+          _sessionId = null;
+          _subscriptionId = null;
         });
+        _terminal.write('\n\n[error] Server error: $errMsg\nready > ');
       default:
         _terminal.write('\nws < $message\nready > ');
     }
