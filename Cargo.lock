@@ -144,6 +144,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "argus-transport-ws"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "argus-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "argus-tui"
 version = "0.0.0"
 dependencies = [
@@ -156,10 +166,6 @@ dependencies = [
  "tracing",
  "unicode-width 0.2.0",
 ]
-
-[[package]]
-name = "argus-web"
-version = "0.0.0"
 
 [[package]]
 name = "arrayvec"

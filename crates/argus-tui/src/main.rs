@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -466,56 +466,73 @@ fn session_context_rows(
     scroll_offset: usize,
 ) -> Vec<Line<'static>> {
     let context = view.snapshot.context.as_ref();
-    let location = context
-        .and_then(|context| {
-            context
-                .worktree_root
-                .as_ref()
-                .or(context.repository_root.as_ref())
-                .map(|root| ("repo", root))
-        })
-        .or_else(|| {
-            view.snapshot
-                .current_working_directory
-                .as_ref()
-                .map(|cwd| ("cwd", cwd))
-        });
 
-    let mut rows = Vec::with_capacity(2);
-    if let Some((label, path)) = location {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        let value_width = width.saturating_sub(label.len() + 3);
-        let value = if selected {
-            scrolling_value(&name, value_width, scroll_offset)
+    let mut rows = Vec::with_capacity(3);
+    if let Some(context) = context {
+        if let Some(root) = context
+            .repository_root
+            .as_ref()
+            .or(context.worktree_root.as_ref())
+        {
+            rows.push(context_path_row("r", root, width, selected, scroll_offset));
         } else {
-            compact_value(&name, value_width)
-        };
-        rows.push(Line::from(truncate_to_width(
-            format!("  {label} {value}"),
-            width,
-        )));
+            rows.push(Line::from(""));
+        }
+
+        if let Some(worktree_root) = context
+            .worktree_root
+            .as_ref()
+            .filter(|worktree_root| context.repository_root.as_ref() != Some(*worktree_root))
+        {
+            rows.push(context_path_row(
+                "w",
+                worktree_root,
+                width,
+                selected,
+                scroll_offset,
+            ));
+        }
     } else {
-        rows.push(Line::from(""));
+        let cwd = view.snapshot.current_working_directory.as_ref();
+        if let Some(cwd) = cwd {
+            rows.push(context_path_row("c", cwd, width, selected, scroll_offset));
+        } else {
+            rows.push(Line::from(""));
+        }
     }
 
     if let Some(branch) = context.and_then(|context| context.branch.as_ref()) {
-        let branch_width = width.saturating_sub(9);
+        let branch_width = width.saturating_sub(4);
         let branch_name = if selected {
             scrolling_value(branch, branch_width, scroll_offset)
         } else {
             compact_value(branch.rsplit('/').next().unwrap_or(branch), branch_width)
         };
         rows.push(Line::from(truncate_to_width(
-            format!("  branch {branch_name}"),
+            format!("  b {branch_name}"),
             width,
         )));
     } else {
         rows.push(Line::from(""));
     }
     rows
+}
+
+fn context_path_row(
+    label: &str,
+    path: &Path,
+    width: usize,
+    selected: bool,
+    scroll_offset: usize,
+) -> Line<'static> {
+    let name = context_path_display_name(path);
+    let value_width = width.saturating_sub(label.len() + 3);
+    let value = if selected {
+        scrolling_value(&name, value_width, scroll_offset)
+    } else {
+        compact_value(&name, value_width)
+    };
+    Line::from(truncate_to_width(format!("  {label} {value}"), width))
 }
 
 /// Collects the longest leading run of `value` whose terminal display width
@@ -602,33 +619,44 @@ fn scrolling_value(value: &str, width: usize, offset: usize) -> String {
 }
 
 fn selected_sidebar_context_overflows(app: &LocalSessionApp, width: usize) -> bool {
-    let view = app.view();
+    session_context_overflows(app.view(), width)
+}
+
+fn session_context_overflows(view: &SessionView, width: usize) -> bool {
     let context = view.snapshot.context.as_ref();
-    let location_overflows = context
-        .and_then(|context| {
-            context
-                .worktree_root
-                .as_ref()
-                .or(context.repository_root.as_ref())
-                .map(|root| (7, root))
-        })
-        .or_else(|| {
-            view.snapshot
-                .current_working_directory
-                .as_ref()
-                .map(|cwd| (6, cwd))
-        })
-        .and_then(|(prefix_width, path)| path.file_name().map(|name| (prefix_width, name)))
-        .map(|(prefix_width, name)| {
-            UnicodeWidthStr::width(name.to_string_lossy().as_ref())
-                > width.saturating_sub(prefix_width)
-        })
-        .unwrap_or(false);
+    let location_overflows = if let Some(context) = context {
+        let repo_overflows = context
+            .repository_root
+            .as_ref()
+            .or(context.worktree_root.as_ref())
+            .is_some_and(|root| context_path_overflows(root, width));
+        let worktree_overflows = context
+            .worktree_root
+            .as_ref()
+            .filter(|worktree_root| context.repository_root.as_ref() != Some(*worktree_root))
+            .is_some_and(|worktree_root| context_path_overflows(worktree_root, width));
+        repo_overflows || worktree_overflows
+    } else {
+        view.snapshot
+            .current_working_directory
+            .as_ref()
+            .is_some_and(|cwd| context_path_overflows(cwd, width))
+    };
     let branch_overflows = context
         .and_then(|context| context.branch.as_ref())
-        .map(|branch| UnicodeWidthStr::width(branch.as_str()) > width.saturating_sub(9))
+        .map(|branch| UnicodeWidthStr::width(branch.as_str()) > width.saturating_sub(4))
         .unwrap_or(false);
     location_overflows || branch_overflows
+}
+
+fn context_path_overflows(path: &Path, width: usize) -> bool {
+    UnicodeWidthStr::width(context_path_display_name(path).as_str()) > width.saturating_sub(4)
+}
+
+fn context_path_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn draw_terminal(
@@ -1407,6 +1435,14 @@ mod tests {
     }
 
     #[test]
+    fn context_path_overflows_uses_display_name_for_roots() {
+        let root = Path::new("/");
+
+        assert!(!context_path_overflows(root, 5));
+        assert!(context_path_overflows(root, 4));
+    }
+
+    #[test]
     fn printable_keys_are_forwarded_to_session() {
         assert_eq!(
             key_to_input(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
@@ -1565,7 +1601,9 @@ mod tests {
                 current_working_directory: Some(PathBuf::from("/workspace/argus/crates")),
                 context: Some(argus_core::session::SessionContext {
                     repository_root: Some(PathBuf::from("/workspace/argus")),
-                    worktree_root: Some(PathBuf::from("/workspace/argus")),
+                    worktree_root: Some(PathBuf::from(
+                        "/workspace/argus/worktrees/websocket-session-api",
+                    )),
                     branch: Some("feat/session-context".to_string()),
                 }),
                 bracketed_paste_enabled: false,
@@ -1579,11 +1617,12 @@ mod tests {
         let rows =
             session_sidebar_rows(0, 1, &view, usize::from(SIDEBAR_COLS.saturating_sub(1)), 0);
 
-        assert_eq!(rows[2].spans[0].content.as_ref(), "  repo argus");
+        assert_eq!(rows[2].spans[0].content.as_ref(), "  r argus");
         assert_eq!(
             rows[3].spans[0].content.as_ref(),
-            "  branch session-context"
+            "  w websocket-session-api"
         );
+        assert_eq!(rows[4].spans[0].content.as_ref(), "  b session-context");
     }
 
     #[test]
@@ -1620,9 +1659,46 @@ mod tests {
         let later = session_sidebar_rows(0, 0, &view, 20, 5);
 
         assert_ne!(first[3].spans[0].content, later[3].spans[0].content);
-        assert!(first[3].spans[0].content.starts_with("  branch "));
+        assert!(first[3].spans[0].content.starts_with("  b "));
         assert_eq!(first[3].width(), 20);
         assert_eq!(later[3].width(), 20);
+    }
+
+    #[test]
+    fn selected_sidebar_context_overflows_when_worktree_name_overflows() {
+        let view = SessionView {
+            session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: argus_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: Vec::new(),
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: argus_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: Some(PathBuf::from(
+                    "/workspace/argus/worktrees/websocket-session-api",
+                )),
+                context: Some(argus_core::session::SessionContext {
+                    repository_root: Some(PathBuf::from("/workspace/argus")),
+                    worktree_root: Some(PathBuf::from(
+                        "/workspace/argus/worktrees/very-long-websocket-session-api",
+                    )),
+                    branch: Some("feat/ws".to_string()),
+                }),
+                bracketed_paste_enabled: false,
+                exited: false,
+            },
+            lease: argus_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+
+        assert!(session_context_overflows(&view, 20));
     }
 
     #[test]

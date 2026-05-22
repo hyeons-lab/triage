@@ -8,7 +8,7 @@ Argus is an attention-routing terminal supervisor: a long-running Rust daemon, a
   - `argus-core` — session trait and shared types (every other crate depends on this)
   - `argus-daemon` — long-running process; owns all session state
   - `argus-tui` — Ratatui local client (terminal-mode)
-  - `argus-web` — WebSocket transport adapter, server-side (consumed by Flutter clients)
+  - `argus-transport-ws` — WebSocket transport adapter, server-side (consumed by remote clients)
   - `argus-mcp` — MCP server (stdio + optional TCP)
 - `flutter/argus_client/` — Flutter app (scaffolded after the local daemon/TUI and remote web path are proven)
 - `devlog/` — checked-in design notes, branch devlogs, and per-task plans.
