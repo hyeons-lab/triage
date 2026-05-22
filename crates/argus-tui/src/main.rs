@@ -525,10 +525,7 @@ fn context_path_row(
     selected: bool,
     scroll_offset: usize,
 ) -> Line<'static> {
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let name = context_path_display_name(path);
     let value_width = width.saturating_sub(label.len() + 3);
     let value = if selected {
         scrolling_value(&name, value_width, scroll_offset)
@@ -653,11 +650,13 @@ fn session_context_overflows(view: &SessionView, width: usize) -> bool {
 }
 
 fn context_path_overflows(path: &Path, width: usize) -> bool {
+    UnicodeWidthStr::width(context_path_display_name(path).as_str()) > width.saturating_sub(4)
+}
+
+fn context_path_display_name(path: &Path) -> String {
     path.file_name()
-        .map(|name| {
-            UnicodeWidthStr::width(name.to_string_lossy().as_ref()) > width.saturating_sub(4)
-        })
-        .unwrap_or(false)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn draw_terminal(
@@ -1433,6 +1432,14 @@ mod tests {
         let compacted = compact_value(wide, 7);
         assert!(UnicodeWidthStr::width(compacted.as_str()) <= 7);
         assert!(compacted.contains('~'));
+    }
+
+    #[test]
+    fn context_path_overflows_uses_display_name_for_roots() {
+        let root = Path::new("/");
+
+        assert!(!context_path_overflows(root, 5));
+        assert!(context_path_overflows(root, 4));
     }
 
     #[test]
