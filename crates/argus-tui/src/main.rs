@@ -382,24 +382,70 @@ fn draw_sidebar(
     scroll_offset: usize,
 ) {
     let content_width = sidebar_content_width(area);
-    let rows = app
-        .sessions()
-        .enumerate()
-        .flat_map(|(index, view)| {
-            session_sidebar_rows(
-                index,
-                app.selected_index(),
-                view,
-                content_width,
-                scroll_offset,
-            )
-        })
-        .collect::<Vec<_>>();
+    let rows = sidebar_visible_rows(
+        app.sessions(),
+        app.selected_index(),
+        content_width,
+        scroll_offset,
+        usize::from(area.height),
+    );
 
     frame.render_widget(
         Paragraph::new(rows).block(Block::default().borders(Borders::RIGHT)),
         area,
     );
+}
+
+fn sidebar_visible_rows<'a>(
+    sessions: impl Iterator<Item = &'a SessionView>,
+    selected: usize,
+    width: usize,
+    scroll_offset: usize,
+    visible_height: usize,
+) -> Vec<Line<'static>> {
+    if visible_height == 0 {
+        return Vec::new();
+    }
+
+    let mut selected_start = 0usize;
+    let mut selected_end = 0usize;
+    let rows = sessions
+        .enumerate()
+        .fold(Vec::<Line<'static>>::new(), |mut rows, (index, view)| {
+            let start = rows.len();
+            rows.extend(session_sidebar_rows(
+                index,
+                selected,
+                view,
+                width,
+                scroll_offset,
+            ));
+            if index == selected {
+                selected_start = start;
+                selected_end = rows.len();
+            }
+            rows
+        });
+
+    let start = sidebar_viewport_start(rows.len(), selected_start, selected_end, visible_height);
+    rows.into_iter().skip(start).take(visible_height).collect()
+}
+
+fn sidebar_viewport_start(
+    total_rows: usize,
+    selected_start: usize,
+    selected_end: usize,
+    visible_height: usize,
+) -> usize {
+    if visible_height == 0 || total_rows <= visible_height {
+        return 0;
+    }
+
+    let max_start = total_rows - visible_height;
+    if selected_end.saturating_sub(selected_start) >= visible_height {
+        return selected_start.min(max_start);
+    }
+    selected_end.saturating_sub(visible_height).min(max_start)
 }
 
 fn sidebar_content_width(area: Rect) -> usize {
@@ -1702,6 +1748,29 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_visible_rows_keep_selected_session_in_view() {
+        let sessions = (1..=4)
+            .map(|index| sidebar_test_view(&format!("session-{index}")))
+            .collect::<Vec<_>>();
+
+        let rows = sidebar_visible_rows(sessions.iter(), 3, 20, 0, 5);
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].spans[0].content.as_ref(), "> session-4  running");
+        assert_eq!(rows[1].spans[0].content.as_ref(), "  observer  80x24");
+    }
+
+    #[test]
+    fn sidebar_viewport_start_keeps_selected_group_visible_when_pane_has_slack() {
+        assert_eq!(sidebar_viewport_start(20, 15, 20, 6), 14);
+    }
+
+    #[test]
+    fn sidebar_viewport_start_anchors_oversized_selected_group_at_top() {
+        assert_eq!(sidebar_viewport_start(20, 8, 16, 5), 8);
+    }
+
+    #[test]
     fn terminal_selection_extracts_only_visible_terminal_text() {
         let view = SessionView {
             session_id: argus_core::session::SessionId::new("session-1").expect("session id"),
@@ -2102,6 +2171,32 @@ mod tests {
         });
 
         assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    fn sidebar_test_view(session_id: &str) -> SessionView {
+        SessionView {
+            session_id: argus_core::session::SessionId::new(session_id).expect("session id"),
+            snapshot: argus_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: Vec::new(),
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: None,
+                context: None,
+                bracketed_paste_enabled: false,
+                exited: false,
+            },
+            lease: argus_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        }
     }
 
     #[test]
