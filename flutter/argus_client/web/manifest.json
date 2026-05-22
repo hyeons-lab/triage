@@ -1,0 +1,9 @@
+{
+  "name": "Argus",
+  "short_name": "Argus",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#101316",
+  "theme_color": "#2f6f73",
+  "description": "Argus remote client terminal bridge spike"
+}

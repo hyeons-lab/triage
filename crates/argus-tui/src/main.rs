@@ -181,6 +181,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut needs_draw = true;
     let mut sidebar_scroll_offset = 0usize;
     let mut last_sidebar_scroll_tick = Instant::now();
+    let mut pending_prefix = false;
 
     loop {
         if sidebar_visible
@@ -203,6 +204,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     app,
                     sidebar_visible,
                     pending_confirmation,
+                    pending_prefix,
                     selection,
                     sidebar_scroll_offset,
                 );
@@ -216,6 +218,25 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
 
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Press => {}
+            Event::Key(key) if pending_prefix => {
+                needs_draw = true;
+                pending_prefix = false;
+                pending_confirmation = None;
+                selection = None;
+                match prefix_key_to_command(key) {
+                    Some(AppCommand::Next) => {
+                        sidebar_scroll_offset = 0;
+                        last_sidebar_scroll_tick = Instant::now();
+                        app.select_next_session();
+                    }
+                    Some(AppCommand::Previous) => {
+                        sidebar_scroll_offset = 0;
+                        last_sidebar_scroll_tick = Instant::now();
+                        app.select_previous_session();
+                    }
+                    _ => {}
+                }
+            }
             Event::Key(key) if should_exit(key) => {
                 needs_draw = true;
                 if app.exits_by_shutting_down_sessions() {
@@ -226,6 +247,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     continue;
                 }
                 return Ok(());
+            }
+            Event::Key(key) if is_prefix_key(key) => {
+                needs_draw = true;
+                pending_prefix = true;
+                pending_confirmation = None;
+                selection = None;
             }
             Event::Key(key) => match key_to_command(key) {
                 Some(AppCommand::New) => {
@@ -344,6 +371,7 @@ fn draw(
     app: &LocalSessionApp,
     sidebar_visible: bool,
     pending_confirmation: Option<Confirmation>,
+    pending_prefix: bool,
     selection: Option<TerminalSelection>,
     sidebar_scroll_offset: usize,
 ) -> Rect {
@@ -371,6 +399,7 @@ fn draw(
         app.view(),
         app.last_error(),
         pending_confirmation,
+        pending_prefix,
     );
     terminal_area
 }
@@ -1256,6 +1285,7 @@ fn draw_status(
     view: &SessionView,
     last_error: Option<&str>,
     pending_confirmation: Option<Confirmation>,
+    pending_prefix: bool,
 ) {
     let status = if let Some(error) = last_error {
         Line::from(vec![
@@ -1269,9 +1299,16 @@ fn draw_status(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ))
+    } else if pending_prefix {
+        Line::from(Span::styled(
+            "prefix: j/n next session, k/p previous session, Esc cancel",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
+            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-G prefix  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
             view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };
@@ -1325,6 +1362,23 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
         KeyCode::F(2) => Some(AppCommand::ToggleSidebar),
         KeyCode::PageUp => Some(AppCommand::ScrollUp),
         KeyCode::PageDown => Some(AppCommand::ScrollDown),
+        _ => None,
+    }
+}
+
+fn is_prefix_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+}
+
+fn prefix_key_to_command(key: KeyEvent) -> Option<AppCommand> {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Char('n') | KeyCode::Char('N') => {
+            Some(AppCommand::Next)
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Char('p') | KeyCode::Char('P') => {
+            Some(AppCommand::Previous)
+        }
         _ => None,
     }
 }
@@ -1584,6 +1638,46 @@ mod tests {
         );
         assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn control_g_starts_prefix_mode() {
+        assert!(is_prefix_key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(is_prefix_key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_prefix_key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn prefix_keys_switch_sessions() {
+        assert_eq!(
+            prefix_key_to_command(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            prefix_key_to_command(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            prefix_key_to_command(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Some(AppCommand::Previous)
+        );
+        assert_eq!(
+            prefix_key_to_command(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(AppCommand::Previous)
+        );
+        assert_eq!(
+            prefix_key_to_command(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             None
         );
     }

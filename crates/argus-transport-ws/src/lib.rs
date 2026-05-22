@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use argus_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEventEnvelope,
@@ -10,9 +13,11 @@ use argus_core::session::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tungstenite::{Message, WebSocket, accept};
 
 pub const PROTOCOL_VERSION: &str = "2026-05-20";
 const MAX_EVENTS_PER_SUBSCRIPTION_DRAIN: usize = 256;
+const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubscriptionId(String);
@@ -182,6 +187,153 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
         self.next_subscription_id += 1;
         subscription_id
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedSessionApi<A>(Arc<A>);
+
+impl<A> SharedSessionApi<A> {
+    pub fn new(api: Arc<A>) -> Self {
+        Self(api)
+    }
+}
+
+impl<A: SessionApi> SessionApi for SharedSessionApi<A> {
+    fn list_sessions(&self) -> Result<Vec<SessionId>> {
+        self.0.list_sessions()
+    }
+
+    fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
+        self.0.start_session(request)
+    }
+
+    fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+        self.0.attach_session(request)
+    }
+
+    fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
+        self.0.subscribe_session_events(session_id)
+    }
+
+    fn subscribe_session_events_from(
+        &self,
+        request: SubscribeSessionEventsRequest,
+    ) -> Result<SessionEventReceiver> {
+        self.0.subscribe_session_events_from(request)
+    }
+
+    fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+        self.0.acquire_input_lease(request)
+    }
+
+    fn release_input_lease(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<LeaseChange> {
+        self.0.release_input_lease(session_id, client_id)
+    }
+
+    fn write_input(&self, request: WriteInputRequest) -> Result<()> {
+        self.0.write_input(request)
+    }
+
+    fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+        self.0.resize_session(request)
+    }
+
+    fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+        self.0.restore_session(request)
+    }
+
+    fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        self.0.snapshot_session(session_id)
+    }
+
+    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+        self.0.styled_rows(request)
+    }
+
+    fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
+        self.0.shutdown_session(session_id)
+    }
+}
+
+pub fn serve_blocking<A>(addr: impl ToSocketAddrs, api: Arc<A>) -> Result<()>
+where
+    A: SessionApi + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(addr).context("binding WebSocket listener")?;
+    let local_addr = listener
+        .local_addr()
+        .context("reading WebSocket listener address")?;
+    tracing::info!(%local_addr, "argus websocket transport listening");
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(error = ?error, "failed to accept websocket TCP connection");
+                continue;
+            }
+        };
+        let api = SharedSessionApi::new(Arc::clone(&api));
+        std::thread::spawn(move || {
+            if let Err(error) = handle_stream(stream, api) {
+                tracing::debug!(error = ?error, "websocket connection ended");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn handle_stream<A: SessionApi>(stream: TcpStream, api: A) -> Result<()> {
+    stream
+        .set_read_timeout(Some(SOCKET_READ_TIMEOUT))
+        .context("setting websocket read timeout")?;
+    let mut socket = accept(stream).context("accepting websocket handshake")?;
+    let mut connection = WebSocketSessionConnection::new(api);
+
+    loop {
+        match socket.read() {
+            Ok(Message::Text(message)) => {
+                let response = connection.handle_text_message(&message);
+                socket
+                    .send(Message::Text(response.into()))
+                    .context("sending websocket response")?;
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(payload)) => {
+                socket
+                    .send(Message::Pong(payload))
+                    .context("sending websocket pong")?;
+            }
+            Ok(Message::Binary(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("reading websocket message"),
+        }
+
+        drain_events_to_socket(&mut connection, &mut socket)?;
+    }
+
+    Ok(())
+}
+
+fn drain_events_to_socket<A: SessionApi>(
+    connection: &mut WebSocketSessionConnection<A>,
+    socket: &mut WebSocket<TcpStream>,
+) -> Result<()> {
+    for event in connection.drain_events() {
+        socket
+            .send(Message::Text(serialize_server_message(&event).into()))
+            .context("sending websocket event")?;
+    }
+    Ok(())
 }
 
 fn request_id_from_value(value: &Value) -> Option<Value> {

@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 argus-core = { path = "../argus-core" }
+argus-transport-ws = { path = "../argus-transport-ws" }
 anyhow.workspace = true
 portable-pty.workspace = true
 serde = { workspace = true }

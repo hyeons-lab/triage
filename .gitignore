@@ -2,6 +2,14 @@
 target/
 **/*.rs.bk
 
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+flutter/argus_client/build/
+flutter/argus_client/.metadata
+
 # macOS
 .DS_Store
 

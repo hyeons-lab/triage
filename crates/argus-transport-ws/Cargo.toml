@@ -12,6 +12,8 @@ anyhow.workspace = true
 argus-core = { path = "../argus-core" }
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+tungstenite.workspace = true
 
 [lints]
 workspace = true
