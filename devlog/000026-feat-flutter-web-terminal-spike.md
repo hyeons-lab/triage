@@ -50,6 +50,7 @@
 - 2026-05-22T00:36-0700 — Added the first end-to-end remote session lifecycle in Flutter: connect now starts a daemon-backed `cat` PTY, attaches as the controller, subscribes to events, renders output bytes, and routes typed input over `write_input`. Revalidated with `flutter analyze`, `flutter test`, `cargo test -p argus-transport-ws`, and `flutter build web`, then hot-restarted the server.
 - 2026-05-22T09:06-0700 — Added `Ctrl-G` prefix mode to the TUI. After the prefix, `j` or `n` selects the next session and `k` or `p` selects the previous session, while the existing Option-arrow bindings remain. Added status-line guidance and unit coverage for the prefix keys.
 - 2026-05-22T09:18-0700 — Fixed terminal input lock on closed stream: reset `_client`, `_sessionId`, and `_subscriptionId` to null and print error details to the terminal pane when disconnect callbacks (`onDone`, `onError`) or closed messages (`subscription_closed`, `error`) trigger. Validated Rust workspace tests.
+- 2026-05-22T09:54-0700 — Suppressed expected Unix socket client disconnect warnings when a broken pipe is wrapped by `serde_json::Error` during response encoding. Added regression coverage for the observed `writing response -> encoding JSON line -> Broken pipe` shape and revalidated the closed-socket IPC tests.
 
 ## Research & Discoveries
 
@@ -61,7 +62,8 @@
 ## Commits
 
 - 899d67f — feat: add flutter web terminal spike
-- HEAD — fix: reset client state and output error when websocket or stream closes
+- 0372788 — fix: reset client state and output error when websocket or stream closes
+- HEAD — fix: suppress JSON broken pipe IPC warning
 
 ## Next Steps
 
@@ -69,3 +71,4 @@
 - Run the web spike in Chrome and verify keyboard focus, resize fitting, and xterm rendering interactively.
 - Install or point Flutter at Chrome before using `flutter run -d chrome` in WSL.
 - Replace the demo `cat` process with a real shell attach flow and render snapshots/styled rows on attach.
+- Keep closed IPC writes quiet when browser or TUI clients disconnect mid-response; only unexpected socket handler errors should warn.

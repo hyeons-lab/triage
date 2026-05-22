@@ -515,15 +515,22 @@ fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
 }
 
 fn is_closed_socket_error(error: &anyhow::Error) -> bool {
-    error
-        .root_cause()
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io_error| {
-            matches!(
-                io_error.kind(),
-                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
-            )
-        })
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| is_closed_socket_error_kind(io_error.kind()))
+            || cause
+                .downcast_ref::<serde_json::Error>()
+                .and_then(serde_json::Error::io_error_kind)
+                .is_some_and(is_closed_socket_error_kind)
+    })
+}
+
+fn is_closed_socket_error_kind(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+    )
 }
 
 #[cfg(test)]
@@ -561,6 +568,28 @@ mod tests {
     fn closed_socket_errors_are_expected_client_disconnects() {
         let error = Err::<(), _>(std::io::Error::from(ErrorKind::BrokenPipe))
             .context("flushing subscription response")
+            .expect_err("broken pipe should stay an error");
+
+        assert!(is_closed_socket_error(&error));
+    }
+
+    #[test]
+    fn json_closed_socket_errors_are_expected_client_disconnects() {
+        struct BrokenPipeWriter;
+
+        impl Write for BrokenPipeWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let response = WireResponse::Ok(Box::new(WireSuccess::Unit));
+        let error = write_json_line(&mut BrokenPipeWriter, &response)
+            .context("writing response")
             .expect_err("broken pipe should stay an error");
 
         assert!(is_closed_socket_error(&error));
