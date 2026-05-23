@@ -303,16 +303,13 @@ class _ArgusHomeState extends State<ArgusHome> {
   void _onWebSocketEvent(Map<String, dynamic> message) {
     final type = message['type'] as String?;
     if (type == 'event') {
-      final subId = message['subscription_id']?.toString();
-      final sessionId = _subscriptionIds[subId];
-      if (sessionId == null) return;
-
       final envelope = message['envelope'] as Map<String, dynamic>?;
       final event = envelope?['event'] as Map<String, dynamic>?;
       if (event == null) return;
 
       if (event.containsKey('Output')) {
         final output = event['Output'] as Map<String, dynamic>;
+        final sessionId = output['session_id'] as String;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
         final text = utf8.decode(bytes, allowMalformed: true);
 
@@ -335,6 +332,9 @@ class _ArgusHomeState extends State<ArgusHome> {
           _sessions[sessionIndex].terminalController.write(text);
         }
       } else if (event.containsKey('Exited')) {
+        final exited = event['Exited'] as Map<String, dynamic>;
+        final sessionId = exited['session_id'] as String;
+
         final sessionIndex = _sessions.indexWhere(
           (s) => s.title == 'argus / $sessionId',
         );

@@ -40,6 +40,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       ..style.backgroundColor = '#0d1113'
       ..style.overflow = 'hidden';
 
+    _container.onClick.listen((event) {
+      if (_initialized) {
+        try {
+          js_util.callMethod(_term, 'focus', []);
+        } catch (_) {}
+      }
+    });
+
     // 2. Register the platform view factory
     ui_web.platformViewRegistry.registerViewFactory(
       _viewType,
@@ -111,6 +119,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       // 8. Bind listeners to the controller
       _bindController();
       _initialized = true;
+
+      try {
+        js_util.callMethod(_term, 'focus', []);
+      } catch (_) {}
 
       // 9. Delayed fits to handle timing/sizing latency
       Future.delayed(const Duration(milliseconds: 50), _onFit);

@@ -11,6 +11,7 @@
 - Antigravity, 2026-05-23T08:39-0700
 - Antigravity, 2026-05-23T08:45-0700
 - Antigravity, 2026-05-23T08:50-0700
+- Antigravity, 2026-05-23T08:54-0700
 
 ## Intent
 
@@ -67,6 +68,9 @@
 - Reset xterm.js terminal instance and reload session styled rows in didUpdateWidget inside terminal_pane_web.dart, resolving layout leaks from the mock initial view.
 - Removed separate bottom command text input, command controller, and CommandBar widget from main.dart, transforming the workspace into a clean native-feeling terminal.
 - Updated widget tests to simulate user typing events directly via TerminalController.sendInput instead of typing in a text field.
+- Implemented write buffering in `TerminalController` to buffer incoming PTY stdout chunks received before the terminal widget is fully mounted and initialized, resolving startup race conditions.
+- Resolved subscription timing race conditions in `_onWebSocketEvent` by looking up the `session_id` directly from the event payload.
+- Added auto-focus and `onClick` native container focus triggers to `TerminalPaneWeb` so `xterm.js` correctly receives keyboard input focus.
 
 ## Progress
 
@@ -86,6 +90,7 @@
 - 2026-05-23T08:39-0700 - Fixed `ArgusWebSocketClient` syntax error, updated session attachment modes to `InteractiveController` and enabled viewport resize forwarding in `main.dart`, then formatted files and ran verification checks.
 - 2026-05-23T08:45-0700 - Fixed state reuse in TerminalPaneWeb by resetting terminal buffer and loading the active session's rows upon controller updates.
 - 2026-05-23T08:50-0700 - Removed the deprecated bottom CommandBar and text input UI, allowing direct input via the xterm.js terminal instance, and adapted widget tests to match.
+- 2026-05-23T08:54-0700 - Added terminal input focus, write event buffering, and payload-based session routing to address race conditions and enable direct keystroke input.
 
 ## Issues
 
@@ -104,7 +109,8 @@
 - 56d8607 — docs(devlog): check in devlog entries for path fallbacks
 - 8606142 — feat(client): enable interactive terminal control and PTY resize propagation
 - 8c595a1 — fix(client): reset terminal view on session update to avoid leak of mock content
-- HEAD — feat(client): remove text box and send button to make terminal clean and native
+- 56d803a — feat(client): remove text box and send button to make terminal clean and native
+- HEAD — feat(client): enable direct terminal focus, write buffering, and de-raced event routing
 
 ## Next Steps
 

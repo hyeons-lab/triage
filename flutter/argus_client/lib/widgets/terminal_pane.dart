@@ -10,8 +10,18 @@ class TerminalController {
   final List<void Function(String)> _inputListeners = [];
   final List<void Function(int, int)> _resizeOutListeners = [];
 
-  void addWriteListener(void Function(String) listener) =>
-      _writeListeners.add(listener);
+  final List<String> _writeBuffer = [];
+
+  void addWriteListener(void Function(String) listener) {
+    _writeListeners.add(listener);
+    if (_writeBuffer.isNotEmpty) {
+      for (final data in _writeBuffer) {
+        listener(data);
+      }
+      _writeBuffer.clear();
+    }
+  }
+
   void removeWriteListener(void Function(String) listener) =>
       _writeListeners.remove(listener);
 
@@ -40,8 +50,12 @@ class TerminalController {
       _resizeOutListeners.remove(listener);
 
   void write(String data) {
-    for (final listener in List.from(_writeListeners)) {
-      listener(data);
+    if (_writeListeners.isEmpty) {
+      _writeBuffer.add(data);
+    } else {
+      for (final listener in List.from(_writeListeners)) {
+        listener(data);
+      }
     }
   }
 
@@ -82,6 +96,7 @@ class TerminalController {
     _fitListeners.clear();
     _inputListeners.clear();
     _resizeOutListeners.clear();
+    _writeBuffer.clear();
   }
 }
 
