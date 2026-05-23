@@ -101,12 +101,17 @@ async fn handle_ws_connection(
             }
             _ = interval.tick() => {
                 let messages = conn.drain_events();
+                let mut send_failed = false;
                 for msg in messages {
                     let serialized = serde_json::to_string(&msg)
                         .context("serializing session event")?;
                     if tx.send(Message::Text(serialized)).is_err() {
+                        send_failed = true;
                         break;
                     }
+                }
+                if send_failed {
+                    break;
                 }
             }
         }

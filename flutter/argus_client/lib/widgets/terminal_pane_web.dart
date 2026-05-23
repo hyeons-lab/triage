@@ -1,3 +1,5 @@
+// ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
+
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
@@ -31,6 +33,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final dynamic _onDataSubscription;
   late final dynamic _onResizeSubscription;
   bool _initialized = false;
+
+  double? _lastWidth;
+  double? _lastHeight;
 
   @override
   void initState() {
@@ -254,9 +259,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          widget.controller.fit();
-        });
+        if (constraints.maxWidth != _lastWidth || constraints.maxHeight != _lastHeight) {
+          _lastWidth = constraints.maxWidth;
+          _lastHeight = constraints.maxHeight;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            widget.controller.fit();
+          });
+        }
         return HtmlElementView(viewType: _viewType);
       },
     );

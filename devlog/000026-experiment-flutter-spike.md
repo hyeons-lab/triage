@@ -17,6 +17,7 @@
 - Antigravity, 2026-05-23T09:12-0700
 - Antigravity, 2026-05-23T09:17-0700
 - Antigravity, 2026-05-23T09:24-0700
+- Antigravity, 2026-05-23T11:51-0700
 
 ## Intent
 
@@ -108,6 +109,7 @@
 - 2026-05-23T09:12-0700 - Fixed widget inspector/diagnostics crash on Flutter Web caused by platform view type changes during session/controller swaps.
 - 2026-05-23T09:17-0700 - Fixed session tab switching issue where returning to a previously active tab resulted in a blank/frozen terminal pane.
 - 2026-05-23T09:24-0700 - Implemented Close Session button and WebSocket shutdownSession logic in the client with empty placeholder UI fallback.
+- 2026-05-23T11:51-0700 - Addressed all PR review comments including map syntax, offline backspace index assignment, attachSession response unwrapping, layout fit performance, and daemon connection loop memory/CPU leak.
 
 ## Issues
 
@@ -132,7 +134,8 @@
 - bac92c1 — fix(client): declare optional callback parameters for JS interop to prevent arguments mismatch error
 - b88581c — fix(client): stabilize platform view type and key to resolve widget inspector crash
 - 77b21a2 — fix(client): ensure platform viewType uniqueness to fix session switching
-- HEAD — feat(client): add Close Session button and wire WebSocket shutdownSession handler
+- fb93962 — feat(client): add Close Session button and wire WebSocket shutdownSession handler
+- HEAD — fix(client): address PR comments and fix daemon ws tight loop
 
 ## Next Steps
 

@@ -172,7 +172,8 @@ class _ArgusHomeState extends State<ArgusHome> {
               final text = session.rows.last.spans.last.text;
               if (text.isNotEmpty) {
                 final newText = text.substring(0, text.length - 1);
-                session.rows.last.spans.last = StyledSpan(
+                final lastIndex = session.rows.last.spans.length - 1;
+                session.rows.last.spans[lastIndex] = StyledSpan(
                   text: newText,
                   style: session.rows.last.spans.last.style,
                 );
@@ -257,7 +258,8 @@ class _ArgusHomeState extends State<ArgusHome> {
           clientId: _clientId,
           mode: 'InteractiveController',
         );
-        final snapshot = attachRes['snapshot'] as Map<String, dynamic>?;
+        final responseObj = attachRes['response'] as Map<String, dynamic>?;
+        final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
         final contextObj = snapshot?['context'] as Map<String, dynamic>?;
         final branch = contextObj?['branch']?.toString() ?? 'main';
 
@@ -391,7 +393,8 @@ class _ArgusHomeState extends State<ArgusHome> {
             clientId: _clientId,
             mode: 'InteractiveController',
           );
-          final snapshot = attachRes['snapshot'] as Map<String, dynamic>?;
+          final responseObj = attachRes['response'] as Map<String, dynamic>?;
+          final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
           final branch = contextObj?['branch']?.toString() ?? 'main';
 

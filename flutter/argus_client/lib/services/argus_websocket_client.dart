@@ -137,7 +137,8 @@ class ArgusWebSocketClient {
       'request': {
         'command': command,
         'args': args,
-        'cwd': ?cwd,
+        // ignore: use_null_aware_elements
+        if (cwd != null) 'cwd': cwd,
         'size': {
           'rows': rows,
           'cols': cols,
@@ -171,7 +172,11 @@ class ArgusWebSocketClient {
     int? afterEventSeq,
   }) async {
     final response = await _send('subscribe_session_events', {
-      'request': {'session_id': sessionId, 'after_event_seq': ?afterEventSeq},
+      'request': {
+        'session_id': sessionId,
+        // ignore: use_null_aware_elements
+        if (afterEventSeq != null) 'after_event_seq': afterEventSeq,
+      },
     });
     return response['subscription_id']?.toString() ?? '';
   }

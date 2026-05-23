@@ -52,44 +52,46 @@ class FakeArgusWebSocketClient extends ArgusWebSocketClient {
   }) async {
     attachSessionCalls.add(sessionId);
     return {
-      'snapshot': {
-        'context': {
-          'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
+      'response': {
+        'snapshot': {
+          'context': {
+            'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
+          },
+          'styled_rows': [
+            {
+              'spans': [
+                {
+                  'text': 'line 1 from $sessionId',
+                  'style': {
+                    'foreground': null,
+                    'background': null,
+                    'bold': false,
+                    'dim': false,
+                    'italic': false,
+                    'underline': false,
+                    'reverse': false,
+                  },
+                },
+              ],
+            },
+            {
+              'spans': [
+                {
+                  'text': 'line 2 from $sessionId',
+                  'style': {
+                    'foreground': null,
+                    'background': null,
+                    'bold': false,
+                    'dim': false,
+                    'italic': false,
+                    'underline': false,
+                    'reverse': false,
+                  },
+                },
+              ],
+            },
+          ],
         },
-        'styled_rows': [
-          {
-            'spans': [
-              {
-                'text': 'line 1 from $sessionId',
-                'style': {
-                  'foreground': null,
-                  'background': null,
-                  'bold': false,
-                  'dim': false,
-                  'italic': false,
-                  'underline': false,
-                  'reverse': false,
-                },
-              },
-            ],
-          },
-          {
-            'spans': [
-              {
-                'text': 'line 2 from $sessionId',
-                'style': {
-                  'foreground': null,
-                  'background': null,
-                  'bold': false,
-                  'dim': false,
-                  'italic': false,
-                  'underline': false,
-                  'reverse': false,
-                },
-              },
-            ],
-          },
-        ],
       },
     };
   }
