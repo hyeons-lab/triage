@@ -12,6 +12,7 @@
 - Antigravity, 2026-05-23T08:45-0700
 - Antigravity, 2026-05-23T08:50-0700
 - Antigravity, 2026-05-23T08:54-0700
+- Antigravity, 2026-05-23T08:59-0700
 
 ## Intent
 
@@ -71,6 +72,7 @@
 - Implemented write buffering in `TerminalController` to buffer incoming PTY stdout chunks received before the terminal widget is fully mounted and initialized, resolving startup race conditions.
 - Resolved subscription timing race conditions in `_onWebSocketEvent` by looking up the `session_id` directly from the event payload.
 - Added auto-focus and `onClick` native container focus triggers to `TerminalPaneWeb` so `xterm.js` correctly receives keyboard input focus.
+- Swapped the initialization order of _initialized = true and _bindController() in terminal_pane_web.dart, resolving a bug where buffered early PTY events were discarded during listener setup.
 
 ## Progress
 
@@ -91,6 +93,7 @@
 - 2026-05-23T08:45-0700 - Fixed state reuse in TerminalPaneWeb by resetting terminal buffer and loading the active session's rows upon controller updates.
 - 2026-05-23T08:50-0700 - Removed the deprecated bottom CommandBar and text input UI, allowing direct input via the xterm.js terminal instance, and adapted widget tests to match.
 - 2026-05-23T08:54-0700 - Added terminal input focus, write event buffering, and payload-based session routing to address race conditions and enable direct keystroke input.
+- 2026-05-23T08:59-0700 - Swapped initialization order in TerminalPaneWeb so early PTY outputs flushed from the controller's write buffer are not ignored.
 
 ## Issues
 
@@ -110,7 +113,8 @@
 - 8606142 — feat(client): enable interactive terminal control and PTY resize propagation
 - 8c595a1 — fix(client): reset terminal view on session update to avoid leak of mock content
 - 56d803a — feat(client): remove text box and send button to make terminal clean and native
-- HEAD — feat(client): enable direct terminal focus, write buffering, and de-raced event routing
+- 32373d8 — feat(client): enable direct terminal focus, write buffering, and de-raced event routing
+- HEAD — fix(client): swap initialization order in terminal_pane_web to avoid discarding early buffered PTY events
 
 ## Next Steps
 

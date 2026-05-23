@@ -117,8 +117,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _writeInitialContent();
 
       // 8. Bind listeners to the controller
-      _bindController();
       _initialized = true;
+      _bindController();
 
       try {
         js_util.callMethod(_term, 'focus', []);
