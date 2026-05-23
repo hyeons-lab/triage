@@ -6,6 +6,7 @@
 - Antigravity, 2026-05-23T06:45-0700
 - Antigravity, 2026-05-23T07:48-0700
 - Antigravity, 2026-05-23T07:51-0700
+- Antigravity, 2026-05-23T07:56-0700
 
 ## Intent
 
@@ -25,6 +26,7 @@
 - Set the event-polling interval to 10ms to achieve low-latency terminal rendering, minimizing perceived typing delay.
 - Transition the WebSocket runtime to a single-threaded current_thread executor to improve resource efficiency.
 - Implement a graceful drain/flush sequence for connection cleanup by dropping the channel sender and awaiting the write task instead of calling abort.
+- Resolve Windows logging and configuration folder initialization failures by adding a USERPROFILE environment variable fallback for HOME-based directory paths.
 
 ## What Changed
 
@@ -53,6 +55,7 @@
 - Refactored crates/argus-daemon/src/ws.rs to use tokio::runtime::Builder::new_current_thread.
 - Replaced write_task.abort() with channel drop and task join to flush outgoing events during shutdown.
 - Set missed tick behavior for the 10ms interval to Skip.
+- Added fallback check for USERPROFILE environment variable in default path and config resolution within crates/argus-core/src/logging.rs and crates/argus-core/src/config.rs.
 
 ## Progress
 
@@ -67,6 +70,7 @@
 - 2026-05-23T07:36-0700 - Resolved xterm.js layout fitting latency and wired interactive keyboard keypress input loops from the emulator back to the transport host.
 - 2026-05-23T07:48-0700 - Wrote the async WebSocket server implementation, resolved formatting and compiler warnings, and verified with cargo check/clippy/test.
 - 2026-05-23T07:51-0700 - Refactored the WebSocket server to use a single-threaded runtime, skip missed tick intervals, and await writer tasks on disconnect. Verified with full checks.
+- 2026-05-23T07:56-0700 - Fixed Windows configuration paths with USERPROFILE fallback, verified daemon port binding, and ran clean client tests.
 
 ## Issues
 
@@ -79,7 +83,8 @@
 - 990697e — feat(client): implement websocket client and integrate xterm.js
 - f42f3c5 — fix(client): address xterm.js layout fitting latency and wire keyboard input loop
 - 4d1f6a5 — feat(daemon): implement async websocket server for remote clients
-- HEAD — refactor(daemon): optimize websocket server runtime and connection shutdown
+- f2c99b9 — refactor(daemon): optimize websocket server runtime and connection shutdown
+- HEAD — fix(daemon): fallback to USERPROFILE env var on Windows for config/logging paths
 
 ## Next Steps
 
