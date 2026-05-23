@@ -16,6 +16,7 @@
 - Antigravity, 2026-05-23T09:01-0700
 - Antigravity, 2026-05-23T09:12-0700
 - Antigravity, 2026-05-23T09:17-0700
+- Antigravity, 2026-05-23T09:24-0700
 
 ## Intent
 
@@ -80,6 +81,8 @@
 - Stabilized the `viewType` of `TerminalPane` on Web to be based on a sanitized version of `widget.terminalId` rather than dynamic `widget.controller.hashCode`, ensuring that platform view factories are not registered on the same view type repeatedly.
 - Passed `key: ValueKey(session.title)` and `terminalId: session.title` to `TerminalPane` inside `SessionWorkspace`, guaranteeing that `TerminalPane`'s state (including the native `xterm.js` instance and layout container) is cleanly disposed and recreated when switching between different tabs.
 - Appended a static instance counter to `_viewType` in `TerminalPaneWeb` to guarantee a unique viewType registration for every state initialization, fixing a bug where switching away and returning to a session rendered a frozen or blank view due to platform view factory reuse.
+- Implemented `shutdownSession` method in `ArgusWebSocketClient` to map to the daemon's WebSocket `shutdown_session` PTY termination endpoint.
+- Added a "Close Session" (X) `IconButton` in the `WorkspaceHeader` to trigger session shutdown and clean removal of sessions from the workspace (handling empty list states gracefully).
 
 ## Progress
 
@@ -104,6 +107,7 @@
 - 2026-05-23T09:01-0700 - Fixed JS-interop argument mismatch crashes in TerminalPaneWeb by declaring optional parameters for the onData and onResize listeners.
 - 2026-05-23T09:12-0700 - Fixed widget inspector/diagnostics crash on Flutter Web caused by platform view type changes during session/controller swaps.
 - 2026-05-23T09:17-0700 - Fixed session tab switching issue where returning to a previously active tab resulted in a blank/frozen terminal pane.
+- 2026-05-23T09:24-0700 - Implemented Close Session button and WebSocket shutdownSession logic in the client with empty placeholder UI fallback.
 
 ## Issues
 
@@ -127,7 +131,8 @@
 - 8665bc6 — fix(client): swap initialization order in terminal_pane_web to avoid discarding early buffered PTY events
 - bac92c1 — fix(client): declare optional callback parameters for JS interop to prevent arguments mismatch error
 - b88581c — fix(client): stabilize platform view type and key to resolve widget inspector crash
-- HEAD — fix(client): ensure platform viewType uniqueness to fix session switching
+- 77b21a2 — fix(client): ensure platform viewType uniqueness to fix session switching
+- HEAD — feat(client): add Close Session button and wire WebSocket shutdownSession handler
 
 ## Next Steps
 

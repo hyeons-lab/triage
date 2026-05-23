@@ -136,6 +136,13 @@ class FakeArgusWebSocketClient extends ArgusWebSocketClient {
     return {};
   }
 
+  final List<String> shutdownSessionCalls = [];
+
+  @override
+  Future<void> shutdownSession({required String sessionId}) async {
+    shutdownSessionCalls.add(sessionId);
+  }
+
   @override
   Future<void> disconnect() async {
     _connected = false;
@@ -197,5 +204,26 @@ void main() {
     expect(find.text('Argus'), findsOneWidget);
     expect(find.text('argus / flutter-spike'), findsWidgets);
     expect(find.text('Offline (Local Mock)'), findsOneWidget);
+  });
+
+  testWidgets('closes a session over WebSocket and removes it from the list', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeArgusWebSocketClient();
+    await tester.pumpWidget(ArgusClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Verify initial active session is argus / flutter-spike
+    expect(find.text('argus / flutter-spike'), findsWidgets);
+
+    // Tap on close button
+    await tester.tap(find.byTooltip('Close session'));
+    await tester.pumpAndSettle();
+
+    // Verify shutdown session was called with 'flutter-spike'
+    expect(client.shutdownSessionCalls.contains('flutter-spike'), isTrue);
+
+    // Verify session was removed and selected index was updated
+    expect(find.text('argus / flutter-spike'), findsNothing);
   });
 }

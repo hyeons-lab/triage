@@ -209,6 +209,12 @@ class ArgusWebSocketClient {
     });
   }
 
+  Future<void> shutdownSession({required String sessionId}) async {
+    await _send('shutdown_session', {
+      'session_id': sessionId,
+    });
+  }
+
   void _cleanupPendingRequests() {
     for (final completer in _pendingRequests.values) {
       if (!completer.isCompleted) {

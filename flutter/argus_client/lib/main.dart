@@ -460,6 +460,40 @@ class _ArgusHomeState extends State<ArgusHome> {
     });
   }
 
+  Future<void> _closeSession(SessionVm session) async {
+    final parts = session.title.split(' / ');
+    final sessionId = parts.length > 1 ? parts[1] : null;
+
+    if (_client.isConnected && sessionId != null) {
+      try {
+        await _client.shutdownSession(sessionId: sessionId);
+        setState(() {
+          final index = _sessions.indexOf(session);
+          if (index != -1) {
+            _sessions.removeAt(index);
+            session.terminalController.dispose();
+            if (_selectedIndex >= _sessions.length) {
+              _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+            }
+          }
+        });
+      } catch (e) {
+        debugPrint('Failed to shutdown session: $e');
+      }
+    } else {
+      setState(() {
+        final index = _sessions.indexOf(session);
+        if (index != -1) {
+          _sessions.removeAt(index);
+          session.terminalController.dispose();
+          if (_selectedIndex >= _sessions.length) {
+            _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+          }
+        }
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -479,7 +513,38 @@ class _ArgusHomeState extends State<ArgusHome> {
               thickness: 1,
               color: Color(0xff263033),
             ),
-            Expanded(child: SessionWorkspace(session: _selectedSession)),
+            Expanded(
+              child: _sessions.isEmpty
+                  ? const Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.terminal, size: 64, color: Color(0xff263033)),
+                          SizedBox(height: 16),
+                          Text(
+                            'No active sessions',
+                            style: TextStyle(
+                              fontSize: 18,
+                              color: Color(0xff7f8b8d),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          SizedBox(height: 8),
+                          Text(
+                            'Create a new session by clicking the "+" button on the sidebar.',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Color(0xff7f8b8d),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  : SessionWorkspace(
+                      session: _selectedSession,
+                      onCloseSession: () => _closeSession(_selectedSession),
+                    ),
+            ),
           ],
         ),
       ),
@@ -694,15 +759,20 @@ class SessionListTile extends StatelessWidget {
 }
 
 class SessionWorkspace extends StatelessWidget {
-  const SessionWorkspace({super.key, required this.session});
+  const SessionWorkspace({
+    super.key,
+    required this.session,
+    this.onCloseSession,
+  });
 
   final SessionVm session;
+  final VoidCallback? onCloseSession;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        WorkspaceHeader(session: session),
+        WorkspaceHeader(session: session, onClose: onCloseSession),
         Expanded(
           child: TerminalPane(
             key: ValueKey(session.title),
@@ -717,9 +787,14 @@ class SessionWorkspace extends StatelessWidget {
 }
 
 class WorkspaceHeader extends StatelessWidget {
-  const WorkspaceHeader({super.key, required this.session});
+  const WorkspaceHeader({
+    super.key,
+    required this.session,
+    this.onClose,
+  });
 
   final SessionVm session;
+  final VoidCallback? onClose;
 
   @override
   Widget build(BuildContext context) {
@@ -765,7 +840,14 @@ class WorkspaceHeader extends StatelessWidget {
             style: const TextStyle(color: Color(0xffcdd7d6)),
           ),
           const SizedBox(width: 16),
-          const Icon(Icons.more_horiz, color: Color(0xffcdd7d6)),
+          if (onClose != null)
+            IconButton(
+              icon: const Icon(Icons.close, color: Color(0xffcdd7d6)),
+              tooltip: 'Close session',
+              onPressed: onClose,
+            )
+          else
+            const Icon(Icons.more_horiz, color: Color(0xffcdd7d6)),
         ],
       ),
     );
