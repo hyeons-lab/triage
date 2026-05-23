@@ -6,7 +6,7 @@ resolver = "3"
 edition = "2024"
 version = "0.0.0"
 license = "Apache-2.0"
-repository = "https://github.com/hyeons-lab/argus"
+repository = "https://github.com/hyeons-lab/triage"
 authors = ["Hyeons' Lab <info@hyeons-lab.com>"]
 
 [workspace.lints.rust]

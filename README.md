@@ -1,10 +1,10 @@
-# Argus
+# Triage
 
-A terminal multiplexer with attention routing and remote access. A long-running daemon owns all session state; the Ratatui TUI, a Flutter client (web / iOS / Android / optional desktop), and an MCP server are clients of the same session API.
+An attention-routing terminal supervisor: a long-running daemon (`triaged`), a Ratatui TUI (`triage`), a Flutter client (`triage_client`), and an MCP server (`triage-mcp`), all sharing one session API.
 
 ## Plan
 
-Argus is daemon-first. The local TUI is the first product target; remote access comes after the daemon and local navigation model are solid.
+Triage is daemon-first. The local TUI is the first product target; remote access comes after the daemon and local navigation model are solid.
 
 Core architecture constraints:
 
@@ -32,7 +32,7 @@ Early development. Not yet usable.
 
 ## Testing
 
-The workspace includes `argus-test-support`, a non-published crate for reusable acceptance-test helpers. It provides renderer snapshot normalization and VT byte-stream fixtures so terminal engine, daemon session, and TUI behavior can be tested with deterministic golden outputs.
+The workspace includes `triage-test-support`, a non-published crate for reusable acceptance-test helpers. It provides renderer snapshot normalization and VT byte-stream fixtures so terminal engine, daemon session, and TUI behavior can be tested with deterministic golden outputs.
 
 ## License
 

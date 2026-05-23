@@ -1,0 +1,36 @@
+---
+source: crates/triage-test-support/tests/alacritty_engine_spike.rs
+expression: snapshot
+---
+## resize_window_report (resize)
+00: resized
+
+## late_attach_screen_reset (late_attach)
+00: after attach
+
+## reconnect_alt_screen_boundary (reconnect)
+00: connected
+01: back
+
+## alt_screen_enter_exit (alt_screen)
+00: mainmain
+
+## bracketed_paste_round_trip (bracketed_paste)
+00: pasted
+01: text
+
+## sgr_mouse_press_release (mouse_reporting)
+(blank)
+
+## scroll_region_reset (scroll_regions)
+00: one
+01: two
+02: three
+
+## chunked_replay_matches_contiguous_stream (replay)
+00: one
+01: two
+02: three
+
+## log_tee_preserves_raw_bytes (log_tee)
+00: rawbytesred

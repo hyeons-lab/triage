@@ -1,0 +1,7 @@
+---
+source: crates/triage-test-support/tests/snapshot_harness.rs
+expression: frame
+---
+Triage
+repo: hyeons-lab/triage
+attention: awaiting-input
