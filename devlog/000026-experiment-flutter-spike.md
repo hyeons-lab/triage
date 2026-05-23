@@ -10,6 +10,7 @@
 - Antigravity, 2026-05-23T08:30-0700
 - Antigravity, 2026-05-23T08:39-0700
 - Antigravity, 2026-05-23T08:45-0700
+- Antigravity, 2026-05-23T08:50-0700
 
 ## Intent
 
@@ -64,6 +65,8 @@
 - Wired `addResizeOutListener` in `main.dart` to trigger `resizeSession` to propagate client viewport resizing back to the daemon.
 - Overrode `resizeSession` in `FakeArgusWebSocketClient` to avoid socket connection failures in test environments.
 - Reset xterm.js terminal instance and reload session styled rows in didUpdateWidget inside terminal_pane_web.dart, resolving layout leaks from the mock initial view.
+- Removed separate bottom command text input, command controller, and CommandBar widget from main.dart, transforming the workspace into a clean native-feeling terminal.
+- Updated widget tests to simulate user typing events directly via TerminalController.sendInput instead of typing in a text field.
 
 ## Progress
 
@@ -82,6 +85,7 @@
 - 2026-05-23T08:30-0700 - Standardized Windows USERPROFILE fallback for sessions and TUI log directories, and committed the changes.
 - 2026-05-23T08:39-0700 - Fixed `ArgusWebSocketClient` syntax error, updated session attachment modes to `InteractiveController` and enabled viewport resize forwarding in `main.dart`, then formatted files and ran verification checks.
 - 2026-05-23T08:45-0700 - Fixed state reuse in TerminalPaneWeb by resetting terminal buffer and loading the active session's rows upon controller updates.
+- 2026-05-23T08:50-0700 - Removed the deprecated bottom CommandBar and text input UI, allowing direct input via the xterm.js terminal instance, and adapted widget tests to match.
 
 ## Issues
 
@@ -99,7 +103,8 @@
 - c0f7a59 — fix(daemon): use USERPROFILE fallback path for sessions and tui log dirs
 - 56d8607 — docs(devlog): check in devlog entries for path fallbacks
 - 8606142 — feat(client): enable interactive terminal control and PTY resize propagation
-- HEAD — fix(client): reset terminal view on session update to avoid leak of mock content
+- 8c595a1 — fix(client): reset terminal view on session update to avoid leak of mock content
+- HEAD — feat(client): remove text box and send button to make terminal clean and native
 
 ## Next Steps
 

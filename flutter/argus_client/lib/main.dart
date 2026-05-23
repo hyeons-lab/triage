@@ -61,9 +61,6 @@ class ArgusHome extends StatefulWidget {
 }
 
 class _ArgusHomeState extends State<ArgusHome> {
-  final TextEditingController _commandController = TextEditingController();
-  final FocusNode _commandFocus = FocusNode();
-
   late final ArgusWebSocketClient _client;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
@@ -367,8 +364,6 @@ class _ArgusHomeState extends State<ArgusHome> {
 
   @override
   void dispose() {
-    _commandController.dispose();
-    _commandFocus.dispose();
     _client.disconnect();
     for (final s in _sessions) {
       s.terminalController.dispose();
@@ -380,7 +375,6 @@ class _ArgusHomeState extends State<ArgusHome> {
     setState(() {
       _selectedIndex = index;
     });
-    _commandFocus.requestFocus();
   }
 
   void _createSession() async {
@@ -440,7 +434,6 @@ class _ArgusHomeState extends State<ArgusHome> {
           _connectionStatusColor = const Color(0xffff6b6b);
         });
       }
-      _commandFocus.requestFocus();
       return;
     }
 
@@ -465,60 +458,6 @@ class _ArgusHomeState extends State<ArgusHome> {
       _sessions.insert(0, session);
       _selectedIndex = 0;
     });
-    _commandFocus.requestFocus();
-  }
-
-  void _sendCommand() async {
-    final command = _commandController.text.trim();
-    if (command.isEmpty) {
-      return;
-    }
-
-    if (_client.isConnected) {
-      final parts = _selectedSession.title.split(' / ');
-      final sessionId = parts.length > 1 ? parts[1] : null;
-
-      if (sessionId != null) {
-        setState(() {
-          _selectedSession.rows
-            ..add(_plainRow(''))
-            ..add(_promptRow(command));
-          _commandController.clear();
-        });
-
-        try {
-          final bytes = utf8.encode('$command\n');
-          await _client.writeInput(
-            sessionId: sessionId,
-            clientId: _clientId,
-            bytes: bytes,
-          );
-        } catch (e) {
-          setState(() {
-            _selectedSession.rows.add(_plainRow('Failed to send: $e'));
-          });
-          _selectedSession.terminalController.write(
-            '\r\nFailed to send: $e\r\n',
-          );
-        }
-        _commandFocus.requestFocus();
-        return;
-      }
-    }
-
-    setState(() {
-      _selectedSession.rows
-        ..add(_plainRow(''))
-        ..add(_promptRow(command))
-        ..add(_plainRow('queued for daemon transport (local fallback)'));
-      _selectedSession.status = 'running';
-      _selectedSession.statusColor = const Color(0xff7fd1c7);
-      _commandController.clear();
-    });
-    _selectedSession.terminalController.write(
-      '\r\n\x1B[1;38;2;127;209;199m\$ \x1B[0m\x1B[1m$command\x1B[0m\r\nqueued for daemon transport (local fallback)\r\n',
-    );
-    _commandFocus.requestFocus();
   }
 
   @override
@@ -540,14 +479,7 @@ class _ArgusHomeState extends State<ArgusHome> {
               thickness: 1,
               color: Color(0xff263033),
             ),
-            Expanded(
-              child: SessionWorkspace(
-                session: _selectedSession,
-                commandController: _commandController,
-                commandFocus: _commandFocus,
-                onSubmitCommand: _sendCommand,
-              ),
-            ),
+            Expanded(child: SessionWorkspace(session: _selectedSession)),
           ],
         ),
       ),
@@ -762,18 +694,9 @@ class SessionListTile extends StatelessWidget {
 }
 
 class SessionWorkspace extends StatelessWidget {
-  const SessionWorkspace({
-    super.key,
-    required this.session,
-    required this.commandController,
-    required this.commandFocus,
-    required this.onSubmitCommand,
-  });
+  const SessionWorkspace({super.key, required this.session});
 
   final SessionVm session;
-  final TextEditingController commandController;
-  final FocusNode commandFocus;
-  final VoidCallback onSubmitCommand;
 
   @override
   Widget build(BuildContext context) {
@@ -785,11 +708,6 @@ class SessionWorkspace extends StatelessWidget {
             controller: session.terminalController,
             fallbackRows: session.rows,
           ),
-        ),
-        CommandBar(
-          controller: commandController,
-          focusNode: commandFocus,
-          onSubmit: onSubmitCommand,
         ),
       ],
     );
@@ -846,67 +764,6 @@ class WorkspaceHeader extends StatelessWidget {
           ),
           const SizedBox(width: 16),
           const Icon(Icons.more_horiz, color: Color(0xffcdd7d6)),
-        ],
-      ),
-    );
-  }
-}
-
-class CommandBar extends StatelessWidget {
-  const CommandBar({
-    super.key,
-    required this.controller,
-    required this.focusNode,
-    required this.onSubmit,
-  });
-
-  final TextEditingController controller;
-  final FocusNode focusNode;
-  final VoidCallback onSubmit;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: 72,
-      padding: const EdgeInsets.fromLTRB(22, 12, 22, 14),
-      decoration: const BoxDecoration(
-        color: Color(0xff151a1d),
-        border: Border(top: BorderSide(color: Color(0xff263033))),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: controller,
-              focusNode: focusNode,
-              onSubmitted: (_) => onSubmit(),
-              textInputAction: TextInputAction.send,
-              decoration: InputDecoration(
-                hintText: 'Send input to selected session...',
-                hintStyle: const TextStyle(color: Color(0xff7f8b8d)),
-                filled: true,
-                fillColor: const Color(0xff0f1416),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 13,
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(color: Color(0xff2f3b3f)),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(color: Color(0xff7fd1c7)),
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          IconButton.filled(
-            onPressed: onSubmit,
-            tooltip: 'Send',
-            icon: const Icon(Icons.send),
-          ),
         ],
       ),
     );

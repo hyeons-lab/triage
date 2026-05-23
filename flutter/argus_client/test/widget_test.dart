@@ -1,9 +1,9 @@
 import 'dart:async';
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:argus_client/main.dart';
 import 'package:argus_client/services/argus_websocket_client.dart';
+import 'package:argus_client/widgets/terminal_pane.dart';
 
 class FakeArgusWebSocketClient extends ArgusWebSocketClient {
   FakeArgusWebSocketClient({this.shouldFailConnection = false})
@@ -153,7 +153,6 @@ void main() {
     expect(find.text('Argus'), findsOneWidget);
     expect(find.text('argus / flutter-spike'), findsWidgets);
     expect(find.text('Connected to Daemon'), findsOneWidget);
-    expect(find.byType(CommandBar), findsOneWidget);
   });
 
   testWidgets('selects sessions and sends input over WebSocket', (
@@ -167,11 +166,10 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('main'), findsOneWidget);
 
-    await tester.enterText(find.byType(TextField), 'pwd');
-    await tester.testTextInput.receiveAction(TextInputAction.send);
+    final terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+    terminalPane.controller.sendInput('pwd');
     await tester.pumpAndSettle();
 
-    expect(find.text(r'$ pwd'), findsOneWidget);
     expect(client.writeInputCalls.contains('main'), isTrue);
   });
 
