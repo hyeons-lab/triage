@@ -24,7 +24,8 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
-  static int _instanceCounter = 0;
+  static final Map<String, html.Element> _sessionContainers = {};
+  static final Set<String> _registeredViewTypes = {};
 
   late final String _viewType;
   late final html.DivElement _container;
@@ -41,8 +42,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void initState() {
     super.initState();
     final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
-    final instanceId = ++_instanceCounter;
-    _viewType = 'xterm-view-$sanitizedId-$instanceId';
+    _viewType = 'xterm-view-$sanitizedId';
 
     // 1. Create native container div
     _container = html.DivElement()
@@ -50,6 +50,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       ..style.height = '100%'
       ..style.backgroundColor = '#0d1113'
       ..style.overflow = 'hidden';
+
+    // Store/update the container for this session
+    _sessionContainers[sanitizedId] = _container;
 
     _container.onClick.listen((event) {
       if (_initialized) {
@@ -59,11 +62,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
-    // 2. Register the platform view factory
-    ui_web.platformViewRegistry.registerViewFactory(
-      _viewType,
-      (int viewId) => _container,
-    );
+    // 2. Register the platform view factory only if not already registered
+    if (!_registeredViewTypes.contains(_viewType)) {
+      ui_web.platformViewRegistry.registerViewFactory(
+        _viewType,
+        (int viewId) => _sessionContainers[sanitizedId] ?? html.DivElement(),
+      );
+      _registeredViewTypes.add(_viewType);
+    }
 
     _initTerminal();
   }
@@ -252,6 +258,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         js_util.callMethod(_term, 'dispose', []);
       } catch (_) {}
     }
+    final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _sessionContainers.remove(sanitizedId);
     super.dispose();
   }
 

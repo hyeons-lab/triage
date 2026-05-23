@@ -18,6 +18,7 @@
 - Antigravity, 2026-05-23T09:17-0700
 - Antigravity, 2026-05-23T09:24-0700
 - Antigravity, 2026-05-23T11:51-0700
+- Antigravity, 2026-05-23T12:15-0700
 
 ## Intent
 
@@ -110,6 +111,7 @@
 - 2026-05-23T09:17-0700 - Fixed session tab switching issue where returning to a previously active tab resulted in a blank/frozen terminal pane.
 - 2026-05-23T09:24-0700 - Implemented Close Session button and WebSocket shutdownSession logic in the client with empty placeholder UI fallback.
 - 2026-05-23T11:51-0700 - Addressed all PR review comments including map syntax, offline backspace index assignment, attachSession response unwrapping, layout fit performance, and daemon connection loop memory/CPU leak.
+- 2026-05-23T12:15-0700 - Refactored platform view factory registration in TerminalPaneWeb to register once per session ID, caching containers dynamically to prevent engine memory leaks.
 
 ## Issues
 
@@ -135,7 +137,8 @@
 - b88581c — fix(client): stabilize platform view type and key to resolve widget inspector crash
 - 77b21a2 — fix(client): ensure platform viewType uniqueness to fix session switching
 - fb93962 — feat(client): add Close Session button and wire WebSocket shutdownSession handler
-- HEAD — fix(client): address PR comments and fix daemon ws tight loop
+- 772c875 — fix(client): address PR comments and fix daemon ws tight loop
+- HEAD — fix(client): register platform view factory once per session to avoid leak
 
 ## Next Steps
 
