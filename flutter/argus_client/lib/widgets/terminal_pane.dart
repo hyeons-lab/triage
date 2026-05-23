@@ -1,0 +1,104 @@
+import 'terminal_pane_stub.dart'
+    if (dart.library.js_util) 'terminal_pane_web.dart'
+    as impl;
+
+class TerminalController {
+  final List<void Function(String)> _writeListeners = [];
+  final List<void Function()> _clearListeners = [];
+  final List<void Function(int, int)> _resizeListeners = [];
+  final List<void Function()> _fitListeners = [];
+  final List<void Function(String)> _inputListeners = [];
+  final List<void Function(int, int)> _resizeOutListeners = [];
+
+  final List<String> _writeBuffer = [];
+
+  void addWriteListener(void Function(String) listener) {
+    _writeListeners.add(listener);
+    if (_writeBuffer.isNotEmpty) {
+      for (final data in _writeBuffer) {
+        listener(data);
+      }
+      _writeBuffer.clear();
+    }
+  }
+
+  void removeWriteListener(void Function(String) listener) =>
+      _writeListeners.remove(listener);
+
+  void addClearListener(void Function() listener) =>
+      _clearListeners.add(listener);
+  void removeClearListener(void Function() listener) =>
+      _clearListeners.remove(listener);
+
+  void addResizeListener(void Function(int, int) listener) =>
+      _resizeListeners.add(listener);
+  void removeResizeListener(void Function(int, int) listener) =>
+      _resizeListeners.remove(listener);
+
+  void addFitListener(void Function() listener) => _fitListeners.add(listener);
+  void removeFitListener(void Function() listener) =>
+      _fitListeners.remove(listener);
+
+  void addInputListener(void Function(String) listener) =>
+      _inputListeners.add(listener);
+  void removeInputListener(void Function(String) listener) =>
+      _inputListeners.remove(listener);
+
+  void addResizeOutListener(void Function(int, int) listener) =>
+      _resizeOutListeners.add(listener);
+  void removeResizeOutListener(void Function(int, int) listener) =>
+      _resizeOutListeners.remove(listener);
+
+  void write(String data) {
+    if (_writeListeners.isEmpty) {
+      _writeBuffer.add(data);
+    } else {
+      for (final listener in List.from(_writeListeners)) {
+        listener(data);
+      }
+    }
+  }
+
+  void clear() {
+    for (final listener in List.from(_clearListeners)) {
+      listener();
+    }
+  }
+
+  void resize(int cols, int rows) {
+    for (final listener in List.from(_resizeListeners)) {
+      listener(cols, rows);
+    }
+  }
+
+  void fit() {
+    for (final listener in List.from(_fitListeners)) {
+      listener();
+    }
+  }
+
+  void sendInput(String data) {
+    for (final listener in List.from(_inputListeners)) {
+      listener(data);
+    }
+  }
+
+  void sendResizeOut(int cols, int rows) {
+    for (final listener in List.from(_resizeOutListeners)) {
+      listener(cols, rows);
+    }
+  }
+
+  void dispose() {
+    _writeListeners.clear();
+    _clearListeners.clear();
+    _resizeListeners.clear();
+    _fitListeners.clear();
+    _inputListeners.clear();
+    _resizeOutListeners.clear();
+    _writeBuffer.clear();
+  }
+}
+
+// Re-export the platform-specific implementation of TerminalPane
+typedef TerminalPane = impl.TerminalPane;

@@ -26,7 +26,9 @@ pub struct Config {
 }
 
 pub fn default_config() -> Result<Config> {
-    let home = std::env::var("HOME").context("HOME environment variable must be set")?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("neither HOME nor USERPROFILE environment variable is set")?;
     let log_file = PathBuf::from(home).join(".local/state/argus/argus.log");
     Ok(Config {
         log_file,

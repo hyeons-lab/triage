@@ -1,3 +1,7 @@
+#![cfg_attr(
+    windows,
+    allow(dead_code, clippy::needless_return, clippy::large_enum_variant)
+)]
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
@@ -667,6 +671,7 @@ fn default_log_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
             home.join(".local/state")

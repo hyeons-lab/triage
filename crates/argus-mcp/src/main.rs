@@ -1,3 +1,4 @@
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
