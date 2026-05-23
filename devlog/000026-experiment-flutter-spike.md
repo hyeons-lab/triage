@@ -9,6 +9,7 @@
 - Antigravity, 2026-05-23T07:56-0700
 - Antigravity, 2026-05-23T08:30-0700
 - Antigravity, 2026-05-23T08:39-0700
+- Antigravity, 2026-05-23T08:45-0700
 
 ## Intent
 
@@ -62,6 +63,7 @@
 - Switched the attach mode to `'InteractiveController'` in `main.dart` to allow keyboard events to write to the PTY.
 - Wired `addResizeOutListener` in `main.dart` to trigger `resizeSession` to propagate client viewport resizing back to the daemon.
 - Overrode `resizeSession` in `FakeArgusWebSocketClient` to avoid socket connection failures in test environments.
+- Reset xterm.js terminal instance and reload session styled rows in didUpdateWidget inside terminal_pane_web.dart, resolving layout leaks from the mock initial view.
 
 ## Progress
 
@@ -79,6 +81,7 @@
 - 2026-05-23T07:56-0700 - Fixed Windows configuration paths with USERPROFILE fallback, verified daemon port binding, and ran clean client tests.
 - 2026-05-23T08:30-0700 - Standardized Windows USERPROFILE fallback for sessions and TUI log directories, and committed the changes.
 - 2026-05-23T08:39-0700 - Fixed `ArgusWebSocketClient` syntax error, updated session attachment modes to `InteractiveController` and enabled viewport resize forwarding in `main.dart`, then formatted files and ran verification checks.
+- 2026-05-23T08:45-0700 - Fixed state reuse in TerminalPaneWeb by resetting terminal buffer and loading the active session's rows upon controller updates.
 
 ## Issues
 
@@ -95,7 +98,8 @@
 - b36aea3 — fix(daemon): fallback to USERPROFILE env var on Windows for config/logging paths
 - c0f7a59 — fix(daemon): use USERPROFILE fallback path for sessions and tui log dirs
 - 56d8607 — docs(devlog): check in devlog entries for path fallbacks
-- HEAD — feat(client): enable interactive terminal control and PTY resize propagation
+- 8606142 — feat(client): enable interactive terminal control and PTY resize propagation
+- HEAD — fix(client): reset terminal view on session update to avoid leak of mock content
 
 ## Next Steps
 

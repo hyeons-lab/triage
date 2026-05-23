@@ -206,6 +206,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.controller.removeResizeListener(_onResize);
       oldWidget.controller.removeFitListener(_onFit);
       _bindController();
+      if (_initialized) {
+        try {
+          js_util.callMethod(_term, 'reset', []);
+          _writeInitialContent();
+          _onFit();
+        } catch (_) {}
+      }
     }
   }
 
