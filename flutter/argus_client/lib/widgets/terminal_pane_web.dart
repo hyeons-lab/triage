@@ -24,6 +24,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final html.DivElement _container;
   late final dynamic _term;
   late final dynamic _fitAddon;
+  late final dynamic _onDataSubscription;
   bool _initialized = false;
 
   @override
@@ -74,12 +75,23 @@ class _TerminalPaneState extends State<TerminalPane> {
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
+      // 6b. Bind JS term.onData to controller
+      final onDataCallback = js_util.allowInterop((String data) {
+        widget.controller.sendInput(data);
+      });
+      _onDataSubscription = js_util.callMethod(_term, 'onData', [onDataCallback]);
+
       // 7. Write fallback initial content
       _writeInitialContent();
 
       // 8. Bind listeners to the controller
       _bindController();
       _initialized = true;
+
+      // 9. Delayed fits to handle timing/sizing latency
+      Future.delayed(const Duration(milliseconds: 50), _onFit);
+      Future.delayed(const Duration(milliseconds: 200), _onFit);
+      Future.delayed(const Duration(milliseconds: 600), _onFit);
     } catch (e) {
       debugPrint('Failed to initialize xterm.js: $e');
     }
@@ -178,6 +190,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _unbindController();
     if (_initialized) {
       try {
+        js_util.callMethod(_onDataSubscription, 'dispose', []);
         js_util.callMethod(_term, 'dispose', []);
       } catch (_) {}
     }

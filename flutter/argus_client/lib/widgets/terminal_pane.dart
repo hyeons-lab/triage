@@ -6,6 +6,7 @@ class TerminalController {
   final List<void Function()> _clearListeners = [];
   final List<void Function(int, int)> _resizeListeners = [];
   final List<void Function()> _fitListeners = [];
+  final List<void Function(String)> _inputListeners = [];
 
   void addWriteListener(void Function(String) listener) => _writeListeners.add(listener);
   void removeWriteListener(void Function(String) listener) => _writeListeners.remove(listener);
@@ -18,6 +19,9 @@ class TerminalController {
 
   void addFitListener(void Function() listener) => _fitListeners.add(listener);
   void removeFitListener(void Function() listener) => _fitListeners.remove(listener);
+
+  void addInputListener(void Function(String) listener) => _inputListeners.add(listener);
+  void removeInputListener(void Function(String) listener) => _inputListeners.remove(listener);
 
   void write(String data) {
     for (final listener in List.from(_writeListeners)) {
@@ -43,11 +47,18 @@ class TerminalController {
     }
   }
 
+  void sendInput(String data) {
+    for (final listener in List.from(_inputListeners)) {
+      listener(data);
+    }
+  }
+
   void dispose() {
     _writeListeners.clear();
     _clearListeners.clear();
     _resizeListeners.clear();
     _fitListeners.clear();
+    _inputListeners.clear();
   }
 }
 

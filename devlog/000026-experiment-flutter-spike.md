@@ -49,6 +49,7 @@
 - 2026-05-23T06:45-0700 - Added the cross-platform WebSocket adapter client service and integrated it into the UI shell, adding mock-based test coverage for all behaviors.
 - 2026-05-23T06:57-0700 - Defined TerminalPane rendering bridge by implementing matching structured Dart models for styled rows and spans, refactoring UI components to render styled rich text, and updating widget tests to match.
 - 2026-05-23T07:26-0700 - Integrated xterm.js in Flutter Web client with dynamic fitting, structured ANSI mapping, and platform-branched native testing stubs.
+- 2026-05-23T07:36-0700 - Resolved xterm.js layout fitting latency and wired interactive keyboard keypress input loops from the emulator back to the transport host.
 
 ## Issues
 
@@ -58,7 +59,8 @@
 
 ## Commits
 
-- HEAD — feat(client): implement websocket client and integrate xterm.js
+- 990697e — feat(client): implement websocket client and integrate xterm.js
+- HEAD — fix(client): address xterm.js layout latency and wire keyboard input loop
 
 ## Next Steps
 

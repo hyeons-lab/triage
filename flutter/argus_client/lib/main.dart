@@ -145,7 +145,53 @@ class _ArgusHomeState extends State<ArgusHome> {
         ],
       ),
     ];
+    for (final s in _sessions) {
+      _setupSessionInputListener(s);
+    }
     _initWebSocket();
+  }
+
+  void _setupSessionInputListener(SessionVm session) {
+    session.terminalController.addInputListener((keys) async {
+      if (_client.isConnected) {
+        final parts = session.title.split(' / ');
+        final sessionId = parts.length > 1 ? parts[1] : null;
+        if (sessionId != null) {
+          try {
+            await _client.writeInput(
+              sessionId: sessionId,
+              clientId: _clientId,
+              bytes: utf8.encode(keys),
+            );
+          } catch (_) {}
+        }
+      } else {
+        setState(() {
+          if (keys == '\r') {
+            session.rows.add(_plainRow(''));
+            session.terminalController.write('\r\n');
+          } else if (keys == '\x7f' || keys == '\x08') {
+            if (session.rows.isNotEmpty && session.rows.last.spans.isNotEmpty) {
+              final text = session.rows.last.spans.last.text;
+              if (text.isNotEmpty) {
+                final newText = text.substring(0, text.length - 1);
+                session.rows.last.spans.last = StyledSpan(
+                  text: newText,
+                  style: session.rows.last.spans.last.style,
+                );
+                session.terminalController.write('\x08 \x08');
+              }
+            }
+          } else {
+            if (session.rows.isEmpty) {
+              session.rows.add(_plainRow(''));
+            }
+            session.rows.last.spans.add(StyledSpan(text: keys, style: const TerminalStyle()));
+            session.terminalController.write(keys);
+          }
+        });
+      }
+    });
   }
 
   void _initWebSocket() async {
@@ -215,6 +261,7 @@ class _ArgusHomeState extends State<ArgusHome> {
           icon: Icons.terminal,
           rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
         );
+        _setupSessionInputListener(session);
         daemonSessions.add(session);
 
         final subId = await _client.subscribeSessionEvents(sessionId: sid);
@@ -353,6 +400,7 @@ class _ArgusHomeState extends State<ArgusHome> {
                 ? [_plainRow('Attached to session $sessionId')]
                 : rows,
           );
+          _setupSessionInputListener(session);
 
           final subId = await _client.subscribeSessionEvents(
             sessionId: sessionId,
@@ -378,24 +426,25 @@ class _ArgusHomeState extends State<ArgusHome> {
       return;
     }
 
+    final scratchId = _createdSessionCount + 1;
+    final session = SessionVm(
+      title: 'argus / scratch-$scratchId',
+      branch: 'experiment/flutter-spike',
+      status: 'idle',
+      statusColor: const Color(0xff7f8b8d),
+      icon: Icons.add_circle_outline,
+      rows: [
+        _promptRow('argus session new'),
+        _plainRow('created scratch session $scratchId'),
+        _plainRow(''),
+        _plainRow('ready'),
+      ],
+    );
+    _setupSessionInputListener(session);
+
     setState(() {
-      _createdSessionCount += 1;
-      _sessions.insert(
-        0,
-        SessionVm(
-          title: 'argus / scratch-$_createdSessionCount',
-          branch: 'experiment/flutter-spike',
-          status: 'idle',
-          statusColor: const Color(0xff7f8b8d),
-          icon: Icons.add_circle_outline,
-          rows: [
-            _promptRow('argus session new'),
-            _plainRow('created scratch session $_createdSessionCount'),
-            _plainRow(''),
-            _plainRow('ready'),
-          ],
-        ),
-      );
+      _createdSessionCount = scratchId;
+      _sessions.insert(0, session);
       _selectedIndex = 0;
     });
     _commandFocus.requestFocus();
