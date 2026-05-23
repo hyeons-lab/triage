@@ -1,4 +1,7 @@
-#![cfg_attr(windows, allow(dead_code, clippy::needless_return, clippy::large_enum_variant))]
+#![cfg_attr(
+    windows,
+    allow(dead_code, clippy::needless_return, clippy::large_enum_variant)
+)]
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs;

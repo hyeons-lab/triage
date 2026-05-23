@@ -413,6 +413,55 @@ pub trait SessionApi {
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
 }
 
+impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
+    fn list_sessions(&self) -> Result<Vec<SessionId>> {
+        (**self).list_sessions()
+    }
+    fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
+        (**self).start_session(request)
+    }
+    fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+        (**self).attach_session(request)
+    }
+    fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
+        (**self).subscribe_session_events(session_id)
+    }
+    fn subscribe_session_events_from(
+        &self,
+        request: SubscribeSessionEventsRequest,
+    ) -> Result<SessionEventReceiver> {
+        (**self).subscribe_session_events_from(request)
+    }
+    fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+        (**self).acquire_input_lease(request)
+    }
+    fn release_input_lease(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<LeaseChange> {
+        (**self).release_input_lease(session_id, client_id)
+    }
+    fn write_input(&self, request: WriteInputRequest) -> Result<()> {
+        (**self).write_input(request)
+    }
+    fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+        (**self).resize_session(request)
+    }
+    fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+        (**self).restore_session(request)
+    }
+    fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+        (**self).snapshot_session(session_id)
+    }
+    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+        (**self).styled_rows(request)
+    }
+    fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
+        (**self).shutdown_session(session_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

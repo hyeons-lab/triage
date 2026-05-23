@@ -17,6 +17,10 @@ tracing.workspace = true
 unicode-width.workspace = true
 wezterm-term.workspace = true
 wezterm-surface.workspace = true
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+argus-transport-ws = { path = "../argus-transport-ws" }
 
 [lints]
 workspace = true

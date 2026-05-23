@@ -4,6 +4,7 @@
 
 - Codex, 2026-05-22T19:28-0700
 - Antigravity, 2026-05-23T06:45-0700
+- Antigravity, 2026-05-23T07:48-0700
 
 ## Intent
 
@@ -18,6 +19,9 @@
 - Run the web spike with local Flutter web resources because this environment cannot reliably fetch CanvasKit and fonts from `gstatic`.
 - Use the cross-platform `web_socket_channel` package to ensure WebSocket compatibility across Web, Desktop, and Mobile.
 - Implement an automatic local mock fallback in the UI when the local daemon is unreachable so the application remains reviewable and interactive offline.
+- Implement a lightweight async WebSocket server using tokio and tokio-tungstenite, isolating the async runtime to the ws module. This scales without the limitations of a thread-per-connection model.
+- Use a split read/write loop with tokio's unbounded channel to ensure cancellation safety during concurrent read/write and tick select operations.
+- Set the event-polling interval to 10ms to achieve low-latency terminal rendering, minimizing perceived typing delay.
 
 ## What Changed
 
@@ -38,6 +42,11 @@
 - Designed platform-branched `TerminalPane` using conditional exports (`terminal_pane_stub.dart` and `terminal_pane_web.dart`) to keep widget tests running on native headless VMs.
 - Implemented `TerminalPaneWeb` using `dart:js_util` to instantiate `Terminal` (5.5.0) and `FitAddon` (0.10.0), mapping structured styled rows to ANSI sequences and handling viewport resizes via `LayoutBuilder`.
 - Updated `analysis_options.yaml` to exclude web-only imports in `terminal_pane_web.dart` from the cross-platform static analyzer.
+- Added tokio, tokio-tungstenite, and futures-util dependencies to the Cargo workspace.
+- Implemented a blanket SessionApi trait implementation for Arc<T> in argus-core.
+- Implemented the WebSocket server in crates/argus-daemon/src/ws.rs with split loops and a 10ms polling interval.
+- Exposed the ws module in crates/argus-daemon/src/lib.rs.
+- Updated crates/argus-daemon/src/main.rs to load the user's config and spawn the WebSocket server concurrently on startup.
 
 ## Progress
 
@@ -50,6 +59,7 @@
 - 2026-05-23T06:57-0700 - Defined TerminalPane rendering bridge by implementing matching structured Dart models for styled rows and spans, refactoring UI components to render styled rich text, and updating widget tests to match.
 - 2026-05-23T07:26-0700 - Integrated xterm.js in Flutter Web client with dynamic fitting, structured ANSI mapping, and platform-branched native testing stubs.
 - 2026-05-23T07:36-0700 - Resolved xterm.js layout fitting latency and wired interactive keyboard keypress input loops from the emulator back to the transport host.
+- 2026-05-23T07:48-0700 - Wrote the async WebSocket server implementation, resolved formatting and compiler warnings, and verified with cargo check/clippy/test.
 
 ## Issues
 
@@ -60,10 +70,10 @@
 ## Commits
 
 - 990697e — feat(client): implement websocket client and integrate xterm.js
-- HEAD — fix(client): address xterm.js layout latency and wire keyboard input loop
+- f42f3c5 — fix(client): address xterm.js layout latency and wire keyboard input loop
+- HEAD — feat(daemon): implement async websocket server for remote clients
 
 ## Next Steps
 
-- Wire the WebSocket server transport into the daemon runtime host.
 - Design user pairing authentication flows for remote clients.
 
