@@ -5,6 +5,7 @@
 - Codex, 2026-05-22T19:28-0700
 - Antigravity, 2026-05-23T06:45-0700
 - Antigravity, 2026-05-23T07:48-0700
+- Antigravity, 2026-05-23T07:51-0700
 
 ## Intent
 
@@ -22,6 +23,8 @@
 - Implement a lightweight async WebSocket server using tokio and tokio-tungstenite, isolating the async runtime to the ws module. This scales without the limitations of a thread-per-connection model.
 - Use a split read/write loop with tokio's unbounded channel to ensure cancellation safety during concurrent read/write and tick select operations.
 - Set the event-polling interval to 10ms to achieve low-latency terminal rendering, minimizing perceived typing delay.
+- Transition the WebSocket runtime to a single-threaded current_thread executor to improve resource efficiency.
+- Implement a graceful drain/flush sequence for connection cleanup by dropping the channel sender and awaiting the write task instead of calling abort.
 
 ## What Changed
 
@@ -47,6 +50,9 @@
 - Implemented the WebSocket server in crates/argus-daemon/src/ws.rs with split loops and a 10ms polling interval.
 - Exposed the ws module in crates/argus-daemon/src/lib.rs.
 - Updated crates/argus-daemon/src/main.rs to load the user's config and spawn the WebSocket server concurrently on startup.
+- Refactored crates/argus-daemon/src/ws.rs to use tokio::runtime::Builder::new_current_thread.
+- Replaced write_task.abort() with channel drop and task join to flush outgoing events during shutdown.
+- Set missed tick behavior for the 10ms interval to Skip.
 
 ## Progress
 
@@ -60,6 +66,7 @@
 - 2026-05-23T07:26-0700 - Integrated xterm.js in Flutter Web client with dynamic fitting, structured ANSI mapping, and platform-branched native testing stubs.
 - 2026-05-23T07:36-0700 - Resolved xterm.js layout fitting latency and wired interactive keyboard keypress input loops from the emulator back to the transport host.
 - 2026-05-23T07:48-0700 - Wrote the async WebSocket server implementation, resolved formatting and compiler warnings, and verified with cargo check/clippy/test.
+- 2026-05-23T07:51-0700 - Refactored the WebSocket server to use a single-threaded runtime, skip missed tick intervals, and await writer tasks on disconnect. Verified with full checks.
 
 ## Issues
 
@@ -70,10 +77,10 @@
 ## Commits
 
 - 990697e — feat(client): implement websocket client and integrate xterm.js
-- f42f3c5 — fix(client): address xterm.js layout latency and wire keyboard input loop
-- HEAD — feat(daemon): implement async websocket server for remote clients
+- f42f3c5 — fix(client): address xterm.js layout fitting latency and wire keyboard input loop
+- 4d1f6a5 — feat(daemon): implement async websocket server for remote clients
+- HEAD — refactor(daemon): optimize websocket server runtime and connection shutdown
 
 ## Next Steps
 
 - Design user pairing authentication flows for remote clients.
-

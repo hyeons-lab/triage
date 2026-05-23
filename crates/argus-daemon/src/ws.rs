@@ -12,7 +12,7 @@ use crate::session::SessionManager;
 
 /// Start the WebSocket server using a dedicated Tokio runtime.
 pub fn start_websocket_server(manager: Arc<SessionManager>, bind_addr: SocketAddr) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .thread_name("argus-ws-runtime")
         .build()
@@ -68,6 +68,7 @@ async fn handle_ws_connection(
 
     let mut conn = WebSocketSessionConnection::new(manager);
     let mut interval = tokio::time::interval(Duration::from_millis(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -111,7 +112,8 @@ async fn handle_ws_connection(
         }
     }
 
-    // Abort the write task when the read loop terminates to clean up
-    write_task.abort();
+    // Drop sender to signal writer task to finish, then await final flush
+    drop(tx);
+    let _ = write_task.await;
     Ok(())
 }
