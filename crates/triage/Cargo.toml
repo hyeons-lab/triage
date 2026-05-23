@@ -1,0 +1,21 @@
+[package]
+name = "triage"
+description = "Ratatui local client for the Triage terminal supervisor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+triage-core = { path = "../triage-core" }
+triaged = { path = "../triaged" }
+anyhow.workspace = true
+base64.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+tracing.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

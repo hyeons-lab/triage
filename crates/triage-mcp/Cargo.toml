@@ -1,0 +1,18 @@
+[package]
+name = "triage-mcp"
+description = "MCP server exposing Triage terminal sessions to local AI agents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+triage-core = { path = "../triage-core" }
+triaged = { path = "../triaged" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

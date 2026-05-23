@@ -1,7 +1,0 @@
----
-source: crates/argus-test-support/tests/snapshot_harness.rs
-expression: frame
----
-Argus
-repo: hyeons-lab/argus
-attention: awaiting-input

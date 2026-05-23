@@ -96,82 +96,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "argus-core"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "serde",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "argus-daemon"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "argus-core",
- "argus-transport-ws",
- "futures-util",
- "portable-pty",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "unicode-width 0.2.0",
- "wezterm-surface",
- "wezterm-term",
-]
-
-[[package]]
-name = "argus-mcp"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "argus-core",
- "argus-daemon",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "argus-test-support"
-version = "0.0.0"
-dependencies = [
- "alacritty_terminal",
- "insta",
- "vte",
- "wezterm-term",
-]
-
-[[package]]
-name = "argus-transport-ws"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "argus-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "argus-tui"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "argus-core",
- "argus-daemon",
- "base64",
- "crossterm",
- "ratatui",
- "tracing",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2777,6 +2701,82 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "triage"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "crossterm",
+ "ratatui",
+ "tracing",
+ "triage-core",
+ "triaged",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "triage-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "triage-mcp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "triage-core",
+ "triaged",
+]
+
+[[package]]
+name = "triage-test-support"
+version = "0.0.0"
+dependencies = [
+ "alacritty_terminal",
+ "insta",
+ "vte",
+ "wezterm-term",
+]
+
+[[package]]
+name = "triage-transport-ws"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "triage-core",
+]
+
+[[package]]
+name = "triaged"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "triage-core",
+ "triage-transport-ws",
+ "unicode-width 0.2.0",
+ "wezterm-surface",
+ "wezterm-term",
 ]
 
 [[package]]

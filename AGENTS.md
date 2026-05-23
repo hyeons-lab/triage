@@ -1,16 +1,16 @@
-# Argus — Project Conventions for Coding Agents
+# Triage — Project Conventions for Coding Agents
 
-Argus is an attention-routing terminal supervisor: a long-running Rust daemon, a Ratatui local TUI, a Flutter remote client (web / iOS / Android / optional desktop), and an MCP server, all sharing one session API. The full design doc lives at `devlog/argus-design-doc.md`.
+Triage is an attention-routing terminal supervisor: a long-running Rust daemon, a Ratatui local TUI, a Flutter remote client (web / iOS / Android / optional desktop), and an MCP server, all sharing one session API. The full design doc lives at `devlog/triage-design-doc.md`.
 
 ## Repository layout
 
 - `crates/` — Cargo workspace
-  - `argus-core` — session trait and shared types (every other crate depends on this)
-  - `argus-daemon` — long-running process; owns all session state
-  - `argus-tui` — Ratatui local client (terminal-mode)
-  - `argus-transport-ws` — WebSocket transport adapter, server-side (consumed by remote clients)
-  - `argus-mcp` — MCP server (stdio + optional TCP)
-- `flutter/argus_client/` — Flutter app (scaffolded after the local daemon/TUI and remote web path are proven)
+  - `triage-core` — session trait and shared types (every other crate depends on this)
+  - `triaged` — long-running process; owns all session state
+  - `triage` — Ratatui local client (terminal-mode)
+  - `triage-transport-ws` — WebSocket transport adapter, server-side (consumed by remote clients)
+  - `triage-mcp` — MCP server (stdio + optional TCP)
+- `flutter/triage_client/` — Flutter app (scaffolded after the local daemon/TUI and remote web path are proven)
 - `devlog/` — checked-in design notes, branch devlogs, and per-task plans.
 - `worktrees/` — gitignored.
 
@@ -89,7 +89,7 @@ Every push to GitHub triggers CI. CI runs are expensive — minimize waste:
 - `cargo clippy --all-targets --all-features -- -D warnings` — lint with warnings denied
 - `cargo check --workspace` — type-check the whole workspace
 - `cargo test --workspace` — run all tests
-- `cargo run -p argus-daemon` — start the daemon (writes to `$HOME/.local/state/argus/argus.log`)
+- `cargo run -p triaged` — start the daemon (writes to `$HOME/.local/state/triage/triaged.log`)
 
 ## Style
 

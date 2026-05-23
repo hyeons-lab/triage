@@ -1,0 +1,26 @@
+[package]
+name = "triaged"
+description = "Long-running daemon that owns Triage terminal session state."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+triage-core = { path = "../triage-core" }
+anyhow.workspace = true
+portable-pty.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+unicode-width.workspace = true
+wezterm-term.workspace = true
+wezterm-surface.workspace = true
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+triage-transport-ws = { path = "../triage-transport-ws" }
+
+[lints]
+workspace = true
