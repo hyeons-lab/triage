@@ -186,10 +186,28 @@ class _ArgusHomeState extends State<ArgusHome> {
             if (session.rows.isEmpty) {
               session.rows.add(_plainRow(''));
             }
-            session.rows.last.spans.add(StyledSpan(text: keys, style: const TerminalStyle()));
+            session.rows.last.spans.add(
+              StyledSpan(text: keys, style: const TerminalStyle()),
+            );
             session.terminalController.write(keys);
           }
         });
+      }
+    });
+
+    session.terminalController.addResizeOutListener((cols, rows) async {
+      if (_client.isConnected) {
+        final parts = session.title.split(' / ');
+        final sessionId = parts.length > 1 ? parts[1] : null;
+        if (sessionId != null) {
+          try {
+            await _client.resizeSession(
+              sessionId: sessionId,
+              cols: cols,
+              rows: rows,
+            );
+          } catch (_) {}
+        }
       }
     });
   }
@@ -240,7 +258,7 @@ class _ArgusHomeState extends State<ArgusHome> {
         final attachRes = await _client.attachSession(
           sessionId: sid,
           clientId: _clientId,
-          mode: 'Observer',
+          mode: 'InteractiveController',
         );
         final snapshot = attachRes['snapshot'] as Map<String, dynamic>?;
         final contextObj = snapshot?['context'] as Map<String, dynamic>?;
@@ -377,7 +395,7 @@ class _ArgusHomeState extends State<ArgusHome> {
           final attachRes = await _client.attachSession(
             sessionId: sessionId,
             clientId: _clientId,
-            mode: 'Observer',
+            mode: 'InteractiveController',
           );
           final snapshot = attachRes['snapshot'] as Map<String, dynamic>?;
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
@@ -479,7 +497,9 @@ class _ArgusHomeState extends State<ArgusHome> {
           setState(() {
             _selectedSession.rows.add(_plainRow('Failed to send: $e'));
           });
-          _selectedSession.terminalController.write('\r\nFailed to send: $e\r\n');
+          _selectedSession.terminalController.write(
+            '\r\nFailed to send: $e\r\n',
+          );
         }
         _commandFocus.requestFocus();
         return;

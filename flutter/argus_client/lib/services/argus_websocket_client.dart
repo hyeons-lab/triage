@@ -190,6 +190,25 @@ class ArgusWebSocketClient {
     });
   }
 
+  Future<Map<String, dynamic>> resizeSession({
+    required String sessionId,
+    required int cols,
+    required int rows,
+  }) async {
+    return _send('resize_session', {
+      'request': {
+        'session_id': sessionId,
+        'size': {
+          'rows': rows,
+          'cols': cols,
+          'pixel_width': cols * 10,
+          'pixel_height': rows * 20,
+          'dpi': 96,
+        },
+      },
+    });
+  }
+
   void _cleanupPendingRequests() {
     for (final completer in _pendingRequests.values) {
       if (!completer.isCompleted) {

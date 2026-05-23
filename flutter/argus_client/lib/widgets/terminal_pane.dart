@@ -1,5 +1,6 @@
 import 'terminal_pane_stub.dart'
-    if (dart.library.js_util) 'terminal_pane_web.dart' as impl;
+    if (dart.library.js_util) 'terminal_pane_web.dart'
+    as impl;
 
 class TerminalController {
   final List<void Function(String)> _writeListeners = [];
@@ -7,21 +8,36 @@ class TerminalController {
   final List<void Function(int, int)> _resizeListeners = [];
   final List<void Function()> _fitListeners = [];
   final List<void Function(String)> _inputListeners = [];
+  final List<void Function(int, int)> _resizeOutListeners = [];
 
-  void addWriteListener(void Function(String) listener) => _writeListeners.add(listener);
-  void removeWriteListener(void Function(String) listener) => _writeListeners.remove(listener);
+  void addWriteListener(void Function(String) listener) =>
+      _writeListeners.add(listener);
+  void removeWriteListener(void Function(String) listener) =>
+      _writeListeners.remove(listener);
 
-  void addClearListener(void Function() listener) => _clearListeners.add(listener);
-  void removeClearListener(void Function() listener) => _clearListeners.remove(listener);
+  void addClearListener(void Function() listener) =>
+      _clearListeners.add(listener);
+  void removeClearListener(void Function() listener) =>
+      _clearListeners.remove(listener);
 
-  void addResizeListener(void Function(int, int) listener) => _resizeListeners.add(listener);
-  void removeResizeListener(void Function(int, int) listener) => _resizeListeners.remove(listener);
+  void addResizeListener(void Function(int, int) listener) =>
+      _resizeListeners.add(listener);
+  void removeResizeListener(void Function(int, int) listener) =>
+      _resizeListeners.remove(listener);
 
   void addFitListener(void Function() listener) => _fitListeners.add(listener);
-  void removeFitListener(void Function() listener) => _fitListeners.remove(listener);
+  void removeFitListener(void Function() listener) =>
+      _fitListeners.remove(listener);
 
-  void addInputListener(void Function(String) listener) => _inputListeners.add(listener);
-  void removeInputListener(void Function(String) listener) => _inputListeners.remove(listener);
+  void addInputListener(void Function(String) listener) =>
+      _inputListeners.add(listener);
+  void removeInputListener(void Function(String) listener) =>
+      _inputListeners.remove(listener);
+
+  void addResizeOutListener(void Function(int, int) listener) =>
+      _resizeOutListeners.add(listener);
+  void removeResizeOutListener(void Function(int, int) listener) =>
+      _resizeOutListeners.remove(listener);
 
   void write(String data) {
     for (final listener in List.from(_writeListeners)) {
@@ -53,12 +69,19 @@ class TerminalController {
     }
   }
 
+  void sendResizeOut(int cols, int rows) {
+    for (final listener in List.from(_resizeOutListeners)) {
+      listener(cols, rows);
+    }
+  }
+
   void dispose() {
     _writeListeners.clear();
     _clearListeners.clear();
     _resizeListeners.clear();
     _fitListeners.clear();
     _inputListeners.clear();
+    _resizeOutListeners.clear();
   }
 }
 

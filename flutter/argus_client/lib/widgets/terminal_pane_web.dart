@@ -25,6 +25,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final dynamic _term;
   late final dynamic _fitAddon;
   late final dynamic _onDataSubscription;
+  late final dynamic _onResizeSubscription;
   bool _initialized = false;
 
   @override
@@ -57,10 +58,18 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(theme, 'foreground', '#d9e5e3');
       js_util.setProperty(theme, 'cursor', '#7fd1c7');
       js_util.setProperty(options, 'theme', theme);
-      js_util.setProperty(options, 'fontFamily', 'Consolas, Courier New, monospace');
+      js_util.setProperty(
+        options,
+        'fontFamily',
+        'Consolas, Courier New, monospace',
+      );
       js_util.setProperty(options, 'fontSize', 15);
       js_util.setProperty(options, 'cursorBlink', true);
-      js_util.setProperty(options, 'convertEol', true); // Normalizes \n to \r\n automatically!
+      js_util.setProperty(
+        options,
+        'convertEol',
+        true,
+      ); // Normalizes \n to \r\n automatically!
 
       // 4. Instantiate Terminal
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
@@ -71,7 +80,10 @@ class _TerminalPaneState extends State<TerminalPane> {
 
       // 6. Instantiate and Load FitAddon
       final fitAddonModule = js_util.getProperty(html.window, 'FitAddon');
-      final fitAddonConstructor = js_util.getProperty(fitAddonModule, 'FitAddon');
+      final fitAddonConstructor = js_util.getProperty(
+        fitAddonModule,
+        'FitAddon',
+      );
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
@@ -79,7 +91,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       final onDataCallback = js_util.allowInterop((String data) {
         widget.controller.sendInput(data);
       });
-      _onDataSubscription = js_util.callMethod(_term, 'onData', [onDataCallback]);
+      _onDataSubscription = js_util.callMethod(_term, 'onData', [
+        onDataCallback,
+      ]);
+
+      // 6c. Bind JS term.onResize to controller
+      final onResizeCallback = js_util.allowInterop((dynamic size) {
+        final cols = js_util.getProperty(size, 'cols') as int;
+        final rows = js_util.getProperty(size, 'rows') as int;
+        widget.controller.sendResizeOut(cols, rows);
+      });
+      _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
+        onResizeCallback,
+      ]);
 
       // 7. Write fallback initial content
       _writeInitialContent();
@@ -191,6 +215,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_initialized) {
       try {
         js_util.callMethod(_onDataSubscription, 'dispose', []);
+        js_util.callMethod(_onResizeSubscription, 'dispose', []);
         js_util.callMethod(_term, 'dispose', []);
       } catch (_) {}
     }

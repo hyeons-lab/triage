@@ -124,6 +124,18 @@ class FakeArgusWebSocketClient extends ArgusWebSocketClient {
     writeInputCalls.add(sessionId);
   }
 
+  final List<String> resizeSessionCalls = [];
+
+  @override
+  Future<Map<String, dynamic>> resizeSession({
+    required String sessionId,
+    required int cols,
+    required int rows,
+  }) async {
+    resizeSessionCalls.add('$sessionId:$cols:$rows');
+    return {};
+  }
+
   @override
   Future<void> disconnect() async {
     _connected = false;

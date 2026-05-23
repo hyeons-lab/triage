@@ -40,7 +40,8 @@ class _TerminalPaneState extends State<TerminalPane> {
                             fontFamily: 'Consolas',
                             fontSize: 15,
                             height: 1.35,
-                            color: span.style.foreground?.toColor() ??
+                            color:
+                                span.style.foreground?.toColor() ??
                                 const Color(0xffd9e5e3),
                             backgroundColor: span.style.background?.toColor(),
                             fontWeight: span.style.bold

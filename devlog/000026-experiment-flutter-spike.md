@@ -8,6 +8,7 @@
 - Antigravity, 2026-05-23T07:51-0700
 - Antigravity, 2026-05-23T07:56-0700
 - Antigravity, 2026-05-23T08:30-0700
+- Antigravity, 2026-05-23T08:39-0700
 
 ## Intent
 
@@ -57,6 +58,10 @@
 - Replaced write_task.abort() with channel drop and task join to flush outgoing events during shutdown.
 - Set missed tick behavior for the 10ms interval to Skip.
 - Added fallback check for USERPROFILE environment variable in default path and config resolution within crates/argus-core/src/logging.rs and crates/argus-core/src/config.rs.
+- Fixed syntax error in `ArgusWebSocketClient` caused by missing closing brace on `writeInput` method.
+- Switched the attach mode to `'InteractiveController'` in `main.dart` to allow keyboard events to write to the PTY.
+- Wired `addResizeOutListener` in `main.dart` to trigger `resizeSession` to propagate client viewport resizing back to the daemon.
+- Overrode `resizeSession` in `FakeArgusWebSocketClient` to avoid socket connection failures in test environments.
 
 ## Progress
 
@@ -73,6 +78,7 @@
 - 2026-05-23T07:51-0700 - Refactored the WebSocket server to use a single-threaded runtime, skip missed tick intervals, and await writer tasks on disconnect. Verified with full checks.
 - 2026-05-23T07:56-0700 - Fixed Windows configuration paths with USERPROFILE fallback, verified daemon port binding, and ran clean client tests.
 - 2026-05-23T08:30-0700 - Standardized Windows USERPROFILE fallback for sessions and TUI log directories, and committed the changes.
+- 2026-05-23T08:39-0700 - Fixed `ArgusWebSocketClient` syntax error, updated session attachment modes to `InteractiveController` and enabled viewport resize forwarding in `main.dart`, then formatted files and ran verification checks.
 
 ## Issues
 
@@ -87,7 +93,9 @@
 - 4d1f6a5 — feat(daemon): implement async websocket server for remote clients
 - f2c99b9 — refactor(daemon): optimize websocket server runtime and connection shutdown
 - b36aea3 — fix(daemon): fallback to USERPROFILE env var on Windows for config/logging paths
-- HEAD — fix(daemon): use USERPROFILE fallback path for sessions and tui log dirs
+- c0f7a59 — fix(daemon): use USERPROFILE fallback path for sessions and tui log dirs
+- 56d8607 — docs(devlog): check in devlog entries for path fallbacks
+- HEAD — feat(client): enable interactive terminal control and PTY resize propagation
 
 ## Next Steps
 
