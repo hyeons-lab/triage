@@ -22,6 +22,8 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
+  static int _instanceCounter = 0;
+
   late final String _viewType;
   late final html.DivElement _container;
   late final dynamic _term;
@@ -34,7 +36,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   void initState() {
     super.initState();
     final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
-    _viewType = 'xterm-view-$sanitizedId';
+    final instanceId = ++_instanceCounter;
+    _viewType = 'xterm-view-$sanitizedId-$instanceId';
 
     // 1. Create native container div
     _container = html.DivElement()
