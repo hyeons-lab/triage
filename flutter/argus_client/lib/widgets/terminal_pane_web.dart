@@ -96,7 +96,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
       // 6b. Bind JS term.onData to controller
-      final onDataCallback = js_util.allowInterop((String data) {
+      final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
         widget.controller.sendInput(data);
       });
       _onDataSubscription = js_util.callMethod(_term, 'onData', [
@@ -104,7 +104,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       ]);
 
       // 6c. Bind JS term.onResize to controller
-      final onResizeCallback = js_util.allowInterop((dynamic size) {
+      final onResizeCallback = js_util.allowInterop((
+        dynamic size, [
+        dynamic _,
+      ]) {
         final cols = js_util.getProperty(size, 'cols') as int;
         final rows = js_util.getProperty(size, 'rows') as int;
         widget.controller.sendResizeOut(cols, rows);

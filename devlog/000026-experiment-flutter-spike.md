@@ -13,6 +13,7 @@
 - Antigravity, 2026-05-23T08:50-0700
 - Antigravity, 2026-05-23T08:54-0700
 - Antigravity, 2026-05-23T08:59-0700
+- Antigravity, 2026-05-23T09:01-0700
 
 ## Intent
 
@@ -73,6 +74,7 @@
 - Resolved subscription timing race conditions in `_onWebSocketEvent` by looking up the `session_id` directly from the event payload.
 - Added auto-focus and `onClick` native container focus triggers to `TerminalPaneWeb` so `xterm.js` correctly receives keyboard input focus.
 - Swapped the initialization order of _initialized = true and _bindController() in terminal_pane_web.dart, resolving a bug where buffered early PTY events were discarded during listener setup.
+- Declared optional positional parameters [dynamic _] on the onData and onResize allowInterop callback closures in terminal_pane_web.dart, resolving runtime NoSuchMethodError argument mismatch failures when xterm.js dispatches extra arguments.
 
 ## Progress
 
@@ -94,6 +96,7 @@
 - 2026-05-23T08:50-0700 - Removed the deprecated bottom CommandBar and text input UI, allowing direct input via the xterm.js terminal instance, and adapted widget tests to match.
 - 2026-05-23T08:54-0700 - Added terminal input focus, write event buffering, and payload-based session routing to address race conditions and enable direct keystroke input.
 - 2026-05-23T08:59-0700 - Swapped initialization order in TerminalPaneWeb so early PTY outputs flushed from the controller's write buffer are not ignored.
+- 2026-05-23T09:01-0700 - Fixed JS-interop argument mismatch crashes in TerminalPaneWeb by declaring optional parameters for the onData and onResize listeners.
 
 ## Issues
 
@@ -114,7 +117,8 @@
 - 8c595a1 — fix(client): reset terminal view on session update to avoid leak of mock content
 - 56d803a — feat(client): remove text box and send button to make terminal clean and native
 - 32373d8 — feat(client): enable direct terminal focus, write buffering, and de-raced event routing
-- HEAD — fix(client): swap initialization order in terminal_pane_web to avoid discarding early buffered PTY events
+- 8665bc6 — fix(client): swap initialization order in terminal_pane_web to avoid discarding early buffered PTY events
+- HEAD — fix(client): declare optional callback parameters for JS interop to prevent arguments mismatch error
 
 ## Next Steps
 
