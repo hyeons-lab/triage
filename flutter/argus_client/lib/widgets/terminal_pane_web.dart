@@ -1,0 +1,198 @@
+import 'dart:html' as html;
+import 'dart:js_util' as js_util;
+import 'dart:ui_web' as ui_web;
+import 'package:flutter/material.dart';
+import 'package:argus_client/models/terminal_models.dart';
+import 'terminal_pane.dart';
+
+class TerminalPane extends StatefulWidget {
+  const TerminalPane({
+    super.key,
+    required this.controller,
+    required this.fallbackRows,
+  });
+
+  final TerminalController controller;
+  final List<StyledRow> fallbackRows;
+
+  @override
+  State<TerminalPane> createState() => _TerminalPaneState();
+}
+
+class _TerminalPaneState extends State<TerminalPane> {
+  late final String _viewType;
+  late final html.DivElement _container;
+  late final dynamic _term;
+  late final dynamic _fitAddon;
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _viewType = 'xterm-view-${widget.controller.hashCode}';
+
+    // 1. Create native container div
+    _container = html.DivElement()
+      ..style.width = '100%'
+      ..style.height = '100%'
+      ..style.backgroundColor = '#0d1113'
+      ..style.overflow = 'hidden';
+
+    // 2. Register the platform view factory
+    ui_web.platformViewRegistry.registerViewFactory(
+      _viewType,
+      (int viewId) => _container,
+    );
+
+    _initTerminal();
+  }
+
+  void _initTerminal() {
+    try {
+      // 3. Create Terminal Options JSObject
+      final options = js_util.newObject();
+      final theme = js_util.newObject();
+      js_util.setProperty(theme, 'background', '#0d1113');
+      js_util.setProperty(theme, 'foreground', '#d9e5e3');
+      js_util.setProperty(theme, 'cursor', '#7fd1c7');
+      js_util.setProperty(options, 'theme', theme);
+      js_util.setProperty(options, 'fontFamily', 'Consolas, Courier New, monospace');
+      js_util.setProperty(options, 'fontSize', 15);
+      js_util.setProperty(options, 'cursorBlink', true);
+      js_util.setProperty(options, 'convertEol', true); // Normalizes \n to \r\n automatically!
+
+      // 4. Instantiate Terminal
+      final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
+      _term = js_util.callConstructor(terminalConstructor, [options]);
+
+      // 5. Open Terminal in Container
+      js_util.callMethod(_term, 'open', [_container]);
+
+      // 6. Instantiate and Load FitAddon
+      final fitAddonModule = js_util.getProperty(html.window, 'FitAddon');
+      final fitAddonConstructor = js_util.getProperty(fitAddonModule, 'FitAddon');
+      _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
+      js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
+
+      // 7. Write fallback initial content
+      _writeInitialContent();
+
+      // 8. Bind listeners to the controller
+      _bindController();
+      _initialized = true;
+    } catch (e) {
+      debugPrint('Failed to initialize xterm.js: $e');
+    }
+  }
+
+  void _writeInitialContent() {
+    final sb = StringBuffer();
+    for (var i = 0; i < widget.fallbackRows.length; i++) {
+      sb.write(_styledRowToAnsi(widget.fallbackRows[i]));
+      if (i < widget.fallbackRows.length - 1) {
+        sb.write('\r\n');
+      }
+    }
+    js_util.callMethod(_term, 'write', [sb.toString()]);
+  }
+
+  String _styledSpanToAnsi(StyledSpan span) {
+    final sb = StringBuffer();
+    final style = span.style;
+    if (style.bold) sb.write('\x1B[1m');
+    if (style.dim) sb.write('\x1B[2m');
+    if (style.italic) sb.write('\x1B[3m');
+    if (style.underline) sb.write('\x1B[4m');
+    if (style.reverse) sb.write('\x1B[7m');
+    final fg = style.foreground;
+    if (fg != null) {
+      sb.write('\x1B[38;2;${fg.red};${fg.green};${fg.blue}m');
+    }
+    final bg = style.background;
+    if (bg != null) {
+      sb.write('\x1B[48;2;${bg.red};${bg.green};${bg.blue}m');
+    }
+    sb.write(span.text);
+    sb.write('\x1B[0m');
+    return sb.toString();
+  }
+
+  String _styledRowToAnsi(StyledRow row) {
+    final sb = StringBuffer();
+    for (final span in row.spans) {
+      sb.write(_styledSpanToAnsi(span));
+    }
+    return sb.toString();
+  }
+
+  void _bindController() {
+    widget.controller.addWriteListener(_onWrite);
+    widget.controller.addClearListener(_onClear);
+    widget.controller.addResizeListener(_onResize);
+    widget.controller.addFitListener(_onFit);
+  }
+
+  void _unbindController() {
+    widget.controller.removeWriteListener(_onWrite);
+    widget.controller.removeClearListener(_onClear);
+    widget.controller.removeResizeListener(_onResize);
+    widget.controller.removeFitListener(_onFit);
+  }
+
+  void _onWrite(String data) {
+    if (!_initialized) return;
+    js_util.callMethod(_term, 'write', [data]);
+  }
+
+  void _onClear() {
+    if (!_initialized) return;
+    js_util.callMethod(_term, 'clear', []);
+  }
+
+  void _onResize(int cols, int rows) {
+    if (!_initialized) return;
+    js_util.callMethod(_term, 'resize', [cols, rows]);
+  }
+
+  void _onFit() {
+    if (!_initialized) return;
+    try {
+      js_util.callMethod(_fitAddon, 'fit', []);
+    } catch (_) {}
+  }
+
+  @override
+  void didUpdateWidget(TerminalPane oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeWriteListener(_onWrite);
+      oldWidget.controller.removeClearListener(_onClear);
+      oldWidget.controller.removeResizeListener(_onResize);
+      oldWidget.controller.removeFitListener(_onFit);
+      _bindController();
+    }
+  }
+
+  @override
+  void dispose() {
+    _unbindController();
+    if (_initialized) {
+      try {
+        js_util.callMethod(_term, 'dispose', []);
+      } catch (_) {}
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          widget.controller.fit();
+        });
+        return HtmlElementView(viewType: _viewType);
+      },
+    );
+  }
+}
