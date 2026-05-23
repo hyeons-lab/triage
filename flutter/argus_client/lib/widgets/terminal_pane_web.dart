@@ -8,10 +8,12 @@ import 'terminal_pane.dart';
 class TerminalPane extends StatefulWidget {
   const TerminalPane({
     super.key,
+    required this.terminalId,
     required this.controller,
     required this.fallbackRows,
   });
 
+  final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
 
@@ -31,7 +33,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
-    _viewType = 'xterm-view-${widget.controller.hashCode}';
+    final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _viewType = 'xterm-view-$sanitizedId';
 
     // 1. Create native container div
     _container = html.DivElement()

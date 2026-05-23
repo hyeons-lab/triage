@@ -5,10 +5,12 @@ import 'terminal_pane.dart';
 class TerminalPane extends StatefulWidget {
   const TerminalPane({
     super.key,
+    required this.terminalId,
     required this.controller,
     required this.fallbackRows,
   });
 
+  final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
 

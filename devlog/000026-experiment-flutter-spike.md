@@ -14,6 +14,7 @@
 - Antigravity, 2026-05-23T08:54-0700
 - Antigravity, 2026-05-23T08:59-0700
 - Antigravity, 2026-05-23T09:01-0700
+- Antigravity, 2026-05-23T09:12-0700
 
 ## Intent
 
@@ -75,6 +76,8 @@
 - Added auto-focus and `onClick` native container focus triggers to `TerminalPaneWeb` so `xterm.js` correctly receives keyboard input focus.
 - Swapped the initialization order of _initialized = true and _bindController() in terminal_pane_web.dart, resolving a bug where buffered early PTY events were discarded during listener setup.
 - Declared optional positional parameters [dynamic _] on the onData and onResize allowInterop callback closures in terminal_pane_web.dart, resolving runtime NoSuchMethodError argument mismatch failures when xterm.js dispatches extra arguments.
+- Stabilized the `viewType` of `TerminalPane` on Web to be based on a sanitized version of `widget.terminalId` rather than dynamic `widget.controller.hashCode`, ensuring that platform view factories are not registered on the same view type repeatedly.
+- Passed `key: ValueKey(session.title)` and `terminalId: session.title` to `TerminalPane` inside `SessionWorkspace`, guaranteeing that `TerminalPane`'s state (including the native `xterm.js` instance and layout container) is cleanly disposed and recreated when switching between different tabs.
 
 ## Progress
 
@@ -97,6 +100,7 @@
 - 2026-05-23T08:54-0700 - Added terminal input focus, write event buffering, and payload-based session routing to address race conditions and enable direct keystroke input.
 - 2026-05-23T08:59-0700 - Swapped initialization order in TerminalPaneWeb so early PTY outputs flushed from the controller's write buffer are not ignored.
 - 2026-05-23T09:01-0700 - Fixed JS-interop argument mismatch crashes in TerminalPaneWeb by declaring optional parameters for the onData and onResize listeners.
+- 2026-05-23T09:12-0700 - Fixed widget inspector/diagnostics crash on Flutter Web caused by platform view type changes during session/controller swaps.
 
 ## Issues
 
@@ -118,7 +122,8 @@
 - 56d803a — feat(client): remove text box and send button to make terminal clean and native
 - 32373d8 — feat(client): enable direct terminal focus, write buffering, and de-raced event routing
 - 8665bc6 — fix(client): swap initialization order in terminal_pane_web to avoid discarding early buffered PTY events
-- HEAD — fix(client): declare optional callback parameters for JS interop to prevent arguments mismatch error
+- bac92c1 — fix(client): declare optional callback parameters for JS interop to prevent arguments mismatch error
+- HEAD — fix(client): stabilize platform view type and key to resolve widget inspector crash
 
 ## Next Steps
 

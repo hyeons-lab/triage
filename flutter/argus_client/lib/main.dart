@@ -705,6 +705,8 @@ class SessionWorkspace extends StatelessWidget {
         WorkspaceHeader(session: session),
         Expanded(
           child: TerminalPane(
+            key: ValueKey(session.title),
+            terminalId: session.title,
             controller: session.terminalController,
             fallbackRows: session.rows,
           ),
