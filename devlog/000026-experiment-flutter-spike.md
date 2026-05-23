@@ -7,6 +7,7 @@
 - Antigravity, 2026-05-23T07:48-0700
 - Antigravity, 2026-05-23T07:51-0700
 - Antigravity, 2026-05-23T07:56-0700
+- Antigravity, 2026-05-23T08:30-0700
 
 ## Intent
 
@@ -71,6 +72,7 @@
 - 2026-05-23T07:48-0700 - Wrote the async WebSocket server implementation, resolved formatting and compiler warnings, and verified with cargo check/clippy/test.
 - 2026-05-23T07:51-0700 - Refactored the WebSocket server to use a single-threaded runtime, skip missed tick intervals, and await writer tasks on disconnect. Verified with full checks.
 - 2026-05-23T07:56-0700 - Fixed Windows configuration paths with USERPROFILE fallback, verified daemon port binding, and ran clean client tests.
+- 2026-05-23T08:30-0700 - Standardized Windows USERPROFILE fallback for sessions and TUI log directories, and committed the changes.
 
 ## Issues
 
@@ -84,7 +86,8 @@
 - f42f3c5 — fix(client): address xterm.js layout fitting latency and wire keyboard input loop
 - 4d1f6a5 — feat(daemon): implement async websocket server for remote clients
 - f2c99b9 — refactor(daemon): optimize websocket server runtime and connection shutdown
-- HEAD — fix(daemon): fallback to USERPROFILE env var on Windows for config/logging paths
+- b36aea3 — fix(daemon): fallback to USERPROFILE env var on Windows for config/logging paths
+- HEAD — fix(daemon): use USERPROFILE fallback path for sessions and tui log dirs
 
 ## Next Steps
 
