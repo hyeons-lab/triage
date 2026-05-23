@@ -35,7 +35,9 @@ impl Config {
     }
 
     pub fn default_path() -> Result<PathBuf> {
-        let home = std::env::var("HOME").context("HOME environment variable must be set")?;
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .context("neither HOME nor USERPROFILE environment variable is set")?;
         Ok(PathBuf::from(home).join(".config/argus/config.toml"))
     }
 
