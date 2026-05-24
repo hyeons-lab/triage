@@ -14,6 +14,7 @@ class TriageWebSocketClient {
   WebSocketChannel? _channel;
 
   final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
+  final Map<String, Timer> _requestTimers = {};
   final StreamController<Map<String, dynamic>> _eventController =
       StreamController<Map<String, dynamic>>.broadcast();
 
@@ -35,10 +36,15 @@ class TriageWebSocketClient {
         onError: (error) {
           _cleanupPendingRequests();
           _channel = null;
+          _eventController.add({
+            'type': 'connection_closed',
+            'error': error.toString(),
+          });
         },
         onDone: () {
           _cleanupPendingRequests();
           _channel = null;
+          _eventController.add({'type': 'connection_closed'});
         },
       );
     } catch (error) {
@@ -57,12 +63,14 @@ class TriageWebSocketClient {
         final id = message['id']?.toString();
         final result = message['result'] as Map<String, dynamic>?;
         if (id != null && _pendingRequests.containsKey(id)) {
+          _requestTimers.remove(id)?.cancel();
           _pendingRequests.remove(id)!.complete(result ?? {});
         }
       } else if (type == 'error') {
         final id = message['id']?.toString();
         final error = message['error'] as Map<String, dynamic>?;
         if (id != null && _pendingRequests.containsKey(id)) {
+          _requestTimers.remove(id)?.cancel();
           final errorMessage = error != null
               ? (error['message'] ?? error['code'] ?? 'Unknown error')
               : 'Unknown error';
@@ -89,6 +97,12 @@ class TriageWebSocketClient {
     final id = 'req-${_requestIdCounter++}';
     final completer = Completer<Map<String, dynamic>>();
     _pendingRequests[id] = completer;
+    _requestTimers[id] = Timer(const Duration(seconds: 10), () {
+      if (_pendingRequests.remove(id) == completer && !completer.isCompleted) {
+        completer.completeError(Exception('WebSocket request timed out'));
+      }
+      _requestTimers.remove(id);
+    });
 
     final payload = <String, dynamic>{'id': id, 'type': type};
     if (extra != null) {
@@ -99,6 +113,7 @@ class TriageWebSocketClient {
       _channel!.sink.add(jsonEncode(payload));
     } catch (e) {
       _pendingRequests.remove(id);
+      _requestTimers.remove(id)?.cancel();
       completer.completeError(e);
       rethrow;
     }
@@ -114,10 +129,7 @@ class TriageWebSocketClient {
   }
 
   Future<String> pair({required String code, required String clientId}) async {
-    final response = await _send('pair', {
-      'code': code,
-      'client_id': clientId,
-    });
+    final response = await _send('pair', {'code': code, 'client_id': clientId});
     return response['token']?.toString() ?? '';
   }
 
@@ -210,9 +222,7 @@ class TriageWebSocketClient {
   }
 
   Future<void> shutdownSession({required String sessionId}) async {
-    await _send('shutdown_session', {
-      'session_id': sessionId,
-    });
+    await _send('shutdown_session', {'session_id': sessionId});
   }
 
   Future<Map<String, dynamic>> styledRows({
@@ -221,15 +231,15 @@ class TriageWebSocketClient {
     required int end,
   }) async {
     return _send('styled_rows', {
-      'request': {
-        'session_id': sessionId,
-        'start': start,
-        'end': end,
-      },
+      'request': {'session_id': sessionId, 'start': start, 'end': end},
     });
   }
 
   void _cleanupPendingRequests() {
+    for (final timer in _requestTimers.values) {
+      timer.cancel();
+    }
+    _requestTimers.clear();
     for (final completer in _pendingRequests.values) {
       if (!completer.isCompleted) {
         completer.completeError(Exception('WebSocket connection closed'));

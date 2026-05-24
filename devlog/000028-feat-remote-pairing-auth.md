@@ -55,6 +55,8 @@
 - 2026-05-24T07:50-0700 Removed temporary debug prints and diagnostic overlays, restoring production layout structure.
 - 2026-05-24T07:51-0700 Critically reviewed changes and removed all remaining temporary console logging in terminal_pane_web.dart.
 - 2026-05-24T08:33-0700 Fixed Flutter pairing client identity by generating and persisting a per-install client id alongside the bearer token, preventing one paired device from invalidating another device's token.
+- 2026-05-24T09:47-0700 Guarded daemon-backed sessions against local mock input editing so typed text and backspace no longer overwrite fallback terminal content when the WebSocket drops, requests stall, xterm focus drifts, or a session exits.
+- 2026-05-24T09:47-0700 Added automatic Flutter WebSocket reconnect attempts while the UI remains mounted, with explicit connection-closed events from the WebSocket client and reconnect test coverage.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -71,6 +73,7 @@
 - 2026-05-24T07:34-0700 Consolidate mouse wheel scrolling into a single, global static window listener that dynamically routes events to the active terminal's container bounds to prevent lifecycle leaks and race conditions on tab/session switching.
 - 2026-05-24T07:35-0700 Implement cross-browser scroll metrics fallbacks and workspace bounds coordinate fallback checking (x > 250, y > 50) to guarantee reliable scroll interception regardless of browser driver configurations.
 - 2026-05-24T08:33-0700 Preserve the daemon's single token hash per `ClientId` model and make remote Flutter installs unique at the client layer, which avoids widening the daemon authentication state for this review fix.
+- 2026-05-24T09:47-0700 Treat daemon-backed sessions as remote even after transport loss; offline mock editing remains only for mock sessions, not stale attached sessions.
 
 ## Commits
 - f7ec173 — feat: implement remote client pairing and secure token authorization
@@ -83,7 +86,8 @@
 - c6777b4 — fix: implement robust dual-layer DOM and dynamic JS Tab key focus capture
 - 39da11d — fix: address PR review comments and resolve clippy errors
 - 2207b53 — feat: switch pairing PIN to 8-char Crockford Base32
-- HEAD — fix: address remote client review follow-ups
+- 0156828 — fix: address remote client review follow-ups
+- HEAD — fix: reconnect remote client automatically
 
 ## Next Steps
 - None.

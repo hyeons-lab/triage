@@ -43,6 +43,7 @@ class SessionVm {
     required this.icon,
     required this.rows,
     required this.outputSeq,
+    this.isRemote = false,
   }) : terminalController = TerminalController();
 
   final String title;
@@ -53,6 +54,7 @@ class SessionVm {
   final List<StyledRow> rows;
   final TerminalController terminalController;
   int outputSeq;
+  final bool isRemote;
 }
 
 class TriageHome extends StatefulWidget {
@@ -67,6 +69,11 @@ class TriageHome extends StatefulWidget {
 class _TriageHomeState extends State<TriageHome> {
   late TriageWebSocketClient _client;
   bool _clientInitialized = false;
+  bool _isConnecting = false;
+  bool _disposed = false;
+  int _connectGeneration = 0;
+  int _reconnectAttempt = 0;
+  Timer? _reconnectTimer;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
   bool _needsPairing = false;
@@ -159,7 +166,7 @@ class _TriageHomeState extends State<TriageHome> {
     for (final s in _sessions) {
       _setupSessionInputListener(s);
     }
-    _initWebSocket();
+    _connectWebSocket();
   }
 
   String _loadOrCreateClientId() {
@@ -178,9 +185,41 @@ class _TriageHomeState extends State<TriageHome> {
     return clientId;
   }
 
+  bool _isRemoteSession(SessionVm session) {
+    return session.isRemote;
+  }
+
+  void _markRemoteSessionDisconnected(SessionVm session) {
+    if (session.status == 'disconnected') return;
+    setState(() {
+      session.status = 'disconnected';
+      session.statusColor = const Color(0xffff6b6b);
+      _connectionStatus = 'Connection Closed';
+      _connectionStatusColor = const Color(0xff7f8b8d);
+    });
+  }
+
+  void _markAttachedSessionsDisconnected() {
+    for (final session in _sessions) {
+      if (session.status == 'attached') {
+        session.status = 'disconnected';
+        session.statusColor = const Color(0xffff6b6b);
+      }
+    }
+  }
+
   void _setupSessionInputListener(SessionVm session) {
     session.terminalController.addInputListener((keys) {
-      if (_client.isConnected && session.status == 'attached') {
+      if (_isRemoteSession(session)) {
+        if (session.status != 'attached') {
+          return;
+        }
+
+        if (!_client.isConnected) {
+          _markRemoteSessionDisconnected(session);
+          return;
+        }
+
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
@@ -190,7 +229,9 @@ class _TriageHomeState extends State<TriageHome> {
                 clientId: _clientId,
                 bytes: utf8.encode(keys),
               )
-              .catchError((_) {});
+              .catchError((_) {
+                _markRemoteSessionDisconnected(session);
+              });
         }
       } else {
         setState(() {
@@ -236,7 +277,35 @@ class _TriageHomeState extends State<TriageHome> {
     });
   }
 
-  void _initWebSocket() async {
+  Duration _nextReconnectDelay() {
+    final seconds = 1 << _reconnectAttempt.clamp(0, 4);
+    _reconnectAttempt += 1;
+    return Duration(seconds: seconds);
+  }
+
+  void _scheduleReconnect() {
+    if (_disposed || _needsPairing || _reconnectTimer?.isActive == true) {
+      return;
+    }
+
+    final delay = _nextReconnectDelay();
+    setState(() {
+      _connectionStatus = 'Reconnecting...';
+      _connectionStatusColor = const Color(0xffffc857);
+      _markAttachedSessionsDisconnected();
+    });
+    _reconnectTimer = Timer(delay, () {
+      _reconnectTimer = null;
+      _connectWebSocket(isReconnect: true);
+    });
+  }
+
+  void _connectWebSocket({bool isReconnect = false}) async {
+    if (_disposed || _isConnecting) return;
+    _isConnecting = true;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    final generation = ++_connectGeneration;
     _bearerToken ??= retrieveToken();
     if (_clientInitialized) {
       try {
@@ -245,6 +314,11 @@ class _TriageHomeState extends State<TriageHome> {
       try {
         await _websocketSubscription?.cancel();
       } catch (_) {}
+    }
+
+    if (_disposed || generation != _connectGeneration) {
+      _isConnecting = false;
+      return;
     }
 
     final client =
@@ -261,10 +335,16 @@ class _TriageHomeState extends State<TriageHome> {
     try {
       await _client.connect();
 
+      if (_disposed || generation != _connectGeneration) {
+        await _client.disconnect();
+        _isConnecting = false;
+        return;
+      }
+
       _websocketSubscription = _client.events.listen(
         _onWebSocketEvent,
-        onError: _onWebSocketError,
-        onDone: _onWebSocketClosed,
+        onError: (error) => _onWebSocketError(error, generation),
+        onDone: () => _onWebSocketClosed(generation),
       );
 
       final helloRes = await _client.hello(
@@ -273,12 +353,18 @@ class _TriageHomeState extends State<TriageHome> {
       );
       final authenticated = helloRes['authenticated'] as bool? ?? false;
 
+      if (_disposed || generation != _connectGeneration) {
+        _isConnecting = false;
+        return;
+      }
+
       if (!authenticated) {
         setState(() {
           _needsPairing = true;
           _connectionStatus = 'Awaiting Pairing';
           _connectionStatusColor = const Color(0xffffc857);
         });
+        _isConnecting = false;
         return;
       }
 
@@ -289,7 +375,12 @@ class _TriageHomeState extends State<TriageHome> {
       });
 
       await _loadDaemonSessions();
+      _reconnectAttempt = 0;
     } catch (e) {
+      if (_disposed || generation != _connectGeneration) {
+        _isConnecting = false;
+        return;
+      }
       final errStr = e.toString();
       if (errStr.contains('unauthorized') ||
           errStr.contains('unauthenticated')) {
@@ -300,9 +391,17 @@ class _TriageHomeState extends State<TriageHome> {
         });
       } else {
         setState(() {
-          _connectionStatus = 'Offline (Local Mock)';
+          _connectionStatus = isReconnect
+              ? 'Reconnect Failed'
+              : 'Offline (Local Mock)';
           _connectionStatusColor = const Color(0xff7f8b8d);
+          _markAttachedSessionsDisconnected();
         });
+        _scheduleReconnect();
+      }
+    } finally {
+      if (generation == _connectGeneration) {
+        _isConnecting = false;
       }
     }
   }
@@ -314,7 +413,8 @@ class _TriageHomeState extends State<TriageHome> {
         _bearerToken = token;
         persistToken(token);
       });
-      _initWebSocket();
+      _reconnectAttempt = 0;
+      _connectWebSocket();
     } else {
       throw Exception('Server returned empty pairing token');
     }
@@ -378,6 +478,7 @@ class _TriageHomeState extends State<TriageHome> {
             icon: Icons.terminal,
             rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
             outputSeq: snapshot?['output_seq'] as int? ?? 0,
+            isRemote: true,
           );
           _setupSessionInputListener(session);
           daemonSessions.add(session);
@@ -424,6 +525,11 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _onWebSocketEvent(Map<String, dynamic> message) {
     final type = message['type'] as String?;
+    if (type == 'connection_closed') {
+      _onWebSocketClosed(_connectGeneration);
+      return;
+    }
+
     if (type == 'event') {
       final envelope = message['envelope'] as Map<String, dynamic>?;
       final event = envelope?['event'] as Map<String, dynamic>?;
@@ -488,22 +594,31 @@ class _TriageHomeState extends State<TriageHome> {
     }
   }
 
-  void _onWebSocketError(dynamic error) {
+  void _onWebSocketError(dynamic error, int generation) {
+    if (_disposed || generation != _connectGeneration) return;
     setState(() {
       _connectionStatus = 'Error';
       _connectionStatusColor = const Color(0xffff6b6b);
+      _markAttachedSessionsDisconnected();
     });
+    _scheduleReconnect();
   }
 
-  void _onWebSocketClosed() {
+  void _onWebSocketClosed(int generation) {
+    if (_disposed || generation != _connectGeneration) return;
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
+      _markAttachedSessionsDisconnected();
     });
+    _scheduleReconnect();
   }
 
   @override
   void dispose() {
+    _disposed = true;
+    _connectGeneration++;
+    _reconnectTimer?.cancel();
     if (_clientInitialized) {
       _client.disconnect();
       _websocketSubscription?.cancel();
@@ -585,6 +700,7 @@ class _TriageHomeState extends State<TriageHome> {
                 ? [_plainRow('Attached to session $sessionId')]
                 : rows,
             outputSeq: snapshot?['output_seq'] as int? ?? 0,
+            isRemote: true,
           );
           _setupSessionInputListener(session);
 
@@ -696,6 +812,7 @@ class _TriageHomeState extends State<TriageHome> {
                   try {
                     _client.disconnect();
                     _websocketSubscription?.cancel();
+                    _reconnectTimer?.cancel();
                   } catch (_) {}
                   setState(() {
                     _needsPairing = false;

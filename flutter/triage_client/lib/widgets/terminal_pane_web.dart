@@ -96,7 +96,17 @@ class _TerminalPaneState extends State<TerminalPane> {
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         final activeEl = html.document.activeElement;
-        if (activeEl != null && _container.contains(activeEl)) {
+        final path =
+            js_util.callMethod(event, 'composedPath', []) as List<dynamic>?;
+        final activeElementInTerminal =
+            activeEl != null && _container.contains(activeEl);
+        final eventPathInTerminal =
+            path != null && path.any((node) => identical(node, _container));
+        final shouldHandleTerminalKey =
+            activeElementInTerminal ||
+            eventPathInTerminal ||
+            _focusNode.hasFocus;
+        if (shouldHandleTerminalKey) {
           if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
             event.preventDefault();
             event.stopPropagation();
@@ -132,6 +142,13 @@ class _TerminalPaneState extends State<TerminalPane> {
                   }
                 })
                 .catchError((_) {});
+          } else if (!activeElementInTerminal) {
+            final input = _keyboardEventToInput(event);
+            if (input != null) {
+              event.preventDefault();
+              event.stopPropagation();
+              widget.controller.sendInput(input);
+            }
           }
         }
       }
@@ -358,6 +375,47 @@ class _TerminalPaneState extends State<TerminalPane> {
     try {
       js_util.callMethod(_fitAddon, 'fit', []);
     } catch (_) {}
+  }
+
+  String? _keyboardEventToInput(html.KeyboardEvent event) {
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      if (event.ctrlKey && event.key.toLowerCase() == 'c') {
+        return '\x03';
+      }
+      return null;
+    }
+
+    switch (event.key) {
+      case 'Enter':
+        return '\r';
+      case 'Backspace':
+        return '\x7f';
+      case 'Escape':
+        return '\x1b';
+      case 'ArrowUp':
+        return '\x1b[A';
+      case 'ArrowDown':
+        return '\x1b[B';
+      case 'ArrowRight':
+        return '\x1b[C';
+      case 'ArrowLeft':
+        return '\x1b[D';
+      case 'Home':
+        return '\x1b[H';
+      case 'End':
+        return '\x1b[F';
+      case 'PageUp':
+        return '\x1b[5~';
+      case 'PageDown':
+        return '\x1b[6~';
+      case 'Delete':
+        return '\x1b[3~';
+    }
+
+    if (event.key.length == 1) {
+      return event.key;
+    }
+    return null;
   }
 
   @override

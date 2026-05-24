@@ -7,13 +7,16 @@ import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
-  FakeTriageWebSocketClient({this.shouldFailConnection = false})
-    : super(Uri.parse('ws://localhost:8080/ws'));
+  FakeTriageWebSocketClient({
+    this.shouldFailConnection = false,
+    this.failConnectAttempts = 0,
+  }) : super(Uri.parse('ws://localhost:8080/ws'));
 
   final bool shouldFailConnection;
+  int failConnectAttempts;
 
-  final StreamController<Map<String, dynamic>> _testEventController =
-      StreamController<Map<String, dynamic>>.broadcast();
+  StreamController<Map<String, dynamic>> _testEventController =
+      StreamController<Map<String, dynamic>>.broadcast(sync: true);
 
   @override
   Stream<Map<String, dynamic>> get events => _testEventController.stream;
@@ -30,7 +33,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<void> connect() async {
-    if (shouldFailConnection) {
+    if (shouldFailConnection || failConnectAttempts > 0) {
+      if (failConnectAttempts > 0) {
+        failConnectAttempts -= 1;
+      }
       throw Exception('Connection failed');
     }
     _connected = true;
@@ -154,6 +160,22 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   Future<void> disconnect() async {
     _connected = false;
   }
+
+  Future<void> emitSocketClosed() async {
+    _connected = false;
+    _testEventController.add({'type': 'connection_closed'});
+  }
+
+  void emitExited(String sessionId) {
+    _testEventController.add({
+      'type': 'event',
+      'envelope': {
+        'event': {
+          'Exited': {'session_id': sessionId},
+        },
+      },
+    });
+  }
 }
 
 void main() {
@@ -202,16 +224,16 @@ void main() {
     expect(find.text('line 1 from scratch-1'), findsOneWidget);
   });
 
-  testWidgets('falls back to local mock sessions when connection fails', (
+  testWidgets('keeps retrying when connection fails', (
     WidgetTester tester,
   ) async {
     final client = FakeTriageWebSocketClient(shouldFailConnection: true);
     await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+    await tester.pump();
 
     expect(find.text('Triage'), findsOneWidget);
     expect(find.text('triage / flutter-spike'), findsWidgets);
-    expect(find.text('Offline (Local Mock)'), findsOneWidget);
+    expect(find.text('Reconnecting...'), findsOneWidget);
   });
 
   testWidgets('closes a session over WebSocket and removes it from the list', (
@@ -253,5 +275,60 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(secondClient.helloClientIds.single, client.helloClientIds.single);
+  });
+
+  testWidgets('does not locally edit daemon terminal after disconnect', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    final terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+    await client.disconnect();
+
+    terminalPane.controller.sendInput('typed while disconnected');
+    terminalPane.controller.sendInput('\x7f');
+    await tester.pumpAndSettle();
+
+    expect(client.writeInputCalls, isEmpty);
+    expect(find.textContaining('typed while disconnected'), findsNothing);
+    expect(find.text('disconnected'), findsWidgets);
+  });
+
+  testWidgets('does not locally edit daemon terminal after exit', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    client.emitExited('flutter-spike');
+    await tester.pumpAndSettle();
+
+    final terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+    terminalPane.controller.sendInput('typed after exit');
+    terminalPane.controller.sendInput('\x7f');
+    await tester.pumpAndSettle();
+
+    expect(client.writeInputCalls, isEmpty);
+    expect(find.textContaining('typed after exit'), findsNothing);
+    expect(find.text('exited'), findsWidgets);
+  });
+
+  testWidgets('reconnects while app is running after connection failure', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(failConnectAttempts: 1);
+    await tester.pumpWidget(TriageClientApp(client: client));
+
+    await tester.pump();
+    expect(client.helloClientIds, isEmpty);
+
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+
+    expect(client.helloClientIds.length, 1);
+    expect(find.text('Connected to Daemon'), findsOneWidget);
   });
 }
