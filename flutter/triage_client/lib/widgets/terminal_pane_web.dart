@@ -89,7 +89,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     }, true);
 
-    // Register global capture-phase listener to intercept Tab/Ctrl+C/Ctrl+V before Flutter's capture listener
+    // Register global capture-phase listener to intercept Tab/Ctrl+C before Flutter's capture listener
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         final activeEl = html.document.activeElement;
@@ -114,14 +114,6 @@ class _TerminalPaneState extends State<TerminalPane> {
               event.stopPropagation();
               html.window.navigator.clipboard?.writeText(selection).catchError((_) {});
             }
-          } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
-            event.preventDefault();
-            event.stopPropagation();
-            html.window.navigator.clipboard?.readText().then((text) {
-              if (text != null && text.isNotEmpty) {
-                widget.controller.sendInput(text);
-              }
-            }).catchError((_) {});
           }
         }
       }

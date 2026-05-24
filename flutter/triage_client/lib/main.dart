@@ -1102,7 +1102,7 @@ class _PairingViewState extends State<_PairingView> {
 
   Future<void> _submit() async {
     final pin = _pinController.text
-        .replaceAll(RegExp(r'\s+'), '')
+        .replaceAll(RegExp(r'[\s\-]+'), '')
         .toUpperCase()
         .replaceAll(RegExp(r'[IL]'), '1')
         .replaceAll('O', '0');

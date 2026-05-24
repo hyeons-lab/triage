@@ -113,11 +113,11 @@ const CROCKFORD_BASE32_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const PAIRING_CODE_LENGTH: usize = 8;
 
 /// Normalize a user-typed pairing code per Crockford Base32 rules:
-/// strip whitespace, uppercase, and map ambiguous characters (I/L → 1, O → 0).
+/// strip whitespace, hyphens, uppercase, and map ambiguous characters (I/L → 1, O → 0).
 fn normalize_pairing_code(input: &str) -> String {
     input
         .chars()
-        .filter(|c| !c.is_whitespace())
+        .filter(|c| !c.is_whitespace() && *c != '-')
         .map(|c| match c.to_ascii_uppercase() {
             'I' | 'L' => '1',
             'O' => '0',
@@ -319,7 +319,11 @@ impl SessionManager {
             + 300; // 5 minutes expiry
 
         let mut codes = self.pairing_codes()?;
-        codes.insert(code.clone(), Instant::now() + Duration::from_secs(300));
+        // Prune expired codes to prevent memory leaks
+        let now = Instant::now();
+        codes.retain(|_, expiry| *expiry > now);
+
+        codes.insert(code.clone(), now + Duration::from_secs(300));
 
         let pairing_code_path = self.config.log_dir.join("pairing_code.json");
         let info = serde_json::json!({
@@ -331,6 +335,13 @@ impl SessionManager {
             fs::create_dir_all(parent)?;
         }
         fs::write(&pairing_code_path, json)?;
+
+        // Set strict file permissions (0600) on Unix-like targets
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&pairing_code_path, std::fs::Permissions::from_mode(0o600));
+        }
 
         tracing::info!("generated new device pairing PIN");
 
@@ -2458,9 +2469,13 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
         if let Some(expiry) = codes.get(&normalized) {
             if Instant::now() > *expiry {
                 codes.remove(&normalized);
+                // Artificial delay to prevent brute-forcing
+                std::thread::sleep(std::time::Duration::from_millis(500));
                 anyhow::bail!("pairing PIN has expired");
             }
         } else {
+            // Artificial delay to prevent brute-forcing
+            std::thread::sleep(std::time::Duration::from_millis(500));
             anyhow::bail!("invalid pairing PIN");
         }
 
@@ -2478,6 +2493,14 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
         devices.insert(client_id.clone(), hash);
 
         save_paired_devices(&self.config.log_dir, &devices)?;
+
+        // Set strict file permissions (0600) on Unix-like targets
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let devices_path = self.config.log_dir.join("paired_devices.json");
+            let _ = std::fs::set_permissions(&devices_path, std::fs::Permissions::from_mode(0o600));
+        }
 
         let pairing_code_path = self.config.log_dir.join("pairing_code.json");
         if pairing_code_path.exists() {
@@ -4263,7 +4286,8 @@ mod tests {
         assert_eq!(normalize_pairing_code("abc def"), "ABCDEF");
         assert_eq!(normalize_pairing_code("oLi"), "011");
         assert_eq!(normalize_pairing_code("  9kxq4m7p  "), "9KXQ4M7P");
-        assert_eq!(normalize_pairing_code("Oil-LIO"), "011-110");
+        assert_eq!(normalize_pairing_code("Oil-LIO"), "011110");
+        assert_eq!(normalize_pairing_code("9KXQ-4M7P"), "9KXQ4M7P");
     }
 
     fn git_test_command(cwd: &PathBuf, args: &[&str]) {
