@@ -15,4 +15,5 @@
 
 ## Commits
 - 0fda0f6 — fix: resolve terminal session text wrapping coordinate mismatches and restore colored history
-- HEAD — fix: add clientWidth and clientHeight > 50 checks inside _onFit
+- 52d7113 — fix: add clientWidth and clientHeight > 50 checks inside _onFit
+- HEAD — fix: register native JS ResizeObserver on terminal wrapper for real-time fitting
