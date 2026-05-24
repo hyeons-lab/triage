@@ -109,7 +109,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              html.window.navigator.clipboard?.writeText(selection);
+              html.window.navigator.clipboard?.writeText(selection).catchError((_) {});
             }
           } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
             event.preventDefault();
@@ -118,7 +118,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               if (text != null && text.isNotEmpty) {
                 widget.controller.sendInput(text);
               }
-            });
+            }).catchError((_) {});
           }
         }
       }
@@ -202,7 +202,12 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (key == 'Tab') {
               js_util.callMethod(event, 'preventDefault', []);
               js_util.callMethod(event, 'stopPropagation', []);
-              widget.controller.sendInput('\t');
+              final shiftKey = js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+              if (shiftKey) {
+                widget.controller.sendInput('\x1B[Z'); // BackTab sequence
+              } else {
+                widget.controller.sendInput('\t');
+              }
               return false;
             }
             return true;

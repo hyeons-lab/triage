@@ -141,7 +141,6 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 let code = if error
                     .downcast_ref::<TransportError>()
                     .is_some_and(|e| matches!(e, TransportError::Unauthorized))
-                    || error.to_string() == "unauthorized"
                 {
                     "unauthorized"
                 } else {
