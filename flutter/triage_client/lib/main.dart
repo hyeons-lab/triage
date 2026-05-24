@@ -156,18 +156,16 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _setupSessionInputListener(SessionVm session) {
-    session.terminalController.addInputListener((keys) async {
+    session.terminalController.addInputListener((keys) {
       if (_client.isConnected && session.status == 'attached') {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          try {
-            await _client.writeInput(
-              sessionId: sessionId,
-              clientId: _clientId,
-              bytes: utf8.encode(keys),
-            );
-          } catch (_) {}
+          _client.writeInput(
+            sessionId: sessionId,
+            clientId: _clientId,
+            bytes: utf8.encode(keys),
+          ).catchError((_) {});
         }
       } else {
         setState(() {
@@ -200,18 +198,16 @@ class _TriageHomeState extends State<TriageHome> {
       }
     });
 
-    session.terminalController.addResizeOutListener((cols, rows) async {
+    session.terminalController.addResizeOutListener((cols, rows) {
       if (_client.isConnected && session.status == 'attached') {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          try {
-            await _client.resizeSession(
-              sessionId: sessionId,
-              cols: cols,
-              rows: rows,
-            );
-          } catch (_) {}
+          _client.resizeSession(
+            sessionId: sessionId,
+            cols: cols,
+            rows: rows,
+          ).catchError((_) {});
         }
       }
     });
