@@ -53,7 +53,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       ..style.width = '100%'
       ..style.height = '100%'
       ..style.backgroundColor = '#0d1113'
-      ..style.overflow = 'hidden';
+      ..style.overflow = 'hidden'
+      ..style.paddingLeft = '16px'
+      ..style.paddingRight = '16px'
+      ..style.boxSizing = 'border-box';
 
     // Store/update the container for this session
     _sessionContainers[sanitizedId] = _container;
@@ -403,10 +406,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
           return Container(
             color: const Color(0xff0d1113),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16.0),
-              child: HtmlElementView(viewType: _viewType),
-            ),
+            child: HtmlElementView(viewType: _viewType),
           );
         },
       ),
