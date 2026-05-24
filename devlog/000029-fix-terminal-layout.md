@@ -14,4 +14,5 @@
 - Wrap xterm.js container inside a native HTML outer and inner nested DivElement wrapper to separate padding margins from xterm.js column coordinate calculations.
 
 ## Commits
-- HEAD — fix: resolve terminal session text wrapping coordinate mismatches and restore colored history
+- 0fda0f6 — fix: resolve terminal session text wrapping coordinate mismatches and restore colored history
+- HEAD — fix: add clientWidth and clientHeight > 50 checks inside _onFit
