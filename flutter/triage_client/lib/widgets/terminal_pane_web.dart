@@ -20,6 +20,14 @@ class TerminalPane extends StatefulWidget {
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
 
+  static void destroySession(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
+    _TerminalPaneState._sessionContainers.remove(sanitizedId);
+  }
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }
