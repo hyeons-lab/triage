@@ -156,13 +156,13 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _setupSessionInputListener(SessionVm session) {
-    session.terminalController.addInputListener((keys) {
-      if (_client.isConnected) {
+    session.terminalController.addInputListener((keys) async {
+      if (_client.isConnected && session.status == 'attached') {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
           try {
-            _client.writeInput(
+            await _client.writeInput(
               sessionId: sessionId,
               clientId: _clientId,
               bytes: utf8.encode(keys),
@@ -200,13 +200,13 @@ class _TriageHomeState extends State<TriageHome> {
       }
     });
 
-    session.terminalController.addResizeOutListener((cols, rows) {
-      if (_client.isConnected) {
+    session.terminalController.addResizeOutListener((cols, rows) async {
+      if (_client.isConnected && session.status == 'attached') {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
           try {
-            _client.resizeSession(
+            await _client.resizeSession(
               sessionId: sessionId,
               cols: cols,
               rows: rows,
