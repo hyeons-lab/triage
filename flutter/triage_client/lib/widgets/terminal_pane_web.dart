@@ -1,5 +1,6 @@
 // ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
 
+import 'dart:async';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
@@ -21,11 +22,15 @@ class TerminalPane extends StatefulWidget {
   final List<StyledRow> fallbackRows;
 
   static void destroySession(String terminalId) {
-    final sanitizedId = terminalId.replaceAll(
-      RegExp(r'[^a-zA-Z0-9-]'),
-      '_',
-    );
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     _TerminalPaneState._sessionContainers.remove(sanitizedId);
+    final term = _TerminalPaneState._sessionTerms.remove(sanitizedId);
+    if (term != null) {
+      try {
+        js_util.callMethod(term, 'dispose', []);
+      } catch (_) {}
+    }
+    _TerminalPaneState._sessionFitAddons.remove(sanitizedId);
   }
 
   @override
@@ -34,16 +39,24 @@ class TerminalPane extends StatefulWidget {
 
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, html.Element> _sessionContainers = {};
+  static final Map<String, dynamic> _sessionTerms = {};
+  static final Map<String, dynamic> _sessionFitAddons = {};
   static final Set<String> _registeredViewTypes = {};
 
   late final String _viewType;
   late final html.DivElement _container;
+  late final html.DivElement _terminalWrapper;
   late final dynamic _term;
   late final dynamic _fitAddon;
-  late final dynamic _onDataSubscription;
-  late final dynamic _onResizeSubscription;
+  dynamic _onDataSubscription;
+  dynamic _onResizeSubscription;
+  dynamic _resizeObserver;
   late final FocusNode _focusNode;
   late final void Function(html.Event) _windowKeyDownListener;
+  late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
+  late final StreamSubscription<html.KeyboardEvent>
+      _containerKeyDownSubscription;
+  late final void Function(html.Event) _containerPasteListener;
   bool _initialized = false;
 
   double? _lastWidth;
@@ -59,48 +72,50 @@ class _TerminalPaneState extends State<TerminalPane> {
     );
     _viewType = 'xterm-view-$sanitizedId';
 
-    // 1. Create native container div
-    _container = html.DivElement()
-      ..style.width = '100%'
-      ..style.height = '100%'
-      ..style.backgroundColor = '#0d1113'
-      ..style.overflow = 'hidden'
-      ..style.paddingLeft = '16px'
-      ..style.paddingRight = '16px'
-      ..style.boxSizing = 'border-box';
+    final cachedContainer = _sessionContainers[sanitizedId];
+    final cachedTerm = _sessionTerms[sanitizedId];
+    final cachedFitAddon = _sessionFitAddons[sanitizedId];
+    if (cachedContainer != null &&
+        cachedTerm != null &&
+        cachedFitAddon != null &&
+        cachedContainer.children.isNotEmpty) {
+      _container = cachedContainer as html.DivElement;
+      _terminalWrapper = _container.children.first as html.DivElement;
+      _term = cachedTerm;
+      _fitAddon = cachedFitAddon;
+      _initialized = true;
+      _bindController();
+      _bindTerminalSubscriptions();
 
-    // Store/update the container for this session
-    _sessionContainers[sanitizedId] = _container;
+      Future.delayed(const Duration(milliseconds: 50), _onFit);
+      Future.delayed(const Duration(milliseconds: 200), _onFit);
+      Future.delayed(const Duration(milliseconds: 600), _onFit);
+      Future.delayed(const Duration(milliseconds: 1500), _onFit);
+    } else {
+      // Clear any partial/stale cache entry
+      _sessionContainers.remove(sanitizedId);
+      _sessionTerms.remove(sanitizedId);
+      _sessionFitAddons.remove(sanitizedId);
+      _container = html.DivElement()
+        ..style.width = '100%'
+        ..style.height = '100%'
+        ..style.backgroundColor = '#0d1113'
+        ..style.overflow = 'hidden';
 
-    _container.onClick.listen((event) {
-      _focusNode.requestFocus();
-      if (_initialized) {
-        try {
-          js_util.callMethod(_term, 'focus', []);
-          _onFit(); // Force re-fit on click/focus to align character cell measurements
-        } catch (_) {}
-      }
-    });
+      _terminalWrapper = html.DivElement()
+        ..style.width = 'calc(100% - 32px)'
+        ..style.height = '100%'
+        ..style.marginLeft = '16px'
+        ..style.marginRight = '16px'
+        ..style.overflow = 'hidden';
 
-    _container.onKeyDown.listen((event) {
-      if (event.key == 'Tab') {
-        event.preventDefault();
-      }
-    });
+      _container.append(_terminalWrapper);
+      _sessionContainers[sanitizedId] = _container;
 
-    _container.addEventListener('paste', (html.Event event) {
-      if (event is html.ClipboardEvent) {
-        event.preventDefault();
-        event.stopPropagation();
-        final clipboardData = event.clipboardData;
-        final text = clipboardData?.getData('text/plain') ?? '';
-        if (text.isNotEmpty) {
-          widget.controller.sendInput(text);
-        }
-      }
-    }, true);
+      _initTerminal(sanitizedId);
+    }
+    _bindContainerEvents();
 
-    // Register global capture-phase listener to intercept Tab/Ctrl+C/Ctrl+V before Flutter's capture listener
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         final activeEl = html.document.activeElement;
@@ -119,7 +134,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             event.preventDefault();
             event.stopPropagation();
             if (event.shiftKey) {
-              widget.controller.sendInput('\x1B[Z'); // BackTab sequence
+              widget.controller.sendInput('\x1B[Z');
             } else {
               widget.controller.sendInput('\t');
             }
@@ -163,7 +178,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     };
     html.window.addEventListener('keydown', _windowKeyDownListener, true);
 
-    // 2. Register the platform view factory only if not already registered
     if (!_registeredViewTypes.contains(_viewType)) {
       ui_web.platformViewRegistry.registerViewFactory(
         _viewType,
@@ -171,20 +185,16 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
       _registeredViewTypes.add(_viewType);
     }
-
-    _initTerminal();
   }
 
-  void _initTerminal() {
+  void _initTerminal(String sanitizedId) {
     try {
-      // 3. Create Terminal Options JSObject
       final options = js_util.newObject();
       final theme = js_util.newObject();
       js_util.setProperty(theme, 'background', '#0d1113');
       js_util.setProperty(theme, 'foreground', '#d9e5e3');
       js_util.setProperty(theme, 'cursor', '#7fd1c7');
 
-      // Mute harsh ANSI colors with a premium, harmonious pastel palette
       js_util.setProperty(theme, 'black', '#1f2b30');
       js_util.setProperty(theme, 'red', '#f2777a');
       js_util.setProperty(theme, 'green', '#99cc99');
@@ -210,75 +220,27 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
       js_util.setProperty(options, 'fontSize', 15);
       js_util.setProperty(options, 'cursorBlink', true);
-      js_util.setProperty(
-        options,
-        'convertEol',
-        false,
-      ); // Normalizes \n to \r\n naturally via PTY post-processing!
+      js_util.setProperty(options, 'convertEol', true);
 
-      // 4. Instantiate Terminal
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
+      _sessionTerms[sanitizedId] = _term;
 
-      // 5. Open Terminal in Container
-      js_util.callMethod(_term, 'open', [_container]);
+      js_util.callMethod(_term, 'open', [_terminalWrapper]);
 
-      // 6. Instantiate and Load FitAddon
       final fitAddonModule = js_util.getProperty(html.window, 'FitAddon');
       final fitAddonConstructor = js_util.getProperty(
         fitAddonModule,
         'FitAddon',
       );
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
+      _sessionFitAddons[sanitizedId] = _fitAddon;
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
-      // Prevent Tab key from escaping focus in xterm.js (allowing shell autocomplete)
-      try {
-        js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
-          js_util.allowInterop((dynamic event) {
-            final key = js_util.getProperty(event, 'key') as String?;
-            if (key == 'Tab') {
-              js_util.callMethod(event, 'preventDefault', []);
-              js_util.callMethod(event, 'stopPropagation', []);
-              final shiftKey =
-                  js_util.getProperty(event, 'shiftKey') as bool? ?? false;
-              if (shiftKey) {
-                widget.controller.sendInput('\x1B[Z'); // BackTab sequence
-              } else {
-                widget.controller.sendInput('\t');
-              }
-              return false;
-            }
-            return true;
-          }),
-        ]);
-      } catch (_) {}
+      _bindTerminalSubscriptions();
 
-      // 6b. Bind JS term.onData to controller
-      final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        widget.controller.sendInput(data);
-      });
-      _onDataSubscription = js_util.callMethod(_term, 'onData', [
-        onDataCallback,
-      ]);
-
-      // 6c. Bind JS term.onResize to controller
-      final onResizeCallback = js_util.allowInterop((
-        dynamic size, [
-        dynamic _,
-      ]) {
-        final cols = js_util.getProperty(size, 'cols') as int;
-        final rows = js_util.getProperty(size, 'rows') as int;
-        widget.controller.sendResizeOut(cols, rows);
-      });
-      _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
-        onResizeCallback,
-      ]);
-
-      // 7. Write fallback initial content
       _writeInitialContent();
 
-      // 8. Bind listeners to the controller
       _initialized = true;
       _bindController();
 
@@ -286,13 +248,11 @@ class _TerminalPaneState extends State<TerminalPane> {
         js_util.callMethod(_term, 'focus', []);
       } catch (_) {}
 
-      // 9. Delayed fits to handle timing/sizing latency
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
       Future.delayed(const Duration(milliseconds: 1500), _onFit);
 
-      // Re-fit when fonts are fully loaded to resolve cursor alignment issues caused by font loading latency!
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
         if (fonts != null) {
@@ -349,6 +309,66 @@ class _TerminalPaneState extends State<TerminalPane> {
     return sb.toString();
   }
 
+  void _bindTerminalSubscriptions() {
+    final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+      if (mounted) {
+        widget.controller.sendInput(data);
+      }
+    });
+    _onDataSubscription = js_util.callMethod(_term, 'onData', [
+      onDataCallback,
+    ]);
+
+    final onResizeCallback = js_util.allowInterop((dynamic size, [dynamic _]) {
+      if (mounted) {
+        final cols = js_util.getProperty(size, 'cols') as int;
+        final rows = js_util.getProperty(size, 'rows') as int;
+        widget.controller.sendResizeOut(cols, rows);
+      }
+    });
+    _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
+      onResizeCallback,
+    ]);
+
+    try {
+      js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
+        js_util.allowInterop((dynamic event) {
+          if (!mounted) return true;
+          final key = js_util.getProperty(event, 'key') as String?;
+          if (key == 'Tab') {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final shiftKey =
+                js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+            if (shiftKey) {
+              widget.controller.sendInput('\x1B[Z');
+            } else {
+              widget.controller.sendInput('\t');
+            }
+            return false;
+          }
+          return true;
+        }),
+      ]);
+    } catch (_) {}
+
+    try {
+      final resizeObserverConstructor =
+          js_util.getProperty(html.window, 'ResizeObserver');
+      if (resizeObserverConstructor != null) {
+        final callback =
+            js_util.allowInterop((dynamic entries, dynamic observer) {
+          if (mounted) {
+            _onFit();
+          }
+        });
+        _resizeObserver =
+            js_util.callConstructor(resizeObserverConstructor, [callback]);
+        js_util.callMethod(_resizeObserver, 'observe', [_terminalWrapper]);
+      }
+    } catch (_) {}
+  }
+
   void _bindController() {
     widget.controller.addWriteListener(_onWrite);
     widget.controller.addClearListener(_onClear);
@@ -361,6 +381,37 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.removeClearListener(_onClear);
     widget.controller.removeResizeListener(_onResize);
     widget.controller.removeFitListener(_onFit);
+  }
+
+  void _bindContainerEvents() {
+    _containerClickSubscription = _container.onClick.listen((event) {
+      _focusNode.requestFocus();
+      if (_initialized) {
+        try {
+          js_util.callMethod(_term, 'focus', []);
+          _onFit();
+        } catch (_) {}
+      }
+    });
+
+    _containerKeyDownSubscription = _container.onKeyDown.listen((event) {
+      if (event.key == 'Tab') {
+        event.preventDefault();
+      }
+    });
+
+    _containerPasteListener = (html.Event event) {
+      if (event is html.ClipboardEvent) {
+        event.preventDefault();
+        event.stopPropagation();
+        final clipboardData = event.clipboardData;
+        final text = clipboardData?.getData('text/plain') ?? '';
+        if (text.isNotEmpty) {
+          widget.controller.sendInput(text);
+        }
+      }
+    };
+    _container.addEventListener('paste', _containerPasteListener, true);
   }
 
   void _onWrite(String data) {
@@ -381,7 +432,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onFit() {
     if (!_initialized) return;
     try {
-      js_util.callMethod(_fitAddon, 'fit', []);
+      final width = _terminalWrapper.clientWidth;
+      final height = _terminalWrapper.clientHeight;
+      if (width > 0 && height > 0) {
+        js_util.callMethod(_fitAddon, 'fit', []);
+      }
     } catch (_) {}
   }
 
@@ -451,20 +506,26 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void dispose() {
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
-    _focusNode.dispose();
-    _unbindController();
-    if (_initialized) {
+    _containerClickSubscription.cancel();
+    _containerKeyDownSubscription.cancel();
+    _container.removeEventListener('paste', _containerPasteListener, true);
+    if (_onDataSubscription != null) {
       try {
         js_util.callMethod(_onDataSubscription, 'dispose', []);
-        js_util.callMethod(_onResizeSubscription, 'dispose', []);
-        js_util.callMethod(_term, 'dispose', []);
       } catch (_) {}
     }
-    final sanitizedId = widget.terminalId.replaceAll(
-      RegExp(r'[^a-zA-Z0-9-]'),
-      '_',
-    );
-    _sessionContainers.remove(sanitizedId);
+    if (_onResizeSubscription != null) {
+      try {
+        js_util.callMethod(_onResizeSubscription, 'dispose', []);
+      } catch (_) {}
+    }
+    if (_resizeObserver != null) {
+      try {
+        js_util.callMethod(_resizeObserver, 'disconnect', []);
+      } catch (_) {}
+    }
+    _focusNode.dispose();
+    _unbindController();
     super.dispose();
   }
 

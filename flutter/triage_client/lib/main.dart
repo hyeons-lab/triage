@@ -96,6 +96,74 @@ class _TriageHomeState extends State<TriageHome> {
     );
   }
 
+  Future<List<StyledRow>> _mergeVisibleAndStyledRows({
+    required String sessionId,
+    required List<dynamic>? visibleRowsJson,
+    required List<dynamic>? styledRowsJson,
+  }) async {
+    final List<StyledRow> rows = [];
+    final styledRows = styledRowsJson
+            ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
+            .toList() ??
+        [];
+
+    if (visibleRowsJson != null) {
+      final visibleRows = visibleRowsJson.cast<String>();
+      final styledRowsStart = visibleRows.length - styledRows.length;
+      if (styledRowsStart > 0) {
+        try {
+          final fetchStart =
+              (visibleRows.length - 200) < 0 ? 0 : visibleRows.length - 200;
+          final historyRes = await _client.styledRows(
+            sessionId: sessionId,
+            start: fetchStart,
+            end: visibleRows.length,
+          );
+          final responseObj = historyRes['response'] as Map<String, dynamic>?;
+          final rowsList = responseObj?['rows'] as List<dynamic>?;
+          if (rowsList != null) {
+            final fetchedRows = rowsList
+                .map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
+                .toList();
+            for (var i = 0; i < visibleRows.length; i++) {
+              if (i < fetchStart) {
+                rows.add(_plainRow(visibleRows[i]));
+              } else {
+                final fetchedIndex = i - fetchStart;
+                if (fetchedIndex < fetchedRows.length) {
+                  rows.add(fetchedRows[fetchedIndex]);
+                } else {
+                  rows.add(_plainRow(visibleRows[i]));
+                }
+              }
+            }
+          } else {
+            for (var i = 0; i < visibleRows.length; i++) {
+              if (i < styledRowsStart) {
+                rows.add(_plainRow(visibleRows[i]));
+              } else {
+                rows.add(styledRows[i - styledRowsStart]);
+              }
+            }
+          }
+        } catch (_) {
+          for (var i = 0; i < visibleRows.length; i++) {
+            if (i < styledRowsStart) {
+              rows.add(_plainRow(visibleRows[i]));
+            } else {
+              rows.add(styledRows[i - styledRowsStart]);
+            }
+          }
+        }
+      } else {
+        rows.addAll(styledRows);
+      }
+    } else {
+      rows.addAll(styledRows);
+    }
+    return rows;
+  }
+
   StyledRow _promptRow(String command) {
     return StyledRow(
       spans: [
@@ -449,26 +517,12 @@ class _TriageHomeState extends State<TriageHome> {
 
           final visibleRowsJson = snapshot?['visible_rows'] as List<dynamic>?;
           final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-          final styledRows =
-              styledRowsJson
-                  ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
-                  .toList() ??
-              [];
 
-          final List<StyledRow> rows = [];
-          if (visibleRowsJson != null) {
-            final visibleRows = visibleRowsJson.cast<String>();
-            final styledRowsStart = visibleRows.length - styledRows.length;
-            for (var i = 0; i < visibleRows.length; i++) {
-              if (i < styledRowsStart) {
-                rows.add(_plainRow(visibleRows[i]));
-              } else {
-                rows.add(styledRows[i - styledRowsStart]);
-              }
-            }
-          } else {
-            rows.addAll(styledRows);
-          }
+          final List<StyledRow> rows = await _mergeVisibleAndStyledRows(
+            sessionId: sid,
+            visibleRowsJson: visibleRowsJson,
+            styledRowsJson: styledRowsJson,
+          );
 
           final session = SessionVm(
             title: 'triage / $sid',
@@ -669,26 +723,12 @@ class _TriageHomeState extends State<TriageHome> {
 
           final visibleRowsJson = snapshot?['visible_rows'] as List<dynamic>?;
           final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-          final styledRows =
-              styledRowsJson
-                  ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
-                  .toList() ??
-              [];
 
-          final List<StyledRow> rows = [];
-          if (visibleRowsJson != null) {
-            final visibleRows = visibleRowsJson.cast<String>();
-            final styledRowsStart = visibleRows.length - styledRows.length;
-            for (var i = 0; i < visibleRows.length; i++) {
-              if (i < styledRowsStart) {
-                rows.add(_plainRow(visibleRows[i]));
-              } else {
-                rows.add(styledRows[i - styledRowsStart]);
-              }
-            }
-          } else {
-            rows.addAll(styledRows);
-          }
+          final List<StyledRow> rows = await _mergeVisibleAndStyledRows(
+            sessionId: sessionId,
+            visibleRowsJson: visibleRowsJson,
+            styledRowsJson: styledRowsJson,
+          );
 
           final session = SessionVm(
             title: 'triage / $sessionId',
@@ -1322,7 +1362,8 @@ class _PairingViewState extends State<_PairingView> {
     final validChars = RegExp(r'^[0-9A-HJ-KM-NP-TV-Z]{8}$');
     if (!validChars.hasMatch(pin)) {
       setState(() {
-        _errorMessage = 'PIN must be 8 characters (letters and digits, excluding U)';
+        _errorMessage =
+            'PIN must be 8 characters (letters and digits, excluding U)';
       });
       return;
     }
