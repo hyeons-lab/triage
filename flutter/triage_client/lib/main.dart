@@ -64,6 +64,8 @@ class TriageHome extends StatefulWidget {
 
 class _TriageHomeState extends State<TriageHome> {
   late TriageWebSocketClient _client;
+  bool _clientInitialized = false;
+  StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
   bool _needsPairing = false;
   bool _sidebarCollapsed = false;
@@ -217,10 +219,20 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _initWebSocket() async {
     _bearerToken ??= retrieveToken();
+    if (_clientInitialized) {
+      try {
+        await _client.disconnect();
+      } catch (_) {}
+      try {
+        await _websocketSubscription?.cancel();
+      } catch (_) {}
+    }
+
     final client =
         widget.client ??
         TriageWebSocketClient(Uri.parse('ws://127.0.0.1:7777/ws'));
     _client = client;
+    _clientInitialized = true;
 
     setState(() {
       _connectionStatus = 'Connecting...';
@@ -230,7 +242,7 @@ class _TriageHomeState extends State<TriageHome> {
     try {
       await _client.connect();
 
-      _client.events.listen(
+      _websocketSubscription = _client.events.listen(
         _onWebSocketEvent,
         onError: _onWebSocketError,
         onDone: _onWebSocketClosed,
@@ -410,7 +422,10 @@ class _TriageHomeState extends State<TriageHome> {
 
   @override
   void dispose() {
-    _client.disconnect();
+    if (_clientInitialized) {
+      _client.disconnect();
+      _websocketSubscription?.cancel();
+    }
     for (final s in _sessions) {
       s.terminalController.dispose();
     }
@@ -562,6 +577,7 @@ class _TriageHomeState extends State<TriageHome> {
                 onCancel: () {
                   try {
                     _client.disconnect();
+                    _websocketSubscription?.cancel();
                   } catch (_) {}
                   setState(() {
                     _needsPairing = false;

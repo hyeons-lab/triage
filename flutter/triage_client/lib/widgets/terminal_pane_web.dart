@@ -361,7 +361,13 @@ class _TerminalPaneState extends State<TerminalPane> {
               widget.controller.fit();
             });
           }
-          return HtmlElementView(viewType: _viewType);
+          return Container(
+            color: const Color(0xff0d1113),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: HtmlElementView(viewType: _viewType),
+            ),
+          );
         },
       ),
     );
