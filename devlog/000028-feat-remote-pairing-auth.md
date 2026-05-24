@@ -19,6 +19,7 @@
 - 2026-05-23T17:19-0700 Ran cargo fmt, cargo check, and cargo test across all workspace packages, confirming 100% test suite completion.
 - 2026-05-23T17:19-0700 Booted daemon to verify automatic pairing PIN generation and tested the CLI triage pair output.
 - 2026-05-23T17:24-0700 Added a tracing log message displaying the remote web client page URL on WebSocket server bind in ws.rs.
+- 2026-05-23T17:34-0700 Fixed LateInitializationError by removing final from the late _client variable in main.dart to allow clean socket re-initialization on pairing.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -27,7 +28,8 @@
 
 ## Commits
 - f7ec173 — feat: implement remote client pairing and secure token authorization
-- HEAD — feat: log remote web client URL when daemon WebSocket starts
+- f9bc480 — feat: log remote web client URL when daemon WebSocket starts
+- HEAD — fix: remove final from late client to allow socket re-initialization
 
 ## Next Steps
 - None.

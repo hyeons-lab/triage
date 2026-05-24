@@ -80,7 +80,7 @@ class TriageHome extends StatefulWidget {
 }
 
 class _TriageHomeState extends State<TriageHome> {
-  late final TriageWebSocketClient _client;
+  late TriageWebSocketClient _client;
   String? _bearerToken;
   bool _needsPairing = false;
   String _connectionStatus = 'Offline (Local Mock)';
