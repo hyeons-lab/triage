@@ -74,15 +74,17 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
-    _container.onPaste.listen((event) {
-      event.preventDefault();
-      event.stopPropagation();
-      final clipboardData = event.clipboardData;
-      final text = clipboardData?.getData('text/plain') ?? '';
-      if (text.isNotEmpty) {
-        widget.controller.sendInput(text);
+    _container.addEventListener('paste', (html.Event event) {
+      if (event is html.ClipboardEvent) {
+        event.preventDefault();
+        event.stopPropagation();
+        final clipboardData = event.clipboardData;
+        final text = clipboardData?.getData('text/plain') ?? '';
+        if (text.isNotEmpty) {
+          widget.controller.sendInput(text);
+        }
       }
-    });
+    }, true);
 
     // Register global capture-phase listener to intercept Tab/Ctrl+C/Ctrl+V before Flutter's capture listener
     _windowKeyDownListener = (html.Event event) {
