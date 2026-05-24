@@ -44,6 +44,12 @@ class TerminalPane extends StatefulWidget {
         js_util.callMethod(onResize, 'dispose', []);
       } catch (_) {}
     }
+    final observer = _TerminalPaneState._sessionResizeObservers.remove(sanitizedId);
+    if (observer != null) {
+      try {
+        js_util.callMethod(observer, 'disconnect', []);
+      } catch (_) {}
+    }
   }
 
   @override
@@ -56,6 +62,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionFitAddons = {};
   static final Map<String, dynamic> _sessionOnDataSubs = {};
   static final Map<String, dynamic> _sessionOnResizeSubs = {};
+  static final Map<String, dynamic> _sessionResizeObservers = {};
   static final Set<String> _registeredViewTypes = {};
 
   late final String _viewType;
@@ -341,6 +348,22 @@ class _TerminalPaneState extends State<TerminalPane> {
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
       Future.delayed(const Duration(milliseconds: 1500), _onFit);
+
+      // Register ResizeObserver for real-time sizing notifications
+      try {
+        final resizeObserverConstructor =
+            js_util.getProperty(html.window, 'ResizeObserver');
+        if (resizeObserverConstructor != null) {
+          final callback =
+              js_util.allowInterop((dynamic entries, dynamic observer) {
+            _onFit();
+          });
+          final observer =
+              js_util.callConstructor(resizeObserverConstructor, [callback]);
+          js_util.callMethod(observer, 'observe', [_terminalWrapper]);
+          _sessionResizeObservers[sanitizedId] = observer;
+        }
+      } catch (_) {}
 
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
