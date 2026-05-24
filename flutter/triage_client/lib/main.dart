@@ -1,9 +1,28 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:js_interop' as js;
+import 'dart:js_interop_unsafe';
 import 'package:flutter/material.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
+
+void _persistToken(String token) {
+  try {
+    final localStorage = js.globalContext.getProperty<js.JSObject>('localStorage'.toJS);
+    localStorage.callMethod('setItem'.toJS, 'triage_bearer_token'.toJS, token.toJS);
+  } catch (_) {}
+}
+
+String? _retrieveToken() {
+  try {
+    final localStorage = js.globalContext.getProperty<js.JSObject>('localStorage'.toJS);
+    final val = localStorage.callMethod<js.JSString?>('getItem'.toJS, 'triage_bearer_token'.toJS);
+    return val?.toDart;
+  } catch (_) {
+    return null;
+  }
+}
 
 void main() {
   runApp(const TriageClientApp());
@@ -62,6 +81,8 @@ class TriageHome extends StatefulWidget {
 
 class _TriageHomeState extends State<TriageHome> {
   late final TriageWebSocketClient _client;
+  String? _bearerToken;
+  bool _needsPairing = false;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
   final String _clientId = 'triage-flutter-client';
@@ -211,6 +232,7 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _initWebSocket() async {
+    _bearerToken ??= _retrieveToken();
     final client =
         widget.client ??
         TriageWebSocketClient(Uri.parse('ws://127.0.0.1:7777/ws'));
@@ -224,24 +246,58 @@ class _TriageHomeState extends State<TriageHome> {
     try {
       await _client.connect();
 
-      setState(() {
-        _connectionStatus = 'Connected to Daemon';
-        _connectionStatusColor = const Color(0xff7fd1c7);
-      });
-
       _client.events.listen(
         _onWebSocketEvent,
         onError: _onWebSocketError,
         onDone: _onWebSocketClosed,
       );
 
-      await _client.hello();
+      final helloRes = await _client.hello(clientId: _clientId, token: _bearerToken);
+      final authenticated = helloRes['authenticated'] as bool? ?? false;
+
+      if (!authenticated) {
+        setState(() {
+          _needsPairing = true;
+          _connectionStatus = 'Awaiting Pairing';
+          _connectionStatusColor = const Color(0xffffc857);
+        });
+        return;
+      }
+
+      setState(() {
+        _needsPairing = false;
+        _connectionStatus = 'Connected to Daemon';
+        _connectionStatusColor = const Color(0xff7fd1c7);
+      });
+
       await _loadDaemonSessions();
     } catch (e) {
+      final errStr = e.toString();
+      if (errStr.contains('unauthorized') || errStr.contains('unauthenticated')) {
+        setState(() {
+          _needsPairing = true;
+          _connectionStatus = 'Awaiting Pairing';
+          _connectionStatusColor = const Color(0xffffc857);
+        });
+      } else {
+        setState(() {
+          _connectionStatus = 'Offline (Local Mock)';
+          _connectionStatusColor = const Color(0xff7f8b8d);
+        });
+      }
+    }
+  }
+
+  Future<void> _onPairRequested(String pin) async {
+    final token = await _client.pair(code: pin, clientId: _clientId);
+    if (token.isNotEmpty) {
       setState(() {
-        _connectionStatus = 'Offline (Local Mock)';
-        _connectionStatusColor = const Color(0xff7f8b8d);
+        _bearerToken = token;
+        _persistToken(token);
       });
+      _initWebSocket();
+    } else {
+      throw Exception('Server returned empty pairing token');
     }
   }
 
@@ -499,6 +555,41 @@ class _TriageHomeState extends State<TriageHome> {
 
   @override
   Widget build(BuildContext context) {
+    if (_needsPairing) {
+      return Scaffold(
+        body: Center(
+          child: SingleChildScrollView(
+            child: Container(
+              width: 420,
+              padding: const EdgeInsets.all(32),
+              decoration: BoxDecoration(
+                color: const Color(0xff161b1d),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xff2a3437)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.4),
+                    blurRadius: 24,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: _PairingView(
+                onPair: _onPairRequested,
+                onCancel: () {
+                  setState(() {
+                    _needsPairing = false;
+                    _connectionStatus = 'Offline (Local Mock)';
+                    _connectionStatusColor = const Color(0xff7f8b8d);
+                  });
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       body: SafeArea(
         child: Row(
@@ -853,6 +944,152 @@ class WorkspaceHeader extends StatelessWidget {
             const Icon(Icons.more_horiz, color: Color(0xffcdd7d6)),
         ],
       ),
+    );
+  }
+}
+
+class _PairingView extends StatefulWidget {
+  const _PairingView({required this.onPair, required this.onCancel});
+
+  final Future<void> Function(String pin) onPair;
+  final VoidCallback onCancel;
+
+  @override
+  State<_PairingView> createState() => _PairingViewState();
+}
+
+class _PairingViewState extends State<_PairingView> {
+  final TextEditingController _pinController = TextEditingController();
+  bool _isLoading = false;
+  String? _errorMessage;
+
+  @override
+  void dispose() {
+    _pinController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final pin = _pinController.text.trim();
+    if (pin.length != 6 || int.tryParse(pin) == null) {
+      setState(() {
+        _errorMessage = 'PIN must be a 6-digit number';
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      await widget.onPair(pin);
+    } catch (e) {
+      setState(() {
+        _isLoading = false;
+        _errorMessage = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.security, color: Color(0xff7fd1c7), size: 28),
+            const SizedBox(width: 12),
+            const Text(
+              'Pair Remote Device',
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        const Text(
+          'This Triage daemon requires pairing. Please run "triage pair" in your local terminal and enter the 6-digit PIN below.',
+          style: TextStyle(
+            color: Color(0xffa5b1b4),
+            fontSize: 14,
+            height: 1.4,
+          ),
+        ),
+        const SizedBox(height: 24),
+        TextField(
+          controller: _pinController,
+          maxLength: 6,
+          keyboardType: TextInputType.number,
+          style: const TextStyle(
+            fontSize: 24,
+            letterSpacing: 8,
+            fontWeight: FontWeight.bold,
+            color: Color(0xff7fd1c7),
+          ),
+          decoration: const InputDecoration(
+            labelText: '6-Digit PIN',
+            labelStyle: TextStyle(fontSize: 14, letterSpacing: 0, color: Color(0xff7f8b8d)),
+            counterText: '',
+            border: OutlineInputBorder(),
+            enabledBorder: OutlineInputBorder(
+              borderSide: BorderSide(color: Color(0xff2a3437)),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderSide: BorderSide(color: Color(0xff7fd1c7)),
+            ),
+          ),
+          onSubmitted: (_) => _isLoading ? null : _submit(),
+        ),
+        if (_errorMessage != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _errorMessage!,
+            style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
+          ),
+        ],
+        const SizedBox(height: 24),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            TextButton(
+              onPressed: _isLoading ? null : widget.onCancel,
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xff7f8b8d),
+              ),
+              child: const Text('Cancel (Offline Mode)'),
+            ),
+            const SizedBox(width: 12),
+            ElevatedButton(
+              onPressed: _isLoading ? null : _submit,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xff2b6f6f),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: _isLoading
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.5,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      ),
+                    )
+                  : const Text('Pair Device'),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

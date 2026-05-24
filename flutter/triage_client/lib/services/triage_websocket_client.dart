@@ -122,8 +122,19 @@ class TriageWebSocketClient {
     return completer.future;
   }
 
-  Future<Map<String, dynamic>> hello() async {
-    return _send('hello');
+  Future<Map<String, dynamic>> hello({String? clientId, String? token}) async {
+    return _send('hello', {
+      if (clientId != null) 'client_id': clientId,
+      if (token != null) 'token': token,
+    });
+  }
+
+  Future<String> pair({required String code, required String clientId}) async {
+    final response = await _send('pair', {
+      'code': code,
+      'client_id': clientId,
+    });
+    return response['token']?.toString() ?? '';
   }
 
   Future<String> startSession({

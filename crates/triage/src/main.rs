@@ -38,6 +38,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if startup_mode == StartupMode::Pair {
+        run_pairing_display()?;
+        return Ok(());
+    }
+
     let size = initial_session_size()?;
     let mut app = start_app(size, startup_mode).context("starting local session")?;
     let mut terminal = match TerminalSession::enter().context("starting terminal UI") {
@@ -57,6 +62,74 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_pairing_display() -> Result<()> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("neither HOME nor USERPROFILE environment variable is set")?;
+    let home_path = PathBuf::from(home);
+
+    let log_dir = home_path.join(".local/state/triage/sessions");
+    let pairing_code_path = log_dir.join("pairing_code.json");
+
+    if !pairing_code_path.exists() {
+        bail!(
+            "No active pairing session found.\nPlease ensure the triaged daemon is running and has --require-pairing enabled."
+        );
+    }
+
+    let content =
+        std::fs::read_to_string(&pairing_code_path).context("reading pairing_code.json")?;
+    let info: serde_json::Value =
+        serde_json::from_str(&content).context("parsing pairing_code.json")?;
+
+    let code = info
+        .get("code")
+        .and_then(|v| v.as_str())
+        .context("pairing_code.json is missing 'code'")?;
+
+    let expires_at_sec = info
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .context("pairing_code.json is missing 'expires_at'")?;
+
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    if now_sec >= expires_at_sec {
+        bail!(
+            "The active pairing PIN has expired.\nPlease restart the triaged daemon to generate a new PIN."
+        );
+    }
+
+    let remaining_mins = (expires_at_sec - now_sec) / 60;
+    let remaining_secs = (expires_at_sec - now_sec) % 60;
+
+    let config_path = home_path.join(".config/triage/config.toml");
+    let bind_addr = if config_path.exists() {
+        let config = triage_core::config::Config::load_from_path(&config_path).unwrap_or_default();
+        config.remote.bind
+    } else {
+        "127.0.0.1:7777".to_string()
+    };
+
+    println!("\x1b[1;36m====================================================\x1b[0m");
+    println!("\x1b[1;36m               TRIAGE REMOTE PAIRING                \x1b[0m");
+    println!("\x1b[1;36m====================================================\x1b[0m");
+    println!("");
+    println!("  Pairing PIN: \x1b[1;32m{}\x1b[0m", code);
+    println!("  Daemon URL:  \x1b[1;33mws://{}\x1b[0m", bind_addr);
+    println!("");
+    println!("  Enter this PIN in your Triage remote client to pair.");
+    println!(
+        "  This PIN will expire in \x1b[1;35m{}m {}s\x1b[0m.",
+        remaining_mins, remaining_secs
+    );
+    println!("\x1b[1;36m====================================================\x1b[0m");
+
+    Ok(())
+}
+
 #[cfg(unix)]
 fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessionApp> {
     match startup_mode {
@@ -71,6 +144,7 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
             tracing::warn!("starting embedded local session manager");
             LocalSessionApp::start(size)
         }
+        StartupMode::Pair => unreachable!("pair mode exits before startup"),
         StartupMode::Help => unreachable!("help mode exits before startup"),
     }
 }
@@ -84,6 +158,7 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
             )
         }
         StartupMode::Embedded => LocalSessionApp::start(size),
+        StartupMode::Pair => unreachable!("pair mode exits before startup"),
         StartupMode::Help => unreachable!("help mode exits before startup"),
     }
 }
@@ -92,14 +167,16 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
 enum StartupMode {
     Daemon { socket_path: PathBuf },
     Embedded,
+    Pair,
     Help,
 }
 
 impl StartupMode {
     const HELP: &'static str = "\
-usage: triage [--socket <path>] [--embedded]
+usage: triage [--socket <path>] [--embedded] [pair]
 
 Options:
+  pair             Display pairing PIN for remote clients
   --socket <path>  Connect to a daemon Unix socket at <path>
   --embedded       Run an isolated in-process session manager
   -h, --help       Print this help text
@@ -115,6 +192,11 @@ for isolated development.";
 
         while let Some(arg) = args.next() {
             match arg.to_str() {
+                Some("pair") | Some("--pair") => {
+                    if mode.replace(StartupMode::Pair).is_some() {
+                        bail!("cannot combine multiple modes; pass --help for usage");
+                    }
+                }
                 Some("--embedded") => {
                     if mode.replace(StartupMode::Embedded).is_some() {
                         bail!("--embedded can only be passed once; pass --help for usage");
@@ -139,6 +221,10 @@ for isolated development.";
                     display_os_str(&arg)
                 ),
             }
+        }
+
+        if mode == Some(StartupMode::Pair) && socket_path.is_some() {
+            bail!("pair mode cannot be combined with --socket; pass --help for usage");
         }
 
         if mode == Some(StartupMode::Embedded) && socket_path.is_some() {

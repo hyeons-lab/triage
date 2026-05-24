@@ -28,6 +28,10 @@ fn run() -> anyhow::Result<()> {
 
     let bind_addr = config.remote.bind_addr()?;
 
+    if config.remote.require_pairing {
+        let _ = manager.generate_pairing_code()?;
+    }
+
     // Spawn WebSocket Server in a background thread
     let ws_manager = Arc::clone(&manager);
     std::thread::Builder::new()

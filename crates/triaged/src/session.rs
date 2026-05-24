@@ -112,6 +112,8 @@ pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
+    pairing_codes: Mutex<HashMap<String, Instant>>,
+    paired_devices: Mutex<HashMap<ClientId, String>>,
 }
 
 enum ManagedSession {
@@ -197,10 +199,13 @@ impl SessionManager {
             HashMap::new()
         });
         let next_session = next_session_sequence(sessions.keys());
+        let paired_devices = load_paired_devices(&config.log_dir);
         Self {
             config,
             next_session: AtomicU64::new(next_session),
             sessions: Mutex::new(sessions),
+            pairing_codes: Mutex::new(HashMap::new()),
+            paired_devices: Mutex::new(paired_devices),
         }
     }
 
@@ -252,6 +257,40 @@ impl SessionManager {
         };
         sessions.insert(session_id, ManagedSession::Historical { session, lease });
         Ok(())
+    }
+
+    pub fn generate_pairing_code(&self) -> Result<String> {
+        use rand::Rng;
+
+        let code: String = (0..6)
+            .map(|_| {
+                let digit = rand::thread_rng().gen_range(0..10);
+                digit.to_string()
+            })
+            .collect();
+
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 300; // 5 minutes expiry
+
+        let mut codes = self.pairing_codes.lock().unwrap();
+        codes.insert(code.clone(), Instant::now() + Duration::from_secs(300));
+
+        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
+        let info = serde_json::json!({
+            "code": code,
+            "expires_at": expires_at,
+        });
+        let json = serde_json::to_vec_pretty(&info)?;
+        if let Some(parent) = pairing_code_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&pairing_code_path, json)?;
+
+        tracing::info!(pairing_code = %code, "generated new device pairing PIN");
+
+        Ok(code)
     }
 }
 
@@ -677,6 +716,51 @@ fn default_log_dir() -> PathBuf {
             home.join(".local/state")
         })
         .join("triage/sessions")
+}
+
+fn load_paired_devices(log_dir: &Path) -> HashMap<ClientId, String> {
+    let path = log_dir.join("paired_devices.json");
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to read paired_devices.json");
+            return HashMap::new();
+        }
+    };
+
+    match serde_json::from_str::<HashMap<String, String>>(&content) {
+        Ok(raw_map) => {
+            let mut map = HashMap::new();
+            for (k, v) in raw_map {
+                if let Ok(client_id) = ClientId::new(k) {
+                    map.insert(client_id, v);
+                }
+            }
+            map
+        }
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to parse paired_devices.json");
+            HashMap::new()
+        }
+    }
+}
+
+fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> Result<()> {
+    let path = log_dir.join("paired_devices.json");
+    let mut raw_map = HashMap::new();
+    for (k, v) in devices {
+        raw_map.insert(k.to_string(), v.clone());
+    }
+    let json = serde_json::to_vec_pretty(&raw_map)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, json)?;
+    Ok(())
 }
 
 fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, ManagedSession>> {
@@ -4314,5 +4398,66 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
+    fn require_pairing(&self) -> bool {
+        let config = if let Ok(path) = triage_core::config::Config::default_path() {
+            if path.exists() {
+                triage_core::config::Config::load_from_path(&path).unwrap_or_default()
+            } else {
+                triage_core::config::Config::default()
+            }
+        } else {
+            triage_core::config::Config::default()
+        };
+        config.remote.require_pairing
+    }
+
+    fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let devices = self.paired_devices.lock().unwrap();
+        if let Some(stored_hash) = devices.get(client_id) {
+            Ok(stored_hash == &hash)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
+        use rand::Rng;
+        use sha2::{Digest, Sha256};
+
+        let mut codes = self.pairing_codes.lock().unwrap();
+        if let Some(expiry) = codes.get(code) {
+            if Instant::now() > *expiry {
+                codes.remove(code);
+                anyhow::bail!("pairing PIN has expired");
+            }
+        } else {
+            anyhow::bail!("invalid pairing PIN");
+        }
+
+        codes.remove(code);
+
+        let mut token_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut token_bytes);
+        let token = hex::encode(token_bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let mut devices = self.paired_devices.lock().unwrap();
+        devices.insert(client_id.clone(), hash);
+
+        save_paired_devices(&self.config.log_dir, &devices)?;
+
+        Ok(token)
     }
 }

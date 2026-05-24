@@ -66,7 +66,8 @@ async fn handle_ws_connection(
         }
     });
 
-    let mut conn = WebSocketSessionConnection::new(manager);
+    let mut conn =
+        WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager));
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

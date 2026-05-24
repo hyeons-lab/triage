@@ -31,17 +31,66 @@ impl SubscriptionId {
     }
 }
 
+pub trait WebSocketAuthenticator {
+    fn require_pairing(&self) -> bool;
+    fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool>;
+    fn pair(&self, code: &str, client_id: &ClientId) -> Result<String>;
+}
+
+impl<T: WebSocketAuthenticator + ?Sized> WebSocketAuthenticator for std::sync::Arc<T> {
+    fn require_pairing(&self) -> bool {
+        (**self).require_pairing()
+    }
+    fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
+        (**self).authenticate(client_id, token)
+    }
+    fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
+        (**self).pair(code, client_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoopAuthenticator;
+
+impl WebSocketAuthenticator for NoopAuthenticator {
+    fn require_pairing(&self) -> bool {
+        false
+    }
+    fn authenticate(&self, _client_id: &ClientId, _token: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn pair(&self, _code: &str, _client_id: &ClientId) -> Result<String> {
+        Ok("noop-token".to_string())
+    }
+}
+
 #[derive(Debug)]
-pub struct WebSocketSessionConnection<A> {
+pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     api: A,
+    authenticator: U,
+    authenticated: bool,
     next_subscription_id: u64,
     subscriptions: HashMap<SubscriptionId, SessionEventReceiver>,
 }
 
-impl<A: SessionApi> WebSocketSessionConnection<A> {
+impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
     pub fn new(api: A) -> Self {
         Self {
             api,
+            authenticator: NoopAuthenticator,
+            authenticated: false,
+            next_subscription_id: 1,
+            subscriptions: HashMap::new(),
+        }
+    }
+}
+
+impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> {
+    pub fn with_authenticator(api: A, authenticator: U) -> Self {
+        Self {
+            api,
+            authenticator,
+            authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
         }
@@ -72,10 +121,17 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
         let id = message.id;
         match self.handle_request(message.request) {
             Ok(result) => ServerMessage::Response { id, result },
-            Err(error) => ServerMessage::Error {
-                id,
-                error: ProtocolError::new("request_failed", error.to_string()),
-            },
+            Err(error) => {
+                let code = if error.to_string() == "unauthorized" {
+                    "unauthorized"
+                } else {
+                    "request_failed"
+                };
+                ServerMessage::Error {
+                    id,
+                    error: ProtocolError::new(code, error.to_string()),
+                }
+            }
         }
     }
 
@@ -108,10 +164,42 @@ impl<A: SessionApi> WebSocketSessionConnection<A> {
     }
 
     fn handle_request(&mut self, request: ClientRequest) -> Result<ServerResult> {
+        if self.authenticator.require_pairing() && !self.authenticated {
+            match &request {
+                ClientRequest::Hello { .. } | ClientRequest::Pair { .. } => {}
+                _ => bail!("unauthorized"),
+            }
+        }
+
         match request {
-            ClientRequest::Hello => Ok(ServerResult::Hello {
-                protocol_version: PROTOCOL_VERSION.to_string(),
-            }),
+            ClientRequest::Hello { client_id, token } => {
+                let authenticated = if self.authenticator.require_pairing() {
+                    if let (Some(client_id), Some(token)) = (client_id, token) {
+                        let ok = self.authenticator.authenticate(&client_id, &token)?;
+                        self.authenticated = ok;
+                        ok
+                    } else {
+                        false
+                    }
+                } else {
+                    self.authenticated = true;
+                    true
+                };
+
+                if self.authenticator.require_pairing() && !authenticated {
+                    bail!("unauthorized");
+                }
+
+                Ok(ServerResult::Hello {
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    authenticated,
+                })
+            }
+            ClientRequest::Pair { code, client_id } => {
+                let token = self.authenticator.pair(&code, &client_id)?;
+                self.authenticated = true;
+                Ok(ServerResult::Paired { token })
+            }
             ClientRequest::ListSessions => {
                 let session_ids = self.api.list_sessions()?;
                 Ok(ServerResult::SessionIds { session_ids })
@@ -199,7 +287,16 @@ pub struct ClientMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientRequest {
-    Hello,
+    Hello {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<ClientId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    Pair {
+        code: String,
+        client_id: ClientId,
+    },
     ListSessions,
     StartSession {
         request: StartSessionRequest,
@@ -263,15 +360,37 @@ pub enum ServerMessage {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ServerResult {
     Unit,
-    Hello { protocol_version: String },
-    SessionIds { session_ids: Vec<SessionId> },
-    SessionId { session_id: SessionId },
-    AttachSession { response: AttachSessionResponse },
-    Subscribed { subscription_id: SubscriptionId },
-    LeaseChange { change: LeaseChange },
-    SessionSnapshot { snapshot: SessionSnapshot },
-    StyledRows { response: StyledRowsResponse },
-    CompletedSession { completed: CompletedSession },
+    Hello {
+        protocol_version: String,
+        authenticated: bool,
+    },
+    Paired {
+        token: String,
+    },
+    SessionIds {
+        session_ids: Vec<SessionId>,
+    },
+    SessionId {
+        session_id: SessionId,
+    },
+    AttachSession {
+        response: AttachSessionResponse,
+    },
+    Subscribed {
+        subscription_id: SubscriptionId,
+    },
+    LeaseChange {
+        change: LeaseChange,
+    },
+    SessionSnapshot {
+        snapshot: SessionSnapshot,
+    },
+    StyledRows {
+        response: StyledRowsResponse,
+    },
+    CompletedSession {
+        completed: CompletedSession,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,7 +441,10 @@ mod tests {
 
         let response = connection.handle_message(ClientMessage {
             id: Some(json!(1)),
-            request: ClientRequest::Hello,
+            request: ClientRequest::Hello {
+                client_id: None,
+                token: None,
+            },
         });
 
         assert_eq!(
@@ -331,6 +453,7 @@ mod tests {
                 id: Some(json!(1)),
                 result: ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
+                    authenticated: true,
                 },
             }
         );
@@ -679,5 +802,165 @@ mod tests {
                 },
             })
         );
+    }
+
+    struct FakeAuthenticator {
+        require_pairing: bool,
+        pairing_code: String,
+        paired_token: String,
+        client_id: ClientId,
+    }
+
+    impl WebSocketAuthenticator for FakeAuthenticator {
+        fn require_pairing(&self) -> bool {
+            self.require_pairing
+        }
+        fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
+            Ok(client_id == &self.client_id && token == self.paired_token)
+        }
+        fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
+            if code == self.pairing_code && client_id == &self.client_id {
+                Ok(self.paired_token.clone())
+            } else {
+                anyhow::bail!("invalid_pairing_code")
+            }
+        }
+    }
+
+    #[test]
+    fn unauthenticated_connection_blocks_session_requests() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth);
+
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("1")),
+            request: ClientRequest::ListSessions,
+        });
+
+        match response {
+            ServerMessage::Error { id, error } => {
+                assert_eq!(id, Some(json!("1")));
+                assert_eq!(error.code, "unauthorized");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pairing_request_with_correct_pin_grants_access() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth);
+
+        // 1. Send pair request
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("pair-req")),
+            request: ClientRequest::Pair {
+                code: "123456".to_string(),
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        });
+
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!("pair-req")));
+                assert_eq!(
+                    result,
+                    ServerResult::Paired {
+                        token: "secret-token".to_string()
+                    }
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // 2. Verified that list sessions now succeeds
+        let list_response = connection.handle_message(ClientMessage {
+            id: Some(json!("list-req")),
+            request: ClientRequest::ListSessions,
+        });
+        assert!(matches!(list_response, ServerMessage::Response { .. }));
+    }
+
+    #[test]
+    fn hello_request_with_valid_token_grants_access() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth);
+
+        // 1. Hello request with valid token
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("hello-req")),
+            request: ClientRequest::Hello {
+                client_id: Some(ClientId::new("phone").unwrap()),
+                token: Some("secret-token".to_string()),
+            },
+        });
+
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!("hello-req")));
+                assert_eq!(
+                    result,
+                    ServerResult::Hello {
+                        protocol_version: PROTOCOL_VERSION.to_string(),
+                        authenticated: true,
+                    }
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // 2. List sessions now succeeds
+        let list_response = connection.handle_message(ClientMessage {
+            id: Some(json!("list-req")),
+            request: ClientRequest::ListSessions,
+        });
+        assert!(matches!(list_response, ServerMessage::Response { .. }));
+    }
+
+    #[test]
+    fn hello_request_with_invalid_token_fails() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth);
+
+        // 1. Hello request with invalid token
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("hello-req")),
+            request: ClientRequest::Hello {
+                client_id: Some(ClientId::new("phone").unwrap()),
+                token: Some("wrong-token".to_string()),
+            },
+        });
+
+        match response {
+            ServerMessage::Error { id, error } => {
+                assert_eq!(id, Some(json!("hello-req")));
+                assert_eq!(error.code, "unauthorized");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }
