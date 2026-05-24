@@ -21,6 +21,7 @@
 - 2026-05-23T17:24-0700 Added a tracing log message displaying the remote web client page URL on WebSocket server bind in ws.rs.
 - 2026-05-23T17:34-0700 Fixed LateInitializationError by removing final from the late _client variable in main.dart to allow clean socket re-initialization on pairing.
 - 2026-05-23T17:37-0700 Added a try-catch fallback to cmd.exe in _createSession if the bash shell executable fails to spawn on a Windows daemon host.
+- 2026-05-23T17:41-0700 Isolated each session loading iteration inside a try-catch block to prevent broken sessions from blocking healthy ones, and allowed closing tab UIs unconditionally.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -31,7 +32,8 @@
 - f7ec173 — feat: implement remote client pairing and secure token authorization
 - f9bc480 — feat: log remote web client URL when daemon WebSocket starts
 - 6f6e7c0 — fix: remove final from late client to allow socket re-initialization
-- HEAD — fix: fall back to cmd.exe in _createSession if bash spawn fails
+- e59c65b — fix: fall back to cmd.exe in _createSession if bash spawn fails
+- HEAD — fix: isolate session loading loop and close tabs unconditionally
 
 ## Next Steps
 - None.

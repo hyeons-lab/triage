@@ -309,50 +309,54 @@ class _TriageHomeState extends State<TriageHome> {
       final List<SessionVm> daemonSessions = [];
 
       for (final sid in sessionIds) {
-        final attachRes = await _client.attachSession(
-          sessionId: sid,
-          clientId: _clientId,
-          mode: 'InteractiveController',
-        );
-        final responseObj = attachRes['response'] as Map<String, dynamic>?;
-        final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-        final contextObj = snapshot?['context'] as Map<String, dynamic>?;
-        final branch = contextObj?['branch']?.toString() ?? 'main';
+        try {
+          final attachRes = await _client.attachSession(
+            sessionId: sid,
+            clientId: _clientId,
+            mode: 'InteractiveController',
+          );
+          final responseObj = attachRes['response'] as Map<String, dynamic>?;
+          final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+          final contextObj = snapshot?['context'] as Map<String, dynamic>?;
+          final branch = contextObj?['branch']?.toString() ?? 'main';
 
-        final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-        final rows =
-            styledRowsJson
-                ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
-                .toList() ??
-            [];
+          final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
+          final rows =
+              styledRowsJson
+                  ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
+                  .toList() ??
+              [];
 
-        final session = SessionVm(
-          title: 'triage / $sid',
-          branch: branch,
-          status: 'attached',
-          statusColor: const Color(0xff7fd1c7),
-          icon: Icons.terminal,
-          rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
-        );
-        _setupSessionInputListener(session);
-        daemonSessions.add(session);
+          final session = SessionVm(
+            title: 'triage / $sid',
+            branch: branch,
+            status: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
+          );
+          _setupSessionInputListener(session);
+          daemonSessions.add(session);
 
-        final subId = await _client.subscribeSessionEvents(sessionId: sid);
-        if (subId.isNotEmpty) {
-          _subscriptionIds[subId] = sid;
+          final subId = await _client.subscribeSessionEvents(sessionId: sid);
+          if (subId.isNotEmpty) {
+            _subscriptionIds[subId] = sid;
+          }
+        } catch (e) {
+          debugPrint('Failed to load session $sid: $e');
         }
       }
 
-      if (daemonSessions.isNotEmpty) {
-        setState(() {
-          for (final s in _sessions) {
-            s.terminalController.dispose();
-          }
-          _sessions.clear();
-          _sessions.addAll(daemonSessions);
-          _selectedIndex = 0;
-        });
-      }
+      setState(() {
+        for (final s in _sessions) {
+          s.terminalController.dispose();
+        }
+        _sessions.clear();
+        _sessions.addAll(daemonSessions);
+        if (_selectedIndex >= _sessions.length) {
+          _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+        }
+      });
     } catch (_) {
       // Fallback
     }
@@ -531,31 +535,21 @@ class _TriageHomeState extends State<TriageHome> {
     if (_client.isConnected && sessionId != null) {
       try {
         await _client.shutdownSession(sessionId: sessionId);
-        setState(() {
-          final index = _sessions.indexOf(session);
-          if (index != -1) {
-            _sessions.removeAt(index);
-            session.terminalController.dispose();
-            if (_selectedIndex >= _sessions.length) {
-              _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
-            }
-          }
-        });
       } catch (e) {
         debugPrint('Failed to shutdown session: $e');
       }
-    } else {
-      setState(() {
-        final index = _sessions.indexOf(session);
-        if (index != -1) {
-          _sessions.removeAt(index);
-          session.terminalController.dispose();
-          if (_selectedIndex >= _sessions.length) {
-            _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
-          }
-        }
-      });
     }
+
+    setState(() {
+      final index = _sessions.indexOf(session);
+      if (index != -1) {
+        _sessions.removeAt(index);
+        session.terminalController.dispose();
+        if (_selectedIndex >= _sessions.length) {
+          _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+        }
+      }
+    });
   }
 
   @override
