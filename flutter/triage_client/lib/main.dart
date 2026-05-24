@@ -312,12 +312,28 @@ class _TriageHomeState extends State<TriageHome> {
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
           final branch = contextObj?['branch']?.toString() ?? 'main';
 
+          final visibleRowsJson = snapshot?['visible_rows'] as List<dynamic>?;
           final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-          final rows =
+          final styledRows =
               styledRowsJson
                   ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
                   .toList() ??
               [];
+
+          final List<StyledRow> rows = [];
+          if (visibleRowsJson != null) {
+            final visibleRows = visibleRowsJson.cast<String>();
+            final styledRowsStart = visibleRows.length - styledRows.length;
+            for (var i = 0; i < visibleRows.length; i++) {
+              if (i < styledRowsStart) {
+                rows.add(_plainRow(visibleRows[i]));
+              } else {
+                rows.add(styledRows[i - styledRowsStart]);
+              }
+            }
+          } else {
+            rows.addAll(styledRows);
+          }
 
           final session = SessionVm(
             title: 'triage / $sid',
@@ -461,12 +477,28 @@ class _TriageHomeState extends State<TriageHome> {
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
           final branch = contextObj?['branch']?.toString() ?? 'main';
 
+          final visibleRowsJson = snapshot?['visible_rows'] as List<dynamic>?;
           final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-          final rows =
+          final styledRows =
               styledRowsJson
                   ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
                   .toList() ??
               [];
+
+          final List<StyledRow> rows = [];
+          if (visibleRowsJson != null) {
+            final visibleRows = visibleRowsJson.cast<String>();
+            final styledRowsStart = visibleRows.length - styledRows.length;
+            for (var i = 0; i < visibleRows.length; i++) {
+              if (i < styledRowsStart) {
+                rows.add(_plainRow(visibleRows[i]));
+              } else {
+                rows.add(styledRows[i - styledRowsStart]);
+              }
+            }
+          } else {
+            rows.addAll(styledRows);
+          }
 
           final session = SessionVm(
             title: 'triage / $sessionId',
