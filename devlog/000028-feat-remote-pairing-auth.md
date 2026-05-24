@@ -59,6 +59,7 @@
 - 2026-05-24T09:47-0700 Added automatic Flutter WebSocket reconnect attempts while the UI remains mounted, with explicit connection-closed events from the WebSocket client and reconnect test coverage.
 - 2026-05-24T10:45-0700 Resolved Flutter compilation errors and analysis warnings, resolved unchecked nullable key usages in terminal_pane_web.dart, and cleaned up deprecated withOpacity calls.
 - 2026-05-24T10:54-0700 Added matching static destroySession implementation to terminal_pane_web.dart, fully addressing the PR review feedback on web compilation mismatch.
+- 2026-05-24T11:05-0700 Addressed outstanding PR feedback on the Flutter client by awaiting disconnect/cancel in onCancel pairing callback and clarifying Crockford Base32 validator letters in the PIN view.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -91,7 +92,8 @@
 - 0156828 — fix: address remote client review follow-ups
 - 444aa2b — fix: reconnect remote client automatically
 - 22cd1e9 — fix: resolve flutter client compile warnings and test errors in ci
-- HEAD — fix: add destroySession implementation to web terminal pane
+- 766021e — fix: add destroySession implementation to web terminal pane
+- HEAD — fix: address additional PR review feedback on cancel flow and Crockford validation
 
 ## Next Steps
 - None.

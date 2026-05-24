@@ -808,12 +808,13 @@ class _TriageHomeState extends State<TriageHome> {
               ),
               child: _PairingView(
                 onPair: _onPairRequested,
-                onCancel: () {
+                onCancel: () async {
                   try {
-                    _client.disconnect();
-                    _websocketSubscription?.cancel();
+                    await _client.disconnect().catchError((_) {});
+                    await _websocketSubscription?.cancel().catchError((_) {});
                     _reconnectTimer?.cancel();
                   } catch (_) {}
+                  if (!mounted) return;
                   setState(() {
                     _needsPairing = false;
                     _connectionStatus = 'Offline (Local Mock)';
@@ -1321,7 +1322,7 @@ class _PairingViewState extends State<_PairingView> {
     final validChars = RegExp(r'^[0-9A-HJ-KM-NP-TV-Z]{8}$');
     if (!validChars.hasMatch(pin)) {
       setState(() {
-        _errorMessage = 'PIN must be 8 characters (letters and digits)';
+        _errorMessage = 'PIN must be 8 characters (letters and digits, excluding U)';
       });
       return;
     }
