@@ -430,7 +430,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onFit() {
     if (!_initialized) return;
     try {
-      js_util.callMethod(_fitAddon, 'fit', []);
+      final width = js_util.getProperty(_terminalWrapper, 'clientWidth') as int? ?? 0;
+      final height = js_util.getProperty(_terminalWrapper, 'clientHeight') as int? ?? 0;
+      if (width > 50 && height > 50) {
+        js_util.callMethod(_fitAddon, 'fit', []);
+      }
     } catch (_) {}
   }
 
