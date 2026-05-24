@@ -83,6 +83,7 @@ class _TriageHomeState extends State<TriageHome> {
   late TriageWebSocketClient _client;
   String? _bearerToken;
   bool _needsPairing = false;
+  bool _sidebarCollapsed = false;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
   final String _clientId = 'triage-flutter-client';
@@ -600,6 +601,12 @@ class _TriageHomeState extends State<TriageHome> {
               onCreateSession: _createSession,
               connectionStatus: _connectionStatus,
               connectionStatusColor: _connectionStatusColor,
+              isCollapsed: _sidebarCollapsed,
+              onToggleCollapse: () {
+                setState(() {
+                  _sidebarCollapsed = !_sidebarCollapsed;
+                });
+              },
             ),
             const VerticalDivider(
               width: 1,
@@ -654,6 +661,8 @@ class SessionRail extends StatelessWidget {
     required this.onCreateSession,
     required this.connectionStatus,
     required this.connectionStatusColor,
+    required this.isCollapsed,
+    required this.onToggleCollapse,
   });
 
   final List<SessionVm> sessions;
@@ -662,9 +671,91 @@ class SessionRail extends StatelessWidget {
   final VoidCallback onCreateSession;
   final String connectionStatus;
   final Color connectionStatusColor;
+  final bool isCollapsed;
+  final VoidCallback onToggleCollapse;
 
   @override
   Widget build(BuildContext context) {
+    if (isCollapsed) {
+      return Container(
+        width: 72,
+        color: const Color(0xff151a1d),
+        child: Column(
+          children: [
+            const SizedBox(height: 20),
+            IconButton(
+              onPressed: onToggleCollapse,
+              tooltip: 'Expand sidebar',
+              icon: const Icon(Icons.chevron_right, color: Color(0xff7fd1c7), size: 26),
+            ),
+            const SizedBox(height: 16),
+            IconButton(
+              onPressed: onCreateSession,
+              tooltip: 'New session',
+              icon: const Icon(Icons.add, color: Color(0xffcdd7d6)),
+            ),
+            const SizedBox(height: 16),
+            Tooltip(
+              message: connectionStatus,
+              child: Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: connectionStatusColor,
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+            const Divider(height: 1, color: Color(0xff263033)),
+            const SizedBox(height: 8),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Column(
+                  children: [
+                    for (final indexed in sessions.indexed)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Tooltip(
+                          message: indexed.$2.title,
+                          child: InkWell(
+                            onTap: () => onSelectSession(indexed.$1),
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              width: 48,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                color: indexed.$1 == selectedIndex
+                                    ? const Color(0xff233033)
+                                    : Colors.transparent,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: indexed.$1 == selectedIndex
+                                      ? const Color(0xff3b5356)
+                                      : Colors.transparent,
+                                ),
+                              ),
+                              child: Icon(
+                                indexed.$2.icon,
+                                color: indexed.$1 == selectedIndex
+                                    ? const Color(0xff7fd1c7)
+                                    : const Color(0xffcdd7d6),
+                                size: 22,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
       width: 320,
       color: const Color(0xff151a1d),
@@ -672,7 +763,7 @@ class SessionRail extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+            padding: const EdgeInsets.fromLTRB(20, 20, 10, 16),
             child: Row(
               children: [
                 const Icon(Icons.route, size: 24, color: Color(0xff7fd1c7)),
@@ -680,6 +771,14 @@ class SessionRail extends StatelessWidget {
                 const Text(
                   'Triage',
                   style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(width: 6),
+                IconButton(
+                  onPressed: onToggleCollapse,
+                  tooltip: 'Minimize sidebar',
+                  icon: const Icon(Icons.chevron_left, color: Color(0xff7f8b8d), size: 22),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
                 ),
                 const Spacer(),
                 IconButton(
