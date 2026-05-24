@@ -63,6 +63,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_initialized) {
         try {
           js_util.callMethod(_term, 'focus', []);
+          _onFit(); // Force re-fit on click/focus to align character cell measurements
         } catch (_) {}
       }
     });
@@ -243,6 +244,20 @@ class _TerminalPaneState extends State<TerminalPane> {
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
+      Future.delayed(const Duration(milliseconds: 1500), _onFit);
+
+      // Re-fit when fonts are fully loaded to resolve cursor alignment issues caused by font loading latency!
+      try {
+        final fonts = js_util.getProperty(html.document, 'fonts');
+        if (fonts != null) {
+          final readyPromise = js_util.getProperty(fonts, 'ready');
+          if (readyPromise != null) {
+            js_util.promiseToFuture(readyPromise).then((_) {
+              _onFit();
+            });
+          }
+        }
+      } catch (_) {}
     } catch (e) {
       debugPrint('Failed to initialize xterm.js: $e');
     }
