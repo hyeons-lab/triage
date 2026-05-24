@@ -73,20 +73,29 @@ class _TerminalPaneState extends State<TerminalPane> {
     _viewType = 'xterm-view-$sanitizedId';
 
     final cachedContainer = _sessionContainers[sanitizedId];
-    if (cachedContainer != null) {
+    final cachedTerm = _sessionTerms[sanitizedId];
+    final cachedFitAddon = _sessionFitAddons[sanitizedId];
+    if (cachedContainer != null &&
+        cachedTerm != null &&
+        cachedFitAddon != null &&
+        cachedContainer.children.isNotEmpty) {
       _container = cachedContainer as html.DivElement;
       _terminalWrapper = _container.children.first as html.DivElement;
-      _term = _sessionTerms[sanitizedId];
-      _fitAddon = _sessionFitAddons[sanitizedId];
+      _term = cachedTerm;
+      _fitAddon = cachedFitAddon;
       _initialized = true;
       _bindController();
-      _bindTerminalSubscriptions(sanitizedId);
+      _bindTerminalSubscriptions();
 
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
       Future.delayed(const Duration(milliseconds: 1500), _onFit);
     } else {
+      // Clear any partial/stale cache entry
+      _sessionContainers.remove(sanitizedId);
+      _sessionTerms.remove(sanitizedId);
+      _sessionFitAddons.remove(sanitizedId);
       _container = html.DivElement()
         ..style.width = '100%'
         ..style.height = '100%'
@@ -228,28 +237,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionFitAddons[sanitizedId] = _fitAddon;
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
-      try {
-        js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
-          js_util.allowInterop((dynamic event) {
-            final key = js_util.getProperty(event, 'key') as String?;
-            if (key == 'Tab') {
-              js_util.callMethod(event, 'preventDefault', []);
-              js_util.callMethod(event, 'stopPropagation', []);
-              final shiftKey =
-                  js_util.getProperty(event, 'shiftKey') as bool? ?? false;
-              if (shiftKey) {
-                widget.controller.sendInput('\x1B[Z');
-              } else {
-                widget.controller.sendInput('\t');
-              }
-              return false;
-            }
-            return true;
-          }),
-        ]);
-      } catch (_) {}
-
-      _bindTerminalSubscriptions(sanitizedId);
+      _bindTerminalSubscriptions();
 
       _writeInitialContent();
 
@@ -321,7 +309,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     return sb.toString();
   }
 
-  void _bindTerminalSubscriptions(String sanitizedId) {
+  void _bindTerminalSubscriptions() {
     final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
       if (mounted) {
         widget.controller.sendInput(data);
@@ -341,6 +329,28 @@ class _TerminalPaneState extends State<TerminalPane> {
     _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
       onResizeCallback,
     ]);
+
+    try {
+      js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
+        js_util.allowInterop((dynamic event) {
+          if (!mounted) return true;
+          final key = js_util.getProperty(event, 'key') as String?;
+          if (key == 'Tab') {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final shiftKey =
+                js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+            if (shiftKey) {
+              widget.controller.sendInput('\x1B[Z');
+            } else {
+              widget.controller.sendInput('\t');
+            }
+            return false;
+          }
+          return true;
+        }),
+      ]);
+    } catch (_) {}
 
     try {
       final resizeObserverConstructor =
@@ -424,7 +434,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     try {
       final width = _terminalWrapper.clientWidth;
       final height = _terminalWrapper.clientHeight;
-      if (width > 50 && height > 50) {
+      if (width > 0 && height > 0) {
         js_util.callMethod(_fitAddon, 'fit', []);
       }
     } catch (_) {}
