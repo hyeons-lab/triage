@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:triage_client/main.dart';
@@ -25,6 +26,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> startSessionCalls = [];
   final List<String> writeInputCalls = [];
   final List<String> attachSessionCalls = [];
+  final List<String> helloClientIds = [];
 
   @override
   Future<void> connect() async {
@@ -36,6 +38,9 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<Map<String, dynamic>> hello({String? clientId, String? token}) async {
+    if (clientId != null) {
+      helloClientIds.add(clientId);
+    }
     return {'protocol_version': '2026-05-20', 'authenticated': true};
   }
 
@@ -152,17 +157,18 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 }
 
 void main() {
-  testWidgets('shows Triage session shell with daemon sessions when connected', (
-    WidgetTester tester,
-  ) async {
-    final client = FakeTriageWebSocketClient();
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+  testWidgets(
+    'shows Triage session shell with daemon sessions when connected',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    expect(find.text('Triage'), findsOneWidget);
-    expect(find.text('triage / flutter-spike'), findsWidgets);
-    expect(find.text('Connected to Daemon'), findsOneWidget);
-  });
+      expect(find.text('Triage'), findsOneWidget);
+      expect(find.text('triage / flutter-spike'), findsWidgets);
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+    },
+  );
 
   testWidgets('selects sessions and sends input over WebSocket', (
     WidgetTester tester,
@@ -227,5 +233,25 @@ void main() {
 
     // Verify session was removed and selected index was updated
     expect(find.text('triage / flutter-spike'), findsNothing);
+  });
+
+  testWidgets('uses a persisted per-install client id for authentication', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(client.helloClientIds, isNotEmpty);
+    expect(client.helloClientIds.single, isNot('triage-flutter-client'));
+    expect(client.helloClientIds.single, startsWith('triage-flutter-client-'));
+
+    final secondClient = FakeTriageWebSocketClient();
+    await tester.pumpWidget(
+      TriageClientApp(key: UniqueKey(), client: secondClient),
+    );
+    await tester.pumpAndSettle();
+
+    expect(secondClient.helloClientIds.single, client.helloClientIds.single);
   });
 }

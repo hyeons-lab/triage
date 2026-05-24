@@ -1,11 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/storage.dart';
-
 
 void main() {
   runApp(const TriageClientApp());
@@ -42,6 +42,7 @@ class SessionVm {
     required this.statusColor,
     required this.icon,
     required this.rows,
+    required this.outputSeq,
   }) : terminalController = TerminalController();
 
   final String title;
@@ -51,6 +52,7 @@ class SessionVm {
   final IconData icon;
   final List<StyledRow> rows;
   final TerminalController terminalController;
+  int outputSeq;
 }
 
 class TriageHome extends StatefulWidget {
@@ -71,8 +73,9 @@ class _TriageHomeState extends State<TriageHome> {
   bool _sidebarCollapsed = false;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
-  final String _clientId = 'triage-flutter-client';
+  late final String _clientId;
   final Map<String, String> _subscriptionIds = {};
+  final Map<String, List<Map<String, dynamic>>> _pendingEvents = {};
 
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
@@ -104,6 +107,7 @@ class _TriageHomeState extends State<TriageHome> {
   @override
   void initState() {
     super.initState();
+    _clientId = _loadOrCreateClientId();
     _sessions = [
       SessionVm(
         title: 'triage / flutter-spike',
@@ -120,6 +124,7 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('awaiting input: define TerminalPane bridge boundary'),
         ],
+        outputSeq: 0,
       ),
       SessionVm(
         title: 'triage / websocket-session-api',
@@ -134,6 +139,7 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('running: websocket integration notes'),
         ],
+        outputSeq: 0,
       ),
       SessionVm(
         title: 'triage / main',
@@ -147,6 +153,7 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('idle'),
         ],
+        outputSeq: 0,
       ),
     ];
     for (final s in _sessions) {
@@ -155,17 +162,35 @@ class _TriageHomeState extends State<TriageHome> {
     _initWebSocket();
   }
 
+  String _loadOrCreateClientId() {
+    final storedClientId = retrieveClientId();
+    if (storedClientId != null && storedClientId.trim().isNotEmpty) {
+      return storedClientId;
+    }
+
+    final random = Random.secure();
+    final suffix = List.generate(
+      16,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+    final clientId = 'triage-flutter-client-$suffix';
+    persistClientId(clientId);
+    return clientId;
+  }
+
   void _setupSessionInputListener(SessionVm session) {
     session.terminalController.addInputListener((keys) {
       if (_client.isConnected && session.status == 'attached') {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          _client.writeInput(
-            sessionId: sessionId,
-            clientId: _clientId,
-            bytes: utf8.encode(keys),
-          ).catchError((_) {});
+          _client
+              .writeInput(
+                sessionId: sessionId,
+                clientId: _clientId,
+                bytes: utf8.encode(keys),
+              )
+              .catchError((_) {});
         }
       } else {
         setState(() {
@@ -203,11 +228,9 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          _client.resizeSession(
-            sessionId: sessionId,
-            cols: cols,
-            rows: rows,
-          ).catchError((_) {});
+          _client
+              .resizeSession(sessionId: sessionId, cols: cols, rows: rows)
+              .catchError((_) {});
         }
       }
     });
@@ -244,7 +267,10 @@ class _TriageHomeState extends State<TriageHome> {
         onDone: _onWebSocketClosed,
       );
 
-      final helloRes = await _client.hello(clientId: _clientId, token: _bearerToken);
+      final helloRes = await _client.hello(
+        clientId: _clientId,
+        token: _bearerToken,
+      );
       final authenticated = helloRes['authenticated'] as bool? ?? false;
 
       if (!authenticated) {
@@ -265,7 +291,8 @@ class _TriageHomeState extends State<TriageHome> {
       await _loadDaemonSessions();
     } catch (e) {
       final errStr = e.toString();
-      if (errStr.contains('unauthorized') || errStr.contains('unauthenticated')) {
+      if (errStr.contains('unauthorized') ||
+          errStr.contains('unauthenticated')) {
         setState(() {
           _needsPairing = true;
           _connectionStatus = 'Awaiting Pairing';
@@ -301,7 +328,14 @@ class _TriageHomeState extends State<TriageHome> {
       final List<SessionVm> daemonSessions = [];
 
       for (final sid in sessionIds) {
+        String? subId;
         try {
+          // Subscribe to events first so we don't miss anything printed during attach
+          subId = await _client.subscribeSessionEvents(sessionId: sid);
+          if (subId.isNotEmpty) {
+            _subscriptionIds[subId] = sid;
+          }
+
           final attachRes = await _client.attachSession(
             sessionId: sid,
             clientId: _clientId,
@@ -309,6 +343,7 @@ class _TriageHomeState extends State<TriageHome> {
           );
           final responseObj = attachRes['response'] as Map<String, dynamic>?;
           final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
           final branch = contextObj?['branch']?.toString() ?? 'main';
 
@@ -342,22 +377,25 @@ class _TriageHomeState extends State<TriageHome> {
             statusColor: const Color(0xff7fd1c7),
             icon: Icons.terminal,
             rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
+            outputSeq: snapshot?['output_seq'] as int? ?? 0,
           );
           _setupSessionInputListener(session);
           daemonSessions.add(session);
-
-          final subId = await _client.subscribeSessionEvents(sessionId: sid);
-          if (subId.isNotEmpty) {
-            _subscriptionIds[subId] = sid;
-          }
         } catch (e) {
-          debugPrint('Failed to load session $sid: $e');
+          // Roll back the subscription bookkeeping and drop any events buffered
+          // for a session we will never expose, so they don't accumulate forever.
+          if (subId != null && subId.isNotEmpty) {
+            _subscriptionIds.remove(subId);
+          }
+          _pendingEvents.remove(sid);
+          debugPrint('Failed to load session $sid: ${e.toString()}');
         }
       }
 
       setState(() {
         for (final s in _sessions) {
           s.terminalController.dispose();
+          TerminalPane.destroySession(s.title);
         }
         _sessions.clear();
         _sessions.addAll(daemonSessions);
@@ -365,6 +403,20 @@ class _TriageHomeState extends State<TriageHome> {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
         }
       });
+
+      // Drain and replay any pending events that arrived while loading
+      for (final session in daemonSessions) {
+        final parts = session.title.split(' / ');
+        final sid = parts.length > 1 ? parts[1] : null;
+        if (sid != null) {
+          final pending = _pendingEvents.remove(sid);
+          if (pending != null) {
+            for (final msg in pending) {
+              _onWebSocketEvent(msg);
+            }
+          }
+        }
+      }
     } catch (_) {
       // Fallback
     }
@@ -377,46 +429,61 @@ class _TriageHomeState extends State<TriageHome> {
       final event = envelope?['event'] as Map<String, dynamic>?;
       if (event == null) return;
 
+      String? sessionId;
+      if (event.containsKey('Output')) {
+        sessionId = event['Output']['session_id'] as String?;
+      } else if (event.containsKey('Exited')) {
+        sessionId = event['Exited']['session_id'] as String?;
+      }
+
+      if (sessionId == null) return;
+
+      final sessionIndex = _sessions.indexWhere(
+        (s) => s.title == 'triage / $sessionId',
+      );
+
+      if (sessionIndex == -1) {
+        // Buffer the event for when the session is fully attached/loaded
+        _pendingEvents.putIfAbsent(sessionId, () => []).add(message);
+        return;
+      }
+
+      final session = _sessions[sessionIndex];
+
       if (event.containsKey('Output')) {
         final output = event['Output'] as Map<String, dynamic>;
-        final sessionId = output['session_id'] as String;
+        final outputSeq = output['output_seq'] as int? ?? 0;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
         final text = utf8.decode(bytes, allowMalformed: true);
 
-        final sessionIndex = _sessions.indexWhere(
-          (s) => s.title == 'triage / $sessionId',
-        );
-        if (sessionIndex != -1) {
-          // Write directly to xterm.js via the controller.
-          // This bypasses calling setState() on every small output chunk,
-          // avoiding Flutter widget tree rebuilds during active WebSocket sessions.
-          _sessions[sessionIndex].terminalController.write(text);
-
-          // Update backup logs silently (without calling setState)
-          final rows = _sessions[sessionIndex].rows;
-          final newLines = text.split('\n');
-          if (rows.isNotEmpty &&
-              rows.last.spans.length == 1 &&
-              rows.last.spans.first.text.isEmpty) {
-            rows.removeLast();
-          }
-          for (final line in newLines) {
-            rows.add(_plainRow(line));
-          }
+        // Filter out any duplicate welcome messages or output
+        // already incorporated in the attached session snapshot.
+        if (outputSeq <= session.outputSeq) {
+          return;
         }
+
+        // Write directly to xterm.js via the controller.
+        // This bypasses calling setState() on every small output chunk,
+        // avoiding Flutter widget tree rebuilds during active WebSocket sessions.
+        session.terminalController.write(text);
+
+        // Update backup logs silently (without calling setState).
+        final rows = session.rows;
+        final newLines = text.split('\n');
+        if (rows.isNotEmpty &&
+            rows.last.spans.length == 1 &&
+            rows.last.spans.first.text.isEmpty) {
+          rows.removeLast();
+        }
+        for (final line in newLines) {
+          rows.add(_plainRow(line));
+        }
+        session.outputSeq = outputSeq;
       } else if (event.containsKey('Exited')) {
-        final exited = event['Exited'] as Map<String, dynamic>;
-        final sessionId = exited['session_id'] as String;
-
-        final sessionIndex = _sessions.indexWhere(
-          (s) => s.title == 'triage / $sessionId',
-        );
-        if (sessionIndex != -1) {
-          setState(() {
-            _sessions[sessionIndex].status = 'exited';
-            _sessions[sessionIndex].statusColor = const Color(0xff7f8b8d);
-          });
-        }
+        setState(() {
+          session.status = 'exited';
+          session.statusColor = const Color(0xff7f8b8d);
+        });
       }
     }
   }
@@ -443,6 +510,7 @@ class _TriageHomeState extends State<TriageHome> {
     }
     for (final s in _sessions) {
       s.terminalController.dispose();
+      TerminalPane.destroySession(s.title);
     }
     super.dispose();
   }
@@ -459,14 +527,21 @@ class _TriageHomeState extends State<TriageHome> {
         _connectionStatus = 'Creating session...';
         _connectionStatusColor = const Color(0xffffc857);
       });
+      String sessionId = '';
+      String? subId;
       try {
-        String sessionId = '';
         try {
           sessionId = await _client.startSession(command: 'bash');
         } catch (_) {
           sessionId = await _client.startSession(command: 'cmd.exe');
         }
         if (sessionId.isNotEmpty) {
+          // Subscribe to events first so we don't miss welcome messages
+          subId = await _client.subscribeSessionEvents(sessionId: sessionId);
+          if (subId.isNotEmpty) {
+            _subscriptionIds[subId] = sessionId;
+          }
+
           final attachRes = await _client.attachSession(
             sessionId: sessionId,
             clientId: _clientId,
@@ -509,15 +584,9 @@ class _TriageHomeState extends State<TriageHome> {
             rows: rows.isEmpty
                 ? [_plainRow('Attached to session $sessionId')]
                 : rows,
+            outputSeq: snapshot?['output_seq'] as int? ?? 0,
           );
           _setupSessionInputListener(session);
-
-          final subId = await _client.subscribeSessionEvents(
-            sessionId: sessionId,
-          );
-          if (subId.isNotEmpty) {
-            _subscriptionIds[subId] = sessionId;
-          }
 
           setState(() {
             _sessions.insert(0, session);
@@ -525,8 +594,24 @@ class _TriageHomeState extends State<TriageHome> {
             _connectionStatus = 'Connected to Daemon';
             _connectionStatusColor = const Color(0xff7fd1c7);
           });
+
+          // Drain and replay any pending events that arrived during attach
+          final pending = _pendingEvents.remove(sessionId);
+          if (pending != null) {
+            for (final msg in pending) {
+              _onWebSocketEvent(msg);
+            }
+          }
         }
       } catch (e) {
+        // Roll back partial state so a failed create doesn't strand a subscription
+        // id or accumulate buffered events for a session that will never appear.
+        if (subId != null && subId.isNotEmpty) {
+          _subscriptionIds.remove(subId);
+        }
+        if (sessionId.isNotEmpty) {
+          _pendingEvents.remove(sessionId);
+        }
         setState(() {
           _connectionStatus = 'Error creating session';
           _connectionStatusColor = const Color(0xffff6b6b);
@@ -548,6 +633,7 @@ class _TriageHomeState extends State<TriageHome> {
         _plainRow(''),
         _plainRow('ready'),
       ],
+      outputSeq: 0,
     );
     _setupSessionInputListener(session);
 
@@ -566,7 +652,7 @@ class _TriageHomeState extends State<TriageHome> {
       try {
         await _client.shutdownSession(sessionId: sessionId);
       } catch (e) {
-        debugPrint('Failed to shutdown session: $e');
+        debugPrint('Failed to shutdown session: ${e.toString()}');
       }
     }
 
@@ -575,6 +661,7 @@ class _TriageHomeState extends State<TriageHome> {
       if (index != -1) {
         _sessions.removeAt(index);
         session.terminalController.dispose();
+        TerminalPane.destroySession(session.title);
         if (_selectedIndex >= _sessions.length) {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
         }
@@ -652,7 +739,11 @@ class _TriageHomeState extends State<TriageHome> {
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(Icons.terminal, size: 64, color: Color(0xff263033)),
+                          Icon(
+                            Icons.terminal,
+                            size: 64,
+                            color: Color(0xff263033),
+                          ),
                           SizedBox(height: 16),
                           Text(
                             'No active sessions',
@@ -719,7 +810,11 @@ class SessionRail extends StatelessWidget {
             IconButton(
               onPressed: onToggleCollapse,
               tooltip: 'Expand sidebar',
-              icon: const Icon(Icons.chevron_right, color: Color(0xff7fd1c7), size: 26),
+              icon: const Icon(
+                Icons.chevron_right,
+                color: Color(0xff7fd1c7),
+                size: 26,
+              ),
             ),
             const SizedBox(height: 16),
             IconButton(
@@ -809,7 +904,11 @@ class SessionRail extends StatelessWidget {
                 IconButton(
                   onPressed: onToggleCollapse,
                   tooltip: 'Minimize sidebar',
-                  icon: const Icon(Icons.chevron_left, color: Color(0xff7f8b8d), size: 22),
+                  icon: const Icon(
+                    Icons.chevron_left,
+                    color: Color(0xff7f8b8d),
+                    size: 22,
+                  ),
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
                 ),
@@ -1012,11 +1111,7 @@ class SessionWorkspace extends StatelessWidget {
 }
 
 class WorkspaceHeader extends StatelessWidget {
-  const WorkspaceHeader({
-    super.key,
-    required this.session,
-    this.onClose,
-  });
+  const WorkspaceHeader({super.key, required this.session, this.onClose});
 
   final SessionVm session;
   final VoidCallback? onClose;
@@ -1152,11 +1247,7 @@ class _PairingViewState extends State<_PairingView> {
         const SizedBox(height: 16),
         const Text(
           'This Triage daemon requires pairing. Please run "triage pair" in your local terminal and enter the 8-character PIN below.',
-          style: TextStyle(
-            color: Color(0xffa5b1b4),
-            fontSize: 14,
-            height: 1.4,
-          ),
+          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
         ),
         const SizedBox(height: 24),
         TextField(
@@ -1171,7 +1262,11 @@ class _PairingViewState extends State<_PairingView> {
           ),
           decoration: const InputDecoration(
             labelText: '8-Character PIN',
-            labelStyle: TextStyle(fontSize: 14, letterSpacing: 0, color: Color(0xff7f8b8d)),
+            labelStyle: TextStyle(
+              fontSize: 14,
+              letterSpacing: 0,
+              color: Color(0xff7f8b8d),
+            ),
             counterText: '',
             border: OutlineInputBorder(),
             enabledBorder: OutlineInputBorder(
@@ -1207,7 +1302,10 @@ class _PairingViewState extends State<_PairingView> {
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xff2b6f6f),
                 foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 12,
+                ),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(8),
                 ),

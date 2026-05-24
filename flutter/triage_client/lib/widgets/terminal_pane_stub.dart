@@ -14,6 +14,10 @@ class TerminalPane extends StatefulWidget {
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
 
+  static void destroySession(String terminalId) {
+    // Stub implementation does nothing
+  }
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }

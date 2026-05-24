@@ -198,6 +198,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                         self.authenticated = ok;
                         ok
                     } else {
+                        self.authenticated = false;
                         false
                     }
                 } else {

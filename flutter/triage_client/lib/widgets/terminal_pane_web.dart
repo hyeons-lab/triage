@@ -45,7 +45,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   void initState() {
     super.initState();
     _focusNode = FocusNode();
-    final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final sanitizedId = widget.terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
     _viewType = 'xterm-view-$sanitizedId';
 
     // 1. Create native container div
@@ -106,22 +109,29 @@ class _TerminalPaneState extends State<TerminalPane> {
             var selection = html.window.getSelection()?.toString() ?? '';
             if (selection.isEmpty) {
               try {
-                selection = js_util.callMethod(_term, 'getSelection', []) as String? ?? '';
+                selection =
+                    js_util.callMethod(_term, 'getSelection', []) as String? ??
+                    '';
               } catch (_) {}
             }
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              html.window.navigator.clipboard?.writeText(selection).catchError((_) {});
+              html.window.navigator.clipboard
+                  ?.writeText(selection)
+                  .catchError((_) {});
             }
           } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
             event.preventDefault();
             event.stopPropagation();
-            html.window.navigator.clipboard?.readText().then((text) {
-              if (text != null && text.isNotEmpty) {
-                widget.controller.sendInput(text);
-              }
-            }).catchError((_) {});
+            html.window.navigator.clipboard
+                ?.readText()
+                .then((text) {
+                  if (text != null && text.isNotEmpty) {
+                    widget.controller.sendInput(text);
+                  }
+                })
+                .catchError((_) {});
           }
         }
       }
@@ -205,7 +215,8 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (key == 'Tab') {
               js_util.callMethod(event, 'preventDefault', []);
               js_util.callMethod(event, 'stopPropagation', []);
-              final shiftKey = js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+              final shiftKey =
+                  js_util.getProperty(event, 'shiftKey') as bool? ?? false;
               if (shiftKey) {
                 widget.controller.sendInput('\x1B[Z'); // BackTab sequence
               } else {
@@ -214,7 +225,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               return false;
             }
             return true;
-          })
+          }),
         ]);
       } catch (_) {}
 
@@ -380,7 +391,10 @@ class _TerminalPaneState extends State<TerminalPane> {
         js_util.callMethod(_term, 'dispose', []);
       } catch (_) {}
     }
-    final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final sanitizedId = widget.terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
     _sessionContainers.remove(sanitizedId);
     super.dispose();
   }
@@ -397,7 +411,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       },
       child: LayoutBuilder(
         builder: (context, constraints) {
-          if (constraints.maxWidth != _lastWidth || constraints.maxHeight != _lastHeight) {
+          if (constraints.maxWidth != _lastWidth ||
+              constraints.maxHeight != _lastHeight) {
             _lastWidth = constraints.maxWidth;
             _lastHeight = constraints.maxHeight;
             WidgetsBinding.instance.addPostFrameCallback((_) {

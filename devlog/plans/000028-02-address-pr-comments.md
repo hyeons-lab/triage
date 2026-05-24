@@ -25,3 +25,5 @@ We need to address all PR #34 comments systematically:
 8. Add require_pairing caching to SessionManager.
 9. Delete pairing_code.json on successful consumption in SessionManager::pair.
 10. Update crates/triage/src/main.rs run_pairing_display to honor XDG_STATE_HOME and update config error help message.
+11. Hardened Hello request unauthenticated state logic to explicitly reset authentication status if client parameters are missing.
+

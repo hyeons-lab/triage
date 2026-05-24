@@ -26,42 +26,26 @@ class TriageWebSocketClient {
   Future<void> connect() async {
     if (_channel != null) return;
 
-    final completer = Completer<void>();
-
-    runZonedGuarded(
-      () {
-        _channel = _channelFactory(uri);
-        _channel!.stream.listen(
-          (message) {
-            _handleIncomingMessage(message.toString());
-          },
-          onError: (error) {
-            _cleanupPendingRequests();
-            _channel = null;
-            if (!completer.isCompleted) {
-              completer.completeError(error);
-            }
-          },
-          onDone: () {
-            _cleanupPendingRequests();
-            _channel = null;
-            if (!completer.isCompleted) {
-              completer.completeError(Exception('WebSocket connection closed'));
-            }
-          },
-        );
-        completer.complete();
-      },
-      (error, stack) {
-        _cleanupPendingRequests();
-        _channel = null;
-        if (!completer.isCompleted) {
-          completer.completeError(error);
-        }
-      },
-    );
-
-    return completer.future;
+    try {
+      _channel = _channelFactory(uri);
+      _channel!.stream.listen(
+        (message) {
+          _handleIncomingMessage(message.toString());
+        },
+        onError: (error) {
+          _cleanupPendingRequests();
+          _channel = null;
+        },
+        onDone: () {
+          _cleanupPendingRequests();
+          _channel = null;
+        },
+      );
+    } catch (error) {
+      _cleanupPendingRequests();
+      _channel = null;
+      rethrow;
+    }
   }
 
   void _handleIncomingMessage(String messageText) {
@@ -228,6 +212,20 @@ class TriageWebSocketClient {
   Future<void> shutdownSession({required String sessionId}) async {
     await _send('shutdown_session', {
       'session_id': sessionId,
+    });
+  }
+
+  Future<Map<String, dynamic>> styledRows({
+    required String sessionId,
+    required int start,
+    required int end,
+  }) async {
+    return _send('styled_rows', {
+      'request': {
+        'session_id': sessionId,
+        'start': start,
+        'end': end,
+      },
     });
   }
 
