@@ -459,12 +459,42 @@ class _TriageHomeState extends State<TriageHome> {
           if (visibleRowsJson != null) {
             final visibleRows = visibleRowsJson.cast<String>();
             final styledRowsStart = visibleRows.length - styledRows.length;
-            for (var i = 0; i < visibleRows.length; i++) {
-              if (i < styledRowsStart) {
-                rows.add(_plainRow(visibleRows[i]));
-              } else {
-                rows.add(styledRows[i - styledRowsStart]);
+            if (styledRowsStart > 0) {
+              try {
+                final historyRes = await _client.styledRows(
+                  sessionId: sid,
+                  start: 0,
+                  end: visibleRows.length,
+                );
+                final responseObj =
+                    historyRes['response'] as Map<String, dynamic>?;
+                final rowsList = responseObj?['rows'] as List<dynamic>?;
+                if (rowsList != null) {
+                  rows.addAll(
+                    rowsList.map(
+                      (e) => StyledRow.fromJson(e as Map<String, dynamic>),
+                    ),
+                  );
+                } else {
+                  for (var i = 0; i < visibleRows.length; i++) {
+                    if (i < styledRowsStart) {
+                      rows.add(_plainRow(visibleRows[i]));
+                    } else {
+                      rows.add(styledRows[i - styledRowsStart]);
+                    }
+                  }
+                }
+              } catch (_) {
+                for (var i = 0; i < visibleRows.length; i++) {
+                  if (i < styledRowsStart) {
+                    rows.add(_plainRow(visibleRows[i]));
+                  } else {
+                    rows.add(styledRows[i - styledRowsStart]);
+                  }
+                }
               }
+            } else {
+              rows.addAll(styledRows);
             }
           } else {
             rows.addAll(styledRows);
@@ -679,12 +709,42 @@ class _TriageHomeState extends State<TriageHome> {
           if (visibleRowsJson != null) {
             final visibleRows = visibleRowsJson.cast<String>();
             final styledRowsStart = visibleRows.length - styledRows.length;
-            for (var i = 0; i < visibleRows.length; i++) {
-              if (i < styledRowsStart) {
-                rows.add(_plainRow(visibleRows[i]));
-              } else {
-                rows.add(styledRows[i - styledRowsStart]);
+            if (styledRowsStart > 0) {
+              try {
+                final historyRes = await _client.styledRows(
+                  sessionId: sessionId,
+                  start: 0,
+                  end: visibleRows.length,
+                );
+                final responseObj =
+                    historyRes['response'] as Map<String, dynamic>?;
+                final rowsList = responseObj?['rows'] as List<dynamic>?;
+                if (rowsList != null) {
+                  rows.addAll(
+                    rowsList.map(
+                      (e) => StyledRow.fromJson(e as Map<String, dynamic>),
+                    ),
+                  );
+                } else {
+                  for (var i = 0; i < visibleRows.length; i++) {
+                    if (i < styledRowsStart) {
+                      rows.add(_plainRow(visibleRows[i]));
+                    } else {
+                      rows.add(styledRows[i - styledRowsStart]);
+                    }
+                  }
+                }
+              } catch (_) {
+                for (var i = 0; i < visibleRows.length; i++) {
+                  if (i < styledRowsStart) {
+                    rows.add(_plainRow(visibleRows[i]));
+                  } else {
+                    rows.add(styledRows[i - styledRowsStart]);
+                  }
+                }
               }
+            } else {
+              rows.addAll(styledRows);
             }
           } else {
             rows.addAll(styledRows);
@@ -1322,7 +1382,8 @@ class _PairingViewState extends State<_PairingView> {
     final validChars = RegExp(r'^[0-9A-HJ-KM-NP-TV-Z]{8}$');
     if (!validChars.hasMatch(pin)) {
       setState(() {
-        _errorMessage = 'PIN must be 8 characters (letters and digits, excluding U)';
+        _errorMessage =
+            'PIN must be 8 characters (letters and digits, excluding U)';
       });
       return;
     }

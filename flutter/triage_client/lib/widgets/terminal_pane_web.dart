@@ -21,11 +21,29 @@ class TerminalPane extends StatefulWidget {
   final List<StyledRow> fallbackRows;
 
   static void destroySession(String terminalId) {
-    final sanitizedId = terminalId.replaceAll(
-      RegExp(r'[^a-zA-Z0-9-]'),
-      '_',
-    );
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     _TerminalPaneState._sessionContainers.remove(sanitizedId);
+    final term = _TerminalPaneState._sessionTerms.remove(sanitizedId);
+    if (term != null) {
+      try {
+        js_util.callMethod(term, 'dispose', []);
+      } catch (_) {}
+    }
+    _TerminalPaneState._sessionFitAddons.remove(sanitizedId);
+    final onData = _TerminalPaneState._sessionOnDataSubs.remove(sanitizedId);
+    if (onData != null) {
+      try {
+        js_util.callMethod(onData, 'dispose', []);
+      } catch (_) {}
+    }
+    final onResize = _TerminalPaneState._sessionOnResizeSubs.remove(
+      sanitizedId,
+    );
+    if (onResize != null) {
+      try {
+        js_util.callMethod(onResize, 'dispose', []);
+      } catch (_) {}
+    }
   }
 
   @override
@@ -34,10 +52,15 @@ class TerminalPane extends StatefulWidget {
 
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, html.Element> _sessionContainers = {};
+  static final Map<String, dynamic> _sessionTerms = {};
+  static final Map<String, dynamic> _sessionFitAddons = {};
+  static final Map<String, dynamic> _sessionOnDataSubs = {};
+  static final Map<String, dynamic> _sessionOnResizeSubs = {};
   static final Set<String> _registeredViewTypes = {};
 
   late final String _viewType;
   late final html.DivElement _container;
+  late final html.DivElement _terminalWrapper;
   late final dynamic _term;
   late final dynamic _fitAddon;
   late final dynamic _onDataSubscription;
@@ -59,48 +82,89 @@ class _TerminalPaneState extends State<TerminalPane> {
     );
     _viewType = 'xterm-view-$sanitizedId';
 
-    // 1. Create native container div
-    _container = html.DivElement()
-      ..style.width = '100%'
-      ..style.height = '100%'
-      ..style.backgroundColor = '#0d1113'
-      ..style.overflow = 'hidden'
-      ..style.paddingLeft = '16px'
-      ..style.paddingRight = '16px'
-      ..style.boxSizing = 'border-box';
+    final cachedContainer = _sessionContainers[sanitizedId];
+    if (cachedContainer != null) {
+      _container = cachedContainer as html.DivElement;
+      _terminalWrapper = _container.children.first as html.DivElement;
+      _term = _sessionTerms[sanitizedId];
+      _fitAddon = _sessionFitAddons[sanitizedId];
+      _onDataSubscription = _sessionOnDataSubs[sanitizedId];
+      _onResizeSubscription = _sessionOnResizeSubs[sanitizedId];
+      _initialized = true;
+      _bindController();
 
-    // Store/update the container for this session
-    _sessionContainers[sanitizedId] = _container;
-
-    _container.onClick.listen((event) {
-      _focusNode.requestFocus();
-      if (_initialized) {
+      _container.onClick.listen((event) {
+        _focusNode.requestFocus();
         try {
           js_util.callMethod(_term, 'focus', []);
-          _onFit(); // Force re-fit on click/focus to align character cell measurements
+          _onFit();
         } catch (_) {}
-      }
-    });
+      });
 
-    _container.onKeyDown.listen((event) {
-      if (event.key == 'Tab') {
-        event.preventDefault();
-      }
-    });
-
-    _container.addEventListener('paste', (html.Event event) {
-      if (event is html.ClipboardEvent) {
-        event.preventDefault();
-        event.stopPropagation();
-        final clipboardData = event.clipboardData;
-        final text = clipboardData?.getData('text/plain') ?? '';
-        if (text.isNotEmpty) {
-          widget.controller.sendInput(text);
+      _container.addEventListener('paste', (html.Event event) {
+        if (event is html.ClipboardEvent) {
+          event.preventDefault();
+          event.stopPropagation();
+          final clipboardData = event.clipboardData;
+          final text = clipboardData?.getData('text/plain') ?? '';
+          if (text.isNotEmpty) {
+            widget.controller.sendInput(text);
+          }
         }
-      }
-    }, true);
+      }, true);
 
-    // Register global capture-phase listener to intercept Tab/Ctrl+C/Ctrl+V before Flutter's capture listener
+      Future.delayed(const Duration(milliseconds: 50), _onFit);
+      Future.delayed(const Duration(milliseconds: 200), _onFit);
+      Future.delayed(const Duration(milliseconds: 600), _onFit);
+      Future.delayed(const Duration(milliseconds: 1500), _onFit);
+    } else {
+      _container = html.DivElement()
+        ..style.width = '100%'
+        ..style.height = '100%'
+        ..style.backgroundColor = '#0d1113'
+        ..style.overflow = 'hidden';
+
+      _terminalWrapper = html.DivElement()
+        ..style.width = 'calc(100% - 32px)'
+        ..style.height = '100%'
+        ..style.marginLeft = '16px'
+        ..style.marginRight = '16px'
+        ..style.overflow = 'hidden';
+
+      _container.append(_terminalWrapper);
+      _sessionContainers[sanitizedId] = _container;
+
+      _container.onClick.listen((event) {
+        _focusNode.requestFocus();
+        if (_initialized) {
+          try {
+            js_util.callMethod(_term, 'focus', []);
+            _onFit();
+          } catch (_) {}
+        }
+      });
+
+      _container.onKeyDown.listen((event) {
+        if (event.key == 'Tab') {
+          event.preventDefault();
+        }
+      });
+
+      _container.addEventListener('paste', (html.Event event) {
+        if (event is html.ClipboardEvent) {
+          event.preventDefault();
+          event.stopPropagation();
+          final clipboardData = event.clipboardData;
+          final text = clipboardData?.getData('text/plain') ?? '';
+          if (text.isNotEmpty) {
+            widget.controller.sendInput(text);
+          }
+        }
+      }, true);
+
+      _initTerminal(sanitizedId);
+    }
+
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         final activeEl = html.document.activeElement;
@@ -119,7 +183,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             event.preventDefault();
             event.stopPropagation();
             if (event.shiftKey) {
-              widget.controller.sendInput('\x1B[Z'); // BackTab sequence
+              widget.controller.sendInput('\x1B[Z');
             } else {
               widget.controller.sendInput('\t');
             }
@@ -163,7 +227,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     };
     html.window.addEventListener('keydown', _windowKeyDownListener, true);
 
-    // 2. Register the platform view factory only if not already registered
     if (!_registeredViewTypes.contains(_viewType)) {
       ui_web.platformViewRegistry.registerViewFactory(
         _viewType,
@@ -171,20 +234,16 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
       _registeredViewTypes.add(_viewType);
     }
-
-    _initTerminal();
   }
 
-  void _initTerminal() {
+  void _initTerminal(String sanitizedId) {
     try {
-      // 3. Create Terminal Options JSObject
       final options = js_util.newObject();
       final theme = js_util.newObject();
       js_util.setProperty(theme, 'background', '#0d1113');
       js_util.setProperty(theme, 'foreground', '#d9e5e3');
       js_util.setProperty(theme, 'cursor', '#7fd1c7');
 
-      // Mute harsh ANSI colors with a premium, harmonious pastel palette
       js_util.setProperty(theme, 'black', '#1f2b30');
       js_util.setProperty(theme, 'red', '#f2777a');
       js_util.setProperty(theme, 'green', '#99cc99');
@@ -210,29 +269,23 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
       js_util.setProperty(options, 'fontSize', 15);
       js_util.setProperty(options, 'cursorBlink', true);
-      js_util.setProperty(
-        options,
-        'convertEol',
-        false,
-      ); // Normalizes \n to \r\n naturally via PTY post-processing!
+      js_util.setProperty(options, 'convertEol', true);
 
-      // 4. Instantiate Terminal
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
+      _sessionTerms[sanitizedId] = _term;
 
-      // 5. Open Terminal in Container
-      js_util.callMethod(_term, 'open', [_container]);
+      js_util.callMethod(_term, 'open', [_terminalWrapper]);
 
-      // 6. Instantiate and Load FitAddon
       final fitAddonModule = js_util.getProperty(html.window, 'FitAddon');
       final fitAddonConstructor = js_util.getProperty(
         fitAddonModule,
         'FitAddon',
       );
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
+      _sessionFitAddons[sanitizedId] = _fitAddon;
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
-      // Prevent Tab key from escaping focus in xterm.js (allowing shell autocomplete)
       try {
         js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
           js_util.allowInterop((dynamic event) {
@@ -243,7 +296,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               final shiftKey =
                   js_util.getProperty(event, 'shiftKey') as bool? ?? false;
               if (shiftKey) {
-                widget.controller.sendInput('\x1B[Z'); // BackTab sequence
+                widget.controller.sendInput('\x1B[Z');
               } else {
                 widget.controller.sendInput('\t');
               }
@@ -254,15 +307,14 @@ class _TerminalPaneState extends State<TerminalPane> {
         ]);
       } catch (_) {}
 
-      // 6b. Bind JS term.onData to controller
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
         widget.controller.sendInput(data);
       });
       _onDataSubscription = js_util.callMethod(_term, 'onData', [
         onDataCallback,
       ]);
+      _sessionOnDataSubs[sanitizedId] = _onDataSubscription;
 
-      // 6c. Bind JS term.onResize to controller
       final onResizeCallback = js_util.allowInterop((
         dynamic size, [
         dynamic _,
@@ -274,11 +326,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
         onResizeCallback,
       ]);
+      _sessionOnResizeSubs[sanitizedId] = _onResizeSubscription;
 
-      // 7. Write fallback initial content
       _writeInitialContent();
 
-      // 8. Bind listeners to the controller
       _initialized = true;
       _bindController();
 
@@ -286,13 +337,11 @@ class _TerminalPaneState extends State<TerminalPane> {
         js_util.callMethod(_term, 'focus', []);
       } catch (_) {}
 
-      // 9. Delayed fits to handle timing/sizing latency
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
       Future.delayed(const Duration(milliseconds: 1500), _onFit);
 
-      // Re-fit when fonts are fully loaded to resolve cursor alignment issues caused by font loading latency!
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
         if (fonts != null) {
@@ -453,18 +502,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _focusNode.dispose();
     _unbindController();
-    if (_initialized) {
-      try {
-        js_util.callMethod(_onDataSubscription, 'dispose', []);
-        js_util.callMethod(_onResizeSubscription, 'dispose', []);
-        js_util.callMethod(_term, 'dispose', []);
-      } catch (_) {}
-    }
-    final sanitizedId = widget.terminalId.replaceAll(
-      RegExp(r'[^a-zA-Z0-9-]'),
-      '_',
-    );
-    _sessionContainers.remove(sanitizedId);
     super.dispose();
   }
 
