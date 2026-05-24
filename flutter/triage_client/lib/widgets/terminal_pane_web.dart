@@ -137,7 +137,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             html.window.navigator.clipboard
                 ?.readText()
                 .then((text) {
-                  if (text != null && text.isNotEmpty) {
+                  if (text.isNotEmpty) {
                     widget.controller.sendInput(text);
                   }
                 })
@@ -378,14 +378,17 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   String? _keyboardEventToInput(html.KeyboardEvent event) {
+    final key = event.key;
+    if (key == null) return null;
+
     if (event.ctrlKey || event.metaKey || event.altKey) {
-      if (event.ctrlKey && event.key.toLowerCase() == 'c') {
+      if (event.ctrlKey && key.toLowerCase() == 'c') {
         return '\x03';
       }
       return null;
     }
 
-    switch (event.key) {
+    switch (key) {
       case 'Enter':
         return '\r';
       case 'Backspace':
@@ -412,8 +415,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         return '\x1b[3~';
     }
 
-    if (event.key.length == 1) {
-      return event.key;
+    if (key.length == 1) {
+      return key;
     }
     return null;
   }

@@ -15,7 +15,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final bool shouldFailConnection;
   int failConnectAttempts;
 
-  StreamController<Map<String, dynamic>> _testEventController =
+  final StreamController<Map<String, dynamic>> _testEventController =
       StreamController<Map<String, dynamic>>.broadcast(sync: true);
 
   @override

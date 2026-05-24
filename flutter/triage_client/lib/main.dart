@@ -271,7 +271,7 @@ class _TriageHomeState extends State<TriageHome> {
         if (sessionId != null) {
           _client
               .resizeSession(sessionId: sessionId, cols: cols, rows: rows)
-              .catchError((_) {});
+              .catchError((_) => <String, dynamic>{});
         }
       }
     });
@@ -800,7 +800,7 @@ class _TriageHomeState extends State<TriageHome> {
                 border: Border.all(color: const Color(0xff2a3437)),
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.black.withOpacity(0.4),
+                    color: Colors.black.withValues(alpha: 0.4),
                     blurRadius: 24,
                     offset: const Offset(0, 8),
                   ),

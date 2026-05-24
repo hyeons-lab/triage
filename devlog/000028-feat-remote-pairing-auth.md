@@ -57,6 +57,7 @@
 - 2026-05-24T08:33-0700 Fixed Flutter pairing client identity by generating and persisting a per-install client id alongside the bearer token, preventing one paired device from invalidating another device's token.
 - 2026-05-24T09:47-0700 Guarded daemon-backed sessions against local mock input editing so typed text and backspace no longer overwrite fallback terminal content when the WebSocket drops, requests stall, xterm focus drifts, or a session exits.
 - 2026-05-24T09:47-0700 Added automatic Flutter WebSocket reconnect attempts while the UI remains mounted, with explicit connection-closed events from the WebSocket client and reconnect test coverage.
+- 2026-05-24T10:45-0700 Resolved Flutter compilation errors and analysis warnings, resolved unchecked nullable key usages in terminal_pane_web.dart, and cleaned up deprecated withOpacity calls.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -87,7 +88,8 @@
 - 39da11d — fix: address PR review comments and resolve clippy errors
 - 2207b53 — feat: switch pairing PIN to 8-char Crockford Base32
 - 0156828 — fix: address remote client review follow-ups
-- HEAD — fix: reconnect remote client automatically
+- 444aa2b — fix: reconnect remote client automatically
+- HEAD — fix: resolve flutter client compile warnings and test errors in ci
 
 ## Next Steps
 - None.

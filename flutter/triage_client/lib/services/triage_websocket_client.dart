@@ -123,8 +123,8 @@ class TriageWebSocketClient {
 
   Future<Map<String, dynamic>> hello({String? clientId, String? token}) async {
     return _send('hello', {
-      if (clientId != null) 'client_id': clientId,
-      if (token != null) 'token': token,
+      'client_id':? clientId,
+      'token':? token,
     });
   }
 
