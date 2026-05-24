@@ -1714,9 +1714,23 @@ impl ActorState {
     }
 }
 
-fn translate_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(bytes.len() + 16);
+fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let mut last = 0;
+    let mut needs_translation = false;
+    for &byte in bytes {
+        if byte == b'\n' && last != b'\r' {
+            needs_translation = true;
+            break;
+        }
+        last = byte;
+    }
+
+    if !needs_translation {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+
+    let mut result = Vec::with_capacity(bytes.len() + 16);
+    last = 0;
     for &byte in bytes {
         if byte == b'\n' && last != b'\r' {
             result.push(b'\r');
@@ -1724,7 +1738,7 @@ fn translate_newlines(bytes: &[u8]) -> Vec<u8> {
         result.push(byte);
         last = byte;
     }
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 impl OutputState {
