@@ -73,7 +73,17 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
-    // Register global capture-phase listener to intercept Tab/Ctrl+C before Flutter's capture listener
+    _container.onPaste.listen((event) {
+      event.preventDefault();
+      event.stopPropagation();
+      final clipboardData = event.clipboardData;
+      final text = clipboardData?.getData('text/plain') ?? '';
+      if (text.isNotEmpty) {
+        widget.controller.sendInput(text);
+      }
+    });
+
+    // Register global capture-phase listener to intercept Tab/Ctrl+C/Ctrl+V before Flutter's capture listener
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         final activeEl = html.document.activeElement;
@@ -86,7 +96,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             } else {
               widget.controller.sendInput('\t');
             }
-          } else if (event.ctrlKey && event.key == 'c') {
+          } else if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
             var selection = html.window.getSelection()?.toString() ?? '';
             if (selection.isEmpty) {
               try {
@@ -98,6 +108,14 @@ class _TerminalPaneState extends State<TerminalPane> {
               event.stopPropagation();
               html.window.navigator.clipboard?.writeText(selection);
             }
+          } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
+            event.preventDefault();
+            event.stopPropagation();
+            html.window.navigator.clipboard?.readText().then((text) {
+              if (text != null && text.isNotEmpty) {
+                widget.controller.sendInput(text);
+              }
+            });
           }
         }
       }
