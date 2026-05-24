@@ -23,6 +23,7 @@ pub fn start_websocket_server(manager: Arc<SessionManager>, bind_addr: SocketAdd
             .await
             .context("binding WebSocket TCP listener")?;
         tracing::info!(bind_addr = %bind_addr, "WebSocket server listening");
+        tracing::info!("triage remote web client UI is typically served at http://127.0.0.1:8080");
 
         loop {
             match listener.accept().await {
@@ -66,7 +67,8 @@ async fn handle_ws_connection(
         }
     });
 
-    let mut conn = WebSocketSessionConnection::new(manager);
+    let mut conn =
+        WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager));
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

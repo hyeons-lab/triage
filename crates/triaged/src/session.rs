@@ -3,7 +3,7 @@
     allow(dead_code, clippy::needless_return, clippy::large_enum_variant)
 )]
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -108,10 +108,31 @@ impl SessionManagerConfig {
     }
 }
 
+/// Crockford Base32 alphabet (RFC 4648 variant): excludes I, L, O, U to reduce typos.
+const CROCKFORD_BASE32_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const PAIRING_CODE_LENGTH: usize = 8;
+
+/// Normalize a user-typed pairing code per Crockford Base32 rules:
+/// strip whitespace, uppercase, and map ambiguous characters (I/L → 1, O → 0).
+fn normalize_pairing_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
+        .collect()
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
+    pairing_codes: Mutex<HashMap<String, Instant>>,
+    paired_devices: Mutex<HashMap<ClientId, String>>,
+    require_pairing: bool,
 }
 
 enum ManagedSession {
@@ -197,10 +218,25 @@ impl SessionManager {
             HashMap::new()
         });
         let next_session = next_session_sequence(sessions.keys());
+        let paired_devices = load_paired_devices(&config.log_dir);
+        let require_pairing = if let Ok(path) = triage_core::config::Config::default_path() {
+            if path.exists() {
+                triage_core::config::Config::load_from_path(&path)
+                    .map(|c| c.remote.require_pairing)
+                    .unwrap_or(true)
+            } else {
+                true
+            }
+        } else {
+            true
+        };
         Self {
             config,
             next_session: AtomicU64::new(next_session),
             sessions: Mutex::new(sessions),
+            pairing_codes: Mutex::new(HashMap::new()),
+            paired_devices: Mutex::new(paired_devices),
+            require_pairing,
         }
     }
 
@@ -217,6 +253,18 @@ impl SessionManager {
         self.sessions
             .lock()
             .map_err(|_| anyhow!("session manager lock poisoned"))
+    }
+
+    fn pairing_codes(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Instant>>> {
+        self.pairing_codes
+            .lock()
+            .map_err(|_| anyhow!("pairing codes lock poisoned"))
+    }
+
+    fn paired_devices(&self) -> Result<std::sync::MutexGuard<'_, HashMap<ClientId, String>>> {
+        self.paired_devices
+            .lock()
+            .map_err(|_| anyhow!("paired devices lock poisoned"))
     }
 
     fn persist_manifest(&self, sessions: &HashMap<SessionId, ManagedSession>) -> Result<()> {
@@ -252,6 +300,41 @@ impl SessionManager {
         };
         sessions.insert(session_id, ManagedSession::Historical { session, lease });
         Ok(())
+    }
+
+    pub fn generate_pairing_code(&self) -> Result<String> {
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+        let code: String = (0..PAIRING_CODE_LENGTH)
+            .map(|_| {
+                let idx = rng.gen_range(0..CROCKFORD_BASE32_ALPHABET.len());
+                CROCKFORD_BASE32_ALPHABET[idx] as char
+            })
+            .collect();
+
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 300; // 5 minutes expiry
+
+        let mut codes = self.pairing_codes()?;
+        codes.insert(code.clone(), Instant::now() + Duration::from_secs(300));
+
+        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
+        let info = serde_json::json!({
+            "code": code,
+            "expires_at": expires_at,
+        });
+        let json = serde_json::to_vec_pretty(&info)?;
+        if let Some(parent) = pairing_code_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&pairing_code_path, json)?;
+
+        tracing::info!("generated new device pairing PIN");
+
+        Ok(code)
     }
 }
 
@@ -666,17 +749,74 @@ impl PtySession {
     }
 }
 
-fn default_log_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
+pub fn default_log_dir() -> PathBuf {
+    default_log_dir_from_env(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+fn default_log_dir_from_env(
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+    userprofile: Option<OsString>,
+) -> PathBuf {
+    xdg_state_home
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
+            let home = home
+                .or(userprofile)
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
             home.join(".local/state")
         })
         .join("triage/sessions")
+}
+
+fn load_paired_devices(log_dir: &Path) -> HashMap<ClientId, String> {
+    let path = log_dir.join("paired_devices.json");
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to read paired_devices.json");
+            return HashMap::new();
+        }
+    };
+
+    match serde_json::from_str::<HashMap<String, String>>(&content) {
+        Ok(raw_map) => {
+            let mut map = HashMap::new();
+            for (k, v) in raw_map {
+                if let Ok(client_id) = ClientId::new(k) {
+                    map.insert(client_id, v);
+                }
+            }
+            map
+        }
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to parse paired_devices.json");
+            HashMap::new()
+        }
+    }
+}
+
+fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> Result<()> {
+    let path = log_dir.join("paired_devices.json");
+    let mut raw_map = HashMap::new();
+    for (k, v) in devices {
+        raw_map.insert(k.to_string(), v.clone());
+    }
+    let json = serde_json::to_vec_pretty(&raw_map)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, json)?;
+    Ok(())
 }
 
 fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, ManagedSession>> {
@@ -2287,6 +2427,64 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
+    fn require_pairing(&self) -> bool {
+        self.require_pairing
+    }
+
+    fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let devices = self.paired_devices()?;
+        if let Some(stored_hash) = devices.get(client_id) {
+            Ok(stored_hash == &hash)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
+        use rand::Rng;
+        use sha2::{Digest, Sha256};
+
+        let normalized = normalize_pairing_code(code);
+        let mut codes = self.pairing_codes()?;
+        if let Some(expiry) = codes.get(&normalized) {
+            if Instant::now() > *expiry {
+                codes.remove(&normalized);
+                anyhow::bail!("pairing PIN has expired");
+            }
+        } else {
+            anyhow::bail!("invalid pairing PIN");
+        }
+
+        codes.remove(&normalized);
+
+        let mut token_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut token_bytes);
+        let token = hex::encode(token_bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let mut devices = self.paired_devices()?;
+        devices.insert(client_id.clone(), hash);
+
+        save_paired_devices(&self.config.log_dir, &devices)?;
+
+        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
+        if pairing_code_path.exists() {
+            let _ = fs::remove_file(pairing_code_path);
+        }
+
+        Ok(token)
     }
 }
 
@@ -4034,6 +4232,38 @@ mod tests {
             std::thread::current().id()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn default_log_dir_uses_xdg_state_home_when_set() {
+        let log_dir = default_log_dir_from_env(
+            Some(OsString::from("/tmp/triage-state")),
+            Some(OsString::from("/tmp/home")),
+            None,
+        );
+
+        assert_eq!(
+            log_dir,
+            PathBuf::from("/tmp/triage-state").join("triage/sessions")
+        );
+    }
+
+    #[test]
+    fn default_log_dir_falls_back_to_home_local_state() {
+        let log_dir = default_log_dir_from_env(None, Some(OsString::from("/tmp/home")), None);
+
+        assert_eq!(
+            log_dir,
+            PathBuf::from("/tmp/home").join(".local/state/triage/sessions")
+        );
+    }
+
+    #[test]
+    fn normalize_pairing_code_maps_ambiguous_chars() {
+        assert_eq!(normalize_pairing_code("abc def"), "ABCDEF");
+        assert_eq!(normalize_pairing_code("oLi"), "011");
+        assert_eq!(normalize_pairing_code("  9kxq4m7p  "), "9KXQ4M7P");
+        assert_eq!(normalize_pairing_code("Oil-LIO"), "011-110");
     }
 
     fn git_test_command(cwd: &PathBuf, args: &[&str]) {

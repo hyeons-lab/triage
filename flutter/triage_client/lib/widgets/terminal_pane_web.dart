@@ -4,6 +4,7 @@ import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'terminal_pane.dart';
 
@@ -19,6 +20,14 @@ class TerminalPane extends StatefulWidget {
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
 
+  static void destroySession(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
+    _TerminalPaneState._sessionContainers.remove(sanitizedId);
+  }
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }
@@ -33,6 +42,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final dynamic _fitAddon;
   late final dynamic _onDataSubscription;
   late final dynamic _onResizeSubscription;
+  late final FocusNode _focusNode;
+  late final void Function(html.Event) _windowKeyDownListener;
   bool _initialized = false;
 
   double? _lastWidth;
@@ -41,7 +52,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
-    final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _focusNode = FocusNode();
+    final sanitizedId = widget.terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
     _viewType = 'xterm-view-$sanitizedId';
 
     // 1. Create native container div
@@ -49,18 +64,104 @@ class _TerminalPaneState extends State<TerminalPane> {
       ..style.width = '100%'
       ..style.height = '100%'
       ..style.backgroundColor = '#0d1113'
-      ..style.overflow = 'hidden';
+      ..style.overflow = 'hidden'
+      ..style.paddingLeft = '16px'
+      ..style.paddingRight = '16px'
+      ..style.boxSizing = 'border-box';
 
     // Store/update the container for this session
     _sessionContainers[sanitizedId] = _container;
 
     _container.onClick.listen((event) {
+      _focusNode.requestFocus();
       if (_initialized) {
         try {
           js_util.callMethod(_term, 'focus', []);
+          _onFit(); // Force re-fit on click/focus to align character cell measurements
         } catch (_) {}
       }
     });
+
+    _container.onKeyDown.listen((event) {
+      if (event.key == 'Tab') {
+        event.preventDefault();
+      }
+    });
+
+    _container.addEventListener('paste', (html.Event event) {
+      if (event is html.ClipboardEvent) {
+        event.preventDefault();
+        event.stopPropagation();
+        final clipboardData = event.clipboardData;
+        final text = clipboardData?.getData('text/plain') ?? '';
+        if (text.isNotEmpty) {
+          widget.controller.sendInput(text);
+        }
+      }
+    }, true);
+
+    // Register global capture-phase listener to intercept Tab/Ctrl+C/Ctrl+V before Flutter's capture listener
+    _windowKeyDownListener = (html.Event event) {
+      if (event is html.KeyboardEvent) {
+        final activeEl = html.document.activeElement;
+        final path =
+            js_util.callMethod(event, 'composedPath', []) as List<dynamic>?;
+        final activeElementInTerminal =
+            activeEl != null && _container.contains(activeEl);
+        final eventPathInTerminal =
+            path != null && path.any((node) => identical(node, _container));
+        final shouldHandleTerminalKey =
+            activeElementInTerminal ||
+            eventPathInTerminal ||
+            _focusNode.hasFocus;
+        if (shouldHandleTerminalKey) {
+          if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.shiftKey) {
+              widget.controller.sendInput('\x1B[Z'); // BackTab sequence
+            } else {
+              widget.controller.sendInput('\t');
+            }
+          } else if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
+            var selection = html.window.getSelection()?.toString() ?? '';
+            if (selection.isEmpty) {
+              try {
+                selection =
+                    js_util.callMethod(_term, 'getSelection', []) as String? ??
+                    '';
+              } catch (_) {}
+            }
+            if (selection.isNotEmpty) {
+              event.preventDefault();
+              event.stopPropagation();
+              html.window.navigator.clipboard
+                  ?.writeText(selection)
+                  .catchError((_) {});
+            }
+          } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
+            event.preventDefault();
+            event.stopPropagation();
+            html.window.navigator.clipboard
+                ?.readText()
+                .then((text) {
+                  if (text.isNotEmpty) {
+                    widget.controller.sendInput(text);
+                  }
+                })
+                .catchError((_) {});
+          } else if (!activeElementInTerminal) {
+            final input = _keyboardEventToInput(event);
+            if (input != null) {
+              event.preventDefault();
+              event.stopPropagation();
+              widget.controller.sendInput(input);
+            }
+          }
+        }
+      }
+    };
+    html.window.addEventListener('keydown', _windowKeyDownListener, true);
 
     // 2. Register the platform view factory only if not already registered
     if (!_registeredViewTypes.contains(_viewType)) {
@@ -82,6 +183,25 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(theme, 'background', '#0d1113');
       js_util.setProperty(theme, 'foreground', '#d9e5e3');
       js_util.setProperty(theme, 'cursor', '#7fd1c7');
+
+      // Mute harsh ANSI colors with a premium, harmonious pastel palette
+      js_util.setProperty(theme, 'black', '#1f2b30');
+      js_util.setProperty(theme, 'red', '#f2777a');
+      js_util.setProperty(theme, 'green', '#99cc99');
+      js_util.setProperty(theme, 'yellow', '#ffcc66');
+      js_util.setProperty(theme, 'blue', '#6699cc');
+      js_util.setProperty(theme, 'magenta', '#cc99cc');
+      js_util.setProperty(theme, 'cyan', '#66cccc');
+      js_util.setProperty(theme, 'white', '#d9e5e3');
+      js_util.setProperty(theme, 'brightBlack', '#74838a');
+      js_util.setProperty(theme, 'brightRed', '#f2777a');
+      js_util.setProperty(theme, 'brightGreen', '#99cc99');
+      js_util.setProperty(theme, 'brightYellow', '#ffcc66');
+      js_util.setProperty(theme, 'brightBlue', '#6699cc');
+      js_util.setProperty(theme, 'brightMagenta', '#cc99cc');
+      js_util.setProperty(theme, 'brightCyan', '#66cccc');
+      js_util.setProperty(theme, 'brightWhite', '#ffffff');
+
       js_util.setProperty(options, 'theme', theme);
       js_util.setProperty(
         options,
@@ -93,8 +213,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(
         options,
         'convertEol',
-        true,
-      ); // Normalizes \n to \r\n automatically!
+        false,
+      ); // Normalizes \n to \r\n naturally via PTY post-processing!
 
       // 4. Instantiate Terminal
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
@@ -111,6 +231,28 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
+
+      // Prevent Tab key from escaping focus in xterm.js (allowing shell autocomplete)
+      try {
+        js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
+          js_util.allowInterop((dynamic event) {
+            final key = js_util.getProperty(event, 'key') as String?;
+            if (key == 'Tab') {
+              js_util.callMethod(event, 'preventDefault', []);
+              js_util.callMethod(event, 'stopPropagation', []);
+              final shiftKey =
+                  js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+              if (shiftKey) {
+                widget.controller.sendInput('\x1B[Z'); // BackTab sequence
+              } else {
+                widget.controller.sendInput('\t');
+              }
+              return false;
+            }
+            return true;
+          }),
+        ]);
+      } catch (_) {}
 
       // 6b. Bind JS term.onData to controller
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
@@ -148,6 +290,20 @@ class _TerminalPaneState extends State<TerminalPane> {
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
+      Future.delayed(const Duration(milliseconds: 1500), _onFit);
+
+      // Re-fit when fonts are fully loaded to resolve cursor alignment issues caused by font loading latency!
+      try {
+        final fonts = js_util.getProperty(html.document, 'fonts');
+        if (fonts != null) {
+          final readyPromise = js_util.getProperty(fonts, 'ready');
+          if (readyPromise != null) {
+            js_util.promiseToFuture(readyPromise).then((_) {
+              _onFit();
+            });
+          }
+        }
+      } catch (_) {}
     } catch (e) {
       debugPrint('Failed to initialize xterm.js: $e');
     }
@@ -229,6 +385,50 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {}
   }
 
+  String? _keyboardEventToInput(html.KeyboardEvent event) {
+    final key = event.key;
+    if (key == null) return null;
+
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      if (event.ctrlKey && key.toLowerCase() == 'c') {
+        return '\x03';
+      }
+      return null;
+    }
+
+    switch (key) {
+      case 'Enter':
+        return '\r';
+      case 'Backspace':
+        return '\x7f';
+      case 'Escape':
+        return '\x1b';
+      case 'ArrowUp':
+        return '\x1b[A';
+      case 'ArrowDown':
+        return '\x1b[B';
+      case 'ArrowRight':
+        return '\x1b[C';
+      case 'ArrowLeft':
+        return '\x1b[D';
+      case 'Home':
+        return '\x1b[H';
+      case 'End':
+        return '\x1b[F';
+      case 'PageUp':
+        return '\x1b[5~';
+      case 'PageDown':
+        return '\x1b[6~';
+      case 'Delete':
+        return '\x1b[3~';
+    }
+
+    if (key.length == 1) {
+      return key;
+    }
+    return null;
+  }
+
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -250,6 +450,8 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   void dispose() {
+    html.window.removeEventListener('keydown', _windowKeyDownListener, true);
+    _focusNode.dispose();
     _unbindController();
     if (_initialized) {
       try {
@@ -258,24 +460,40 @@ class _TerminalPaneState extends State<TerminalPane> {
         js_util.callMethod(_term, 'dispose', []);
       } catch (_) {}
     }
-    final sanitizedId = widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final sanitizedId = widget.terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
     _sessionContainers.remove(sanitizedId);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (constraints.maxWidth != _lastWidth || constraints.maxHeight != _lastHeight) {
-          _lastWidth = constraints.maxWidth;
-          _lastHeight = constraints.maxHeight;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            widget.controller.fit();
-          });
+    return Focus(
+      focusNode: _focusNode,
+      onKeyEvent: (node, event) {
+        if (event.logicalKey == LogicalKeyboardKey.tab) {
+          return KeyEventResult.handled;
         }
-        return HtmlElementView(viewType: _viewType);
+        return KeyEventResult.ignored;
       },
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth != _lastWidth ||
+              constraints.maxHeight != _lastHeight) {
+            _lastWidth = constraints.maxWidth;
+            _lastHeight = constraints.maxHeight;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              widget.controller.fit();
+            });
+          }
+          return Container(
+            color: const Color(0xff0d1113),
+            child: HtmlElementView(viewType: _viewType),
+          );
+        },
+      ),
     );
   }
 }

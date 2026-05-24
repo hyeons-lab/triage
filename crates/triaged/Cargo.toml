@@ -21,6 +21,9 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 triage-transport-ws = { path = "../triage-transport-ws" }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
