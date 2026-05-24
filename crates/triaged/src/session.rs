@@ -1714,6 +1714,19 @@ impl ActorState {
     }
 }
 
+fn translate_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(bytes.len() + 16);
+    let mut last = 0;
+    for &byte in bytes {
+        if byte == b'\n' && last != b'\r' {
+            result.push(b'\r');
+        }
+        result.push(byte);
+        last = byte;
+    }
+    result
+}
+
 impl OutputState {
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
         self.log
@@ -1722,7 +1735,8 @@ impl OutputState {
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
         let current_working_directory = self.extract_current_working_directory(bytes);
-        self.terminal.advance_bytes(bytes);
+        let translated = translate_newlines(bytes);
+        self.terminal.advance_bytes(&translated);
         Ok(current_working_directory)
     }
 
@@ -1730,7 +1744,8 @@ impl OutputState {
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
         let current_working_directory = self.extract_current_working_directory(bytes);
-        self.terminal.advance_bytes(bytes);
+        let translated = translate_newlines(bytes);
+        self.terminal.advance_bytes(&translated);
         Ok(current_working_directory)
     }
 
@@ -2929,11 +2944,8 @@ mod tests {
         let rows = visible_rows(&output.terminal);
 
         assert!(rows.iter().any(|row| row == "Nodes: 330"));
-        assert!(rows.iter().any(|row| row == "          Edges: 2400"));
-        assert!(
-            rows.iter()
-                .any(|row| row == "                     Files: 8")
-        );
+        assert!(rows.iter().any(|row| row == "Edges: 2400"));
+        assert!(rows.iter().any(|row| row == "Files: 8"));
         let _ = std::fs::remove_file(log_path);
     }
 
