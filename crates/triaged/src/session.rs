@@ -2940,6 +2940,34 @@ mod tests {
     }
 
     #[test]
+    fn test_translate_newlines_direct() {
+        use std::borrow::Cow;
+
+        // Empty bytes should remain borrowed and empty
+        assert!(matches!(translate_newlines(b""), Cow::Borrowed(b"")));
+
+        // Normal text without bare newlines should remain borrowed
+        assert!(matches!(
+            translate_newlines(b"hello world"),
+            Cow::Borrowed(b"hello world")
+        ));
+        assert!(matches!(
+            translate_newlines(b"hello\r\nworld\r\n"),
+            Cow::Borrowed(b"hello\r\nworld\r\n")
+        ));
+
+        // Text with a bare newline should be translated to Owned with \r\n
+        let translated = translate_newlines(b"hello\nworld");
+        assert!(matches!(translated, Cow::Owned(_)));
+        assert_eq!(translated.as_ref(), b"hello\r\nworld");
+
+        // Mixed content with both CRLF and bare newlines should translate only bare ones
+        let mixed = translate_newlines(b"hello\r\nworld\nagain\r\n");
+        assert!(matches!(mixed, Cow::Owned(_)));
+        assert_eq!(mixed.as_ref(), b"hello\r\nworld\r\nagain\r\n");
+    }
+
+    #[test]
     fn visible_rows_align_raw_bare_line_feed_to_column_0() {
         let log_path = unique_log_path();
         let mut output = test_output_state(
