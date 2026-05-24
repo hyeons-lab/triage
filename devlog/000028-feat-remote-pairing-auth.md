@@ -24,6 +24,7 @@
 - 2026-05-23T17:41-0700 Isolated each session loading iteration inside a try-catch block to prevent broken sessions from blocking healthy ones, and allowed closing tab UIs unconditionally.
 - 2026-05-23T17:47-0700 Implemented a collapsible sessions sidebar in the Flutter client UI that supports full and compact minimized rail layouts, matching TUI's collapsible layout capabilities.
 - 2026-05-23T17:50-0700 Registered attachCustomKeyEventHandler on xterm.js to capture the Tab key and call event.preventDefault(), resolving the browser focus escape issue and enabling shell tab autocompletion.
+- 2026-05-23T17:52-0700 Hardened Tab key capture by implementing dual-layer DOM capture on container and using dynamic type casting to prevent JS-Dart bridge casting failures.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -37,7 +38,8 @@
 - e59c65b — fix: fall back to cmd.exe in _createSession if bash spawn fails
 - 6f007e5 — fix: isolate session loading loop and close tabs unconditionally
 - de11fb0 — feat: implement collapsible sessions rail for sidebar minimization
-- HEAD — fix: intercept and prevent Tab key focus escapes in xterm.js
+- d5c3d2a — fix: intercept and prevent Tab key focus escapes in xterm.js
+- HEAD — fix: implement robust dual-layer DOM and dynamic JS Tab key focus capture
 
 ## Next Steps
 - None.

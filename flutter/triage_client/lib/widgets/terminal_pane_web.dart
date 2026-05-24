@@ -62,6 +62,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
+    _container.onKeyDown.listen((event) {
+      if (event.key == 'Tab') {
+        event.preventDefault();
+      }
+    });
+
     // 2. Register the platform view factory only if not already registered
     if (!_registeredViewTypes.contains(_viewType)) {
       ui_web.platformViewRegistry.registerViewFactory(
@@ -115,9 +121,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       // Prevent Tab key from escaping focus in xterm.js (allowing shell autocomplete)
       try {
         js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
-          js_util.allowInterop((html.KeyboardEvent event) {
-            if (event.key == 'Tab') {
-              event.preventDefault();
+          js_util.allowInterop((dynamic event) {
+            final key = js_util.getProperty(event, 'key') as String?;
+            if (key == 'Tab') {
+              js_util.callMethod(event, 'preventDefault', []);
             }
             return true;
           })
