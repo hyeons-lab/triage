@@ -48,6 +48,22 @@ impl<T: WebSocketAuthenticator + ?Sized> WebSocketAuthenticator for std::sync::A
         (**self).pair(code, client_id)
     }
 }
+#[derive(Debug)]
+pub enum TransportError {
+    Unauthorized,
+    RequestFailed(String),
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportError::Unauthorized => write!(f, "unauthorized"),
+            TransportError::RequestFailed(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {}
 
 #[derive(Debug, Clone, Copy)]
 pub struct NoopAuthenticator;
@@ -122,7 +138,11 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         match self.handle_request(message.request) {
             Ok(result) => ServerMessage::Response { id, result },
             Err(error) => {
-                let code = if error.to_string() == "unauthorized" {
+                let code = if error
+                    .downcast_ref::<TransportError>()
+                    .is_some_and(|e| matches!(e, TransportError::Unauthorized))
+                    || error.to_string() == "unauthorized"
+                {
                     "unauthorized"
                 } else {
                     "request_failed"
@@ -167,7 +187,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         if self.authenticator.require_pairing() && !self.authenticated {
             match &request {
                 ClientRequest::Hello { .. } | ClientRequest::Pair { .. } => {}
-                _ => bail!("unauthorized"),
+                _ => bail!(TransportError::Unauthorized),
             }
         }
 
@@ -185,10 +205,6 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     self.authenticated = true;
                     true
                 };
-
-                if self.authenticator.require_pairing() && !authenticated {
-                    bail!("unauthorized");
-                }
 
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
@@ -936,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_request_with_invalid_token_fails() {
+    fn hello_request_with_invalid_token_returns_unauthenticated() {
         let auth = FakeAuthenticator {
             require_pairing: true,
             pairing_code: "123456".to_string(),
@@ -956,8 +972,27 @@ mod tests {
         });
 
         match response {
-            ServerMessage::Error { id, error } => {
+            ServerMessage::Response { id, result } => {
                 assert_eq!(id, Some(json!("hello-req")));
+                assert_eq!(
+                    result,
+                    ServerResult::Hello {
+                        protocol_version: PROTOCOL_VERSION.to_string(),
+                        authenticated: false,
+                    }
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // 2. Verified that list sessions fails with unauthorized error
+        let list_response = connection.handle_message(ClientMessage {
+            id: Some(json!("list-req")),
+            request: ClientRequest::ListSessions,
+        });
+        match list_response {
+            ServerMessage::Error { id, error } => {
+                assert_eq!(id, Some(json!("list-req")));
                 assert_eq!(error.code, "unauthorized");
             }
             other => panic!("unexpected response: {other:?}"),

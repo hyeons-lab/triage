@@ -63,17 +63,12 @@ fn main() -> Result<()> {
 }
 
 fn run_pairing_display() -> Result<()> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("neither HOME nor USERPROFILE environment variable is set")?;
-    let home_path = PathBuf::from(home);
-
-    let log_dir = home_path.join(".local/state/triage/sessions");
+    let log_dir = triaged::session::default_log_dir();
     let pairing_code_path = log_dir.join("pairing_code.json");
 
     if !pairing_code_path.exists() {
         bail!(
-            "No active pairing session found.\nPlease ensure the triaged daemon is running and has --require-pairing enabled."
+            "No active pairing session found.\nPlease ensure the triaged daemon is running and has `remote.require_pairing = true` set in config.toml."
         );
     }
 
@@ -105,7 +100,13 @@ fn run_pairing_display() -> Result<()> {
     let remaining_mins = (expires_at_sec - now_sec) / 60;
     let remaining_secs = (expires_at_sec - now_sec) % 60;
 
-    let config_path = home_path.join(".config/triage/config.toml");
+    let config_path = triage_core::config::Config::default_path().unwrap_or_else(|_| {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        home.join(".config/triage/config.toml")
+    });
     let bind_addr = if config_path.exists() {
         let config = triage_core::config::Config::load_from_path(&config_path).unwrap_or_default();
         config.remote.bind
@@ -116,10 +117,10 @@ fn run_pairing_display() -> Result<()> {
     println!("\x1b[1;36m====================================================\x1b[0m");
     println!("\x1b[1;36m               TRIAGE REMOTE PAIRING                \x1b[0m");
     println!("\x1b[1;36m====================================================\x1b[0m");
-    println!("");
+    println!();
     println!("  Pairing PIN: \x1b[1;32m{}\x1b[0m", code);
     println!("  Daemon URL:  \x1b[1;33mws://{}\x1b[0m", bind_addr);
-    println!("");
+    println!();
     println!("  Enter this PIN in your Triage remote client to pair.");
     println!(
         "  This PIN will expire in \x1b[1;35m{}m {}s\x1b[0m.",

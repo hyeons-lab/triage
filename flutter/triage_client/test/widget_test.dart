@@ -35,8 +35,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   }
 
   @override
-  Future<Map<String, dynamic>> hello() async {
-    return {'protocol_version': '2026-05-20'};
+  Future<Map<String, dynamic>> hello({String? clientId, String? token}) async {
+    return {'protocol_version': '2026-05-20', 'authenticated': true};
   }
 
   @override

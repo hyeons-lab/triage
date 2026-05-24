@@ -1,28 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:js_interop' as js;
-import 'dart:js_interop_unsafe';
 import 'package:flutter/material.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
+import 'package:triage_client/services/storage.dart';
 
-void _persistToken(String token) {
-  try {
-    final localStorage = js.globalContext.getProperty<js.JSObject>('localStorage'.toJS);
-    localStorage.callMethod('setItem'.toJS, 'triage_bearer_token'.toJS, token.toJS);
-  } catch (_) {}
-}
-
-String? _retrieveToken() {
-  try {
-    final localStorage = js.globalContext.getProperty<js.JSObject>('localStorage'.toJS);
-    final val = localStorage.callMethod<js.JSString?>('getItem'.toJS, 'triage_bearer_token'.toJS);
-    return val?.toDart;
-  } catch (_) {
-    return null;
-  }
-}
 
 void main() {
   runApp(const TriageClientApp());
@@ -171,13 +154,13 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _setupSessionInputListener(SessionVm session) {
-    session.terminalController.addInputListener((keys) async {
+    session.terminalController.addInputListener((keys) {
       if (_client.isConnected) {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
           try {
-            await _client.writeInput(
+            _client.writeInput(
               sessionId: sessionId,
               clientId: _clientId,
               bytes: utf8.encode(keys),
@@ -215,13 +198,13 @@ class _TriageHomeState extends State<TriageHome> {
       }
     });
 
-    session.terminalController.addResizeOutListener((cols, rows) async {
+    session.terminalController.addResizeOutListener((cols, rows) {
       if (_client.isConnected) {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
           try {
-            await _client.resizeSession(
+            _client.resizeSession(
               sessionId: sessionId,
               cols: cols,
               rows: rows,
@@ -233,7 +216,7 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _initWebSocket() async {
-    _bearerToken ??= _retrieveToken();
+    _bearerToken ??= retrieveToken();
     final client =
         widget.client ??
         TriageWebSocketClient(Uri.parse('ws://127.0.0.1:7777/ws'));
@@ -294,7 +277,7 @@ class _TriageHomeState extends State<TriageHome> {
     if (token.isNotEmpty) {
       setState(() {
         _bearerToken = token;
-        _persistToken(token);
+        persistToken(token);
       });
       _initWebSocket();
     } else {
@@ -577,6 +560,9 @@ class _TriageHomeState extends State<TriageHome> {
               child: _PairingView(
                 onPair: _onPairRequested,
                 onCancel: () {
+                  try {
+                    _client.disconnect();
+                  } catch (_) {}
                   setState(() {
                     _needsPairing = false;
                     _connectionStatus = 'Offline (Local Mock)';
