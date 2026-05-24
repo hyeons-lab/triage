@@ -1717,10 +1717,11 @@ impl ActorState {
 fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let mut last = 0;
     let mut needs_translation = false;
+    let mut bare_lf_count = 0;
     for &byte in bytes {
         if byte == b'\n' && last != b'\r' {
             needs_translation = true;
-            break;
+            bare_lf_count += 1;
         }
         last = byte;
     }
@@ -1729,7 +1730,7 @@ fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         return std::borrow::Cow::Borrowed(bytes);
     }
 
-    let mut result = Vec::with_capacity(bytes.len() + 16);
+    let mut result = Vec::with_capacity(bytes.len() + bare_lf_count);
     last = 0;
     for &byte in bytes {
         if byte == b'\n' && last != b'\r' {
@@ -2939,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_rows_preserve_raw_bare_line_feed_columns() {
+    fn visible_rows_align_raw_bare_line_feed_to_column_0() {
         let log_path = unique_log_path();
         let mut output = test_output_state(
             &log_path,
@@ -2960,6 +2961,33 @@ mod tests {
         assert!(rows.iter().any(|row| row == "Nodes: 330"));
         assert!(rows.iter().any(|row| row == "Edges: 2400"));
         assert!(rows.iter().any(|row| row == "Files: 8"));
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn translate_newlines_across_chunk_boundaries() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 4,
+                cols: 32,
+                pixel_width: 320,
+                pixel_height: 80,
+                dpi: 96,
+            },
+        );
+
+        // First chunk ends with \r
+        output.ingest(b"Nodes: 330\r").expect("ingest first chunk");
+        // Second chunk starts with \n
+        output
+            .ingest(b"\nEdges: 2400")
+            .expect("ingest second chunk");
+
+        let rows = visible_rows(&output.terminal);
+        assert!(rows.iter().any(|row| row == "Nodes: 330"));
+        assert!(rows.iter().any(|row| row == "Edges: 2400"));
         let _ = std::fs::remove_file(log_path);
     }
 
