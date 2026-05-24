@@ -1054,10 +1054,15 @@ class _PairingViewState extends State<_PairingView> {
   }
 
   Future<void> _submit() async {
-    final pin = _pinController.text.trim();
-    if (pin.length != 6 || int.tryParse(pin) == null) {
+    final pin = _pinController.text
+        .replaceAll(RegExp(r'\s+'), '')
+        .toUpperCase()
+        .replaceAll(RegExp(r'[IL]'), '1')
+        .replaceAll('O', '0');
+    final validChars = RegExp(r'^[0-9A-HJ-KM-NP-TV-Z]{8}$');
+    if (!validChars.hasMatch(pin)) {
       setState(() {
-        _errorMessage = 'PIN must be a 6-digit number';
+        _errorMessage = 'PIN must be 8 characters (letters and digits)';
       });
       return;
     }
@@ -1099,7 +1104,7 @@ class _PairingViewState extends State<_PairingView> {
         ),
         const SizedBox(height: 16),
         const Text(
-          'This Triage daemon requires pairing. Please run "triage pair" in your local terminal and enter the 6-digit PIN below.',
+          'This Triage daemon requires pairing. Please run "triage pair" in your local terminal and enter the 8-character PIN below.',
           style: TextStyle(
             color: Color(0xffa5b1b4),
             fontSize: 14,
@@ -1109,16 +1114,16 @@ class _PairingViewState extends State<_PairingView> {
         const SizedBox(height: 24),
         TextField(
           controller: _pinController,
-          maxLength: 6,
-          keyboardType: TextInputType.number,
+          maxLength: 8,
+          textCapitalization: TextCapitalization.characters,
           style: const TextStyle(
-            fontSize: 24,
-            letterSpacing: 8,
+            fontSize: 22,
+            letterSpacing: 6,
             fontWeight: FontWeight.bold,
             color: Color(0xff7fd1c7),
           ),
           decoration: const InputDecoration(
-            labelText: '6-Digit PIN',
+            labelText: '8-Character PIN',
             labelStyle: TextStyle(fontSize: 14, letterSpacing: 0, color: Color(0xff7f8b8d)),
             counterText: '',
             border: OutlineInputBorder(),

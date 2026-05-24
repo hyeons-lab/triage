@@ -108,6 +108,24 @@ impl SessionManagerConfig {
     }
 }
 
+/// Crockford Base32 alphabet (RFC 4648 variant): excludes I, L, O, U to reduce typos.
+const CROCKFORD_BASE32_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const PAIRING_CODE_LENGTH: usize = 8;
+
+/// Normalize a user-typed pairing code per Crockford Base32 rules:
+/// strip whitespace, uppercase, and map ambiguous characters (I/L → 1, O → 0).
+fn normalize_pairing_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
+        .collect()
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
@@ -287,10 +305,11 @@ impl SessionManager {
     pub fn generate_pairing_code(&self) -> Result<String> {
         use rand::Rng;
 
-        let code: String = (0..6)
+        let mut rng = rand::thread_rng();
+        let code: String = (0..PAIRING_CODE_LENGTH)
             .map(|_| {
-                let digit = rand::thread_rng().gen_range(0..10);
-                digit.to_string()
+                let idx = rng.gen_range(0..CROCKFORD_BASE32_ALPHABET.len());
+                CROCKFORD_BASE32_ALPHABET[idx] as char
             })
             .collect();
 
@@ -2434,17 +2453,18 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
         use rand::Rng;
         use sha2::{Digest, Sha256};
 
+        let normalized = normalize_pairing_code(code);
         let mut codes = self.pairing_codes()?;
-        if let Some(expiry) = codes.get(code) {
+        if let Some(expiry) = codes.get(&normalized) {
             if Instant::now() > *expiry {
-                codes.remove(code);
+                codes.remove(&normalized);
                 anyhow::bail!("pairing PIN has expired");
             }
         } else {
             anyhow::bail!("invalid pairing PIN");
         }
 
-        codes.remove(code);
+        codes.remove(&normalized);
 
         let mut token_bytes = [0u8; 32];
         rand::thread_rng().fill(&mut token_bytes);
@@ -4236,6 +4256,14 @@ mod tests {
             log_dir,
             PathBuf::from("/tmp/home").join(".local/state/triage/sessions")
         );
+    }
+
+    #[test]
+    fn normalize_pairing_code_maps_ambiguous_chars() {
+        assert_eq!(normalize_pairing_code("abc def"), "ABCDEF");
+        assert_eq!(normalize_pairing_code("oLi"), "011");
+        assert_eq!(normalize_pairing_code("  9kxq4m7p  "), "9KXQ4M7P");
+        assert_eq!(normalize_pairing_code("Oil-LIO"), "011-110");
     }
 
     fn git_test_command(cwd: &PathBuf, args: &[&str]) {
