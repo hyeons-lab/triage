@@ -18,6 +18,7 @@
 - 2026-05-23T17:19-0700 Fixed a missing closing brace syntax error inside the wait_for_event unit test helper in crates/triaged/src/session.rs.
 - 2026-05-23T17:19-0700 Ran cargo fmt, cargo check, and cargo test across all workspace packages, confirming 100% test suite completion.
 - 2026-05-23T17:19-0700 Booted daemon to verify automatic pairing PIN generation and tested the CLI triage pair output.
+- 2026-05-23T17:24-0700 Added a tracing log message displaying the remote web client page URL on WebSocket server bind in ws.rs.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -25,7 +26,8 @@
 - 2026-05-23T17:05-0700 Leverage local OS filesystem directory permissions as the local trust boundary, utilizing JSON files to securely share pairing state with the local CLI across Unix and Windows without IPC socket dependencies.
 
 ## Commits
-- HEAD — feat: implement remote client pairing and secure token authorization
+- f7ec173 — feat: implement remote client pairing and secure token authorization
+- HEAD — feat: log remote web client URL when daemon WebSocket starts
 
 ## Next Steps
 - None.
