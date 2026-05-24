@@ -371,19 +371,22 @@ class _TriageHomeState extends State<TriageHome> {
           (s) => s.title == 'triage / $sessionId',
         );
         if (sessionIndex != -1) {
-          setState(() {
-            final rows = _sessions[sessionIndex].rows;
-            final newLines = text.split('\n');
-            if (rows.isNotEmpty &&
-                rows.last.spans.length == 1 &&
-                rows.last.spans.first.text.isEmpty) {
-              rows.removeLast();
-            }
-            for (final line in newLines) {
-              rows.add(_plainRow(line));
-            }
-          });
+          // Write directly to xterm.js via the controller.
+          // This bypasses calling setState() on every small output chunk,
+          // avoiding Flutter widget tree rebuilds during active WebSocket sessions.
           _sessions[sessionIndex].terminalController.write(text);
+
+          // Update backup logs silently (without calling setState)
+          final rows = _sessions[sessionIndex].rows;
+          final newLines = text.split('\n');
+          if (rows.isNotEmpty &&
+              rows.last.spans.length == 1 &&
+              rows.last.spans.first.text.isEmpty) {
+            rows.removeLast();
+          }
+          for (final line in newLines) {
+            rows.add(_plainRow(line));
+          }
         }
       } else if (event.containsKey('Exited')) {
         final exited = event['Exited'] as Map<String, dynamic>;
