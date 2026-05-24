@@ -1,5 +1,6 @@
 // ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
 
+import 'dart:async';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
@@ -74,6 +75,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final dynamic _onResizeSubscription;
   late final FocusNode _focusNode;
   late final void Function(html.Event) _windowKeyDownListener;
+  late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
+  late final StreamSubscription<html.KeyboardEvent>
+      _containerKeyDownSubscription;
+  late final void Function(html.Event) _containerPasteListener;
   bool _initialized = false;
 
   double? _lastWidth;
@@ -100,26 +105,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       _initialized = true;
       _bindController();
 
-      _container.onClick.listen((event) {
-        _focusNode.requestFocus();
-        try {
-          js_util.callMethod(_term, 'focus', []);
-          _onFit();
-        } catch (_) {}
-      });
-
-      _container.addEventListener('paste', (html.Event event) {
-        if (event is html.ClipboardEvent) {
-          event.preventDefault();
-          event.stopPropagation();
-          final clipboardData = event.clipboardData;
-          final text = clipboardData?.getData('text/plain') ?? '';
-          if (text.isNotEmpty) {
-            widget.controller.sendInput(text);
-          }
-        }
-      }, true);
-
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
@@ -141,36 +126,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _container.append(_terminalWrapper);
       _sessionContainers[sanitizedId] = _container;
 
-      _container.onClick.listen((event) {
-        _focusNode.requestFocus();
-        if (_initialized) {
-          try {
-            js_util.callMethod(_term, 'focus', []);
-            _onFit();
-          } catch (_) {}
-        }
-      });
-
-      _container.onKeyDown.listen((event) {
-        if (event.key == 'Tab') {
-          event.preventDefault();
-        }
-      });
-
-      _container.addEventListener('paste', (html.Event event) {
-        if (event is html.ClipboardEvent) {
-          event.preventDefault();
-          event.stopPropagation();
-          final clipboardData = event.clipboardData;
-          final text = clipboardData?.getData('text/plain') ?? '';
-          if (text.isNotEmpty) {
-            widget.controller.sendInput(text);
-          }
-        }
-      }, true);
-
       _initTerminal(sanitizedId);
     }
+    _bindContainerEvents();
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
@@ -435,6 +393,37 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.removeFitListener(_onFit);
   }
 
+  void _bindContainerEvents() {
+    _containerClickSubscription = _container.onClick.listen((event) {
+      _focusNode.requestFocus();
+      if (_initialized) {
+        try {
+          js_util.callMethod(_term, 'focus', []);
+          _onFit();
+        } catch (_) {}
+      }
+    });
+
+    _containerKeyDownSubscription = _container.onKeyDown.listen((event) {
+      if (event.key == 'Tab') {
+        event.preventDefault();
+      }
+    });
+
+    _containerPasteListener = (html.Event event) {
+      if (event is html.ClipboardEvent) {
+        event.preventDefault();
+        event.stopPropagation();
+        final clipboardData = event.clipboardData;
+        final text = clipboardData?.getData('text/plain') ?? '';
+        if (text.isNotEmpty) {
+          widget.controller.sendInput(text);
+        }
+      }
+    };
+    _container.addEventListener('paste', _containerPasteListener, true);
+  }
+
   void _onWrite(String data) {
     if (!_initialized) return;
     js_util.callMethod(_term, 'write', [data]);
@@ -527,6 +516,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void dispose() {
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
+    _containerClickSubscription.cancel();
+    _containerKeyDownSubscription.cancel();
+    _container.removeEventListener('paste', _containerPasteListener, true);
     _focusNode.dispose();
     _unbindController();
     super.dispose();
