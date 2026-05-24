@@ -23,6 +23,7 @@
 - 2026-05-23T17:37-0700 Added a try-catch fallback to cmd.exe in _createSession if the bash shell executable fails to spawn on a Windows daemon host.
 - 2026-05-23T17:41-0700 Isolated each session loading iteration inside a try-catch block to prevent broken sessions from blocking healthy ones, and allowed closing tab UIs unconditionally.
 - 2026-05-23T17:47-0700 Implemented a collapsible sessions sidebar in the Flutter client UI that supports full and compact minimized rail layouts, matching TUI's collapsible layout capabilities.
+- 2026-05-23T17:50-0700 Registered attachCustomKeyEventHandler on xterm.js to capture the Tab key and call event.preventDefault(), resolving the browser focus escape issue and enabling shell tab autocompletion.
 
 ## Decisions
 - 2026-05-23T16:52-0700 Establish a token-based pairing handshake protocol over the WebSocket endpoint to secure daemon state access.
@@ -35,7 +36,8 @@
 - 6f6e7c0 — fix: remove final from late client to allow socket re-initialization
 - e59c65b — fix: fall back to cmd.exe in _createSession if bash spawn fails
 - 6f007e5 — fix: isolate session loading loop and close tabs unconditionally
-- HEAD — feat: implement collapsible sessions rail for sidebar minimization
+- de11fb0 — feat: implement collapsible sessions rail for sidebar minimization
+- HEAD — fix: intercept and prevent Tab key focus escapes in xterm.js
 
 ## Next Steps
 - None.

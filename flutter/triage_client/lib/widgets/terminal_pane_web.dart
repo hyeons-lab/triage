@@ -112,6 +112,18 @@ class _TerminalPaneState extends State<TerminalPane> {
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
+      // Prevent Tab key from escaping focus in xterm.js (allowing shell autocomplete)
+      try {
+        js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
+          js_util.allowInterop((html.KeyboardEvent event) {
+            if (event.key == 'Tab') {
+              event.preventDefault();
+            }
+            return true;
+          })
+        ]);
+      } catch (_) {}
+
       // 6b. Bind JS term.onData to controller
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
         widget.controller.sendInput(data);
