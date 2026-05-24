@@ -442,7 +442,12 @@ class _TriageHomeState extends State<TriageHome> {
         _connectionStatusColor = const Color(0xffffc857);
       });
       try {
-        final sessionId = await _client.startSession(command: 'bash');
+        String sessionId = '';
+        try {
+          sessionId = await _client.startSession(command: 'bash');
+        } catch (_) {
+          sessionId = await _client.startSession(command: 'cmd.exe');
+        }
         if (sessionId.isNotEmpty) {
           final attachRes = await _client.attachSession(
             sessionId: sessionId,
