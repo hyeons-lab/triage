@@ -1000,7 +1000,7 @@ class SessionWorkspace extends StatelessWidget {
         WorkspaceHeader(session: session, onClose: onCloseSession),
         Expanded(
           child: TerminalPane(
-            key: ValueKey(session.title),
+            key: ObjectKey(session.terminalController),
             terminalId: session.title,
             controller: session.terminalController,
             fallbackRows: session.rows,
