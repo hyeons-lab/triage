@@ -461,20 +461,32 @@ class _TriageHomeState extends State<TriageHome> {
             final styledRowsStart = visibleRows.length - styledRows.length;
             if (styledRowsStart > 0) {
               try {
+                final fetchStart =
+                    (visibleRows.length - 200) < 0 ? 0 : visibleRows.length - 200;
                 final historyRes = await _client.styledRows(
                   sessionId: sid,
-                  start: 0,
+                  start: fetchStart,
                   end: visibleRows.length,
                 );
                 final responseObj =
                     historyRes['response'] as Map<String, dynamic>?;
                 final rowsList = responseObj?['rows'] as List<dynamic>?;
                 if (rowsList != null) {
-                  rows.addAll(
-                    rowsList.map(
-                      (e) => StyledRow.fromJson(e as Map<String, dynamic>),
-                    ),
-                  );
+                  final fetchedRows = rowsList
+                      .map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
+                      .toList();
+                  for (var i = 0; i < visibleRows.length; i++) {
+                    if (i < fetchStart) {
+                      rows.add(_plainRow(visibleRows[i]));
+                    } else {
+                      final fetchedIndex = i - fetchStart;
+                      if (fetchedIndex < fetchedRows.length) {
+                        rows.add(fetchedRows[fetchedIndex]);
+                      } else {
+                        rows.add(_plainRow(visibleRows[i]));
+                      }
+                    }
+                  }
                 } else {
                   for (var i = 0; i < visibleRows.length; i++) {
                     if (i < styledRowsStart) {
@@ -711,20 +723,32 @@ class _TriageHomeState extends State<TriageHome> {
             final styledRowsStart = visibleRows.length - styledRows.length;
             if (styledRowsStart > 0) {
               try {
+                final fetchStart =
+                    (visibleRows.length - 200) < 0 ? 0 : visibleRows.length - 200;
                 final historyRes = await _client.styledRows(
                   sessionId: sessionId,
-                  start: 0,
+                  start: fetchStart,
                   end: visibleRows.length,
                 );
                 final responseObj =
                     historyRes['response'] as Map<String, dynamic>?;
                 final rowsList = responseObj?['rows'] as List<dynamic>?;
                 if (rowsList != null) {
-                  rows.addAll(
-                    rowsList.map(
-                      (e) => StyledRow.fromJson(e as Map<String, dynamic>),
-                    ),
-                  );
+                  final fetchedRows = rowsList
+                      .map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
+                      .toList();
+                  for (var i = 0; i < visibleRows.length; i++) {
+                    if (i < fetchStart) {
+                      rows.add(_plainRow(visibleRows[i]));
+                    } else {
+                      final fetchedIndex = i - fetchStart;
+                      if (fetchedIndex < fetchedRows.length) {
+                        rows.add(fetchedRows[fetchedIndex]);
+                      } else {
+                        rows.add(_plainRow(visibleRows[i]));
+                      }
+                    }
+                  }
                 } else {
                   for (var i = 0; i < visibleRows.length; i++) {
                     if (i < styledRowsStart) {

@@ -31,26 +31,6 @@ class TerminalPane extends StatefulWidget {
       } catch (_) {}
     }
     _TerminalPaneState._sessionFitAddons.remove(sanitizedId);
-    final onData = _TerminalPaneState._sessionOnDataSubs.remove(sanitizedId);
-    if (onData != null) {
-      try {
-        js_util.callMethod(onData, 'dispose', []);
-      } catch (_) {}
-    }
-    final onResize = _TerminalPaneState._sessionOnResizeSubs.remove(
-      sanitizedId,
-    );
-    if (onResize != null) {
-      try {
-        js_util.callMethod(onResize, 'dispose', []);
-      } catch (_) {}
-    }
-    final observer = _TerminalPaneState._sessionResizeObservers.remove(sanitizedId);
-    if (observer != null) {
-      try {
-        js_util.callMethod(observer, 'disconnect', []);
-      } catch (_) {}
-    }
   }
 
   @override
@@ -61,9 +41,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, html.Element> _sessionContainers = {};
   static final Map<String, dynamic> _sessionTerms = {};
   static final Map<String, dynamic> _sessionFitAddons = {};
-  static final Map<String, dynamic> _sessionOnDataSubs = {};
-  static final Map<String, dynamic> _sessionOnResizeSubs = {};
-  static final Map<String, dynamic> _sessionResizeObservers = {};
   static final Set<String> _registeredViewTypes = {};
 
   late final String _viewType;
@@ -71,8 +48,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final html.DivElement _terminalWrapper;
   late final dynamic _term;
   late final dynamic _fitAddon;
-  late final dynamic _onDataSubscription;
-  late final dynamic _onResizeSubscription;
+  dynamic _onDataSubscription;
+  dynamic _onResizeSubscription;
+  dynamic _resizeObserver;
   late final FocusNode _focusNode;
   late final void Function(html.Event) _windowKeyDownListener;
   late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
@@ -100,10 +78,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _terminalWrapper = _container.children.first as html.DivElement;
       _term = _sessionTerms[sanitizedId];
       _fitAddon = _sessionFitAddons[sanitizedId];
-      _onDataSubscription = _sessionOnDataSubs[sanitizedId];
-      _onResizeSubscription = _sessionOnResizeSubs[sanitizedId];
       _initialized = true;
       _bindController();
+      _bindTerminalSubscriptions(sanitizedId);
 
       Future.delayed(const Duration(milliseconds: 50), _onFit);
       Future.delayed(const Duration(milliseconds: 200), _onFit);
@@ -272,26 +249,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         ]);
       } catch (_) {}
 
-      final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        widget.controller.sendInput(data);
-      });
-      _onDataSubscription = js_util.callMethod(_term, 'onData', [
-        onDataCallback,
-      ]);
-      _sessionOnDataSubs[sanitizedId] = _onDataSubscription;
-
-      final onResizeCallback = js_util.allowInterop((
-        dynamic size, [
-        dynamic _,
-      ]) {
-        final cols = js_util.getProperty(size, 'cols') as int;
-        final rows = js_util.getProperty(size, 'rows') as int;
-        widget.controller.sendResizeOut(cols, rows);
-      });
-      _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
-        onResizeCallback,
-      ]);
-      _sessionOnResizeSubs[sanitizedId] = _onResizeSubscription;
+      _bindTerminalSubscriptions(sanitizedId);
 
       _writeInitialContent();
 
@@ -306,22 +264,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       Future.delayed(const Duration(milliseconds: 200), _onFit);
       Future.delayed(const Duration(milliseconds: 600), _onFit);
       Future.delayed(const Duration(milliseconds: 1500), _onFit);
-
-      // Register ResizeObserver for real-time sizing notifications
-      try {
-        final resizeObserverConstructor =
-            js_util.getProperty(html.window, 'ResizeObserver');
-        if (resizeObserverConstructor != null) {
-          final callback =
-              js_util.allowInterop((dynamic entries, dynamic observer) {
-            _onFit();
-          });
-          final observer =
-              js_util.callConstructor(resizeObserverConstructor, [callback]);
-          js_util.callMethod(observer, 'observe', [_terminalWrapper]);
-          _sessionResizeObservers[sanitizedId] = observer;
-        }
-      } catch (_) {}
 
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
@@ -377,6 +319,44 @@ class _TerminalPaneState extends State<TerminalPane> {
       sb.write(_styledSpanToAnsi(span));
     }
     return sb.toString();
+  }
+
+  void _bindTerminalSubscriptions(String sanitizedId) {
+    final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+      if (mounted) {
+        widget.controller.sendInput(data);
+      }
+    });
+    _onDataSubscription = js_util.callMethod(_term, 'onData', [
+      onDataCallback,
+    ]);
+
+    final onResizeCallback = js_util.allowInterop((dynamic size, [dynamic _]) {
+      if (mounted) {
+        final cols = js_util.getProperty(size, 'cols') as int;
+        final rows = js_util.getProperty(size, 'rows') as int;
+        widget.controller.sendResizeOut(cols, rows);
+      }
+    });
+    _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
+      onResizeCallback,
+    ]);
+
+    try {
+      final resizeObserverConstructor =
+          js_util.getProperty(html.window, 'ResizeObserver');
+      if (resizeObserverConstructor != null) {
+        final callback =
+            js_util.allowInterop((dynamic entries, dynamic observer) {
+          if (mounted) {
+            _onFit();
+          }
+        });
+        _resizeObserver =
+            js_util.callConstructor(resizeObserverConstructor, [callback]);
+        js_util.callMethod(_resizeObserver, 'observe', [_terminalWrapper]);
+      }
+    } catch (_) {}
   }
 
   void _bindController() {
@@ -442,8 +422,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onFit() {
     if (!_initialized) return;
     try {
-      final width = js_util.getProperty(_terminalWrapper, 'clientWidth') as int? ?? 0;
-      final height = js_util.getProperty(_terminalWrapper, 'clientHeight') as int? ?? 0;
+      final width = _terminalWrapper.clientWidth;
+      final height = _terminalWrapper.clientHeight;
       if (width > 50 && height > 50) {
         js_util.callMethod(_fitAddon, 'fit', []);
       }
@@ -519,6 +499,21 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription.cancel();
     _containerKeyDownSubscription.cancel();
     _container.removeEventListener('paste', _containerPasteListener, true);
+    if (_onDataSubscription != null) {
+      try {
+        js_util.callMethod(_onDataSubscription, 'dispose', []);
+      } catch (_) {}
+    }
+    if (_onResizeSubscription != null) {
+      try {
+        js_util.callMethod(_onResizeSubscription, 'dispose', []);
+      } catch (_) {}
+    }
+    if (_resizeObserver != null) {
+      try {
+        js_util.callMethod(_resizeObserver, 'disconnect', []);
+      } catch (_) {}
+    }
     _focusNode.dispose();
     _unbindController();
     super.dispose();
