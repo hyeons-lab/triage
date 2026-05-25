@@ -622,10 +622,14 @@ class _TriageHomeState extends State<TriageHome> {
           return;
         }
 
+        // Translate bare newlines to \r\n to prevent stair-casing layout formatting issues in the client-side terminal emulator.
+        // We use a high-performance two-step replacement to ensure compatibility on older JS engines.
+        final translatedText = text.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n');
+
         // Write directly to xterm.js via the controller.
         // This bypasses calling setState() on every small output chunk,
         // avoiding Flutter widget tree rebuilds during active WebSocket sessions.
-        session.terminalController.write(text);
+        session.terminalController.write(translatedText);
 
         // Update backup logs silently (without calling setState).
         final rows = session.rows;
