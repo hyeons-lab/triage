@@ -1,0 +1,335 @@
+// FlatBuffers Schema for Triage Session Protocol
+namespace triage.generated;
+
+enum AttachMode : byte {
+    Observer = 0,
+    InteractiveController = 1,
+    AgentController = 2
+}
+
+enum InputControllerKind : byte {
+    Interactive = 0,
+    Agent = 1
+}
+
+enum LeaseChangeAction : byte {
+    Acquired = 0,
+    Released = 1,
+    TakenOver = 2
+}
+
+struct SessionSize {
+    rows: uint32;
+    cols: uint32;
+    pixel_width: uint32;
+    pixel_height: uint32;
+    dpi: uint32;
+}
+
+struct TerminalCursor {
+    row: uint32;
+    col: uint32;
+    visible: bool;
+}
+
+struct TerminalColor {
+    red: ubyte;
+    green: ubyte;
+    blue: ubyte;
+}
+
+struct TerminalStyle {
+    foreground: TerminalColor;
+    background: TerminalColor;
+    bold: bool;
+    dim: bool;
+    italic: bool;
+    underline: bool;
+    reverse: bool;
+}
+
+table StyledSpan {
+    text: string;
+    style: TerminalStyle;
+}
+
+table StyledRow {
+    spans: [StyledSpan];
+}
+
+table SessionContext {
+    repository_root: string;
+    worktree_root: string;
+    branch: string;
+}
+
+table SessionSnapshot {
+    output_seq: uint64;
+    bytes_logged: uint64;
+    size: SessionSize;
+    visible_rows: [string];
+    styled_rows_start: uint32;
+    styled_rows: [StyledRow];
+    cursor: TerminalCursor;
+    current_working_directory: string;
+    context: SessionContext;
+    bracketed_paste_enabled: bool;
+    exited: bool;
+}
+
+table CompletedSession {
+    output_seq: uint64;
+    bytes_logged: uint64;
+    visible_rows: [string];
+}
+
+table InputLeaseHolder {
+    client_id: string;
+    kind: InputControllerKind;
+}
+
+table InputLeaseState {
+    holder: InputLeaseHolder;
+    generation: uint64;
+}
+
+table LeaseChange {
+    generation: uint64;
+    previous: InputLeaseHolder;
+    current: InputLeaseHolder;
+    action: LeaseChangeAction;
+}
+
+table AttachSessionResponse {
+    snapshot: SessionSnapshot;
+    lease: InputLeaseState;
+}
+
+table StyledRowsResponse {
+    output_seq: uint64;
+    start: uint32;
+    rows: [StyledRow];
+}
+
+// --- CLIENT REQUESTS ---
+
+table HelloRequest {
+    client_id: string;
+    token: string;
+}
+
+table PairRequest {
+    code: string;
+    client_id: string;
+}
+
+table ListSessionsRequest {}
+
+table StartSessionRequestTable {
+    command: string;
+    args: [string];
+    cwd: string;
+    size: SessionSize;
+}
+
+table AttachSessionRequestTable {
+    session_id: string;
+    client_id: string;
+    mode: AttachMode;
+}
+
+table SubscribeSessionEventsRequestTable {
+    session_id: string;
+    after_event_seq: uint64;
+}
+
+table AcquireInputLeaseRequest {
+    session_id: string;
+    client_id: string;
+    kind: InputControllerKind;
+}
+
+table ReleaseInputLeaseRequest {
+    session_id: string;
+    client_id: string;
+}
+
+table WriteInputRequestTable {
+    session_id: string;
+    client_id: string;
+    bytes: [ubyte]; // HOT PATH: Raw input stream bytes
+}
+
+table ResizeSessionRequestTable {
+    session_id: string;
+    size: SessionSize;
+}
+
+table RestoreSessionRequestTable {
+    session_id: string;
+    size: SessionSize;
+}
+
+table SnapshotSessionRequest {
+    session_id: string;
+}
+
+table StyledRowsRequestTable {
+    session_id: string;
+    start: uint32;
+    end: uint32;
+}
+
+table ShutdownSessionRequest {
+    session_id: string;
+}
+
+union ClientRequestPayload {
+    HelloRequest,
+    PairRequest,
+    ListSessionsRequest,
+    StartSessionRequestTable,
+    AttachSessionRequestTable,
+    SubscribeSessionEventsRequestTable,
+    AcquireInputLeaseRequest,
+    ReleaseInputLeaseRequest,
+    WriteInputRequestTable,
+    ResizeSessionRequestTable,
+    RestoreSessionRequestTable,
+    SnapshotSessionRequest,
+    StyledRowsRequestTable,
+    ShutdownSessionRequest
+}
+
+table ClientMessage {
+    id: string;
+    payload: ClientRequestPayload;
+}
+
+// --- SERVER MESSAGES ---
+
+table UnitResult {}
+
+table HelloResult {
+    protocol_version: string;
+    authenticated: bool;
+}
+
+table PairedResult {
+    token: string;
+}
+
+table SessionIdsResult {
+    session_ids: [string];
+}
+
+table SessionIdResult {
+    session_id: string;
+}
+
+table AttachSessionResult {
+    response: AttachSessionResponse;
+}
+
+table SubscribedResult {
+    subscription_id: string;
+}
+
+table LeaseChangeResult {
+    change: LeaseChange;
+}
+
+table SessionSnapshotResult {
+    snapshot: SessionSnapshot;
+}
+
+table StyledRowsResult {
+    response: StyledRowsResponse;
+}
+
+table CompletedSessionResult {
+    completed: CompletedSession;
+}
+
+union ServerResultPayload {
+    UnitResult,
+    HelloResult,
+    PairedResult,
+    SessionIdsResult,
+    SessionIdResult,
+    AttachSessionResult,
+    SubscribedResult,
+    LeaseChangeResult,
+    SessionSnapshotResult,
+    StyledRowsResult,
+    CompletedSessionResult
+}
+
+table ResponsePayload {
+    id: string;
+    result: ServerResultPayload;
+}
+
+table ErrorPayload {
+    id: string;
+    code: string;
+    message: string;
+}
+
+table ResyncRequiredEvent {
+    session_id: string;
+    latest_event_seq: uint64;
+    snapshot: SessionSnapshot;
+}
+
+table OutputEvent {
+    session_id: string;
+    output_seq: uint64;
+    bytes: [ubyte]; // HOT PATH: Dynamic binary terminal stream bytes
+}
+
+table SnapshotEvent {
+    session_id: string;
+    snapshot: SessionSnapshot;
+}
+
+table LeaseChangedEvent {
+    session_id: string;
+    change: LeaseChange;
+}
+
+table ExitedEvent {
+    session_id: string;
+    completed: CompletedSession;
+}
+
+union SessionEventPayload {
+    ResyncRequiredEvent,
+    OutputEvent,
+    SnapshotEvent,
+    LeaseChangedEvent,
+    ExitedEvent
+}
+
+table EventPayload {
+    subscription_id: string;
+    event_seq: uint64;
+    event: SessionEventPayload;
+}
+
+table SubscriptionClosedPayload {
+    subscription_id: string;
+}
+
+union ServerMessagePayload {
+    ResponsePayload,
+    ErrorPayload,
+    EventPayload,
+    SubscriptionClosedPayload
+}
+
+table ServerMessage {
+    payload: ServerMessagePayload;
+}
+
+root_type ServerMessage;
