@@ -11,7 +11,7 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - [x] Create branch devlog and initial plan file.
 - [x] Define the FlatBuffers schema (`triage.fbs`) inside `triage-core`.
 - [x] Add `flatbuffers` dependencies and implement build script in `triage-core/build.rs`.
-- [ ] Implement conversion helpers in `flatbuffers_proto.rs` in `triage-core`.
+- [x] Implement conversion helpers in `flatbuffers_proto.rs` in `triage-core`.
 - [ ] Refactor `triage-transport-ws` to support `ProtocolFormat` and binary message handlers.
 - [ ] Refactor `triaged` to negotiate subprotocols and route binary WebSocket frames.
 - [ ] Implement Criterion microbenchmarks inside `crates/triage-transport-ws/benches/`.
@@ -27,4 +27,5 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - Implement the FlatBuffers schema file.
 
 ## Commits
-- HEAD — dev(web): initialize branch devlog and plan for FlatBuffers protocol
+- HEAD — feat(flatbuffers): implement FlatBuffers schema compilation and core model builders
+- 9481a9a — dev(web): initialize branch devlog and plan for FlatBuffers protocol
