@@ -186,7 +186,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
-        if (!widget.isExited) {
+        if (!widget.isExited && _eventTargetsTerminal(event)) {
           if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
             event.preventDefault();
             event.stopPropagation();
@@ -200,7 +200,10 @@ class _TerminalPaneState extends State<TerminalPane> {
             final selectionObj = html.window.getSelection();
             if (selectionObj != null) {
               try {
-                selection = js_util.callMethod(selectionObj, 'toString', []) as String? ?? '';
+                selection =
+                    js_util.callMethod(selectionObj, 'toString', [])
+                        as String? ??
+                    '';
               } catch (_) {}
             }
             if (selection == 'Instance of \'Selection\'') {
@@ -632,6 +635,27 @@ class _TerminalPaneState extends State<TerminalPane> {
     _container.addEventListener('paste', _containerPasteListener, true);
   }
 
+  bool _eventTargetsTerminal(html.Event event) {
+    if (_focusNode.hasFocus) {
+      return true;
+    }
+
+    try {
+      final path = js_util.callMethod(event, 'composedPath', []) as List?;
+      if (path != null && path.contains(_container)) {
+        return true;
+      }
+    } catch (_) {}
+
+    final target = event.target;
+    if (target is html.Node) {
+      try {
+        return _container.contains(target);
+      } catch (_) {}
+    }
+    return false;
+  }
+
   void _onWrite(String data) {
     if (!_initialized) return;
     if (!_initialContentWritten) {
@@ -650,6 +674,25 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onResize(int cols, int rows) {
     if (!_initialized) return;
     js_util.callMethod(_term, 'resize', [cols, rows]);
+  }
+
+  void _finishInitialContent(int fittedCols, int fittedRows) {
+    _initialContentWritten = true;
+    _writeInitialContent();
+    _flushPendingLiveWrites();
+    _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
+  }
+
+  void _flushPendingLiveWrites() {
+    if (_pendingLiveWriteBuffer.isEmpty) {
+      return;
+    }
+    final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
+    _pendingLiveWriteBuffer.clear();
+    _liveOutputReceived = true;
+    for (final data in pendingWrites) {
+      js_util.callMethod(_term, 'write', [data]);
+    }
   }
 
   void _onFit() {
@@ -701,28 +744,16 @@ class _TerminalPaneState extends State<TerminalPane> {
               _stableHeight = dHeight;
               _stabilityTimer?.cancel();
               _stabilityTimer = Timer(const Duration(milliseconds: 250), () {
-                if (mounted && !_initialContentWritten && !widget.replayPending) {
-                  _initialContentWritten = true;
-                  _writeInitialContent();
-                  _pendingLiveWriteBuffer.clear();
-                  _sessionInputRouter.sendResizeOut(
-                    _sanitizedId,
-                    fittedCols,
-                    fittedRows,
-                  );
+                if (mounted &&
+                    !_initialContentWritten &&
+                    !widget.replayPending) {
+                  _finishInitialContent(fittedCols, fittedRows);
                 }
               });
               return;
             }
             if (_stabilityTimer == null || !_stabilityTimer!.isActive) {
-              _initialContentWritten = true;
-              _writeInitialContent();
-              _pendingLiveWriteBuffer.clear();
-              _sessionInputRouter.sendResizeOut(
-                _sanitizedId,
-                fittedCols,
-                fittedRows,
-              );
+              _finishInitialContent(fittedCols, fittedRows);
             }
           } else if (widget.isExited) {
             _resetTerminalSafe();
@@ -891,9 +922,6 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   Widget build(BuildContext context) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _activateTerminal();
-    });
     return Focus(
       focusNode: _focusNode,
       onKeyEvent: (node, event) {

@@ -311,19 +311,12 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _setupSessionInputListener(SessionVm session) {
     session.terminalController.addInputListener((keys) {
-      debugPrint(
-        '_setupSessionInputListener input callback: title=${session.title}, status=${session.status}, keys=$keys',
-      );
       if (_isRemoteSession(session)) {
         if (session.status != 'attached') {
-          debugPrint(
-            'Suppressed remote input because status is not attached: status=${session.status}',
-          );
           return;
         }
 
         if (!_client.isConnected) {
-          debugPrint('Suppressed remote input because client is disconnected');
           _markRemoteSessionDisconnected(session);
           return;
         }
@@ -331,9 +324,6 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          debugPrint(
-            'Calling writeInput: sessionId=$sessionId, clientId=$_clientId, keys=$keys',
-          );
           _client
               .writeInput(
                 sessionId: sessionId,
@@ -709,19 +699,22 @@ class _TriageHomeState extends State<TriageHome> {
   void _onWebSocketEvent(Map<String, dynamic> message) {
     if (_disposed) return;
     _websocketEventQueue.add(message);
-    _processWebsocketEventQueue();
+    unawaited(_processWebsocketEventQueue());
   }
 
-  void _processWebsocketEventQueue() async {
+  Future<void> _processWebsocketEventQueue() async {
     if (_websocketProcessingEvent || _websocketEventQueue.isEmpty) return;
     _websocketProcessingEvent = true;
-    while (_websocketEventQueue.isNotEmpty && !_disposed) {
-      final message = _websocketEventQueue.removeFirst();
-      try {
-        await _processWebSocketEvent(message);
-      } catch (_) {}
+    try {
+      while (_websocketEventQueue.isNotEmpty && !_disposed) {
+        final message = _websocketEventQueue.removeFirst();
+        try {
+          await _processWebSocketEvent(message);
+        } catch (_) {}
+      }
+    } finally {
+      _websocketProcessingEvent = false;
     }
-    _websocketProcessingEvent = false;
   }
 
   Future<void> _processWebSocketEvent(Map<String, dynamic> message) async {

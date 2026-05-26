@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const PORT = 8080;
-const PUBLIC_DIR = path.join(__dirname, 'build', 'web');
+const PUBLIC_DIR = path.resolve(__dirname, 'build', 'web');
 
 const MIME_TYPES = {
   '.html': 'text/html',
@@ -21,17 +21,27 @@ const MIME_TYPES = {
 const server = http.createServer((req, res) => {
   console.log(`[SERVER] Request: ${req.method} ${req.url}`);
   
-  // Normalize URL path to prevent directory traversal
-  let safePath = req.url.split('?')[0];
-  if (safePath === '/') {
-    safePath = '/index.html';
+  let safePath;
+  try {
+    safePath = decodeURIComponent(req.url.split('?')[0]);
+  } catch (_) {
+    res.statusCode = 400;
+    res.end('Bad Request');
+    return;
   }
-  
-  const filePath = path.join(PUBLIC_DIR, safePath);
+  if (safePath === '/') {
+    safePath = 'index.html';
+  } else {
+    safePath = safePath.replace(/^[/\\]+/, '');
+  }
+
+  const filePath = path.resolve(PUBLIC_DIR, safePath);
   const resolvedPath = path.resolve(filePath);
-  
-  // Verify path is within PUBLIC_DIR
-  const isSafe = resolvedPath.startsWith(PUBLIC_DIR + path.sep) || resolvedPath === PUBLIC_DIR;
+
+  const relativePath = path.relative(PUBLIC_DIR, resolvedPath);
+  const isSafe =
+    relativePath === '' ||
+    (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
   if (!isSafe) {
     res.statusCode = 403;
     res.end('Forbidden');

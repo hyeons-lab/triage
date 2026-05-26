@@ -118,11 +118,15 @@
 - Wait 150ms after stylesheet onLoad before fitting. The browser requires a short rendering tick to parse the downloaded CSS and apply font metrics to the Shadow DOM; immediate fitting measures unstyled default fonts, leading to wrong column counts.
 - Gate the initial log write to when the terminal is at least 35 columns wide. Extremely narrow intermediate layout sizes are skipped to prevent premature text wrapping.
 - Gate PTY resize commands on `_initialContentWritten` during bootstrap. The browser DOM undergoes rapid reflow layout changes during initialization, triggering premature narrow fits (e.g. 53 columns). Gating and delaying the resize command ensures the daemon's ConPTY instance does not wrap the active prompt buffer into narrow columns before the client has expanded to its full stable size.
+- Restore the terminal keyboard focus guard on global key handling. Window-level keydown routing should only handle events that originate from the terminal DOM path or while the pane focus node is active, preventing unrelated app text fields from forwarding input into xterm.
+- Flush live output buffered during initial replay after the historical snapshot write. Clearing `_pendingLiveWriteBuffer` drops bytes that arrive during stylesheet/layout stabilization, so buffered chunks are now written to xterm immediately after initial content.
+- Address current PR review comments by hardening the static server path resolution, removing per-keystroke logging, making WebSocket queue processing recover its guard in `finally`, and avoiding unconditional terminal focus activation from `build()`.
 
 ## Commits
 - 2024645 — fix(daemon): reflow log on resize, suppress cursor replies, and optimize cache
 - d7b3c72 — fix(client): resolve terminal layout wrapping, styling, and restored history
 - cc522e6 — test(client): add playwright real-browser integration tests
-- HEAD — docs: update branch devlog and plans
+- 9cc8b30 — docs: update branch devlog and plans
+- HEAD — fix(client): address PR review comments
 
 

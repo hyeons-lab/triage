@@ -511,12 +511,6 @@ impl SessionApi for SessionManager {
     }
 
     fn write_input(&self, request: WriteInputRequest) -> Result<()> {
-        tracing::info!(
-            "write_input request: session_id = {:?}, client_id = {:?}, bytes_len = {}",
-            request.session_id,
-            request.client_id,
-            request.bytes.len()
-        );
         let sessions = self.sessions()?;
         let session = sessions
             .get(&request.session_id)
