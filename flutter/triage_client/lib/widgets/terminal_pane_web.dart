@@ -123,23 +123,58 @@ class _TerminalPaneState extends State<TerminalPane> {
     _sanitizedId = sanitizedId;
     _viewType = 'xterm-view-$sanitizedId';
 
-    _discardCachedSession(sanitizedId);
-    _container = html.DivElement()
-      ..style.width = '100%'
-      ..style.height = '100%'
-      ..style.backgroundColor = '#0d1113'
-      ..style.overflow = 'hidden';
+    final cachedContainer = _sessionContainers[sanitizedId];
+    final cachedTerm = _sessionTerms[sanitizedId];
+    final cachedFitAddon = _sessionFitAddons[sanitizedId];
+    if (cachedContainer != null &&
+        cachedTerm != null &&
+        cachedFitAddon != null &&
+        cachedContainer.children.isNotEmpty) {
+      _container = cachedContainer as html.DivElement;
+      _terminalWrapper = _container.children.firstWhere((el) => el is html.DivElement) as html.DivElement;
+      _term = cachedTerm;
+      _fitAddon = cachedFitAddon;
+      _initialized = true;
+      _initialContentWritten = true;
+      _styleSheetLoaded = true;
+      _bindController();
+      _bindTerminalSubscriptions();
+    } else {
+      _container = html.DivElement()
+        ..style.width = '100%'
+        ..style.height = '100%'
+        ..style.backgroundColor = '#0d1113'
+        ..style.overflow = 'hidden';
 
-    // Inject xterm.css directly inside the container so it penetrates the Flutter Web platform view Shadow DOM
-    final link = html.LinkElement()
-      ..rel = 'stylesheet'
-      ..href = 'xterm.css';
-    link.onLoad.listen((_) {
-      if (mounted) {
-        // Wait for the browser to parse CSS and apply font styles to the Shadow DOM
-        Timer(const Duration(milliseconds: 150), () {
-          if (mounted) {
-            _styleSheetLoaded = true;
+      // Inject xterm.css directly inside the container so it penetrates the Flutter Web platform view Shadow DOM
+      final link = html.LinkElement()
+        ..rel = 'stylesheet'
+        ..href = 'xterm.css';
+      link.onLoad.listen((_) {
+        if (mounted) {
+          // Wait for the browser to parse CSS and apply font styles to the Shadow DOM
+          Timer(const Duration(milliseconds: 150), () {
+            if (mounted) {
+              _styleSheetLoaded = true;
+              try {
+                _resetTerminalSafe();
+                _initialContentWritten = false;
+                _stableWidth = null;
+                _stableHeight = null;
+                _liveOutputReceived = false;
+                _triggerFitWithDelayedRetries();
+              } catch (_) {}
+            }
+          });
+        }
+      });
+      _container.append(link);
+
+      // Safety fallback in case stylesheet onLoad fails or is slow
+      Timer(const Duration(milliseconds: 600), () {
+        if (mounted && !_styleSheetLoaded) {
+          _styleSheetLoaded = true;
+          if (_initialized) {
             try {
               _resetTerminalSafe();
               _initialContentWritten = false;
@@ -149,40 +184,22 @@ class _TerminalPaneState extends State<TerminalPane> {
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
-        });
-      }
-    });
-    _container.append(link);
-
-    // Safety fallback in case stylesheet onLoad fails or is slow
-    Timer(const Duration(milliseconds: 600), () {
-      if (mounted && !_styleSheetLoaded) {
-        _styleSheetLoaded = true;
-        if (_initialized) {
-          try {
-            _resetTerminalSafe();
-            _initialContentWritten = false;
-            _stableWidth = null;
-            _stableHeight = null;
-            _liveOutputReceived = false;
-            _triggerFitWithDelayedRetries();
-          } catch (_) {}
         }
-      }
-    });
+      });
 
-    _terminalWrapper = html.DivElement()
-      ..style.width = 'calc(100% - 32px)'
-      ..style.height = '100%'
-      ..style.marginLeft = '16px'
-      ..style.marginRight = '16px'
-      ..style.overflow = 'hidden';
+      _terminalWrapper = html.DivElement()
+        ..style.width = 'calc(100% - 32px)'
+        ..style.height = '100%'
+        ..style.marginLeft = '16px'
+        ..style.marginRight = '16px'
+        ..style.overflow = 'hidden';
 
-    _container.append(_terminalWrapper);
-    _sessionContainers[sanitizedId] = _container;
+      _container.append(_terminalWrapper);
+      _sessionContainers[sanitizedId] = _container;
 
-    _initTerminal(sanitizedId);
-    _bindContainerEvents();
+      _initTerminal(sanitizedId);
+      _bindContainerEvents();
+    }
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
@@ -835,7 +852,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.isExited != widget.isExited) {
+        if (oldWidget.isExited != widget.isExited) {
       if (_initialized) {
         try {
           _updateCursorOptions();

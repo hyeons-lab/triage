@@ -10,19 +10,22 @@ use triage_transport_ws::WebSocketSessionConnection;
 
 use crate::session::SessionManager;
 
-/// Start the WebSocket server using a dedicated Tokio runtime.
-pub fn start_websocket_server(manager: Arc<SessionManager>, bind_addr: SocketAddr) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+/// Start the WebSocket server using a dedicated Tokio runtime and pre-bound std::net::TcpListener.
+pub fn start_websocket_server(
+    manager: Arc<SessionManager>,
+    listener: std::net::TcpListener,
+) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("triage-ws-runtime")
         .build()
         .context("building Tokio runtime for WebSocket server")?;
 
     rt.block_on(async {
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .context("binding WebSocket TCP listener")?;
-        tracing::info!(bind_addr = %bind_addr, "WebSocket server listening");
+        let listener = TcpListener::from_std(listener)
+            .context("converting std TcpListener to Tokio TcpListener")?;
+        let bind_addr = listener.local_addr().ok();
+        tracing::info!(bind_addr = ?bind_addr, "WebSocket server listening");
         tracing::info!("triage remote web client UI is typically served at http://127.0.0.1:8080");
 
         loop {
@@ -55,32 +58,20 @@ async fn handle_ws_connection(
     tracing::info!(client_addr = %addr, "WebSocket client connected");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-
-    // Spawn a dedicated write task to safely serialize socket writes and avoid cancellation safety issues
-    let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Err(err) = ws_sender.send(msg).await {
-                tracing::warn!("failed to send WebSocket message: {:?}", err);
-                break;
-            }
-        }
-    });
-
     let mut conn =
         WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager));
-    let mut interval = tokio::time::interval(Duration::from_millis(10));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut next_msg = ws_receiver.next();
 
     loop {
         tokio::select! {
-            maybe_msg = ws_receiver.next() => {
+            maybe_msg = &mut next_msg => {
                 match maybe_msg {
                     Some(Ok(msg)) => {
                         match msg {
                             Message::Text(text) => {
                                 let response = conn.handle_text_message(&text);
-                                if tx.send(Message::Text(response)).is_err() {
+                                if ws_sender.send(Message::Text(response)).await.is_err() {
                                     break;
                                 }
                             }
@@ -100,14 +91,15 @@ async fn handle_ws_connection(
                         break;
                     }
                 }
+                next_msg = ws_receiver.next();
             }
-            _ = interval.tick() => {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {
                 let messages = conn.drain_events();
                 let mut send_failed = false;
                 for msg in messages {
                     let serialized = serde_json::to_string(&msg)
                         .context("serializing session event")?;
-                    if tx.send(Message::Text(serialized)).is_err() {
+                    if ws_sender.send(Message::Text(serialized)).await.is_err() {
                         send_failed = true;
                         break;
                     }
@@ -119,8 +111,5 @@ async fn handle_ws_connection(
         }
     }
 
-    // Drop sender to signal writer task to finish, then await final flush
-    drop(tx);
-    let _ = write_task.await;
     Ok(())
 }

@@ -278,6 +278,7 @@ enum WireRequest {
     ShutdownSession {
         session_id: SessionId,
     },
+    Handover,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +318,7 @@ enum WireSuccess {
     Subscribed,
     SessionEvent(SessionEventEnvelope),
     Heartbeat,
+    HandoverState(crate::handover::HandoverState),
 }
 
 fn fallback_user_component() -> String {
@@ -391,6 +393,17 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> Result
     let request: WireRequest = read_json_line(&mut reader)?.context("reading request")?;
     let mut writer = BufWriter::new(stream);
 
+    if let WireRequest::Handover = request {
+        #[cfg(unix)]
+        {
+            return handle_handover_server(&manager, reader.into_inner());
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("Handover request not supported on non-unix systems");
+        }
+    }
+
     if let WireRequest::SubscribeSessionEvents {
         session_id,
         after_event_seq,
@@ -403,6 +416,87 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> Result
     write_json_line(&mut writer, &response).context("writing response")?;
     writer.flush().context("flushing response")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Result<()> {
+    use crate::handover::{get_active_tcp_listener_fd, send_fds};
+    use std::io::{Read, Write};
+
+    tracing::info!("Received handover request. Beginning process serialization...");
+
+    let (mut state, pty_fds) = manager
+        .serialize_active_sessions()
+        .context("serializing active sessions for handover")?;
+
+    let mut fds_to_send = Vec::new();
+
+    let tcp_fd = get_active_tcp_listener_fd();
+    if tcp_fd >= 0 {
+        let dup_tcp = unsafe { libc::dup(tcp_fd) };
+        if dup_tcp < 0 {
+            bail!(
+                "failed to dup TCP listener socket: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        fds_to_send.push(dup_tcp);
+        state.has_tcp_listener = true;
+    } else {
+        state.has_tcp_listener = false;
+    }
+
+    fds_to_send.extend(pty_fds);
+
+    let response = WireResponse::Ok(Box::new(WireSuccess::HandoverState(state)));
+    let response_bytes =
+        serde_json::to_vec(&response).context("serializing handover response JSON")?;
+
+    let send_res = send_fds(&stream, &fds_to_send, &response_bytes);
+
+    // Close duplicated FDs in this process to prevent FD leaks!
+    for fd in fds_to_send {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    send_res.context("sending handover state and FDs via SCM_RIGHTS")?;
+
+    tracing::info!("Handover transfer completed. Waiting for client adoption sync (Phase 2)...");
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("setting read timeout on handover socket")?;
+    let mut sync_byte = [0u8; 1];
+    if let Err(err) = stream.try_clone()?.read_exact(&mut sync_byte) {
+        bail!("Failed to receive sync byte from client: {err}");
+    }
+    if sync_byte[0] != 0x01 {
+        bail!(
+            "Invalid sync byte received from client: {:02x}",
+            sync_byte[0]
+        );
+    }
+
+    tracing::info!("Received adoption sync byte (0x01). Initiating Phase 3 (teardown)...");
+
+    manager.clear_all_live_sessions();
+
+    let mut out_stream = stream;
+    out_stream
+        .write_all(&[0x02])
+        .context("writing teardown sync byte (0x02) to client")?;
+    out_stream.flush().context("flushing teardown sync byte")?;
+
+    tracing::info!("Process handover handshake completed successfully. Exiting daemon.");
+
+    let socket_path = default_socket_path();
+    if socket_path.exists() {
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    std::process::exit(0);
 }
 
 fn handle_subscription(
@@ -495,6 +589,9 @@ fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<Wire
         WireRequest::ShutdownSession { session_id } => manager
             .shutdown_session(session_id)
             .map(WireSuccess::CompletedSession),
+        WireRequest::Handover => {
+            bail!("handover requests require direct socket handler")
+        }
     }
 }
 

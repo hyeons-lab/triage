@@ -2768,6 +2768,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "hex",
+ "libc",
  "portable-pty",
  "rand 0.8.6",
  "serde",

@@ -336,6 +336,234 @@ impl SessionManager {
 
         Ok(code)
     }
+
+    #[cfg(unix)]
+    pub fn serialize_active_sessions(
+        &self,
+    ) -> Result<(
+        crate::handover::HandoverState,
+        Vec<std::os::unix::io::RawFd>,
+    )> {
+        let sessions = self.sessions()?;
+        let mut handover_sessions = Vec::new();
+        let mut fds = Vec::new();
+
+        for (id, managed) in sessions.iter() {
+            if let ManagedSession::Live {
+                actor,
+                lease: _,
+                launch,
+            } = managed
+            {
+                let (tx, rx) = mpsc::channel();
+                if let Err(err) = actor
+                    .tx
+                    .send(ActorCommand::ExtractHandoverState { response: tx })
+                {
+                    tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
+                    continue;
+                }
+
+                let ext = match rx.recv().context("waiting for extract response")? {
+                    Ok(ext) => ext,
+                    Err(err) => {
+                        tracing::warn!(session_id = %id, ?err, "Actor failed to extract handover state");
+                        continue;
+                    }
+                };
+
+                fds.push(ext.fd);
+
+                handover_sessions.push(crate::handover::HandoverSession {
+                    id: id.clone(),
+                    command: launch.command.clone(),
+                    args: launch.args.clone(),
+                    cwd: launch.cwd.clone(),
+                    size: launch.size.clone(),
+                    log_path: launch.log_path.clone(),
+                    output_seq: ext.output_seq,
+                    bytes_logged: ext.bytes_logged,
+                    pid: ext.pid,
+                });
+            }
+        }
+
+        let state = crate::handover::HandoverState {
+            sessions: handover_sessions,
+            has_tcp_listener: false,
+        };
+
+        Ok((state, fds))
+    }
+
+    #[cfg(unix)]
+    pub fn clear_all_live_sessions(&self) {
+        if let Ok(mut sessions) = self.sessions() {
+            let keys: Vec<_> = sessions.keys().cloned().collect();
+            for id in keys {
+                if let Some(ManagedSession::Live {
+                    mut actor,
+                    lease: _,
+                    launch: _,
+                }) = sessions.remove(&id)
+                {
+                    let (tx, rx) = mpsc::channel();
+                    if let Err(err) = actor.tx.send(ActorCommand::Shutdown { response: tx }) {
+                        tracing::warn!(session_id = %id, ?err, "Failed to send shutdown command to actor");
+                    } else {
+                        let _ = rx.recv();
+                    }
+                    actor.join_threads();
+                }
+            }
+            sessions.clear();
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn adopt_sessions(
+        &self,
+        state: crate::handover::HandoverState,
+        mut fds: Vec<std::os::unix::io::RawFd>,
+    ) -> Result<()> {
+        let mut sessions = self.sessions()?;
+
+        for h_sess in state.sessions {
+            if fds.is_empty() {
+                bail!("No inherited FDs left for session {}", h_sess.id);
+            }
+            let fd = fds.remove(0);
+
+            let runtime = spawn_adopted_pty_runtime(&h_sess, fd)?;
+
+            let launch = PersistedSessionLaunch {
+                command: h_sess.command.clone(),
+                args: h_sess.args.clone(),
+                cwd: h_sess.cwd.clone(),
+                size: h_sess.size.clone(),
+                log_path: h_sess.log_path.clone(),
+            };
+
+            let event_session_id = Some(h_sess.id.clone());
+
+            let PtyRuntime {
+                master,
+                child,
+                reader,
+                writer,
+                output,
+                size,
+                log_path,
+                current_working_directory,
+            } = runtime;
+
+            let initial_working_directory = current_working_directory
+                .or_else(|| h_sess.cwd.clone())
+                .or_else(|| std::env::current_dir().ok());
+            let initial_context = resolve_session_context(initial_working_directory.as_ref());
+
+            let (command_tx, command_rx) = mpsc::channel();
+            let (output_tx, output_rx) = mpsc::sync_channel(64);
+
+            let reader = thread::Builder::new()
+                .name("session-actor-reader".into())
+                .spawn(move || read_pty_output(reader, output_tx))
+                .context("spawning session actor reader thread")?;
+
+            let worker = thread::Builder::new()
+                .name("session-actor-worker".into())
+                .spawn(move || {
+                    let state = ActorState {
+                        master,
+                        child,
+                        writer,
+                        output,
+                        size,
+                        log_path,
+                        exited: false,
+                        output_closed: false,
+                        exit_broadcasted: false,
+                        current_working_directory: initial_working_directory,
+                        context: initial_context,
+                        event_session_id,
+                        subscribers: Vec::new(),
+                        event_log: VecDeque::new(),
+                        next_event_seq: 1,
+                    };
+                    run_actor(state, command_rx, output_rx);
+                })
+                .context("spawning session actor worker thread")?;
+
+            let actor = SessionActor {
+                tx: command_tx,
+                worker: Some(worker),
+                reader: Some(reader),
+            };
+
+            sessions.insert(
+                h_sess.id.clone(),
+                ManagedSession::Live {
+                    actor,
+                    lease: InputLeaseState::default(),
+                    launch,
+                },
+            );
+        }
+
+        self.persist_manifest(&sessions)?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn spawn_adopted_pty_runtime(
+    h_sess: &crate::handover::HandoverSession,
+    fd: std::os::unix::io::RawFd,
+) -> Result<PtyRuntime> {
+    use crate::handover::{AdoptedChild, AdoptedMasterPty};
+
+    let master = Box::new(AdoptedMasterPty { fd });
+    let child = Box::new(AdoptedChild { pid: h_sess.pid });
+
+    let reader = master.try_clone_reader().context("cloning PTY reader")?;
+    let writer = shared_pty_writer(master.take_writer().context("taking PTY writer")?);
+
+    let terminal = terminal_with_writer(&h_sess.size, writer.clone());
+    let log = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&h_sess.log_path)
+        .with_context(|| format!("opening session log {}", h_sess.log_path.display()))?;
+
+    let mut output = OutputState {
+        log: log.try_clone().context("cloning restored session log")?,
+        terminal,
+        cwd_sequence_buffer: Vec::new(),
+        bytes_logged: 0,
+        output_seq: 0,
+        log_cache: None,
+    };
+
+    let replay = fs::read(&h_sess.log_path)
+        .with_context(|| format!("reading session log {}", h_sess.log_path.display()))?;
+    let replayed_working_directory = if replay.is_empty() {
+        None
+    } else {
+        output.replay(&replay)?
+    };
+    let current_working_directory = restorable_cwd(replayed_working_directory, h_sess.cwd.clone());
+
+    Ok(PtyRuntime {
+        master,
+        child,
+        reader,
+        writer,
+        output,
+        size: h_sess.size.clone(),
+        log_path: h_sess.log_path.clone(),
+        current_working_directory,
+    })
 }
 
 impl ManagedSession {
@@ -1304,6 +1532,19 @@ enum ActorCommand {
     Shutdown {
         response: Sender<ActorResult<CompletedSession>>,
     },
+    #[cfg(unix)]
+    ExtractHandoverState {
+        response: Sender<ActorResult<ExtractedHandover>>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ExtractedHandover {
+    pub fd: std::os::unix::io::RawFd,
+    pub pid: u32,
+    pub output_seq: u64,
+    pub bytes_logged: u64,
 }
 
 type ActorResult<T> = Result<T>;
@@ -1357,6 +1598,34 @@ fn run_actor(
 }
 
 impl ActorState {
+    #[cfg(unix)]
+    fn extract_handover_state(&mut self) -> Result<ExtractedHandover> {
+        let fd = self
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| anyhow!("MasterPty has no raw fd"))?;
+
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            bail!(
+                "failed to dup PTY master: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let pid = self
+            .child
+            .process_id()
+            .ok_or_else(|| anyhow!("Child process has no process ID"))?;
+
+        Ok(ExtractedHandover {
+            fd: dup_fd,
+            pid,
+            output_seq: self.output.output_seq,
+            bytes_logged: self.output.bytes_logged,
+        })
+    }
+
     fn handle_output(&mut self, message: ActorMessage) {
         match message {
             ActorMessage::Output(bytes) => match self.output.ingest(&bytes) {
@@ -1434,6 +1703,11 @@ impl ActorState {
             ActorCommand::Shutdown { response } => {
                 let _ = response.send(self.shutdown(command_rx, output_rx));
                 true
+            }
+            #[cfg(unix)]
+            ActorCommand::ExtractHandoverState { response } => {
+                let _ = response.send(self.extract_handover_state());
+                false
             }
         }
     }
@@ -2120,6 +2394,10 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Shutdown { response } => {
+            let _ = response.send(Err(error));
+        }
+        #[cfg(unix)]
+        ActorCommand::ExtractHandoverState { response } => {
             let _ = response.send(Err(error));
         }
     }
