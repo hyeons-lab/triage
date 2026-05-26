@@ -57,16 +57,15 @@ fn find_flatc() -> Option<PathBuf> {
 
     // 2. Windows-specific winget package fallback
     if cfg!(target_os = "windows") {
-        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
-            let fallback = PathBuf::from(local_appdata)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Packages")
-                .join("Google.flatbuffers_Microsoft.Winget.Source_8wekyb3d8bbwe")
-                .join("flatc.exe");
-            if fallback.exists() {
-                return Some(fallback);
-            }
+        let local_appdata = std::env::var_os("LOCALAPPDATA")?;
+        let fallback = PathBuf::from(local_appdata)
+            .join("Microsoft")
+            .join("WinGet")
+            .join("Packages")
+            .join("Google.flatbuffers_Microsoft.Winget.Source_8wekyb3d8bbwe")
+            .join("flatc.exe");
+        if fallback.exists() {
+            return Some(fallback);
         }
     }
 

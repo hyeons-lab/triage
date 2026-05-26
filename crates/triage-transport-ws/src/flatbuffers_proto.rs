@@ -1,3 +1,4 @@
+use crate::{ClientMessage, ClientRequest, ServerMessage, ServerResult};
 use flatbuffers::FlatBufferBuilder;
 use triage_core::generated::triage::generated as fb;
 use triage_core::session::{
@@ -5,7 +6,6 @@ use triage_core::session::{
     ResizeSessionRequest, RestoreSessionRequest, SessionEvent, SessionId, StartSessionRequest,
     StyledRowsRequest, WriteInputRequest,
 };
-use crate::{ClientMessage, ClientRequest, ServerMessage, ServerResult};
 
 pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
     let id = msg.id().map(|s| serde_json::Value::String(s.to_string()));
@@ -22,9 +22,7 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
             ClientRequest::Pair { code, client_id }
         }
-        fb::ClientRequestPayload::ListSessionsRequest => {
-            ClientRequest::ListSessions
-        }
+        fb::ClientRequestPayload::ListSessionsRequest => ClientRequest::ListSessions,
         fb::ClientRequestPayload::StartSessionRequestTable => {
             let req = msg.payload_as_start_session_request_table().unwrap();
             let command = req.command().unwrap_or("").to_string();
@@ -48,7 +46,12 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
                 dpi: fb_size.dpi() as usize,
             };
             ClientRequest::StartSession {
-                request: StartSessionRequest { command, args, cwd, size },
+                request: StartSessionRequest {
+                    command,
+                    args,
+                    cwd,
+                    size,
+                },
             }
         }
         fb::ClientRequestPayload::AttachSessionRequestTable => {
@@ -62,11 +65,17 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
                 _ => AttachMode::Observer,
             };
             ClientRequest::AttachSession {
-                request: AttachSessionRequest { session_id, client_id, mode },
+                request: AttachSessionRequest {
+                    session_id,
+                    client_id,
+                    mode,
+                },
             }
         }
         fb::ClientRequestPayload::SubscribeSessionEventsRequestTable => {
-            let req = msg.payload_as_subscribe_session_events_request_table().unwrap();
+            let req = msg
+                .payload_as_subscribe_session_events_request_table()
+                .unwrap();
             let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
             let after_event_seq = if req.after_event_seq() == 0 {
                 None
@@ -90,14 +99,21 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
                 _ => InputControllerKind::Interactive,
             };
             ClientRequest::AcquireInputLease {
-                request: InputLeaseRequest { session_id, client_id, kind },
+                request: InputLeaseRequest {
+                    session_id,
+                    client_id,
+                    kind,
+                },
             }
         }
         fb::ClientRequestPayload::ReleaseInputLeaseRequest => {
             let req = msg.payload_as_release_input_lease_request().unwrap();
             let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
             let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
-            ClientRequest::ReleaseInputLease { session_id, client_id }
+            ClientRequest::ReleaseInputLease {
+                session_id,
+                client_id,
+            }
         }
         fb::ClientRequestPayload::WriteInputRequestTable => {
             let req = msg.payload_as_write_input_request_table().unwrap();
@@ -108,7 +124,11 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
                 bytes.extend_from_slice(fb_bytes.bytes());
             }
             ClientRequest::WriteInput {
-                request: WriteInputRequest { session_id, client_id, bytes },
+                request: WriteInputRequest {
+                    session_id,
+                    client_id,
+                    bytes,
+                },
             }
         }
         fb::ClientRequestPayload::ResizeSessionRequestTable => {
@@ -152,7 +172,11 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             let start = req.start() as usize;
             let end = req.end() as usize;
             ClientRequest::StyledRows {
-                request: StyledRowsRequest { session_id, start, end },
+                request: StyledRowsRequest {
+                    session_id,
+                    start,
+                    end,
+                },
             }
         }
         fb::ClientRequestPayload::ShutdownSessionRequest => {
@@ -163,6 +187,274 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
         _ => ClientRequest::ListSessions,
     };
     ClientMessage { id, request }
+}
+
+pub fn serialize_client_message(msg: &ClientMessage) -> Vec<u8> {
+    let mut builder = FlatBufferBuilder::new();
+    let offset = build_client_message(&mut builder, msg);
+    builder.finish(offset, None);
+    builder.finished_data().to_vec()
+}
+
+pub fn build_client_message<'a>(
+    builder: &mut FlatBufferBuilder<'a>,
+    msg: &ClientMessage,
+) -> flatbuffers::WIPOffset<fb::ClientMessage<'a>> {
+    let id_str = msg.id.as_ref().map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.to_string(),
+    });
+    let id_val = id_str.as_ref().map(|s| builder.create_string(s));
+
+    let (payload_type, payload_offset) = match &msg.request {
+        ClientRequest::Hello { client_id, token } => {
+            let client_id_str = client_id
+                .as_ref()
+                .map(|id| builder.create_string(id.as_str()));
+            let token_str = token.as_ref().map(|tok| builder.create_string(tok));
+            let req = fb::HelloRequest::create(
+                builder,
+                &fb::HelloRequestArgs {
+                    client_id: client_id_str,
+                    token: token_str,
+                },
+            );
+            (fb::ClientRequestPayload::HelloRequest, req.as_union_value())
+        }
+        ClientRequest::Pair { code, client_id } => {
+            let code_str = builder.create_string(code);
+            let client_id_str = builder.create_string(client_id.as_str());
+            let req = fb::PairRequest::create(
+                builder,
+                &fb::PairRequestArgs {
+                    code: Some(code_str),
+                    client_id: Some(client_id_str),
+                },
+            );
+            (fb::ClientRequestPayload::PairRequest, req.as_union_value())
+        }
+        ClientRequest::ListSessions => {
+            let req = fb::ListSessionsRequest::create(builder, &fb::ListSessionsRequestArgs {});
+            (
+                fb::ClientRequestPayload::ListSessionsRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::StartSession { request } => {
+            let cmd_str = builder.create_string(&request.command);
+            let mut args_vec = Vec::new();
+            for arg in &request.args {
+                args_vec.push(builder.create_string(arg));
+            }
+            let args_offset = builder.create_vector(&args_vec);
+            let cwd_str = request
+                .cwd
+                .as_ref()
+                .map(|path| builder.create_string(&path.to_string_lossy()));
+            let size = fb::SessionSize::new(
+                request.size.rows as u32,
+                request.size.cols as u32,
+                request.size.pixel_width as u32,
+                request.size.pixel_height as u32,
+                request.size.dpi as u32,
+            );
+            let req = fb::StartSessionRequestTable::create(
+                builder,
+                &fb::StartSessionRequestTableArgs {
+                    command: Some(cmd_str),
+                    args: Some(args_offset),
+                    cwd: cwd_str,
+                    size: Some(&size),
+                },
+            );
+            (
+                fb::ClientRequestPayload::StartSessionRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::AttachSession { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let client_id_str = builder.create_string(request.client_id.as_str());
+            let mode = match request.mode {
+                AttachMode::Observer => fb::AttachMode::Observer,
+                AttachMode::InteractiveController => fb::AttachMode::InteractiveController,
+                AttachMode::AgentController => fb::AttachMode::AgentController,
+            };
+            let req = fb::AttachSessionRequestTable::create(
+                builder,
+                &fb::AttachSessionRequestTableArgs {
+                    session_id: Some(sess_id_str),
+                    client_id: Some(client_id_str),
+                    mode,
+                },
+            );
+            (
+                fb::ClientRequestPayload::AttachSessionRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::SubscribeSessionEvents { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let req = fb::SubscribeSessionEventsRequestTable::create(
+                builder,
+                &fb::SubscribeSessionEventsRequestTableArgs {
+                    session_id: Some(sess_id_str),
+                    after_event_seq: request.after_event_seq.unwrap_or(0),
+                },
+            );
+            (
+                fb::ClientRequestPayload::SubscribeSessionEventsRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::AcquireInputLease { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let client_id_str = builder.create_string(request.client_id.as_str());
+            let kind = match request.kind {
+                InputControllerKind::Interactive => fb::InputControllerKind::Interactive,
+                InputControllerKind::Agent => fb::InputControllerKind::Agent,
+            };
+            let req = fb::AcquireInputLeaseRequest::create(
+                builder,
+                &fb::AcquireInputLeaseRequestArgs {
+                    session_id: Some(sess_id_str),
+                    client_id: Some(client_id_str),
+                    kind,
+                },
+            );
+            (
+                fb::ClientRequestPayload::AcquireInputLeaseRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::ReleaseInputLease {
+            session_id,
+            client_id,
+        } => {
+            let sess_id_str = builder.create_string(session_id.as_str());
+            let client_id_str = builder.create_string(client_id.as_str());
+            let req = fb::ReleaseInputLeaseRequest::create(
+                builder,
+                &fb::ReleaseInputLeaseRequestArgs {
+                    session_id: Some(sess_id_str),
+                    client_id: Some(client_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::ReleaseInputLeaseRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::WriteInput { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let client_id_str = builder.create_string(request.client_id.as_str());
+            let bytes_offset = builder.create_vector(&request.bytes);
+            let req = fb::WriteInputRequestTable::create(
+                builder,
+                &fb::WriteInputRequestTableArgs {
+                    session_id: Some(sess_id_str),
+                    client_id: Some(client_id_str),
+                    bytes: Some(bytes_offset),
+                },
+            );
+            (
+                fb::ClientRequestPayload::WriteInputRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::ResizeSession { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let size = fb::SessionSize::new(
+                request.size.rows as u32,
+                request.size.cols as u32,
+                request.size.pixel_width as u32,
+                request.size.pixel_height as u32,
+                request.size.dpi as u32,
+            );
+            let req = fb::ResizeSessionRequestTable::create(
+                builder,
+                &fb::ResizeSessionRequestTableArgs {
+                    session_id: Some(sess_id_str),
+                    size: Some(&size),
+                },
+            );
+            (
+                fb::ClientRequestPayload::ResizeSessionRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::RestoreSession { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let size = fb::SessionSize::new(
+                request.size.rows as u32,
+                request.size.cols as u32,
+                request.size.pixel_width as u32,
+                request.size.pixel_height as u32,
+                request.size.dpi as u32,
+            );
+            let req = fb::RestoreSessionRequestTable::create(
+                builder,
+                &fb::RestoreSessionRequestTableArgs {
+                    session_id: Some(sess_id_str),
+                    size: Some(&size),
+                },
+            );
+            (
+                fb::ClientRequestPayload::RestoreSessionRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::SnapshotSession { session_id } => {
+            let sess_id_str = builder.create_string(session_id.as_str());
+            let req = fb::SnapshotSessionRequest::create(
+                builder,
+                &fb::SnapshotSessionRequestArgs {
+                    session_id: Some(sess_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::SnapshotSessionRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::StyledRows { request } => {
+            let sess_id_str = builder.create_string(request.session_id.as_str());
+            let req = fb::StyledRowsRequestTable::create(
+                builder,
+                &fb::StyledRowsRequestTableArgs {
+                    session_id: Some(sess_id_str),
+                    start: request.start as u32,
+                    end: request.end as u32,
+                },
+            );
+            (
+                fb::ClientRequestPayload::StyledRowsRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::ShutdownSession { session_id } => {
+            let sess_id_str = builder.create_string(session_id.as_str());
+            let req = fb::ShutdownSessionRequest::create(
+                builder,
+                &fb::ShutdownSessionRequestArgs {
+                    session_id: Some(sess_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::ShutdownSessionRequest,
+                req.as_union_value(),
+            )
+        }
+    };
+
+    fb::ClientMessage::create(
+        builder,
+        &fb::ClientMessageArgs {
+            id: id_val,
+            payload_type,
+            payload: Some(payload_offset),
+        },
+    )
 }
 
 pub fn serialize_server_message(msg: &ServerMessage) -> Vec<u8> {
@@ -189,7 +481,10 @@ pub fn build_server_message<'a>(
                     let r = fb::UnitResult::create(builder, &fb::UnitResultArgs {});
                     (fb::ServerResultPayload::UnitResult, r.as_union_value())
                 }
-                ServerResult::Hello { protocol_version, authenticated } => {
+                ServerResult::Hello {
+                    protocol_version,
+                    authenticated,
+                } => {
                     let pv = builder.create_string(protocol_version);
                     let r = fb::HelloResult::create(
                         builder,
@@ -204,9 +499,7 @@ pub fn build_server_message<'a>(
                     let tok = builder.create_string(token);
                     let r = fb::PairedResult::create(
                         builder,
-                        &fb::PairedResultArgs {
-                            token: Some(tok),
-                        },
+                        &fb::PairedResultArgs { token: Some(tok) },
                     );
                     (fb::ServerResultPayload::PairedResult, r.as_union_value())
                 }
@@ -222,7 +515,10 @@ pub fn build_server_message<'a>(
                             session_ids: Some(sids_vec),
                         },
                     );
-                    (fb::ServerResultPayload::SessionIdsResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::SessionIdsResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::SessionId { session_id } => {
                     let sid = builder.create_string(session_id.as_str());
@@ -235,14 +531,19 @@ pub fn build_server_message<'a>(
                     (fb::ServerResultPayload::SessionIdResult, r.as_union_value())
                 }
                 ServerResult::AttachSession { response } => {
-                    let resp = triage_core::flatbuffers_proto::build_attach_session_response(builder, response);
+                    let resp = triage_core::flatbuffers_proto::build_attach_session_response(
+                        builder, response,
+                    );
                     let r = fb::AttachSessionResult::create(
                         builder,
                         &fb::AttachSessionResultArgs {
                             response: Some(resp),
                         },
                     );
-                    (fb::ServerResultPayload::AttachSessionResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::AttachSessionResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::Subscribed { subscription_id } => {
                     let sub = builder.create_string(subscription_id.as_str());
@@ -252,47 +553,64 @@ pub fn build_server_message<'a>(
                             subscription_id: Some(sub),
                         },
                     );
-                    (fb::ServerResultPayload::SubscribedResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::SubscribedResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::LeaseChange { change } => {
                     let chg = triage_core::flatbuffers_proto::build_lease_change(builder, change);
                     let r = fb::LeaseChangeResult::create(
                         builder,
-                        &fb::LeaseChangeResultArgs {
-                            change: Some(chg),
-                        },
+                        &fb::LeaseChangeResultArgs { change: Some(chg) },
                     );
-                    (fb::ServerResultPayload::LeaseChangeResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::LeaseChangeResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::SessionSnapshot { snapshot } => {
-                    let snap = triage_core::flatbuffers_proto::build_session_snapshot(builder, snapshot);
+                    let snap =
+                        triage_core::flatbuffers_proto::build_session_snapshot(builder, snapshot);
                     let r = fb::SessionSnapshotResult::create(
                         builder,
                         &fb::SessionSnapshotResultArgs {
                             snapshot: Some(snap),
                         },
                     );
-                    (fb::ServerResultPayload::SessionSnapshotResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::SessionSnapshotResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::StyledRows { response } => {
-                    let resp = triage_core::flatbuffers_proto::build_styled_rows_response(builder, response);
+                    let resp = triage_core::flatbuffers_proto::build_styled_rows_response(
+                        builder, response,
+                    );
                     let r = fb::StyledRowsResult::create(
                         builder,
                         &fb::StyledRowsResultArgs {
                             response: Some(resp),
                         },
                     );
-                    (fb::ServerResultPayload::StyledRowsResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::StyledRowsResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::CompletedSession { completed } => {
-                    let comp = triage_core::flatbuffers_proto::build_completed_session(builder, completed);
+                    let comp =
+                        triage_core::flatbuffers_proto::build_completed_session(builder, completed);
                     let r = fb::CompletedSessionResult::create(
                         builder,
                         &fb::CompletedSessionResultArgs {
                             completed: Some(comp),
                         },
                     );
-                    (fb::ServerResultPayload::CompletedSessionResult, r.as_union_value())
+                    (
+                        fb::ServerResultPayload::CompletedSessionResult,
+                        r.as_union_value(),
+                    )
                 }
             };
 
@@ -304,7 +622,10 @@ pub fn build_server_message<'a>(
                     result: Some(res_offset),
                 },
             );
-            (fb::ServerMessagePayload::ResponsePayload, res_payload.as_union_value())
+            (
+                fb::ServerMessagePayload::ResponsePayload,
+                res_payload.as_union_value(),
+            )
         }
         ServerMessage::Error { id, error } => {
             let id_str = id.as_ref().map(|v| match v {
@@ -323,15 +644,26 @@ pub fn build_server_message<'a>(
                     message: Some(message),
                 },
             );
-            (fb::ServerMessagePayload::ErrorPayload, err_payload.as_union_value())
+            (
+                fb::ServerMessagePayload::ErrorPayload,
+                err_payload.as_union_value(),
+            )
         }
-        ServerMessage::Event { subscription_id, envelope } => {
+        ServerMessage::Event {
+            subscription_id,
+            envelope,
+        } => {
             let sub = builder.create_string(subscription_id.as_str());
 
             let (evt_type, evt_offset) = match &envelope.event {
-                SessionEvent::ResyncRequired { session_id, latest_event_seq, snapshot } => {
+                SessionEvent::ResyncRequired {
+                    session_id,
+                    latest_event_seq,
+                    snapshot,
+                } => {
                     let sid = builder.create_string(session_id.as_str());
-                    let snap = triage_core::flatbuffers_proto::build_session_snapshot(builder, snapshot);
+                    let snap =
+                        triage_core::flatbuffers_proto::build_session_snapshot(builder, snapshot);
                     let e = fb::ResyncRequiredEvent::create(
                         builder,
                         &fb::ResyncRequiredEventArgs {
@@ -340,9 +672,16 @@ pub fn build_server_message<'a>(
                             snapshot: Some(snap),
                         },
                     );
-                    (fb::SessionEventPayload::ResyncRequiredEvent, e.as_union_value())
+                    (
+                        fb::SessionEventPayload::ResyncRequiredEvent,
+                        e.as_union_value(),
+                    )
                 }
-                SessionEvent::Output { session_id, output_seq, bytes } => {
+                SessionEvent::Output {
+                    session_id,
+                    output_seq,
+                    bytes,
+                } => {
                     let sid = builder.create_string(session_id.as_str());
                     let bytes_vec = builder.create_vector(bytes);
                     let e = fb::OutputEvent::create(
@@ -355,9 +694,13 @@ pub fn build_server_message<'a>(
                     );
                     (fb::SessionEventPayload::OutputEvent, e.as_union_value())
                 }
-                SessionEvent::Snapshot { session_id, snapshot } => {
+                SessionEvent::Snapshot {
+                    session_id,
+                    snapshot,
+                } => {
                     let sid = builder.create_string(session_id.as_str());
-                    let snap = triage_core::flatbuffers_proto::build_session_snapshot(builder, snapshot);
+                    let snap =
+                        triage_core::flatbuffers_proto::build_session_snapshot(builder, snapshot);
                     let e = fb::SnapshotEvent::create(
                         builder,
                         &fb::SnapshotEventArgs {
@@ -377,11 +720,18 @@ pub fn build_server_message<'a>(
                             change: Some(chg),
                         },
                     );
-                    (fb::SessionEventPayload::LeaseChangedEvent, e.as_union_value())
+                    (
+                        fb::SessionEventPayload::LeaseChangedEvent,
+                        e.as_union_value(),
+                    )
                 }
-                SessionEvent::Exited { session_id, completed } => {
+                SessionEvent::Exited {
+                    session_id,
+                    completed,
+                } => {
                     let sid = builder.create_string(session_id.as_str());
-                    let comp = triage_core::flatbuffers_proto::build_completed_session(builder, completed);
+                    let comp =
+                        triage_core::flatbuffers_proto::build_completed_session(builder, completed);
                     let e = fb::ExitedEvent::create(
                         builder,
                         &fb::ExitedEventArgs {
@@ -402,7 +752,10 @@ pub fn build_server_message<'a>(
                     event: Some(evt_offset),
                 },
             );
-            (fb::ServerMessagePayload::EventPayload, evt_payload.as_union_value())
+            (
+                fb::ServerMessagePayload::EventPayload,
+                evt_payload.as_union_value(),
+            )
         }
         ServerMessage::SubscriptionClosed { subscription_id } => {
             let sub = builder.create_string(subscription_id.as_str());
@@ -412,7 +765,10 @@ pub fn build_server_message<'a>(
                     subscription_id: Some(sub),
                 },
             );
-            (fb::ServerMessagePayload::SubscriptionClosedPayload, sub_closed.as_union_value())
+            (
+                fb::ServerMessagePayload::SubscriptionClosedPayload,
+                sub_closed.as_union_value(),
+            )
         }
     };
 

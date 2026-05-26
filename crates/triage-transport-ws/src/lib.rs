@@ -150,7 +150,10 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
     }
 
     pub fn handle_binary_message(&mut self, message: &[u8]) -> Vec<u8> {
-        let response = match ::flatbuffers::root::<triage_core::generated::triage::generated::ClientMessage>(message) {
+        let response = match ::flatbuffers::root::<
+            triage_core::generated::triage::generated::ClientMessage,
+        >(message)
+        {
             Ok(fb_msg) => {
                 let parsed = flatbuffers_proto::parse_client_message(fb_msg);
                 self.handle_message(parsed)

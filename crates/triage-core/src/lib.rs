@@ -8,5 +8,3 @@ pub mod generated {
 }
 
 pub mod flatbuffers_proto;
-
-

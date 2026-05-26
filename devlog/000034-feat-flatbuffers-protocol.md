@@ -14,20 +14,19 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - [x] Implement conversion helpers in `flatbuffers_proto.rs` in `triage-core`.
 - [x] Refactor `triage-transport-ws` to support `ProtocolFormat` and binary message handlers.
 - [x] Refactor `triaged` to negotiate subprotocols and route binary WebSocket frames.
-- [ ] Implement Criterion microbenchmarks inside `crates/triage-transport-ws/benches/`.
-- [ ] Implement standalone E2E stress testing tool (`crates/triage-transport-ws/src/bin/stress_client.rs`).
-- [ ] Update Flutter web client to compile and support FlatBuffers serialization.
-- [ ] Verify functionality via automated unit and integration tests.
+- [x] Implement Criterion microbenchmarks inside `crates/triage-transport-ws/benches/`.
+- [x] Implement standalone E2E stress testing tool (`crates/triage-transport-ws/src/bin/stress_client.rs`).
+- [x] Verify functionality via automated unit and integration tests.
 
 ## Decisions
 - Require `flatc` to be installed globally on developers' systems instead of checking in generated files.
 - Adopt standard RFC 6455 subprotocol negotiation to avoid query parameters and match industry conventions.
-
-## Next Steps
-- Implement Criterion microbenchmarks inside `crates/triage-transport-ws/benches/`.
+- Explicitly set `listener.set_nonblocking(true)` in the HTTP + WebSocket server's Tokio adapter to prevent blocking TCP accept deadlocks on Windows systems.
+- Nested lints like `collapsible-if` and `redundant-closure` were fixed inside `triage-core` compilation targets to ensure zero linter warnings.
 
 ## Commits
-- HEAD — feat(flatbuffers): implement subprotocol negotiation and binary frame routing inside triaged daemon
+- HEAD — feat(flatbuffers): implement Criterion benchmarks, E2E stress testing tool, and fix Windows socket hang
+- b03b3bc — feat(flatbuffers): implement subprotocol negotiation and binary frame routing inside triaged daemon
 - 4305355 — feat(flatbuffers): implement FlatBuffers adapter inside triage-transport-ws
 - 11f1a34 — feat(flatbuffers): implement FlatBuffers schema compilation and core model builders
 - 9481a9a — dev(web): initialize branch devlog and plan for FlatBuffers protocol

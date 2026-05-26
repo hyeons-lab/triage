@@ -1,10 +1,10 @@
-use flatbuffers::FlatBufferBuilder;
 use crate::generated::triage::generated as fb;
 use crate::session::{
     AttachSessionResponse, CompletedSession, InputLeaseHolder, InputLeaseState, LeaseChange,
-    SessionContext, SessionSnapshot, SessionSize, StyledRow, StyledSpan, StyledRowsResponse,
+    SessionContext, SessionSize, SessionSnapshot, StyledRow, StyledRowsResponse, StyledSpan,
     TerminalColor, TerminalCursor, TerminalStyle,
 };
+use flatbuffers::FlatBufferBuilder;
 
 impl From<&SessionSize> for fb::SessionSize {
     fn from(s: &SessionSize) -> Self {
@@ -20,11 +20,7 @@ impl From<&SessionSize> for fb::SessionSize {
 
 impl From<&TerminalCursor> for fb::TerminalCursor {
     fn from(c: &TerminalCursor) -> Self {
-        fb::TerminalCursor::new(
-            c.row as u32,
-            c.col as u32,
-            c.visible,
-        )
+        fb::TerminalCursor::new(c.row as u32, c.col as u32, c.visible)
     }
 }
 
@@ -36,17 +32,15 @@ impl From<TerminalColor> for fb::TerminalColor {
 
 impl From<&TerminalStyle> for fb::TerminalStyle {
     fn from(s: &TerminalStyle) -> Self {
-        let fg = s.foreground.map(|c| fb::TerminalColor::from(c)).unwrap_or_else(|| fb::TerminalColor::new(0, 0, 0));
-        let bg = s.background.map(|c| fb::TerminalColor::from(c)).unwrap_or_else(|| fb::TerminalColor::new(0, 0, 0));
-        fb::TerminalStyle::new(
-            &fg,
-            &bg,
-            s.bold,
-            s.dim,
-            s.italic,
-            s.underline,
-            s.reverse,
-        )
+        let fg = s
+            .foreground
+            .map(fb::TerminalColor::from)
+            .unwrap_or_else(|| fb::TerminalColor::new(0, 0, 0));
+        let bg = s
+            .background
+            .map(fb::TerminalColor::from)
+            .unwrap_or_else(|| fb::TerminalColor::new(0, 0, 0));
+        fb::TerminalStyle::new(&fg, &bg, s.bold, s.dim, s.italic, s.underline, s.reverse)
     }
 }
 
@@ -86,8 +80,14 @@ pub fn build_session_context<'a>(
     builder: &mut FlatBufferBuilder<'a>,
     ctx: &SessionContext,
 ) -> flatbuffers::WIPOffset<fb::SessionContext<'a>> {
-    let repo = ctx.repository_root.as_ref().map(|p| builder.create_string(&p.to_string_lossy()));
-    let wt = ctx.worktree_root.as_ref().map(|p| builder.create_string(&p.to_string_lossy()));
+    let repo = ctx
+        .repository_root
+        .as_ref()
+        .map(|p| builder.create_string(&p.to_string_lossy()));
+    let wt = ctx
+        .worktree_root
+        .as_ref()
+        .map(|p| builder.create_string(&p.to_string_lossy()));
     let branch = ctx.branch.as_ref().map(|b| builder.create_string(b));
     fb::SessionContext::create(
         builder,
@@ -117,8 +117,14 @@ pub fn build_session_snapshot<'a>(
     let styled_vec = builder.create_vector(&styled);
 
     let cursor = fb::TerminalCursor::from(&snap.cursor);
-    let cwd = snap.current_working_directory.as_ref().map(|p| builder.create_string(&p.to_string_lossy()));
-    let context = snap.context.as_ref().map(|c| build_session_context(builder, c));
+    let cwd = snap
+        .current_working_directory
+        .as_ref()
+        .map(|p| builder.create_string(&p.to_string_lossy()));
+    let context = snap
+        .context
+        .as_ref()
+        .map(|c| build_session_context(builder, c));
 
     fb::SessionSnapshot::create(
         builder,
@@ -179,7 +185,10 @@ pub fn build_input_lease_state<'a>(
     builder: &mut FlatBufferBuilder<'a>,
     state: &InputLeaseState,
 ) -> flatbuffers::WIPOffset<fb::InputLeaseState<'a>> {
-    let holder = state.holder.as_ref().map(|h| build_input_lease_holder(builder, h));
+    let holder = state
+        .holder
+        .as_ref()
+        .map(|h| build_input_lease_holder(builder, h));
     fb::InputLeaseState::create(
         builder,
         &fb::InputLeaseStateArgs {
@@ -193,8 +202,14 @@ pub fn build_lease_change<'a>(
     builder: &mut FlatBufferBuilder<'a>,
     change: &LeaseChange,
 ) -> flatbuffers::WIPOffset<fb::LeaseChange<'a>> {
-    let prev = change.previous.as_ref().map(|h| build_input_lease_holder(builder, h));
-    let cur = change.current.as_ref().map(|h| build_input_lease_holder(builder, h));
+    let prev = change
+        .previous
+        .as_ref()
+        .map(|h| build_input_lease_holder(builder, h));
+    let cur = change
+        .current
+        .as_ref()
+        .map(|h| build_input_lease_holder(builder, h));
     let action = match change.action {
         crate::session::LeaseChangeAction::Acquired => fb::LeaseChangeAction::Acquired,
         crate::session::LeaseChangeAction::Released => fb::LeaseChangeAction::Released,

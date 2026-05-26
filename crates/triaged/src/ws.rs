@@ -25,6 +25,7 @@ pub fn start_websocket_server(
         .context("building Tokio runtime for multiplexed HTTP server")?;
 
     rt.block_on(async {
+        listener.set_nonblocking(true).context("setting socket to non-blocking")?;
         let listener = TcpListener::from_std(listener)
             .context("converting std TcpListener to Tokio TcpListener")?;
         let bind_addr = listener.local_addr().ok();
@@ -33,13 +34,20 @@ pub fn start_websocket_server(
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    tracing::info!(client_addr = %addr, "Accepted TCP connection");
                     let manager = Arc::clone(&manager);
                     let cache = Arc::clone(&cache);
                     tokio::spawn(async move {
+                        tracing::info!(client_addr = %addr, "Spawning HTTP/WebSocket handler");
                         let io = TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
                             let cache = Arc::clone(&cache);
                             let manager = Arc::clone(&manager);
+                            tracing::info!(
+                                method = %req.method(),
+                                path = %req.uri().path(),
+                                "Received HTTP request"
+                            );
                             crate::http::serve_http(req, cache, manager)
                         });
 
@@ -48,7 +56,6 @@ pub fn start_websocket_server(
                             .with_upgrades()
                             .await
                         {
-                            // A connection drop or reset is normal and should not clutter logs at WARN/ERROR.
                             tracing::debug!(error = ?error, client_addr = %addr, "HTTP/WebSocket connection finished or closed");
                         }
                     });

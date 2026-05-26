@@ -333,7 +333,9 @@ where
                     None,
                 )
                 .await;
-                if let Err(error) = crate::ws::handle_upgraded_ws(manager, ws_stream, selected_format).await {
+                if let Err(error) =
+                    crate::ws::handle_upgraded_ws(manager, ws_stream, selected_format).await
+                {
                     tracing::warn!(error = ?error, "Upgraded WebSocket connection failed");
                 }
             }
