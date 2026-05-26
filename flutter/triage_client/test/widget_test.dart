@@ -10,10 +10,13 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   FakeTriageWebSocketClient({
     this.shouldFailConnection = false,
     this.failConnectAttempts = 0,
-  }) : super(Uri.parse('ws://localhost:8080/ws'));
+    Set<String>? exitedSessionIds,
+  }) : exitedSessionIds = {...?exitedSessionIds},
+       super(Uri.parse('ws://localhost:8080/ws'));
 
   final bool shouldFailConnection;
   int failConnectAttempts;
+  final Set<String> exitedSessionIds;
 
   final StreamController<Map<String, dynamic>> _testEventController =
       StreamController<Map<String, dynamic>>.broadcast(sync: true);
@@ -29,7 +32,13 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> startSessionCalls = [];
   final List<String> writeInputCalls = [];
   final List<String> attachSessionCalls = [];
+  final List<String> restoreSessionCalls = [];
+  final Map<String, String> restoreSessionSizes = {};
   final List<String> helloClientIds = [];
+  final List<String> snapshotSessionCalls = [];
+  final Map<String, List<String>> snapshotVisibleRows = {};
+  final Map<String, Completer<Map<String, dynamic>>> snapshotCompleters = {};
+  final Map<String, List<dynamic>> snapshotStyledRowsMap = {};
 
   @override
   Future<void> connect() async {
@@ -62,12 +71,56 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String mode = 'InteractiveController',
   }) async {
     attachSessionCalls.add(sessionId);
+    final completer = snapshotCompleters[sessionId];
+    if (completer != null) {
+      final snapRes = await completer.future;
+      return {
+        'response': {
+          'snapshot': snapRes['snapshot'],
+        },
+      };
+    }
+    final visibleRows = snapshotVisibleRows[sessionId];
+    if (visibleRows != null) {
+      return {
+        'response': {
+          'snapshot': {
+            'size': {'rows': 24, 'cols': 80},
+            'exited': exitedSessionIds.contains(sessionId),
+            'visible_rows': visibleRows,
+            'styled_rows': visibleRows
+                .map(
+                  (row) => {
+                    'spans': [
+                      {
+                        'text': row,
+                        'style': {
+                          'foreground': null,
+                          'background': null,
+                          'bold': false,
+                          'dim': false,
+                          'italic': false,
+                          'underline': false,
+                          'reverse': false,
+                        },
+                      },
+                    ],
+                  },
+                )
+                .toList(),
+            'cursor': {'row': visibleRows.length - 1, 'col': 0},
+          },
+        },
+      };
+    }
     return {
       'response': {
         'snapshot': {
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
           },
+          'size': {'rows': 24, 'cols': 80},
+          'exited': exitedSessionIds.contains(sessionId),
           'styled_rows': [
             {
               'spans': [
@@ -103,6 +156,65 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
             },
           ],
         },
+      },
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> snapshotSession({
+    required String sessionId,
+  }) async {
+    snapshotSessionCalls.add(sessionId);
+    final completer = snapshotCompleters[sessionId];
+    if (completer != null) {
+      return completer.future;
+    }
+    final visibleRows = snapshotVisibleRows[sessionId];
+    return {
+      'snapshot': {
+        'size': {'rows': 24, 'cols': 80},
+        'exited': exitedSessionIds.contains(sessionId),
+        if (visibleRows != null) ...{
+          'visible_rows': visibleRows,
+          'styled_rows': visibleRows
+              .map(
+                (row) => {
+                  'spans': [
+                    {
+                      'text': row,
+                      'style': {
+                        'foreground': null,
+                        'background': null,
+                        'bold': false,
+                        'dim': false,
+                        'italic': false,
+                        'underline': false,
+                        'reverse': false,
+                      },
+                    },
+                  ],
+                },
+              )
+              .toList(),
+          'cursor': {'row': visibleRows.length - 1, 'col': 0},
+        },
+      },
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> restoreSession({
+    required String sessionId,
+    required int cols,
+    required int rows,
+  }) async {
+    restoreSessionCalls.add(sessionId);
+    restoreSessionSizes[sessionId] = '${cols}x${rows}';
+    exitedSessionIds.remove(sessionId);
+    return {
+      'snapshot': {
+        'size': {'rows': rows, 'cols': cols},
+        'exited': false,
       },
     };
   }
@@ -149,6 +261,18 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     return {};
   }
 
+  @override
+  Future<Map<String, dynamic>> styledRows({
+    required String sessionId,
+    required int start,
+    required int end,
+  }) async {
+    final rows = snapshotStyledRowsMap[sessionId] ?? <dynamic>[];
+    return {
+      'response': {'rows': rows},
+    };
+  }
+
   final List<String> shutdownSessionCalls = [];
 
   @override
@@ -172,6 +296,53 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       'envelope': {
         'event': {
           'Exited': {'session_id': sessionId},
+        },
+      },
+    });
+  }
+
+  void emitSnapshot(
+    String sessionId,
+    List<String> visibleRows, {
+    List<String>? styledRows,
+  }) {
+    final snapshotStyledRows = styledRows ?? visibleRows;
+    final mappedRows = snapshotStyledRows
+        .map(
+          (row) => {
+            'spans': [
+              {
+                'text': row,
+                'style': {
+                  'foreground': null,
+                  'background': null,
+                  'bold': false,
+                  'dim': false,
+                  'italic': false,
+                  'underline': false,
+                  'reverse': false,
+                },
+              },
+            ],
+          },
+        )
+        .toList();
+    snapshotStyledRowsMap[sessionId] = mappedRows;
+
+    _testEventController.add({
+      'type': 'event',
+      'envelope': {
+        'event': {
+          'Snapshot': {
+            'session_id': sessionId,
+            'snapshot': {
+              'output_seq': 42,
+              'exited': false,
+              'visible_rows': visibleRows,
+              'styled_rows': mappedRows,
+              'cursor': {'row': visibleRows.length - 1, 'col': 0},
+            },
+          },
         },
       },
     });
@@ -209,6 +380,158 @@ void main() {
 
     expect(client.writeInputCalls.contains('main'), isTrue);
   });
+
+  testWidgets('restores historical daemon sessions before attaching input', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(
+      exitedSessionIds: {'flutter-spike'},
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(client.restoreSessionCalls, contains('flutter-spike'));
+    expect(find.text('attached'), findsWidgets);
+
+    final terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+    terminalPane.controller.sendInput('pwd');
+    await tester.pumpAndSettle();
+
+    expect(client.writeInputCalls.contains('flutter-spike'), isTrue);
+  });
+
+  testWidgets('restores historical sessions using authentic saved size when available', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(client.restoreSessionCalls, contains('main'));
+    expect(client.restoreSessionSizes['main'], '80x24');
+  });
+
+  testWidgets('restores historical sessions using estimated viewport size when saved size is absent', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
+    client.snapshotCompleters['main'] = Completer<Map<String, dynamic>>()..complete({
+      'snapshot': {
+        'context': {'branch': 'main'},
+        'exited': true,
+        'size': null,
+      }
+    });
+
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(client.restoreSessionCalls, contains('main'));
+    expect(client.restoreSessionSizes['main'], '94x40');
+  });
+
+  testWidgets('applies daemon snapshot events to replace restored rows', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('line 1 from flutter-spike'), findsOneWidget);
+
+    client.emitSnapshot(
+      'flutter-spike',
+      ['stale full-screen row', 'wide restored row'],
+      styledRows: ['wide restored row'],
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('wide restored row'), findsOneWidget);
+    expect(find.text('stale full-screen row'), findsNothing);
+    expect(find.text('line 1 from flutter-spike'), findsOneWidget);
+  });
+
+  testWidgets('refreshes selected remote session from daemon snapshot', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    client.snapshotVisibleRows['flutter-spike'] = ['refreshed flutter-spike'];
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('triage / main'));
+    await tester.pumpAndSettle();
+    client.snapshotVisibleRows['flutter-spike'] = ['fresh after switch back'];
+
+    await tester.tap(find.text('triage / flutter-spike').first);
+    await tester.pumpAndSettle();
+
+    expect(client.snapshotSessionCalls, contains('flutter-spike'));
+    expect(find.text('fresh after switch back'), findsOneWidget);
+    expect(find.text('line 1 from flutter-spike'), findsNothing);
+  });
+
+  testWidgets(
+    'marks replay pending while selected session snapshot refreshes',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final completer = Completer<Map<String, dynamic>>();
+      client.snapshotCompleters['main'] = completer;
+      await tester.tap(find.text('triage / main'));
+      await tester.pump();
+
+      var terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+      expect(terminalPane.replayPending, isTrue);
+
+      completer.complete({
+        'snapshot': {
+          'size': {'rows': 24, 'cols': 80},
+          'exited': false,
+          'visible_rows': ['main refreshed'],
+          'styled_rows': [
+            {
+              'spans': [
+                {
+                  'text': 'main refreshed',
+                  'style': {
+                    'foreground': null,
+                    'background': null,
+                    'bold': false,
+                    'dim': false,
+                    'italic': false,
+                    'underline': false,
+                    'reverse': false,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      });
+      await tester.pumpAndSettle();
+
+      terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+      expect(terminalPane.replayPending, isFalse);
+      expect(find.text('main refreshed'), findsOneWidget);
+    },
+  );
 
   testWidgets('creates a scratch session over WebSocket', (
     WidgetTester tester,

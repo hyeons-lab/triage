@@ -100,5 +100,43 @@ class TerminalController {
   }
 }
 
+class TerminalSessionInputRouter {
+  final Map<String, _TerminalSessionRoute> _routes = {};
+
+  bool hasRoute(String sessionId) => _routes.containsKey(sessionId);
+
+  Object bind(String sessionId, TerminalController controller) {
+    final token = Object();
+    _routes[sessionId] = _TerminalSessionRoute(controller, token);
+    return token;
+  }
+
+  void unbind(String sessionId, Object token) {
+    final route = _routes[sessionId];
+    if (route != null && identical(route.token, token)) {
+      _routes.remove(sessionId);
+    }
+  }
+
+  void remove(String sessionId) {
+    _routes.remove(sessionId);
+  }
+
+  void sendInput(String sessionId, String data) {
+    _routes[sessionId]?.controller.sendInput(data);
+  }
+
+  void sendResizeOut(String sessionId, int cols, int rows) {
+    _routes[sessionId]?.controller.sendResizeOut(cols, rows);
+  }
+}
+
+class _TerminalSessionRoute {
+  _TerminalSessionRoute(this.controller, this.token);
+
+  final TerminalController controller;
+  final Object token;
+}
+
 // Re-export the platform-specific implementation of TerminalPane
 typedef TerminalPane = impl.TerminalPane;

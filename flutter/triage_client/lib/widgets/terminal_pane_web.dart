@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'terminal_pane.dart';
+import 'terminal_replay.dart';
 
 class TerminalPane extends StatefulWidget {
   const TerminalPane({
@@ -15,22 +16,25 @@ class TerminalPane extends StatefulWidget {
     required this.terminalId,
     required this.controller,
     required this.fallbackRows,
+    this.initialCursorRow,
+    this.initialCursorCol,
+    this.isExited = false,
+    this.replayRevision = 0,
+    this.replayPending = false,
   });
 
   final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
+  final int? initialCursorRow;
+  final int? initialCursorCol;
+  final bool isExited;
+  final int replayRevision;
+  final bool replayPending;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
-    _TerminalPaneState._sessionContainers.remove(sanitizedId);
-    final term = _TerminalPaneState._sessionTerms.remove(sanitizedId);
-    if (term != null) {
-      try {
-        js_util.callMethod(term, 'dispose', []);
-      } catch (_) {}
-    }
-    _TerminalPaneState._sessionFitAddons.remove(sanitizedId);
+    _TerminalPaneState._discardCachedSession(sanitizedId);
   }
 
   @override
@@ -41,9 +45,42 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, html.Element> _sessionContainers = {};
   static final Map<String, dynamic> _sessionTerms = {};
   static final Map<String, dynamic> _sessionFitAddons = {};
+  static final Map<String, dynamic> _sessionOnDataSubscriptions = {};
+  static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
+  static final TerminalSessionInputRouter _sessionInputRouter =
+      TerminalSessionInputRouter();
   static final Set<String> _registeredViewTypes = {};
 
+  static void _discardCachedSession(String sanitizedId) {
+    _TerminalPaneState._sessionContainers.remove(sanitizedId);
+    final term = _TerminalPaneState._sessionTerms.remove(sanitizedId);
+    if (term != null) {
+      try {
+        js_util.callMethod(term, 'dispose', []);
+      } catch (_) {}
+    }
+    _TerminalPaneState._sessionFitAddons.remove(sanitizedId);
+    _TerminalPaneState._sessionInputRouter.remove(sanitizedId);
+    final onData = _TerminalPaneState._sessionOnDataSubscriptions.remove(
+      sanitizedId,
+    );
+    if (onData != null) {
+      try {
+        js_util.callMethod(onData, 'dispose', []);
+      } catch (_) {}
+    }
+    final onResize = _TerminalPaneState._sessionOnResizeSubscriptions.remove(
+      sanitizedId,
+    );
+    if (onResize != null) {
+      try {
+        js_util.callMethod(onResize, 'dispose', []);
+      } catch (_) {}
+    }
+  }
+
   late final String _viewType;
+  late final String _sanitizedId;
   late final html.DivElement _container;
   late final html.DivElement _terminalWrapper;
   late final dynamic _term;
@@ -51,16 +88,29 @@ class _TerminalPaneState extends State<TerminalPane> {
   dynamic _onDataSubscription;
   dynamic _onResizeSubscription;
   dynamic _resizeObserver;
+  late Object _inputRouteToken;
   late final FocusNode _focusNode;
   late final void Function(html.Event) _windowKeyDownListener;
   late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
   late final StreamSubscription<html.KeyboardEvent>
-      _containerKeyDownSubscription;
+  _containerKeyDownSubscription;
   late final void Function(html.Event) _containerPasteListener;
   bool _initialized = false;
+  bool _initialContentWritten = false;
+  bool _styleSheetLoaded = false;
+  final List<String> _pendingLiveWriteBuffer = [];
 
   double? _lastWidth;
   double? _lastHeight;
+  bool _liveOutputReceived = false;
+  int? _lastFittedRows;
+  int? _lastFittedCols;
+  int _replaySuppressGeneration = 0;
+  bool _suppressInput = false;
+  Timer? _resizeDebounceTimer;
+  double? _stableWidth;
+  double? _stableHeight;
+  Timer? _stabilityTimer;
 
   @override
   void initState() {
@@ -70,76 +120,92 @@ class _TerminalPaneState extends State<TerminalPane> {
       RegExp(r'[^a-zA-Z0-9-]'),
       '_',
     );
+    _sanitizedId = sanitizedId;
     _viewType = 'xterm-view-$sanitizedId';
 
-    final cachedContainer = _sessionContainers[sanitizedId];
-    final cachedTerm = _sessionTerms[sanitizedId];
-    final cachedFitAddon = _sessionFitAddons[sanitizedId];
-    if (cachedContainer != null &&
-        cachedTerm != null &&
-        cachedFitAddon != null &&
-        cachedContainer.children.isNotEmpty) {
-      _container = cachedContainer as html.DivElement;
-      _terminalWrapper = _container.children.first as html.DivElement;
-      _term = cachedTerm;
-      _fitAddon = cachedFitAddon;
-      _initialized = true;
-      _bindController();
-      _bindTerminalSubscriptions();
+    _discardCachedSession(sanitizedId);
+    _container = html.DivElement()
+      ..style.width = '100%'
+      ..style.height = '100%'
+      ..style.backgroundColor = '#0d1113'
+      ..style.overflow = 'hidden';
 
-      Future.delayed(const Duration(milliseconds: 50), _onFit);
-      Future.delayed(const Duration(milliseconds: 200), _onFit);
-      Future.delayed(const Duration(milliseconds: 600), _onFit);
-      Future.delayed(const Duration(milliseconds: 1500), _onFit);
-    } else {
-      // Clear any partial/stale cache entry
-      _sessionContainers.remove(sanitizedId);
-      _sessionTerms.remove(sanitizedId);
-      _sessionFitAddons.remove(sanitizedId);
-      _container = html.DivElement()
-        ..style.width = '100%'
-        ..style.height = '100%'
-        ..style.backgroundColor = '#0d1113'
-        ..style.overflow = 'hidden';
+    // Inject xterm.css directly inside the container so it penetrates the Flutter Web platform view Shadow DOM
+    final link = html.LinkElement()
+      ..rel = 'stylesheet'
+      ..href = 'xterm.css';
+    link.onLoad.listen((_) {
+      if (mounted) {
+        // Wait for the browser to parse CSS and apply font styles to the Shadow DOM
+        Timer(const Duration(milliseconds: 150), () {
+          if (mounted) {
+            _styleSheetLoaded = true;
+            try {
+              _resetTerminalSafe();
+              _initialContentWritten = false;
+              _stableWidth = null;
+              _stableHeight = null;
+              _liveOutputReceived = false;
+              _triggerFitWithDelayedRetries();
+            } catch (_) {}
+          }
+        });
+      }
+    });
+    _container.append(link);
 
-      _terminalWrapper = html.DivElement()
-        ..style.width = 'calc(100% - 32px)'
-        ..style.height = '100%'
-        ..style.marginLeft = '16px'
-        ..style.marginRight = '16px'
-        ..style.overflow = 'hidden';
+    // Safety fallback in case stylesheet onLoad fails or is slow
+    Timer(const Duration(milliseconds: 600), () {
+      if (mounted && !_styleSheetLoaded) {
+        _styleSheetLoaded = true;
+        if (_initialized) {
+          try {
+            _resetTerminalSafe();
+            _initialContentWritten = false;
+            _stableWidth = null;
+            _stableHeight = null;
+            _liveOutputReceived = false;
+            _triggerFitWithDelayedRetries();
+          } catch (_) {}
+        }
+      }
+    });
 
-      _container.append(_terminalWrapper);
-      _sessionContainers[sanitizedId] = _container;
+    _terminalWrapper = html.DivElement()
+      ..style.width = 'calc(100% - 32px)'
+      ..style.height = '100%'
+      ..style.marginLeft = '16px'
+      ..style.marginRight = '16px'
+      ..style.overflow = 'hidden';
 
-      _initTerminal(sanitizedId);
-    }
+    _container.append(_terminalWrapper);
+    _sessionContainers[sanitizedId] = _container;
+
+    _initTerminal(sanitizedId);
     _bindContainerEvents();
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
-        final activeEl = html.document.activeElement;
-        final path =
-            js_util.callMethod(event, 'composedPath', []) as List<dynamic>?;
-        final activeElementInTerminal =
-            activeEl != null && _container.contains(activeEl);
-        final eventPathInTerminal =
-            path != null && path.any((node) => identical(node, _container));
-        final shouldHandleTerminalKey =
-            activeElementInTerminal ||
-            eventPathInTerminal ||
-            _focusNode.hasFocus;
-        if (shouldHandleTerminalKey) {
+        if (!widget.isExited) {
           if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
             event.preventDefault();
             event.stopPropagation();
             if (event.shiftKey) {
-              widget.controller.sendInput('\x1B[Z');
+              _sendInput('\x1B[Z');
             } else {
-              widget.controller.sendInput('\t');
+              _sendInput('\t');
             }
           } else if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
-            var selection = html.window.getSelection()?.toString() ?? '';
+            var selection = '';
+            final selectionObj = html.window.getSelection();
+            if (selectionObj != null) {
+              try {
+                selection = js_util.callMethod(selectionObj, 'toString', []) as String? ?? '';
+              } catch (_) {}
+            }
+            if (selection == 'Instance of \'Selection\'') {
+              selection = '';
+            }
             if (selection.isEmpty) {
               try {
                 selection =
@@ -161,16 +227,16 @@ class _TerminalPaneState extends State<TerminalPane> {
                 ?.readText()
                 .then((text) {
                   if (text.isNotEmpty) {
-                    widget.controller.sendInput(text);
+                    _sendInput(text);
                   }
                 })
                 .catchError((_) {});
-          } else if (!activeElementInTerminal) {
+          } else {
             final input = _keyboardEventToInput(event);
             if (input != null) {
               event.preventDefault();
               event.stopPropagation();
-              widget.controller.sendInput(input);
+              _sendInput(input);
             }
           }
         }
@@ -187,13 +253,49 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  void _sendInput(String data) {
+    _sessionInputRouter.sendInput(_sanitizedId, data);
+    if (_initialized && !widget.isExited) {
+      try {
+        _focusNode.requestFocus();
+        js_util.callMethod(_term, 'focus', []);
+      } catch (_) {}
+    }
+  }
+
+  void _activateTerminal() {
+    if (!_initialized) return;
+    _focusNode.requestFocus();
+    try {
+      js_util.callMethod(_term, 'focus', []);
+    } catch (_) {}
+    Future.delayed(const Duration(milliseconds: 0), () {
+      if (!mounted) return;
+      _focusNode.requestFocus();
+      try {
+        js_util.callMethod(_term, 'focus', []);
+      } catch (_) {}
+    });
+    Future.delayed(const Duration(milliseconds: 75), () {
+      if (!mounted) return;
+      _focusNode.requestFocus();
+      try {
+        js_util.callMethod(_term, 'focus', []);
+      } catch (_) {}
+    });
+  }
+
   void _initTerminal(String sanitizedId) {
     try {
       final options = js_util.newObject();
       final theme = js_util.newObject();
       js_util.setProperty(theme, 'background', '#0d1113');
       js_util.setProperty(theme, 'foreground', '#d9e5e3');
-      js_util.setProperty(theme, 'cursor', '#7fd1c7');
+      if (widget.isExited) {
+        js_util.setProperty(theme, 'cursor', 'transparent');
+      } else {
+        js_util.setProperty(theme, 'cursor', '#7fd1c7');
+      }
 
       js_util.setProperty(theme, 'black', '#1f2b30');
       js_util.setProperty(theme, 'red', '#f2777a');
@@ -219,12 +321,15 @@ class _TerminalPaneState extends State<TerminalPane> {
         'Consolas, Courier New, monospace',
       );
       js_util.setProperty(options, 'fontSize', 15);
-      js_util.setProperty(options, 'cursorBlink', true);
+      js_util.setProperty(options, 'cursorStyle', 'block');
+      js_util.setProperty(options, 'cursorInactiveStyle', 'block');
+      js_util.setProperty(options, 'cursorBlink', !widget.isExited);
       js_util.setProperty(options, 'convertEol', true);
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
       _sessionTerms[sanitizedId] = _term;
+      js_util.setProperty(html.window, 'activeTerm', _term);
 
       js_util.callMethod(_term, 'open', [_terminalWrapper]);
 
@@ -239,19 +344,14 @@ class _TerminalPaneState extends State<TerminalPane> {
 
       _bindTerminalSubscriptions();
 
-      _writeInitialContent();
-
       _initialized = true;
       _bindController();
 
       try {
-        js_util.callMethod(_term, 'focus', []);
+        _activateTerminal();
       } catch (_) {}
 
-      Future.delayed(const Duration(milliseconds: 50), _onFit);
-      Future.delayed(const Duration(milliseconds: 200), _onFit);
-      Future.delayed(const Duration(milliseconds: 600), _onFit);
-      Future.delayed(const Duration(milliseconds: 1500), _onFit);
+      _triggerFitWithDelayedRetries();
 
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
@@ -269,15 +369,100 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  StyledRow _clipRowToCols(StyledRow row, int cols) {
+    if (cols <= 0 || row.spans.isEmpty) return row;
+    final clippedSpans = <StyledSpan>[];
+    var used = 0;
+    for (final span in row.spans) {
+      if (used >= cols) break;
+      final remaining = cols - used;
+      if (span.text.length <= remaining) {
+        clippedSpans.add(span);
+        used += span.text.length;
+      } else {
+        clippedSpans.add(
+          StyledSpan(
+            text: span.text.substring(0, remaining),
+            style: span.style,
+          ),
+        );
+        break;
+      }
+    }
+    return StyledRow(spans: clippedSpans);
+  }
+
   void _writeInitialContent() {
+    if (widget.replayPending) {
+      return;
+    }
+    final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
+    final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
+    final fittedRows = fittedRowsNum.toInt();
+    final fittedCols = fittedColsNum.toInt();
+    final cursor = computeReplayCursorPlacement(
+      fallbackRows: widget.fallbackRows,
+      fittedRows: fittedRows,
+      initialCursorRow: widget.initialCursorRow,
+      initialCursorCol: widget.initialCursorCol,
+    );
+
     final sb = StringBuffer();
-    for (var i = 0; i < widget.fallbackRows.length; i++) {
-      sb.write(_styledRowToAnsi(widget.fallbackRows[i]));
-      if (i < widget.fallbackRows.length - 1) {
+    if (widget.isExited) {
+      sb.write('\x1b[?25l');
+    } else {
+      sb.write('\x1b[?25h');
+    }
+    // Write historical rows first to fill the scrollback buffer
+    for (var i = 0; i < cursor.startRow; i++) {
+      final trimmedRow = _clipRowToCols(
+        trimReplayTrailingWhitespace(widget.fallbackRows[i]),
+        fittedCols,
+      );
+      sb.write(_styledRowToAnsi(trimmedRow));
+      sb.write('\r\n');
+    }
+    // Write the active viewport rows
+    for (var i = cursor.startRow; i < cursor.endRow; i++) {
+      final trimmedRow = _clipRowToCols(
+        trimReplayTrailingWhitespace(widget.fallbackRows[i]),
+        fittedCols,
+      );
+      sb.write(_styledRowToAnsi(trimmedRow));
+      if (i < cursor.endRow - 1) {
         sb.write('\r\n');
       }
     }
-    js_util.callMethod(_term, 'write', [sb.toString()]);
+
+    sb.write('\x1B[${cursor.terminalRow};${cursor.terminalCol}H');
+    _writeReplayContent(sb.toString());
+  }
+
+  void _writeReplayContent(String data) {
+    final generation = ++_replaySuppressGeneration;
+    _suppressInput = true;
+
+    // Safety timeout to ensure key input is never permanently blocked
+    Timer(const Duration(milliseconds: 150), () {
+      if (mounted && _replaySuppressGeneration == generation) {
+        _suppressInput = false;
+      }
+    });
+
+    final complete = js_util.allowInterop(() {
+      Timer(const Duration(milliseconds: 50), () {
+        if (mounted && _replaySuppressGeneration == generation) {
+          _suppressInput = false;
+        }
+      });
+    });
+    try {
+      js_util.callMethod(_term, 'write', [data, complete]);
+    } catch (_) {
+      if (_replaySuppressGeneration == generation) {
+        _suppressInput = false;
+      }
+    }
   }
 
   String _styledSpanToAnsi(StyledSpan span) {
@@ -309,31 +494,59 @@ class _TerminalPaneState extends State<TerminalPane> {
     return sb.toString();
   }
 
-  void _bindTerminalSubscriptions() {
-    final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-      if (mounted) {
-        widget.controller.sendInput(data);
-      }
-    });
-    _onDataSubscription = js_util.callMethod(_term, 'onData', [
-      onDataCallback,
-    ]);
+  void _resetTerminalSafe() {
+    if (!_initialized) return;
+    try {
+      js_util.callMethod(_term, 'clear', []);
+      js_util.callMethod(_term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
+    } catch (_) {}
+  }
 
-    final onResizeCallback = js_util.allowInterop((dynamic size, [dynamic _]) {
-      if (mounted) {
-        final cols = js_util.getProperty(size, 'cols') as int;
-        final rows = js_util.getProperty(size, 'rows') as int;
-        widget.controller.sendResizeOut(cols, rows);
-      }
-    });
-    _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
-      onResizeCallback,
-    ]);
+  void _bindTerminalSubscriptions() {
+    _inputRouteToken = _sessionInputRouter.bind(
+      _sanitizedId,
+      widget.controller,
+    );
+
+    _onDataSubscription = _sessionOnDataSubscriptions[_sanitizedId];
+    if (_onDataSubscription == null) {
+      final sessionId = _sanitizedId;
+      final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+        if (_suppressInput) {
+          return;
+        }
+        _sessionInputRouter.sendInput(sessionId, data);
+      });
+      _onDataSubscription = js_util.callMethod(_term, 'onData', [
+        onDataCallback,
+      ]);
+      _sessionOnDataSubscriptions[_sanitizedId] = _onDataSubscription;
+    }
+
+    _onResizeSubscription = _sessionOnResizeSubscriptions[_sanitizedId];
+    if (_onResizeSubscription == null) {
+      final onResizeCallback = js_util.allowInterop((
+        dynamic size, [
+        dynamic _,
+      ]) {
+        if (!_initialContentWritten) {
+          return;
+        }
+        final colsNum = js_util.getProperty(size, 'cols') as num;
+        final rowsNum = js_util.getProperty(size, 'rows') as num;
+        final cols = colsNum.toInt();
+        final rows = rowsNum.toInt();
+        _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
+      });
+      _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
+        onResizeCallback,
+      ]);
+      _sessionOnResizeSubscriptions[_sanitizedId] = _onResizeSubscription;
+    }
 
     try {
       js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
         js_util.allowInterop((dynamic event) {
-          if (!mounted) return true;
           final key = js_util.getProperty(event, 'key') as String?;
           if (key == 'Tab') {
             js_util.callMethod(event, 'preventDefault', []);
@@ -341,9 +554,9 @@ class _TerminalPaneState extends State<TerminalPane> {
             final shiftKey =
                 js_util.getProperty(event, 'shiftKey') as bool? ?? false;
             if (shiftKey) {
-              widget.controller.sendInput('\x1B[Z');
+              _sessionInputRouter.sendInput(_sanitizedId, '\x1B[Z');
             } else {
-              widget.controller.sendInput('\t');
+              _sessionInputRouter.sendInput(_sanitizedId, '\t');
             }
             return false;
           }
@@ -353,17 +566,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {}
 
     try {
-      final resizeObserverConstructor =
-          js_util.getProperty(html.window, 'ResizeObserver');
+      final resizeObserverConstructor = js_util.getProperty(
+        html.window,
+        'ResizeObserver',
+      );
       if (resizeObserverConstructor != null) {
-        final callback =
-            js_util.allowInterop((dynamic entries, dynamic observer) {
+        final callback = js_util.allowInterop((
+          dynamic entries,
+          dynamic observer,
+        ) {
           if (mounted) {
             _onFit();
           }
         });
-        _resizeObserver =
-            js_util.callConstructor(resizeObserverConstructor, [callback]);
+        _resizeObserver = js_util.callConstructor(resizeObserverConstructor, [
+          callback,
+        ]);
         js_util.callMethod(_resizeObserver, 'observe', [_terminalWrapper]);
       }
     } catch (_) {}
@@ -388,8 +606,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _focusNode.requestFocus();
       if (_initialized) {
         try {
-          js_util.callMethod(_term, 'focus', []);
-          _onFit();
+          _activateTerminal();
+          _triggerFitWithDelayedRetries();
         } catch (_) {}
       }
     });
@@ -407,7 +625,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         final clipboardData = event.clipboardData;
         final text = clipboardData?.getData('text/plain') ?? '';
         if (text.isNotEmpty) {
-          widget.controller.sendInput(text);
+          _sendInput(text);
         }
       }
     };
@@ -416,7 +634,12 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _onWrite(String data) {
     if (!_initialized) return;
-    js_util.callMethod(_term, 'write', [data]);
+    if (!_initialContentWritten) {
+      _pendingLiveWriteBuffer.add(data);
+    } else {
+      _liveOutputReceived = true;
+      js_util.callMethod(_term, 'write', [data]);
+    }
   }
 
   void _onClear() {
@@ -436,8 +659,89 @@ class _TerminalPaneState extends State<TerminalPane> {
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
         js_util.callMethod(_fitAddon, 'fit', []);
+        _activateTerminal();
+        final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
+        final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
+        final fittedRows = fittedRowsNum.toInt();
+        final fittedCols = fittedColsNum.toInt();
+
+        if (fittedRows >= 5 && fittedCols >= 10) {
+          final sizeChanged =
+              _lastFittedRows != fittedRows || _lastFittedCols != fittedCols;
+          _lastFittedRows = fittedRows;
+          _lastFittedCols = fittedCols;
+          if (sizeChanged && _initialContentWritten) {
+            _resizeDebounceTimer?.cancel();
+            _resizeDebounceTimer = Timer(const Duration(milliseconds: 100), () {
+              if (mounted) {
+                _sessionInputRouter.sendResizeOut(
+                  _sanitizedId,
+                  fittedCols,
+                  fittedRows,
+                );
+              }
+            });
+          }
+
+          if (!_initialContentWritten) {
+            if (widget.replayPending) {
+              return;
+            }
+            if (!_styleSheetLoaded) {
+              return;
+            }
+            if (fittedCols < 35) {
+              // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
+              return;
+            }
+            final dWidth = width.toDouble();
+            final dHeight = height.toDouble();
+            if (_stableWidth != dWidth || _stableHeight != dHeight) {
+              _stableWidth = dWidth;
+              _stableHeight = dHeight;
+              _stabilityTimer?.cancel();
+              _stabilityTimer = Timer(const Duration(milliseconds: 250), () {
+                if (mounted && !_initialContentWritten && !widget.replayPending) {
+                  _initialContentWritten = true;
+                  _writeInitialContent();
+                  _pendingLiveWriteBuffer.clear();
+                  _sessionInputRouter.sendResizeOut(
+                    _sanitizedId,
+                    fittedCols,
+                    fittedRows,
+                  );
+                }
+              });
+              return;
+            }
+            if (_stabilityTimer == null || !_stabilityTimer!.isActive) {
+              _initialContentWritten = true;
+              _writeInitialContent();
+              _pendingLiveWriteBuffer.clear();
+              _sessionInputRouter.sendResizeOut(
+                _sanitizedId,
+                fittedCols,
+                fittedRows,
+              );
+            }
+          } else if (widget.isExited) {
+            _resetTerminalSafe();
+            _writeInitialContent();
+          } else if (sizeChanged && !_liveOutputReceived) {
+            _resetTerminalSafe();
+            _writeInitialContent();
+          }
+        }
       }
     } catch (_) {}
+  }
+
+  void _triggerFitWithDelayedRetries() {
+    _onFit();
+    Future.delayed(const Duration(milliseconds: 50), _onFit);
+    Future.delayed(const Duration(milliseconds: 200), _onFit);
+    Future.delayed(const Duration(milliseconds: 600), _onFit);
+    Future.delayed(const Duration(milliseconds: 1500), _onFit);
   }
 
   String? _keyboardEventToInput(html.KeyboardEvent event) {
@@ -484,20 +788,82 @@ class _TerminalPaneState extends State<TerminalPane> {
     return null;
   }
 
+  void _updateCursorOptions() {
+    final options = js_util.getProperty(_term, 'options');
+    var theme = js_util.getProperty(options, 'theme');
+    theme ??= js_util.newObject();
+    js_util.setProperty(
+      theme,
+      'cursor',
+      widget.isExited ? 'transparent' : '#7fd1c7',
+    );
+    js_util.setProperty(options, 'theme', theme);
+    js_util.setProperty(options, 'cursorBlink', !widget.isExited);
+  }
+
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isExited != widget.isExited) {
+      if (_initialized) {
+        try {
+          _updateCursorOptions();
+          _resetTerminalSafe();
+          _pendingLiveWriteBuffer.clear();
+          _initialContentWritten = false;
+          _stableWidth = null;
+          _stableHeight = null;
+          _liveOutputReceived = false;
+          _triggerFitWithDelayedRetries();
+        } catch (_) {}
+      }
+    }
+    if (oldWidget.replayRevision != widget.replayRevision) {
+      if (_initialized) {
+        try {
+          _resetTerminalSafe();
+          _pendingLiveWriteBuffer.clear();
+          _initialContentWritten = false;
+          _stableWidth = null;
+          _stableHeight = null;
+          _liveOutputReceived = false;
+          _triggerFitWithDelayedRetries();
+        } catch (_) {}
+      }
+    }
+    if (oldWidget.replayPending && !widget.replayPending) {
+      if (_initialized) {
+        try {
+          _resetTerminalSafe();
+          _pendingLiveWriteBuffer.clear();
+          _initialContentWritten = false;
+          _stableWidth = null;
+          _stableHeight = null;
+          _liveOutputReceived = false;
+          _triggerFitWithDelayedRetries();
+        } catch (_) {}
+      }
+    }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeWriteListener(_onWrite);
       oldWidget.controller.removeClearListener(_onClear);
       oldWidget.controller.removeResizeListener(_onResize);
       oldWidget.controller.removeFitListener(_onFit);
+      _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
+      _inputRouteToken = _sessionInputRouter.bind(
+        _sanitizedId,
+        widget.controller,
+      );
       _bindController();
       if (_initialized) {
         try {
-          js_util.callMethod(_term, 'reset', []);
-          _writeInitialContent();
-          _onFit();
+          _resetTerminalSafe();
+          _pendingLiveWriteBuffer.clear();
+          _initialContentWritten = false;
+          _stableWidth = null;
+          _stableHeight = null;
+          _liveOutputReceived = false;
+          _triggerFitWithDelayedRetries();
         } catch (_) {}
       }
     }
@@ -505,20 +871,13 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   void dispose() {
+    _resizeDebounceTimer?.cancel();
+    _stabilityTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _containerClickSubscription.cancel();
     _containerKeyDownSubscription.cancel();
     _container.removeEventListener('paste', _containerPasteListener, true);
-    if (_onDataSubscription != null) {
-      try {
-        js_util.callMethod(_onDataSubscription, 'dispose', []);
-      } catch (_) {}
-    }
-    if (_onResizeSubscription != null) {
-      try {
-        js_util.callMethod(_onResizeSubscription, 'dispose', []);
-      } catch (_) {}
-    }
+    _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
     if (_resizeObserver != null) {
       try {
         js_util.callMethod(_resizeObserver, 'disconnect', []);
@@ -526,11 +885,15 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     _focusNode.dispose();
     _unbindController();
+    _discardCachedSession(_sanitizedId);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _activateTerminal();
+    });
     return Focus(
       focusNode: _focusNode,
       onKeyEvent: (node, event) {
