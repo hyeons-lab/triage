@@ -289,22 +289,27 @@ where
         }
     };
 
-    // Subprotocol negotiation
-    let requested_protocols = req
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
+    // Subprotocol negotiation per RFC 6455
     let mut selected_format = triage_transport_ws::ProtocolFormat::Json;
     let mut selected_proto_header = None;
 
-    if requested_protocols.contains("triage-flatbuffers") {
-        selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
-        selected_proto_header = Some(HeaderValue::from_static("triage-flatbuffers"));
-    } else if requested_protocols.contains("triage-json") {
-        selected_format = triage_transport_ws::ProtocolFormat::Json;
-        selected_proto_header = Some(HeaderValue::from_static("triage-json"));
+    if let Some(protocol_header) = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+    {
+        for token in protocol_header.split(',') {
+            let trimmed = token.trim();
+            if trimmed == "triage-flatbuffers" {
+                selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
+                selected_proto_header = Some(HeaderValue::from_static("triage-flatbuffers"));
+                break;
+            } else if trimmed == "triage-json" {
+                selected_format = triage_transport_ws::ProtocolFormat::Json;
+                selected_proto_header = Some(HeaderValue::from_static("triage-json"));
+                break;
+            }
+        }
     }
 
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());

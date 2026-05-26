@@ -7,25 +7,51 @@ use triage_core::session::{
     StyledRowsRequest, WriteInputRequest,
 };
 
-pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
+pub fn parse_client_message(
+    msg: fb::ClientMessage<'_>,
+) -> Result<ClientMessage, crate::ProtocolError> {
     let id = msg.id().map(|s| serde_json::Value::String(s.to_string()));
     let request = match msg.payload_type() {
         fb::ClientRequestPayload::HelloRequest => {
-            let req = msg.payload_as_hello_request().unwrap();
-            let client_id = req.client_id().map(|s| ClientId::new(s).unwrap());
+            let req = msg.payload_as_hello_request().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "HelloRequest payload is missing")
+            })?;
+            let client_id =
+                match req.client_id() {
+                    Some(s) => Some(ClientId::new(s).map_err(|e| {
+                        crate::ProtocolError::new("invalid_client_id", e.to_string())
+                    })?),
+                    None => None,
+                };
             let token = req.token().map(|s| s.to_string());
             ClientRequest::Hello { client_id, token }
         }
         fb::ClientRequestPayload::PairRequest => {
-            let req = msg.payload_as_pair_request().unwrap();
+            let req = msg.payload_as_pair_request().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "PairRequest payload is missing")
+            })?;
             let code = req.code().unwrap_or("").to_string();
-            let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             ClientRequest::Pair { code, client_id }
         }
         fb::ClientRequestPayload::ListSessionsRequest => ClientRequest::ListSessions,
         fb::ClientRequestPayload::StartSessionRequestTable => {
-            let req = msg.payload_as_start_session_request_table().unwrap();
-            let command = req.command().unwrap_or("").to_string();
+            let req = msg
+                .payload_as_start_session_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "StartSessionRequestTable payload is missing",
+                    )
+                })?;
+            let command = req
+                .command()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "command is missing"))?
+                .to_string();
             let mut args = Vec::new();
             if let Some(fb_args) = req.args() {
                 for i in 0..fb_args.len() {
@@ -37,7 +63,9 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             } else {
                 Some(std::path::PathBuf::from(req.cwd().unwrap()))
             };
-            let fb_size = req.size().unwrap();
+            let fb_size = req
+                .size()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "size is missing"))?;
             let size = triage_core::session::SessionSize {
                 rows: fb_size.rows() as usize,
                 cols: fb_size.cols() as usize,
@@ -55,9 +83,24 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::AttachSessionRequestTable => {
-            let req = msg.payload_as_attach_session_request_table().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
-            let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
+            let req = msg
+                .payload_as_attach_session_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "AttachSessionRequestTable payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             let mode = match req.mode() {
                 fb::AttachMode::Observer => AttachMode::Observer,
                 fb::AttachMode::InteractiveController => AttachMode::InteractiveController,
@@ -75,8 +118,17 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
         fb::ClientRequestPayload::SubscribeSessionEventsRequestTable => {
             let req = msg
                 .payload_as_subscribe_session_events_request_table()
-                .unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "SubscribeSessionEventsRequestTable payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
             let after_event_seq = if req.after_event_seq() == 0 {
                 None
             } else {
@@ -90,9 +142,24 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::AcquireInputLeaseRequest => {
-            let req = msg.payload_as_acquire_input_lease_request().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
-            let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
+            let req = msg
+                .payload_as_acquire_input_lease_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "AcquireInputLeaseRequest payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             let kind = match req.kind() {
                 fb::InputControllerKind::Interactive => InputControllerKind::Interactive,
                 fb::InputControllerKind::Agent => InputControllerKind::Agent,
@@ -107,18 +174,46 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::ReleaseInputLeaseRequest => {
-            let req = msg.payload_as_release_input_lease_request().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
-            let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
+            let req = msg
+                .payload_as_release_input_lease_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "ReleaseInputLeaseRequest payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             ClientRequest::ReleaseInputLease {
                 session_id,
                 client_id,
             }
         }
         fb::ClientRequestPayload::WriteInputRequestTable => {
-            let req = msg.payload_as_write_input_request_table().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
-            let client_id = ClientId::new(req.client_id().unwrap_or("")).unwrap();
+            let req = msg.payload_as_write_input_request_table().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "WriteInputRequestTable payload is missing",
+                )
+            })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             let mut bytes = Vec::new();
             if let Some(fb_bytes) = req.bytes() {
                 bytes.extend_from_slice(fb_bytes.bytes());
@@ -132,9 +227,22 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::ResizeSessionRequestTable => {
-            let req = msg.payload_as_resize_session_request_table().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
-            let fb_size = req.size().unwrap();
+            let req = msg
+                .payload_as_resize_session_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "ResizeSessionRequestTable payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let fb_size = req
+                .size()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "size is missing"))?;
             let size = triage_core::session::SessionSize {
                 rows: fb_size.rows() as usize,
                 cols: fb_size.cols() as usize,
@@ -147,9 +255,22 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::RestoreSessionRequestTable => {
-            let req = msg.payload_as_restore_session_request_table().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
-            let fb_size = req.size().unwrap();
+            let req = msg
+                .payload_as_restore_session_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "RestoreSessionRequestTable payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let fb_size = req
+                .size()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "size is missing"))?;
             let size = triage_core::session::SessionSize {
                 rows: fb_size.rows() as usize,
                 cols: fb_size.cols() as usize,
@@ -162,13 +283,31 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::SnapshotSessionRequest => {
-            let req = msg.payload_as_snapshot_session_request().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
+            let req = msg.payload_as_snapshot_session_request().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "SnapshotSessionRequest payload is missing",
+                )
+            })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
             ClientRequest::SnapshotSession { session_id }
         }
         fb::ClientRequestPayload::StyledRowsRequestTable => {
-            let req = msg.payload_as_styled_rows_request_table().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
+            let req = msg.payload_as_styled_rows_request_table().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "StyledRowsRequestTable payload is missing",
+                )
+            })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
             let start = req.start() as usize;
             let end = req.end() as usize;
             ClientRequest::StyledRows {
@@ -180,13 +319,27 @@ pub fn parse_client_message(msg: fb::ClientMessage<'_>) -> ClientMessage {
             }
         }
         fb::ClientRequestPayload::ShutdownSessionRequest => {
-            let req = msg.payload_as_shutdown_session_request().unwrap();
-            let session_id = SessionId::new(req.session_id().unwrap_or("")).unwrap();
+            let req = msg.payload_as_shutdown_session_request().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "ShutdownSessionRequest payload is missing",
+                )
+            })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
             ClientRequest::ShutdownSession { session_id }
         }
-        _ => ClientRequest::ListSessions,
+        _ => {
+            return Err(crate::ProtocolError::new(
+                "unsupported_payload",
+                "The provided FlatBuffers payload type is not recognized or supported by Triage",
+            ));
+        }
     };
-    ClientMessage { id, request }
+    Ok(ClientMessage { id, request })
 }
 
 pub fn serialize_client_message(msg: &ClientMessage) -> Vec<u8> {

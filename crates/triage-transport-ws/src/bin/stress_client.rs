@@ -201,6 +201,9 @@ fn parse_fb_server_message(bytes: &[u8]) -> Result<ServerMessage> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let (url, protocol, duration_secs, rate, payload_size, session_id_arg) = parse_args();
+    if rate == 0 {
+        return Err(anyhow!("Stress client write rate must be greater than 0"));
+    }
     let use_fb = protocol.to_lowercase() == "flatbuffers";
     let subprotocol = if use_fb {
         "triage-flatbuffers"
@@ -530,8 +533,13 @@ async fn main() -> Result<()> {
                 let bytes = flatbuffers_proto::serialize_client_message(&write_msg);
                 ws_sink.send(Message::Binary(bytes)).await
             } else {
-                let text = serde_json::to_string(&write_msg).unwrap();
-                ws_sink.send(Message::Text(text)).await
+                match serde_json::to_string(&write_msg) {
+                    Ok(text) => ws_sink.send(Message::Text(text)).await,
+                    Err(e) => {
+                        eprintln!("Failed to serialize write message: {:?}", e);
+                        break;
+                    }
+                }
             };
 
             if send_result.is_err() {

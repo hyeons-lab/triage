@@ -7,7 +7,9 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
-use triage_transport_ws::WebSocketSessionConnection;
+use triage_transport_ws::{
+    ProtocolError, ServerMessage, WebSocketSessionConnection, flatbuffers_proto,
+};
 
 use crate::http::WebAssetCache;
 use crate::session::SessionManager;
@@ -34,16 +36,16 @@ pub fn start_websocket_server(
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    tracing::info!(client_addr = %addr, "Accepted TCP connection");
+                    tracing::debug!(client_addr = %addr, "Accepted TCP connection");
                     let manager = Arc::clone(&manager);
                     let cache = Arc::clone(&cache);
                     tokio::spawn(async move {
-                        tracing::info!(client_addr = %addr, "Spawning HTTP/WebSocket handler");
+                        tracing::debug!(client_addr = %addr, "Spawning HTTP/WebSocket handler");
                         let io = TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
                             let cache = Arc::clone(&cache);
                             let manager = Arc::clone(&manager);
-                            tracing::info!(
+                            tracing::debug!(
                                 method = %req.method(),
                                 path = %req.uri().path(),
                                 "Received HTTP request"
@@ -77,7 +79,7 @@ pub async fn handle_upgraded_ws<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!(?format, "Upgraded WebSocket client connected");
+    tracing::debug!(?format, "Upgraded WebSocket client connected");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut conn =
@@ -98,6 +100,14 @@ where
                                     if ws_sender.send(Message::Text(response)).await.is_err() {
                                         break;
                                     }
+                                } else {
+                                    let err_response = ServerMessage::Error {
+                                        id: None,
+                                        error: ProtocolError::new("invalid_frame_type", "Expected binary frame for FlatBuffers subprotocol"),
+                                    };
+                                    let bytes = flatbuffers_proto::serialize_server_message(&err_response);
+                                    let _ = ws_sender.send(Message::Binary(bytes)).await;
+                                    break;
                                 }
                             }
                             Message::Binary(bytes) => {
@@ -106,21 +116,30 @@ where
                                     if ws_sender.send(Message::Binary(response)).await.is_err() {
                                         break;
                                     }
+                                } else {
+                                    let err_response = ServerMessage::Error {
+                                        id: None,
+                                        error: ProtocolError::new("invalid_frame_type", "Expected text frame for JSON subprotocol"),
+                                    };
+                                    if let Ok(text) = serde_json::to_string(&err_response) {
+                                        let _ = ws_sender.send(Message::Text(text)).await;
+                                    }
+                                    break;
                                 }
                             }
                             Message::Close(_) => {
-                                tracing::info!("WebSocket client disconnected");
+                                tracing::debug!("WebSocket client disconnected");
                                 break;
                             }
                             _ => {}
                         }
                     }
                     Some(Err(err)) => {
-                        tracing::info!(error = ?err, "WebSocket client connection error");
+                        tracing::debug!(error = ?err, "WebSocket client connection error");
                         break;
                     }
                     None => {
-                        tracing::info!("WebSocket client connection closed");
+                        tracing::debug!("WebSocket client connection closed");
                         break;
                     }
                 }

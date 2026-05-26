@@ -40,7 +40,9 @@ struct TerminalColor {
 
 struct TerminalStyle {
     foreground: TerminalColor;
+    has_foreground: bool;
     background: TerminalColor;
+    has_background: bool;
     bold: bool;
     dim: bool;
     italic: bool;

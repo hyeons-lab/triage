@@ -32,15 +32,27 @@ impl From<TerminalColor> for fb::TerminalColor {
 
 impl From<&TerminalStyle> for fb::TerminalStyle {
     fn from(s: &TerminalStyle) -> Self {
+        let has_fg = s.foreground.is_some();
         let fg = s
             .foreground
             .map(fb::TerminalColor::from)
             .unwrap_or_else(|| fb::TerminalColor::new(0, 0, 0));
+        let has_bg = s.background.is_some();
         let bg = s
             .background
             .map(fb::TerminalColor::from)
             .unwrap_or_else(|| fb::TerminalColor::new(0, 0, 0));
-        fb::TerminalStyle::new(&fg, &bg, s.bold, s.dim, s.italic, s.underline, s.reverse)
+        fb::TerminalStyle::new(
+            &fg,
+            has_fg,
+            &bg,
+            has_bg,
+            s.bold,
+            s.dim,
+            s.italic,
+            s.underline,
+            s.reverse,
+        )
     }
 }
 
