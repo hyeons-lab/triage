@@ -25,7 +25,8 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - Nested lints like `collapsible-if` and `redundant-closure` were fixed inside `triage-core` compilation targets to ensure zero linter warnings.
 
 ## Commits
-- HEAD — feat(flatbuffers): implement Criterion benchmarks, E2E stress testing tool, and fix Windows socket hang
+- HEAD — refactor(flatbuffers): output generated bindings to OUT_DIR and remove tracked generated file
+- 9a0a0f5 — feat(flatbuffers): implement Criterion benchmarks, E2E stress testing tool, and fix Windows socket hang
 - b03b3bc — feat(flatbuffers): implement subprotocol negotiation and binary frame routing inside triaged daemon
 - 4305355 — feat(flatbuffers): implement FlatBuffers adapter inside triage-transport-ws
 - 11f1a34 — feat(flatbuffers): implement FlatBuffers schema compilation and core model builders

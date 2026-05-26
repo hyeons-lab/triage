@@ -574,9 +574,12 @@ async fn main() -> Result<()> {
                             bytes_received_receiver
                                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                             if let Ok(root) = flatbuffers::root::<fb::ServerMessage>(&bytes) {
-                                let is_event = root.payload_type() == fb::ServerMessagePayload::EventPayload;
-                                let is_output = is_event && root.payload_as_event_payload()
-                                    .is_some_and(|ep| ep.event_type() == fb::SessionEventPayload::OutputEvent);
+                                let is_event =
+                                    root.payload_type() == fb::ServerMessagePayload::EventPayload;
+                                let is_output = is_event
+                                    && root.payload_as_event_payload().is_some_and(|ep| {
+                                        ep.event_type() == fb::SessionEventPayload::OutputEvent
+                                    });
                                 if is_output {
                                     output_event_count_receiver.fetch_add(1, Ordering::Relaxed);
                                 }

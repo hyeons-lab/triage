@@ -16,10 +16,7 @@ fn main() {
     };
 
     // Ensure output directory exists
-    let out_dir = PathBuf::from("src/generated");
-    if !out_dir.exists() {
-        std::fs::create_dir_all(&out_dir).unwrap();
-    }
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // 2. Compile flatbuffers schema
     let status = Command::new(&flatc)
