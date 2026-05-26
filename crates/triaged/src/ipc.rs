@@ -667,8 +667,10 @@ mod tests {
         let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
             log_dir.clone(),
         )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
         let server = UnixSocketServer::new(
             Arc::clone(&manager),
+            cache,
             UnixSocketConfig::new(socket_path.clone()),
         );
         spawn_server(server);
@@ -714,8 +716,10 @@ mod tests {
         let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
             log_dir.clone(),
         )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
         let server = UnixSocketServer::new(
             Arc::clone(&manager),
+            cache,
             UnixSocketConfig::new(socket_path.clone()),
         );
         spawn_server(server);
@@ -816,8 +820,10 @@ mod tests {
         let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
             log_dir.clone(),
         )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
         let server = UnixSocketServer::new(
             Arc::clone(&manager),
+            cache,
             UnixSocketConfig::new(socket_path.clone()),
         );
         spawn_server(server);
