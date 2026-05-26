@@ -189,6 +189,7 @@ pub struct RemoteConfig {
     pub require_pairing: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    pub web_assets_path: Option<String>,
 }
 
 impl RemoteConfig {
@@ -198,6 +199,9 @@ impl RemoteConfig {
 
     fn validate(&self) -> Result<()> {
         self.bind_addr()?;
+        if let Some(ref path) = self.web_assets_path {
+            ensure_non_empty("remote.web_assets_path", path)?;
+        }
         match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => {
                 ensure_non_empty("remote.tls_cert", cert)?;
@@ -216,6 +220,7 @@ impl Default for RemoteConfig {
             require_pairing: true,
             tls_cert: None,
             tls_key: None,
+            web_assets_path: None,
         }
     }
 }
