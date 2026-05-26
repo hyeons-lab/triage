@@ -289,6 +289,24 @@ where
         }
     };
 
+    // Subprotocol negotiation
+    let requested_protocols = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let mut selected_format = triage_transport_ws::ProtocolFormat::Json;
+    let mut selected_proto_header = None;
+
+    if requested_protocols.contains("triage-flatbuffers") {
+        selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
+        selected_proto_header = Some(HeaderValue::from_static("triage-flatbuffers"));
+    } else if requested_protocols.contains("triage-json") {
+        selected_format = triage_transport_ws::ProtocolFormat::Json;
+        selected_proto_header = Some(HeaderValue::from_static("triage-json"));
+    }
+
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
 
     let mut res = Response::new(Full::new(Bytes::new()));
@@ -301,6 +319,9 @@ where
         "sec-websocket-accept",
         HeaderValue::from_str(&accept).unwrap(),
     );
+    if let Some(proto) = selected_proto_header {
+        headers.insert("sec-websocket-protocol", proto);
+    }
 
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
@@ -312,7 +333,7 @@ where
                     None,
                 )
                 .await;
-                if let Err(error) = crate::ws::handle_upgraded_ws(manager, ws_stream).await {
+                if let Err(error) = crate::ws::handle_upgraded_ws(manager, ws_stream, selected_format).await {
                     tracing::warn!(error = ?error, "Upgraded WebSocket connection failed");
                 }
             }

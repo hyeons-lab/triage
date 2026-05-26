@@ -13,7 +13,7 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - [x] Add `flatbuffers` dependencies and implement build script in `triage-core/build.rs`.
 - [x] Implement conversion helpers in `flatbuffers_proto.rs` in `triage-core`.
 - [x] Refactor `triage-transport-ws` to support `ProtocolFormat` and binary message handlers.
-- [ ] Refactor `triaged` to negotiate subprotocols and route binary WebSocket frames.
+- [x] Refactor `triaged` to negotiate subprotocols and route binary WebSocket frames.
 - [ ] Implement Criterion microbenchmarks inside `crates/triage-transport-ws/benches/`.
 - [ ] Implement standalone E2E stress testing tool (`crates/triage-transport-ws/src/bin/stress_client.rs`).
 - [ ] Update Flutter web client to compile and support FlatBuffers serialization.
@@ -24,9 +24,10 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - Adopt standard RFC 6455 subprotocol negotiation to avoid query parameters and match industry conventions.
 
 ## Next Steps
-- Refactor the daemon ws routing to support dynamic negotiation and binary loops.
+- Implement Criterion microbenchmarks inside `crates/triage-transport-ws/benches/`.
 
 ## Commits
-- HEAD — feat(flatbuffers): implement FlatBuffers adapter inside triage-transport-ws
+- HEAD — feat(flatbuffers): implement subprotocol negotiation and binary frame routing inside triaged daemon
+- 4305355 — feat(flatbuffers): implement FlatBuffers adapter inside triage-transport-ws
 - 11f1a34 — feat(flatbuffers): implement FlatBuffers schema compilation and core model builders
 - 9481a9a — dev(web): initialize branch devlog and plan for FlatBuffers protocol
