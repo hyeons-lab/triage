@@ -1,0 +1,21 @@
+{
+  "name": "triage_client",
+  "version": "1.0.0",
+  "description": "A Flutter-based cross-device remote client for Triage.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test:xterm": "playwright test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "jsdom": "^29.1.1"
+  }
+}
