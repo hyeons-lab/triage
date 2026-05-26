@@ -11,6 +11,14 @@ use triage_core::session::{
     StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
 };
 
+pub mod flatbuffers_proto;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFormat {
+    Json,
+    Flatbuffers,
+}
+
 pub const PROTOCOL_VERSION: &str = "2026-05-20";
 const MAX_EVENTS_PER_SUBSCRIPTION_DRAIN: usize = 256;
 
@@ -87,6 +95,7 @@ pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     authenticated: bool,
     next_subscription_id: u64,
     subscriptions: HashMap<SubscriptionId, SessionEventReceiver>,
+    pub format: ProtocolFormat,
 }
 
 impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
@@ -97,6 +106,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            format: ProtocolFormat::Json,
         }
     }
 }
@@ -109,7 +119,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            format: ProtocolFormat::Json,
         }
+    }
+
+    pub fn with_format(mut self, format: ProtocolFormat) -> Self {
+        self.format = format;
+        self
     }
 
     pub fn handle_text_message(&mut self, message: &str) -> String {
@@ -131,6 +147,21 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         };
 
         serialize_server_message(&response)
+    }
+
+    pub fn handle_binary_message(&mut self, message: &[u8]) -> Vec<u8> {
+        let response = match ::flatbuffers::root::<triage_core::generated::triage::generated::ClientMessage>(message) {
+            Ok(fb_msg) => {
+                let parsed = flatbuffers_proto::parse_client_message(fb_msg);
+                self.handle_message(parsed)
+            }
+            Err(error) => ServerMessage::Error {
+                id: None,
+                error: ProtocolError::new("invalid_flatbuffer", error.to_string()),
+            },
+        };
+
+        flatbuffers_proto::serialize_server_message(&response)
     }
 
     pub fn handle_message(&mut self, message: ClientMessage) -> ServerMessage {

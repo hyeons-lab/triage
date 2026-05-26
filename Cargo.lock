@@ -3028,6 +3028,7 @@ name = "triage-transport-ws"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "flatbuffers",
  "serde",
  "serde_json",
  "triage-core",
