@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -44,6 +45,9 @@ class SessionVm {
     required this.rows,
     required this.outputSeq,
     this.isRemote = false,
+    this.initialCursorRow,
+    this.initialCursorCol,
+    this.isExited = false,
   }) : terminalController = TerminalController();
 
   final String title;
@@ -55,6 +59,13 @@ class SessionVm {
   final TerminalController terminalController;
   int outputSeq;
   final bool isRemote;
+  int? initialCursorRow;
+  int? initialCursorCol;
+  bool isExited;
+  int replayRevision = 0;
+  bool snapshotRefreshPending = false;
+  int? lastFittedCols;
+  int? lastFittedRows;
 }
 
 class TriageHome extends StatefulWidget {
@@ -83,6 +94,8 @@ class _TriageHomeState extends State<TriageHome> {
   late final String _clientId;
   final Map<String, String> _subscriptionIds = {};
   final Map<String, List<Map<String, dynamic>>> _pendingEvents = {};
+  final Queue<Map<String, dynamic>> _websocketEventQueue = Queue();
+  bool _websocketProcessingEvent = false;
 
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
@@ -100,20 +113,34 @@ class _TriageHomeState extends State<TriageHome> {
     required String sessionId,
     required List<dynamic>? visibleRowsJson,
     required List<dynamic>? styledRowsJson,
+    bool includeHistory = true,
+    List<StyledRow>? existingRows,
   }) async {
     final List<StyledRow> rows = [];
-    final styledRows = styledRowsJson
+    final styledRows =
+        styledRowsJson
             ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
             .toList() ??
         [];
+
+    if (!includeHistory && styledRows.isNotEmpty) {
+      if (existingRows != null && existingRows.length > styledRows.length) {
+        final historyCount = existingRows.length - styledRows.length;
+        rows.addAll(existingRows.take(historyCount));
+        rows.addAll(styledRows);
+        return rows;
+      }
+      return styledRows;
+    }
 
     if (visibleRowsJson != null) {
       final visibleRows = visibleRowsJson.cast<String>();
       final styledRowsStart = visibleRows.length - styledRows.length;
       if (styledRowsStart > 0) {
         try {
-          final fetchStart =
-              (visibleRows.length - 200) < 0 ? 0 : visibleRows.length - 200;
+          final fetchStart = (visibleRows.length - 200) < 0
+              ? 0
+              : visibleRows.length - 200;
           final historyRes = await _client.styledRows(
             sessionId: sessionId,
             start: fetchStart,
@@ -234,7 +261,13 @@ class _TriageHomeState extends State<TriageHome> {
     for (final s in _sessions) {
       _setupSessionInputListener(s);
     }
-    _connectWebSocket();
+    final isMockMode = Uri.base.queryParameters['mock'] == 'true';
+    if (isMockMode) {
+      _connectionStatus = 'Offline (Local Mock)';
+      _connectionStatusColor = const Color(0xff7f8b8d);
+    } else {
+      _connectWebSocket();
+    }
   }
 
   String _loadOrCreateClientId() {
@@ -494,10 +527,38 @@ class _TriageHomeState extends State<TriageHome> {
     try {
       final sessionIds = await _client.listSessions();
       final List<SessionVm> daemonSessions = [];
+      final targetSelectedIndex = _selectedIndex >= sessionIds.length
+          ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
+          : _selectedIndex;
+      var idx = 0;
 
       for (final sid in sessionIds) {
+        final includeHistory = idx == targetSelectedIndex;
         String? subId;
         try {
+          var preAttachSnapshot = <String, dynamic>{};
+          try {
+            final snapshotRes = await _client.snapshotSession(sessionId: sid);
+            preAttachSnapshot =
+                snapshotRes['snapshot'] as Map<String, dynamic>? ?? {};
+          } catch (_) {}
+
+          if (preAttachSnapshot['exited'] == true) {
+            final sizeObj = preAttachSnapshot['size'] as Map<String, dynamic>?;
+            final cols = sizeObj?['cols'] as int?;
+            final rows = sizeObj?['rows'] as int?;
+            final restoreSize = (cols != null && rows != null)
+                ? (rows, cols)
+                : _estimatedTerminalRestoreSize(sizeObj);
+            try {
+              await _client.restoreSession(
+                sessionId: sid,
+                rows: restoreSize.$1,
+                cols: restoreSize.$2,
+              );
+            } catch (_) {}
+          }
+
           // Subscribe to events first so we don't miss anything printed during attach
           subId = await _client.subscribeSessionEvents(sessionId: sid);
           if (subId.isNotEmpty) {
@@ -522,18 +583,39 @@ class _TriageHomeState extends State<TriageHome> {
             sessionId: sid,
             visibleRowsJson: visibleRowsJson,
             styledRowsJson: styledRowsJson,
+            includeHistory: includeHistory,
           );
+
+          final cursorObj = snapshot?['cursor'] as Map<String, dynamic>?;
+          final absoluteCursorRow = cursorObj?['row'] as int?;
+          final initialCursorCol = cursorObj?['col'] as int?;
+          int? initialCursorRow;
+          if (absoluteCursorRow != null) {
+            final totalLength = visibleRowsJson?.length ?? rows.length;
+            final startOffset = totalLength - rows.length;
+            initialCursorRow = absoluteCursorRow - startOffset;
+          }
+
+          final exited = snapshot?['exited'] as bool? ?? false;
 
           final session = SessionVm(
             title: 'triage / $sid',
             branch: branch,
-            status: 'attached',
-            statusColor: const Color(0xff7fd1c7),
+            status: exited ? 'exited' : 'attached',
+            statusColor: exited
+                ? const Color(0xff7f8b8d)
+                : const Color(0xff7fd1c7),
             icon: Icons.terminal,
             rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
             outputSeq: snapshot?['output_seq'] as int? ?? 0,
             isRemote: true,
+            initialCursorRow: initialCursorRow,
+            initialCursorCol: initialCursorCol,
+            isExited: exited,
           );
+          if (includeHistory) {
+            session.replayRevision = 1;
+          }
           _setupSessionInputListener(session);
           daemonSessions.add(session);
         } catch (e) {
@@ -545,6 +627,7 @@ class _TriageHomeState extends State<TriageHome> {
           _pendingEvents.remove(sid);
           debugPrint('Failed to load session $sid: ${e.toString()}');
         }
+        idx++;
       }
 
       setState(() {
@@ -556,6 +639,9 @@ class _TriageHomeState extends State<TriageHome> {
         _sessions.addAll(daemonSessions);
         if (_selectedIndex >= _sessions.length) {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+        }
+        if (_sessions.isNotEmpty) {
+          _sessions[_selectedIndex].snapshotRefreshPending = true;
         }
       });
 
@@ -572,12 +658,66 @@ class _TriageHomeState extends State<TriageHome> {
           }
         }
       }
+
+      if (_sessions.isNotEmpty) {
+        final activeSession = _sessions[_selectedIndex];
+        unawaited(
+          _refreshSessionSnapshot(
+            activeSession,
+            markPending: false,
+            includeHistory: true,
+          ),
+        );
+      }
     } catch (_) {
       // Fallback
     }
   }
 
+  (int, int) _estimatedTerminalRestoreSize(Map<String, dynamic>? fallbackSize) {
+    final viewportSize = MediaQuery.maybeSizeOf(context);
+    if (viewportSize == null) {
+      return (
+        fallbackSize?['rows'] as int? ?? 24,
+        fallbackSize?['cols'] as int? ?? 80,
+      );
+    }
+
+    const headerHeight = 68.0;
+    const horizontalPadding = 32.0;
+    const averageCellWidth = 9.0;
+    const averageCellHeight = 18.0;
+    final sidebarWidth = _sidebarCollapsed ? 72.0 : 320.0;
+    final terminalWidth =
+        viewportSize.width - sidebarWidth - 1 - horizontalPadding;
+    final terminalHeight = viewportSize.height - headerHeight;
+    final cols = (terminalWidth / averageCellWidth).floor().clamp(40, 240);
+    final rows = (terminalHeight / averageCellHeight).floor().clamp(10, 80);
+    return (rows, cols);
+  }
+
   void _onWebSocketEvent(Map<String, dynamic> message) {
+    if (_disposed) return;
+    _websocketEventQueue.add(message);
+    unawaited(_processWebsocketEventQueue());
+  }
+
+  Future<void> _processWebsocketEventQueue() async {
+    if (_websocketProcessingEvent || _websocketEventQueue.isEmpty) return;
+    _websocketProcessingEvent = true;
+    try {
+      while (_websocketEventQueue.isNotEmpty && !_disposed) {
+        final message = _websocketEventQueue.removeFirst();
+        try {
+          await _processWebSocketEvent(message);
+        } catch (_) {}
+      }
+    } finally {
+      _websocketProcessingEvent = false;
+    }
+  }
+
+  Future<void> _processWebSocketEvent(Map<String, dynamic> message) async {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
       _onWebSocketClosed(_connectGeneration);
@@ -594,6 +734,10 @@ class _TriageHomeState extends State<TriageHome> {
         sessionId = event['Output']['session_id'] as String?;
       } else if (event.containsKey('Exited')) {
         sessionId = event['Exited']['session_id'] as String?;
+      } else if (event.containsKey('Snapshot')) {
+        sessionId = event['Snapshot']['session_id'] as String?;
+      } else if (event.containsKey('ResyncRequired')) {
+        sessionId = event['ResyncRequired']['session_id'] as String?;
       }
 
       if (sessionId == null) return;
@@ -624,7 +768,9 @@ class _TriageHomeState extends State<TriageHome> {
 
         // Translate bare newlines to \r\n to prevent stair-casing layout formatting issues in the client-side terminal emulator.
         // We use a high-performance two-step replacement to ensure compatibility on older JS engines.
-        final translatedText = text.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n');
+        final translatedText = text
+            .replaceAll('\r\n', '\n')
+            .replaceAll('\n', '\r\n');
 
         // Write directly to xterm.js via the controller.
         // This bypasses calling setState() on every small output chunk,
@@ -634,22 +780,122 @@ class _TriageHomeState extends State<TriageHome> {
         // Update backup logs silently (without calling setState).
         final rows = session.rows;
         final newLines = text.split('\n');
-        if (rows.isNotEmpty &&
-            rows.last.spans.length == 1 &&
-            rows.last.spans.first.text.isEmpty) {
-          rows.removeLast();
-        }
-        for (final line in newLines) {
-          rows.add(_plainRow(line));
+        if (newLines.isNotEmpty) {
+          if (rows.isNotEmpty) {
+            final lastRow = rows.last;
+            if (lastRow.spans.isNotEmpty) {
+              final lastSpan = lastRow.spans.last;
+              final updatedSpan = StyledSpan(
+                text: lastSpan.text + newLines[0],
+                style: lastSpan.style,
+              );
+              final updatedSpans = List<StyledSpan>.from(lastRow.spans)
+                ..removeLast()
+                ..add(updatedSpan);
+              rows[rows.length - 1] = StyledRow(spans: updatedSpans);
+            } else {
+              rows[rows.length - 1] = _plainRow(newLines[0]);
+            }
+          } else {
+            rows.add(_plainRow(newLines[0]));
+          }
+          for (var i = 1; i < newLines.length; i++) {
+            rows.add(_plainRow(newLines[i]));
+          }
         }
         session.outputSeq = outputSeq;
       } else if (event.containsKey('Exited')) {
-        setState(() {
-          session.status = 'exited';
-          session.statusColor = const Color(0xff7f8b8d);
-        });
+        if (mounted) {
+          setState(() {
+            session.status = 'exited';
+            session.statusColor = const Color(0xff7f8b8d);
+            session.isExited = true;
+          });
+        }
+      } else if (event.containsKey('Snapshot')) {
+        final snapshot = event['Snapshot']['snapshot'] as Map<String, dynamic>?;
+        if (snapshot != null) {
+          final size = snapshot['size'] as Map<String, dynamic>?;
+          final cols = size?['cols'] as int?;
+          final rows = size?['rows'] as int?;
+          final sizeChanged =
+              cols != null &&
+              rows != null &&
+              (session.lastFittedCols != cols ||
+                  session.lastFittedRows != rows);
+          await _applySnapshotToSession(
+            session,
+            sessionId,
+            snapshot,
+            includeHistory: sizeChanged,
+          );
+        }
+      } else if (event.containsKey('ResyncRequired')) {
+        final snapshot =
+            event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
+        if (snapshot != null) {
+          await _applySnapshotToSession(
+            session,
+            sessionId,
+            snapshot,
+            includeHistory: true,
+          );
+        }
       }
     }
+  }
+
+  Future<void> _applySnapshotToSession(
+    SessionVm session,
+    String sessionId,
+    Map<String, dynamic> snapshot, {
+    bool includeHistory = false,
+  }) async {
+    final visibleRowsJson = snapshot['visible_rows'] as List<dynamic>?;
+    final styledRowsJson = snapshot['styled_rows'] as List<dynamic>?;
+    final rows = await _mergeVisibleAndStyledRows(
+      sessionId: sessionId,
+      visibleRowsJson: visibleRowsJson,
+      styledRowsJson: styledRowsJson,
+      includeHistory: includeHistory,
+      existingRows: session.rows,
+    );
+    if (_disposed || rows.isEmpty) return;
+
+    final cursorObj = snapshot['cursor'] as Map<String, dynamic>?;
+    final absoluteCursorRow = cursorObj?['row'] as int?;
+    final initialCursorCol = cursorObj?['col'] as int?;
+    int? initialCursorRow;
+    if (absoluteCursorRow != null) {
+      final totalLength = visibleRowsJson?.length ?? rows.length;
+      final startOffset = totalLength - rows.length;
+      initialCursorRow = absoluteCursorRow - startOffset;
+    }
+    final exited = snapshot['exited'] as bool? ?? false;
+    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+    final cols = sizeObj?['cols'] as int?;
+    final rowsVal = sizeObj?['rows'] as int?;
+
+    setState(() {
+      session.rows
+        ..clear()
+        ..addAll(rows);
+      session.outputSeq = snapshot['output_seq'] as int? ?? session.outputSeq;
+      session.initialCursorRow = initialCursorRow;
+      session.initialCursorCol = initialCursorCol;
+      session.isExited = exited;
+      session.status = exited ? 'exited' : 'attached';
+      session.statusColor = exited
+          ? const Color(0xff7f8b8d)
+          : const Color(0xff7fd1c7);
+      if (includeHistory) {
+        session.replayRevision += 1;
+      }
+      if (cols != null && rowsVal != null) {
+        session.lastFittedCols = cols;
+        session.lastFittedRows = rowsVal;
+      }
+    });
   }
 
   void _onWebSocketError(dynamic error, int generation) {
@@ -689,9 +935,104 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _selectSession(int index) {
+    if (index < 0 || index >= _sessions.length) return;
+    final session = _sessions[index];
+    final shouldRefresh =
+        _client.isConnected &&
+        session.isRemote &&
+        _sessionIdFor(session) != null;
     setState(() {
       _selectedIndex = index;
+      if (shouldRefresh) {
+        session.snapshotRefreshPending = true;
+      }
     });
+    unawaited(
+      _refreshSessionSnapshot(
+        session,
+        markPending: false,
+        includeHistory: true,
+      ),
+    );
+  }
+
+  Future<void> _refreshSessionSnapshot(
+    SessionVm session, {
+    bool markPending = true,
+    bool includeHistory = false,
+  }) async {
+    if (!_client.isConnected || !session.isRemote) return;
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    if (markPending && mounted && !_disposed) {
+      setState(() {
+        session.snapshotRefreshPending = true;
+      });
+    }
+    try {
+      final attachRes = await _client.attachSession(
+        sessionId: sessionId,
+        clientId: _clientId,
+        mode: 'InteractiveController',
+      );
+      final responseObj = attachRes['response'] as Map<String, dynamic>?;
+      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      if (snapshot != null && !_disposed) {
+        var finalSnapshot = snapshot;
+        if (snapshot['exited'] == true) {
+          debugPrint(
+            'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
+          );
+          final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+          final cols = sizeObj?['cols'] as int?;
+          final rows = sizeObj?['rows'] as int?;
+          final restoreSize = (cols != null && rows != null)
+              ? (rows, cols)
+              : _estimatedTerminalRestoreSize(sizeObj);
+          try {
+            await _client.restoreSession(
+              sessionId: sessionId,
+              rows: restoreSize.$1,
+              cols: restoreSize.$2,
+            );
+            final freshAttachRes = await _client.attachSession(
+              sessionId: sessionId,
+              clientId: _clientId,
+              mode: 'InteractiveController',
+            );
+            final freshResponseObj =
+                freshAttachRes['response'] as Map<String, dynamic>?;
+            final freshSnapshot =
+                freshResponseObj?['snapshot'] as Map<String, dynamic>?;
+            if (freshSnapshot != null) {
+              finalSnapshot = freshSnapshot;
+            }
+          } catch (e) {
+            debugPrint(
+              'Failed to restore session $sessionId during refresh: ${e.toString()}',
+            );
+          }
+        }
+        await _applySnapshotToSession(
+          session,
+          sessionId,
+          finalSnapshot,
+          includeHistory: includeHistory,
+        );
+      }
+    } catch (_) {
+    } finally {
+      if (mounted && !_disposed) {
+        setState(() {
+          session.snapshotRefreshPending = false;
+        });
+      }
+    }
+  }
+
+  String? _sessionIdFor(SessionVm session) {
+    final parts = session.title.split(' / ');
+    return parts.length > 1 ? parts[1] : null;
   }
 
   void _createSession() async {
@@ -732,19 +1073,37 @@ class _TriageHomeState extends State<TriageHome> {
             sessionId: sessionId,
             visibleRowsJson: visibleRowsJson,
             styledRowsJson: styledRowsJson,
+            includeHistory: false,
           );
+
+          final cursorObj = snapshot?['cursor'] as Map<String, dynamic>?;
+          final absoluteCursorRow = cursorObj?['row'] as int?;
+          final initialCursorCol = cursorObj?['col'] as int?;
+          int? initialCursorRow;
+          if (absoluteCursorRow != null) {
+            final totalLength = visibleRowsJson?.length ?? rows.length;
+            final startOffset = totalLength - rows.length;
+            initialCursorRow = absoluteCursorRow - startOffset;
+          }
+
+          final exited = snapshot?['exited'] as bool? ?? false;
 
           final session = SessionVm(
             title: 'triage / $sessionId',
             branch: branch,
-            status: 'attached',
-            statusColor: const Color(0xff7fd1c7),
+            status: exited ? 'exited' : 'attached',
+            statusColor: exited
+                ? const Color(0xff7f8b8d)
+                : const Color(0xff7fd1c7),
             icon: Icons.terminal,
             rows: rows.isEmpty
                 ? [_plainRow('Attached to session $sessionId')]
                 : rows,
             outputSeq: snapshot?['output_seq'] as int? ?? 0,
             isRemote: true,
+            initialCursorRow: initialCursorRow,
+            initialCursorCol: initialCursorCol,
+            isExited: exited,
           );
           _setupSessionInputListener(session);
 
@@ -1265,6 +1624,11 @@ class SessionWorkspace extends StatelessWidget {
             terminalId: session.title,
             controller: session.terminalController,
             fallbackRows: session.rows,
+            initialCursorRow: session.initialCursorRow,
+            initialCursorCol: session.initialCursorCol,
+            isExited: session.status == 'exited',
+            replayRevision: session.replayRevision,
+            replayPending: session.snapshotRefreshPending,
           ),
         ),
       ],

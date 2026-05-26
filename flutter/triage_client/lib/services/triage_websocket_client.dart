@@ -123,8 +123,8 @@ class TriageWebSocketClient {
 
   Future<Map<String, dynamic>> hello({String? clientId, String? token}) async {
     return _send('hello', {
-      'client_id':? clientId,
-      'token':? token,
+      if (clientId != null) 'client_id': clientId,
+      if (token != null) 'token': token,
     });
   }
 
@@ -193,13 +193,31 @@ class TriageWebSocketClient {
     required String clientId,
     required List<int> bytes,
   }) async {
-    await _send('write_input', {
+    final channel = _channel;
+    if (channel == null) {
+      throw StateError('WebSocket is not connected');
+    }
+    final payload = <String, dynamic>{
+      'type': 'write_input',
       'request': {
         'session_id': sessionId,
         'client_id': clientId,
         'bytes': bytes,
       },
-    });
+    };
+    try {
+      channel.sink.add(jsonEncode(payload));
+    } catch (error, stackTrace) {
+      _cleanupPendingRequests();
+      if (identical(_channel, channel)) {
+        _channel = null;
+      }
+      _eventController.add({
+        'type': 'connection_closed',
+        'error': error.toString(),
+      });
+      Error.throwWithStackTrace(error, stackTrace);
+    }
   }
 
   Future<Map<String, dynamic>> resizeSession({
@@ -219,6 +237,31 @@ class TriageWebSocketClient {
         },
       },
     });
+  }
+
+  Future<Map<String, dynamic>> restoreSession({
+    required String sessionId,
+    required int cols,
+    required int rows,
+  }) async {
+    return _send('restore_session', {
+      'request': {
+        'session_id': sessionId,
+        'size': {
+          'rows': rows,
+          'cols': cols,
+          'pixel_width': cols * 10,
+          'pixel_height': rows * 20,
+          'dpi': 96,
+        },
+      },
+    });
+  }
+
+  Future<Map<String, dynamic>> snapshotSession({
+    required String sessionId,
+  }) async {
+    return _send('snapshot_session', {'session_id': sessionId});
   }
 
   Future<void> shutdownSession({required String sessionId}) async {

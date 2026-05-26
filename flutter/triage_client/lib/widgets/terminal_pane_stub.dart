@@ -8,11 +8,21 @@ class TerminalPane extends StatefulWidget {
     required this.terminalId,
     required this.controller,
     required this.fallbackRows,
+    this.initialCursorRow,
+    this.initialCursorCol,
+    this.isExited = false,
+    this.replayRevision = 0,
+    this.replayPending = false,
   });
 
   final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
+  final int? initialCursorRow;
+  final int? initialCursorCol;
+  final bool isExited;
+  final int replayRevision;
+  final bool replayPending;
 
   static void destroySession(String terminalId) {
     // Stub implementation does nothing
