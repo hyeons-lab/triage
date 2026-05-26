@@ -511,6 +511,12 @@ impl SessionApi for SessionManager {
     }
 
     fn write_input(&self, request: WriteInputRequest) -> Result<()> {
+        tracing::info!(
+            "write_input request: session_id = {:?}, client_id = {:?}, bytes_len = {}",
+            request.session_id,
+            request.client_id,
+            request.bytes.len()
+        );
         let sessions = self.sessions()?;
         let session = sessions
             .get(&request.session_id)
@@ -1072,6 +1078,7 @@ impl SessionActor {
             writer,
             output,
             size,
+            log_path,
             current_working_directory,
         } = runtime;
         let initial_working_directory = current_working_directory.or(initial_working_directory);
@@ -1092,6 +1099,7 @@ impl SessionActor {
                     writer,
                     output,
                     size,
+                    log_path,
                     exited: false,
                     output_closed: false,
                     exit_broadcasted: false,
@@ -1228,6 +1236,7 @@ struct ActorState {
     writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
+    log_path: PathBuf,
     exited: bool,
     output_closed: bool,
     exit_broadcasted: bool,
@@ -1251,6 +1260,7 @@ struct PtyRuntime {
     writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
+    log_path: PathBuf,
     current_working_directory: Option<PathBuf>,
 }
 
@@ -1260,6 +1270,7 @@ struct OutputState {
     cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
     output_seq: u64,
+    log_cache: Option<Vec<u8>>,
 }
 
 enum ActorMessage {
@@ -1449,7 +1460,8 @@ impl ActorState {
         self.master
             .resize(pty_size(&size))
             .context("resizing PTY")?;
-        self.output.terminal.resize(terminal_size(&size));
+        self.output
+            .reflow_from_log(&self.log_path, &size, self.writer.clone())?;
         self.size = size;
         let snapshot = self.snapshot();
         if let Some(session_id) = self.event_session_id.clone() {
@@ -1749,6 +1761,13 @@ impl OutputState {
             .context("writing PTY output log")?;
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
+        if let Some(cache) = &mut self.log_cache {
+            if cache.len() + bytes.len() <= 1024 * 1024 {
+                cache.extend_from_slice(bytes);
+            } else {
+                self.log_cache = None;
+            }
+        }
         let current_working_directory = self.extract_current_working_directory(bytes);
         let translated = translate_newlines(bytes);
         self.terminal.advance_bytes(&translated);
@@ -1758,10 +1777,59 @@ impl OutputState {
     fn replay(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
+        if let Some(cache) = &mut self.log_cache {
+            if cache.len() + bytes.len() <= 1024 * 1024 {
+                cache.extend_from_slice(bytes);
+            } else {
+                self.log_cache = None;
+            }
+        }
+        Ok(self.advance_replayed_bytes(bytes))
+    }
+
+    fn reflow_from_log(
+        &mut self,
+        log_path: &PathBuf,
+        size: &SessionSize,
+        writer: SharedPtyWriter,
+    ) -> Result<()> {
+        let (replay_writer, replay_gate) = replay_gated_pty_writer();
+        self.terminal = terminal_with_writer(size, replay_writer);
+        self.cwd_sequence_buffer.clear();
+
+        if let Some(cache) = self.log_cache.clone() {
+            self.advance_replayed_bytes(&cache);
+        } else {
+            self.log
+                .flush()
+                .context("flushing session log before reflow")?;
+            let mut replay = File::open(log_path)
+                .with_context(|| format!("opening session log {}", log_path.display()))?;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = replay
+                    .read(&mut buffer)
+                    .with_context(|| format!("reading session log {}", log_path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                self.advance_replayed_bytes(&buffer[..read]);
+            }
+        }
+
+        let replay_writes = replay_gate.dropped_write_count();
+        let replay_flushes = replay_gate.dropped_flush_count();
+        self.terminal.advance_bytes(b"\x1b[c");
+        replay_gate.wait_for_dropped_activity_quiet_after(replay_writes, replay_flushes)?;
+        replay_gate.enable(Box::new(SharedPtyWriterProxy { writer }))?;
+        Ok(())
+    }
+
+    fn advance_replayed_bytes(&mut self, bytes: &[u8]) -> Option<PathBuf> {
         let current_working_directory = self.extract_current_working_directory(bytes);
         let translated = translate_newlines(bytes);
         self.terminal.advance_bytes(&translated);
-        Ok(current_working_directory)
+        current_working_directory
     }
 
     fn extract_current_working_directory(&mut self, bytes: &[u8]) -> Option<PathBuf> {
@@ -1864,8 +1932,10 @@ fn spawn_pty_runtime(
                     cwd_sequence_buffer: Vec::new(),
                     bytes_logged: 0,
                     output_seq: 0,
+                    log_cache: Some(Vec::new()),
                 },
                 size: config.size,
+                log_path: config.log_path,
                 current_working_directory: None,
             })
         }
@@ -1884,6 +1954,7 @@ fn spawn_pty_runtime(
                 cwd_sequence_buffer: Vec::new(),
                 bytes_logged: 0,
                 output_seq: 0,
+                log_cache: Some(Vec::new()),
             };
             let replay = fs::read(&config.log_path)
                 .with_context(|| format!("reading session log {}", config.log_path.display()))?;
@@ -1894,9 +1965,10 @@ fn spawn_pty_runtime(
             };
             let current_working_directory =
                 restorable_cwd(replayed_working_directory, config.cwd.clone());
+            let replay_writes = replay_gate.dropped_write_count();
             let replay_flushes = replay_gate.dropped_flush_count();
             output.terminal.advance_bytes(b"\x1b[c");
-            replay_gate.wait_for_dropped_flush_after(replay_flushes)?;
+            replay_gate.wait_for_dropped_activity_quiet_after(replay_writes, replay_flushes)?;
             replay_gate.enable(pair.master.take_writer().context("taking PTY writer")?)?;
             Ok(PtyRuntime {
                 master: pair.master,
@@ -1905,6 +1977,7 @@ fn spawn_pty_runtime(
                 writer,
                 output,
                 size: config.size,
+                log_path: config.log_path,
                 current_working_directory,
             })
         }
@@ -1923,6 +1996,7 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: 0,
         output_seq: 0,
+        log_cache: Some(Vec::new()),
     })
 }
 
@@ -2081,6 +2155,7 @@ fn replay_gated_pty_writer() -> (SharedPtyWriter, Arc<ReplayGateState>) {
     let state = Arc::new(ReplayGateState {
         live_writer: Mutex::new(None),
         pass_through: AtomicBool::new(false),
+        dropped_writes: AtomicU64::new(0),
         dropped_flushes: AtomicU64::new(0),
     });
     let writer = shared_pty_writer(Box::new(ReplayGateWriter {
@@ -2092,24 +2167,50 @@ fn replay_gated_pty_writer() -> (SharedPtyWriter, Arc<ReplayGateState>) {
 struct ReplayGateState {
     live_writer: Mutex<Option<Box<dyn Write + Send>>>,
     pass_through: AtomicBool,
+    dropped_writes: AtomicU64,
     dropped_flushes: AtomicU64,
 }
 
 impl ReplayGateState {
+    fn dropped_write_count(&self) -> u64 {
+        self.dropped_writes.load(Ordering::SeqCst)
+    }
+
     fn dropped_flush_count(&self) -> u64 {
         self.dropped_flushes.load(Ordering::SeqCst)
     }
 
-    fn wait_for_dropped_flush_after(&self, previous_count: u64) -> Result<()> {
+    fn wait_for_dropped_activity_quiet_after(
+        &self,
+        previous_writes: u64,
+        previous_flushes: u64,
+    ) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while self.dropped_flush_count() <= previous_count {
+        let quiet_period = Duration::from_millis(50);
+        let mut last_writes = self.dropped_write_count();
+        let mut last_flushes = self.dropped_flush_count();
+        let mut saw_activity = last_writes > previous_writes || last_flushes > previous_flushes;
+        let mut quiet_since = Instant::now();
+
+        loop {
+            let current_writes = self.dropped_write_count();
+            let current_flushes = self.dropped_flush_count();
+            if current_writes != last_writes || current_flushes != last_flushes {
+                last_writes = current_writes;
+                last_flushes = current_flushes;
+                saw_activity =
+                    current_writes > previous_writes || current_flushes > previous_flushes;
+                quiet_since = Instant::now();
+            }
+            if saw_activity && quiet_since.elapsed() >= quiet_period {
+                return Ok(());
+            }
             ensure!(
                 Instant::now() < deadline,
                 "timed out draining restored terminal replay replies"
             );
             thread::sleep(Duration::from_millis(10));
         }
-        Ok(())
     }
 
     fn enable(&self, writer: Box<dyn Write + Send>) -> Result<()> {
@@ -2126,9 +2227,30 @@ struct ReplayGateWriter {
     state: Arc<ReplayGateState>,
 }
 
+struct SharedPtyWriterProxy {
+    writer: SharedPtyWriter,
+}
+
+impl Write for SharedPtyWriterProxy {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?
+            .flush()
+    }
+}
+
 impl Write for ReplayGateWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if !self.state.pass_through.load(Ordering::SeqCst) {
+            self.state.dropped_writes.fetch_add(1, Ordering::SeqCst);
             return Ok(buf.len());
         }
         let mut live_writer = self
@@ -2726,6 +2848,77 @@ mod tests {
             "scrollback rows should include line-5: {rows:?}"
         );
         assert!(rows.len() > output.terminal.screen().physical_rows);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_reflows_log_at_resized_width() {
+        let log_path = unique_log_path();
+        let narrow = SessionSize {
+            rows: 6,
+            cols: 12,
+            pixel_width: 120,
+            pixel_height: 120,
+            dpi: 96,
+        };
+        let wide = SessionSize {
+            rows: 6,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 120,
+            dpi: 96,
+        };
+        let long_line = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut output = test_output_state(&log_path, narrow);
+
+        output
+            .ingest(long_line.as_bytes())
+            .expect("ingest long line");
+        let bytes_logged = output.bytes_logged;
+        let output_seq = output.output_seq;
+        let narrow_rows = visible_rows(&output.terminal);
+        assert!(
+            !narrow_rows.iter().any(|row| row == long_line),
+            "narrow terminal should soft-wrap the long line: {narrow_rows:?}"
+        );
+
+        output
+            .reflow_from_log(
+                &log_path,
+                &wide,
+                shared_pty_writer(Box::new(std::io::sink())),
+            )
+            .expect("reflow log");
+
+        let wide_rows = visible_rows(&output.terminal);
+        assert!(
+            wide_rows.iter().any(|row| row == long_line),
+            "wide terminal should replay the log without narrow wrapping: {wide_rows:?}"
+        );
+        assert_eq!(output.bytes_logged, bytes_logged);
+        assert_eq!(output.output_seq, output_seq);
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_reflow_suppresses_historical_terminal_replies() {
+        let log_path = unique_log_path();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = shared_pty_writer(Box::new(RecordingWriter {
+            bytes: captured.clone(),
+        }));
+        let mut output = test_output_state(&log_path, SessionSize::default());
+
+        output.ingest(b"\x1b[6n").expect("ingest cursor query");
+        captured.lock().expect("captured writer lock").clear();
+
+        output
+            .reflow_from_log(&log_path, &SessionSize::default(), writer)
+            .expect("reflow log");
+        assert!(
+            captured.lock().expect("captured writer lock").is_empty(),
+            "historical reflow should not write terminal replies to the live PTY"
+        );
         let _ = std::fs::remove_file(log_path);
     }
 
@@ -3780,6 +3973,83 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn restored_live_session_reflows_history_on_resize() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        let long_line = "0123456789abcdefghijklmnopqrstuvwxyz";
+        std::fs::write(&log_path, long_line).expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize {
+                    rows: 6,
+                    cols: 12,
+                    pixel_width: 120,
+                    pixel_height: 120,
+                    dpi: 96,
+                },
+                log_path: log_path.clone(),
+                exited: false,
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let restored = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize {
+                    rows: 6,
+                    cols: 12,
+                    pixel_width: 120,
+                    pixel_height: 120,
+                    dpi: 96,
+                },
+            })
+            .expect("restore shell session");
+        assert!(
+            !restored.visible_rows.iter().any(|row| row == long_line),
+            "narrow restored session should initially wrap history: {:?}",
+            restored.visible_rows
+        );
+
+        let resized = manager
+            .resize_session(ResizeSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize {
+                    rows: 6,
+                    cols: 80,
+                    pixel_width: 800,
+                    pixel_height: 120,
+                    dpi: 96,
+                },
+            })
+            .expect("resize restored session");
+
+        assert!(
+            resized
+                .visible_rows
+                .iter()
+                .any(|row| row.starts_with(long_line)),
+            "resized restored session should reflow history: {:?}",
+            resized.visible_rows
+        );
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn session_manager_restores_shell_in_last_known_cwd() {
         let log_dir = unique_log_dir();
@@ -4237,6 +4507,7 @@ mod tests {
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
+            log_cache: Some(Vec::new()),
         };
 
         output
@@ -4247,10 +4518,11 @@ mod tests {
             "historical replay should not write terminal replies to the live PTY"
         );
 
+        let replay_writes = replay_gate.dropped_write_count();
         let replay_flushes = replay_gate.dropped_flush_count();
         output.terminal.advance_bytes(b"\x1b[c");
         replay_gate
-            .wait_for_dropped_flush_after(replay_flushes)
+            .wait_for_dropped_activity_quiet_after(replay_writes, replay_flushes)
             .expect("drain replay writer");
         replay_gate
             .enable(Box::new(RecordingWriter {
@@ -4304,6 +4576,7 @@ mod tests {
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
+            log_cache: Some(Vec::new()),
         }
     }
 
