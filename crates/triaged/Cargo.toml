@@ -24,6 +24,13 @@ triage-transport-ws = { path = "../triage-transport-ws" }
 rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = "0.1"
+rust-embed = { version = "8", features = ["compression"] }
+bytes = "1"
+http = "1"
+flate2 = "1"
 
 [lints]
 workspace = true

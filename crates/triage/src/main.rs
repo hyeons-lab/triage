@@ -43,6 +43,79 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let StartupMode::ClientReload {
+        socket_path: _socket_path,
+    } = &startup_mode
+    {
+        #[cfg(unix)]
+        {
+            let path = _socket_path
+                .clone()
+                .unwrap_or_else(triaged::ipc::default_socket_path);
+            if !path.exists() {
+                bail!(
+                    "Daemon Unix socket not found at {}. Is the Triage daemon running?",
+                    path.display()
+                );
+            }
+            let client = triaged::ipc::UnixSocketClient::new(path);
+            println!("Sending ReloadClientAssets command to triaged daemon...");
+            client
+                .reload_client_assets()
+                .context("failed to reload web assets cache")?;
+            println!("Successfully reloaded web assets cache.");
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("Client asset reloading is only supported on Unix systems.");
+        }
+    }
+
+    if let StartupMode::ClientUpgrade {
+        socket_path: _socket_path,
+        src,
+    } = &startup_mode
+    {
+        if !src.exists() || !src.is_dir() {
+            bail!(
+                "Source directory does not exist or is not a directory: {}",
+                src.display()
+            );
+        }
+
+        let dest = triaged::http::default_override_dir()
+            .context("failed to resolve web override directory")?;
+
+        println!(
+            "Upgrading web client assets from {} to {}...",
+            src.display(),
+            dest.display()
+        );
+
+        copy_dir_all(src, &dest).context("failed to copy client assets")?;
+        println!("Assets successfully copied.");
+
+        #[cfg(unix)]
+        {
+            let path = _socket_path
+                .clone()
+                .unwrap_or_else(triaged::ipc::default_socket_path);
+            if path.exists() {
+                let client = triaged::ipc::UnixSocketClient::new(path);
+                println!("Notifying triaged daemon to reload web cache...");
+                if let Err(e) = client.reload_client_assets() {
+                    tracing::warn!(
+                        "Failed to notify daemon: {e}. The daemon will use new assets upon next restart."
+                    );
+                } else {
+                    println!("Successfully notified daemon. New assets are live.");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let size = initial_session_size()?;
     let mut app = start_app(size, startup_mode).context("starting local session")?;
     let mut terminal = match TerminalSession::enter().context("starting terminal UI") {
@@ -59,6 +132,20 @@ fn main() -> Result<()> {
 
     result?;
     shutdown_result.context("shutting down local session")?;
+    Ok(())
+}
+
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
     Ok(())
 }
 
@@ -147,6 +234,9 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
         }
         StartupMode::Pair => unreachable!("pair mode exits before startup"),
         StartupMode::Help => unreachable!("help mode exits before startup"),
+        StartupMode::ClientReload { .. } | StartupMode::ClientUpgrade { .. } => {
+            unreachable!("client subcommands exit before starting app")
+        }
     }
 }
 
@@ -161,26 +251,41 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
         StartupMode::Embedded => LocalSessionApp::start(size),
         StartupMode::Pair => unreachable!("pair mode exits before startup"),
         StartupMode::Help => unreachable!("help mode exits before startup"),
+        StartupMode::ClientReload { .. } | StartupMode::ClientUpgrade { .. } => {
+            unreachable!("client subcommands exit before starting app")
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartupMode {
-    Daemon { socket_path: PathBuf },
+    Daemon {
+        socket_path: PathBuf,
+    },
     Embedded,
     Pair,
+    ClientReload {
+        socket_path: Option<PathBuf>,
+    },
+    ClientUpgrade {
+        socket_path: Option<PathBuf>,
+        src: PathBuf,
+    },
     Help,
 }
 
 impl StartupMode {
     const HELP: &'static str = "\
-usage: triage [--socket <path>] [--embedded] [pair]
+usage: triage [--socket <path>] [--embedded] [pair] [client reload] [client upgrade --src <dir>]
 
 Options:
-  pair             Display pairing PIN for remote clients
-  --socket <path>  Connect to a daemon Unix socket at <path>
-  --embedded       Run an isolated in-process session manager
-  -h, --help       Print this help text
+  pair              Display pairing PIN for remote clients
+  client reload     Reload in-memory web asset cache inside running daemon
+  client upgrade    Upgrade web client assets from a source directory
+  --src <dir>       Source directory for web client upgrade (required for client upgrade)
+  --socket <path>   Connect to a daemon Unix socket at <path>
+  --embedded        Run an isolated in-process session manager
+  -h, --help        Print this help text
 
 By default triage connects to the daemon Unix socket on Unix and uses
 embedded development mode on non-Unix platforms. Use --embedded on Unix only
@@ -189,6 +294,7 @@ for isolated development.";
     fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut mode = None;
         let mut socket_path = None;
+        let mut src_path = None;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
@@ -197,6 +303,44 @@ for isolated development.";
                     if mode.replace(StartupMode::Pair).is_some() {
                         bail!("cannot combine multiple modes; pass --help for usage");
                     }
+                }
+                Some("client") => {
+                    let Some(subcmd) = args.next() else {
+                        bail!(
+                            "client requires a subcommand (reload or upgrade); pass --help for usage"
+                        );
+                    };
+                    match subcmd.to_str() {
+                        Some("reload") => {
+                            if mode
+                                .replace(StartupMode::ClientReload { socket_path: None })
+                                .is_some()
+                            {
+                                bail!("cannot combine multiple modes; pass --help for usage");
+                            }
+                        }
+                        Some("upgrade") => {
+                            if mode
+                                .replace(StartupMode::ClientUpgrade {
+                                    socket_path: None,
+                                    src: PathBuf::new(),
+                                })
+                                .is_some()
+                            {
+                                bail!("cannot combine multiple modes; pass --help for usage");
+                            }
+                        }
+                        Some(other) => {
+                            bail!("unknown client subcommand {other}; reload or upgrade")
+                        }
+                        None => bail!("unexpected non-UTF-8 client subcommand"),
+                    }
+                }
+                Some("--src") => {
+                    let Some(val) = args.next() else {
+                        bail!("--src option requires a source directory path");
+                    };
+                    src_path = Some(PathBuf::from(val));
                 }
                 Some("--embedded") => {
                     if mode.replace(StartupMode::Embedded).is_some() {
@@ -232,15 +376,28 @@ for isolated development.";
             bail!("--embedded cannot be combined with --socket; pass --help for usage");
         }
 
-        if let Some(mode) = mode {
-            return Ok(mode);
+        match mode {
+            Some(StartupMode::ClientReload { .. }) => Ok(StartupMode::ClientReload { socket_path }),
+            Some(StartupMode::ClientUpgrade { .. }) => {
+                let Some(src) = src_path else {
+                    bail!("client upgrade requires a source directory via --src <path>");
+                };
+                Ok(StartupMode::ClientUpgrade { socket_path, src })
+            }
+            Some(other) => {
+                if socket_path.is_some() && other == StartupMode::Embedded {
+                    bail!("--embedded cannot be combined with --socket; pass --help for usage");
+                }
+                Ok(other)
+            }
+            None => {
+                if let Some(socket_path) = socket_path {
+                    Ok(StartupMode::Daemon { socket_path })
+                } else {
+                    Ok(default_startup_mode())
+                }
+            }
         }
-
-        if let Some(socket_path) = socket_path {
-            return Ok(StartupMode::Daemon { socket_path });
-        }
-
-        Ok(default_startup_mode())
     }
 }
 

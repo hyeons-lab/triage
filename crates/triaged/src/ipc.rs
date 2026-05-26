@@ -36,12 +36,21 @@ impl UnixSocketConfig {
 
 pub struct UnixSocketServer {
     manager: Arc<SessionManager>,
+    web_cache: Arc<crate::http::WebAssetCache>,
     config: UnixSocketConfig,
 }
 
 impl UnixSocketServer {
-    pub fn new(manager: Arc<SessionManager>, config: UnixSocketConfig) -> Self {
-        Self { manager, config }
+    pub fn new(
+        manager: Arc<SessionManager>,
+        web_cache: Arc<crate::http::WebAssetCache>,
+        config: UnixSocketConfig,
+    ) -> Self {
+        Self {
+            manager,
+            web_cache,
+            config,
+        }
     }
 
     pub fn serve(self) -> Result<()> {
@@ -51,10 +60,11 @@ impl UnixSocketServer {
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     let manager = Arc::clone(&self.manager);
+                    let web_cache = Arc::clone(&self.web_cache);
                     if let Err(error) = thread::Builder::new()
                         .name("triage-ipc-client".to_string())
                         .spawn(move || {
-                            if let Err(error) = handle_connection(manager, stream)
+                            if let Err(error) = handle_connection(manager, web_cache, stream)
                                 && !is_closed_socket_error(&error)
                             {
                                 tracing::warn!(error = ?error, "Unix socket client failed");
@@ -81,6 +91,13 @@ impl UnixSocketClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+        }
+    }
+
+    pub fn reload_client_assets(&self) -> Result<()> {
+        match self.round_trip(WireRequest::ReloadClientAssets)? {
+            WireSuccess::Unit => Ok(()),
+            other => bail!("unexpected reload response: {other:?}"),
         }
     }
 
@@ -279,6 +296,7 @@ enum WireRequest {
         session_id: SessionId,
     },
     Handover,
+    ReloadClientAssets,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,7 +406,11 @@ fn bind_owner_socket(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> Result<()> {
+fn handle_connection(
+    manager: Arc<SessionManager>,
+    web_cache: Arc<crate::http::WebAssetCache>,
+    stream: UnixStream,
+) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning Unix socket stream")?);
     let request: WireRequest = read_json_line(&mut reader)?.context("reading request")?;
     let mut writer = BufWriter::new(stream);
@@ -412,7 +434,7 @@ fn handle_connection(manager: Arc<SessionManager>, stream: UnixStream) -> Result
         return handle_subscription(&manager, session_id, after_event_seq, &mut writer);
     }
 
-    let response = WireResponse::from_result(handle_request(&manager, request));
+    let response = WireResponse::from_result(handle_request(&manager, &web_cache, request));
     write_json_line(&mut writer, &response).context("writing response")?;
     writer.flush().context("flushing response")?;
     Ok(())
@@ -550,7 +572,11 @@ fn handle_subscription(
     }
 }
 
-fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<WireSuccess> {
+fn handle_request(
+    manager: &SessionManager,
+    web_cache: &crate::http::WebAssetCache,
+    request: WireRequest,
+) -> Result<WireSuccess> {
     match request {
         WireRequest::ListSessions => manager.list_sessions().map(WireSuccess::SessionIds),
         WireRequest::StartSession(request) => {
@@ -591,6 +617,10 @@ fn handle_request(manager: &SessionManager, request: WireRequest) -> Result<Wire
             .map(WireSuccess::CompletedSession),
         WireRequest::Handover => {
             bail!("handover requests require direct socket handler")
+        }
+        WireRequest::ReloadClientAssets => {
+            web_cache.reload();
+            Ok(WireSuccess::Unit)
         }
     }
 }
