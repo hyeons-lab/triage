@@ -188,6 +188,7 @@ void main() {
       final f = client.attachSession(
         sessionId: 'session-789',
         clientId: 'client-abc',
+        mode: 'Observer',
       );
       f.catchError((_) => <String, dynamic>{});
 
@@ -204,7 +205,7 @@ void main() {
       final attachReq = msg.payload as fbs.AttachSessionRequestTable;
       expect(attachReq.sessionId, equals('session-789'));
       expect(attachReq.clientId, equals('client-abc'));
-      expect(attachReq.mode, equals(fbs.AttachMode.InteractiveController));
+      expect(attachReq.mode, equals(fbs.AttachMode.Observer));
     });
 
     test(

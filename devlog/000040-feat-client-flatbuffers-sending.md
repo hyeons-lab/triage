@@ -13,6 +13,8 @@ Support the FlatBuffers binary subprotocol in the Flutter client for outgoing re
 - Implemented `isFlatBuffersNegotiated` getter to dynamically detect the negotiated subprotocol post-handshake.
 - Added private serialization mapper `_serializeFlatBuffersRequest` using generated `ObjectBuilder` classes to serialize all 11 client request payloads.
 - Intercepted `_send` and `writeInput` to serialize and dispatch binary FlatBuffers payloads instead of JSON text frames when `triage-flatbuffers` is active.
+- Resolved subprotocol timing race conditions by awaiting the WebSocket handshake ready promise (`channel.ready`) before assigning the channel reference and sending any requests.
+- Mapped outgoing `AttachSessionRequestTable.mode` dynamically from the input request mode string to corresponding FlatBuffers `AttachMode` enum values (`Observer`, `AgentController`, `InteractiveController`), rather than hardcoding.
 
 ## Decisions
 
@@ -25,6 +27,8 @@ Support the FlatBuffers binary subprotocol in the Flutter client for outgoing re
 
 ## Commits
 
-- HEAD — fix(client): resolve nested extraction bugs for styled_rows, attach, and subscribe client requests
+- HEAD — fix(client): await channel ready and map AttachMode enum in FlatBuffers path
+- 26fdbaf — docs(devlog): document round 2 review resolutions in plan file
+- c0a411a — fix(client): resolve nested extraction bugs for styled_rows, attach, and subscribe client requests
 - d9db6f5 — fix(client): address PR comments on channel safety, allocations, and add FlatBuffers unit tests
 - 78f7a30 — feat(client): implement bi-directional FlatBuffers serialization and sending

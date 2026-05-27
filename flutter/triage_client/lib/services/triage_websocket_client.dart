@@ -38,8 +38,8 @@ class TriageWebSocketClient {
     if (_channel != null) return;
 
     try {
-      _channel = _channelFactory(uri);
-      _channel!.stream.listen(
+      final channel = _channelFactory(uri);
+      channel.stream.listen(
         (message) {
           _handleIncomingMessage(message);
         },
@@ -57,6 +57,8 @@ class TriageWebSocketClient {
           _eventController.add({'type': 'connection_closed'});
         },
       );
+      _channel = channel;
+      await channel.ready;
     } catch (error) {
       _cleanupPendingRequests();
       _channel = null;
@@ -667,10 +669,19 @@ class TriageWebSocketClient {
       case 'attach_session':
         payloadType = fbs.ClientRequestPayloadTypeId.AttachSessionRequestTable;
         final request = extra?['request'] as Map<String, dynamic>?;
+        final modeStr = request?['mode'] as String?;
+        final fbs.AttachMode mode;
+        if (modeStr == 'Observer') {
+          mode = fbs.AttachMode.Observer;
+        } else if (modeStr == 'AgentController') {
+          mode = fbs.AttachMode.AgentController;
+        } else {
+          mode = fbs.AttachMode.InteractiveController;
+        }
         payload = fbs.AttachSessionRequestTableObjectBuilder(
           sessionId: request?['session_id'] as String?,
           clientId: request?['client_id'] as String?,
-          mode: fbs.AttachMode.InteractiveController,
+          mode: mode,
         );
         break;
 
