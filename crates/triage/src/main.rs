@@ -1341,7 +1341,10 @@ fn write_osc52_clipboard(output: &mut CrosstermBackend<Stdout>, text: &str) -> R
     #[cfg(target_os = "macos")]
     {
         use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Ok(mut child) = Command::new("/usr/bin/pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
             }
@@ -1571,20 +1574,10 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
         {
             Some(AppCommand::Close)
         }
-        KeyCode::Down | KeyCode::Right
-            if key.modifiers.contains(KeyModifiers::ALT)
-                || key
-                    .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
+        KeyCode::Down | KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(AppCommand::Next)
         }
-        KeyCode::Up | KeyCode::Left
-            if key.modifiers.contains(KeyModifiers::ALT)
-                || key
-                    .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
+        KeyCode::Up | KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(AppCommand::Previous)
         }
         KeyCode::F(2) => Some(AppCommand::ToggleSidebar),

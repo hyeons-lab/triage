@@ -23,5 +23,10 @@ Resolve the keyboard shortcut tab switching issue on macOS where the default `Al
 
 ## Commits
 
-- HEAD — fix(triage): use pbcopy for native macOS clipboard copy support in TUI
+- HEAD — fix(triage): address PR review comments
+- 7308c24 — fix(triage): use pbcopy for native macOS clipboard copy support in TUI
 - 1aa224d — fix(triage): add Ctrl+Alt+Arrow and F3/F4 tab switching shortcuts for macOS
+
+## Progress
+
+- 2026-05-27T15:15-0700: Addressed PR review comments by switching macOS clipboard spawning to `/usr/bin/pbcopy` and simplifying `Alt + Arrow` modifier guards; `KeyModifiers::contains(KeyModifiers::ALT)` already covers `Ctrl + Alt` combinations. Verified with `cargo fmt --all -- --check` and `cargo test -p triage reserved_control_keys_become_app_commands`.
