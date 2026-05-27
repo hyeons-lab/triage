@@ -114,8 +114,13 @@ void main() {
       await client.connect();
     });
 
+    tearDown(() async {
+      await client.disconnect();
+    });
+
     test('hello request translates to binary FlatBuffers', () async {
-      client.hello(clientId: 'client-123', token: 'token-abc');
+      final f = client.hello(clientId: 'client-123', token: 'token-abc');
+      f.catchError((_) => <String, dynamic>{});
 
       expect(sink.sent, hasLength(1));
       final bytes = sink.sent.first as List<int>;
@@ -156,7 +161,12 @@ void main() {
     });
 
     test('resizeSession request translates to binary FlatBuffers', () async {
-      client.resizeSession(sessionId: 'session-456', cols: 120, rows: 40);
+      final f = client.resizeSession(
+        sessionId: 'session-456',
+        cols: 120,
+        rows: 40,
+      );
+      f.catchError((_) => <String, dynamic>{});
 
       expect(sink.sent, hasLength(1));
       final bytes = sink.sent.first as List<int>;
@@ -172,6 +182,76 @@ void main() {
       expect(resizeReq.sessionId, equals('session-456'));
       expect(resizeReq.size!.cols, equals(120));
       expect(resizeReq.size!.rows, equals(40));
+    });
+
+    test('attachSession request translates to binary FlatBuffers', () async {
+      final f = client.attachSession(
+        sessionId: 'session-789',
+        clientId: 'client-abc',
+      );
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.AttachSessionRequestTable),
+      );
+
+      final attachReq = msg.payload as fbs.AttachSessionRequestTable;
+      expect(attachReq.sessionId, equals('session-789'));
+      expect(attachReq.clientId, equals('client-abc'));
+      expect(attachReq.mode, equals(fbs.AttachMode.InteractiveController));
+    });
+
+    test(
+      'subscribeSessionEvents request translates to binary FlatBuffers',
+      () async {
+        final f = client.subscribeSessionEvents(
+          sessionId: 'session-789',
+          afterEventSeq: 42,
+        );
+        f.catchError((_) => '');
+
+        expect(sink.sent, hasLength(1));
+        final bytes = sink.sent.first as List<int>;
+
+        final msg = fbs.ClientMessage(bytes);
+        expect(msg.id, equals('req-0'));
+        expect(
+          msg.payloadType,
+          equals(
+            fbs.ClientRequestPayloadTypeId.SubscribeSessionEventsRequestTable,
+          ),
+        );
+
+        final subReq = msg.payload as fbs.SubscribeSessionEventsRequestTable;
+        expect(subReq.sessionId, equals('session-789'));
+        expect(subReq.afterEventSeq, equals(42));
+      },
+    );
+
+    test('styledRows request translates to binary FlatBuffers', () async {
+      final f = client.styledRows(sessionId: 'session-789', start: 10, end: 20);
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.StyledRowsRequestTable),
+      );
+
+      final styledReq = msg.payload as fbs.StyledRowsRequestTable;
+      expect(styledReq.sessionId, equals('session-789'));
+      expect(styledReq.start, equals(10));
+      expect(styledReq.end, equals(20));
     });
   });
 }

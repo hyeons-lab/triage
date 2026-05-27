@@ -25,5 +25,6 @@ Support the FlatBuffers binary subprotocol in the Flutter client for outgoing re
 
 ## Commits
 
-- HEAD — fix(client): address PR comments on channel safety, allocations, and add FlatBuffers unit tests
+- HEAD — fix(client): resolve nested extraction bugs for styled_rows, attach, and subscribe client requests
+- d9db6f5 — fix(client): address PR comments on channel safety, allocations, and add FlatBuffers unit tests
 - 78f7a30 — feat(client): implement bi-directional FlatBuffers serialization and sending

@@ -666,9 +666,10 @@ class TriageWebSocketClient {
 
       case 'attach_session':
         payloadType = fbs.ClientRequestPayloadTypeId.AttachSessionRequestTable;
+        final request = extra?['request'] as Map<String, dynamic>?;
         payload = fbs.AttachSessionRequestTableObjectBuilder(
-          sessionId: extra?['session_id'] as String?,
-          clientId: extra?['client_id'] as String?,
+          sessionId: request?['session_id'] as String?,
+          clientId: request?['client_id'] as String?,
           mode: fbs.AttachMode.InteractiveController,
         );
         break;
@@ -676,8 +677,10 @@ class TriageWebSocketClient {
       case 'subscribe_session_events':
         payloadType =
             fbs.ClientRequestPayloadTypeId.SubscribeSessionEventsRequestTable;
+        final request = extra?['request'] as Map<String, dynamic>?;
         payload = fbs.SubscribeSessionEventsRequestTableObjectBuilder(
-          sessionId: extra?['session_id'] as String?,
+          sessionId: request?['session_id'] as String?,
+          afterEventSeq: request?['after_event_seq'] as int?,
         );
         break;
 
@@ -733,10 +736,11 @@ class TriageWebSocketClient {
 
       case 'styled_rows':
         payloadType = fbs.ClientRequestPayloadTypeId.StyledRowsRequestTable;
+        final request = extra?['request'] as Map<String, dynamic>?;
         payload = fbs.StyledRowsRequestTableObjectBuilder(
-          sessionId: extra?['session_id'] as String?,
-          start: extra?['start_row'] as int?,
-          end: extra?['end_row'] as int?,
+          sessionId: request?['session_id'] as String?,
+          start: request?['start'] as int?,
+          end: request?['end'] as int?,
         );
         break;
 
