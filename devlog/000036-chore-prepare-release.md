@@ -27,7 +27,8 @@ Prepare the repository for initial publication to crates.io by bumping the versi
 
 ## Commits
 
-- HEAD — doc: resolve crates.io documentation url inheritance in manifests
+- HEAD — doc: document zero-downtime handover upgrades in triaged readme
+- 59a58ac — doc: resolve crates.io documentation url inheritance in manifests
 - f0f0eab — chore: implement pre-bundled crates.io packaging and CI/CD manual dispatch workflow
 - 7aa171c — chore: prepare repository and metadata for crates.io release
 
