@@ -57,8 +57,8 @@ class TriageWebSocketClient {
           _eventController.add({'type': 'connection_closed'});
         },
       );
-      _channel = channel;
       await channel.ready;
+      _channel = channel;
     } catch (error) {
       _cleanupPendingRequests();
       _channel = null;
@@ -135,7 +135,6 @@ class TriageWebSocketClient {
     } catch (e) {
       _pendingRequests.remove(id);
       _requestTimers.remove(id)?.cancel();
-      completer.completeError(e);
       rethrow;
     }
 
@@ -671,13 +670,16 @@ class TriageWebSocketClient {
         final request = extra?['request'] as Map<String, dynamic>?;
         final modeStr = request?['mode'] as String?;
         final fbs.AttachMode mode;
-        if (modeStr == 'Observer') {
-          mode = fbs.AttachMode.Observer;
-        } else if (modeStr == 'AgentController') {
-          mode = fbs.AttachMode.AgentController;
-        } else {
-          mode = fbs.AttachMode.InteractiveController;
-        }
+        mode = switch (modeStr) {
+          'Observer' => fbs.AttachMode.Observer,
+          'AgentController' => fbs.AttachMode.AgentController,
+          'InteractiveController' => fbs.AttachMode.InteractiveController,
+          _ => throw ArgumentError.value(
+            modeStr,
+            'mode',
+            'Unknown attach mode',
+          ),
+        };
         payload = fbs.AttachSessionRequestTableObjectBuilder(
           sessionId: request?['session_id'] as String?,
           clientId: request?['client_id'] as String?,

@@ -15,6 +15,8 @@ Support the FlatBuffers binary subprotocol in the Flutter client for outgoing re
 - Intercepted `_send` and `writeInput` to serialize and dispatch binary FlatBuffers payloads instead of JSON text frames when `triage-flatbuffers` is active.
 - Resolved subprotocol timing race conditions by awaiting the WebSocket handshake ready promise (`channel.ready`) before assigning the channel reference and sending any requests.
 - Mapped outgoing `AttachSessionRequestTable.mode` dynamically from the input request mode string to corresponding FlatBuffers `AttachMode` enum values (`Observer`, `AgentController`, `InteractiveController`), rather than hardcoding.
+- Tightened FlatBuffers attach mode validation so unsupported mode strings fail instead of silently becoming `InteractiveController`.
+- Added regression tests for handshake publication timing, invalid attach modes, and `restoreSession` FlatBuffers serialization.
 
 ## Decisions
 
@@ -27,8 +29,13 @@ Support the FlatBuffers binary subprotocol in the Flutter client for outgoing re
 
 ## Commits
 
-- HEAD — fix(client): await channel ready and map AttachMode enum in FlatBuffers path
+- HEAD — fix(client): address FlatBuffers PR review comments
+- 34bb2d3 — fix(client): await channel ready and map AttachMode enum in FlatBuffers path
 - 26fdbaf — docs(devlog): document round 2 review resolutions in plan file
 - c0a411a — fix(client): resolve nested extraction bugs for styled_rows, attach, and subscribe client requests
 - d9db6f5 — fix(client): address PR comments on channel safety, allocations, and add FlatBuffers unit tests
 - 78f7a30 — feat(client): implement bi-directional FlatBuffers serialization and sending
+
+## Progress
+
+- 2026-05-27T13:57-0700: Addressed follow-up PR review comments by delaying channel publication until WebSocket readiness, rejecting unknown FlatBuffers attach modes, and adding focused test coverage for handshake timing, invalid modes, and restore-session serialization.

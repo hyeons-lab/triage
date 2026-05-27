@@ -7,7 +7,8 @@ import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class FakeWebSocketChannel implements WebSocketChannel {
-  FakeWebSocketChannel({required this.sink, this.protocol});
+  FakeWebSocketChannel({required this.sink, this.protocol, Future<void>? ready})
+    : _ready = ready ?? Future.value();
 
   @override
   final WebSocketSink sink;
@@ -25,7 +26,9 @@ class FakeWebSocketChannel implements WebSocketChannel {
   final String? protocol;
 
   @override
-  Future<void> get ready => Future.value();
+  Future<void> get ready => _ready;
+
+  final Future<void> _ready;
 
   @override
   Stream get stream => _streamController.stream;
@@ -67,6 +70,34 @@ class ThrowingWebSocketSink extends RecordingWebSocketSink {
 }
 
 void main() {
+  test(
+    'connect exposes the channel only after the handshake completes',
+    () async {
+      final sink = RecordingWebSocketSink();
+      final ready = Completer<void>();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+          ready: ready.future,
+        ),
+      );
+
+      final connectFuture = client.connect();
+
+      await Future<void>.delayed(Duration.zero);
+      expect(client.isConnected, isFalse);
+      expect(client.isFlatBuffersNegotiated, isFalse);
+
+      ready.complete();
+      await connectFuture;
+
+      expect(client.isConnected, isTrue);
+      expect(client.isFlatBuffersNegotiated, isTrue);
+    },
+  );
+
   test('writeInput fails when the WebSocket is not connected', () async {
     final client = TriageWebSocketClient(Uri.parse('ws://localhost/ws'));
 
@@ -184,6 +215,30 @@ void main() {
       expect(resizeReq.size!.rows, equals(40));
     });
 
+    test('restoreSession request translates to binary FlatBuffers', () async {
+      final f = client.restoreSession(
+        sessionId: 'session-456',
+        cols: 100,
+        rows: 30,
+      );
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.RestoreSessionRequestTable),
+      );
+
+      final restoreReq = msg.payload as fbs.RestoreSessionRequestTable;
+      expect(restoreReq.sessionId, equals('session-456'));
+      expect(restoreReq.size!.cols, equals(100));
+      expect(restoreReq.size!.rows, equals(30));
+    });
+
     test('attachSession request translates to binary FlatBuffers', () async {
       final f = client.attachSession(
         sessionId: 'session-789',
@@ -206,6 +261,19 @@ void main() {
       expect(attachReq.sessionId, equals('session-789'));
       expect(attachReq.clientId, equals('client-abc'));
       expect(attachReq.mode, equals(fbs.AttachMode.Observer));
+    });
+
+    test('attachSession rejects unknown attach modes', () async {
+      await expectLater(
+        client.attachSession(
+          sessionId: 'session-789',
+          clientId: 'client-abc',
+          mode: 'observer',
+        ),
+        throwsArgumentError,
+      );
+
+      expect(sink.sent, isEmpty);
     });
 
     test(
