@@ -13,8 +13,8 @@ use triage_core::session::{
     SubscribeSessionEventsRequest, WriteInputRequest,
 };
 use triage_transport_ws::{
-    ClientMessage, ClientRequest, ServerMessage, ServerResult, flatbuffers_proto,
-    ServerMessageBorrowed, ServerResultBorrowed, SessionEventBorrowed,
+    ClientMessage, ClientRequest, ServerMessage, ServerMessageBorrowed, ServerResult,
+    ServerResultBorrowed, SessionEventBorrowed, flatbuffers_proto,
     parse_fb_server_message_borrowed,
 };
 
@@ -86,6 +86,7 @@ fn parse_args() -> (String, String, u64, u64, usize, Option<String>) {
     (url, protocol, duration, rate, payload_size, session)
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum ParsedServerMessage<'a> {
     Owned(ServerMessage),
@@ -295,7 +296,7 @@ async fn main() -> Result<()> {
 
             let start_resp = parse_message(&start_resp_raw)?;
 
-            let session_id = match start_resp {
+            match start_resp {
                 ParsedServerMessage::Owned(ServerMessage::Response {
                     result: ServerResult::SessionId { session_id },
                     ..
@@ -312,13 +313,9 @@ async fn main() -> Result<()> {
                     sid
                 }
                 other => {
-                    return Err(anyhow!(
-                        "Failed to start new session. Got: {:?}",
-                        other
-                    ));
+                    return Err(anyhow!("Failed to start new session. Got: {:?}", other));
                 }
-            };
-            session_id
+            }
         }
     };
 
@@ -356,17 +353,15 @@ async fn main() -> Result<()> {
         ParsedServerMessage::Owned(ServerMessage::Response {
             result: ServerResult::AttachSession { .. },
             ..
-        }) | ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+        })
+        | ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
             result: ServerResultBorrowed::AttachSession,
             ..
         }) => {
             println!("Successfully attached to session.");
         }
         other => {
-            return Err(anyhow!(
-                "Failed to attach to session. Got: {:?}",
-                other
-            ));
+            return Err(anyhow!("Failed to attach to session. Got: {:?}", other));
         }
     }
 
@@ -403,7 +398,8 @@ async fn main() -> Result<()> {
         ParsedServerMessage::Owned(ServerMessage::Response {
             result: ServerResult::Subscribed { .. },
             ..
-        }) | ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+        })
+        | ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
             result: ServerResultBorrowed::Subscribed { .. },
             ..
         }) => {
@@ -505,7 +501,8 @@ async fn main() -> Result<()> {
                             if let Ok(ServerMessageBorrowed::Event {
                                 event: SessionEventBorrowed::Output { .. },
                                 ..
-                            }) = parse_fb_server_message_borrowed(&bytes) {
+                            }) = parse_fb_server_message_borrowed(&bytes)
+                            {
                                 output_event_count_receiver.fetch_add(1, Ordering::Relaxed);
                             }
                         }

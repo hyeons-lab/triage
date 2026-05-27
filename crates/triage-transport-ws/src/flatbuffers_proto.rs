@@ -1028,7 +1028,10 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 }
                 fb::ServerResultPayload::SessionIdsResult => {
                     let sids_res = resp.result_as_session_ids_result().ok_or_else(|| {
-                        crate::ProtocolError::new("invalid_flatbuffer", "missing session ids result")
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing session ids result",
+                        )
                     })?;
                     let mut session_ids = Vec::new();
                     if let Some(fb_sids) = sids_res.session_ids() {
@@ -1046,9 +1049,7 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         session_id: sid_res.session_id().unwrap_or(""),
                     }
                 }
-                fb::ServerResultPayload::AttachSessionResult => {
-                    ServerResultBorrowed::AttachSession
-                }
+                fb::ServerResultPayload::AttachSessionResult => ServerResultBorrowed::AttachSession,
                 fb::ServerResultPayload::SubscribedResult => {
                     let sub_res = resp.result_as_subscribed_result().ok_or_else(|| {
                         crate::ProtocolError::new("invalid_flatbuffer", "missing subscribed result")
@@ -1139,9 +1140,14 @@ pub fn parse_fb_server_message_borrowed<'a>(
             })
         }
         fb::ServerMessagePayload::SubscriptionClosedPayload => {
-            let closed = root.payload_as_subscription_closed_payload().ok_or_else(|| {
-                crate::ProtocolError::new("invalid_flatbuffer", "missing subscription closed payload")
-            })?;
+            let closed = root
+                .payload_as_subscription_closed_payload()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "missing subscription closed payload",
+                    )
+                })?;
             Ok(ServerMessageBorrowed::SubscriptionClosed {
                 subscription_id: closed.subscription_id().unwrap_or(""),
             })
