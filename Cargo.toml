@@ -8,7 +8,6 @@ version = "0.1.0"
 license = "Apache-2.0"
 repository = "https://github.com/hyeons-lab/triage"
 homepage = "https://github.com/hyeons-lab/triage"
-documentation = "https://docs.rs/triage-core"
 authors = ["Hyeons' Lab <info@hyeons-lab.com>"]
 keywords = ["terminal", "pty", "supervisor", "ratatui", "mcp"]
 categories = ["command-line-utilities", "development-tools"]

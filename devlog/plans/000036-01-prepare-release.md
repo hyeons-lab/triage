@@ -40,3 +40,7 @@ Our steps are:
 4.  **Verify**:
     *   Type-check the workspace using `cargo check --workspace`.
     *   Verify with a dry-run publish validation: `cargo publish --dry-run` on each crate in order.
+
+## Update: Address PR Comments on Documentation URLs (2026-05-26)
+
+Following PR review comments, the shared `documentation` URL inheritance has been removed from all package manifests to let crates.io naturally infer separate docs.rs links for every crate.
