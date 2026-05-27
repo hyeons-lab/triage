@@ -691,7 +691,7 @@ class _TriageHomeState extends State<TriageHome> {
     final terminalWidth =
         viewportSize.width - sidebarWidth - 1 - horizontalPadding;
     final terminalHeight = viewportSize.height - headerHeight;
-    final cols = (terminalWidth / averageCellWidth).floor().clamp(40, 240);
+    final cols = (terminalWidth / averageCellWidth).floor().clamp(80, 240);
     final rows = (terminalHeight / averageCellHeight).floor().clamp(10, 80);
     return (rows, cols);
   }

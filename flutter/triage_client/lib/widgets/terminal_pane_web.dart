@@ -727,7 +727,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         final fittedRows = fittedRowsNum.toInt();
         final fittedCols = fittedColsNum.toInt();
 
-        if (fittedRows >= 5 && fittedCols >= 40) {
+        if (fittedRows >= 5 && fittedCols >= 80) {
           final sizeChanged =
               _lastFittedRows != fittedRows || _lastFittedCols != fittedCols;
           _lastFittedRows = fittedRows;
@@ -752,7 +752,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (!_styleSheetLoaded) {
               return;
             }
-            if (fittedCols < 35) {
+            if (fittedCols < 80) {
               // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
               return;
             }
