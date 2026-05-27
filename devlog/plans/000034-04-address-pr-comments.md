@@ -15,10 +15,16 @@ We need to address the latest PR review comments targeting the E2E stress testin
 3. **Validation and Lint Verification**:
    - We will run `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --workspace` to ensure zero-warning compilation and that all tests pass.
 
+4. **FlatBuffers Enum and Union Deserialization Safety**:
+   - We will address the new PR review comment regarding defaulting unknown enum/union values. Unrecognized values will return a descriptive `ProtocolError` rather than silently defaulting to standard values.
+   - We will modify the match blocks for `AttachMode` and `InputControllerKind` inside `crates/triage-transport-ws/src/flatbuffers_proto.rs` to return `invalid_enum` errors on unknown values.
+   - We will modify `ServerResultPayload` matching to return `invalid_flatbuffer` on unknown results while preserving `NONE` mapped to `Unit`.
+
 ## Plan
-- [ ] Modify `crates/triage-transport-ws/src/bin/stress_client.rs` to clamp the pacing interval duration calculation to at least 1 nanosecond.
-- [ ] Eliminate all unsafe `.unwrap()` calls during `ClientId` and `SessionId` parsing inside `stress_client.rs`, propagating errors cleanly using `?` or `anyhow` contexts.
-- [ ] Verify clean compilation with `cargo check --workspace`.
-- [ ] Run formatting check with `cargo fmt --all -- --check`.
-- [ ] Run lints with `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] Run all workspace tests with `cargo test --workspace`.
+- [x] Modify `crates/triage-transport-ws/src/bin/stress_client.rs` to clamp the pacing interval duration calculation to at least 1 nanosecond.
+- [x] Eliminate all unsafe `.unwrap()` calls during `ClientId` and `SessionId` parsing inside `stress_client.rs`, propagating errors cleanly using `?` or `anyhow` contexts.
+- [x] Implement strict FlatBuffers enum and union validation inside `crates/triage-transport-ws/src/flatbuffers_proto.rs`, returning descriptive protocol errors on unknown variants.
+- [x] Verify clean compilation with `cargo check --workspace`.
+- [x] Run formatting check with `cargo fmt --all -- --check`.
+- [x] Run lints with `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] Run all workspace tests with `cargo test --workspace`.

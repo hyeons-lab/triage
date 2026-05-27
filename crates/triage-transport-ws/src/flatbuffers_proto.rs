@@ -105,7 +105,12 @@ pub fn parse_client_message(
                 fb::AttachMode::Observer => AttachMode::Observer,
                 fb::AttachMode::InteractiveController => AttachMode::InteractiveController,
                 fb::AttachMode::AgentController => AttachMode::AgentController,
-                _ => AttachMode::Observer,
+                other => {
+                    return Err(crate::ProtocolError::new(
+                        "invalid_enum",
+                        format!("invalid AttachMode value: {:?}", other.0),
+                    ));
+                }
             };
             ClientRequest::AttachSession {
                 request: AttachSessionRequest {
@@ -163,7 +168,12 @@ pub fn parse_client_message(
             let kind = match req.kind() {
                 fb::InputControllerKind::Interactive => InputControllerKind::Interactive,
                 fb::InputControllerKind::Agent => InputControllerKind::Agent,
-                _ => InputControllerKind::Interactive,
+                other => {
+                    return Err(crate::ProtocolError::new(
+                        "invalid_enum",
+                        format!("invalid InputControllerKind value: {:?}", other.0),
+                    ));
+                }
             };
             ClientRequest::AcquireInputLease {
                 request: InputLeaseRequest {
@@ -1058,7 +1068,13 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         subscription_id: sub_res.subscription_id().unwrap_or(""),
                     }
                 }
-                _ => ServerResultBorrowed::Unit,
+                fb::ServerResultPayload::NONE => ServerResultBorrowed::Unit,
+                _ => {
+                    return Err(crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "unknown server result payload type",
+                    ));
+                }
             };
             Ok(ServerMessageBorrowed::Response { id, result })
         }
