@@ -1560,13 +1560,25 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
         {
             Some(AppCommand::Close)
         }
-        KeyCode::Down | KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyCode::Down | KeyCode::Right
+            if key.modifiers.contains(KeyModifiers::ALT)
+                || key
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             Some(AppCommand::Next)
         }
-        KeyCode::Up | KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyCode::Up | KeyCode::Left
+            if key.modifiers.contains(KeyModifiers::ALT)
+                || key
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             Some(AppCommand::Previous)
         }
         KeyCode::F(2) => Some(AppCommand::ToggleSidebar),
+        KeyCode::F(3) => Some(AppCommand::Next),
+        KeyCode::F(4) => Some(AppCommand::Previous),
         KeyCode::PageUp => Some(AppCommand::ScrollUp),
         KeyCode::PageDown => Some(AppCommand::ScrollDown),
         _ => None,
@@ -1815,8 +1827,30 @@ mod tests {
             Some(AppCommand::Previous)
         );
         assert_eq!(
+            key_to_command(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some(AppCommand::Previous)
+        );
+        assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
             Some(AppCommand::ToggleSidebar)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)),
+            Some(AppCommand::Previous)
         );
         assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
