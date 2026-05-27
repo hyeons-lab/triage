@@ -11,6 +11,14 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
+include = [
+    "src/**/*",
+    "dist/**/*",
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "web_fallback/**/*"
+]
 
 [dependencies]
 triage-core = { path = "../triage-core" }
