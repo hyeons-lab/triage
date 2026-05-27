@@ -31,6 +31,8 @@ class TriageWebSocketClient {
 
   bool get isConnected => _channel != null;
 
+  bool get isFlatBuffersNegotiated => _channel?.protocol == 'triage-flatbuffers';
+
   Future<void> connect() async {
     if (_channel != null) return;
 
@@ -122,7 +124,12 @@ class TriageWebSocketClient {
     }
 
     try {
-      _channel!.sink.add(jsonEncode(payload));
+      if (isFlatBuffersNegotiated) {
+        final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
+        _channel!.sink.add(bytes);
+      } else {
+        _channel!.sink.add(jsonEncode(payload));
+      }
     } catch (e) {
       _pendingRequests.remove(id);
       _requestTimers.remove(id)?.cancel();
@@ -218,7 +225,21 @@ class TriageWebSocketClient {
       },
     };
     try {
-      channel.sink.add(jsonEncode(payload));
+      if (isFlatBuffersNegotiated) {
+        final bytesPayload = fbs.WriteInputRequestTableObjectBuilder(
+          sessionId: sessionId,
+          clientId: clientId,
+          bytes: bytes,
+        );
+        final msg = fbs.ClientMessageObjectBuilder(
+          id: 'req-${_requestIdCounter++}',
+          payloadType: fbs.ClientRequestPayloadTypeId.WriteInputRequestTable,
+          payload: bytesPayload,
+        );
+        channel.sink.add(msg.toBytes());
+      } else {
+        channel.sink.add(jsonEncode(payload));
+      }
     } catch (error, stackTrace) {
       _cleanupPendingRequests();
       if (identical(_channel, channel)) {
@@ -590,5 +611,134 @@ class TriageWebSocketClient {
       default:
         return {};
     }
+  }
+
+  List<int> _serializeFlatBuffersRequest(String id, String type, Map<String, dynamic>? extra) {
+    final fbs.ClientRequestPayloadTypeId payloadType;
+    final dynamic payload;
+
+    switch (type) {
+      case 'hello':
+        payloadType = fbs.ClientRequestPayloadTypeId.HelloRequest;
+        payload = fbs.HelloRequestObjectBuilder(
+          clientId: extra?['client_id'] as String?,
+          token: extra?['token'] as String?,
+        );
+        break;
+
+      case 'pair':
+        payloadType = fbs.ClientRequestPayloadTypeId.PairRequest;
+        payload = fbs.PairRequestObjectBuilder(
+          code: extra?['code'] as String?,
+          clientId: extra?['client_id'] as String?,
+        );
+        break;
+
+      case 'list_sessions':
+        payloadType = fbs.ClientRequestPayloadTypeId.ListSessionsRequest;
+        payload = fbs.ListSessionsRequestObjectBuilder();
+        break;
+
+      case 'start_session':
+        payloadType = fbs.ClientRequestPayloadTypeId.StartSessionRequestTable;
+        final request = extra?['request'] as Map<String, dynamic>?;
+        final sizeMap = request?['size'] as Map<String, dynamic>?;
+        payload = fbs.StartSessionRequestTableObjectBuilder(
+          command: request?['command'] as String?,
+          args: (request?['args'] as List?)?.cast<String>(),
+          cwd: request?['cwd'] as String?,
+          size: sizeMap == null
+              ? null
+              : fbs.SessionSizeObjectBuilder(
+                  rows: sizeMap['rows'] as int? ?? 24,
+                  cols: sizeMap['cols'] as int? ?? 80,
+                  pixelWidth: sizeMap['pixel_width'] as int? ?? 800,
+                  pixelHeight: sizeMap['pixel_height'] as int? ?? 480,
+                  dpi: sizeMap['dpi'] as int? ?? 96,
+                ),
+        );
+        break;
+
+      case 'attach_session':
+        payloadType = fbs.ClientRequestPayloadTypeId.AttachSessionRequestTable;
+        payload = fbs.AttachSessionRequestTableObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+          clientId: extra?['client_id'] as String?,
+          mode: fbs.AttachMode.InteractiveController,
+        );
+        break;
+
+      case 'subscribe_session_events':
+        payloadType = fbs.ClientRequestPayloadTypeId.SubscribeSessionEventsRequestTable;
+        payload = fbs.SubscribeSessionEventsRequestTableObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+        );
+        break;
+
+      case 'resize_session':
+        payloadType = fbs.ClientRequestPayloadTypeId.ResizeSessionRequestTable;
+        final cols = extra?['cols'] as int? ?? 80;
+        final rows = extra?['rows'] as int? ?? 24;
+        payload = fbs.ResizeSessionRequestTableObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+          size: fbs.SessionSizeObjectBuilder(
+            rows: rows,
+            cols: cols,
+            pixelWidth: cols * 10,
+            pixelHeight: rows * 20,
+            dpi: 96,
+          ),
+        );
+        break;
+
+      case 'restore_session':
+        payloadType = fbs.ClientRequestPayloadTypeId.RestoreSessionRequestTable;
+        final cols = extra?['cols'] as int? ?? 80;
+        final rows = extra?['rows'] as int? ?? 24;
+        payload = fbs.RestoreSessionRequestTableObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+          size: fbs.SessionSizeObjectBuilder(
+            rows: rows,
+            cols: cols,
+            pixelWidth: cols * 10,
+            pixelHeight: rows * 20,
+            dpi: 96,
+          ),
+        );
+        break;
+
+      case 'snapshot_session':
+        payloadType = fbs.ClientRequestPayloadTypeId.SnapshotSessionRequest;
+        payload = fbs.SnapshotSessionRequestObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+        );
+        break;
+
+      case 'shutdown_session':
+        payloadType = fbs.ClientRequestPayloadTypeId.ShutdownSessionRequest;
+        payload = fbs.ShutdownSessionRequestObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+        );
+        break;
+
+      case 'styled_rows':
+        payloadType = fbs.ClientRequestPayloadTypeId.StyledRowsRequestTable;
+        payload = fbs.StyledRowsRequestTableObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+          start: extra?['start_row'] as int?,
+          end: extra?['end_row'] as int?,
+        );
+        break;
+
+      default:
+        throw UnimplementedError('FlatBuffers serialization not implemented for request type: $type');
+    }
+
+    final msg = fbs.ClientMessageObjectBuilder(
+      id: id,
+      payloadType: payloadType,
+      payload: payload,
+    );
+    return msg.toBytes();
   }
 }
