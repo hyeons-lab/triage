@@ -75,9 +75,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (completer != null) {
       final snapRes = await completer.future;
       return {
-        'response': {
-          'snapshot': snapRes['snapshot'],
-        },
+        'response': {'snapshot': snapRes['snapshot']},
       };
     }
     final visibleRows = snapshotVisibleRows[sessionId];
@@ -400,49 +398,52 @@ void main() {
     expect(client.writeInputCalls.contains('flutter-spike'), isTrue);
   });
 
-  testWidgets('restores historical sessions using authentic saved size when available', (
-    WidgetTester tester,
-  ) async {
-    tester.view.physicalSize = const Size(1200, 800);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(() {
-      tester.view.resetPhysicalSize();
-      tester.view.resetDevicePixelRatio();
-    });
+  testWidgets(
+    'restores historical sessions using authentic saved size when available',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1200, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
 
-    final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+      final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    expect(client.restoreSessionCalls, contains('main'));
-    expect(client.restoreSessionSizes['main'], '80x24');
-  });
+      expect(client.restoreSessionCalls, contains('main'));
+      expect(client.restoreSessionSizes['main'], '80x24');
+    },
+  );
 
-  testWidgets('restores historical sessions using estimated viewport size when saved size is absent', (
-    WidgetTester tester,
-  ) async {
-    tester.view.physicalSize = const Size(1200, 800);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(() {
-      tester.view.resetPhysicalSize();
-      tester.view.resetDevicePixelRatio();
-    });
+  testWidgets(
+    'restores historical sessions using estimated viewport size when saved size is absent',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1200, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
 
-    final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
-    client.snapshotCompleters['main'] = Completer<Map<String, dynamic>>()..complete({
-      'snapshot': {
-        'context': {'branch': 'main'},
-        'exited': true,
-        'size': null,
-      }
-    });
+      final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
+      client.snapshotCompleters['main'] = Completer<Map<String, dynamic>>()
+        ..complete({
+          'snapshot': {
+            'context': {'branch': 'main'},
+            'exited': true,
+            'size': null,
+          },
+        });
 
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    expect(client.restoreSessionCalls, contains('main'));
-    expect(client.restoreSessionSizes['main'], '94x40');
-  });
+      expect(client.restoreSessionCalls, contains('main'));
+      expect(client.restoreSessionSizes['main'], '94x40');
+    },
+  );
 
   testWidgets('applies daemon snapshot events to replace restored rows', (
     WidgetTester tester,

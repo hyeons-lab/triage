@@ -12,6 +12,20 @@ anyhow.workspace = true
 triage-core = { path = "../triage-core" }
 serde.workspace = true
 serde_json.workspace = true
+flatbuffers.workspace = true
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+[[bin]]
+name = "stress_client"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "protocol_bench"
+harness = false

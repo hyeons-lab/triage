@@ -11,6 +11,18 @@ use triage_core::session::{
     StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
 };
 
+pub mod flatbuffers_proto;
+pub use flatbuffers_proto::{
+    ProtocolErrorBorrowed, ServerMessageBorrowed, ServerResultBorrowed, SessionEventBorrowed,
+    parse_fb_server_message_borrowed,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFormat {
+    Json,
+    Flatbuffers,
+}
+
 pub const PROTOCOL_VERSION: &str = "2026-05-20";
 const MAX_EVENTS_PER_SUBSCRIPTION_DRAIN: usize = 256;
 
@@ -87,6 +99,7 @@ pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     authenticated: bool,
     next_subscription_id: u64,
     subscriptions: HashMap<SubscriptionId, SessionEventReceiver>,
+    pub format: ProtocolFormat,
 }
 
 impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
@@ -97,6 +110,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            format: ProtocolFormat::Json,
         }
     }
 }
@@ -109,7 +123,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            format: ProtocolFormat::Json,
         }
+    }
+
+    pub fn with_format(mut self, format: ProtocolFormat) -> Self {
+        self.format = format;
+        self
     }
 
     pub fn handle_text_message(&mut self, message: &str) -> String {
@@ -131,6 +151,24 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         };
 
         serialize_server_message(&response)
+    }
+
+    pub fn handle_binary_message(&mut self, message: &[u8]) -> Vec<u8> {
+        let response = match ::flatbuffers::root::<
+            triage_core::generated::triage::generated::ClientMessage,
+        >(message)
+        {
+            Ok(fb_msg) => match flatbuffers_proto::parse_client_message(fb_msg) {
+                Ok(parsed) => self.handle_message(parsed),
+                Err(error) => ServerMessage::Error { id: None, error },
+            },
+            Err(error) => ServerMessage::Error {
+                id: None,
+                error: ProtocolError::new("invalid_flatbuffer", error.to_string()),
+            },
+        };
+
+        flatbuffers_proto::serialize_server_message(&response)
     }
 
     pub fn handle_message(&mut self, message: ClientMessage) -> ServerMessage {
@@ -416,7 +454,7 @@ pub struct ProtocolError {
 }
 
 impl ProtocolError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -445,6 +483,7 @@ mod tests {
 
     use anyhow::{Result, bail};
     use serde_json::json;
+    use triage_core::generated::triage::generated as fb;
     use triage_core::session::{
         AttachMode, InputLeaseState, SessionEvent, SessionSize, StyledRow, TerminalCursor,
     };
@@ -997,5 +1036,47 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn flatbuffers_hello_roundtrip() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+        let request = ClientMessage {
+            id: Some(json!("req-fb")),
+            request: ClientRequest::Hello {
+                client_id: None,
+                token: None,
+            },
+        };
+
+        let client_bytes = flatbuffers_proto::serialize_client_message(&request);
+        let response_bytes = connection.handle_binary_message(&client_bytes);
+
+        let root = flatbuffers::root::<fb::ServerMessage>(&response_bytes).unwrap();
+        assert_eq!(
+            root.payload_type(),
+            fb::ServerMessagePayload::ResponsePayload
+        );
+        let resp = root.payload_as_response_payload().unwrap();
+        assert_eq!(resp.id().unwrap(), "req-fb");
+
+        assert_eq!(resp.result_type(), fb::ServerResultPayload::HelloResult);
+        let hello = resp.result_as_hello_result().unwrap();
+        assert_eq!(hello.protocol_version().unwrap(), PROTOCOL_VERSION);
+        assert!(hello.authenticated());
+    }
+
+    #[test]
+    fn flatbuffers_invalid_payload_returns_error_safely() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+
+        let response_bytes =
+            connection.handle_binary_message(&[0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34]);
+
+        let root = flatbuffers::root::<fb::ServerMessage>(&response_bytes).unwrap();
+        assert_eq!(root.payload_type(), fb::ServerMessagePayload::ErrorPayload);
+        let err = root.payload_as_error_payload().unwrap();
+        assert_eq!(err.code().unwrap(), "invalid_flatbuffer");
+        assert!(!err.message().unwrap().is_empty());
     }
 }

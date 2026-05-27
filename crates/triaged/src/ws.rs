@@ -7,7 +7,9 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
-use triage_transport_ws::WebSocketSessionConnection;
+use triage_transport_ws::{
+    ProtocolError, ServerMessage, WebSocketSessionConnection, flatbuffers_proto,
+};
 
 use crate::http::WebAssetCache;
 use crate::session::SessionManager;
@@ -25,6 +27,7 @@ pub fn start_websocket_server(
         .context("building Tokio runtime for multiplexed HTTP server")?;
 
     rt.block_on(async {
+        listener.set_nonblocking(true).context("setting socket to non-blocking")?;
         let listener = TcpListener::from_std(listener)
             .context("converting std TcpListener to Tokio TcpListener")?;
         let bind_addr = listener.local_addr().ok();
@@ -33,13 +36,20 @@ pub fn start_websocket_server(
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    tracing::debug!(client_addr = %addr, "Accepted TCP connection");
                     let manager = Arc::clone(&manager);
                     let cache = Arc::clone(&cache);
                     tokio::spawn(async move {
+                        tracing::debug!(client_addr = %addr, "Spawning HTTP/WebSocket handler");
                         let io = TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
                             let cache = Arc::clone(&cache);
                             let manager = Arc::clone(&manager);
+                            tracing::debug!(
+                                method = %req.method(),
+                                path = %req.uri().path(),
+                                "Received HTTP request"
+                            );
                             crate::http::serve_http(req, cache, manager)
                         });
 
@@ -48,7 +58,6 @@ pub fn start_websocket_server(
                             .with_upgrades()
                             .await
                         {
-                            // A connection drop or reset is normal and should not clutter logs at WARN/ERROR.
                             tracing::debug!(error = ?error, client_addr = %addr, "HTTP/WebSocket connection finished or closed");
                         }
                     });
@@ -65,15 +74,17 @@ pub fn start_websocket_server(
 pub async fn handle_upgraded_ws<S>(
     manager: Arc<SessionManager>,
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    format: triage_transport_ws::ProtocolFormat,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::info!("Upgraded WebSocket client connected");
+    tracing::debug!(?format, "Upgraded WebSocket client connected");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut conn =
-        WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager));
+        WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager))
+            .with_format(format);
 
     let mut next_msg = ws_receiver.next();
 
@@ -84,24 +95,51 @@ where
                     Some(Ok(msg)) => {
                         match msg {
                             Message::Text(text) => {
-                                let response = conn.handle_text_message(&text);
-                                if ws_sender.send(Message::Text(response)).await.is_err() {
+                                if format == triage_transport_ws::ProtocolFormat::Json {
+                                    let response = conn.handle_text_message(&text);
+                                    if ws_sender.send(Message::Text(response)).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    let err_response = ServerMessage::Error {
+                                        id: None,
+                                        error: ProtocolError::new("invalid_frame_type", "Expected binary frame for FlatBuffers subprotocol"),
+                                    };
+                                    let bytes = flatbuffers_proto::serialize_server_message(&err_response);
+                                    let _ = ws_sender.send(Message::Binary(bytes)).await;
+                                    break;
+                                }
+                            }
+                            Message::Binary(bytes) => {
+                                if format == triage_transport_ws::ProtocolFormat::Flatbuffers {
+                                    let response = conn.handle_binary_message(&bytes);
+                                    if ws_sender.send(Message::Binary(response)).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    let err_response = ServerMessage::Error {
+                                        id: None,
+                                        error: ProtocolError::new("invalid_frame_type", "Expected text frame for JSON subprotocol"),
+                                    };
+                                    if let Ok(text) = serde_json::to_string(&err_response) {
+                                        let _ = ws_sender.send(Message::Text(text)).await;
+                                    }
                                     break;
                                 }
                             }
                             Message::Close(_) => {
-                                tracing::info!("WebSocket client disconnected");
+                                tracing::debug!("WebSocket client disconnected");
                                 break;
                             }
                             _ => {}
                         }
                     }
                     Some(Err(err)) => {
-                        tracing::info!(error = ?err, "WebSocket client connection error");
+                        tracing::debug!(error = ?err, "WebSocket client connection error");
                         break;
                     }
                     None => {
-                        tracing::info!("WebSocket client connection closed");
+                        tracing::debug!("WebSocket client connection closed");
                         break;
                     }
                 }
@@ -111,11 +149,22 @@ where
                 let messages = conn.drain_events();
                 let mut send_failed = false;
                 for msg in messages {
-                    let serialized = serde_json::to_string(&msg)
-                        .context("serializing session event")?;
-                    if ws_sender.send(Message::Text(serialized)).await.is_err() {
-                        send_failed = true;
-                        break;
+                    match format {
+                        triage_transport_ws::ProtocolFormat::Json => {
+                            let serialized = serde_json::to_string(&msg)
+                                .context("serializing session event")?;
+                            if ws_sender.send(Message::Text(serialized)).await.is_err() {
+                                send_failed = true;
+                                break;
+                            }
+                        }
+                        triage_transport_ws::ProtocolFormat::Flatbuffers => {
+                            let serialized = triage_transport_ws::flatbuffers_proto::serialize_server_message(&msg);
+                            if ws_sender.send(Message::Binary(serialized)).await.is_err() {
+                                send_failed = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 if send_failed {
