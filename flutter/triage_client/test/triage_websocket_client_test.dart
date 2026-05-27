@@ -1,11 +1,14 @@
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/generated/triage_triage.generated_generated.dart'
+    as fbs;
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class FakeWebSocketChannel implements WebSocketChannel {
-  FakeWebSocketChannel({required this.sink});
+  FakeWebSocketChannel({required this.sink, this.protocol, Future<void>? ready})
+    : _ready = ready ?? Future.value();
 
   @override
   final WebSocketSink sink;
@@ -20,10 +23,12 @@ class FakeWebSocketChannel implements WebSocketChannel {
   String? get closeReason => null;
 
   @override
-  String? get protocol => null;
+  final String? protocol;
 
   @override
-  Future<void> get ready => Future.value();
+  Future<void> get ready => _ready;
+
+  final Future<void> _ready;
 
   @override
   Stream get stream => _streamController.stream;
@@ -65,6 +70,34 @@ class ThrowingWebSocketSink extends RecordingWebSocketSink {
 }
 
 void main() {
+  test(
+    'connect exposes the channel only after the handshake completes',
+    () async {
+      final sink = RecordingWebSocketSink();
+      final ready = Completer<void>();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+          ready: ready.future,
+        ),
+      );
+
+      final connectFuture = client.connect();
+
+      await Future<void>.delayed(Duration.zero);
+      expect(client.isConnected, isFalse);
+      expect(client.isFlatBuffersNegotiated, isFalse);
+
+      ready.complete();
+      await connectFuture;
+
+      expect(client.isConnected, isTrue);
+      expect(client.isFlatBuffersNegotiated, isTrue);
+    },
+  );
+
   test('writeInput fails when the WebSocket is not connected', () async {
     final client = TriageWebSocketClient(Uri.parse('ws://localhost/ws'));
 
@@ -97,4 +130,197 @@ void main() {
       expect(event['error'], contains('sink closed'));
     },
   );
+
+  group('FlatBuffers Sending Path', () {
+    late RecordingWebSocketSink sink;
+    late TriageWebSocketClient client;
+
+    setUp(() async {
+      sink = RecordingWebSocketSink();
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) =>
+            FakeWebSocketChannel(sink: sink, protocol: 'triage-flatbuffers'),
+      );
+      await client.connect();
+    });
+
+    tearDown(() async {
+      await client.disconnect();
+    });
+
+    test('hello request translates to binary FlatBuffers', () async {
+      final f = client.hello(clientId: 'client-123', token: 'token-abc');
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.HelloRequest),
+      );
+
+      final helloReq = msg.payload as fbs.HelloRequest;
+      expect(helloReq.clientId, equals('client-123'));
+      expect(helloReq.token, equals('token-abc'));
+    });
+
+    test('writeInput request translates to binary FlatBuffers', () async {
+      await client.writeInput(
+        sessionId: 'session-456',
+        clientId: 'client-123',
+        bytes: [1, 2, 3],
+      );
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.WriteInputRequestTable),
+      );
+
+      final writeReq = msg.payload as fbs.WriteInputRequestTable;
+      expect(writeReq.sessionId, equals('session-456'));
+      expect(writeReq.clientId, equals('client-123'));
+      expect(writeReq.bytes, equals([1, 2, 3]));
+    });
+
+    test('resizeSession request translates to binary FlatBuffers', () async {
+      final f = client.resizeSession(
+        sessionId: 'session-456',
+        cols: 120,
+        rows: 40,
+      );
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.ResizeSessionRequestTable),
+      );
+
+      final resizeReq = msg.payload as fbs.ResizeSessionRequestTable;
+      expect(resizeReq.sessionId, equals('session-456'));
+      expect(resizeReq.size!.cols, equals(120));
+      expect(resizeReq.size!.rows, equals(40));
+    });
+
+    test('restoreSession request translates to binary FlatBuffers', () async {
+      final f = client.restoreSession(
+        sessionId: 'session-456',
+        cols: 100,
+        rows: 30,
+      );
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.RestoreSessionRequestTable),
+      );
+
+      final restoreReq = msg.payload as fbs.RestoreSessionRequestTable;
+      expect(restoreReq.sessionId, equals('session-456'));
+      expect(restoreReq.size!.cols, equals(100));
+      expect(restoreReq.size!.rows, equals(30));
+    });
+
+    test('attachSession request translates to binary FlatBuffers', () async {
+      final f = client.attachSession(
+        sessionId: 'session-789',
+        clientId: 'client-abc',
+        mode: 'Observer',
+      );
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.AttachSessionRequestTable),
+      );
+
+      final attachReq = msg.payload as fbs.AttachSessionRequestTable;
+      expect(attachReq.sessionId, equals('session-789'));
+      expect(attachReq.clientId, equals('client-abc'));
+      expect(attachReq.mode, equals(fbs.AttachMode.Observer));
+    });
+
+    test('attachSession rejects unknown attach modes', () async {
+      await expectLater(
+        client.attachSession(
+          sessionId: 'session-789',
+          clientId: 'client-abc',
+          mode: 'observer',
+        ),
+        throwsArgumentError,
+      );
+
+      expect(sink.sent, isEmpty);
+    });
+
+    test(
+      'subscribeSessionEvents request translates to binary FlatBuffers',
+      () async {
+        final f = client.subscribeSessionEvents(
+          sessionId: 'session-789',
+          afterEventSeq: 42,
+        );
+        f.catchError((_) => '');
+
+        expect(sink.sent, hasLength(1));
+        final bytes = sink.sent.first as List<int>;
+
+        final msg = fbs.ClientMessage(bytes);
+        expect(msg.id, equals('req-0'));
+        expect(
+          msg.payloadType,
+          equals(
+            fbs.ClientRequestPayloadTypeId.SubscribeSessionEventsRequestTable,
+          ),
+        );
+
+        final subReq = msg.payload as fbs.SubscribeSessionEventsRequestTable;
+        expect(subReq.sessionId, equals('session-789'));
+        expect(subReq.afterEventSeq, equals(42));
+      },
+    );
+
+    test('styledRows request translates to binary FlatBuffers', () async {
+      final f = client.styledRows(sessionId: 'session-789', start: 10, end: 20);
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.StyledRowsRequestTable),
+      );
+
+      final styledReq = msg.payload as fbs.StyledRowsRequestTable;
+      expect(styledReq.sessionId, equals('session-789'));
+      expect(styledReq.start, equals(10));
+      expect(styledReq.end, equals(20));
+    });
+  });
 }
