@@ -10,12 +10,11 @@ Our steps are:
 1.  **Configure Root `Cargo.toml`**:
     *   Set `version` to `"0.1.0"`.
     *   Add `homepage = "https://github.com/hyeons-lab/triage"`.
-    *   Add `documentation = "https://docs.rs/triage-core"` (pointing to docs.rs).
     *   Add `keywords = ["terminal", "pty", "supervisor", "ratatui", "mcp"]`.
     *   Add `categories = ["command-line-utilities", "development-tools"]`.
 2.  **Inherit and Reference in Sub-Crates**:
     *   In `crates/triage-core/Cargo.toml`, `crates/triage-transport-ws/Cargo.toml`, `crates/triaged/Cargo.toml`, `crates/triage-mcp/Cargo.toml`, and `crates/triage/Cargo.toml`:
-        *   Inherit `homepage`, `documentation`, `keywords`, and `categories` from the workspace.
+        *   Inherit `homepage`, `keywords`, and `categories` from the workspace.
         *   Define `readme = "README.md"` pointing to a local file in their directories.
 3.  **Author Individual READMEs**:
     *   Create a clean, descriptive `README.md` file in each crate directory:
@@ -32,7 +31,7 @@ Our steps are:
 
 1.  **Modify Workspace `Cargo.toml`**:
     *   Update `version` under `[workspace.package]` to `"0.1.0"`.
-    *   Add `homepage`, `documentation`, `keywords`, and `categories`.
+    *   Add `homepage`, `keywords`, and `categories`.
 2.  **Modify Crate manifests**:
     *   Append inherited properties and add `readme = "README.md"` to each public crate manifest.
 3.  **Create Crate READMEs**:

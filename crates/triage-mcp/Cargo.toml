@@ -13,8 +13,8 @@ readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
-triage-core = { path = "../triage-core" }
-triaged = { path = "../triaged" }
+triage-core.workspace = true
+triaged.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

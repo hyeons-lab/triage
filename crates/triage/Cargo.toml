@@ -12,8 +12,8 @@ categories.workspace = true
 readme = "README.md"
 
 [dependencies]
-triage-core = { path = "../triage-core" }
-triaged = { path = "../triaged" }
+triage-core.workspace = true
+triaged.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 crossterm.workspace = true

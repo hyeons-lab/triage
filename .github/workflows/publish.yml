@@ -3,7 +3,7 @@ name: Publish to crates.io
 on:
   workflow_dispatch:
     inputs:
-      dry-run:
+      dry_run:
         description: 'Dry run (verify packaging without uploading)'
         type: boolean
         required: true
@@ -72,7 +72,7 @@ jobs:
         run: |
           # Determine extra flags (dry-run vs actual publish)
           FLAGS="--allow-dirty"
-          if [ "${{ github.event.inputs.dry-run }}" = "true" ]; then
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             FLAGS="$FLAGS --dry-run"
             echo "=== RUNNING IN DRY-RUN MODE ==="
           else
@@ -82,7 +82,7 @@ jobs:
           echo "Publishing triage-core..."
           cargo publish -p triage-core $FLAGS
           
-          if [ "${{ github.event.inputs.dry-run }}" = "false" ]; then
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
             echo "Waiting for crates.io index propagation..."
             sleep 20
           fi
@@ -90,7 +90,7 @@ jobs:
           echo "Publishing triage-transport-ws..."
           cargo publish -p triage-transport-ws $FLAGS
           
-          if [ "${{ github.event.inputs.dry-run }}" = "false" ]; then
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
             echo "Waiting for crates.io index propagation..."
             sleep 20
           fi
@@ -98,7 +98,7 @@ jobs:
           echo "Publishing triaged..."
           cargo publish -p triaged $FLAGS
           
-          if [ "${{ github.event.inputs.dry-run }}" = "false" ]; then
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
             echo "Waiting for crates.io index propagation..."
             sleep 20
           fi
@@ -106,7 +106,7 @@ jobs:
           echo "Publishing triage-mcp..."
           cargo publish -p triage-mcp $FLAGS
           
-          if [ "${{ github.event.inputs.dry-run }}" = "false" ]; then
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
             echo "Waiting for crates.io index propagation..."
             sleep 20
           fi

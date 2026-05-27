@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
-triage-core = { path = "../triage-core" }
+triage-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 flatbuffers.workspace = true

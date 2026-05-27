@@ -20,7 +20,7 @@ include = [
 ]
 
 [dependencies]
-triage-core = { path = "../triage-core" }
+triage-core.workspace = true
 anyhow.workspace = true
 portable-pty.workspace = true
 serde = { workspace = true }
@@ -32,7 +32,7 @@ tattoy-wezterm-surface.workspace = true
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
-triage-transport-ws = { path = "../triage-transport-ws" }
+triage-transport-ws.workspace = true
 rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
