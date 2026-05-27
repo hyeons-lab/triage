@@ -13,7 +13,7 @@ class TriageWebSocketClient {
           channelFactory ??
           ((uri) => WebSocketChannel.connect(
             uri,
-            protocols: ['triage-flatbuffers', 'triage-json'],
+            protocols: ['triage-json'],
           ));
 
   final Uri uri;
