@@ -1338,6 +1338,17 @@ fn slice_chars(value: &str, start: usize, end: usize) -> String {
 fn write_osc52_clipboard(output: &mut CrosstermBackend<Stdout>, text: &str) -> Result<()> {
     use std::io::Write;
 
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
     write!(
         output,
         "\x1b]52;c;{}\x07",

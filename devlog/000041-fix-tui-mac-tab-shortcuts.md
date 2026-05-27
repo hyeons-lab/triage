@@ -12,13 +12,16 @@ Resolve the keyboard shortcut tab switching issue on macOS where the default `Al
 - Mapped `Ctrl + Alt + Right` and `Ctrl + Alt + Down` to the `AppCommand::Next` command.
 - Mapped `Ctrl + Alt + Left` and `Ctrl + Alt + Up` to the `AppCommand::Previous` command.
 - Mapped `F3` to the `AppCommand::Next` command and `F4` to the `AppCommand::Previous` command.
+- Integrated native macOS `pbcopy` execution inside `write_osc52_clipboard` under a conditional compilation block `#[cfg(target_os = "macos")]`, enabling out-of-the-box clipboard copying on standard macOS terminals (which do not support or enable OSC 52 by default).
 
 ## Decisions
 
 - Retain existing `Alt + Arrow` shortcuts for Windows/Linux users who prefer them.
 - Introduce `Ctrl + Alt + Arrow` keys which override standard macOS option-diacritic intercept behavior and are parsed reliably by crossterm.
 - Introduce `F3` and `F4` keys as a completely universal backup shortcut that does not conflict with any text editing selection shortcuts or terminal emulators.
+- Execute the built-in system utility `pbcopy` as a child process when Triage runs locally on macOS, providing a zero-configuration, 100% reliable system clipboard integration.
 
 ## Commits
 
-- HEAD — fix(triage): add Ctrl+Alt+Arrow and F3/F4 tab switching shortcuts for macOS
+- HEAD — fix(triage): use pbcopy for native macOS clipboard copy support in TUI
+- 1aa224d — fix(triage): add Ctrl+Alt+Arrow and F3/F4 tab switching shortcuts for macOS
