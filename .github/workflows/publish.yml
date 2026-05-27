@@ -1,0 +1,117 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (verify packaging without uploading)'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: Build Client & Publish Crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+
+      - name: Install flatc
+        uses: Nugine/setup-flatc@v1
+        with:
+          version: "25.2.10"
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.12.0'
+          channel: 'stable'
+          cache: true
+
+      # Step 1: Upgrade & Build Flutter Web Client
+      - name: Build Flutter Web Client
+        run: |
+          cd flutter/triage_client
+          flutter pub get
+          flutter build web --release
+
+      # Step 2: Stage assets inside triaged daemon crate dist/ directory
+      - name: Stage Web Assets in triaged Crate
+        run: |
+          mkdir -p crates/triaged/dist
+          cp -r flutter/triage_client/build/web/* crates/triaged/dist/
+
+      # Step 3: Run Crate Dry-runs / Checks
+      - name: Verify Workspace Compiles with Staged Assets
+        run: cargo check --workspace --locked
+
+      # Step 4: Publish in strict topological order with index propagation delay
+      - name: Publish Crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          # Determine extra flags (dry-run vs actual publish)
+          FLAGS="--allow-dirty"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run"
+            echo "=== RUNNING IN DRY-RUN MODE ==="
+          else
+            echo "=== PUBLISHING TO CRATES.IO ==="
+          fi
+
+          echo "Publishing triage-core..."
+          cargo publish -p triage-core $FLAGS
+          
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            echo "Waiting for crates.io index propagation..."
+            sleep 20
+          fi
+
+          echo "Publishing triage-transport-ws..."
+          cargo publish -p triage-transport-ws $FLAGS
+          
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            echo "Waiting for crates.io index propagation..."
+            sleep 20
+          fi
+
+          echo "Publishing triaged..."
+          cargo publish -p triaged $FLAGS
+          
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            echo "Waiting for crates.io index propagation..."
+            sleep 20
+          fi
+
+          echo "Publishing triage-mcp..."
+          cargo publish -p triage-mcp $FLAGS
+          
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
+            echo "Waiting for crates.io index propagation..."
+            sleep 20
+          fi
+
+          echo "Publishing triage..."
+          cargo publish -p triage $FLAGS
+
+          echo "All crates processed successfully."

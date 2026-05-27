@@ -9,12 +9,17 @@ use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, header};
 use rust_embed::RustEmbed;
 
+#[cfg(embed_packaged_client)]
+#[derive(RustEmbed)]
+#[folder = "dist/"]
+struct WebAsset;
+
 #[cfg(embed_real_client)]
 #[derive(RustEmbed)]
 #[folder = "../../flutter/triage_client/build/web/"]
 struct WebAsset;
 
-#[cfg(not(embed_real_client))]
+#[cfg(not(any(embed_real_client, embed_packaged_client)))]
 #[derive(RustEmbed)]
 #[folder = "web_fallback/"]
 struct WebAsset;

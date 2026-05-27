@@ -13,3 +13,6 @@ worktrees/
 *.swo
 # Added by code-review-graph
 .code-review-graph/
+
+# Triage daemon pre-built web client assets
+/crates/triaged/dist/
