@@ -68,7 +68,7 @@ jobs:
       # Step 4: Publish in strict topological order with index propagation delay
       - name: Publish Crates
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             echo "=== RUNNING IN DRY-RUN MODE ==="
