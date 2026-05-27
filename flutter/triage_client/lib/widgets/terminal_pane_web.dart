@@ -131,7 +131,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         cachedFitAddon != null &&
         cachedContainer.children.isNotEmpty) {
       _container = cachedContainer as html.DivElement;
-      _terminalWrapper = _container.children.firstWhere((el) => el is html.DivElement) as html.DivElement;
+      _terminalWrapper =
+          _container.children.firstWhere((el) => el is html.DivElement)
+              as html.DivElement;
       _term = cachedTerm;
       _fitAddon = cachedFitAddon;
       _initialized = true;
@@ -725,7 +727,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         final fittedRows = fittedRowsNum.toInt();
         final fittedCols = fittedColsNum.toInt();
 
-        if (fittedRows >= 5 && fittedCols >= 10) {
+        if (fittedRows >= 5 && fittedCols >= 40) {
           final sizeChanged =
               _lastFittedRows != fittedRows || _lastFittedCols != fittedCols;
           _lastFittedRows = fittedRows;
@@ -852,7 +854,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
-        if (oldWidget.isExited != widget.isExited) {
+    if (oldWidget.isExited != widget.isExited) {
       if (_initialized) {
         try {
           _updateCursorOptions();

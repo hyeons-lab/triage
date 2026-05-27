@@ -66,7 +66,11 @@ mod tests {
         assert!(!index_file.content.is_empty());
 
         let body_str = String::from_utf8_lossy(&index_file.content);
-        assert!(body_str.contains("Triage Web Client") || body_str.contains("Flutter Client"));
+        assert!(
+            body_str.contains("Triage Web Client")
+                || body_str.contains("Triage Client")
+                || body_str.contains("Flutter Client")
+        );
     }
 
     #[test]

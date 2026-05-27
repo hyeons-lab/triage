@@ -25,7 +25,8 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - Nested lints like `collapsible-if` and `redundant-closure` were fixed inside `triage-core` compilation targets to ensure zero linter warnings.
 
 ## Commits
-- HEAD — refactor(flatbuffers): address PR review comments, implement safe fallible parsing, and compliant subprotocol negotiation
+- HEAD — fix(client): resolve transient narrow terminal sizing and E2E build embedding
+- 43e6c07 — refactor(flatbuffers): address PR review comments, implement safe fallible parsing, and compliant subprotocol negotiation
 - c0b8469 — ci: install flatc compiler dependency in CI workflows for Linux, macOS, and Windows
 - 4e6559c — refactor(flatbuffers): output generated bindings to OUT_DIR and remove tracked generated file
 - 9a0a0f5 — feat(flatbuffers): implement Criterion benchmarks, E2E stress testing tool, and fix Windows socket hang
