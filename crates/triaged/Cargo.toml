@@ -12,7 +12,13 @@ categories.workspace = true
 readme = "README.md"
 include = [
     "src/**/*",
-    "dist/**/*",
+    "dist/*.css",
+    "dist/*.html",
+    "dist/*.js",
+    "dist/*.json",
+    "dist/*.png",
+    "dist/assets/**/*",
+    "dist/icons/**/*",
     "Cargo.toml",
     "README.md",
     "build.rs",

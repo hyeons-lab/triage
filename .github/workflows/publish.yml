@@ -44,7 +44,7 @@ jobs:
       - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.12.0'
+          flutter-version: '3.44.0'
           channel: 'stable'
           cache: true
 
@@ -70,48 +70,66 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
-          # Determine extra flags (dry-run vs actual publish)
-          FLAGS="--allow-dirty"
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            FLAGS="$FLAGS --dry-run"
             echo "=== RUNNING IN DRY-RUN MODE ==="
+
+            echo "Packaging triage-core..."
+            cargo package -p triage-core --allow-dirty
+
+            # Downstream crates depend on internal versions that may not exist on crates.io yet.
+            # `cargo check --workspace --locked` already verifies the workspace with local path deps.
+            echo "Packaging triage-transport-ws..."
+            cargo package -p triage-transport-ws --allow-dirty --no-verify \
+              --config "patch.crates-io.triage-core.path='crates/triage-core'"
+
+            echo "Packaging triaged..."
+            cargo package -p triaged --allow-dirty --no-verify \
+              --config "patch.crates-io.triage-core.path='crates/triage-core'" \
+              --config "patch.crates-io.triage-transport-ws.path='crates/triage-transport-ws'"
+
+            echo "Packaging triage-mcp..."
+            cargo package -p triage-mcp --allow-dirty --no-verify \
+              --config "patch.crates-io.triage-core.path='crates/triage-core'" \
+              --config "patch.crates-io.triage-transport-ws.path='crates/triage-transport-ws'" \
+              --config "patch.crates-io.triaged.path='crates/triaged'"
+
+            echo "Packaging triage..."
+            cargo package -p triage --allow-dirty --no-verify \
+              --config "patch.crates-io.triage-core.path='crates/triage-core'" \
+              --config "patch.crates-io.triage-transport-ws.path='crates/triage-transport-ws'" \
+              --config "patch.crates-io.triaged.path='crates/triaged'"
+
+            echo "All crates packaged successfully."
+            exit 0
           else
             echo "=== PUBLISHING TO CRATES.IO ==="
           fi
 
           echo "Publishing triage-core..."
-          cargo publish -p triage-core $FLAGS
+          cargo publish -p triage-core --allow-dirty
           
-          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
-            echo "Waiting for crates.io index propagation..."
-            sleep 20
-          fi
+          echo "Waiting for crates.io index propagation..."
+          sleep 20
 
           echo "Publishing triage-transport-ws..."
-          cargo publish -p triage-transport-ws $FLAGS
+          cargo publish -p triage-transport-ws --allow-dirty
           
-          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
-            echo "Waiting for crates.io index propagation..."
-            sleep 20
-          fi
+          echo "Waiting for crates.io index propagation..."
+          sleep 20
 
           echo "Publishing triaged..."
-          cargo publish -p triaged $FLAGS
+          cargo publish -p triaged --allow-dirty
           
-          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
-            echo "Waiting for crates.io index propagation..."
-            sleep 20
-          fi
+          echo "Waiting for crates.io index propagation..."
+          sleep 20
 
           echo "Publishing triage-mcp..."
-          cargo publish -p triage-mcp $FLAGS
+          cargo publish -p triage-mcp --allow-dirty
           
-          if [ "${{ github.event.inputs.dry_run }}" = "false" ]; then
-            echo "Waiting for crates.io index propagation..."
-            sleep 20
-          fi
+          echo "Waiting for crates.io index propagation..."
+          sleep 20
 
           echo "Publishing triage..."
-          cargo publish -p triage $FLAGS
+          cargo publish -p triage --allow-dirty
 
-          echo "All crates processed successfully."
+          echo "All crates published successfully."
