@@ -20,6 +20,7 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - [x] Refactor E2E stress testing tool to use zero-copy, lifetime-bound `ServerMessageBorrowed<'a>` to eliminate dynamic string and vector allocations in the hot path.
 - [x] Add `flat_buffers` dependency in Flutter remote client, compile Dart schema classes using `flatc --dart`, and integrate dynamic subprotocol negotiation and binary frame parsing inside the WebSocket client service.
 - [x] Remove the `"stress-client"` Cargo feature from `triage-transport-ws`, making `tokio`, `tokio-tungstenite`, and `futures-util` non-optional dependencies and building them in by default.
+- [x] Address E2E stress client safety panics, clamp pacing interval duration calculation to >= 1ns, and eliminate parsing unwrap pathways.
 
 ## Decisions
 - Require `flatc` to be installed globally on developers' systems instead of checking in generated files.
@@ -28,9 +29,13 @@ Implement a high-performance binary serialization protocol for the Triage WebSoc
 - Nested lints like `collapsible-if` and `redundant-closure` were fixed inside `triage-core` compilation targets to ensure zero linter warnings.
 - Map the parsed Dart FlatBuffers structures recursively to `Map<String, dynamic>` in `triage_websocket_client.dart` to guarantee full, transparent backwards-compatibility with the existing Flutter UI and state machine layers without introducing massive breaking API refactorings.
 - Standardize on built-in asynchronous WebSocket dependencies inside the hot-path transport crate, completely eliminating the optional `"stress-client"` feature gating for a simpler build model.
+- Completely eliminate unsafe `.unwrap()` panic paths in `stress_client.rs`'s ID parsing logic in favor of anyhow error context propagation to prevent client tool crashes on unexpected daemon responses.
+- Clamp the stress client's pacing interval duration calculation to a minimum of 1 nanosecond (`.max(1)`) to avoid Tokio interval scheduler panics under high pacing rate configurations.
 
 ## Commits
-- HEAD — feat(flatbuffers): implement zero-copy Rust deserializer and Flutter FlatBuffers client with built-in async dependencies
+- HEAD — refactor(stress): address E2E stress client panic paths and safety review comments
+- 955085c — style(flatbuffers): apply cargo fmt and resolve clippy lints
+- 284ebac — feat(flatbuffers): implement zero-copy Rust deserializer and Flutter client integration
 - 0aab289 — fix(client): increase minimum terminal column clamp to 80 to prevent prompt wrapping
 - 927e384 — fix(client): resolve transient narrow terminal sizing and E2E build embedding
 - 43e6c07 — refactor(flatbuffers): address PR review comments, implement safe fallible parsing, and compliant subprotocol negotiation

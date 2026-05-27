@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
     // 2. Hello handshake
-    let client_id = ClientId::new("stress-client-1").unwrap();
+    let client_id = ClientId::new("stress-client-1").context("Failed to create ClientId")?;
     let hello_msg = ClientMessage {
         id: Some(serde_json::Value::String("hello-req".to_string())),
         request: ClientRequest::Hello {
@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
 
     // 3. Resolve Session ID
     let session_id = if let Some(sid_str) = session_id_arg {
-        SessionId::new(&sid_str).unwrap()
+        SessionId::new(&sid_str).context("Invalid session ID arg")?
     } else {
         // First try to list sessions
         let list_msg = ClientMessage {
@@ -251,7 +251,10 @@ async fn main() -> Result<()> {
                 result: ServerResultBorrowed::SessionIds { session_ids },
                 ..
             }) => {
-                existing_id = session_ids.first().map(|s| SessionId::new(*s).unwrap());
+                if let Some(s) = session_ids.first() {
+                    existing_id =
+                        Some(SessionId::new(*s).context("Invalid SessionId in list response")?);
+                }
             }
             _ => {}
         }
@@ -308,7 +311,8 @@ async fn main() -> Result<()> {
                     result: ServerResultBorrowed::SessionId { session_id },
                     ..
                 }) => {
-                    let sid = SessionId::new(session_id).unwrap();
+                    let sid =
+                        SessionId::new(session_id).context("Invalid SessionId in response")?;
                     println!("Created new session: {}", sid);
                     sid
                 }
@@ -430,7 +434,8 @@ async fn main() -> Result<()> {
     // Spawn high-frequency sender task
     let mut ws_sink = ws_sink;
     let sender_task = tokio::spawn(async move {
-        let mut tick = interval(Duration::from_nanos(1_000_000_000 / rate));
+        let nanos = (1_000_000_000 / rate).max(1);
+        let mut tick = interval(Duration::from_nanos(nanos));
         let mut msg_seq = 0;
         while run_sender.load(Ordering::Relaxed) {
             tick.tick().await;
