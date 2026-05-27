@@ -12,6 +12,10 @@ use triage_core::session::{
 };
 
 pub mod flatbuffers_proto;
+pub use flatbuffers_proto::{
+    ServerMessageBorrowed, ServerResultBorrowed, SessionEventBorrowed, ProtocolErrorBorrowed,
+    parse_fb_server_message_borrowed,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolFormat {

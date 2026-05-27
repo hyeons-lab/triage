@@ -933,3 +933,222 @@ pub fn build_server_message<'a>(
         },
     )
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolErrorBorrowed<'a> {
+    pub code: &'a str,
+    pub message: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerResultBorrowed<'a> {
+    Unit,
+    Hello {
+        protocol_version: &'a str,
+        authenticated: bool,
+    },
+    Paired {
+        token: &'a str,
+    },
+    SessionIds {
+        session_ids: Vec<&'a str>,
+    },
+    SessionId {
+        session_id: &'a str,
+    },
+    AttachSession,
+    Subscribed {
+        subscription_id: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionEventBorrowed<'a> {
+    Output {
+        session_id: &'a str,
+        output_seq: u64,
+        bytes: &'a [u8],
+    },
+    ResyncRequired {
+        session_id: &'a str,
+        latest_event_seq: u64,
+    },
+    Snapshot {
+        session_id: &'a str,
+    },
+    LeaseChanged {
+        session_id: &'a str,
+    },
+    Exited {
+        session_id: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerMessageBorrowed<'a> {
+    Response {
+        id: Option<&'a str>,
+        result: ServerResultBorrowed<'a>,
+    },
+    Error {
+        id: Option<&'a str>,
+        error: ProtocolErrorBorrowed<'a>,
+    },
+    Event {
+        subscription_id: &'a str,
+        event_seq: u64,
+        event: SessionEventBorrowed<'a>,
+    },
+    SubscriptionClosed {
+        subscription_id: &'a str,
+    },
+}
+
+pub fn parse_fb_server_message_borrowed<'a>(
+    bytes: &'a [u8],
+) -> Result<ServerMessageBorrowed<'a>, crate::ProtocolError> {
+    let root = flatbuffers::root::<fb::ServerMessage>(bytes)
+        .map_err(|e| crate::ProtocolError::new("invalid_flatbuffer", e.to_string()))?;
+
+    match root.payload_type() {
+        fb::ServerMessagePayload::ResponsePayload => {
+            let resp = root.payload_as_response_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing response payload")
+            })?;
+            let id = resp.id();
+            let result = match resp.result_type() {
+                fb::ServerResultPayload::HelloResult => {
+                    let hello = resp.result_as_hello_result().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing hello result")
+                    })?;
+                    ServerResultBorrowed::Hello {
+                        protocol_version: hello.protocol_version().unwrap_or(""),
+                        authenticated: hello.authenticated(),
+                    }
+                }
+                fb::ServerResultPayload::SessionIdsResult => {
+                    let sids_res = resp.result_as_session_ids_result().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing session ids result")
+                    })?;
+                    let mut session_ids = Vec::new();
+                    if let Some(fb_sids) = sids_res.session_ids() {
+                        for i in 0..fb_sids.len() {
+                            session_ids.push(fb_sids.get(i));
+                        }
+                    }
+                    ServerResultBorrowed::SessionIds { session_ids }
+                }
+                fb::ServerResultPayload::SessionIdResult => {
+                    let sid_res = resp.result_as_session_id_result().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing session id result")
+                    })?;
+                    ServerResultBorrowed::SessionId {
+                        session_id: sid_res.session_id().unwrap_or(""),
+                    }
+                }
+                fb::ServerResultPayload::AttachSessionResult => {
+                    ServerResultBorrowed::AttachSession
+                }
+                fb::ServerResultPayload::SubscribedResult => {
+                    let sub_res = resp.result_as_subscribed_result().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing subscribed result")
+                    })?;
+                    ServerResultBorrowed::Subscribed {
+                        subscription_id: sub_res.subscription_id().unwrap_or(""),
+                    }
+                }
+                _ => ServerResultBorrowed::Unit,
+            };
+            Ok(ServerMessageBorrowed::Response { id, result })
+        }
+        fb::ServerMessagePayload::ErrorPayload => {
+            let err = root.payload_as_error_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing error payload")
+            })?;
+            let id = err.id();
+            let code = err.code().unwrap_or("");
+            let message = err.message().unwrap_or("");
+            Ok(ServerMessageBorrowed::Error {
+                id,
+                error: ProtocolErrorBorrowed { code, message },
+            })
+        }
+        fb::ServerMessagePayload::EventPayload => {
+            let evt = root.payload_as_event_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing event payload")
+            })?;
+            let subscription_id = evt.subscription_id().unwrap_or("");
+            let event_seq = evt.event_seq();
+
+            let event = match evt.event_type() {
+                fb::SessionEventPayload::OutputEvent => {
+                    let out = evt.event_as_output_event().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing output event")
+                    })?;
+                    SessionEventBorrowed::Output {
+                        session_id: out.session_id().unwrap_or(""),
+                        output_seq: out.output_seq(),
+                        bytes: out.bytes().map(|b| b.bytes()).unwrap_or(&[]),
+                    }
+                }
+                fb::SessionEventPayload::ResyncRequiredEvent => {
+                    let res = evt.event_as_resync_required_event().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing resync event")
+                    })?;
+                    SessionEventBorrowed::ResyncRequired {
+                        session_id: res.session_id().unwrap_or(""),
+                        latest_event_seq: res.latest_event_seq(),
+                    }
+                }
+                fb::SessionEventPayload::SnapshotEvent => {
+                    let snap = evt.event_as_snapshot_event().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing snapshot event")
+                    })?;
+                    SessionEventBorrowed::Snapshot {
+                        session_id: snap.session_id().unwrap_or(""),
+                    }
+                }
+                fb::SessionEventPayload::LeaseChangedEvent => {
+                    let lease = evt.event_as_lease_changed_event().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing lease event")
+                    })?;
+                    SessionEventBorrowed::LeaseChanged {
+                        session_id: lease.session_id().unwrap_or(""),
+                    }
+                }
+                fb::SessionEventPayload::ExitedEvent => {
+                    let exited = evt.event_as_exited_event().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing exited event")
+                    })?;
+                    SessionEventBorrowed::Exited {
+                        session_id: exited.session_id().unwrap_or(""),
+                    }
+                }
+                _ => {
+                    return Err(crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "unknown session event type",
+                    ));
+                }
+            };
+
+            Ok(ServerMessageBorrowed::Event {
+                subscription_id,
+                event_seq,
+                event,
+            })
+        }
+        fb::ServerMessagePayload::SubscriptionClosedPayload => {
+            let closed = root.payload_as_subscription_closed_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing subscription closed payload")
+            })?;
+            Ok(ServerMessageBorrowed::SubscriptionClosed {
+                subscription_id: closed.subscription_id().unwrap_or(""),
+            })
+        }
+        _ => Err(crate::ProtocolError::new(
+            "invalid_flatbuffer",
+            "unknown server message payload type",
+        )),
+    }
+}

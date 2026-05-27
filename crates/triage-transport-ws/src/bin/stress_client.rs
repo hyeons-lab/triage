@@ -7,13 +7,15 @@ use tokio::time::interval;
 use tokio_tungstenite::{
     connect_async, tungstenite::Message, tungstenite::client::IntoClientRequest,
 };
-use triage_core::generated::triage::generated as fb;
+
 use triage_core::session::{
     AttachMode, AttachSessionRequest, ClientId, SessionId, SessionSize, StartSessionRequest,
     SubscribeSessionEventsRequest, WriteInputRequest,
 };
 use triage_transport_ws::{
     ClientMessage, ClientRequest, ServerMessage, ServerResult, flatbuffers_proto,
+    ServerMessageBorrowed, ServerResultBorrowed, SessionEventBorrowed,
+    parse_fb_server_message_borrowed,
 };
 
 fn parse_args() -> (String, String, u64, u64, usize, Option<String>) {
@@ -84,117 +86,24 @@ fn parse_args() -> (String, String, u64, u64, usize, Option<String>) {
     (url, protocol, duration, rate, payload_size, session)
 }
 
-fn parse_fb_server_message(bytes: &[u8]) -> Result<ServerMessage> {
-    let root = flatbuffers::root::<fb::ServerMessage>(bytes)?;
-    match root.payload_type() {
-        fb::ServerMessagePayload::ResponsePayload => {
-            let resp = root
-                .payload_as_response_payload()
-                .ok_or_else(|| anyhow!("Missing response payload"))?;
-            let id = resp
-                .id()
-                .map(|id| serde_json::Value::String(id.to_string()));
+#[derive(Debug)]
+enum ParsedServerMessage<'a> {
+    Owned(ServerMessage),
+    Borrowed(ServerMessageBorrowed<'a>),
+}
 
-            match resp.result_type() {
-                fb::ServerResultPayload::HelloResult => {
-                    let hello = resp
-                        .result_as_hello_result()
-                        .ok_or_else(|| anyhow!("Missing HelloResult"))?;
-                    Ok(ServerMessage::Response {
-                        id,
-                        result: ServerResult::Hello {
-                            protocol_version: hello.protocol_version().unwrap_or("").to_string(),
-                            authenticated: hello.authenticated(),
-                        },
-                    })
-                }
-                fb::ServerResultPayload::SessionIdsResult => {
-                    let sids_res = resp
-                        .result_as_session_ids_result()
-                        .ok_or_else(|| anyhow!("Missing SessionIdsResult"))?;
-                    let mut session_ids = Vec::new();
-                    if let Some(fb_sids) = sids_res.session_ids() {
-                        for i in 0..fb_sids.len() {
-                            session_ids.push(SessionId::new(fb_sids.get(i)).unwrap());
-                        }
-                    }
-                    Ok(ServerMessage::Response {
-                        id,
-                        result: ServerResult::SessionIds { session_ids },
-                    })
-                }
-                fb::ServerResultPayload::SessionIdResult => {
-                    let sid_res = resp
-                        .result_as_session_id_result()
-                        .ok_or_else(|| anyhow!("Missing SessionIdResult"))?;
-                    let session_id = SessionId::new(sid_res.session_id().unwrap_or("")).unwrap();
-                    Ok(ServerMessage::Response {
-                        id,
-                        result: ServerResult::SessionId { session_id },
-                    })
-                }
-                fb::ServerResultPayload::AttachSessionResult => Ok(ServerMessage::Response {
-                    id,
-                    result: ServerResult::AttachSession {
-                        response: triage_core::session::AttachSessionResponse {
-                            snapshot: triage_core::session::SessionSnapshot {
-                                output_seq: 0,
-                                bytes_logged: 0,
-                                size: triage_core::session::SessionSize::default(),
-                                visible_rows: vec![],
-                                styled_rows_start: 0,
-                                styled_rows: vec![],
-                                cursor: triage_core::session::TerminalCursor {
-                                    row: 0,
-                                    col: 0,
-                                    visible: false,
-                                },
-                                current_working_directory: None,
-                                context: None,
-                                bracketed_paste_enabled: false,
-                                exited: false,
-                            },
-                            lease: triage_core::session::InputLeaseState::default(),
-                        },
-                    },
-                }),
-                fb::ServerResultPayload::SubscribedResult => {
-                    let sub_res = resp
-                        .result_as_subscribed_result()
-                        .ok_or_else(|| anyhow!("Missing SubscribedResult"))?;
-                    let sub_id = triage_transport_ws::SubscriptionId::new(
-                        sub_res.subscription_id().unwrap_or(""),
-                    )
-                    .unwrap();
-                    Ok(ServerMessage::Response {
-                        id,
-                        result: ServerResult::Subscribed {
-                            subscription_id: sub_id,
-                        },
-                    })
-                }
-                _ => Ok(ServerMessage::Response {
-                    id,
-                    result: ServerResult::Unit,
-                }),
-            }
+fn parse_message<'a>(msg: &'a Message) -> Result<ParsedServerMessage<'a>> {
+    match msg {
+        Message::Text(text) => {
+            let owned: ServerMessage = serde_json::from_str(text)?;
+            Ok(ParsedServerMessage::Owned(owned))
         }
-        fb::ServerMessagePayload::ErrorPayload => {
-            let err = root
-                .payload_as_error_payload()
-                .ok_or_else(|| anyhow!("Missing error payload"))?;
-            let id = err.id().map(|id| serde_json::Value::String(id.to_string()));
-            let code = err.code().unwrap_or("").to_string();
-            let message = err.message().unwrap_or("").to_string();
-            Ok(ServerMessage::Error {
-                id,
-                error: triage_transport_ws::ProtocolError { code, message },
-            })
+        Message::Binary(bytes) => {
+            let borrowed = parse_fb_server_message_borrowed(bytes)
+                .map_err(|e| anyhow!("Failed to parse FlatBuffers server message: {:?}", e))?;
+            Ok(ParsedServerMessage::Borrowed(borrowed))
         }
-        _ => Ok(ServerMessage::Response {
-            id: None,
-            result: ServerResult::Unit,
-        }),
+        _ => Err(anyhow!("Unexpected message type")),
     }
 }
 
@@ -264,24 +173,30 @@ async fn main() -> Result<()> {
         .await
         .ok_or_else(|| anyhow!("Connection closed immediately after Hello"))??;
 
-    let server_hello = match hello_resp_raw {
-        Message::Text(text) => {
-            let msg: ServerMessage = serde_json::from_str(&text)?;
-            msg
-        }
-        Message::Binary(bytes) => parse_fb_server_message(&bytes)?,
-        _ => return Err(anyhow!("Unexpected response format for Hello")),
-    };
+    let server_hello = parse_message(&hello_resp_raw)?;
 
     match server_hello {
-        ServerMessage::Response {
+        ParsedServerMessage::Owned(ServerMessage::Response {
             result:
                 ServerResult::Hello {
                     protocol_version,
                     authenticated,
                 },
             ..
-        } => {
+        }) => {
+            println!(
+                "Connected successfully. Protocol version: {}, Authenticated: {}",
+                protocol_version, authenticated
+            );
+        }
+        ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+            result:
+                ServerResultBorrowed::Hello {
+                    protocol_version,
+                    authenticated,
+                },
+            ..
+        }) => {
             println!(
                 "Connected successfully. Protocol version: {}, Authenticated: {}",
                 protocol_version, authenticated
@@ -321,22 +236,23 @@ async fn main() -> Result<()> {
             .await
             .ok_or_else(|| anyhow!("Connection closed during session listing"))??;
 
-        let server_resp = match resp_raw {
-            Message::Text(text) => {
-                let msg: ServerMessage = serde_json::from_str(&text)?;
-                msg
-            }
-            Message::Binary(bytes) => parse_fb_server_message(&bytes)?,
-            _ => return Err(anyhow!("Unexpected response format for ListSessions")),
-        };
+        let server_resp = parse_message(&resp_raw)?;
 
         let mut existing_id = None;
-        if let ServerMessage::Response {
-            result: ServerResult::SessionIds { session_ids },
-            ..
-        } = server_resp
-        {
-            existing_id = session_ids.first().cloned();
+        match server_resp {
+            ParsedServerMessage::Owned(ServerMessage::Response {
+                result: ServerResult::SessionIds { session_ids },
+                ..
+            }) => {
+                existing_id = session_ids.first().cloned();
+            }
+            ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+                result: ServerResultBorrowed::SessionIds { session_ids },
+                ..
+            }) => {
+                existing_id = session_ids.first().map(|s| SessionId::new(*s).unwrap());
+            }
+            _ => {}
         }
 
         if let Some(sid) = existing_id {
@@ -377,25 +293,32 @@ async fn main() -> Result<()> {
                 .await
                 .ok_or_else(|| anyhow!("Connection closed during StartSession"))??;
 
-            let start_resp = match start_resp_raw {
-                Message::Text(text) => serde_json::from_str::<ServerMessage>(&text)?,
-                Message::Binary(bytes) => parse_fb_server_message(&bytes)?,
-                _ => return Err(anyhow!("Unexpected response format for StartSession")),
-            };
+            let start_resp = parse_message(&start_resp_raw)?;
 
-            if let ServerMessage::Response {
-                result: ServerResult::SessionId { session_id },
-                ..
-            } = start_resp
-            {
-                println!("Created new session: {}", session_id);
-                session_id
-            } else {
-                return Err(anyhow!(
-                    "Failed to start new session. Got: {:?}",
-                    start_resp
-                ));
-            }
+            let session_id = match start_resp {
+                ParsedServerMessage::Owned(ServerMessage::Response {
+                    result: ServerResult::SessionId { session_id },
+                    ..
+                }) => {
+                    println!("Created new session: {}", session_id);
+                    session_id
+                }
+                ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+                    result: ServerResultBorrowed::SessionId { session_id },
+                    ..
+                }) => {
+                    let sid = SessionId::new(session_id).unwrap();
+                    println!("Created new session: {}", sid);
+                    sid
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Failed to start new session. Got: {:?}",
+                        other
+                    ));
+                }
+            };
+            session_id
         }
     };
 
@@ -427,23 +350,24 @@ async fn main() -> Result<()> {
         .next()
         .await
         .ok_or_else(|| anyhow!("Connection closed during AttachSession"))??;
-    let attach_resp = match attach_resp_raw {
-        Message::Text(text) => serde_json::from_str::<ServerMessage>(&text)?,
-        Message::Binary(bytes) => parse_fb_server_message(&bytes)?,
-        _ => return Err(anyhow!("Unexpected response format for AttachSession")),
-    };
+    let attach_resp = parse_message(&attach_resp_raw)?;
 
-    if let ServerMessage::Response {
-        result: ServerResult::AttachSession { .. },
-        ..
-    } = attach_resp
-    {
-        println!("Successfully attached to session.");
-    } else {
-        return Err(anyhow!(
-            "Failed to attach to session. Got: {:?}",
-            attach_resp
-        ));
+    match attach_resp {
+        ParsedServerMessage::Owned(ServerMessage::Response {
+            result: ServerResult::AttachSession { .. },
+            ..
+        }) | ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+            result: ServerResultBorrowed::AttachSession,
+            ..
+        }) => {
+            println!("Successfully attached to session.");
+        }
+        other => {
+            return Err(anyhow!(
+                "Failed to attach to session. Got: {:?}",
+                other
+            ));
+        }
     }
 
     // Subscribe
@@ -473,27 +397,24 @@ async fn main() -> Result<()> {
         .next()
         .await
         .ok_or_else(|| anyhow!("Connection closed during SubscribeSessionEvents"))??;
-    let sub_resp = match sub_resp_raw {
-        Message::Text(text) => serde_json::from_str::<ServerMessage>(&text)?,
-        Message::Binary(bytes) => parse_fb_server_message(&bytes)?,
-        _ => {
+    let sub_resp = parse_message(&sub_resp_raw)?;
+
+    match sub_resp {
+        ParsedServerMessage::Owned(ServerMessage::Response {
+            result: ServerResult::Subscribed { .. },
+            ..
+        }) | ParsedServerMessage::Borrowed(ServerMessageBorrowed::Response {
+            result: ServerResultBorrowed::Subscribed { .. },
+            ..
+        }) => {
+            println!("Successfully subscribed to session events.");
+        }
+        other => {
             return Err(anyhow!(
-                "Unexpected response format for SubscribeSessionEvents"
+                "Failed to subscribe to session events. Got: {:?}",
+                other
             ));
         }
-    };
-
-    if let ServerMessage::Response {
-        result: ServerResult::Subscribed { .. },
-        ..
-    } = sub_resp
-    {
-        println!("Successfully subscribed to session events.");
-    } else {
-        return Err(anyhow!(
-            "Failed to subscribe to session events. Got: {:?}",
-            sub_resp
-        ));
     }
 
     // 5. Stress loop
@@ -581,16 +502,11 @@ async fn main() -> Result<()> {
                         Message::Binary(bytes) => {
                             bytes_received_receiver
                                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            if let Ok(root) = flatbuffers::root::<fb::ServerMessage>(&bytes) {
-                                let is_event =
-                                    root.payload_type() == fb::ServerMessagePayload::EventPayload;
-                                let is_output = is_event
-                                    && root.payload_as_event_payload().is_some_and(|ep| {
-                                        ep.event_type() == fb::SessionEventPayload::OutputEvent
-                                    });
-                                if is_output {
-                                    output_event_count_receiver.fetch_add(1, Ordering::Relaxed);
-                                }
+                            if let Ok(ServerMessageBorrowed::Event {
+                                event: SessionEventBorrowed::Output { .. },
+                                ..
+                            }) = parse_fb_server_message_borrowed(&bytes) {
+                                output_event_count_receiver.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Message::Close(_) => {
