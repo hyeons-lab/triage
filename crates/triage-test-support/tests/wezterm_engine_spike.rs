@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use tattoy_wezterm_term::color::ColorPalette;
+use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use triage_test_support::terminal_acceptance::{SCENARIOS, TerminalScenario};
-use wezterm_term::color::ColorPalette;
-use wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
 const ROWS: usize = 8;
 const COLS: usize = 32;
