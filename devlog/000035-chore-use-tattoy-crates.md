@@ -24,7 +24,8 @@ Replace the `wezterm-term` and `wezterm-surface` Git-based dependencies in `Carg
 
 ## Commits
 
-- HEAD — chore: migrate wezterm dependencies to community tattoy crates
+- HEAD — doc: address PR comment on planned dependency version discrepancy
+- 52f0b9f — chore: migrate wezterm dependencies to community tattoy crates
 
 ## Research & Discoveries
 

@@ -26,3 +26,7 @@ Our tasks are:
 4.  **Verification**:
     *   Run `cargo check --workspace` to ensure compiling works.
     *   Run `cargo test --workspace` to ensure all unit and integration tests pass.
+
+## Update: Applied Version Correction (2026-05-26)
+
+During execution, it was discovered that `tattoy-wezterm-surface` only has versions up to `0.1.0-fork.2` on crates.io, whereas `tattoy-wezterm-term` is available up to `0.1.0-fork.5`. The plan was amended in practice to use `tattoy-wezterm-surface = "0.1.0-fork.2"` inside the workspace `Cargo.toml`.
