@@ -25,4 +25,5 @@ Support the FlatBuffers binary subprotocol in the Flutter client for outgoing re
 
 ## Commits
 
-- HEAD — feat: implement client-side FlatBuffers serialization and sending
+- HEAD — fix(client): address PR comments on channel safety, allocations, and add FlatBuffers unit tests
+- 78f7a30 — feat(client): implement bi-directional FlatBuffers serialization and sending
