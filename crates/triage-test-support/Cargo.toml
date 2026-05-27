@@ -14,10 +14,10 @@ workspace = true
 [dependencies]
 alacritty_terminal = { version = "0.26.0", optional = true }
 vte.workspace = true
-wezterm-term = { workspace = true, optional = true }
+tattoy-wezterm-term = { workspace = true, optional = true }
 
 [features]
-engine-spikes = ["dep:alacritty_terminal", "dep:wezterm-term"]
+engine-spikes = ["dep:alacritty_terminal", "dep:tattoy-wezterm-term"]
 
 [dev-dependencies]
 insta.workspace = true

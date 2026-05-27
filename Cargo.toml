@@ -30,8 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tracing-appender = "0.2"
 unicode-width = "0.2"
 vte = "0.15"
-wezterm-term = { git = "https://github.com/wezterm/wezterm.git", rev = "577474d89ee61aef4a48145cdec82a638d874751" }
-wezterm-surface = { git = "https://github.com/wezterm/wezterm.git", rev = "577474d89ee61aef4a48145cdec82a638d874751" }
+tattoy-wezterm-term = "0.1.0-fork.5"
+tattoy-wezterm-surface = "0.1.0-fork.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

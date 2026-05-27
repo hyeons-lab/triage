@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
+use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
+use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi,
@@ -32,8 +34,6 @@ use triage_core::session::{
     TerminalStyle, WriteInputRequest,
 };
 use unicode_width::UnicodeWidthStr;
-use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
-use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const EVENT_REPLAY_BUFFER: usize = 1024;
@@ -2738,12 +2738,15 @@ fn terminal_cursor(terminal: &Terminal) -> TerminalCursor {
         col: cursor.x,
         visible: matches!(
             cursor.visibility,
-            wezterm_surface::CursorVisibility::Visible
+            tattoy_wezterm_surface::CursorVisibility::Visible
         ),
     }
 }
 
-fn terminal_style(attrs: &wezterm_term::CellAttributes, palette: &ColorPalette) -> TerminalStyle {
+fn terminal_style(
+    attrs: &tattoy_wezterm_term::CellAttributes,
+    palette: &ColorPalette,
+) -> TerminalStyle {
     TerminalStyle {
         foreground: terminal_color(attrs.foreground(), palette, true),
         background: terminal_color(attrs.background(), palette, false),
