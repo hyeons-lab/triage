@@ -1529,7 +1529,7 @@ fn draw_status(
         ))
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
+            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt/Ctrl-Alt arrows, F3/F4 switch  Ctrl-Q exit",
             view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };

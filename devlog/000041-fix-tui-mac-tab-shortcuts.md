@@ -19,6 +19,7 @@ Resolve the keyboard shortcut tab switching issue on macOS where the default `Al
 - Changed daemon session startup in the Flutter client to show daemon session placeholders immediately and load each session independently.
 - Ignored local Playwright install and test output directories under the Flutter client.
 - Re-enabled Flutter web FlatBuffers negotiation and made binary browser frames, FlatBuffers events, and generated uint64 getters compatible with dart2js.
+- Updated the TUI footer hint to advertise the new `Ctrl + Alt + Arrow` and `F3`/`F4` tab-switch fallbacks.
 
 ## Decisions
 
@@ -34,7 +35,8 @@ Resolve the keyboard shortcut tab switching issue on macOS where the default `Al
 
 ## Commits
 
-- HEAD — fix(client): enable Flutter web FlatBuffers
+- HEAD — fix(triage): advertise tab shortcut fallbacks
+- 2345fdd — fix(client): enable Flutter web FlatBuffers
 - b1a2190 — fix(client): avoid blocking daemon session startup
 - 8001fae — fix(triage): address PR review comments
 - 7308c24 — fix(triage): use pbcopy for native macOS clipboard copy support in TUI
@@ -45,3 +47,4 @@ Resolve the keyboard shortcut tab switching issue on macOS where the default `Al
 - 2026-05-27T15:15-0700: Addressed PR review comments by switching macOS clipboard spawning to `/usr/bin/pbcopy` and simplifying `Alt + Arrow` modifier guards; `KeyModifiers::contains(KeyModifiers::ALT)` already covers `Ctrl + Alt` combinations. Verified with `cargo fmt --all -- --check` and `cargo test -p triage reserved_control_keys_become_app_commands`.
 - 2026-05-27T17:26-0700: Debugged Flutter web daemon connection failures. Verified direct JSON WebSocket requests, Rust FlatBuffers stress traffic, daemon-served bundle contents, and Playwright browser traffic. Installed Playwright dependencies locally, ran the existing web tests, forced Flutter web to offer only `triage-json`, added named timeout/protocol diagnostics, disabled embedded web asset caching, and made daemon session startup nonblocking with a widget regression test. Rebuilt Flutter web, rebuilt and installed `triaged`, restarted the daemon, and verified `http://127.0.0.1:7777/` with headless Playwright. Validated with `flutter test`, `npm run test:xterm`, `cargo fmt --all -- --check`, `cargo build -p triaged --release --locked`, and `cargo test -p triaged http --target-dir target\triaged-http-tests-final`.
 - 2026-05-27T20:53-0700: Re-enabled Flutter web FlatBuffers and verified the previous timeout was caused by dart2js rejecting generated `ByteData.getUint64` reads from FlatBuffers response/event payloads. Added browser binary frame handling, JSON-compatible decoded event envelopes, and web-safe generated uint64 getters. Rebuilt Flutter web with local web resources, reinstalled and restarted `triaged`, and verified headless Chromium exchanged binary WebSocket frames with an active terminal and no FlatBuffers parse/time-out logs. Validated with `flutter test test/triage_websocket_client_test.dart`, `flutter test`, `flutter build web --no-web-resources-cdn`, `cargo fmt --all -- --check`, `cargo check --workspace`, `cargo install --path crates/triaged --locked --force`, and `npm run test:xterm`.
+- 2026-05-27T21:30-0700: Addressed PR review feedback that the TUI footer only advertised `Alt-arrows switch`. Updated the footer shortcut hint to include `Alt/Ctrl-Alt arrows` and `F3/F4` switching alternatives.
