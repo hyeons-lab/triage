@@ -137,7 +137,7 @@ mod tests {
                 .headers()
                 .get(hyper::header::CACHE_CONTROL)
                 .unwrap(),
-            "public, max-age=31536000"
+            "no-cache, no-store, must-revalidate"
         );
 
         // Verify body content

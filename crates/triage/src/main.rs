@@ -1338,6 +1338,20 @@ fn slice_chars(value: &str, start: usize, end: usize) -> String {
 fn write_osc52_clipboard(output: &mut CrosstermBackend<Stdout>, text: &str) -> Result<()> {
     use std::io::Write;
 
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("/usr/bin/pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
     write!(
         output,
         "\x1b]52;c;{}\x07",
@@ -1515,7 +1529,7 @@ fn draw_status(
         ))
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt-arrows switch  Ctrl-Q exit",
+            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt/Ctrl-Alt arrows, F3/F4 switch  Ctrl-Q exit",
             view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };
@@ -1567,6 +1581,8 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
             Some(AppCommand::Previous)
         }
         KeyCode::F(2) => Some(AppCommand::ToggleSidebar),
+        KeyCode::F(3) => Some(AppCommand::Next),
+        KeyCode::F(4) => Some(AppCommand::Previous),
         KeyCode::PageUp => Some(AppCommand::ScrollUp),
         KeyCode::PageDown => Some(AppCommand::ScrollDown),
         _ => None,
@@ -1815,8 +1831,30 @@ mod tests {
             Some(AppCommand::Previous)
         );
         assert_eq!(
+            key_to_command(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some(AppCommand::Previous)
+        );
+        assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
             Some(AppCommand::ToggleSidebar)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(AppCommand::Next)
+        );
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)),
+            Some(AppCommand::Previous)
         );
         assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
