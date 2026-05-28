@@ -12,7 +12,10 @@ class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
           channelFactory ??
-          ((uri) => WebSocketChannel.connect(uri, protocols: ['triage-json']));
+          ((uri) => WebSocketChannel.connect(
+            uri,
+            protocols: ['triage-flatbuffers', 'triage-json'],
+          ));
 
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
@@ -68,8 +71,9 @@ class TriageWebSocketClient {
   void _handleIncomingMessage(dynamic messageData) {
     try {
       final Map<String, dynamic> message;
-      if (messageData is List<int>) {
-        message = _parseFlatBuffers(messageData);
+      final binaryMessage = _asBinaryMessage(messageData);
+      if (binaryMessage != null) {
+        message = _parseFlatBuffers(binaryMessage);
       } else {
         message = jsonDecode(messageData.toString()) as Map<String, dynamic>;
       }
@@ -109,6 +113,25 @@ class TriageWebSocketClient {
         'error': error.toString(),
       });
     }
+  }
+
+  Uint8List? _asBinaryMessage(dynamic messageData) {
+    if (messageData is Uint8List) {
+      return messageData;
+    }
+    if (messageData is ByteData) {
+      return messageData.buffer.asUint8List(
+        messageData.offsetInBytes,
+        messageData.lengthInBytes,
+      );
+    }
+    if (messageData is ByteBuffer) {
+      return messageData.asUint8List();
+    }
+    if (messageData is List<int>) {
+      return Uint8List.fromList(messageData);
+    }
+    return null;
   }
 
   Future<Map<String, dynamic>> _send(
@@ -374,7 +397,10 @@ class TriageWebSocketClient {
         'type': 'event',
         'subscription_id': evt.subscriptionId,
         'event_seq': evt.eventSeq,
-        'event': _parseSessionEvent(evt.eventType, evt.event),
+        'envelope': {
+          'event_seq': evt.eventSeq,
+          'event': _parseSessionEvent(evt.eventType, evt.event),
+        },
       };
     } else if (payloadType ==
         fbs.ServerMessagePayloadTypeId.SubscriptionClosedPayload) {
@@ -590,39 +616,44 @@ class TriageWebSocketClient {
       case 1: // ResyncRequiredEvent
         final res = event as fbs.ResyncRequiredEvent;
         return {
-          'type': 'resync_required',
-          'session_id': res.sessionId,
-          'latest_event_seq': res.latestEventSeq,
-          'snapshot': _parseSessionSnapshot(res.snapshot),
+          'ResyncRequired': {
+            'session_id': res.sessionId,
+            'latest_event_seq': res.latestEventSeq,
+            'snapshot': _parseSessionSnapshot(res.snapshot),
+          },
         };
       case 2: // OutputEvent
         final out = event as fbs.OutputEvent;
         return {
-          'type': 'output',
-          'session_id': out.sessionId,
-          'output_seq': out.outputSeq,
-          'bytes': out.bytes ?? [],
+          'Output': {
+            'session_id': out.sessionId,
+            'output_seq': out.outputSeq,
+            'bytes': out.bytes ?? [],
+          },
         };
       case 3: // SnapshotEvent
         final snap = event as fbs.SnapshotEvent;
         return {
-          'type': 'snapshot',
-          'session_id': snap.sessionId,
-          'snapshot': _parseSessionSnapshot(snap.snapshot),
+          'Snapshot': {
+            'session_id': snap.sessionId,
+            'snapshot': _parseSessionSnapshot(snap.snapshot),
+          },
         };
       case 4: // LeaseChangedEvent
         final lease = event as fbs.LeaseChangedEvent;
         return {
-          'type': 'lease_changed',
-          'session_id': lease.sessionId,
-          'change': _parseLeaseChange(lease.change),
+          'LeaseChanged': {
+            'session_id': lease.sessionId,
+            'change': _parseLeaseChange(lease.change),
+          },
         };
       case 5: // ExitedEvent
         final exited = event as fbs.ExitedEvent;
         return {
-          'type': 'exited',
-          'session_id': exited.sessionId,
-          'completed': _parseCompletedSession(exited.completed),
+          'Exited': {
+            'session_id': exited.sessionId,
+            'completed': _parseCompletedSession(exited.completed),
+          },
         };
       default:
         return {};

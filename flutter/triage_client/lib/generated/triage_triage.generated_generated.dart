@@ -3,8 +3,35 @@
 
 library triage.generated;
 
-import 'dart:typed_data' show Uint8List;
+import 'dart:typed_data' show Endian, Uint8List;
 import 'package:flat_buffers/flat_buffers.dart' as fb;
+
+// dart2js does not support ByteData.getUint64; generated uint64 getters route here.
+int _vTableGetUint64(
+  fb.BufferContext object,
+  int offset,
+  int field,
+  int defaultValue,
+) {
+  final buffer = object.buffer;
+  final vTableSOffset = buffer.getInt32(offset, Endian.little);
+  final vTableOffset = offset - vTableSOffset;
+  final vTableSize = buffer.getUint16(vTableOffset, Endian.little);
+  if (field >= vTableSize) return defaultValue;
+
+  final fieldOffset = buffer.getUint16(vTableOffset + field, Endian.little);
+  if (fieldOffset == 0) return defaultValue;
+
+  final valueOffset = offset + fieldOffset;
+  final low = buffer.getUint32(valueOffset, Endian.little);
+  final high = buffer.getUint32(valueOffset + 4, Endian.little);
+  if (high > 0x1fffff) {
+    throw UnsupportedError(
+      'uint64 value exceeds the JavaScript safe integer range',
+    );
+  }
+  return high * 0x100000000 + low;
+}
 
 enum AttachMode {
   Observer(0),
@@ -1008,9 +1035,8 @@ class SessionSnapshot {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  int get bytesLogged =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 4, 0);
+  int get bytesLogged => _vTableGetUint64(_bc, _bcOffset, 6, 0);
   SessionSize? get size =>
       SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 8);
   List<String>? get visibleRows => const fb.ListReader<String>(
@@ -1208,9 +1234,8 @@ class CompletedSession {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  int get bytesLogged =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 4, 0);
+  int get bytesLogged => _vTableGetUint64(_bc, _bcOffset, 6, 0);
   List<String>? get visibleRows => const fb.ListReader<String>(
     fb.StringReader(),
   ).vTableGetNullable(_bc, _bcOffset, 8);
@@ -1394,7 +1419,7 @@ class InputLeaseState {
 
   InputLeaseHolder? get holder =>
       InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 4);
-  int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get generation => _vTableGetUint64(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
@@ -1475,7 +1500,7 @@ class LeaseChange {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
+  int get generation => _vTableGetUint64(_bc, _bcOffset, 4, 0);
   InputLeaseHolder? get previous =>
       InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 6);
   InputLeaseHolder? get current =>
@@ -1670,7 +1695,7 @@ class StyledRowsResponse {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
+  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 4, 0);
   int get start => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 6, 0);
   List<StyledRow>? get rows => const fb.ListReader<StyledRow>(
     StyledRow.reader,
@@ -2211,8 +2236,7 @@ class SubscribeSessionEventsRequestTable {
 
   String? get sessionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get afterEventSeq =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get afterEventSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
@@ -4219,8 +4243,7 @@ class ResyncRequiredEvent {
 
   String? get sessionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get latestEventSeq =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get latestEventSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
   SessionSnapshot? get snapshot =>
       SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 8);
 
@@ -4317,7 +4340,7 @@ class OutputEvent {
 
   String? get sessionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
   List<int>? get bytes =>
       const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
 
@@ -4677,7 +4700,7 @@ class EventPayload {
 
   String? get subscriptionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get eventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get eventSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
   SessionEventPayloadTypeId? get eventType =>
       SessionEventPayloadTypeId._createOrNull(
         const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 8),
