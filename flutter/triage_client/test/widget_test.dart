@@ -361,6 +361,61 @@ void main() {
     },
   );
 
+  testWidgets('shows available sessions while one daemon session is loading', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    final delayedSnapshot = Completer<Map<String, dynamic>>();
+    client.snapshotCompleters['flutter-spike'] = delayedSnapshot;
+
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('triage / flutter-spike'), findsWidgets);
+    expect(find.text('Loading session flutter-spike...'), findsOneWidget);
+    expect(find.text('triage / main'), findsWidgets);
+    expect(find.text('Loading 3 sessions...'), findsOneWidget);
+
+    await tester.tap(find.text('triage / main').first);
+    await tester.pumpAndSettle();
+    expect(find.text('line 1 from main'), findsOneWidget);
+
+    delayedSnapshot.complete({
+      'snapshot': {
+        'context': {'branch': 'experiment/flutter-spike'},
+        'size': {'rows': 24, 'cols': 80},
+        'exited': false,
+        'visible_rows': ['flutter-spike ready'],
+        'styled_rows': [
+          {
+            'spans': [
+              {
+                'text': 'flutter-spike ready',
+                'style': {
+                  'foreground': null,
+                  'background': null,
+                  'bold': false,
+                  'dim': false,
+                  'italic': false,
+                  'underline': false,
+                  'reverse': false,
+                },
+              },
+            ],
+          },
+        ],
+        'cursor': {'row': 0, 'col': 0},
+      },
+    });
+    await tester.pumpAndSettle();
+
+    expect(find.text('Connected to Daemon'), findsOneWidget);
+
+    await tester.tap(find.text('triage / flutter-spike').first);
+    await tester.pumpAndSettle();
+    expect(find.text('flutter-spike ready'), findsOneWidget);
+  });
+
   testWidgets('selects sessions and sends input over WebSocket', (
     WidgetTester tester,
   ) async {

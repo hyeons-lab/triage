@@ -33,6 +33,10 @@ class FakeWebSocketChannel implements WebSocketChannel {
   @override
   Stream get stream => _streamController.stream;
 
+  void addIncoming(Object? message) {
+    _streamController.add(message);
+  }
+
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
@@ -322,5 +326,100 @@ void main() {
       expect(styledReq.start, equals(10));
       expect(styledReq.end, equals(20));
     });
+
+    test('attachSession completes from binary FlatBuffers response', () async {
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-flatbuffers',
+      );
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await client.connect();
+
+      final future = client.attachSession(
+        sessionId: 'session-789',
+        clientId: 'client-abc',
+      );
+
+      final response = fbs.ServerMessageObjectBuilder(
+        payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+        payload: fbs.ResponsePayloadObjectBuilder(
+          id: 'req-0',
+          resultType: fbs.ServerResultPayloadTypeId.AttachSessionResult,
+          result: fbs.AttachSessionResultObjectBuilder(
+            response: fbs.AttachSessionResponseObjectBuilder(
+              snapshot: fbs.SessionSnapshotObjectBuilder(
+                outputSeq: 1,
+                bytesLogged: 2,
+                size: fbs.SessionSizeObjectBuilder(
+                  rows: 24,
+                  cols: 80,
+                  pixelWidth: 800,
+                  pixelHeight: 480,
+                  dpi: 96,
+                ),
+                visibleRows: ['ready'],
+                styledRowsStart: 0,
+                styledRows: [],
+                bracketedPasteEnabled: false,
+                exited: false,
+              ),
+              lease: fbs.InputLeaseStateObjectBuilder(generation: 1),
+            ),
+          ),
+        ),
+      ).toBytes();
+
+      channel.addIncoming(response);
+
+      final result = await future;
+      expect(result['result'], equals('attach_session'));
+      expect(result['response']['snapshot']['visible_rows'], equals(['ready']));
+    });
+
+    test(
+      'styledRows completes with error from binary FlatBuffers response',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final future = client.styledRows(
+          sessionId: 'session-789',
+          start: 0,
+          end: 200,
+        );
+
+        final response = fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ErrorPayload,
+          payload: fbs.ErrorPayloadObjectBuilder(
+            id: 'req-0',
+            code: 'request_failed',
+            message: 'styled row range 0..200 exceeds retained row count 44',
+          ),
+        ).toBytes();
+
+        channel.addIncoming(response);
+
+        await expectLater(
+          future,
+          throwsA(
+            isA<Exception>().having(
+              (e) => e.toString(),
+              'message',
+              contains('styled row range'),
+            ),
+          ),
+        );
+      },
+    );
   });
 }

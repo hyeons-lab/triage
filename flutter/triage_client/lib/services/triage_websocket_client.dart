@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:triage_client/generated/triage_triage.generated_generated.dart'
     as fbs;
@@ -11,16 +12,14 @@ class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
           channelFactory ??
-          ((uri) => WebSocketChannel.connect(
-            uri,
-            protocols: ['triage-flatbuffers', 'triage-json'],
-          ));
+          ((uri) => WebSocketChannel.connect(uri, protocols: ['triage-json']));
 
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
   WebSocketChannel? _channel;
 
   final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
+  final Map<String, String> _pendingRequestTypes = {};
   final Map<String, Timer> _requestTimers = {};
   final StreamController<Map<String, dynamic>> _eventController =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -81,6 +80,7 @@ class TriageWebSocketClient {
         final result = message['result'] as Map<String, dynamic>?;
         if (id != null && _pendingRequests.containsKey(id)) {
           _requestTimers.remove(id)?.cancel();
+          _pendingRequestTypes.remove(id);
           _pendingRequests.remove(id)!.complete(result ?? {});
         }
       } else if (type == 'error') {
@@ -88,6 +88,7 @@ class TriageWebSocketClient {
         final error = message['error'] as Map<String, dynamic>?;
         if (id != null && _pendingRequests.containsKey(id)) {
           _requestTimers.remove(id)?.cancel();
+          _pendingRequestTypes.remove(id);
           final errorMessage = error != null
               ? (error['message'] ?? error['code'] ?? 'Unknown error')
               : 'Unknown error';
@@ -98,8 +99,15 @@ class TriageWebSocketClient {
       } else if (type == 'subscription_closed') {
         _eventController.add(message);
       }
-    } catch (_) {
-      // Ignore or log malformed message
+    } catch (error) {
+      debugPrint(
+        'Failed to parse WebSocket message '
+        '(${messageData.runtimeType}): $error',
+      );
+      _eventController.add({
+        'type': 'protocol_error',
+        'error': error.toString(),
+      });
     }
   }
 
@@ -114,9 +122,13 @@ class TriageWebSocketClient {
     final id = 'req-${_requestIdCounter++}';
     final completer = Completer<Map<String, dynamic>>();
     _pendingRequests[id] = completer;
+    _pendingRequestTypes[id] = type;
     _requestTimers[id] = Timer(const Duration(seconds: 10), () {
       if (_pendingRequests.remove(id) == completer && !completer.isCompleted) {
-        completer.completeError(Exception('WebSocket request timed out'));
+        final requestType = _pendingRequestTypes.remove(id) ?? type;
+        completer.completeError(
+          Exception('WebSocket request timed out: $requestType ($id)'),
+        );
       }
       _requestTimers.remove(id);
     });
@@ -134,6 +146,7 @@ class TriageWebSocketClient {
       }
     } catch (e) {
       _pendingRequests.remove(id);
+      _pendingRequestTypes.remove(id);
       _requestTimers.remove(id)?.cancel();
       rethrow;
     }
@@ -318,6 +331,7 @@ class TriageWebSocketClient {
       timer.cancel();
     }
     _requestTimers.clear();
+    _pendingRequestTypes.clear();
     for (final completer in _pendingRequests.values) {
       if (!completer.isCompleted) {
         completer.completeError(Exception('WebSocket connection closed'));

@@ -210,10 +210,10 @@ where
     }
 
     // 3. Retrieve from cache with fallback to index.html (SPA routing)
-    let (file, is_fallback) = match cache.get(clean_path) {
-        Some(file) => (file, false),
+    let file = match cache.get(clean_path) {
+        Some(file) => file,
         None => match cache.get("index.html") {
-            Some(file) => (file, true),
+            Some(file) => file,
             None => {
                 let mut res = Response::new(Full::new(Bytes::from("Not Found")));
                 *res.status_mut() = StatusCode::NOT_FOUND;
@@ -263,17 +263,10 @@ where
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
     }
 
-    if clean_path == "index.html" || is_fallback {
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-        );
-    } else {
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000"),
-        );
-    }
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
 
     Ok(res)
 }

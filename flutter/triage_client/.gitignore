@@ -32,6 +32,9 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+node_modules/
+test-results/
+playwright-report/
 
 # Symbolication related
 app.*.symbols
