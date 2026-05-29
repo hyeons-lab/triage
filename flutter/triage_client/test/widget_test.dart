@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show TargetPlatform;
+import 'package:flutter/material.dart' show CheckedPopupMenuItem;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -12,12 +14,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     this.shouldFailConnection = false,
     this.failConnectAttempts = 0,
     Set<String>? exitedSessionIds,
+    Set<String>? failedStartSessionCommands,
   }) : exitedSessionIds = {...?exitedSessionIds},
+       failedStartSessionCommands = {...?failedStartSessionCommands},
        super(Uri.parse('ws://localhost:8080/ws'));
 
   final bool shouldFailConnection;
   int failConnectAttempts;
   final Set<String> exitedSessionIds;
+  final Set<String> failedStartSessionCommands;
 
   final StreamController<Map<String, dynamic>> _testEventController =
       StreamController<Map<String, dynamic>>.broadcast(sync: true);
@@ -31,6 +36,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   bool get isConnected => _connected;
 
   final List<String> startSessionCalls = [];
+  final List<String> startSessionCommands = [];
   final List<String> writeInputCalls = [];
   final List<String> attachSessionCalls = [];
   final List<String> restoreSessionCalls = [];
@@ -239,6 +245,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     int rows = 24,
     int cols = 80,
   }) async {
+    startSessionCommands.add(command);
+    if (failedStartSessionCommands.contains(command)) {
+      throw Exception('start session failed for $command');
+    }
     final nextId = 'scratch-${startSessionCalls.length + 1}';
     startSessionCalls.add(nextId);
     return nextId;
@@ -409,6 +419,21 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 }
 
 void main() {
+  test('orders new-session shell menu by platform', () {
+    expect(newSessionShellMenuOrderForPlatform(TargetPlatform.windows), [
+      NewSessionShell.cmd,
+      NewSessionShell.bash,
+    ]);
+    expect(newSessionShellMenuOrderForPlatform(TargetPlatform.macOS), [
+      NewSessionShell.bash,
+      NewSessionShell.cmd,
+    ]);
+    expect(newSessionShellMenuOrderForPlatform(TargetPlatform.linux), [
+      NewSessionShell.bash,
+      NewSessionShell.cmd,
+    ]);
+  });
+
   testWidgets(
     'shows Triage session shell with daemon sessions when connected',
     (WidgetTester tester) async {
@@ -706,9 +731,63 @@ void main() {
 
     await tester.tap(find.byTooltip('New session'));
     await tester.pumpAndSettle();
+    await tester.tap(
+      find.widgetWithText(
+        CheckedPopupMenuItem<NewSessionShell>,
+        'Cmd (cmd.exe)',
+      ),
+    );
+    await tester.pumpAndSettle();
 
     expect(find.text('triage / scratch-1'), findsWidgets);
     expect(find.text('line 1 from scratch-1'), findsOneWidget);
+    expect(client.startSessionCommands, ['cmd.exe']);
+    expect(
+      client.attachSessionCalls.where((sid) => sid == 'scratch-1'),
+      hasLength(2),
+    );
+  });
+
+  testWidgets('creates a bash session from the plus menu', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('New session'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.widgetWithText(CheckedPopupMenuItem<NewSessionShell>, 'Bash (bash)'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('triage / scratch-1'), findsWidgets);
+    expect(client.startSessionCommands, ['bash']);
+  });
+
+  testWidgets('falls back to bash when cmd shell is unavailable', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(
+      failedStartSessionCommands: {'cmd.exe'},
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('New session'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.widgetWithText(
+        CheckedPopupMenuItem<NewSessionShell>,
+        'Cmd (cmd.exe)',
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('triage / scratch-1'), findsWidgets);
+    expect(find.text('line 1 from scratch-1'), findsOneWidget);
+    expect(client.startSessionCommands, ['cmd.exe', 'bash']);
   });
 
   testWidgets('keeps retrying when connection fails', (

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/models/terminal_models.dart';
@@ -33,6 +35,25 @@ class TriageClientApp extends StatelessWidget {
       home: TriageHome(client: client),
     );
   }
+}
+
+enum NewSessionShell {
+  cmd('cmd.exe', 'Cmd'),
+  bash('bash', 'Bash');
+
+  const NewSessionShell(this.command, this.label);
+
+  final String command;
+  final String label;
+}
+
+@visibleForTesting
+List<NewSessionShell> newSessionShellMenuOrderForPlatform(
+  TargetPlatform platform,
+) {
+  return platform == TargetPlatform.windows
+      ? const [NewSessionShell.cmd, NewSessionShell.bash]
+      : const [NewSessionShell.bash, NewSessionShell.cmd];
 }
 
 class SessionVm {
@@ -106,6 +127,7 @@ class _TriageHomeState extends State<TriageHome> {
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
   int _createdSessionCount = 0;
+  late NewSessionShell _newSessionShell;
 
   SessionVm get _selectedSession => _sessions[_selectedIndex];
 
@@ -216,6 +238,9 @@ class _TriageHomeState extends State<TriageHome> {
   void initState() {
     super.initState();
     _clientId = _loadOrCreateClientId();
+    _newSessionShell = newSessionShellMenuOrderForPlatform(
+      defaultTargetPlatform,
+    ).first;
     _sessions = [
       SessionVm(
         title: 'triage / flutter-spike',
@@ -1133,9 +1158,13 @@ class _TriageHomeState extends State<TriageHome> {
     return parts.length > 1 ? parts[1] : null;
   }
 
-  void _createSession() async {
+  void _createSession(NewSessionShell preferredShell) async {
     if (_client.isConnected) {
+      final fallbackShell = preferredShell == NewSessionShell.cmd
+          ? NewSessionShell.bash
+          : NewSessionShell.cmd;
       setState(() {
+        _newSessionShell = preferredShell;
         _connectionStatus = 'Creating session...';
         _connectionStatusColor = const Color(0xffffc857);
       });
@@ -1143,9 +1172,13 @@ class _TriageHomeState extends State<TriageHome> {
       String? subId;
       try {
         try {
-          sessionId = await _client.startSession(command: 'bash');
+          sessionId = await _client.startSession(
+            command: preferredShell.command,
+          );
         } catch (_) {
-          sessionId = await _client.startSession(command: 'cmd.exe');
+          sessionId = await _client.startSession(
+            command: fallbackShell.command,
+          );
         }
         if (sessionId.isNotEmpty) {
           // Subscribe to events first so we don't miss welcome messages
@@ -1219,6 +1252,13 @@ class _TriageHomeState extends State<TriageHome> {
               _onWebSocketEvent(msg);
             }
           }
+          unawaited(
+            _refreshSessionSnapshot(
+              session,
+              markPending: false,
+              includeHistory: true,
+            ),
+          );
         }
       } catch (e) {
         // Roll back partial state so a failed create doesn't strand a subscription
@@ -1337,6 +1377,10 @@ class _TriageHomeState extends State<TriageHome> {
               selectedIndex: _selectedIndex,
               onSelectSession: _selectSession,
               onCreateSession: _createSession,
+              selectedShell: _newSessionShell,
+              shellOptions: newSessionShellMenuOrderForPlatform(
+                defaultTargetPlatform,
+              ),
               connectionStatus: _connectionStatus,
               connectionStatusColor: _connectionStatusColor,
               isCollapsed: _sidebarCollapsed,
@@ -1401,6 +1445,8 @@ class SessionRail extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelectSession,
     required this.onCreateSession,
+    required this.selectedShell,
+    required this.shellOptions,
     required this.connectionStatus,
     required this.connectionStatusColor,
     required this.isCollapsed,
@@ -1410,7 +1456,9 @@ class SessionRail extends StatelessWidget {
   final List<SessionVm> sessions;
   final int selectedIndex;
   final ValueChanged<int> onSelectSession;
-  final VoidCallback onCreateSession;
+  final ValueChanged<NewSessionShell> onCreateSession;
+  final NewSessionShell selectedShell;
+  final List<NewSessionShell> shellOptions;
   final String connectionStatus;
   final Color connectionStatusColor;
   final bool isCollapsed;
@@ -1435,10 +1483,10 @@ class SessionRail extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 16),
-            IconButton(
-              onPressed: onCreateSession,
-              tooltip: 'New session',
-              icon: const Icon(Icons.add, color: Color(0xffcdd7d6)),
+            _NewSessionMenu(
+              selectedShell: selectedShell,
+              shellOptions: shellOptions,
+              onCreateSession: onCreateSession,
             ),
             const SizedBox(height: 16),
             Tooltip(
@@ -1531,10 +1579,10 @@ class SessionRail extends StatelessWidget {
                   constraints: const BoxConstraints(),
                 ),
                 const Spacer(),
-                IconButton(
-                  onPressed: onCreateSession,
-                  tooltip: 'New session',
-                  icon: const Icon(Icons.add, color: Color(0xffcdd7d6)),
+                _NewSessionMenu(
+                  selectedShell: selectedShell,
+                  shellOptions: shellOptions,
+                  onCreateSession: onCreateSession,
                 ),
               ],
             ),
@@ -1612,6 +1660,35 @@ class _ConnectionStatus extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _NewSessionMenu extends StatelessWidget {
+  const _NewSessionMenu({
+    required this.selectedShell,
+    required this.shellOptions,
+    required this.onCreateSession,
+  });
+
+  final NewSessionShell selectedShell;
+  final List<NewSessionShell> shellOptions;
+  final ValueChanged<NewSessionShell> onCreateSession;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<NewSessionShell>(
+      tooltip: 'New session',
+      icon: const Icon(Icons.add, color: Color(0xffcdd7d6)),
+      onSelected: onCreateSession,
+      itemBuilder: (context) => [
+        for (final shell in shellOptions)
+          CheckedPopupMenuItem<NewSessionShell>(
+            value: shell,
+            checked: shell == selectedShell,
+            child: Text('${shell.label} (${shell.command})'),
+          ),
+      ],
     );
   }
 }
