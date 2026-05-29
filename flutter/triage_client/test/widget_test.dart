@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart' show TargetPlatform;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart' show CheckedPopupMenuItem;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -418,19 +419,29 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   }
 }
 
+Future<void> withPlatform(
+  TargetPlatform platform,
+  Future<void> Function() body,
+) async {
+  debugDefaultTargetPlatformOverride = platform;
+  try {
+    await body();
+  } finally {
+    debugDefaultTargetPlatformOverride = null;
+  }
+}
+
 void main() {
-  test('orders new-session shell menu by platform', () {
+  test('chooses new-session shell options by platform', () {
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.windows), [
       NewSessionShell.cmd,
       NewSessionShell.bash,
     ]);
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.macOS), [
       NewSessionShell.bash,
-      NewSessionShell.cmd,
     ]);
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.linux), [
       NewSessionShell.bash,
-      NewSessionShell.cmd,
     ]);
   });
 
@@ -725,69 +736,95 @@ void main() {
   testWidgets('creates a scratch session over WebSocket', (
     WidgetTester tester,
   ) async {
-    final client = FakeTriageWebSocketClient();
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+    await withPlatform(TargetPlatform.windows, () async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    await tester.tap(find.byTooltip('New session'));
-    await tester.pumpAndSettle();
-    await tester.tap(
-      find.widgetWithText(
-        CheckedPopupMenuItem<NewSessionShell>,
-        'Cmd (cmd.exe)',
-      ),
-    );
-    await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(
+          CheckedPopupMenuItem<NewSessionShell>,
+          'Cmd (cmd.exe)',
+        ),
+      );
+      await tester.pumpAndSettle();
 
-    expect(find.text('triage / scratch-1'), findsWidgets);
-    expect(find.text('line 1 from scratch-1'), findsOneWidget);
-    expect(client.startSessionCommands, ['cmd.exe']);
-    expect(
-      client.attachSessionCalls.where((sid) => sid == 'scratch-1'),
-      hasLength(2),
-    );
+      expect(find.text('triage / scratch-1'), findsWidgets);
+      expect(find.text('line 1 from scratch-1'), findsOneWidget);
+      expect(client.startSessionCommands, ['cmd.exe']);
+      expect(
+        client.attachSessionCalls.where((sid) => sid == 'scratch-1'),
+        hasLength(2),
+      );
+    });
+  });
+
+  testWidgets('creates a bash session directly on macOS', (
+    WidgetTester tester,
+  ) async {
+    await withPlatform(TargetPlatform.macOS, () async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(CheckedPopupMenuItem<NewSessionShell>), findsNothing);
+      expect(find.text('triage / scratch-1'), findsWidgets);
+      expect(client.startSessionCommands, ['bash']);
+    });
   });
 
   testWidgets('creates a bash session from the plus menu', (
     WidgetTester tester,
   ) async {
-    final client = FakeTriageWebSocketClient();
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+    await withPlatform(TargetPlatform.windows, () async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    await tester.tap(find.byTooltip('New session'));
-    await tester.pumpAndSettle();
-    await tester.tap(
-      find.widgetWithText(CheckedPopupMenuItem<NewSessionShell>, 'Bash (bash)'),
-    );
-    await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(
+          CheckedPopupMenuItem<NewSessionShell>,
+          'Bash (bash)',
+        ),
+      );
+      await tester.pumpAndSettle();
 
-    expect(find.text('triage / scratch-1'), findsWidgets);
-    expect(client.startSessionCommands, ['bash']);
+      expect(find.text('triage / scratch-1'), findsWidgets);
+      expect(client.startSessionCommands, ['bash']);
+    });
   });
 
   testWidgets('falls back to bash when cmd shell is unavailable', (
     WidgetTester tester,
   ) async {
-    final client = FakeTriageWebSocketClient(
-      failedStartSessionCommands: {'cmd.exe'},
-    );
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+    await withPlatform(TargetPlatform.windows, () async {
+      final client = FakeTriageWebSocketClient(
+        failedStartSessionCommands: {'cmd.exe'},
+      );
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    await tester.tap(find.byTooltip('New session'));
-    await tester.pumpAndSettle();
-    await tester.tap(
-      find.widgetWithText(
-        CheckedPopupMenuItem<NewSessionShell>,
-        'Cmd (cmd.exe)',
-      ),
-    );
-    await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(
+          CheckedPopupMenuItem<NewSessionShell>,
+          'Cmd (cmd.exe)',
+        ),
+      );
+      await tester.pumpAndSettle();
 
-    expect(find.text('triage / scratch-1'), findsWidgets);
-    expect(find.text('line 1 from scratch-1'), findsOneWidget);
-    expect(client.startSessionCommands, ['cmd.exe', 'bash']);
+      expect(find.text('triage / scratch-1'), findsWidgets);
+      expect(find.text('line 1 from scratch-1'), findsOneWidget);
+      expect(client.startSessionCommands, ['cmd.exe', 'bash']);
+    });
   });
 
   testWidgets('keeps retrying when connection fails', (
