@@ -53,7 +53,7 @@ List<NewSessionShell> newSessionShellMenuOrderForPlatform(
 ) {
   return platform == TargetPlatform.windows
       ? const [NewSessionShell.cmd, NewSessionShell.bash]
-      : const [NewSessionShell.bash, NewSessionShell.cmd];
+      : const [NewSessionShell.bash];
 }
 
 class SessionVm {
@@ -1677,6 +1677,15 @@ class _NewSessionMenu extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (shellOptions.length <= 1) {
+      final shell = shellOptions.isEmpty ? selectedShell : shellOptions.first;
+      return IconButton(
+        tooltip: 'New session',
+        icon: const Icon(Icons.add, color: Color(0xffcdd7d6)),
+        onPressed: () => onCreateSession(shell),
+      );
+    }
+
     return PopupMenuButton<NewSessionShell>(
       tooltip: 'New session',
       icon: const Icon(Icons.add, color: Color(0xffcdd7d6)),
