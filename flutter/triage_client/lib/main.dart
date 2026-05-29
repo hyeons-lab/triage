@@ -538,10 +538,15 @@ class _TriageHomeState extends State<TriageHome> {
           : _selectedIndex;
 
       if (_disposed) return;
+      final loadingSessionTitles = {
+        for (final sid in sessionIds) 'triage / $sid',
+      };
       setState(() {
         for (final s in _sessions) {
           s.terminalController.dispose();
-          TerminalPane.destroySession(s.title);
+          if (!loadingSessionTitles.contains(s.title)) {
+            TerminalPane.destroySession(s.title);
+          }
         }
         _sessions.clear();
         for (final sid in sessionIds) {
@@ -581,7 +586,9 @@ class _TriageHomeState extends State<TriageHome> {
               if (existingIndex == -1) return;
               final oldSession = _sessions[existingIndex];
               oldSession.terminalController.dispose();
-              TerminalPane.destroySession(oldSession.title);
+              if (oldSession.title != session.title) {
+                TerminalPane.destroySession(oldSession.title);
+              }
               _sessions[existingIndex] = session;
               if (includeHistory) {
                 session.snapshotRefreshPending = true;
@@ -840,6 +847,10 @@ class _TriageHomeState extends State<TriageHome> {
       }
 
       final session = _sessions[sessionIndex];
+      if (session.status == 'loading') {
+        _pendingEvents.putIfAbsent(sessionId, () => []).add(message);
+        return;
+      }
 
       if (event.containsKey('Output')) {
         final output = event['Output'] as Map<String, dynamic>;

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -38,6 +39,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> snapshotSessionCalls = [];
   final Map<String, List<String>> snapshotVisibleRows = {};
   final Map<String, Completer<Map<String, dynamic>>> snapshotCompleters = {};
+  final Map<String, Completer<Map<String, dynamic>>> attachCompleters = {};
   final Map<String, List<dynamic>> snapshotStyledRowsMap = {};
 
   @override
@@ -71,6 +73,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String mode = 'InteractiveController',
   }) async {
     attachSessionCalls.add(sessionId);
+    final attachCompleter = attachCompleters[sessionId];
+    if (attachCompleter != null) {
+      return attachCompleter.future;
+    }
     final completer = snapshotCompleters[sessionId];
     if (completer != null) {
       final snapRes = await completer.future;
@@ -299,6 +305,61 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     });
   }
 
+  void emitOutput(String sessionId, String text, {int outputSeq = 1}) {
+    _testEventController.add({
+      'type': 'event',
+      'envelope': {
+        'event': {
+          'Output': {
+            'session_id': sessionId,
+            'output_seq': outputSeq,
+            'bytes': utf8.encode(text),
+          },
+        },
+      },
+    });
+  }
+
+  Map<String, dynamic> attachSnapshotResponse(
+    String sessionId,
+    List<String> visibleRows,
+  ) {
+    return {
+      'response': {
+        'snapshot': {
+          'context': {
+            'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
+          },
+          'size': {'rows': 24, 'cols': 80},
+          'output_seq': 0,
+          'exited': exitedSessionIds.contains(sessionId),
+          'visible_rows': visibleRows,
+          'styled_rows': visibleRows
+              .map(
+                (row) => {
+                  'spans': [
+                    {
+                      'text': row,
+                      'style': {
+                        'foreground': null,
+                        'background': null,
+                        'bold': false,
+                        'dim': false,
+                        'italic': false,
+                        'underline': false,
+                        'reverse': false,
+                      },
+                    },
+                  ],
+                },
+              )
+              .toList(),
+          'cursor': {'row': visibleRows.length - 1, 'col': 0},
+        },
+      },
+    };
+  }
+
   void emitSnapshot(
     String sessionId,
     List<String> visibleRows, {
@@ -414,6 +475,53 @@ void main() {
     await tester.tap(find.text('triage / flutter-spike').first);
     await tester.pumpAndSettle();
     expect(find.text('flutter-spike ready'), findsOneWidget);
+  });
+
+  testWidgets('buffers output while daemon session placeholder is loading', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    final delayedAttach = Completer<Map<String, dynamic>>();
+    client.attachCompleters['flutter-spike'] = delayedAttach;
+
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Loading session flutter-spike...'), findsOneWidget);
+
+    await tester.tap(find.text('triage / main').first);
+    await tester.pumpAndSettle();
+    expect(find.text('line 1 from main'), findsOneWidget);
+
+    client.emitOutput(
+      'flutter-spike',
+      '\nlive output during attach',
+      outputSeq: 7,
+    );
+    await tester.pump();
+
+    delayedAttach.complete(
+      client.attachSnapshotResponse('flutter-spike', [
+        'flutter-spike attached',
+      ]),
+    );
+    await tester.pumpAndSettle();
+
+    final delayedRefresh = Completer<Map<String, dynamic>>();
+    client.attachCompleters['flutter-spike'] = delayedRefresh;
+    await tester.tap(find.text('triage / flutter-spike').first);
+    await tester.pump();
+
+    expect(find.text('flutter-spike attached'), findsOneWidget);
+    expect(find.text('live output during attach'), findsOneWidget);
+
+    delayedRefresh.complete(
+      client.attachSnapshotResponse('flutter-spike', [
+        'flutter-spike attached',
+        'live output during attach',
+      ]),
+    );
+    await tester.pumpAndSettle();
   });
 
   testWidgets('selects sessions and sends input over WebSocket', (
