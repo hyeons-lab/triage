@@ -101,6 +101,16 @@ ReplayCursorPlacement computeReplayCursorPlacement({
   int? initialCursorCol,
 }) {
   final rowCount = fallbackRows.length;
+  if (rowCount == 0) {
+    return const ReplayCursorPlacement(
+      sourceRow: 0,
+      sourceCol: 0,
+      startRow: 0,
+      endRow: 0,
+      terminalRow: 1,
+      terminalCol: 1,
+    );
+  }
   var cursorRow = initialCursorRow ?? 0;
   int? cursorCol = initialCursorCol;
 

@@ -15,6 +15,7 @@
 - 2026-05-30T20:55-0700: Ensure clearing browser site data drops any in-memory bearer token and returns the running app to pairing.
 - 2026-05-30T23:32-0700: Make the pairing approval URL directly clickable, add copy controls for pairing codes, and keep the new-session shell submenu Windows-only.
 - 2026-05-30T23:46-0700: Correct initial web terminal replay layout when shell prompt rows include stale leading terminal padding.
+- 2026-05-31T12:39-0700: Resolve the infinite resizing and terminal flashing loop on active sessions by optimizing replay/reset handling when initial content is already written.
 
 ## What Changed
 
@@ -49,6 +50,7 @@
 - 2026-05-30T23:46-0700: Added replay regression coverage for padded WSL-style prompt rows while preserving leading indentation in ordinary output.
 - 2026-05-31T08:41-0700: Changed selected live session replay to resize the daemon snapshot to the current web viewport before applying initial history, preventing stale 80-column MOTD wrapping after refresh.
 - 2026-05-31T08:41-0700: Applied daemon resize response snapshots from the terminal resize callback and only bumped replay revision when the snapshot size changes, so fitted xterm dimensions update without a replay/resize feedback loop.
+- 2026-05-31T12:39-0700: Refactored `didUpdateWidget` in `terminal_pane_web.dart` to use a helper `_triggerFullReplayOrReset()`, which bypasses full stability timing, empty-fitting, and daemon resizing requests if the terminal has already finished writing initial content, preventing the scrollbar-presence layout feedback loop.
 
 ## Decisions
 
@@ -68,6 +70,7 @@
 - 2026-05-30T23:32-0700: Gate shell-submenu visibility by platform rather than the number of configured shells so future non-Windows shell options do not accidentally reintroduce a submenu.
 - 2026-05-30T23:46-0700: Keep the normalization in the web replay path rather than daemon snapshots so command output and stored session logs remain unchanged.
 - 2026-05-31T08:41-0700: Prefer current viewport sizing for the selected replay, preserve saved sizes for unselected historical session restore, and treat same-size resize responses as state updates rather than full replay triggers.
+- 2026-05-31T12:39-0700: Avoid redundant terminal clearing, empty fitting, and layout-debounce timing when updating an already populated terminal, relying on standard ResizeObserver callbacks for actual viewport/window size changes rather than replay revision triggers.
 
 ## Issues
 
@@ -82,11 +85,13 @@
 - 2026-05-30T23:32-0700: The in-app browser backend was unavailable, so UI verification used widget tests and local HTTP checks against the restarted daemon.
 - 2026-05-30T23:32-0700: The focused `triaged` test initially hit Windows `link.exe` LNK1104 on test executable output; rerunning the library target passed.
 - 2026-05-31T08:41-0700: The first `cargo install --path crates\triaged --force` rebuilt successfully but could not replace the running Windows executable; stopping the old daemon and rerunning install succeeded.
+- 2026-05-31T12:39-0700: The terminal flashing bug occurred due to a layout feedback loop where empty terminals fitted to one column more (without scrollbars), sent a resize to the daemon, received a Snapshot, triggered a full replay revision reset which cleared the terminal, showing the scrollbar on replay and fitting to one column less (with scrollbar), starting the loop again.
 
 ## Commits
 
 - 81d48ea — fix: make pairing pins device-specific
-- HEAD — fix: repair pairing UX and terminal replay
+- 5eae74c — fix: repair pairing UX and terminal replay
+- HEAD — fix: repair terminal session restore and flashing loop
 
 ## Progress
 
@@ -102,10 +107,8 @@
 - 2026-05-30T23:32-0700: Added clickable/copy pairing controls and Windows-only shell-menu gating; validated with `dart format`, `cargo fmt --all`, `flutter test test\widget_test.dart`, the focused `triaged` HTTP test, `flutter build web`, `cargo install --path crates\triaged --force`, and local HTTP bundle checks.
 - 2026-05-30T23:46-0700: Fixed padded initial terminal prompt replay and validated with `dart format`, `flutter test test\cursor_position_test.dart`, `flutter test test\widget_test.dart`, `flutter build web`, `cargo install --path crates\triaged --force`, whitespace diff checks, and local HTTP bundle checks.
 - 2026-05-31T08:41-0700: Fixed stale-width initial session replay after refresh and validated with `dart format`, `flutter test test\widget_test.dart`, `flutter test test\cursor_position_test.dart`, `flutter build web`, `cargo install --path crates\triaged --force`, and local HTTP checks against restarted `triaged`.
+- 2026-05-31T12:39-0700: Fixed terminal flashing layout feedback loop by optimizing `replayRevision` updates in the web client, compiled the Flutter web client and Rust daemon, validated with the full workspace Rust and Flutter test suites, and verified the running daemon.
 
 ## Next Steps
 
-- 2026-05-29T20:19-0700: Run broader CI-equivalent checks before opening a PR if time allows, especially full workspace tests and Flutter analysis.
-- 2026-05-29T21:40-0700: Consider full `cargo test --workspace` and `flutter analyze` before PR if CI-equivalent confidence is needed beyond the focused checks run locally.
-- 2026-05-29T22:34-0700: Full workspace Rust tests and Flutter analysis remain useful before PR; only the daemon crate was rerun for this review-fix pass.
-- 2026-05-30T15:26-0700: Consider `cargo test --workspace` and `flutter analyze` before PR if broader CI parity is needed.
+- 2026-05-31T12:39-0700: Open a pull request via `gh pr create` and verify status checks.

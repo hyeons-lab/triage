@@ -676,10 +676,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onWrite(String data) {
-    if (!_initialized) return;
     if (!_initialContentWritten) {
       _pendingLiveWriteBuffer.add(data);
     } else {
+      if (!_initialized) return;
       _liveOutputReceived = true;
       js_util.callMethod(_term, 'write', [data]);
     }
@@ -727,7 +727,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         final fittedRows = fittedRowsNum.toInt();
         final fittedCols = fittedColsNum.toInt();
 
-        if (fittedRows >= 5 && fittedCols >= 80) {
+        if (fittedRows >= 5 && fittedCols >= 10) {
           final sizeChanged =
               _lastFittedRows != fittedRows || _lastFittedCols != fittedCols;
           _lastFittedRows = fittedRows;
@@ -752,7 +752,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (!_styleSheetLoaded) {
               return;
             }
-            if (fittedCols < 80) {
+            if (fittedCols < 10) {
               // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
               return;
             }
@@ -851,6 +851,24 @@ class _TerminalPaneState extends State<TerminalPane> {
     js_util.setProperty(options, 'cursorBlink', !widget.isExited);
   }
 
+  void _triggerFullReplayOrReset() {
+    if (!_initialized) return;
+    try {
+      if (_initialContentWritten) {
+        _resetTerminalSafe();
+        _writeInitialContent();
+      } else {
+        _resetTerminalSafe();
+        _pendingLiveWriteBuffer.clear();
+        _initialContentWritten = false;
+        _stableWidth = null;
+        _stableHeight = null;
+        _liveOutputReceived = false;
+        _triggerFitWithDelayedRetries();
+      }
+    } catch (_) {}
+  }
+
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -858,41 +876,15 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_initialized) {
         try {
           _updateCursorOptions();
-          _resetTerminalSafe();
-          _pendingLiveWriteBuffer.clear();
-          _initialContentWritten = false;
-          _stableWidth = null;
-          _stableHeight = null;
-          _liveOutputReceived = false;
-          _triggerFitWithDelayedRetries();
         } catch (_) {}
       }
+      _triggerFullReplayOrReset();
     }
     if (oldWidget.replayRevision != widget.replayRevision) {
-      if (_initialized) {
-        try {
-          _resetTerminalSafe();
-          _pendingLiveWriteBuffer.clear();
-          _initialContentWritten = false;
-          _stableWidth = null;
-          _stableHeight = null;
-          _liveOutputReceived = false;
-          _triggerFitWithDelayedRetries();
-        } catch (_) {}
-      }
+      _triggerFullReplayOrReset();
     }
     if (oldWidget.replayPending && !widget.replayPending) {
-      if (_initialized) {
-        try {
-          _resetTerminalSafe();
-          _pendingLiveWriteBuffer.clear();
-          _initialContentWritten = false;
-          _stableWidth = null;
-          _stableHeight = null;
-          _liveOutputReceived = false;
-          _triggerFitWithDelayedRetries();
-        } catch (_) {}
-      }
+      _triggerFullReplayOrReset();
     }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeWriteListener(_onWrite);
@@ -905,17 +897,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         widget.controller,
       );
       _bindController();
-      if (_initialized) {
-        try {
-          _resetTerminalSafe();
-          _pendingLiveWriteBuffer.clear();
-          _initialContentWritten = false;
-          _stableWidth = null;
-          _stableHeight = null;
-          _liveOutputReceived = false;
-          _triggerFitWithDelayedRetries();
-        } catch (_) {}
-      }
+      _triggerFullReplayOrReset();
     }
   }
 

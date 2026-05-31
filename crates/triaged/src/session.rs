@@ -1288,7 +1288,6 @@ fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
 fn is_triage_default_shell_wrapper(args: &[String]) -> bool {
     matches!(args, [flag, script]
         if matches!(flag.as_str(), "-lc" | "-c")
-            && script.contains("PROMPT_COMMAND")
             && script.contains("exec \"${SHELL:-/bin/sh}\""))
 }
 
