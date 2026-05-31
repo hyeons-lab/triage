@@ -32,6 +32,29 @@
   <title>Triage Client</title>
   <link rel="manifest" href="manifest.json">
   <link rel="stylesheet" href="xterm.css">
+  <script>
+    // Clear stale Flutter service worker caches without touching localStorage pairing state.
+    (function () {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations()
+          .then(function (registrations) {
+            return Promise.all(registrations.map(function (registration) {
+              return registration.unregister();
+            }));
+          })
+          .catch(function () {});
+      }
+      if ('caches' in window) {
+        caches.keys()
+          .then(function (keys) {
+            return Promise.all(keys.map(function (key) {
+              return caches.delete(key);
+            }));
+          })
+          .catch(function () {});
+      }
+    }());
+  </script>
   <script src="xterm.js"></script>
   <script src="xterm-addon-fit.js"></script>
 </head>

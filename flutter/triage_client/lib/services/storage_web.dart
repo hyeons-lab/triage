@@ -28,6 +28,15 @@ String? retrieveToken() {
   }
 }
 
+void clearToken() {
+  try {
+    final localStorage = js.globalContext.getProperty<js.JSObject>(
+      'localStorage'.toJS,
+    );
+    localStorage.callMethod('removeItem'.toJS, _tokenStorageKey.toJS);
+  } catch (_) {}
+}
+
 void persistClientId(String clientId) {
   try {
     final localStorage = js.globalContext.getProperty<js.JSObject>(

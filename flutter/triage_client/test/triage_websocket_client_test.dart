@@ -173,6 +173,24 @@ void main() {
       expect(helloReq.token, equals('token-abc'));
     });
 
+    test('pairingChallenge request translates to binary FlatBuffers', () async {
+      final f = client.pairingChallenge(clientId: 'client-123');
+      f.catchError((_) => <String, dynamic>{});
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.PairingChallengeRequest),
+      );
+
+      final challengeReq = msg.payload as fbs.PairingChallengeRequest;
+      expect(challengeReq.clientId, equals('client-123'));
+    });
+
     test('writeInput request translates to binary FlatBuffers', () async {
       await client.writeInput(
         sessionId: 'session-456',
@@ -379,6 +397,42 @@ void main() {
       expect(result['result'], equals('attach_session'));
       expect(result['response']['snapshot']['visible_rows'], equals(['ready']));
     });
+
+    test(
+      'pairingChallenge completes from binary FlatBuffers response',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final future = client.pairingChallenge(clientId: 'client-123');
+
+        final response = fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.PairingChallengeResult,
+            result: fbs.PairingChallengeResultObjectBuilder(
+              deviceCode: 'DEVICE01',
+              expiresAt: 123,
+            ),
+          ),
+        ).toBytes();
+
+        channel.addIncoming(response);
+
+        final result = await future;
+        expect(result['result'], equals('pairing_challenge'));
+        expect(result['device_code'], equals('DEVICE01'));
+        expect(result['expires_at'], equals(123));
+      },
+    );
 
     test(
       'attachSession completes from browser ByteBuffer FlatBuffers response',

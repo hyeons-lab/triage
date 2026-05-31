@@ -38,6 +38,20 @@ pub fn parse_client_message(
                 .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             ClientRequest::Pair { code, client_id }
         }
+        fb::ClientRequestPayload::PairingChallengeRequest => {
+            let req = msg.payload_as_pairing_challenge_request().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "PairingChallengeRequest payload is missing",
+                )
+            })?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
+            ClientRequest::PairingChallenge { client_id }
+        }
         fb::ClientRequestPayload::ListSessionsRequest => ClientRequest::ListSessions,
         fb::ClientRequestPayload::StartSessionRequestTable => {
             let req = msg
@@ -396,6 +410,19 @@ pub fn build_client_message<'a>(
             );
             (fb::ClientRequestPayload::PairRequest, req.as_union_value())
         }
+        ClientRequest::PairingChallenge { client_id } => {
+            let client_id_str = builder.create_string(client_id.as_str());
+            let req = fb::PairingChallengeRequest::create(
+                builder,
+                &fb::PairingChallengeRequestArgs {
+                    client_id: Some(client_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::PairingChallengeRequest,
+                req.as_union_value(),
+            )
+        }
         ClientRequest::ListSessions => {
             let req = fb::ListSessionsRequest::create(builder, &fb::ListSessionsRequestArgs {});
             (
@@ -665,6 +692,23 @@ pub fn build_server_message<'a>(
                         &fb::PairedResultArgs { token: Some(tok) },
                     );
                     (fb::ServerResultPayload::PairedResult, r.as_union_value())
+                }
+                ServerResult::PairingChallenge {
+                    device_code,
+                    expires_at,
+                } => {
+                    let device_code = builder.create_string(device_code);
+                    let r = fb::PairingChallengeResult::create(
+                        builder,
+                        &fb::PairingChallengeResultArgs {
+                            device_code: Some(device_code),
+                            expires_at: *expires_at,
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::PairingChallengeResult,
+                        r.as_union_value(),
+                    )
                 }
                 ServerResult::SessionIds { session_ids } => {
                     let mut sids = Vec::new();
@@ -960,6 +1004,10 @@ pub enum ServerResultBorrowed<'a> {
     Paired {
         token: &'a str,
     },
+    PairingChallenge {
+        device_code: &'a str,
+        expires_at: u64,
+    },
     SessionIds {
         session_ids: Vec<&'a str>,
     },
@@ -1034,6 +1082,18 @@ pub fn parse_fb_server_message_borrowed<'a>(
                     ServerResultBorrowed::Hello {
                         protocol_version: hello.protocol_version().unwrap_or(""),
                         authenticated: hello.authenticated(),
+                    }
+                }
+                fb::ServerResultPayload::PairingChallengeResult => {
+                    let challenge = resp.result_as_pairing_challenge_result().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing pairing challenge result",
+                        )
+                    })?;
+                    ServerResultBorrowed::PairingChallenge {
+                        device_code: challenge.device_code().unwrap_or(""),
+                        expires_at: challenge.expires_at(),
                     }
                 }
                 fb::ServerResultPayload::SessionIdsResult => {

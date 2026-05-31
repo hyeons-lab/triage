@@ -14,6 +14,24 @@ void main() {
   runApp(const TriageClientApp());
 }
 
+const int _defaultDaemonPort = 7777;
+
+@visibleForTesting
+Uri defaultWebSocketUriForBase(Uri base) {
+  if ((base.scheme == 'http' || base.scheme == 'https') &&
+      base.host.isNotEmpty &&
+      base.port == _defaultDaemonPort) {
+    return Uri(
+      scheme: base.scheme == 'https' ? 'wss' : 'ws',
+      host: base.host,
+      port: base.port,
+      path: '/ws',
+    );
+  }
+
+  return Uri.parse('ws://127.0.0.1:$_defaultDaemonPort/ws');
+}
+
 class TriageClientApp extends StatelessWidget {
   const TriageClientApp({super.key, this.client});
 
@@ -115,6 +133,11 @@ class _TriageHomeState extends State<TriageHome> {
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
   bool _needsPairing = false;
+  bool _pairingChallengeLoading = false;
+  String? _pairingDeviceCode;
+  Uri? _pairingVerificationUri;
+  DateTime? _pairingExpiresAt;
+  String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
@@ -317,6 +340,34 @@ class _TriageHomeState extends State<TriageHome> {
     return clientId;
   }
 
+  Uri _defaultWebSocketUri() {
+    return defaultWebSocketUriForBase(Uri.base);
+  }
+
+  Uri? _verificationUriForClient(TriageWebSocketClient client) {
+    final wsUri = client.uri;
+    if (!_isLocalVerificationHost(wsUri.host)) {
+      return null;
+    }
+
+    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+    return wsUri.replace(
+      scheme: scheme,
+      path: '/pair',
+      query: '',
+      fragment: '',
+    );
+  }
+
+  bool _isLocalVerificationHost(String host) {
+    final normalized = host.toLowerCase();
+    return normalized == 'localhost' ||
+        normalized == '::1' ||
+        normalized == '0:0:0:0:0:0:0:1' ||
+        normalized == '::ffff:127.0.0.1' ||
+        normalized.startsWith('127.');
+  }
+
   bool _isRemoteSession(SessionVm session) {
     return session.isRemote;
   }
@@ -416,7 +467,9 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _scheduleReconnect() {
-    if (_disposed || _needsPairing || _reconnectTimer?.isActive == true) {
+    if (_disposed ||
+        (_needsPairing && _client.isConnected) ||
+        _reconnectTimer?.isActive == true) {
       return;
     }
 
@@ -432,7 +485,7 @@ class _TriageHomeState extends State<TriageHome> {
     });
   }
 
-  void _connectWebSocket({bool isReconnect = false}) async {
+  Future<void> _connectWebSocket({bool isReconnect = false}) async {
     if (_disposed || _isConnecting) return;
     _isConnecting = true;
     _reconnectTimer?.cancel();
@@ -440,11 +493,13 @@ class _TriageHomeState extends State<TriageHome> {
     final generation = ++_connectGeneration;
     _bearerToken ??= retrieveToken();
     if (_clientInitialized) {
+      final subscription = _websocketSubscription;
+      _websocketSubscription = null;
       try {
-        await _client.disconnect();
+        await subscription?.cancel().timeout(const Duration(milliseconds: 250));
       } catch (_) {}
       try {
-        await _websocketSubscription?.cancel();
+        await _client.disconnect();
       } catch (_) {}
     }
 
@@ -454,8 +509,7 @@ class _TriageHomeState extends State<TriageHome> {
     }
 
     final client =
-        widget.client ??
-        TriageWebSocketClient(Uri.parse('ws://127.0.0.1:7777/ws'));
+        widget.client ?? TriageWebSocketClient(_defaultWebSocketUri());
     _client = client;
     _clientInitialized = true;
 
@@ -491,17 +545,15 @@ class _TriageHomeState extends State<TriageHome> {
       }
 
       if (!authenticated) {
-        setState(() {
-          _needsPairing = true;
-          _connectionStatus = 'Awaiting Pairing';
-          _connectionStatusColor = const Color(0xffffc857);
-        });
+        await _showPairingChallenge(generation);
         _isConnecting = false;
         return;
       }
 
       setState(() {
         _needsPairing = false;
+        _pairingChallengeLoading = false;
+        _pairingChallengeError = null;
         _connectionStatus = 'Connected to Daemon';
         _connectionStatusColor = const Color(0xff7fd1c7);
       });
@@ -516,11 +568,7 @@ class _TriageHomeState extends State<TriageHome> {
       final errStr = e.toString();
       if (errStr.contains('unauthorized') ||
           errStr.contains('unauthenticated')) {
-        setState(() {
-          _needsPairing = true;
-          _connectionStatus = 'Awaiting Pairing';
-          _connectionStatusColor = const Color(0xffffc857);
-        });
+        await _showPairingChallenge(generation);
       } else {
         setState(() {
           _connectionStatus = isReconnect
@@ -538,15 +586,92 @@ class _TriageHomeState extends State<TriageHome> {
     }
   }
 
+  Future<void> _showPairingChallenge(int generation) async {
+    _bearerToken = null;
+    clearToken();
+    if (_disposed || generation != _connectGeneration) {
+      return;
+    }
+
+    setState(() {
+      _needsPairing = true;
+      _pairingChallengeLoading = true;
+      _pairingChallengeError = null;
+      _connectionStatus = 'Awaiting Pairing';
+      _connectionStatusColor = const Color(0xffffc857);
+    });
+
+    await _requestPairingChallenge(generation: generation);
+  }
+
+  Future<void> _requestPairingChallenge({int? generation}) async {
+    if (_disposed || (generation != null && generation != _connectGeneration)) {
+      return;
+    }
+
+    if (!_client.isConnected) {
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError =
+            'Connection closed before the pairing challenge could be requested.';
+      });
+      _scheduleReconnect();
+      return;
+    }
+
+    setState(() {
+      _pairingChallengeLoading = true;
+      _pairingChallengeError = null;
+    });
+
+    try {
+      final challenge = await _client.pairingChallenge(clientId: _clientId);
+      if (_disposed ||
+          (generation != null && generation != _connectGeneration)) {
+        return;
+      }
+
+      final expiresAtSeconds = challenge['expires_at'];
+      setState(() {
+        _pairingDeviceCode = challenge['device_code']?.toString();
+        _pairingVerificationUri = _verificationUriForClient(_client);
+        _pairingExpiresAt = expiresAtSeconds is int
+            ? DateTime.fromMillisecondsSinceEpoch(
+                expiresAtSeconds * 1000,
+                isUtc: true,
+              ).toLocal()
+            : null;
+        _pairingChallengeLoading = false;
+      });
+    } catch (e) {
+      if (_disposed ||
+          (generation != null && generation != _connectGeneration)) {
+        return;
+      }
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
   Future<void> _onPairRequested(String pin) async {
-    final token = await _client.pair(code: pin, clientId: _clientId);
+    final String token;
+    try {
+      token = await _client.pair(code: pin, clientId: _clientId);
+    } catch (_) {
+      await _requestPairingChallenge();
+      rethrow;
+    }
     if (token.isNotEmpty) {
       setState(() {
         _bearerToken = token;
         persistToken(token);
+        _pairingChallengeError = null;
       });
       _reconnectAttempt = 0;
-      _connectWebSocket();
+      _isConnecting = false;
+      await _connectWebSocket();
     } else {
       throw Exception('Server returned empty pairing token');
     }
@@ -1036,6 +1161,11 @@ class _TriageHomeState extends State<TriageHome> {
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
+      if (_needsPairing) {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError =
+            'Connection closed before the pairing challenge could be requested.';
+      }
       _markAttachedSessionsDisconnected();
     });
     _scheduleReconnect();
@@ -1332,7 +1462,7 @@ class _TriageHomeState extends State<TriageHome> {
         body: Center(
           child: SingleChildScrollView(
             child: Container(
-              width: 420,
+              width: 520,
               padding: const EdgeInsets.all(32),
               decoration: BoxDecoration(
                 color: const Color(0xff161b1d),
@@ -1347,6 +1477,12 @@ class _TriageHomeState extends State<TriageHome> {
                 ],
               ),
               child: _PairingView(
+                deviceCode: _pairingDeviceCode,
+                verificationUri: _pairingVerificationUri,
+                expiresAt: _pairingExpiresAt,
+                isChallengeLoading: _pairingChallengeLoading,
+                challengeError: _pairingChallengeError,
+                onRefreshChallenge: () => _requestPairingChallenge(),
                 onPair: _onPairRequested,
                 onCancel: () async {
                   try {
@@ -1884,8 +2020,23 @@ class WorkspaceHeader extends StatelessWidget {
 }
 
 class _PairingView extends StatefulWidget {
-  const _PairingView({required this.onPair, required this.onCancel});
+  const _PairingView({
+    required this.deviceCode,
+    required this.verificationUri,
+    required this.expiresAt,
+    required this.isChallengeLoading,
+    required this.challengeError,
+    required this.onRefreshChallenge,
+    required this.onPair,
+    required this.onCancel,
+  });
 
+  final String? deviceCode;
+  final Uri? verificationUri;
+  final DateTime? expiresAt;
+  final bool isChallengeLoading;
+  final String? challengeError;
+  final Future<void> Function() onRefreshChallenge;
   final Future<void> Function(String pin) onPair;
   final VoidCallback onCancel;
 
@@ -1934,8 +2085,20 @@ class _PairingViewState extends State<_PairingView> {
     }
   }
 
+  String _expiryLabel(DateTime? expiresAt) {
+    if (expiresAt == null) return '';
+    final hour = expiresAt.hour.toString().padLeft(2, '0');
+    final minute = expiresAt.minute.toString().padLeft(2, '0');
+    return 'Expires at $hour:$minute';
+  }
+
   @override
   Widget build(BuildContext context) {
+    final deviceCode = widget.deviceCode;
+    final verificationUri = widget.verificationUri;
+    final hasVerificationUri = verificationUri != null;
+    final expiryLabel = _expiryLabel(widget.expiresAt);
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1955,10 +2118,127 @@ class _PairingViewState extends State<_PairingView> {
           ],
         ),
         const SizedBox(height: 16),
-        const Text(
-          'This Triage daemon requires pairing. Please run "triage pair" in your local terminal and enter the 8-character PIN below.',
-          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
+        Text(
+          hasVerificationUri
+              ? 'This browser is not paired with the Triage daemon. Open the verification URL, enter this device code to get a PIN, then enter the PIN below.'
+              : 'This browser is not paired with the Triage daemon. Approve pairing from the computer running triaged, then enter the PIN below.',
+          style: const TextStyle(
+            color: Color(0xffa5b1b4),
+            fontSize: 14,
+            height: 1.4,
+          ),
         ),
+        const SizedBox(height: 18),
+        if (widget.isChallengeLoading && deviceCode == null)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: CircularProgressIndicator(
+                strokeWidth: 2.5,
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xff7fd1c7)),
+              ),
+            ),
+          )
+        else ...[
+          if (hasVerificationUri) ...[
+            const Text(
+              'Verification URL',
+              style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            SelectableText(
+              verificationUri.toString(),
+              style: const TextStyle(color: Color(0xff7fd1c7), fontSize: 14),
+            ),
+          ] else ...[
+            const Text(
+              'Local approval required',
+              style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Use the daemon host pairing page or run triage pair.',
+              style: TextStyle(color: Color(0xffcdd7d6), fontSize: 14),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xff101517),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xff344145)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Device Code',
+                        style: TextStyle(
+                          color: Color(0xff7f8b8d),
+                          fontSize: 12,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      SelectableText(
+                        deviceCode ?? '--------',
+                        style: const TextStyle(
+                          color: Color(0xffedf7f6),
+                          fontSize: 24,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 4,
+                        ),
+                      ),
+                      if (expiryLabel.isNotEmpty) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          expiryLabel,
+                          style: const TextStyle(
+                            color: Color(0xff7f8b8d),
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton(
+                onPressed: widget.isChallengeLoading
+                    ? null
+                    : () => widget.onRefreshChallenge(),
+                icon: widget.isChallengeLoading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.2,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Color(0xff7fd1c7),
+                          ),
+                        ),
+                      )
+                    : const Icon(Icons.refresh),
+                tooltip: 'Refresh device code',
+                color: const Color(0xffcdd7d6),
+              ),
+            ],
+          ),
+        ],
+        if (widget.challengeError != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            widget.challengeError!,
+            style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
+          ),
+        ],
         const SizedBox(height: 24),
         TextField(
           controller: _pinController,
@@ -1996,8 +2276,10 @@ class _PairingViewState extends State<_PairingView> {
           ),
         ],
         const SizedBox(height: 24),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.end,
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 12,
+          runSpacing: 8,
           children: [
             TextButton(
               onPressed: _isLoading ? null : widget.onCancel,
@@ -2006,7 +2288,6 @@ class _PairingViewState extends State<_PairingView> {
               ),
               child: const Text('Cancel (Offline Mode)'),
             ),
-            const SizedBox(width: 12),
             ElevatedButton(
               onPressed: _isLoading ? null : _submit,
               style: ElevatedButton.styleFrom(

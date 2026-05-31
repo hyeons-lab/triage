@@ -150,43 +150,6 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> 
 }
 
 fn run_pairing_display() -> Result<()> {
-    let log_dir = triaged::session::default_log_dir();
-    let pairing_code_path = log_dir.join("pairing_code.json");
-
-    if !pairing_code_path.exists() {
-        bail!(
-            "No active pairing session found.\nPlease ensure the triaged daemon is running and has `remote.require_pairing = true` set in config.toml."
-        );
-    }
-
-    let content =
-        std::fs::read_to_string(&pairing_code_path).context("reading pairing_code.json")?;
-    let info: serde_json::Value =
-        serde_json::from_str(&content).context("parsing pairing_code.json")?;
-
-    let code = info
-        .get("code")
-        .and_then(|v| v.as_str())
-        .context("pairing_code.json is missing 'code'")?;
-
-    let expires_at_sec = info
-        .get("expires_at")
-        .and_then(|v| v.as_u64())
-        .context("pairing_code.json is missing 'expires_at'")?;
-
-    let now_sec = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-
-    if now_sec >= expires_at_sec {
-        bail!(
-            "The active pairing PIN has expired.\nPlease restart the triaged daemon to generate a new PIN."
-        );
-    }
-
-    let remaining_mins = (expires_at_sec - now_sec) / 60;
-    let remaining_secs = (expires_at_sec - now_sec) % 60;
-
     let config_path = triage_core::config::Config::default_path().unwrap_or_else(|_| {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
@@ -194,28 +157,36 @@ fn run_pairing_display() -> Result<()> {
             .unwrap_or_else(std::env::temp_dir);
         home.join(".config/triage/config.toml")
     });
-    let bind_addr = if config_path.exists() {
-        let config = triage_core::config::Config::load_from_path(&config_path).unwrap_or_default();
-        config.remote.bind
+    let config = if config_path.exists() {
+        triage_core::config::Config::load_from_path(&config_path).unwrap_or_default()
     } else {
-        "127.0.0.1:7777".to_string()
+        triage_core::config::Config::default()
     };
+    let bind_addr = config.remote.bind_addr()?;
+    let verification_url = pairing_url_for_bind(bind_addr);
 
     println!("\x1b[1;36m====================================================\x1b[0m");
     println!("\x1b[1;36m               TRIAGE REMOTE PAIRING                \x1b[0m");
     println!("\x1b[1;36m====================================================\x1b[0m");
     println!();
-    println!("  Pairing PIN: \x1b[1;32m{}\x1b[0m", code);
-    println!("  Daemon URL:  \x1b[1;33mws://{}\x1b[0m", bind_addr);
+    println!("  Verification URL: \x1b[1;33m{}\x1b[0m", verification_url);
     println!();
-    println!("  Enter this PIN in your Triage remote client to pair.");
-    println!(
-        "  This PIN will expire in \x1b[1;35m{}m {}s\x1b[0m.",
-        remaining_mins, remaining_secs
-    );
+    println!("  Open the Triage client. If it is not paired, it will show a device code.");
+    println!("  Enter that device code at the verification URL to get a pairing PIN.");
+    println!("  Then enter the PIN back in that same Triage client.");
     println!("\x1b[1;36m====================================================\x1b[0m");
 
     Ok(())
+}
+
+fn pairing_url_for_bind(bind_addr: std::net::SocketAddr) -> String {
+    let ip = match bind_addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    format!("http://{}:{}/pair", ip, bind_addr.port())
 }
 
 #[cfg(unix)]
@@ -279,7 +250,7 @@ impl StartupMode {
 usage: triage [--socket <path>] [--embedded] [pair] [client reload] [client upgrade --src <dir>]
 
 Options:
-  pair              Display pairing PIN for remote clients
+  pair              Display remote client pairing instructions
   client reload     Reload in-memory web asset cache inside running daemon
   client upgrade    Upgrade web client assets from a source directory
   --src <dir>       Source directory for web client upgrade (required for client upgrade)

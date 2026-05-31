@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, debugDefaultTargetPlatformOverride;
-import 'package:flutter/material.dart' show CheckedPopupMenuItem;
+import 'package:flutter/material.dart' show CheckedPopupMenuItem, TextField;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -12,16 +12,21 @@ import 'package:triage_client/widgets/terminal_pane.dart';
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
   FakeTriageWebSocketClient({
+    Uri? uri,
     this.shouldFailConnection = false,
     this.failConnectAttempts = 0,
+    this.authenticated = true,
+    this.disconnectAfterHello = false,
     Set<String>? exitedSessionIds,
     Set<String>? failedStartSessionCommands,
   }) : exitedSessionIds = {...?exitedSessionIds},
        failedStartSessionCommands = {...?failedStartSessionCommands},
-       super(Uri.parse('ws://localhost:8080/ws'));
+       super(uri ?? Uri.parse('ws://localhost:8080/ws'));
 
   final bool shouldFailConnection;
   int failConnectAttempts;
+  bool authenticated;
+  final bool disconnectAfterHello;
   final Set<String> exitedSessionIds;
   final Set<String> failedStartSessionCommands;
 
@@ -38,6 +43,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   final List<String> startSessionCalls = [];
   final List<String> startSessionCommands = [];
+  final List<String> pairingChallengeClientIds = [];
+  final List<String> pairCodes = [];
   final List<String> writeInputCalls = [];
   final List<String> attachSessionCalls = [];
   final List<String> restoreSessionCalls = [];
@@ -65,7 +72,33 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (clientId != null) {
       helloClientIds.add(clientId);
     }
-    return {'protocol_version': '2026-05-20', 'authenticated': true};
+    if (disconnectAfterHello) {
+      _connected = false;
+    }
+    return {'protocol_version': '2026-05-20', 'authenticated': authenticated};
+  }
+
+  @override
+  Future<Map<String, dynamic>> pairingChallenge({
+    required String clientId,
+  }) async {
+    pairingChallengeClientIds.add(clientId);
+    return {
+      'device_code': 'ABCD1234',
+      'expires_at':
+          DateTime.now()
+              .add(const Duration(minutes: 15))
+              .toUtc()
+              .millisecondsSinceEpoch ~/
+          1000,
+    };
+  }
+
+  @override
+  Future<String> pair({required String code, required String clientId}) async {
+    pairCodes.add(code);
+    authenticated = true;
+    return 'paired-token';
   }
 
   @override
@@ -443,6 +476,32 @@ void main() {
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.linux), [
       NewSessionShell.bash,
     ]);
+  });
+
+  test('uses daemon websocket target for Flutter dev server base URL', () {
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('http://127.0.0.1:8080/')),
+      Uri.parse('ws://127.0.0.1:7777/ws'),
+    );
+  });
+
+  test(
+    'uses same-origin websocket target when served by default daemon port',
+    () {
+      expect(
+        defaultWebSocketUriForBase(
+          Uri.parse('https://triage.example.test:7777/app/?mock=false#top'),
+        ),
+        Uri.parse('wss://triage.example.test:7777/ws'),
+      );
+    },
+  );
+
+  test('uses daemon websocket target for non-http base URLs', () {
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('file:///tmp/triage/index.html')),
+      Uri.parse('ws://127.0.0.1:7777/ws'),
+    );
   });
 
   testWidgets(
@@ -878,6 +937,70 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(secondClient.helloClientIds.single, client.helloClientIds.single);
+  });
+
+  testWidgets('shows device-specific pairing challenge when unauthenticated', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(authenticated: false);
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pair Remote Device'), findsOneWidget);
+    expect(find.text('ABCD1234'), findsOneWidget);
+    expect(
+      find.textContaining('localhost:8080/pair', findRichText: true),
+      findsOneWidget,
+    );
+    expect(client.pairingChallengeClientIds, client.helloClientIds);
+
+    await tester.enterText(find.byType(TextField), 'WXYZ9876');
+    await tester.tap(find.text('Pair Device'));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(client.pairCodes, ['WXYZ9876']);
+    expect(client.helloClientIds.length, 2);
+    expect(find.text('Pair Remote Device'), findsNothing);
+  });
+
+  testWidgets('does not show non-local pairing URL when unauthenticated', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(
+      uri: Uri.parse('ws://192.168.1.10:7777/ws'),
+      authenticated: false,
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pair Remote Device'), findsOneWidget);
+    expect(find.text('ABCD1234'), findsOneWidget);
+    expect(find.text('Local approval required'), findsOneWidget);
+    expect(find.textContaining('triage pair'), findsOneWidget);
+    expect(
+      find.textContaining('192.168.1.10:7777/pair', findRichText: true),
+      findsNothing,
+    );
+  });
+
+  testWidgets('clears pairing challenge loading when disconnected', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(
+      authenticated: false,
+      disconnectAfterHello: true,
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('Pair Remote Device'), findsOneWidget);
+    expect(
+      find.textContaining('Connection closed before the pairing challenge'),
+      findsOneWidget,
+    );
+    expect(client.pairingChallengeClientIds, isEmpty);
   });
 
   testWidgets('does not locally edit daemon terminal after disconnect', (

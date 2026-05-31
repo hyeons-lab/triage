@@ -12,10 +12,7 @@ class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
           channelFactory ??
-          ((uri) => WebSocketChannel.connect(
-            uri,
-            protocols: ['triage-flatbuffers', 'triage-json'],
-          ));
+          ((uri) => WebSocketChannel.connect(uri, protocols: ['triage-json']));
 
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
@@ -187,6 +184,12 @@ class TriageWebSocketClient {
   Future<String> pair({required String code, required String clientId}) async {
     final response = await _send('pair', {'code': code, 'client_id': clientId});
     return response['token']?.toString() ?? '';
+  }
+
+  Future<Map<String, dynamic>> pairingChallenge({
+    required String clientId,
+  }) async {
+    return _send('pairing_challenge', {'client_id': clientId});
   }
 
   Future<String> startSession({
@@ -431,6 +434,13 @@ class TriageWebSocketClient {
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
         return {'result': 'paired', 'token': paired.token};
+      case 12: // PairingChallengeResult
+        final challenge = result as fbs.PairingChallengeResult;
+        return {
+          'result': 'pairing_challenge',
+          'device_code': challenge.deviceCode,
+          'expires_at': challenge.expiresAt,
+        };
       case 4: // SessionIdsResult
         final sids = result as fbs.SessionIdsResult;
         return {'result': 'session_ids', 'session_ids': sids.sessionIds ?? []};
@@ -681,6 +691,13 @@ class TriageWebSocketClient {
         payloadType = fbs.ClientRequestPayloadTypeId.PairRequest;
         payload = fbs.PairRequestObjectBuilder(
           code: extra?['code'] as String?,
+          clientId: extra?['client_id'] as String?,
+        );
+        break;
+
+      case 'pairing_challenge':
+        payloadType = fbs.ClientRequestPayloadTypeId.PairingChallengeRequest;
+        payload = fbs.PairingChallengeRequestObjectBuilder(
           clientId: extra?['client_id'] as String?,
         );
         break;

@@ -9,6 +9,10 @@ String? retrieveToken() {
   return _stubToken;
 }
 
+void clearToken() {
+  _stubToken = null;
+}
+
 void persistClientId(String clientId) {
   _stubClientId = clientId;
 }
