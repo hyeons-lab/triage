@@ -3,6 +3,7 @@
 ## Agent
 
 - Codex
+- Antigravity
 
 ## Intent
 
@@ -16,6 +17,7 @@
 - 2026-05-30T23:46-0700: Correct initial web terminal replay layout when shell prompt rows include stale leading terminal padding.
 - 2026-05-31T12:39-0700: Resolve the infinite resizing and terminal flashing loop on active sessions by optimizing replay/reset handling when initial content is already written.
 - 2026-05-31T12:47-0700: Resolve the live active cursor displacement issue where the cursor is placed too high due to aggressive scrollback prompt line clamping.
+- 2026-05-31T13:01-0700: Resolve the terminal cursor misalignment on first load by synchronously updating lastFittedCols/lastFittedRows to prevent duplicate concurrent layout refreshes.
 
 ## What Changed
 
@@ -51,7 +53,8 @@
 - 2026-05-31T08:41-0700: Changed selected live session replay to resize the daemon snapshot to the current web viewport before applying initial history, preventing stale 80-column MOTD wrapping after refresh.
 - 2026-05-31T08:41-0700: Applied daemon resize response snapshots from the terminal resize callback and only bumped replay revision when the snapshot size changes, so fitted xterm dimensions update without a replay/resize feedback loop.
 - 2026-05-31T12:39-0700: Refactored `didUpdateWidget` in `terminal_pane_web.dart` to use a helper `_triggerFullReplayOrReset()`, which bypasses full stability timing, empty-fitting, and daemon resizing requests if the terminal has already finished writing initial content, preventing the scrollbar-presence layout feedback loop.
-- 2026-05-31T12:47-0700: Added an `isExited` parameter (defaulting to `true`) to `computeReplayCursorPlacement` in `terminal_replay.dart` and passed `widget.isExited` from `terminal_pane_web.dart` so that active sessions bypass prompt-line clamping, preserving precise PTY cursor coordinates.
+- 2026-05-31T12:47-0700: Disabled cursor clamping for live active sessions, added custom regression test coverage in `cursor_position_test.dart`, rebuilt and reinstalled all client and daemon components, and verified successful operation of the daemon.
+- 2026-05-31T13:01-0700: Updated `_applySnapshotToSession` to update `session.lastFittedCols` and `session.lastFittedRows` synchronously before performing asynchronous history merging, ensuring subsequent concurrent WebSocket snapshot events resolve `sizeChanged` to `false` and skip duplicate history-replay cycles.
 
 ## Decisions
 
@@ -73,6 +76,7 @@
 - 2026-05-31T08:41-0700: Prefer current viewport sizing for the selected replay, preserve saved sizes for unselected historical session restore, and treat same-size resize responses as state updates rather than full replay triggers.
 - 2026-05-31T12:39-0700: Avoid redundant terminal clearing, empty fitting, and layout-debounce timing when updating an already populated terminal, relying on standard ResizeObserver callbacks for actual viewport/window size changes rather than replay revision triggers.
 - 2026-05-31T12:47-0700: Keep the prompt-line cursor clamping active *only* for exited/historical sessions (to prevent the cursor from floating on blank padding rows), while completely disabling it for active sessions where the live PTY coordinates must be trusted.
+- 2026-05-31T13:01-0700: Update `lastFittedCols` and `lastFittedRows` synchronously to ensure any asynchronous task boundaries see the size state immediately without awaiting the full snapshot rendering frame.
 
 ## Issues
 
@@ -95,7 +99,8 @@
 - 81d48ea — fix: make pairing pins device-specific
 - 5eae74c — fix: repair pairing UX and terminal replay
 - bf7d68e — fix: repair terminal session restore and flashing loop
-- HEAD — fix: disable prompt line clamping for active session cursor
+- 228b602 — fix: disable prompt line clamping for active session cursor
+- HEAD — fix: prevent duplicate concurrent terminal layout refreshes on first load
 
 ## Progress
 
@@ -113,6 +118,7 @@
 - 2026-05-31T08:41-0700: Fixed stale-width initial session replay after refresh and validated with `dart format`, `flutter test test\widget_test.dart`, `flutter test test\cursor_position_test.dart`, `flutter build web`, `cargo install --path crates\triaged --force`, and local HTTP checks against restarted `triaged`.
 - 2026-05-31T12:39-0700: Fixed terminal flashing layout feedback loop by optimizing `replayRevision` updates in the web client, compiled the Flutter web client and Rust daemon, validated with the full workspace Rust and Flutter test suites, and verified the running daemon.
 - 2026-05-31T12:47-0700: Disabled cursor clamping for live active sessions, added custom regression test coverage in `cursor_position_test.dart`, rebuilt and reinstalled all client and daemon components, and verified successful operation of the daemon.
+- 2026-05-31T13:01-0700: Prevented duplicate concurrent history merges and terminal layout refreshes during first load by updating size state synchronously, compiled the web client, reinstalled and restarted the daemon, and successfully verified all tests.
 
 ## Next Steps
 

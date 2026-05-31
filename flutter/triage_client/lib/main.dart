@@ -1309,6 +1309,14 @@ class _TriageHomeState extends State<TriageHome> {
     Map<String, dynamic> snapshot, {
     bool includeHistory = false,
   }) async {
+    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+    final cols = sizeObj?['cols'] as int?;
+    final rowsVal = sizeObj?['rows'] as int?;
+    if (cols != null && rowsVal != null) {
+      session.lastFittedCols = cols;
+      session.lastFittedRows = rowsVal;
+    }
+
     final visibleRowsJson = snapshot['visible_rows'] as List<dynamic>?;
     final styledRowsJson = snapshot['styled_rows'] as List<dynamic>?;
     final rows = await _mergeVisibleAndStyledRows(
@@ -1330,9 +1338,6 @@ class _TriageHomeState extends State<TriageHome> {
       initialCursorRow = absoluteCursorRow - startOffset;
     }
     final exited = snapshot['exited'] as bool? ?? false;
-    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-    final cols = sizeObj?['cols'] as int?;
-    final rowsVal = sizeObj?['rows'] as int?;
 
     setState(() {
       session.rows

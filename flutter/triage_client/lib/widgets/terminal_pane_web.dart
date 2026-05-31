@@ -884,6 +884,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (oldWidget.replayRevision != widget.replayRevision) {
       _triggerFullReplayOrReset();
     }
+    if (oldWidget.initialCursorRow != widget.initialCursorRow ||
+        oldWidget.initialCursorCol != widget.initialCursorCol) {
+      _triggerFullReplayOrReset();
+    }
     if (oldWidget.replayPending && !widget.replayPending) {
       _triggerFullReplayOrReset();
     }
