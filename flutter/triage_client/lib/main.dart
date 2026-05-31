@@ -114,6 +114,8 @@ class SessionVm {
   bool snapshotRefreshPending = false;
   int? lastFittedCols;
   int? lastFittedRows;
+  int? inFlightCols;
+  int? inFlightRows;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
@@ -1136,9 +1138,11 @@ class _TriageHomeState extends State<TriageHome> {
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     final cols = sizeObj?['cols'] as int?;
     final rows = sizeObj?['rows'] as int?;
+    final currentCols = session.inFlightCols ?? session.lastFittedCols;
+    final currentRows = session.inFlightRows ?? session.lastFittedRows;
     return cols != null &&
         rows != null &&
-        (session.lastFittedCols != cols || session.lastFittedRows != rows);
+        (currentCols != cols || currentRows != rows);
   }
 
   bool _sessionStillLoaded(SessionVm session, String sessionId) {
@@ -1276,11 +1280,13 @@ class _TriageHomeState extends State<TriageHome> {
           final size = snapshot['size'] as Map<String, dynamic>?;
           final cols = size?['cols'] as int?;
           final rows = size?['rows'] as int?;
+          final currentCols = session.inFlightCols ?? session.lastFittedCols;
+          final currentRows = session.inFlightRows ?? session.lastFittedRows;
           final sizeChanged =
               cols != null &&
               rows != null &&
-              (session.lastFittedCols != cols ||
-                  session.lastFittedRows != rows);
+              (currentCols != cols ||
+                  currentRows != rows);
           await _applySnapshotToSession(
             session,
             sessionId,
@@ -1313,8 +1319,8 @@ class _TriageHomeState extends State<TriageHome> {
     final cols = sizeObj?['cols'] as int?;
     final rowsVal = sizeObj?['rows'] as int?;
     if (cols != null && rowsVal != null) {
-      session.lastFittedCols = cols;
-      session.lastFittedRows = rowsVal;
+      session.inFlightCols = cols;
+      session.inFlightRows = rowsVal;
     }
 
     final visibleRowsJson = snapshot['visible_rows'] as List<dynamic>?;
@@ -1326,7 +1332,11 @@ class _TriageHomeState extends State<TriageHome> {
       includeHistory: includeHistory,
       existingRows: session.rows,
     );
-    if (_disposed || rows.isEmpty) return;
+    if (_disposed || rows.isEmpty) {
+      session.inFlightCols = null;
+      session.inFlightRows = null;
+      return;
+    }
 
     final cursorObj = snapshot['cursor'] as Map<String, dynamic>?;
     final absoluteCursorRow = cursorObj?['row'] as int?;
@@ -1357,6 +1367,10 @@ class _TriageHomeState extends State<TriageHome> {
       if (cols != null && rowsVal != null) {
         session.lastFittedCols = cols;
         session.lastFittedRows = rowsVal;
+        if (session.inFlightCols == cols && session.inFlightRows == rowsVal) {
+          session.inFlightCols = null;
+          session.inFlightRows = null;
+        }
       }
     });
   }

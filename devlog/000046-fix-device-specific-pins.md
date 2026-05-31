@@ -100,7 +100,8 @@
 - 5eae74c — fix: repair pairing UX and terminal replay
 - bf7d68e — fix: repair terminal session restore and flashing loop
 - 228b602 — fix: disable prompt line clamping for active session cursor
-- HEAD — fix: prevent duplicate concurrent terminal layout refreshes on first load
+- a500cc4 — fix: prevent duplicate concurrent terminal layout refreshes on first load
+- HEAD — fix: resolve terminal state inconsistency on asynchronous size updates
 
 ## Progress
 
@@ -119,6 +120,7 @@
 - 2026-05-31T12:39-0700: Fixed terminal flashing layout feedback loop by optimizing `replayRevision` updates in the web client, compiled the Flutter web client and Rust daemon, validated with the full workspace Rust and Flutter test suites, and verified the running daemon.
 - 2026-05-31T12:47-0700: Disabled cursor clamping for live active sessions, added custom regression test coverage in `cursor_position_test.dart`, rebuilt and reinstalled all client and daemon components, and verified successful operation of the daemon.
 - 2026-05-31T13:01-0700: Prevented duplicate concurrent history merges and terminal layout refreshes during first load by updating size state synchronously, compiled the web client, reinstalled and restarted the daemon, and successfully verified all tests.
+- 2026-05-31T13:15-0700: Resolved potential state inconsistency on asynchronous size updates by tracking in-flight sizes synchronously on the session VM, staging, committing, compiling the web client, and reinstalling/restarting the daemon.
 
 ## Next Steps
 
