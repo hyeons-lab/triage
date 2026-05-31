@@ -450,5 +450,31 @@ void main() {
         expect(result.terminalCol, equals(1));
       },
     );
+
+    test(
+      'does not clamp cursor to prompt row in live active sessions (isExited: false)',
+      () {
+        final fallbackRows = [
+          const StyledRow(
+            spans: [StyledSpan(text: r'prompt$', style: TerminalStyle())],
+          ),
+          const StyledRow(spans: []), // blank line
+          const StyledRow(spans: []), // blank line
+        ];
+
+        final result = computeReplayCursorPlacement(
+          initialCursorRow: 2,
+          initialCursorCol: 5,
+          fallbackRows: fallbackRows,
+          fittedRows: 10,
+          isExited: false,
+        );
+
+        expect(result.sourceRow, equals(2));
+        expect(result.sourceCol, equals(5));
+        expect(result.terminalRow, equals(3));
+        expect(result.terminalCol, equals(6));
+      },
+    );
   });
 }

@@ -99,6 +99,7 @@ ReplayCursorPlacement computeReplayCursorPlacement({
   required int fittedRows,
   int? initialCursorRow,
   int? initialCursorCol,
+  bool isExited = true,
 }) {
   final rowCount = fallbackRows.length;
   if (rowCount == 0) {
@@ -142,13 +143,13 @@ ReplayCursorPlacement computeReplayCursorPlacement({
   var shouldClamp =
       cursorRow < 0 ||
       cursorRow >= rowCount ||
-      (!allRowsEmpty && cursorRow > lastActiveRow);
+      (isExited && !allRowsEmpty && cursorRow > lastActiveRow);
   if (!shouldClamp && cursorRow >= 0 && cursorRow < rowCount && !allRowsEmpty) {
     final cursorRowText = fallbackRows[cursorRow].spans
         .map((s) => s.text)
         .join()
         .trimRight();
-    shouldClamp = isReplayStatusOrDividerRow(cursorRowText);
+    shouldClamp = isExited && isReplayStatusOrDividerRow(cursorRowText);
   }
   if (shouldClamp) {
     for (var i = lastActiveRow + 1; i <= cursorRow; i++) {

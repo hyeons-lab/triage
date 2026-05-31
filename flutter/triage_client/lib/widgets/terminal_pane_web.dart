@@ -427,6 +427,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       fittedRows: fittedRows,
       initialCursorRow: widget.initialCursorRow,
       initialCursorCol: widget.initialCursorCol,
+      isExited: widget.isExited,
     );
 
     final sb = StringBuffer();
