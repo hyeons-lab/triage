@@ -319,6 +319,8 @@ mod tests {
         use http_body_util::BodyExt;
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("Copy PIN"));
+        assert!(body.contains("copyPairingValue"));
         let pin = body
             .split("<div class=\"pin\">")
             .nth(1)

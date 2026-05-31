@@ -7,6 +7,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:triage_client/main.dart';
+import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 
@@ -43,6 +44,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   final List<String> startSessionCalls = [];
   final List<String> startSessionCommands = [];
+  final List<List<String>> startSessionArgs = [];
   final List<String> pairingChallengeClientIds = [];
   final List<String> pairCodes = [];
   final List<String> writeInputCalls = [];
@@ -50,8 +52,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> restoreSessionCalls = [];
   final Map<String, String> restoreSessionSizes = {};
   final List<String> helloClientIds = [];
+  final List<String?> helloTokens = [];
   final List<String> snapshotSessionCalls = [];
   final Map<String, List<String>> snapshotVisibleRows = {};
+  final Map<String, List<String>> resizedVisibleRows = {};
   final Map<String, Completer<Map<String, dynamic>>> snapshotCompleters = {};
   final Map<String, Completer<Map<String, dynamic>>> attachCompleters = {};
   final Map<String, List<dynamic>> snapshotStyledRowsMap = {};
@@ -72,6 +76,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (clientId != null) {
       helloClientIds.add(clientId);
     }
+    helloTokens.add(token);
     if (disconnectAfterHello) {
       _connected = false;
     }
@@ -280,6 +285,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     int cols = 80,
   }) async {
     startSessionCommands.add(command);
+    startSessionArgs.add(args);
     if (failedStartSessionCommands.contains(command)) {
       throw Exception('start session failed for $command');
     }
@@ -306,7 +312,39 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required int rows,
   }) async {
     resizeSessionCalls.add('$sessionId:$cols:$rows');
-    return {};
+    final visibleRows = resizedVisibleRows[sessionId];
+    if (visibleRows == null) {
+      return {};
+    }
+    snapshotVisibleRows[sessionId] = visibleRows;
+    return {
+      'snapshot': {
+        'size': {'rows': rows, 'cols': cols},
+        'exited': false,
+        'visible_rows': visibleRows,
+        'styled_rows': visibleRows
+            .map(
+              (row) => {
+                'spans': [
+                  {
+                    'text': row,
+                    'style': {
+                      'foreground': null,
+                      'background': null,
+                      'bold': false,
+                      'dim': false,
+                      'italic': false,
+                      'underline': false,
+                      'reverse': false,
+                    },
+                  },
+                ],
+              },
+            )
+            .toList(),
+        'cursor': {'row': visibleRows.length - 1, 'col': 0},
+      },
+    };
   }
 
   @override
@@ -471,11 +509,14 @@ void main() {
       NewSessionShell.bash,
     ]);
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.macOS), [
-      NewSessionShell.bash,
+      NewSessionShell.defaultPosix,
     ]);
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.linux), [
-      NewSessionShell.bash,
+      NewSessionShell.defaultPosix,
     ]);
+    expect(showNewSessionShellMenuForPlatform(TargetPlatform.windows), isTrue);
+    expect(showNewSessionShellMenuForPlatform(TargetPlatform.macOS), isFalse);
+    expect(showNewSessionShellMenuForPlatform(TargetPlatform.linux), isFalse);
   });
 
   test('uses daemon websocket target for Flutter dev server base URL', () {
@@ -703,6 +744,45 @@ void main() {
     },
   );
 
+  testWidgets('resizes selected live history before initial replay', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final client = FakeTriageWebSocketClient();
+    client.snapshotVisibleRows['flutter-spike'] = [
+      '                                        Welcome to Ubuntu 26.04 LTS (GNU/Linux 6.6.114.1-microso',
+      'ft-standard-WSL2 x86_64)',
+      '',
+      r'dberrios@rogflowz13:/mnt/c/Users/iamst$',
+    ];
+    client.resizedVisibleRows['flutter-spike'] = [
+      'Welcome to Ubuntu 26.04 LTS (GNU/Linux 6.6.114.1-microsoft-standard-WSL2 x86_64)',
+      '',
+      r'dberrios@rogflowz13:/mnt/c/Users/iamst$',
+    ];
+
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(
+      client.resizeSessionCalls.where((call) => call == 'flutter-spike:94:40'),
+      isNotEmpty,
+    );
+    expect(
+      find.text(
+        'Welcome to Ubuntu 26.04 LTS (GNU/Linux 6.6.114.1-microsoft-standard-WSL2 x86_64)',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('ft-standard-WSL2 x86_64)'), findsNothing);
+  });
+
   testWidgets('applies daemon snapshot events to replace restored rows', (
     WidgetTester tester,
   ) async {
@@ -820,7 +900,7 @@ void main() {
     });
   });
 
-  testWidgets('creates a bash session directly on macOS', (
+  testWidgets('creates a default shell session directly on macOS', (
     WidgetTester tester,
   ) async {
     await withPlatform(TargetPlatform.macOS, () async {
@@ -833,7 +913,10 @@ void main() {
 
       expect(find.byType(CheckedPopupMenuItem<NewSessionShell>), findsNothing);
       expect(find.text('triage / scratch-1'), findsWidgets);
-      expect(client.startSessionCommands, ['bash']);
+      expect(client.startSessionCommands, ['/bin/sh']);
+      expect(client.startSessionArgs, [
+        ['-lc', 'exec "\${SHELL:-/bin/sh}"'],
+      ]);
     });
   });
 
@@ -939,6 +1022,42 @@ void main() {
     expect(secondClient.helloClientIds.single, client.helloClientIds.single);
   });
 
+  testWidgets('drops in-memory token when site data is cleared while running', (
+    WidgetTester tester,
+  ) async {
+    clearToken();
+    clearClientId();
+    addTearDown(() {
+      clearToken();
+      clearClientId();
+    });
+
+    persistClientId('triage-flutter-client-stored');
+    persistToken('stored-token');
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(client.helloClientIds.single, 'triage-flutter-client-stored');
+    expect(client.helloTokens.single, 'stored-token');
+    expect(find.text('Connected to Daemon'), findsOneWidget);
+
+    clearToken();
+    clearClientId();
+    client.authenticated = false;
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(client.helloTokens.last, isNull);
+    expect(retrieveClientId(), 'triage-flutter-client-stored');
+    expect(find.text('Pair Remote Device'), findsOneWidget);
+    expect(
+      client.pairingChallengeClientIds.last,
+      'triage-flutter-client-stored',
+    );
+  });
+
   testWidgets('shows device-specific pairing challenge when unauthenticated', (
     WidgetTester tester,
   ) async {
@@ -952,6 +1071,12 @@ void main() {
       find.textContaining('localhost:8080/pair', findRichText: true),
       findsOneWidget,
     );
+    expect(
+      find.textContaining('device_code=ABCD1234', findRichText: true),
+      findsOneWidget,
+    );
+    expect(find.byTooltip('Open verification URL'), findsOneWidget);
+    expect(find.byTooltip('Copy device code'), findsOneWidget);
     expect(client.pairingChallengeClientIds, client.helloClientIds);
 
     await tester.enterText(find.byType(TextField), 'WXYZ9876');

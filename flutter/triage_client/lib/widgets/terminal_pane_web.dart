@@ -438,7 +438,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Write historical rows first to fill the scrollback buffer
     for (var i = 0; i < cursor.startRow; i++) {
       final trimmedRow = _clipRowToCols(
-        trimReplayTrailingWhitespace(widget.fallbackRows[i]),
+        normalizeReplayRow(widget.fallbackRows[i]),
         fittedCols,
       );
       sb.write(_styledRowToAnsi(trimmedRow));
@@ -447,7 +447,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Write the active viewport rows
     for (var i = cursor.startRow; i < cursor.endRow; i++) {
       final trimmedRow = _clipRowToCols(
-        trimReplayTrailingWhitespace(widget.fallbackRows[i]),
+        normalizeReplayRow(widget.fallbackRows[i]),
         fittedCols,
       );
       sb.write(_styledRowToAnsi(trimmedRow));

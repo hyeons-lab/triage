@@ -64,3 +64,12 @@ String? retrieveClientId() {
     return null;
   }
 }
+
+void clearClientId() {
+  try {
+    final localStorage = js.globalContext.getProperty<js.JSObject>(
+      'localStorage'.toJS,
+    );
+    localStorage.callMethod('removeItem'.toJS, _clientIdStorageKey.toJS);
+  } catch (_) {}
+}

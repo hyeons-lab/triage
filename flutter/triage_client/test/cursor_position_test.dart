@@ -243,6 +243,28 @@ void main() {
       final trimmed = trimReplayTrailingWhitespace(row);
       expect(trimmed.spans, isEmpty);
     });
+
+    test('normalizes terminal padding before shell prompt-only rows', () {
+      final normalized = normalizeReplayRow(
+        row(
+          r'                                        dberrios@rogflowz13:/mnt/c/Users/iamst$ ',
+        ),
+      );
+
+      expect(
+        normalized.spans.map((span) => span.text).join(),
+        r'dberrios@rogflowz13:/mnt/c/Users/iamst$',
+      );
+    });
+
+    test('keeps leading indentation for ordinary output rows', () {
+      final normalized = normalizeReplayRow(row('    total cost \$3'));
+
+      expect(
+        normalized.spans.map((span) => span.text).join(),
+        '    total cost \$3',
+      );
+    });
   });
 
   group('Cursor Repositioning and Clamping Tests', () {

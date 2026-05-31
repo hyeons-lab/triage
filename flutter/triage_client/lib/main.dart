@@ -5,6 +5,8 @@ import 'dart:math';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
@@ -57,12 +59,14 @@ class TriageClientApp extends StatelessWidget {
 
 enum NewSessionShell {
   cmd('cmd.exe', 'Cmd'),
-  bash('bash', 'Bash');
+  bash('bash', 'Bash'),
+  defaultPosix('/bin/sh', 'Default', ['-lc', 'exec "\${SHELL:-/bin/sh}"']);
 
-  const NewSessionShell(this.command, this.label);
+  const NewSessionShell(this.command, this.label, [this.args = const []]);
 
   final String command;
   final String label;
+  final List<String> args;
 }
 
 @visibleForTesting
@@ -71,7 +75,12 @@ List<NewSessionShell> newSessionShellMenuOrderForPlatform(
 ) {
   return platform == TargetPlatform.windows
       ? const [NewSessionShell.cmd, NewSessionShell.bash]
-      : const [NewSessionShell.bash];
+      : const [NewSessionShell.defaultPosix];
+}
+
+@visibleForTesting
+bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
+  return platform == TargetPlatform.windows;
 }
 
 class SessionVm {
@@ -130,8 +139,10 @@ class _TriageHomeState extends State<TriageHome> {
   int _connectGeneration = 0;
   int _reconnectAttempt = 0;
   Timer? _reconnectTimer;
+  Timer? _credentialStorageTimer;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
+  bool _storageBackedClientId = false;
   bool _needsPairing = false;
   bool _pairingChallengeLoading = false;
   String? _pairingDeviceCode;
@@ -261,6 +272,7 @@ class _TriageHomeState extends State<TriageHome> {
   void initState() {
     super.initState();
     _clientId = _loadOrCreateClientId();
+    _startCredentialStorageWatcher();
     _newSessionShell = newSessionShellMenuOrderForPlatform(
       defaultTargetPlatform,
     ).first;
@@ -327,6 +339,7 @@ class _TriageHomeState extends State<TriageHome> {
   String _loadOrCreateClientId() {
     final storedClientId = retrieveClientId();
     if (storedClientId != null && storedClientId.trim().isNotEmpty) {
+      _storageBackedClientId = true;
       return storedClientId;
     }
 
@@ -337,25 +350,86 @@ class _TriageHomeState extends State<TriageHome> {
     ).join();
     final clientId = 'triage-flutter-client-$suffix';
     persistClientId(clientId);
+    _storageBackedClientId = retrieveClientId() == clientId;
     return clientId;
+  }
+
+  void _refreshBearerTokenFromStorage() {
+    final storedClientId = retrieveClientId();
+    final storedToken = retrieveToken();
+    if (!_storageBackedClientId) {
+      if (storedClientId == _clientId) {
+        _storageBackedClientId = true;
+      }
+      if (storedToken?.trim().isNotEmpty == true) {
+        _bearerToken = storedToken;
+      }
+      return;
+    }
+
+    if (storedClientId == null || storedClientId.trim().isEmpty) {
+      _bearerToken = null;
+      persistClientId(_clientId);
+      _storageBackedClientId = retrieveClientId() == _clientId;
+      return;
+    }
+    if (storedClientId != _clientId) {
+      _bearerToken = null;
+      return;
+    }
+    _bearerToken = storedToken?.trim().isEmpty == false ? storedToken : null;
+  }
+
+  void _startCredentialStorageWatcher() {
+    _credentialStorageTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _checkCredentialStorageStillMatches();
+    });
+  }
+
+  void _checkCredentialStorageStillMatches() {
+    if (_disposed ||
+        !_storageBackedClientId ||
+        !_clientInitialized ||
+        !_client.isConnected ||
+        _needsPairing ||
+        _bearerToken == null) {
+      return;
+    }
+
+    if (retrieveClientId() == _clientId && retrieveToken() == _bearerToken) {
+      return;
+    }
+
+    _bearerToken = null;
+    _reconnectAttempt = 0;
+    unawaited(_connectWebSocket(isReconnect: true));
   }
 
   Uri _defaultWebSocketUri() {
     return defaultWebSocketUriForBase(Uri.base);
   }
 
-  Uri? _verificationUriForClient(TriageWebSocketClient client) {
+  Uri? _verificationUriForClient(
+    TriageWebSocketClient client, {
+    String? deviceCode,
+  }) {
     final wsUri = client.uri;
     if (!_isLocalVerificationHost(wsUri.host)) {
       return null;
     }
 
     final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
-    return wsUri.replace(
+    final verificationUri = wsUri.replace(
       scheme: scheme,
       path: '/pair',
       query: '',
       fragment: '',
+    );
+    if (deviceCode == null || deviceCode.trim().isEmpty) {
+      return verificationUri;
+    }
+    return verificationUri.replace(
+      queryParameters: {'device_code': deviceCode},
     );
   }
 
@@ -452,9 +526,29 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          _client
-              .resizeSession(sessionId: sessionId, cols: cols, rows: rows)
-              .catchError((_) => <String, dynamic>{});
+          unawaited(() async {
+            try {
+              final snapshot = _snapshotFromResponse(
+                await _client.resizeSession(
+                  sessionId: sessionId,
+                  cols: cols,
+                  rows: rows,
+                ),
+              );
+              if (snapshot != null && _sessionStillLoaded(session, sessionId)) {
+                final sizeChanged = _snapshotSizeDiffersFromSession(
+                  session,
+                  snapshot,
+                );
+                await _applySnapshotToSession(
+                  session,
+                  sessionId,
+                  snapshot,
+                  includeHistory: sizeChanged,
+                );
+              }
+            } catch (_) {}
+          }());
         }
       }
     });
@@ -491,7 +585,7 @@ class _TriageHomeState extends State<TriageHome> {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     final generation = ++_connectGeneration;
-    _bearerToken ??= retrieveToken();
+    _refreshBearerTokenFromStorage();
     if (_clientInitialized) {
       final subscription = _websocketSubscription;
       _websocketSubscription = null;
@@ -634,7 +728,10 @@ class _TriageHomeState extends State<TriageHome> {
       final expiresAtSeconds = challenge['expires_at'];
       setState(() {
         _pairingDeviceCode = challenge['device_code']?.toString();
-        _pairingVerificationUri = _verificationUriForClient(_client);
+        _pairingVerificationUri = _verificationUriForClient(
+          _client,
+          deviceCode: _pairingDeviceCode,
+        );
         _pairingExpiresAt = expiresAtSeconds is int
             ? DateTime.fromMillisecondsSinceEpoch(
                 expiresAtSeconds * 1000,
@@ -666,7 +763,9 @@ class _TriageHomeState extends State<TriageHome> {
     if (token.isNotEmpty) {
       setState(() {
         _bearerToken = token;
+        persistClientId(_clientId);
         persistToken(token);
+        _storageBackedClientId = retrieveClientId() == _clientId;
         _pairingChallengeError = null;
       });
       _reconnectAttempt = 0;
@@ -825,19 +924,41 @@ class _TriageHomeState extends State<TriageHome> {
             snapshotRes['snapshot'] as Map<String, dynamic>? ?? {};
       } catch (_) {}
 
+      final replayTargetSize = includeHistory
+          ? _estimatedTerminalRestoreSize(
+              preAttachSnapshot['size'] as Map<String, dynamic>?,
+            )
+          : null;
+      Map<String, dynamic>? preparedSnapshot;
       if (preAttachSnapshot['exited'] == true) {
         final sizeObj = preAttachSnapshot['size'] as Map<String, dynamic>?;
-        final cols = sizeObj?['cols'] as int?;
-        final rows = sizeObj?['rows'] as int?;
-        final restoreSize = (cols != null && rows != null)
-            ? (rows, cols)
-            : _estimatedTerminalRestoreSize(sizeObj);
+        final restoreSize =
+            replayTargetSize ?? _savedOrEstimatedTerminalRestoreSize(sizeObj);
         try {
-          await _client.restoreSession(
-            sessionId: sid,
-            rows: restoreSize.$1,
-            cols: restoreSize.$2,
+          preparedSnapshot = _snapshotFromResponse(
+            await _client.restoreSession(
+              sessionId: sid,
+              rows: restoreSize.$1,
+              cols: restoreSize.$2,
+            ),
           );
+          if (preparedSnapshot != null) {
+            preAttachSnapshot = preparedSnapshot;
+          }
+        } catch (_) {}
+      } else if (replayTargetSize != null &&
+          !_snapshotSizeMatches(preAttachSnapshot, replayTargetSize)) {
+        try {
+          preparedSnapshot = _snapshotFromResponse(
+            await _client.resizeSession(
+              sessionId: sid,
+              rows: replayTargetSize.$1,
+              cols: replayTargetSize.$2,
+            ),
+          );
+          if (preparedSnapshot != null) {
+            preAttachSnapshot = preparedSnapshot;
+          }
         } catch (_) {}
       }
 
@@ -853,7 +974,12 @@ class _TriageHomeState extends State<TriageHome> {
         mode: 'InteractiveController',
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
-      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      if (replayTargetSize != null &&
+          preparedSnapshot != null &&
+          !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+        snapshot = preparedSnapshot;
+      }
 
       final contextObj = snapshot?['context'] as Map<String, dynamic>?;
       final branch = contextObj?['branch']?.toString() ?? 'main';
@@ -938,6 +1064,90 @@ class _TriageHomeState extends State<TriageHome> {
     final cols = (terminalWidth / averageCellWidth).floor().clamp(80, 240);
     final rows = (terminalHeight / averageCellHeight).floor().clamp(10, 80);
     return (rows, cols);
+  }
+
+  (int, int) _savedOrEstimatedTerminalRestoreSize(
+    Map<String, dynamic>? fallbackSize,
+  ) {
+    final cols = fallbackSize?['cols'] as int?;
+    final rows = fallbackSize?['rows'] as int?;
+    if (cols != null && rows != null) {
+      return (rows, cols);
+    }
+    return _estimatedTerminalRestoreSize(fallbackSize);
+  }
+
+  (int, int) _currentReplayTerminalSize(
+    SessionVm session,
+    Map<String, dynamic>? fallbackSize,
+  ) {
+    final cols = session.lastFittedCols;
+    final rows = session.lastFittedRows;
+    if (cols != null && rows != null) {
+      return (rows, cols);
+    }
+    return _estimatedTerminalRestoreSize(fallbackSize);
+  }
+
+  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
+    final direct = response['snapshot'];
+    if (direct is Map<String, dynamic>) {
+      return direct;
+    }
+    if (direct is Map) {
+      return Map<String, dynamic>.from(direct);
+    }
+
+    final responseObj = response['response'];
+    if (responseObj is Map<String, dynamic>) {
+      final nested = responseObj['snapshot'];
+      if (nested is Map<String, dynamic>) {
+        return nested;
+      }
+      if (nested is Map) {
+        return Map<String, dynamic>.from(nested);
+      }
+    }
+    if (responseObj is Map) {
+      final nested = responseObj['snapshot'];
+      if (nested is Map<String, dynamic>) {
+        return nested;
+      }
+      if (nested is Map) {
+        return Map<String, dynamic>.from(nested);
+      }
+    }
+    return null;
+  }
+
+  bool _snapshotSizeMatches(
+    Map<String, dynamic>? snapshot,
+    (int, int) targetSize,
+  ) {
+    final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
+    return sizeObj?['rows'] == targetSize.$1 &&
+        sizeObj?['cols'] == targetSize.$2;
+  }
+
+  bool _snapshotSizeDiffersFromSession(
+    SessionVm session,
+    Map<String, dynamic> snapshot,
+  ) {
+    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+    final cols = sizeObj?['cols'] as int?;
+    final rows = sizeObj?['rows'] as int?;
+    return cols != null &&
+        rows != null &&
+        (session.lastFittedCols != cols || session.lastFittedRows != rows);
+  }
+
+  bool _sessionStillLoaded(SessionVm session, String sessionId) {
+    if (_disposed || !mounted) return false;
+    return _sessions.any(
+      (candidate) =>
+          identical(candidate, session) &&
+          _sessionIdFor(candidate) == sessionId,
+    );
   }
 
   void _onWebSocketEvent(Map<String, dynamic> message) {
@@ -1176,6 +1386,7 @@ class _TriageHomeState extends State<TriageHome> {
     _disposed = true;
     _connectGeneration++;
     _reconnectTimer?.cancel();
+    _credentialStorageTimer?.cancel();
     if (_clientInitialized) {
       _client.disconnect();
       _websocketSubscription?.cancel();
@@ -1232,22 +1443,27 @@ class _TriageHomeState extends State<TriageHome> {
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot != null && !_disposed) {
         var finalSnapshot = snapshot;
+        final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+        final replayTargetSize = includeHistory
+            ? _currentReplayTerminalSize(session, sizeObj)
+            : null;
         if (snapshot['exited'] == true) {
           debugPrint(
             'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
           );
-          final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-          final cols = sizeObj?['cols'] as int?;
-          final rows = sizeObj?['rows'] as int?;
-          final restoreSize = (cols != null && rows != null)
-              ? (rows, cols)
-              : _estimatedTerminalRestoreSize(sizeObj);
+          final restoreSize =
+              replayTargetSize ?? _savedOrEstimatedTerminalRestoreSize(sizeObj);
           try {
-            await _client.restoreSession(
-              sessionId: sessionId,
-              rows: restoreSize.$1,
-              cols: restoreSize.$2,
+            final restoredSnapshot = _snapshotFromResponse(
+              await _client.restoreSession(
+                sessionId: sessionId,
+                rows: restoreSize.$1,
+                cols: restoreSize.$2,
+              ),
             );
+            if (restoredSnapshot != null) {
+              finalSnapshot = restoredSnapshot;
+            }
             final freshAttachRes = await _client.attachSession(
               sessionId: sessionId,
               clientId: _clientId,
@@ -1258,13 +1474,30 @@ class _TriageHomeState extends State<TriageHome> {
             final freshSnapshot =
                 freshResponseObj?['snapshot'] as Map<String, dynamic>?;
             if (freshSnapshot != null) {
-              finalSnapshot = freshSnapshot;
+              if (replayTargetSize == null ||
+                  _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
+                finalSnapshot = freshSnapshot;
+              }
             }
           } catch (e) {
             debugPrint(
               'Failed to restore session $sessionId during refresh: ${e.toString()}',
             );
           }
+        } else if (replayTargetSize != null &&
+            !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+          try {
+            final resizedSnapshot = _snapshotFromResponse(
+              await _client.resizeSession(
+                sessionId: sessionId,
+                rows: replayTargetSize.$1,
+                cols: replayTargetSize.$2,
+              ),
+            );
+            if (resizedSnapshot != null) {
+              finalSnapshot = resizedSnapshot;
+            }
+          } catch (_) {}
         }
         await _applySnapshotToSession(
           session,
@@ -1290,9 +1523,11 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _createSession(NewSessionShell preferredShell) async {
     if (_client.isConnected) {
-      final fallbackShell = preferredShell == NewSessionShell.cmd
-          ? NewSessionShell.bash
-          : NewSessionShell.cmd;
+      final fallbackShell = switch (preferredShell) {
+        NewSessionShell.cmd => NewSessionShell.bash,
+        NewSessionShell.bash => NewSessionShell.cmd,
+        NewSessionShell.defaultPosix => null,
+      };
       setState(() {
         _newSessionShell = preferredShell;
         _connectionStatus = 'Creating session...';
@@ -1304,10 +1539,15 @@ class _TriageHomeState extends State<TriageHome> {
         try {
           sessionId = await _client.startSession(
             command: preferredShell.command,
+            args: preferredShell.args,
           );
         } catch (_) {
+          if (fallbackShell == null) {
+            rethrow;
+          }
           sessionId = await _client.startSession(
             command: fallbackShell.command,
+            args: fallbackShell.args,
           );
         }
         if (sessionId.isNotEmpty) {
@@ -1517,6 +1757,9 @@ class _TriageHomeState extends State<TriageHome> {
               shellOptions: newSessionShellMenuOrderForPlatform(
                 defaultTargetPlatform,
               ),
+              showShellMenu: showNewSessionShellMenuForPlatform(
+                defaultTargetPlatform,
+              ),
               connectionStatus: _connectionStatus,
               connectionStatusColor: _connectionStatusColor,
               isCollapsed: _sidebarCollapsed,
@@ -1583,6 +1826,7 @@ class SessionRail extends StatelessWidget {
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
+    required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
     required this.isCollapsed,
@@ -1595,6 +1839,7 @@ class SessionRail extends StatelessWidget {
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
+  final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
   final bool isCollapsed;
@@ -1622,6 +1867,7 @@ class SessionRail extends StatelessWidget {
             _NewSessionMenu(
               selectedShell: selectedShell,
               shellOptions: shellOptions,
+              showShellMenu: showShellMenu,
               onCreateSession: onCreateSession,
             ),
             const SizedBox(height: 16),
@@ -1718,6 +1964,7 @@ class SessionRail extends StatelessWidget {
                 _NewSessionMenu(
                   selectedShell: selectedShell,
                   shellOptions: shellOptions,
+                  showShellMenu: showShellMenu,
                   onCreateSession: onCreateSession,
                 ),
               ],
@@ -1804,16 +2051,18 @@ class _NewSessionMenu extends StatelessWidget {
   const _NewSessionMenu({
     required this.selectedShell,
     required this.shellOptions,
+    required this.showShellMenu,
     required this.onCreateSession,
   });
 
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
+  final bool showShellMenu;
   final ValueChanged<NewSessionShell> onCreateSession;
 
   @override
   Widget build(BuildContext context) {
-    if (shellOptions.length <= 1) {
+    if (!showShellMenu || shellOptions.length <= 1) {
       final shell = shellOptions.isEmpty ? selectedShell : shellOptions.first;
       return IconButton(
         tooltip: 'New session',
@@ -2092,6 +2341,29 @@ class _PairingViewState extends State<_PairingView> {
     return 'Expires at $hour:$minute';
   }
 
+  Future<void> _copyText(String label, String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$label copied'),
+        duration: const Duration(milliseconds: 1400),
+      ),
+    );
+  }
+
+  void _openVerificationUri(Uri uri) {
+    final opened = openExternalUri(uri);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          opened ? 'Verification page opened' : 'Open this URL in a browser',
+        ),
+        duration: const Duration(milliseconds: 1400),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final deviceCode = widget.deviceCode;
@@ -2146,9 +2418,35 @@ class _PairingViewState extends State<_PairingView> {
               style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
             ),
             const SizedBox(height: 6),
-            SelectableText(
-              verificationUri.toString(),
-              style: const TextStyle(color: Color(0xff7fd1c7), fontSize: 14),
+            Tooltip(
+              message: 'Open verification URL',
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => _openVerificationUri(verificationUri!),
+                  icon: const Icon(Icons.open_in_new, size: 18),
+                  label: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      verificationUri.toString(),
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    alignment: Alignment.centerLeft,
+                    foregroundColor: const Color(0xff7fd1c7),
+                    side: const BorderSide(color: Color(0xff344145)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 12,
+                    ),
+                  ),
+                ),
+              ),
             ),
           ] else ...[
             const Text(
@@ -2186,14 +2484,28 @@ class _PairingViewState extends State<_PairingView> {
                         ),
                       ),
                       const SizedBox(height: 6),
-                      SelectableText(
-                        deviceCode ?? '--------',
-                        style: const TextStyle(
-                          color: Color(0xffedf7f6),
-                          fontSize: 24,
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: 4,
-                        ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: SelectableText(
+                              deviceCode ?? '--------',
+                              style: const TextStyle(
+                                color: Color(0xffedf7f6),
+                                fontSize: 24,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 4,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Copy device code',
+                            onPressed: deviceCode == null
+                                ? null
+                                : () => _copyText('Device code', deviceCode),
+                            icon: const Icon(Icons.copy, size: 20),
+                            color: const Color(0xff7fd1c7),
+                          ),
+                        ],
                       ),
                       if (expiryLabel.isNotEmpty) ...[
                         const SizedBox(height: 4),

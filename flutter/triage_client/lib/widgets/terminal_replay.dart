@@ -19,6 +19,40 @@ StyledRow trimReplayTrailingWhitespace(StyledRow row) {
   return StyledRow(spans: newSpans);
 }
 
+StyledRow normalizeReplayRow(StyledRow row) {
+  final trimmed = trimReplayTrailingWhitespace(row);
+  final text = trimmed.spans.map((span) => span.text).join();
+  final leadingWhitespace = RegExp(r'^\s+').firstMatch(text);
+  if (leadingWhitespace == null || !_isShellPromptOnlyRow(text.trimLeft())) {
+    return trimmed;
+  }
+
+  var remaining = leadingWhitespace.group(0)!.length;
+  final spans = <StyledSpan>[];
+  for (final span in trimmed.spans) {
+    if (remaining >= span.text.length) {
+      remaining -= span.text.length;
+      continue;
+    }
+    if (remaining > 0) {
+      spans.add(
+        StyledSpan(text: span.text.substring(remaining), style: span.style),
+      );
+      remaining = 0;
+    } else {
+      spans.add(span);
+    }
+  }
+  return StyledRow(spans: spans);
+}
+
+bool _isShellPromptOnlyRow(String rowText) {
+  final trimmed = rowText.trimRight();
+  if (trimmed.isEmpty || trimmed.contains('\n')) return false;
+  return RegExp(r'^[^\s@]+@[^\s:]+:.+[$#>] ?$').hasMatch(trimmed) ||
+      RegExp(r'^[A-Za-z]:\\.*> ?$').hasMatch(trimmed);
+}
+
 bool isReplayStatusOrDividerRow(String rowText) {
   final trimmed = rowText.trim();
   if (trimmed.isEmpty) return true;

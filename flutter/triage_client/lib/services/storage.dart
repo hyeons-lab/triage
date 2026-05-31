@@ -8,3 +8,4 @@ void clearToken() => impl.clearToken();
 
 void persistClientId(String clientId) => impl.persistClientId(clientId);
 String? retrieveClientId() => impl.retrieveClientId();
+void clearClientId() => impl.clearClientId();

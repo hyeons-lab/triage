@@ -12,6 +12,9 @@
 - 2026-05-30T19:32-0700: Address follow-up pairing review findings around FlatBuffers first-time pairing and disconnected pairing challenge loading state.
 - 2026-05-30T20:04-0700: Address follow-up clippy blockers and complete borrowed FlatBuffers pairing result parsing.
 - 2026-05-30T20:26-0700: Preserve the daemon WebSocket target when the Flutter app is served by a dev or static asset host.
+- 2026-05-30T20:55-0700: Ensure clearing browser site data drops any in-memory bearer token and returns the running app to pairing.
+- 2026-05-30T23:32-0700: Make the pairing approval URL directly clickable, add copy controls for pairing codes, and keep the new-session shell submenu Windows-only.
+- 2026-05-30T23:46-0700: Correct initial web terminal replay layout when shell prompt rows include stale leading terminal padding.
 
 ## What Changed
 
@@ -36,6 +39,16 @@
 - 2026-05-30T20:04-0700: Moved `ws.rs` tests after production items and simplified `triage pair` config loading to clear additional clippy-denied warnings.
 - 2026-05-30T20:26-0700: Changed the Flutter default WebSocket URI helper to use same-origin only when the page is served on the daemon's default port, otherwise falling back to `ws://127.0.0.1:7777/ws`.
 - 2026-05-30T20:26-0700: Added widget-test coverage for Flutter dev-server, daemon-served, and non-HTTP base URL WebSocket defaults.
+- 2026-05-30T20:55-0700: Changed Flutter reconnects to re-read the stored client id and bearer token before `hello`, clearing the in-memory token if browser storage was cleared.
+- 2026-05-30T20:55-0700: Added a lightweight running-app credential storage watcher that reconnects into pairing when the stored client id or token no longer matches memory.
+- 2026-05-30T20:55-0700: Added storage client-id clearing helpers and a widget regression test for clearing stored credentials while the app remains open.
+- 2026-05-30T23:32-0700: Changed the Flutter pairing URL into a clickable button that opens `/pair?device_code=...` directly and added a copy button beside the device code.
+- 2026-05-30T23:32-0700: Added a copy button to the daemon `/pair` PIN page, including a clipboard fallback that selects the PIN if browser clipboard access fails.
+- 2026-05-30T23:32-0700: Made the web client's new-session shell menu explicit to Windows and changed non-Windows direct creation to launch the user's default POSIX shell through `/bin/sh -lc`.
+- 2026-05-30T23:46-0700: Added terminal replay row normalization that removes leading padding only from shell-prompt-only rows before writing the initial xterm contents.
+- 2026-05-30T23:46-0700: Added replay regression coverage for padded WSL-style prompt rows while preserving leading indentation in ordinary output.
+- 2026-05-31T08:41-0700: Changed selected live session replay to resize the daemon snapshot to the current web viewport before applying initial history, preventing stale 80-column MOTD wrapping after refresh.
+- 2026-05-31T08:41-0700: Applied daemon resize response snapshots from the terminal resize callback and only bumped replay revision when the snapshot size changes, so fitted xterm dimensions update without a replay/resize feedback loop.
 
 ## Decisions
 
@@ -50,6 +63,11 @@
 - 2026-05-30T19:32-0700: Appended the FlatBuffers pairing challenge tables to request/result unions to avoid renumbering existing payload variants.
 - 2026-05-30T20:04-0700: Removed `PendingPairingPin.expires_at_unix` instead of preserving the field because stored PIN validation only needs `Instant`; the approval response still returns the clamped Unix expiry computed at issuance.
 - 2026-05-30T20:26-0700: Keep direct daemon serving useful through same-origin on port 7777, but treat other HTTP origins as asset hosts so local dev and static-host flows retain the daemon default target.
+- 2026-05-30T20:55-0700: Treat browser storage as the source of truth once client-id storage is available. If the user clears site data while the app is running, the app must stop reusing stale in-memory credentials and re-enter pairing.
+- 2026-05-30T23:32-0700: Keep `/pair?device_code=...` links visible only for local verification hosts; remote clients still get local-approval guidance instead of a unusable or unsafe remote approval URL.
+- 2026-05-30T23:32-0700: Gate shell-submenu visibility by platform rather than the number of configured shells so future non-Windows shell options do not accidentally reintroduce a submenu.
+- 2026-05-30T23:46-0700: Keep the normalization in the web replay path rather than daemon snapshots so command output and stored session logs remain unchanged.
+- 2026-05-31T08:41-0700: Prefer current viewport sizing for the selected replay, preserve saved sizes for unselected historical session restore, and treat same-size resize responses as state updates rather than full replay triggers.
 
 ## Issues
 
@@ -61,10 +79,14 @@
 - 2026-05-30T15:26-0700: The `code-review-graph` CLI/tooling was unavailable in this environment, so follow-up review work used direct targeted source inspection.
 - 2026-05-30T19:32-0700: The default Cargo target dir hit Windows `link.exe` LNK1104 when running the focused transport test; reran in `target\codex-test-flatbuffers`, which passed.
 - 2026-05-30T20:04-0700: `cargo clippy --all-targets --all-features -- -D warnings` also exposed `items_after_test_module` in `ws.rs` and `let_and_return` in `triage/src/main.rs`; both were corrected and the rerun passed.
+- 2026-05-30T23:32-0700: The in-app browser backend was unavailable, so UI verification used widget tests and local HTTP checks against the restarted daemon.
+- 2026-05-30T23:32-0700: The focused `triaged` test initially hit Windows `link.exe` LNK1104 on test executable output; rerunning the library target passed.
+- 2026-05-31T08:41-0700: The first `cargo install --path crates\triaged --force` rebuilt successfully but could not replace the running Windows executable; stopping the old daemon and rerunning install succeeded.
 
 ## Commits
 
-- HEAD — fix: make pairing pins device-specific
+- 81d48ea — fix: make pairing pins device-specific
+- HEAD — fix: repair pairing UX and terminal replay
 
 ## Progress
 
@@ -76,6 +98,10 @@
 - 2026-05-30T19:32-0700: Fixed FlatBuffers pairing challenge support and the disconnected pairing loading state; validated with focused transport/UI tests, full relevant Rust crate tests, full Flutter tests, formatting, and whitespace checks.
 - 2026-05-30T20:04-0700: Fixed the latest review findings and validated with `cargo fmt --all -- --check`, `cargo clippy --target-dir target\codex-clippy-review --all-targets --all-features -- -D warnings`, focused FlatBuffers and pairing Rust tests, and whitespace diff checks.
 - 2026-05-30T20:26-0700: Fixed the Flutter dev/static host WebSocket default and validated with `dart format`, `flutter test test\widget_test.dart`, and whitespace diff checks.
+- 2026-05-30T20:55-0700: Fixed the site-data-cleared reconnect behavior and validated with `dart format`, `flutter test test\widget_test.dart`, and whitespace diff checks.
+- 2026-05-30T23:32-0700: Added clickable/copy pairing controls and Windows-only shell-menu gating; validated with `dart format`, `cargo fmt --all`, `flutter test test\widget_test.dart`, the focused `triaged` HTTP test, `flutter build web`, `cargo install --path crates\triaged --force`, and local HTTP bundle checks.
+- 2026-05-30T23:46-0700: Fixed padded initial terminal prompt replay and validated with `dart format`, `flutter test test\cursor_position_test.dart`, `flutter test test\widget_test.dart`, `flutter build web`, `cargo install --path crates\triaged --force`, whitespace diff checks, and local HTTP bundle checks.
+- 2026-05-31T08:41-0700: Fixed stale-width initial session replay after refresh and validated with `dart format`, `flutter test test\widget_test.dart`, `flutter test test\cursor_position_test.dart`, `flutter build web`, `cargo install --path crates\triaged --force`, and local HTTP checks against restarted `triaged`.
 
 ## Next Steps
 

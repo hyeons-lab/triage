@@ -20,3 +20,7 @@ void persistClientId(String clientId) {
 String? retrieveClientId() {
   return _stubClientId;
 }
+
+void clearClientId() {
+  _stubClientId = null;
+}

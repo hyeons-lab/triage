@@ -445,10 +445,12 @@ fn render_pairing_pin_page(pin: &str, expires_at: u64) -> String {
         r#"{}
       <p>Enter this PIN in the Triage client that showed the device code.</p>
       <div class="pin">{}</div>
+      <button type="button" class="copy-button" data-copy="{}" data-label="Copy PIN" onclick="copyPairingValue(this)">Copy PIN</button>
       <p class="muted">This PIN expires at Unix time {}.</p>
       <a href="/pair">Pair another device</a>
 {}"#,
         pairing_page_prefix("Pairing PIN"),
+        pin,
         pin,
         expires_at,
         pairing_page_suffix()
@@ -477,8 +479,10 @@ fn pairing_page_prefix(title: &str) -> String {
     label {{ display: block; margin: 20px 0 8px; color: #cdd7d6; }}
     input {{ box-sizing: border-box; width: 100%; padding: 13px 14px; border: 1px solid #344145; border-radius: 6px; background: #101517; color: #edf7f6; font-size: 20px; letter-spacing: 4px; text-transform: uppercase; }}
     button {{ margin-top: 16px; width: 100%; padding: 12px 14px; border: 0; border-radius: 6px; background: #2b6f6f; color: #fff; font-weight: 700; cursor: pointer; }}
+    button.copy-button {{ margin-top: 0; background: #344145; }}
+    button.copy-button.copied {{ background: #2b6f6f; }}
     a {{ color: #7fd1c7; }}
-    .pin {{ margin: 20px 0; padding: 18px; border: 1px solid #344145; border-radius: 8px; background: #101517; color: #7fd1c7; font-size: 34px; font-weight: 800; letter-spacing: 8px; text-align: center; }}
+    .pin {{ margin: 20px 0 10px; padding: 18px; border: 1px solid #344145; border-radius: 8px; background: #101517; color: #7fd1c7; font-size: 34px; font-weight: 800; letter-spacing: 8px; text-align: center; }}
     .muted {{ font-size: 13px; }}
     .error {{ color: #ff8a8a; }}
   </style>
@@ -492,7 +496,34 @@ fn pairing_page_prefix(title: &str) -> String {
 }
 
 fn pairing_page_suffix() -> &'static str {
-    "  </main>\n</body>\n</html>\n"
+    r#"  </main>
+  <script>
+    async function copyPairingValue(button) {
+      const value = button.getAttribute("data-copy") || "";
+      const label = button.getAttribute("data-label") || "Copy";
+      try {
+        await navigator.clipboard.writeText(value);
+        button.textContent = "Copied";
+        button.classList.add("copied");
+        setTimeout(function() {
+          button.textContent = label;
+          button.classList.remove("copied");
+        }, 1400);
+      } catch (_) {
+        const target = button.previousElementSibling;
+        if (target && window.getSelection) {
+          const range = document.createRange();
+          range.selectNodeContents(target);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+      }
+    }
+  </script>
+</body>
+</html>
+"#
 }
 
 fn html_escape(value: &str) -> String {
