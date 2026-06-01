@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:triage_client/models/terminal_models.dart';
 
 StyledRow trimReplayTrailingWhitespace(StyledRow row) {
@@ -77,7 +79,9 @@ bool isReplayStatusOrDividerRow(String rowText) {
 bool isReplayPromptRow(String rowText) {
   if (isReplayStatusOrDividerRow(rowText)) return false;
   final trimmed = rowText.trim();
-  return trimmed.contains('\$') || trimmed.contains('>');
+  return trimmed.contains('\$') ||
+      trimmed.contains('>') ||
+      trimmed.contains('❯');
 }
 
 int replayCursorColForRow(String rowTextRaw) {
@@ -85,7 +89,8 @@ int replayCursorColForRow(String rowTextRaw) {
   var cursorCol = rowTextTrimmed.length;
   final lastDollar = rowTextTrimmed.lastIndexOf('\$');
   final lastChevron = rowTextTrimmed.lastIndexOf('>');
-  final promptIndex = lastDollar > lastChevron ? lastDollar : lastChevron;
+  final lastHeavyChevron = rowTextTrimmed.lastIndexOf('❯');
+  final promptIndex = [lastDollar, lastChevron, lastHeavyChevron].reduce(max);
   if (promptIndex == rowTextTrimmed.length - 1 &&
       promptIndex + 1 < rowTextRaw.length &&
       rowTextRaw[promptIndex + 1] == ' ') {

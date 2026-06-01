@@ -43,6 +43,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _suppressInput = false;
   int _replaySuppressGeneration = 0;
   final FocusNode _focusNode = FocusNode();
+  Timer? _resizeOutDebounceTimer;
+  int? _pendingResizeOutCols;
+  int? _pendingResizeOutRows;
+  int? _lastResizeOutCols;
+  int? _lastResizeOutRows;
 
   // Premium design system theme matching the web terminal
   static const _theme = xt.TerminalTheme(
@@ -77,7 +82,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
-    _terminal = xt.Terminal(maxLines: 10000, onResize: _onTerminalResize);
+    _terminal = xt.Terminal(
+      maxLines: 10000,
+      onResize: _onTerminalResize,
+      reflowEnabled: false,
+    );
     _terminal.onOutput = _onTerminalOutput;
     _bindController();
   }
@@ -125,6 +134,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _focusNode.dispose();
     _replaySuppressTimer1?.cancel();
     _replaySuppressTimer2?.cancel();
+    _resizeOutDebounceTimer?.cancel();
     super.dispose();
   }
 
@@ -167,7 +177,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
         });
       } else {
-        widget.controller.sendResizeOut(width, height);
+        _scheduleResizeOut(width, height);
       }
     }
   }
@@ -175,8 +185,38 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _finishInitialContent(int fittedCols, int fittedRows) {
     _initialContentWritten = true;
     _writeInitialContent();
-    _flushPendingLiveWrites();
-    widget.controller.sendResizeOut(fittedCols, fittedRows);
+    _pendingLiveWriteBuffer.clear();
+    _sendResizeOutNow(fittedCols, fittedRows);
+  }
+
+  void _scheduleResizeOut(int cols, int rows) {
+    if (_lastResizeOutCols == cols && _lastResizeOutRows == rows) {
+      return;
+    }
+    _pendingResizeOutCols = cols;
+    _pendingResizeOutRows = rows;
+    _resizeOutDebounceTimer?.cancel();
+    _resizeOutDebounceTimer = Timer(const Duration(milliseconds: 260), () {
+      final pendingCols = _pendingResizeOutCols;
+      final pendingRows = _pendingResizeOutRows;
+      _pendingResizeOutCols = null;
+      _pendingResizeOutRows = null;
+      if (mounted && pendingCols != null && pendingRows != null) {
+        _sendResizeOutNow(pendingCols, pendingRows);
+      }
+    });
+  }
+
+  void _sendResizeOutNow(int cols, int rows) {
+    _resizeOutDebounceTimer?.cancel();
+    _pendingResizeOutCols = null;
+    _pendingResizeOutRows = null;
+    if (_lastResizeOutCols == cols && _lastResizeOutRows == rows) {
+      return;
+    }
+    _lastResizeOutCols = cols;
+    _lastResizeOutRows = rows;
+    widget.controller.sendResizeOut(cols, rows);
   }
 
   void _writeInitialContent() {
@@ -248,18 +288,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     });
   }
 
-  void _flushPendingLiveWrites() {
-    if (_pendingLiveWriteBuffer.isEmpty) return;
-    final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
-    _pendingLiveWriteBuffer.clear();
-    for (final data in pendingWrites) {
-      _terminal.write(data);
-    }
-  }
-
   void _resetTerminalSafe() {
     try {
-      _terminal.write('\x1bc');
+      _terminal.useMainBuffer();
+      _terminal.mainBuffer.clear();
+      _terminal.altBuffer.clear();
+      _terminal.write('\x1b[H\x1b[2J\x1b[3J');
     } catch (_) {}
   }
 

@@ -17,6 +17,9 @@ void main() {
 }
 
 const int _defaultDaemonPort = 7777;
+const double _sessionRailCollapsedWidth = 72;
+const double _sessionRailExpandedWidth = 320;
+const Duration _sessionRailAnimationDuration = Duration(milliseconds: 220);
 
 @visibleForTesting
 Uri defaultWebSocketUriForBase(Uri base) {
@@ -116,6 +119,7 @@ class SessionVm {
   int? lastFittedRows;
   int? inFlightCols;
   int? inFlightRows;
+  int resizeRequestSeq = 0;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
@@ -528,6 +532,7 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
+          final requestSeq = ++session.resizeRequestSeq;
           unawaited(() async {
             try {
               final snapshot = _snapshotFromResponse(
@@ -538,6 +543,9 @@ class _TriageHomeState extends State<TriageHome> {
                 ),
               );
               if (snapshot != null && _sessionStillLoaded(session, sessionId)) {
+                if (requestSeq != session.resizeRequestSeq) {
+                  return;
+                }
                 final sizeChanged = _snapshotSizeDiffersFromSession(
                   session,
                   snapshot,
@@ -1865,170 +1873,204 @@ class SessionRail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final railWidth = isCollapsed
+        ? _sessionRailCollapsedWidth
+        : _sessionRailExpandedWidth;
+
+    return AnimatedContainer(
+      duration: _sessionRailAnimationDuration,
+      curve: Curves.easeOutCubic,
+      width: railWidth,
+      clipBehavior: Clip.hardEdge,
+      decoration: const BoxDecoration(color: Color(0xff151a1d)),
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 160),
+        switchInCurve: Curves.easeOut,
+        switchOutCurve: Curves.easeIn,
+        layoutBuilder: (currentChild, previousChildren) {
+          return Stack(
+            alignment: Alignment.topLeft,
+            children: [
+              ...previousChildren,
+              if (currentChild != null) currentChild,
+            ],
+          );
+        },
+        child: OverflowBox(
+          key: ValueKey<bool>(isCollapsed),
+          alignment: Alignment.topLeft,
+          minWidth: railWidth,
+          maxWidth: railWidth,
+          child: SizedBox(
+            width: railWidth,
+            child: isCollapsed ? _buildCollapsedRail() : _buildExpandedRail(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCollapsedRail() {
     if (isCollapsed) {
-      return Container(
-        width: 72,
-        color: const Color(0xff151a1d),
-        child: Column(
-          children: [
-            const SizedBox(height: 20),
-            IconButton(
-              onPressed: onToggleCollapse,
-              tooltip: 'Expand sidebar',
-              icon: const Icon(
-                Icons.chevron_right,
-                color: Color(0xff7fd1c7),
-                size: 26,
+      return Column(
+        children: [
+          const SizedBox(height: 20),
+          IconButton(
+            onPressed: onToggleCollapse,
+            tooltip: 'Expand sidebar',
+            icon: const Icon(
+              Icons.chevron_right,
+              color: Color(0xff7fd1c7),
+              size: 26,
+            ),
+          ),
+          const SizedBox(height: 16),
+          _NewSessionMenu(
+            selectedShell: selectedShell,
+            shellOptions: shellOptions,
+            showShellMenu: showShellMenu,
+            onCreateSession: onCreateSession,
+          ),
+          const SizedBox(height: 16),
+          Tooltip(
+            message: connectionStatus,
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: connectionStatusColor,
               ),
             ),
-            const SizedBox(height: 16),
-            _NewSessionMenu(
-              selectedShell: selectedShell,
-              shellOptions: shellOptions,
-              showShellMenu: showShellMenu,
-              onCreateSession: onCreateSession,
-            ),
-            const SizedBox(height: 16),
-            Tooltip(
-              message: connectionStatus,
-              child: Container(
-                width: 10,
-                height: 10,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: connectionStatusColor,
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            const Divider(height: 1, color: Color(0xff263033)),
-            const SizedBox(height: 8),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Column(
-                  children: [
-                    for (final indexed in sessions.indexed)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 4),
-                        child: Tooltip(
-                          message: indexed.$2.title,
-                          child: InkWell(
-                            onTap: () => onSelectSession(indexed.$1),
-                            borderRadius: BorderRadius.circular(8),
-                            child: Container(
-                              width: 48,
-                              height: 48,
-                              decoration: BoxDecoration(
+          ),
+          const SizedBox(height: 20),
+          const Divider(height: 1, color: Color(0xff263033)),
+          const SizedBox(height: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Column(
+                children: [
+                  for (final indexed in sessions.indexed)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Tooltip(
+                        message: indexed.$2.title,
+                        child: InkWell(
+                          onTap: () => onSelectSession(indexed.$1),
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              color: indexed.$1 == selectedIndex
+                                  ? const Color(0xff233033)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
                                 color: indexed.$1 == selectedIndex
-                                    ? const Color(0xff233033)
+                                    ? const Color(0xff3b5356)
                                     : Colors.transparent,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: indexed.$1 == selectedIndex
-                                      ? const Color(0xff3b5356)
-                                      : Colors.transparent,
-                                ),
                               ),
-                              child: Icon(
-                                indexed.$2.icon,
-                                color: indexed.$1 == selectedIndex
-                                    ? const Color(0xff7fd1c7)
-                                    : const Color(0xffcdd7d6),
-                                size: 22,
-                              ),
+                            ),
+                            child: Icon(
+                              indexed.$2.icon,
+                              color: indexed.$1 == selectedIndex
+                                  ? const Color(0xff7fd1c7)
+                                  : const Color(0xffcdd7d6),
+                              size: 22,
                             ),
                           ),
                         ),
                       ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return Container(
-      width: 320,
-      color: const Color(0xff151a1d),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 20, 10, 16),
-            child: Row(
-              children: [
-                const Icon(Icons.route, size: 24, color: Color(0xff7fd1c7)),
-                const SizedBox(width: 10),
-                const Text(
-                  'Triage',
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(width: 6),
-                IconButton(
-                  onPressed: onToggleCollapse,
-                  tooltip: 'Minimize sidebar',
-                  icon: const Icon(
-                    Icons.chevron_left,
-                    color: Color(0xff7f8b8d),
-                    size: 22,
-                  ),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                ),
-                const Spacer(),
-                _NewSessionMenu(
-                  selectedShell: selectedShell,
-                  shellOptions: shellOptions,
-                  showShellMenu: showShellMenu,
-                  onCreateSession: onCreateSession,
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: _ConnectionStatus(
-              status: connectionStatus,
-              color: connectionStatusColor,
-            ),
-          ),
-          const SizedBox(height: 18),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 20),
-            child: Text(
-              'SESSIONS',
-              style: TextStyle(
-                color: Color(0xff7f8b8d),
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0,
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-              child: Column(
-                children: [
-                  for (final indexed in sessions.indexed)
-                    SessionListTile(
-                      selected: indexed.$1 == selectedIndex,
-                      title: indexed.$2.title,
-                      subtitle: indexed.$2.status,
-                      statusColor: indexed.$2.statusColor,
-                      icon: indexed.$2.icon,
-                      onTap: () => onSelectSession(indexed.$1),
                     ),
                 ],
               ),
             ),
           ),
         ],
-      ),
+      );
+    }
+
+    return const SizedBox.shrink();
+  }
+
+  Widget _buildExpandedRail() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 10, 16),
+          child: Row(
+            children: [
+              const Icon(Icons.terminal, size: 24, color: Color(0xff7fd1c7)),
+              const SizedBox(width: 10),
+              const Text(
+                'Triage',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(width: 6),
+              IconButton(
+                onPressed: onToggleCollapse,
+                tooltip: 'Minimize sidebar',
+                icon: const Icon(
+                  Icons.chevron_left,
+                  color: Color(0xff7f8b8d),
+                  size: 22,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
+              const Spacer(),
+              _NewSessionMenu(
+                selectedShell: selectedShell,
+                shellOptions: shellOptions,
+                showShellMenu: showShellMenu,
+                onCreateSession: onCreateSession,
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: _ConnectionStatus(
+            status: connectionStatus,
+            color: connectionStatusColor,
+          ),
+        ),
+        const SizedBox(height: 18),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 20),
+          child: Text(
+            'SESSIONS',
+            style: TextStyle(
+              color: Color(0xff7f8b8d),
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0,
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+            child: Column(
+              children: [
+                for (final indexed in sessions.indexed)
+                  SessionListTile(
+                    selected: indexed.$1 == selectedIndex,
+                    title: indexed.$2.title,
+                    subtitle: indexed.$2.status,
+                    statusColor: indexed.$2.statusColor,
+                    icon: indexed.$2.icon,
+                    onTap: () => onSelectSession(indexed.$1),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -2370,8 +2412,9 @@ class _PairingViewState extends State<_PairingView> {
     );
   }
 
-  void _openVerificationUri(Uri uri) {
-    final opened = openExternalUri(uri);
+  Future<void> _openVerificationUri(Uri uri) async {
+    final opened = await openExternalUri(uri);
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
