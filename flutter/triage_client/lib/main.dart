@@ -1285,8 +1285,7 @@ class _TriageHomeState extends State<TriageHome> {
           final sizeChanged =
               cols != null &&
               rows != null &&
-              (currentCols != cols ||
-                  currentRows != rows);
+              (currentCols != cols || currentRows != rows);
           await _applySnapshotToSession(
             session,
             sessionId,
