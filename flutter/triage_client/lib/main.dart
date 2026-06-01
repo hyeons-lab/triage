@@ -5,6 +5,8 @@ import 'dart:math';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
@@ -12,6 +14,24 @@ import 'package:triage_client/services/storage.dart';
 
 void main() {
   runApp(const TriageClientApp());
+}
+
+const int _defaultDaemonPort = 7777;
+
+@visibleForTesting
+Uri defaultWebSocketUriForBase(Uri base) {
+  if ((base.scheme == 'http' || base.scheme == 'https') &&
+      base.host.isNotEmpty &&
+      base.port == _defaultDaemonPort) {
+    return Uri(
+      scheme: base.scheme == 'https' ? 'wss' : 'ws',
+      host: base.host,
+      port: base.port,
+      path: '/ws',
+    );
+  }
+
+  return Uri.parse('ws://127.0.0.1:$_defaultDaemonPort/ws');
 }
 
 class TriageClientApp extends StatelessWidget {
@@ -39,12 +59,14 @@ class TriageClientApp extends StatelessWidget {
 
 enum NewSessionShell {
   cmd('cmd.exe', 'Cmd'),
-  bash('bash', 'Bash');
+  bash('bash', 'Bash'),
+  defaultPosix('/bin/sh', 'Default', ['-lc', 'exec "\${SHELL:-/bin/sh}"']);
 
-  const NewSessionShell(this.command, this.label);
+  const NewSessionShell(this.command, this.label, [this.args = const []]);
 
   final String command;
   final String label;
+  final List<String> args;
 }
 
 @visibleForTesting
@@ -53,7 +75,12 @@ List<NewSessionShell> newSessionShellMenuOrderForPlatform(
 ) {
   return platform == TargetPlatform.windows
       ? const [NewSessionShell.cmd, NewSessionShell.bash]
-      : const [NewSessionShell.bash];
+      : const [NewSessionShell.defaultPosix];
+}
+
+@visibleForTesting
+bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
+  return platform == TargetPlatform.windows;
 }
 
 class SessionVm {
@@ -87,6 +114,8 @@ class SessionVm {
   bool snapshotRefreshPending = false;
   int? lastFittedCols;
   int? lastFittedRows;
+  int? inFlightCols;
+  int? inFlightRows;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
@@ -112,9 +141,16 @@ class _TriageHomeState extends State<TriageHome> {
   int _connectGeneration = 0;
   int _reconnectAttempt = 0;
   Timer? _reconnectTimer;
+  Timer? _credentialStorageTimer;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
+  bool _storageBackedClientId = false;
   bool _needsPairing = false;
+  bool _pairingChallengeLoading = false;
+  String? _pairingDeviceCode;
+  Uri? _pairingVerificationUri;
+  DateTime? _pairingExpiresAt;
+  String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
@@ -238,6 +274,7 @@ class _TriageHomeState extends State<TriageHome> {
   void initState() {
     super.initState();
     _clientId = _loadOrCreateClientId();
+    _startCredentialStorageWatcher();
     _newSessionShell = newSessionShellMenuOrderForPlatform(
       defaultTargetPlatform,
     ).first;
@@ -304,6 +341,7 @@ class _TriageHomeState extends State<TriageHome> {
   String _loadOrCreateClientId() {
     final storedClientId = retrieveClientId();
     if (storedClientId != null && storedClientId.trim().isNotEmpty) {
+      _storageBackedClientId = true;
       return storedClientId;
     }
 
@@ -314,7 +352,96 @@ class _TriageHomeState extends State<TriageHome> {
     ).join();
     final clientId = 'triage-flutter-client-$suffix';
     persistClientId(clientId);
+    _storageBackedClientId = retrieveClientId() == clientId;
     return clientId;
+  }
+
+  void _refreshBearerTokenFromStorage() {
+    final storedClientId = retrieveClientId();
+    final storedToken = retrieveToken();
+    if (!_storageBackedClientId) {
+      if (storedClientId == _clientId) {
+        _storageBackedClientId = true;
+      }
+      if (storedToken?.trim().isNotEmpty == true) {
+        _bearerToken = storedToken;
+      }
+      return;
+    }
+
+    if (storedClientId == null || storedClientId.trim().isEmpty) {
+      _bearerToken = null;
+      persistClientId(_clientId);
+      _storageBackedClientId = retrieveClientId() == _clientId;
+      return;
+    }
+    if (storedClientId != _clientId) {
+      _bearerToken = null;
+      return;
+    }
+    _bearerToken = storedToken?.trim().isEmpty == false ? storedToken : null;
+  }
+
+  void _startCredentialStorageWatcher() {
+    _credentialStorageTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _checkCredentialStorageStillMatches();
+    });
+  }
+
+  void _checkCredentialStorageStillMatches() {
+    if (_disposed ||
+        !_storageBackedClientId ||
+        !_clientInitialized ||
+        !_client.isConnected ||
+        _needsPairing ||
+        _bearerToken == null) {
+      return;
+    }
+
+    if (retrieveClientId() == _clientId && retrieveToken() == _bearerToken) {
+      return;
+    }
+
+    _bearerToken = null;
+    _reconnectAttempt = 0;
+    unawaited(_connectWebSocket(isReconnect: true));
+  }
+
+  Uri _defaultWebSocketUri() {
+    return defaultWebSocketUriForBase(Uri.base);
+  }
+
+  Uri? _verificationUriForClient(
+    TriageWebSocketClient client, {
+    String? deviceCode,
+  }) {
+    final wsUri = client.uri;
+    if (!_isLocalVerificationHost(wsUri.host)) {
+      return null;
+    }
+
+    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+    final verificationUri = wsUri.replace(
+      scheme: scheme,
+      path: '/pair',
+      query: '',
+      fragment: '',
+    );
+    if (deviceCode == null || deviceCode.trim().isEmpty) {
+      return verificationUri;
+    }
+    return verificationUri.replace(
+      queryParameters: {'device_code': deviceCode},
+    );
+  }
+
+  bool _isLocalVerificationHost(String host) {
+    final normalized = host.toLowerCase();
+    return normalized == 'localhost' ||
+        normalized == '::1' ||
+        normalized == '0:0:0:0:0:0:0:1' ||
+        normalized == '::ffff:127.0.0.1' ||
+        normalized.startsWith('127.');
   }
 
   bool _isRemoteSession(SessionVm session) {
@@ -401,9 +528,29 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          _client
-              .resizeSession(sessionId: sessionId, cols: cols, rows: rows)
-              .catchError((_) => <String, dynamic>{});
+          unawaited(() async {
+            try {
+              final snapshot = _snapshotFromResponse(
+                await _client.resizeSession(
+                  sessionId: sessionId,
+                  cols: cols,
+                  rows: rows,
+                ),
+              );
+              if (snapshot != null && _sessionStillLoaded(session, sessionId)) {
+                final sizeChanged = _snapshotSizeDiffersFromSession(
+                  session,
+                  snapshot,
+                );
+                await _applySnapshotToSession(
+                  session,
+                  sessionId,
+                  snapshot,
+                  includeHistory: sizeChanged,
+                );
+              }
+            } catch (_) {}
+          }());
         }
       }
     });
@@ -416,7 +563,9 @@ class _TriageHomeState extends State<TriageHome> {
   }
 
   void _scheduleReconnect() {
-    if (_disposed || _needsPairing || _reconnectTimer?.isActive == true) {
+    if (_disposed ||
+        (_needsPairing && _client.isConnected) ||
+        _reconnectTimer?.isActive == true) {
       return;
     }
 
@@ -432,19 +581,21 @@ class _TriageHomeState extends State<TriageHome> {
     });
   }
 
-  void _connectWebSocket({bool isReconnect = false}) async {
+  Future<void> _connectWebSocket({bool isReconnect = false}) async {
     if (_disposed || _isConnecting) return;
     _isConnecting = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     final generation = ++_connectGeneration;
-    _bearerToken ??= retrieveToken();
+    _refreshBearerTokenFromStorage();
     if (_clientInitialized) {
+      final subscription = _websocketSubscription;
+      _websocketSubscription = null;
       try {
-        await _client.disconnect();
+        await subscription?.cancel().timeout(const Duration(milliseconds: 250));
       } catch (_) {}
       try {
-        await _websocketSubscription?.cancel();
+        await _client.disconnect();
       } catch (_) {}
     }
 
@@ -454,8 +605,7 @@ class _TriageHomeState extends State<TriageHome> {
     }
 
     final client =
-        widget.client ??
-        TriageWebSocketClient(Uri.parse('ws://127.0.0.1:7777/ws'));
+        widget.client ?? TriageWebSocketClient(_defaultWebSocketUri());
     _client = client;
     _clientInitialized = true;
 
@@ -491,17 +641,15 @@ class _TriageHomeState extends State<TriageHome> {
       }
 
       if (!authenticated) {
-        setState(() {
-          _needsPairing = true;
-          _connectionStatus = 'Awaiting Pairing';
-          _connectionStatusColor = const Color(0xffffc857);
-        });
+        await _showPairingChallenge(generation);
         _isConnecting = false;
         return;
       }
 
       setState(() {
         _needsPairing = false;
+        _pairingChallengeLoading = false;
+        _pairingChallengeError = null;
         _connectionStatus = 'Connected to Daemon';
         _connectionStatusColor = const Color(0xff7fd1c7);
       });
@@ -516,11 +664,7 @@ class _TriageHomeState extends State<TriageHome> {
       final errStr = e.toString();
       if (errStr.contains('unauthorized') ||
           errStr.contains('unauthenticated')) {
-        setState(() {
-          _needsPairing = true;
-          _connectionStatus = 'Awaiting Pairing';
-          _connectionStatusColor = const Color(0xffffc857);
-        });
+        await _showPairingChallenge(generation);
       } else {
         setState(() {
           _connectionStatus = isReconnect
@@ -538,15 +682,97 @@ class _TriageHomeState extends State<TriageHome> {
     }
   }
 
+  Future<void> _showPairingChallenge(int generation) async {
+    _bearerToken = null;
+    clearToken();
+    if (_disposed || generation != _connectGeneration) {
+      return;
+    }
+
+    setState(() {
+      _needsPairing = true;
+      _pairingChallengeLoading = true;
+      _pairingChallengeError = null;
+      _connectionStatus = 'Awaiting Pairing';
+      _connectionStatusColor = const Color(0xffffc857);
+    });
+
+    await _requestPairingChallenge(generation: generation);
+  }
+
+  Future<void> _requestPairingChallenge({int? generation}) async {
+    if (_disposed || (generation != null && generation != _connectGeneration)) {
+      return;
+    }
+
+    if (!_client.isConnected) {
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError =
+            'Connection closed before the pairing challenge could be requested.';
+      });
+      _scheduleReconnect();
+      return;
+    }
+
+    setState(() {
+      _pairingChallengeLoading = true;
+      _pairingChallengeError = null;
+    });
+
+    try {
+      final challenge = await _client.pairingChallenge(clientId: _clientId);
+      if (_disposed ||
+          (generation != null && generation != _connectGeneration)) {
+        return;
+      }
+
+      final expiresAtSeconds = challenge['expires_at'];
+      setState(() {
+        _pairingDeviceCode = challenge['device_code']?.toString();
+        _pairingVerificationUri = _verificationUriForClient(
+          _client,
+          deviceCode: _pairingDeviceCode,
+        );
+        _pairingExpiresAt = expiresAtSeconds is int
+            ? DateTime.fromMillisecondsSinceEpoch(
+                expiresAtSeconds * 1000,
+                isUtc: true,
+              ).toLocal()
+            : null;
+        _pairingChallengeLoading = false;
+      });
+    } catch (e) {
+      if (_disposed ||
+          (generation != null && generation != _connectGeneration)) {
+        return;
+      }
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
   Future<void> _onPairRequested(String pin) async {
-    final token = await _client.pair(code: pin, clientId: _clientId);
+    final String token;
+    try {
+      token = await _client.pair(code: pin, clientId: _clientId);
+    } catch (_) {
+      await _requestPairingChallenge();
+      rethrow;
+    }
     if (token.isNotEmpty) {
       setState(() {
         _bearerToken = token;
+        persistClientId(_clientId);
         persistToken(token);
+        _storageBackedClientId = retrieveClientId() == _clientId;
+        _pairingChallengeError = null;
       });
       _reconnectAttempt = 0;
-      _connectWebSocket();
+      _isConnecting = false;
+      await _connectWebSocket();
     } else {
       throw Exception('Server returned empty pairing token');
     }
@@ -700,19 +926,41 @@ class _TriageHomeState extends State<TriageHome> {
             snapshotRes['snapshot'] as Map<String, dynamic>? ?? {};
       } catch (_) {}
 
+      final replayTargetSize = includeHistory
+          ? _estimatedTerminalRestoreSize(
+              preAttachSnapshot['size'] as Map<String, dynamic>?,
+            )
+          : null;
+      Map<String, dynamic>? preparedSnapshot;
       if (preAttachSnapshot['exited'] == true) {
         final sizeObj = preAttachSnapshot['size'] as Map<String, dynamic>?;
-        final cols = sizeObj?['cols'] as int?;
-        final rows = sizeObj?['rows'] as int?;
-        final restoreSize = (cols != null && rows != null)
-            ? (rows, cols)
-            : _estimatedTerminalRestoreSize(sizeObj);
+        final restoreSize =
+            replayTargetSize ?? _savedOrEstimatedTerminalRestoreSize(sizeObj);
         try {
-          await _client.restoreSession(
-            sessionId: sid,
-            rows: restoreSize.$1,
-            cols: restoreSize.$2,
+          preparedSnapshot = _snapshotFromResponse(
+            await _client.restoreSession(
+              sessionId: sid,
+              rows: restoreSize.$1,
+              cols: restoreSize.$2,
+            ),
           );
+          if (preparedSnapshot != null) {
+            preAttachSnapshot = preparedSnapshot;
+          }
+        } catch (_) {}
+      } else if (replayTargetSize != null &&
+          !_snapshotSizeMatches(preAttachSnapshot, replayTargetSize)) {
+        try {
+          preparedSnapshot = _snapshotFromResponse(
+            await _client.resizeSession(
+              sessionId: sid,
+              rows: replayTargetSize.$1,
+              cols: replayTargetSize.$2,
+            ),
+          );
+          if (preparedSnapshot != null) {
+            preAttachSnapshot = preparedSnapshot;
+          }
         } catch (_) {}
       }
 
@@ -728,7 +976,12 @@ class _TriageHomeState extends State<TriageHome> {
         mode: 'InteractiveController',
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
-      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      if (replayTargetSize != null &&
+          preparedSnapshot != null &&
+          !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+        snapshot = preparedSnapshot;
+      }
 
       final contextObj = snapshot?['context'] as Map<String, dynamic>?;
       final branch = contextObj?['branch']?.toString() ?? 'main';
@@ -813,6 +1066,92 @@ class _TriageHomeState extends State<TriageHome> {
     final cols = (terminalWidth / averageCellWidth).floor().clamp(80, 240);
     final rows = (terminalHeight / averageCellHeight).floor().clamp(10, 80);
     return (rows, cols);
+  }
+
+  (int, int) _savedOrEstimatedTerminalRestoreSize(
+    Map<String, dynamic>? fallbackSize,
+  ) {
+    final cols = fallbackSize?['cols'] as int?;
+    final rows = fallbackSize?['rows'] as int?;
+    if (cols != null && rows != null) {
+      return (rows, cols);
+    }
+    return _estimatedTerminalRestoreSize(fallbackSize);
+  }
+
+  (int, int) _currentReplayTerminalSize(
+    SessionVm session,
+    Map<String, dynamic>? fallbackSize,
+  ) {
+    final cols = session.lastFittedCols;
+    final rows = session.lastFittedRows;
+    if (cols != null && rows != null) {
+      return (rows, cols);
+    }
+    return _estimatedTerminalRestoreSize(fallbackSize);
+  }
+
+  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
+    final direct = response['snapshot'];
+    if (direct is Map<String, dynamic>) {
+      return direct;
+    }
+    if (direct is Map) {
+      return Map<String, dynamic>.from(direct);
+    }
+
+    final responseObj = response['response'];
+    if (responseObj is Map<String, dynamic>) {
+      final nested = responseObj['snapshot'];
+      if (nested is Map<String, dynamic>) {
+        return nested;
+      }
+      if (nested is Map) {
+        return Map<String, dynamic>.from(nested);
+      }
+    }
+    if (responseObj is Map) {
+      final nested = responseObj['snapshot'];
+      if (nested is Map<String, dynamic>) {
+        return nested;
+      }
+      if (nested is Map) {
+        return Map<String, dynamic>.from(nested);
+      }
+    }
+    return null;
+  }
+
+  bool _snapshotSizeMatches(
+    Map<String, dynamic>? snapshot,
+    (int, int) targetSize,
+  ) {
+    final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
+    return sizeObj?['rows'] == targetSize.$1 &&
+        sizeObj?['cols'] == targetSize.$2;
+  }
+
+  bool _snapshotSizeDiffersFromSession(
+    SessionVm session,
+    Map<String, dynamic> snapshot,
+  ) {
+    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+    final cols = sizeObj?['cols'] as int?;
+    final rows = sizeObj?['rows'] as int?;
+    final currentCols = session.inFlightCols ?? session.lastFittedCols;
+    final currentRows = session.inFlightRows ?? session.lastFittedRows;
+    return cols != null &&
+        rows != null &&
+        (currentCols != cols || currentRows != rows);
+  }
+
+  bool _sessionStillLoaded(SessionVm session, String sessionId) {
+    if (_disposed || !mounted) return false;
+    return _sessions.any(
+      (candidate) =>
+          identical(candidate, session) &&
+          _sessionIdFor(candidate) == sessionId,
+    );
   }
 
   void _onWebSocketEvent(Map<String, dynamic> message) {
@@ -941,11 +1280,13 @@ class _TriageHomeState extends State<TriageHome> {
           final size = snapshot['size'] as Map<String, dynamic>?;
           final cols = size?['cols'] as int?;
           final rows = size?['rows'] as int?;
+          final currentCols = session.inFlightCols ?? session.lastFittedCols;
+          final currentRows = session.inFlightRows ?? session.lastFittedRows;
           final sizeChanged =
               cols != null &&
               rows != null &&
-              (session.lastFittedCols != cols ||
-                  session.lastFittedRows != rows);
+              (currentCols != cols ||
+                  currentRows != rows);
           await _applySnapshotToSession(
             session,
             sessionId,
@@ -974,6 +1315,14 @@ class _TriageHomeState extends State<TriageHome> {
     Map<String, dynamic> snapshot, {
     bool includeHistory = false,
   }) async {
+    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+    final cols = sizeObj?['cols'] as int?;
+    final rowsVal = sizeObj?['rows'] as int?;
+    if (cols != null && rowsVal != null) {
+      session.inFlightCols = cols;
+      session.inFlightRows = rowsVal;
+    }
+
     final visibleRowsJson = snapshot['visible_rows'] as List<dynamic>?;
     final styledRowsJson = snapshot['styled_rows'] as List<dynamic>?;
     final rows = await _mergeVisibleAndStyledRows(
@@ -983,7 +1332,11 @@ class _TriageHomeState extends State<TriageHome> {
       includeHistory: includeHistory,
       existingRows: session.rows,
     );
-    if (_disposed || rows.isEmpty) return;
+    if (_disposed || rows.isEmpty) {
+      session.inFlightCols = null;
+      session.inFlightRows = null;
+      return;
+    }
 
     final cursorObj = snapshot['cursor'] as Map<String, dynamic>?;
     final absoluteCursorRow = cursorObj?['row'] as int?;
@@ -995,9 +1348,6 @@ class _TriageHomeState extends State<TriageHome> {
       initialCursorRow = absoluteCursorRow - startOffset;
     }
     final exited = snapshot['exited'] as bool? ?? false;
-    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-    final cols = sizeObj?['cols'] as int?;
-    final rowsVal = sizeObj?['rows'] as int?;
 
     setState(() {
       session.rows
@@ -1017,6 +1367,10 @@ class _TriageHomeState extends State<TriageHome> {
       if (cols != null && rowsVal != null) {
         session.lastFittedCols = cols;
         session.lastFittedRows = rowsVal;
+        if (session.inFlightCols == cols && session.inFlightRows == rowsVal) {
+          session.inFlightCols = null;
+          session.inFlightRows = null;
+        }
       }
     });
   }
@@ -1036,6 +1390,11 @@ class _TriageHomeState extends State<TriageHome> {
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
+      if (_needsPairing) {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError =
+            'Connection closed before the pairing challenge could be requested.';
+      }
       _markAttachedSessionsDisconnected();
     });
     _scheduleReconnect();
@@ -1046,6 +1405,7 @@ class _TriageHomeState extends State<TriageHome> {
     _disposed = true;
     _connectGeneration++;
     _reconnectTimer?.cancel();
+    _credentialStorageTimer?.cancel();
     if (_clientInitialized) {
       _client.disconnect();
       _websocketSubscription?.cancel();
@@ -1102,22 +1462,27 @@ class _TriageHomeState extends State<TriageHome> {
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot != null && !_disposed) {
         var finalSnapshot = snapshot;
+        final sizeObj = snapshot['size'] as Map<String, dynamic>?;
+        final replayTargetSize = includeHistory
+            ? _currentReplayTerminalSize(session, sizeObj)
+            : null;
         if (snapshot['exited'] == true) {
           debugPrint(
             'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
           );
-          final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-          final cols = sizeObj?['cols'] as int?;
-          final rows = sizeObj?['rows'] as int?;
-          final restoreSize = (cols != null && rows != null)
-              ? (rows, cols)
-              : _estimatedTerminalRestoreSize(sizeObj);
+          final restoreSize =
+              replayTargetSize ?? _savedOrEstimatedTerminalRestoreSize(sizeObj);
           try {
-            await _client.restoreSession(
-              sessionId: sessionId,
-              rows: restoreSize.$1,
-              cols: restoreSize.$2,
+            final restoredSnapshot = _snapshotFromResponse(
+              await _client.restoreSession(
+                sessionId: sessionId,
+                rows: restoreSize.$1,
+                cols: restoreSize.$2,
+              ),
             );
+            if (restoredSnapshot != null) {
+              finalSnapshot = restoredSnapshot;
+            }
             final freshAttachRes = await _client.attachSession(
               sessionId: sessionId,
               clientId: _clientId,
@@ -1128,13 +1493,30 @@ class _TriageHomeState extends State<TriageHome> {
             final freshSnapshot =
                 freshResponseObj?['snapshot'] as Map<String, dynamic>?;
             if (freshSnapshot != null) {
-              finalSnapshot = freshSnapshot;
+              if (replayTargetSize == null ||
+                  _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
+                finalSnapshot = freshSnapshot;
+              }
             }
           } catch (e) {
             debugPrint(
               'Failed to restore session $sessionId during refresh: ${e.toString()}',
             );
           }
+        } else if (replayTargetSize != null &&
+            !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+          try {
+            final resizedSnapshot = _snapshotFromResponse(
+              await _client.resizeSession(
+                sessionId: sessionId,
+                rows: replayTargetSize.$1,
+                cols: replayTargetSize.$2,
+              ),
+            );
+            if (resizedSnapshot != null) {
+              finalSnapshot = resizedSnapshot;
+            }
+          } catch (_) {}
         }
         await _applySnapshotToSession(
           session,
@@ -1160,9 +1542,11 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _createSession(NewSessionShell preferredShell) async {
     if (_client.isConnected) {
-      final fallbackShell = preferredShell == NewSessionShell.cmd
-          ? NewSessionShell.bash
-          : NewSessionShell.cmd;
+      final fallbackShell = switch (preferredShell) {
+        NewSessionShell.cmd => NewSessionShell.bash,
+        NewSessionShell.bash => NewSessionShell.cmd,
+        NewSessionShell.defaultPosix => null,
+      };
       setState(() {
         _newSessionShell = preferredShell;
         _connectionStatus = 'Creating session...';
@@ -1174,10 +1558,15 @@ class _TriageHomeState extends State<TriageHome> {
         try {
           sessionId = await _client.startSession(
             command: preferredShell.command,
+            args: preferredShell.args,
           );
         } catch (_) {
+          if (fallbackShell == null) {
+            rethrow;
+          }
           sessionId = await _client.startSession(
             command: fallbackShell.command,
+            args: fallbackShell.args,
           );
         }
         if (sessionId.isNotEmpty) {
@@ -1332,7 +1721,7 @@ class _TriageHomeState extends State<TriageHome> {
         body: Center(
           child: SingleChildScrollView(
             child: Container(
-              width: 420,
+              width: 520,
               padding: const EdgeInsets.all(32),
               decoration: BoxDecoration(
                 color: const Color(0xff161b1d),
@@ -1347,6 +1736,12 @@ class _TriageHomeState extends State<TriageHome> {
                 ],
               ),
               child: _PairingView(
+                deviceCode: _pairingDeviceCode,
+                verificationUri: _pairingVerificationUri,
+                expiresAt: _pairingExpiresAt,
+                isChallengeLoading: _pairingChallengeLoading,
+                challengeError: _pairingChallengeError,
+                onRefreshChallenge: () => _requestPairingChallenge(),
                 onPair: _onPairRequested,
                 onCancel: () async {
                   try {
@@ -1379,6 +1774,9 @@ class _TriageHomeState extends State<TriageHome> {
               onCreateSession: _createSession,
               selectedShell: _newSessionShell,
               shellOptions: newSessionShellMenuOrderForPlatform(
+                defaultTargetPlatform,
+              ),
+              showShellMenu: showNewSessionShellMenuForPlatform(
                 defaultTargetPlatform,
               ),
               connectionStatus: _connectionStatus,
@@ -1447,6 +1845,7 @@ class SessionRail extends StatelessWidget {
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
+    required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
     required this.isCollapsed,
@@ -1459,6 +1858,7 @@ class SessionRail extends StatelessWidget {
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
+  final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
   final bool isCollapsed;
@@ -1486,6 +1886,7 @@ class SessionRail extends StatelessWidget {
             _NewSessionMenu(
               selectedShell: selectedShell,
               shellOptions: shellOptions,
+              showShellMenu: showShellMenu,
               onCreateSession: onCreateSession,
             ),
             const SizedBox(height: 16),
@@ -1582,6 +1983,7 @@ class SessionRail extends StatelessWidget {
                 _NewSessionMenu(
                   selectedShell: selectedShell,
                   shellOptions: shellOptions,
+                  showShellMenu: showShellMenu,
                   onCreateSession: onCreateSession,
                 ),
               ],
@@ -1668,16 +2070,18 @@ class _NewSessionMenu extends StatelessWidget {
   const _NewSessionMenu({
     required this.selectedShell,
     required this.shellOptions,
+    required this.showShellMenu,
     required this.onCreateSession,
   });
 
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
+  final bool showShellMenu;
   final ValueChanged<NewSessionShell> onCreateSession;
 
   @override
   Widget build(BuildContext context) {
-    if (shellOptions.length <= 1) {
+    if (!showShellMenu || shellOptions.length <= 1) {
       final shell = shellOptions.isEmpty ? selectedShell : shellOptions.first;
       return IconButton(
         tooltip: 'New session',
@@ -1884,8 +2288,23 @@ class WorkspaceHeader extends StatelessWidget {
 }
 
 class _PairingView extends StatefulWidget {
-  const _PairingView({required this.onPair, required this.onCancel});
+  const _PairingView({
+    required this.deviceCode,
+    required this.verificationUri,
+    required this.expiresAt,
+    required this.isChallengeLoading,
+    required this.challengeError,
+    required this.onRefreshChallenge,
+    required this.onPair,
+    required this.onCancel,
+  });
 
+  final String? deviceCode;
+  final Uri? verificationUri;
+  final DateTime? expiresAt;
+  final bool isChallengeLoading;
+  final String? challengeError;
+  final Future<void> Function() onRefreshChallenge;
   final Future<void> Function(String pin) onPair;
   final VoidCallback onCancel;
 
@@ -1934,8 +2353,43 @@ class _PairingViewState extends State<_PairingView> {
     }
   }
 
+  String _expiryLabel(DateTime? expiresAt) {
+    if (expiresAt == null) return '';
+    final hour = expiresAt.hour.toString().padLeft(2, '0');
+    final minute = expiresAt.minute.toString().padLeft(2, '0');
+    return 'Expires at $hour:$minute';
+  }
+
+  Future<void> _copyText(String label, String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$label copied'),
+        duration: const Duration(milliseconds: 1400),
+      ),
+    );
+  }
+
+  void _openVerificationUri(Uri uri) {
+    final opened = openExternalUri(uri);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          opened ? 'Verification page opened' : 'Open this URL in a browser',
+        ),
+        duration: const Duration(milliseconds: 1400),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final deviceCode = widget.deviceCode;
+    final verificationUri = widget.verificationUri;
+    final hasVerificationUri = verificationUri != null;
+    final expiryLabel = _expiryLabel(widget.expiresAt);
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1955,10 +2409,167 @@ class _PairingViewState extends State<_PairingView> {
           ],
         ),
         const SizedBox(height: 16),
-        const Text(
-          'This Triage daemon requires pairing. Please run "triage pair" in your local terminal and enter the 8-character PIN below.',
-          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
+        Text(
+          hasVerificationUri
+              ? 'This browser is not paired with the Triage daemon. Open the verification URL, enter this device code to get a PIN, then enter the PIN below.'
+              : 'This browser is not paired with the Triage daemon. Approve pairing from the computer running triaged, then enter the PIN below.',
+          style: const TextStyle(
+            color: Color(0xffa5b1b4),
+            fontSize: 14,
+            height: 1.4,
+          ),
         ),
+        const SizedBox(height: 18),
+        if (widget.isChallengeLoading && deviceCode == null)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: CircularProgressIndicator(
+                strokeWidth: 2.5,
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xff7fd1c7)),
+              ),
+            ),
+          )
+        else ...[
+          if (hasVerificationUri) ...[
+            const Text(
+              'Verification URL',
+              style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            Tooltip(
+              message: 'Open verification URL',
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => _openVerificationUri(verificationUri!),
+                  icon: const Icon(Icons.open_in_new, size: 18),
+                  label: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      verificationUri.toString(),
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    alignment: Alignment.centerLeft,
+                    foregroundColor: const Color(0xff7fd1c7),
+                    side: const BorderSide(color: Color(0xff344145)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 12,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ] else ...[
+            const Text(
+              'Local approval required',
+              style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Use the daemon host pairing page or run triage pair.',
+              style: TextStyle(color: Color(0xffcdd7d6), fontSize: 14),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xff101517),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xff344145)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Device Code',
+                        style: TextStyle(
+                          color: Color(0xff7f8b8d),
+                          fontSize: 12,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: SelectableText(
+                              deviceCode ?? '--------',
+                              style: const TextStyle(
+                                color: Color(0xffedf7f6),
+                                fontSize: 24,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 4,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Copy device code',
+                            onPressed: deviceCode == null
+                                ? null
+                                : () => _copyText('Device code', deviceCode),
+                            icon: const Icon(Icons.copy, size: 20),
+                            color: const Color(0xff7fd1c7),
+                          ),
+                        ],
+                      ),
+                      if (expiryLabel.isNotEmpty) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          expiryLabel,
+                          style: const TextStyle(
+                            color: Color(0xff7f8b8d),
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton(
+                onPressed: widget.isChallengeLoading
+                    ? null
+                    : () => widget.onRefreshChallenge(),
+                icon: widget.isChallengeLoading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.2,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Color(0xff7fd1c7),
+                          ),
+                        ),
+                      )
+                    : const Icon(Icons.refresh),
+                tooltip: 'Refresh device code',
+                color: const Color(0xffcdd7d6),
+              ),
+            ],
+          ),
+        ],
+        if (widget.challengeError != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            widget.challengeError!,
+            style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
+          ),
+        ],
         const SizedBox(height: 24),
         TextField(
           controller: _pinController,
@@ -1996,8 +2607,10 @@ class _PairingViewState extends State<_PairingView> {
           ),
         ],
         const SizedBox(height: 24),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.end,
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 12,
+          runSpacing: 8,
           children: [
             TextButton(
               onPressed: _isLoading ? null : widget.onCancel,
@@ -2006,7 +2619,6 @@ class _PairingViewState extends State<_PairingView> {
               ),
               child: const Text('Cancel (Offline Mode)'),
             ),
-            const SizedBox(width: 12),
             ElevatedButton(
               onPressed: _isLoading ? null : _submit,
               style: ElevatedButton.styleFrom(

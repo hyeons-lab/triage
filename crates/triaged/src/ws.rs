@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ pub fn start_websocket_server(
                     tracing::debug!(client_addr = %addr, "Accepted TCP connection");
                     let manager = Arc::clone(&manager);
                     let cache = Arc::clone(&cache);
+                    let allow_pairing_approval = is_local_pairing_peer(addr, bind_addr);
                     tokio::spawn(async move {
                         tracing::debug!(client_addr = %addr, "Spawning HTTP/WebSocket handler");
                         let io = TokioIo::new(stream);
@@ -50,7 +52,7 @@ pub fn start_websocket_server(
                                 path = %req.uri().path(),
                                 "Received HTTP request"
                             );
-                            crate::http::serve_http(req, cache, manager)
+                            crate::http::serve_http(req, cache, manager, allow_pairing_approval)
                         });
 
                         if let Err(error) = http1::Builder::new()
@@ -68,6 +70,48 @@ pub fn start_websocket_server(
             }
         }
     })
+}
+
+fn is_local_pairing_peer(peer_addr: SocketAddr, listener_addr: Option<SocketAddr>) -> bool {
+    let peer_ip = peer_addr.ip();
+    if is_loopback_ip(peer_ip) {
+        return true;
+    }
+
+    listener_addr.is_some_and(|listener_addr| {
+        let listener_ip = listener_addr.ip();
+        !is_unspecified_ip(listener_ip) && same_ip_address(peer_ip, listener_ip)
+    })
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+    }
+}
+
+fn is_unspecified_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_unspecified(),
+        IpAddr::V6(ip) => ip.is_unspecified(),
+    }
+}
+
+fn same_ip_address(left: IpAddr, right: IpAddr) -> bool {
+    left == right
+        || mapped_ipv4(left)
+            .zip(mapped_ipv4(right))
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn mapped_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped(),
+    }
 }
 
 /// Handle upgraded WebSocket connections on the Hyper multiplexed port.
@@ -175,4 +219,41 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_pairing_peer_accepts_loopback_peer() {
+        assert!(is_local_pairing_peer(
+            "127.0.0.1:50123".parse().unwrap(),
+            Some("0.0.0.0:7777".parse().unwrap())
+        ));
+        assert!(is_local_pairing_peer(
+            "[::ffff:127.0.0.1]:50123".parse().unwrap(),
+            Some("[::]:7777".parse().unwrap())
+        ));
+    }
+
+    #[test]
+    fn local_pairing_peer_accepts_same_concrete_listener_address() {
+        assert!(is_local_pairing_peer(
+            "192.168.1.10:50123".parse().unwrap(),
+            Some("192.168.1.10:7777".parse().unwrap())
+        ));
+    }
+
+    #[test]
+    fn local_pairing_peer_rejects_remote_peer_on_concrete_or_wildcard_listener() {
+        assert!(!is_local_pairing_peer(
+            "192.168.1.11:50123".parse().unwrap(),
+            Some("192.168.1.10:7777".parse().unwrap())
+        ));
+        assert!(!is_local_pairing_peer(
+            "192.168.1.11:50123".parse().unwrap(),
+            Some("0.0.0.0:7777".parse().unwrap())
+        ));
+    }
 }

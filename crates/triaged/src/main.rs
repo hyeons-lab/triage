@@ -59,10 +59,6 @@ fn run() -> anyhow::Result<()> {
 
     let bind_addr = config.remote.bind_addr()?;
 
-    if config.remote.require_pairing {
-        let _ = manager.generate_pairing_code()?;
-    }
-
     // Bind TCP listener (either inherited or brand new)
     let tcp_listener = {
         #[cfg(unix)]

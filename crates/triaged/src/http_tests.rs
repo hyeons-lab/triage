@@ -6,6 +6,8 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::Empty;
     use hyper::Request;
+    use triage_core::session::ClientId;
+    use triage_transport_ws::WebSocketAuthenticator;
 
     use crate::http::{WebAssetCache, mime_type_for_path, serve_http};
     use crate::session::{SessionManager, SessionManagerConfig};
@@ -74,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn test_web_asset_cache_override_and_reload() {
+    fn test_web_asset_cache_override_updates_without_reload() {
         let temp_dir = TempDir::new().unwrap();
         let cache = WebAssetCache::new(Some(temp_dir.path.clone()));
 
@@ -91,14 +93,14 @@ mod tests {
         let updated_content = b"UPDATED OVERRIDE INDEX";
         std::fs::write(&override_file, updated_content).unwrap();
 
-        // 3. Fetch again -> should still yield cached custom content (hot cached)!
+        // 3. Fetch again -> should yield updated content without a manual reload.
         let index2 = cache.get("index.html").unwrap();
-        assert_eq!(index2.content.as_ref(), custom_content);
+        assert_eq!(index2.content.as_ref(), updated_content);
 
-        // 4. Trigger reload
+        // 4. Trigger reload; override files still read current bytes.
         cache.reload();
 
-        // 5. Fetch again -> should yield updated custom content (cache cleared)!
+        // 5. Fetch again -> should yield updated custom content.
         let index3 = cache.get("index.html").unwrap();
         assert_eq!(index3.content.as_ref(), updated_content);
     }
@@ -123,7 +125,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager))
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
             .await
             .unwrap();
 
@@ -161,7 +163,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager))
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
             .await
             .unwrap();
 
@@ -178,6 +180,52 @@ mod tests {
                 .unwrap(),
             "no-cache, no-store, must-revalidate"
         );
+        assert_eq!(
+            response.headers().get("clear-site-data").unwrap(),
+            "\"cache\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_http_stale_service_worker_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(WebAssetCache::new(Some(temp_dir.path.clone())));
+
+        let config = SessionManagerConfig::new(temp_dir.path.clone());
+        let manager = Arc::new(SessionManager::new(config));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/flutter_service_worker.js")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-cache, no-store, must-revalidate"
+        );
+        assert_eq!(
+            response.headers().get("clear-site-data").unwrap(),
+            "\"cache\""
+        );
+
+        use http_body_util::BodyExt;
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
+        assert!(body.contains("registration.unregister"));
+        assert!(body.contains("caches.delete"));
     }
 
     #[tokio::test]
@@ -202,7 +250,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager))
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
             .await
             .unwrap();
 
@@ -227,7 +275,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response_raw = serve_http(req_raw, Arc::clone(&cache), Arc::clone(&manager))
+        let response_raw = serve_http(req_raw, Arc::clone(&cache), Arc::clone(&manager), true)
             .await
             .unwrap();
 
@@ -241,5 +289,72 @@ mod tests {
 
         let body_bytes_raw = response_raw.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body_bytes_raw.as_ref(), content_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_pair_page_issues_device_bound_pin() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(WebAssetCache::new(Some(temp_dir.path.clone())));
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            temp_dir.path.clone(),
+        )));
+        let client_id = ClientId::new("browser-a").unwrap();
+        let other_client_id = ClientId::new("browser-b").unwrap();
+        let challenge = manager
+            .request_pairing_challenge(&client_id)
+            .expect("request pairing challenge");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/pair?device_code={}", challenge.device_code))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        use http_body_util::BodyExt;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("Copy PIN"));
+        assert!(body.contains("copyPairingValue"));
+        let pin = body
+            .split("<div class=\"pin\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</div>").next())
+            .expect("pin in pairing page")
+            .to_string();
+
+        assert!(WebSocketAuthenticator::pair(manager.as_ref(), &pin, &other_client_id).is_err());
+        WebSocketAuthenticator::pair(manager.as_ref(), &pin, &client_id)
+            .expect("pin pairs intended client");
+    }
+
+    #[tokio::test]
+    async fn test_pair_page_is_not_served_to_non_local_peers() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(WebAssetCache::new(Some(temp_dir.path.clone())));
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            temp_dir.path.clone(),
+        )));
+        let client_id = ClientId::new("browser-a").unwrap();
+        let challenge = manager
+            .request_pairing_challenge(&client_id)
+            .expect("request pairing challenge");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/pair?device_code={}", challenge.device_code))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), false)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
     }
 }

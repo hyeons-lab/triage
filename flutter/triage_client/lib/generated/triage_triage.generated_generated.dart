@@ -3,35 +3,8 @@
 
 library triage.generated;
 
-import 'dart:typed_data' show Endian, Uint8List;
+import 'dart:typed_data' show Uint8List;
 import 'package:flat_buffers/flat_buffers.dart' as fb;
-
-// dart2js does not support ByteData.getUint64; generated uint64 getters route here.
-int _vTableGetUint64(
-  fb.BufferContext object,
-  int offset,
-  int field,
-  int defaultValue,
-) {
-  final buffer = object.buffer;
-  final vTableSOffset = buffer.getInt32(offset, Endian.little);
-  final vTableOffset = offset - vTableSOffset;
-  final vTableSize = buffer.getUint16(vTableOffset, Endian.little);
-  if (field >= vTableSize) return defaultValue;
-
-  final fieldOffset = buffer.getUint16(vTableOffset + field, Endian.little);
-  if (fieldOffset == 0) return defaultValue;
-
-  final valueOffset = offset + fieldOffset;
-  final low = buffer.getUint32(valueOffset, Endian.little);
-  final high = buffer.getUint32(valueOffset + 4, Endian.little);
-  if (high > 0x1fffff) {
-    throw UnsupportedError(
-      'uint64 value exceeds the JavaScript safe integer range',
-    );
-  }
-  return high * 0x100000000 + low;
-}
 
 enum AttachMode {
   Observer(0),
@@ -166,7 +139,8 @@ enum ClientRequestPayloadTypeId {
   RestoreSessionRequestTable(11),
   SnapshotSessionRequest(12),
   StyledRowsRequestTable(13),
-  ShutdownSessionRequest(14);
+  ShutdownSessionRequest(14),
+  PairingChallengeRequest(15);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -203,6 +177,8 @@ enum ClientRequestPayloadTypeId {
         return ClientRequestPayloadTypeId.StyledRowsRequestTable;
       case 14:
         return ClientRequestPayloadTypeId.ShutdownSessionRequest;
+      case 15:
+        return ClientRequestPayloadTypeId.PairingChallengeRequest;
       default:
         throw StateError('Invalid value $value for bit flag enum');
     }
@@ -212,7 +188,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 14;
+  static const int maxValue = 15;
   static const fb.Reader<ClientRequestPayloadTypeId> reader =
       _ClientRequestPayloadTypeIdReader();
 }
@@ -243,7 +219,8 @@ enum ServerResultPayloadTypeId {
   LeaseChangeResult(8),
   SessionSnapshotResult(9),
   StyledRowsResult(10),
-  CompletedSessionResult(11);
+  CompletedSessionResult(11),
+  PairingChallengeResult(12);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
@@ -274,6 +251,8 @@ enum ServerResultPayloadTypeId {
         return ServerResultPayloadTypeId.StyledRowsResult;
       case 11:
         return ServerResultPayloadTypeId.CompletedSessionResult;
+      case 12:
+        return ServerResultPayloadTypeId.PairingChallengeResult;
       default:
         throw StateError('Invalid value $value for bit flag enum');
     }
@@ -283,7 +262,7 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 11;
+  static const int maxValue = 12;
   static const fb.Reader<ServerResultPayloadTypeId> reader =
       _ServerResultPayloadTypeIdReader();
 }
@@ -423,6 +402,50 @@ class SessionSize {
   String toString() {
     return 'SessionSize{rows: ${rows}, cols: ${cols}, pixelWidth: ${pixelWidth}, pixelHeight: ${pixelHeight}, dpi: ${dpi}}';
   }
+
+  SessionSizeT unpack() => SessionSizeT(
+    rows: rows,
+    cols: cols,
+    pixelWidth: pixelWidth,
+    pixelHeight: pixelHeight,
+    dpi: dpi,
+  );
+
+  static int pack(fb.Builder fbBuilder, SessionSizeT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SessionSizeT implements fb.Packable {
+  int rows;
+  int cols;
+  int pixelWidth;
+  int pixelHeight;
+  int dpi;
+
+  SessionSizeT({
+    required this.rows,
+    required this.cols,
+    required this.pixelWidth,
+    required this.pixelHeight,
+    required this.dpi,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    fbBuilder.putUint32(dpi);
+    fbBuilder.putUint32(pixelHeight);
+    fbBuilder.putUint32(pixelWidth);
+    fbBuilder.putUint32(cols);
+    fbBuilder.putUint32(rows);
+    return fbBuilder.offset;
+  }
+
+  @override
+  String toString() {
+    return 'SessionSizeT{rows: ${rows}, cols: ${cols}, pixelWidth: ${pixelWidth}, pixelHeight: ${pixelHeight}, dpi: ${dpi}}';
+  }
 }
 
 class _SessionSizeReader extends fb.StructReader<SessionSize> {
@@ -506,6 +529,40 @@ class TerminalCursor {
   String toString() {
     return 'TerminalCursor{row: ${row}, col: ${col}, visible: ${visible}}';
   }
+
+  TerminalCursorT unpack() =>
+      TerminalCursorT(row: row, col: col, visible: visible);
+
+  static int pack(fb.Builder fbBuilder, TerminalCursorT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class TerminalCursorT implements fb.Packable {
+  int row;
+  int col;
+  bool visible;
+
+  TerminalCursorT({
+    required this.row,
+    required this.col,
+    required this.visible,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    fbBuilder.pad(3);
+    fbBuilder.putBool(visible);
+    fbBuilder.putUint32(col);
+    fbBuilder.putUint32(row);
+    return fbBuilder.offset;
+  }
+
+  @override
+  String toString() {
+    return 'TerminalCursorT{row: ${row}, col: ${col}, visible: ${visible}}';
+  }
 }
 
 class _TerminalCursorReader extends fb.StructReader<TerminalCursor> {
@@ -580,6 +637,34 @@ class TerminalColor {
   @override
   String toString() {
     return 'TerminalColor{red: ${red}, green: ${green}, blue: ${blue}}';
+  }
+
+  TerminalColorT unpack() => TerminalColorT(red: red, green: green, blue: blue);
+
+  static int pack(fb.Builder fbBuilder, TerminalColorT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class TerminalColorT implements fb.Packable {
+  int red;
+  int green;
+  int blue;
+
+  TerminalColorT({required this.red, required this.green, required this.blue});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    fbBuilder.putUint8(blue);
+    fbBuilder.putUint8(green);
+    fbBuilder.putUint8(red);
+    return fbBuilder.offset;
+  }
+
+  @override
+  String toString() {
+    return 'TerminalColorT{red: ${red}, green: ${green}, blue: ${blue}}';
   }
 }
 
@@ -659,6 +744,66 @@ class TerminalStyle {
   @override
   String toString() {
     return 'TerminalStyle{foreground: ${foreground}, hasForeground: ${hasForeground}, background: ${background}, hasBackground: ${hasBackground}, bold: ${bold}, dim: ${dim}, italic: ${italic}, underline: ${underline}, reverse: ${reverse}}';
+  }
+
+  TerminalStyleT unpack() => TerminalStyleT(
+    foreground: foreground.unpack(),
+    hasForeground: hasForeground,
+    background: background.unpack(),
+    hasBackground: hasBackground,
+    bold: bold,
+    dim: dim,
+    italic: italic,
+    underline: underline,
+    reverse: reverse,
+  );
+
+  static int pack(fb.Builder fbBuilder, TerminalStyleT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class TerminalStyleT implements fb.Packable {
+  TerminalColorT foreground;
+  bool hasForeground;
+  TerminalColorT background;
+  bool hasBackground;
+  bool bold;
+  bool dim;
+  bool italic;
+  bool underline;
+  bool reverse;
+
+  TerminalStyleT({
+    required this.foreground,
+    required this.hasForeground,
+    required this.background,
+    required this.hasBackground,
+    required this.bold,
+    required this.dim,
+    required this.italic,
+    required this.underline,
+    required this.reverse,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    fbBuilder.putBool(reverse);
+    fbBuilder.putBool(underline);
+    fbBuilder.putBool(italic);
+    fbBuilder.putBool(dim);
+    fbBuilder.putBool(bold);
+    fbBuilder.putBool(hasBackground);
+    background.pack(fbBuilder);
+    fbBuilder.putBool(hasForeground);
+    foreground.pack(fbBuilder);
+    return fbBuilder.offset;
+  }
+
+  @override
+  String toString() {
+    return 'TerminalStyleT{foreground: ${foreground}, hasForeground: ${hasForeground}, background: ${background}, hasBackground: ${hasBackground}, bold: ${bold}, dim: ${dim}, italic: ${italic}, underline: ${underline}, reverse: ${reverse}}';
   }
 }
 
@@ -778,6 +923,36 @@ class StyledSpan {
   String toString() {
     return 'StyledSpan{text: ${text}, style: ${style}}';
   }
+
+  StyledSpanT unpack() => StyledSpanT(text: text, style: style?.unpack());
+
+  static int pack(fb.Builder fbBuilder, StyledSpanT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class StyledSpanT implements fb.Packable {
+  String? text;
+  TerminalStyleT? style;
+
+  StyledSpanT({this.text, this.style});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? textOffset = text == null ? null : fbBuilder.writeString(text!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, textOffset);
+    if (style != null) {
+      fbBuilder.addStruct(1, style!.pack(fbBuilder));
+    }
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'StyledSpanT{text: ${text}, style: ${style}}';
+  }
 }
 
 class _StyledSpanReader extends fb.TableReader<StyledSpan> {
@@ -863,6 +1038,35 @@ class StyledRow {
   String toString() {
     return 'StyledRow{spans: ${spans}}';
   }
+
+  StyledRowT unpack() =>
+      StyledRowT(spans: spans?.map((e) => e.unpack()).toList());
+
+  static int pack(fb.Builder fbBuilder, StyledRowT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class StyledRowT implements fb.Packable {
+  List<StyledSpanT>? spans;
+
+  StyledRowT({this.spans});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? spansOffset = spans == null
+        ? null
+        : fbBuilder.writeList(spans!.map((b) => b.pack(fbBuilder)).toList());
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, spansOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'StyledRowT{spans: ${spans}}';
+  }
 }
 
 class _StyledRowReader extends fb.TableReader<StyledRow> {
@@ -942,6 +1146,48 @@ class SessionContext {
   @override
   String toString() {
     return 'SessionContext{repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
+  }
+
+  SessionContextT unpack() => SessionContextT(
+    repositoryRoot: repositoryRoot,
+    worktreeRoot: worktreeRoot,
+    branch: branch,
+  );
+
+  static int pack(fb.Builder fbBuilder, SessionContextT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SessionContextT implements fb.Packable {
+  String? repositoryRoot;
+  String? worktreeRoot;
+  String? branch;
+
+  SessionContextT({this.repositoryRoot, this.worktreeRoot, this.branch});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? repositoryRootOffset = repositoryRoot == null
+        ? null
+        : fbBuilder.writeString(repositoryRoot!);
+    final int? worktreeRootOffset = worktreeRoot == null
+        ? null
+        : fbBuilder.writeString(worktreeRoot!);
+    final int? branchOffset = branch == null
+        ? null
+        : fbBuilder.writeString(branch!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, repositoryRootOffset);
+    fbBuilder.addOffset(1, worktreeRootOffset);
+    fbBuilder.addOffset(2, branchOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SessionContextT{repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
   }
 }
 
@@ -1035,8 +1281,9 @@ class SessionSnapshot {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 4, 0);
-  int get bytesLogged => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
+  int get bytesLogged =>
+      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
   SessionSize? get size =>
       SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 8);
   List<String>? get visibleRows => const fb.ListReader<String>(
@@ -1060,6 +1307,91 @@ class SessionSnapshot {
   @override
   String toString() {
     return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}}';
+  }
+
+  SessionSnapshotT unpack() => SessionSnapshotT(
+    outputSeq: outputSeq,
+    bytesLogged: bytesLogged,
+    size: size?.unpack(),
+    visibleRows: visibleRows?.toList(),
+    styledRowsStart: styledRowsStart,
+    styledRows: styledRows?.map((e) => e.unpack()).toList(),
+    cursor: cursor?.unpack(),
+    currentWorkingDirectory: currentWorkingDirectory,
+    context: context?.unpack(),
+    bracketedPasteEnabled: bracketedPasteEnabled,
+    exited: exited,
+  );
+
+  static int pack(fb.Builder fbBuilder, SessionSnapshotT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SessionSnapshotT implements fb.Packable {
+  int outputSeq;
+  int bytesLogged;
+  SessionSizeT? size;
+  List<String>? visibleRows;
+  int styledRowsStart;
+  List<StyledRowT>? styledRows;
+  TerminalCursorT? cursor;
+  String? currentWorkingDirectory;
+  SessionContextT? context;
+  bool bracketedPasteEnabled;
+  bool exited;
+
+  SessionSnapshotT({
+    this.outputSeq = 0,
+    this.bytesLogged = 0,
+    this.size,
+    this.visibleRows,
+    this.styledRowsStart = 0,
+    this.styledRows,
+    this.cursor,
+    this.currentWorkingDirectory,
+    this.context,
+    this.bracketedPasteEnabled = false,
+    this.exited = false,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? visibleRowsOffset = visibleRows == null
+        ? null
+        : fbBuilder.writeList(visibleRows!.map(fbBuilder.writeString).toList());
+    final int? styledRowsOffset = styledRows == null
+        ? null
+        : fbBuilder.writeList(
+            styledRows!.map((b) => b.pack(fbBuilder)).toList(),
+          );
+    final int? currentWorkingDirectoryOffset = currentWorkingDirectory == null
+        ? null
+        : fbBuilder.writeString(currentWorkingDirectory!);
+    final int? contextOffset = context?.pack(fbBuilder);
+    fbBuilder.startTable(11);
+    fbBuilder.addUint64(0, outputSeq);
+    fbBuilder.addUint64(1, bytesLogged);
+    if (size != null) {
+      fbBuilder.addStruct(2, size!.pack(fbBuilder));
+    }
+    fbBuilder.addOffset(3, visibleRowsOffset);
+    fbBuilder.addUint32(4, styledRowsStart);
+    fbBuilder.addOffset(5, styledRowsOffset);
+    if (cursor != null) {
+      fbBuilder.addStruct(6, cursor!.pack(fbBuilder));
+    }
+    fbBuilder.addOffset(7, currentWorkingDirectoryOffset);
+    fbBuilder.addOffset(8, contextOffset);
+    fbBuilder.addBool(9, bracketedPasteEnabled);
+    fbBuilder.addBool(10, exited);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SessionSnapshotT{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}}';
   }
 }
 
@@ -1234,8 +1566,9 @@ class CompletedSession {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 4, 0);
-  int get bytesLogged => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
+  int get bytesLogged =>
+      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
   List<String>? get visibleRows => const fb.ListReader<String>(
     fb.StringReader(),
   ).vTableGetNullable(_bc, _bcOffset, 8);
@@ -1243,6 +1576,46 @@ class CompletedSession {
   @override
   String toString() {
     return 'CompletedSession{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, visibleRows: ${visibleRows}}';
+  }
+
+  CompletedSessionT unpack() => CompletedSessionT(
+    outputSeq: outputSeq,
+    bytesLogged: bytesLogged,
+    visibleRows: visibleRows?.toList(),
+  );
+
+  static int pack(fb.Builder fbBuilder, CompletedSessionT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class CompletedSessionT implements fb.Packable {
+  int outputSeq;
+  int bytesLogged;
+  List<String>? visibleRows;
+
+  CompletedSessionT({
+    this.outputSeq = 0,
+    this.bytesLogged = 0,
+    this.visibleRows,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? visibleRowsOffset = visibleRows == null
+        ? null
+        : fbBuilder.writeList(visibleRows!.map(fbBuilder.writeString).toList());
+    fbBuilder.startTable(3);
+    fbBuilder.addUint64(0, outputSeq);
+    fbBuilder.addUint64(1, bytesLogged);
+    fbBuilder.addOffset(2, visibleRowsOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'CompletedSessionT{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, visibleRows: ${visibleRows}}';
   }
 }
 
@@ -1342,6 +1715,40 @@ class InputLeaseHolder {
   String toString() {
     return 'InputLeaseHolder{clientId: ${clientId}, kind: ${kind}}';
   }
+
+  InputLeaseHolderT unpack() =>
+      InputLeaseHolderT(clientId: clientId, kind: kind);
+
+  static int pack(fb.Builder fbBuilder, InputLeaseHolderT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class InputLeaseHolderT implements fb.Packable {
+  String? clientId;
+  InputControllerKind kind;
+
+  InputLeaseHolderT({
+    this.clientId,
+    this.kind = InputControllerKind.Interactive,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, clientIdOffset);
+    fbBuilder.addInt8(1, kind.value);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'InputLeaseHolderT{clientId: ${clientId}, kind: ${kind}}';
+  }
 }
 
 class _InputLeaseHolderReader extends fb.TableReader<InputLeaseHolder> {
@@ -1419,11 +1826,40 @@ class InputLeaseState {
 
   InputLeaseHolder? get holder =>
       InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 4);
-  int get generation => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
     return 'InputLeaseState{holder: ${holder}, generation: ${generation}}';
+  }
+
+  InputLeaseStateT unpack() =>
+      InputLeaseStateT(holder: holder?.unpack(), generation: generation);
+
+  static int pack(fb.Builder fbBuilder, InputLeaseStateT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class InputLeaseStateT implements fb.Packable {
+  InputLeaseHolderT? holder;
+  int generation;
+
+  InputLeaseStateT({this.holder, this.generation = 0});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? holderOffset = holder?.pack(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, holderOffset);
+    fbBuilder.addUint64(1, generation);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'InputLeaseStateT{holder: ${holder}, generation: ${generation}}';
   }
 }
 
@@ -1500,7 +1936,7 @@ class LeaseChange {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get generation => _vTableGetUint64(_bc, _bcOffset, 4, 0);
+  int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
   InputLeaseHolder? get previous =>
       InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 6);
   InputLeaseHolder? get current =>
@@ -1512,6 +1948,49 @@ class LeaseChange {
   @override
   String toString() {
     return 'LeaseChange{generation: ${generation}, previous: ${previous}, current: ${current}, action: ${action}}';
+  }
+
+  LeaseChangeT unpack() => LeaseChangeT(
+    generation: generation,
+    previous: previous?.unpack(),
+    current: current?.unpack(),
+    action: action,
+  );
+
+  static int pack(fb.Builder fbBuilder, LeaseChangeT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class LeaseChangeT implements fb.Packable {
+  int generation;
+  InputLeaseHolderT? previous;
+  InputLeaseHolderT? current;
+  LeaseChangeAction action;
+
+  LeaseChangeT({
+    this.generation = 0,
+    this.previous,
+    this.current,
+    this.action = LeaseChangeAction.Acquired,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? previousOffset = previous?.pack(fbBuilder);
+    final int? currentOffset = current?.pack(fbBuilder);
+    fbBuilder.startTable(4);
+    fbBuilder.addUint64(0, generation);
+    fbBuilder.addOffset(1, previousOffset);
+    fbBuilder.addOffset(2, currentOffset);
+    fbBuilder.addInt8(3, action.value);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'LeaseChangeT{generation: ${generation}, previous: ${previous}, current: ${current}, action: ${action}}';
   }
 }
 
@@ -1617,6 +2096,38 @@ class AttachSessionResponse {
   String toString() {
     return 'AttachSessionResponse{snapshot: ${snapshot}, lease: ${lease}}';
   }
+
+  AttachSessionResponseT unpack() => AttachSessionResponseT(
+    snapshot: snapshot?.unpack(),
+    lease: lease?.unpack(),
+  );
+
+  static int pack(fb.Builder fbBuilder, AttachSessionResponseT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class AttachSessionResponseT implements fb.Packable {
+  SessionSnapshotT? snapshot;
+  InputLeaseStateT? lease;
+
+  AttachSessionResponseT({this.snapshot, this.lease});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? snapshotOffset = snapshot?.pack(fbBuilder);
+    final int? leaseOffset = lease?.pack(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, snapshotOffset);
+    fbBuilder.addOffset(1, leaseOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'AttachSessionResponseT{snapshot: ${snapshot}, lease: ${lease}}';
+  }
 }
 
 class _AttachSessionResponseReader
@@ -1695,7 +2206,7 @@ class StyledRowsResponse {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 4, 0);
+  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
   int get start => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 6, 0);
   List<StyledRow>? get rows => const fb.ListReader<StyledRow>(
     StyledRow.reader,
@@ -1704,6 +2215,42 @@ class StyledRowsResponse {
   @override
   String toString() {
     return 'StyledRowsResponse{outputSeq: ${outputSeq}, start: ${start}, rows: ${rows}}';
+  }
+
+  StyledRowsResponseT unpack() => StyledRowsResponseT(
+    outputSeq: outputSeq,
+    start: start,
+    rows: rows?.map((e) => e.unpack()).toList(),
+  );
+
+  static int pack(fb.Builder fbBuilder, StyledRowsResponseT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class StyledRowsResponseT implements fb.Packable {
+  int outputSeq;
+  int start;
+  List<StyledRowT>? rows;
+
+  StyledRowsResponseT({this.outputSeq = 0, this.start = 0, this.rows});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? rowsOffset = rows == null
+        ? null
+        : fbBuilder.writeList(rows!.map((b) => b.pack(fbBuilder)).toList());
+    fbBuilder.startTable(3);
+    fbBuilder.addUint64(0, outputSeq);
+    fbBuilder.addUint32(1, start);
+    fbBuilder.addOffset(2, rowsOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'StyledRowsResponseT{outputSeq: ${outputSeq}, start: ${start}, rows: ${rows}}';
   }
 }
 
@@ -1802,6 +2349,39 @@ class HelloRequest {
   String toString() {
     return 'HelloRequest{clientId: ${clientId}, token: ${token}}';
   }
+
+  HelloRequestT unpack() => HelloRequestT(clientId: clientId, token: token);
+
+  static int pack(fb.Builder fbBuilder, HelloRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class HelloRequestT implements fb.Packable {
+  String? clientId;
+  String? token;
+
+  HelloRequestT({this.clientId, this.token});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    final int? tokenOffset = token == null
+        ? null
+        : fbBuilder.writeString(token!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, clientIdOffset);
+    fbBuilder.addOffset(1, tokenOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'HelloRequestT{clientId: ${clientId}, token: ${token}}';
+  }
 }
 
 class _HelloRequestReader extends fb.TableReader<HelloRequest> {
@@ -1889,6 +2469,37 @@ class PairRequest {
   String toString() {
     return 'PairRequest{code: ${code}, clientId: ${clientId}}';
   }
+
+  PairRequestT unpack() => PairRequestT(code: code, clientId: clientId);
+
+  static int pack(fb.Builder fbBuilder, PairRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class PairRequestT implements fb.Packable {
+  String? code;
+  String? clientId;
+
+  PairRequestT({this.code, this.clientId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? codeOffset = code == null ? null : fbBuilder.writeString(code!);
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, codeOffset);
+    fbBuilder.addOffset(1, clientIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'PairRequestT{code: ${code}, clientId: ${clientId}}';
+  }
 }
 
 class _PairRequestReader extends fb.TableReader<PairRequest> {
@@ -1955,6 +2566,111 @@ class PairRequestObjectBuilder extends fb.ObjectBuilder {
   }
 }
 
+class PairingChallengeRequest {
+  PairingChallengeRequest._(this._bc, this._bcOffset);
+  factory PairingChallengeRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<PairingChallengeRequest> reader =
+      _PairingChallengeRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get clientId =>
+      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'PairingChallengeRequest{clientId: ${clientId}}';
+  }
+
+  PairingChallengeRequestT unpack() =>
+      PairingChallengeRequestT(clientId: clientId);
+
+  static int pack(fb.Builder fbBuilder, PairingChallengeRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class PairingChallengeRequestT implements fb.Packable {
+  String? clientId;
+
+  PairingChallengeRequestT({this.clientId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, clientIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'PairingChallengeRequestT{clientId: ${clientId}}';
+  }
+}
+
+class _PairingChallengeRequestReader
+    extends fb.TableReader<PairingChallengeRequest> {
+  const _PairingChallengeRequestReader();
+
+  @override
+  PairingChallengeRequest createObject(fb.BufferContext bc, int offset) =>
+      PairingChallengeRequest._(bc, offset);
+}
+
+class PairingChallengeRequestBuilder {
+  PairingChallengeRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addClientIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class PairingChallengeRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _clientId;
+
+  PairingChallengeRequestObjectBuilder({String? clientId})
+    : _clientId = clientId;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? clientIdOffset = _clientId == null
+        ? null
+        : fbBuilder.writeString(_clientId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, clientIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+
 class ListSessionsRequest {
   ListSessionsRequest._(this._bc, this._bcOffset);
   factory ListSessionsRequest(List<int> bytes) {
@@ -1971,6 +2687,26 @@ class ListSessionsRequest {
   @override
   String toString() {
     return 'ListSessionsRequest{}';
+  }
+
+  ListSessionsRequestT unpack() => ListSessionsRequestT();
+
+  static int pack(fb.Builder fbBuilder, ListSessionsRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ListSessionsRequestT implements fb.Packable {
+  @override
+  int pack(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ListSessionsRequestT{}';
   }
 }
 
@@ -2027,6 +2763,51 @@ class StartSessionRequestTable {
   @override
   String toString() {
     return 'StartSessionRequestTable{command: ${command}, args: ${args}, cwd: ${cwd}, size: ${size}}';
+  }
+
+  StartSessionRequestTableT unpack() => StartSessionRequestTableT(
+    command: command,
+    args: args?.toList(),
+    cwd: cwd,
+    size: size?.unpack(),
+  );
+
+  static int pack(fb.Builder fbBuilder, StartSessionRequestTableT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class StartSessionRequestTableT implements fb.Packable {
+  String? command;
+  List<String>? args;
+  String? cwd;
+  SessionSizeT? size;
+
+  StartSessionRequestTableT({this.command, this.args, this.cwd, this.size});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? commandOffset = command == null
+        ? null
+        : fbBuilder.writeString(command!);
+    final int? argsOffset = args == null
+        ? null
+        : fbBuilder.writeList(args!.map(fbBuilder.writeString).toList());
+    final int? cwdOffset = cwd == null ? null : fbBuilder.writeString(cwd!);
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, commandOffset);
+    fbBuilder.addOffset(1, argsOffset);
+    fbBuilder.addOffset(2, cwdOffset);
+    if (size != null) {
+      fbBuilder.addStruct(3, size!.pack(fbBuilder));
+    }
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'StartSessionRequestTableT{command: ${command}, args: ${args}, cwd: ${cwd}, size: ${size}}';
   }
 }
 
@@ -2143,6 +2924,49 @@ class AttachSessionRequestTable {
   String toString() {
     return 'AttachSessionRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}}';
   }
+
+  AttachSessionRequestTableT unpack() => AttachSessionRequestTableT(
+    sessionId: sessionId,
+    clientId: clientId,
+    mode: mode,
+  );
+
+  static int pack(fb.Builder fbBuilder, AttachSessionRequestTableT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class AttachSessionRequestTableT implements fb.Packable {
+  String? sessionId;
+  String? clientId;
+  AttachMode mode;
+
+  AttachSessionRequestTableT({
+    this.sessionId,
+    this.clientId,
+    this.mode = AttachMode.Observer,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, clientIdOffset);
+    fbBuilder.addInt8(2, mode.value);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'AttachSessionRequestTableT{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}}';
+  }
 }
 
 class _AttachSessionRequestTableReader
@@ -2236,11 +3060,49 @@ class SubscribeSessionEventsRequestTable {
 
   String? get sessionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get afterEventSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get afterEventSeq =>
+      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
     return 'SubscribeSessionEventsRequestTable{sessionId: ${sessionId}, afterEventSeq: ${afterEventSeq}}';
+  }
+
+  SubscribeSessionEventsRequestTableT unpack() =>
+      SubscribeSessionEventsRequestTableT(
+        sessionId: sessionId,
+        afterEventSeq: afterEventSeq,
+      );
+
+  static int pack(
+    fb.Builder fbBuilder,
+    SubscribeSessionEventsRequestTableT? object,
+  ) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SubscribeSessionEventsRequestTableT implements fb.Packable {
+  String? sessionId;
+  int afterEventSeq;
+
+  SubscribeSessionEventsRequestTableT({this.sessionId, this.afterEventSeq = 0});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addUint64(1, afterEventSeq);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SubscribeSessionEventsRequestTableT{sessionId: ${sessionId}, afterEventSeq: ${afterEventSeq}}';
   }
 }
 
@@ -2334,6 +3196,49 @@ class AcquireInputLeaseRequest {
   @override
   String toString() {
     return 'AcquireInputLeaseRequest{sessionId: ${sessionId}, clientId: ${clientId}, kind: ${kind}}';
+  }
+
+  AcquireInputLeaseRequestT unpack() => AcquireInputLeaseRequestT(
+    sessionId: sessionId,
+    clientId: clientId,
+    kind: kind,
+  );
+
+  static int pack(fb.Builder fbBuilder, AcquireInputLeaseRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class AcquireInputLeaseRequestT implements fb.Packable {
+  String? sessionId;
+  String? clientId;
+  InputControllerKind kind;
+
+  AcquireInputLeaseRequestT({
+    this.sessionId,
+    this.clientId,
+    this.kind = InputControllerKind.Interactive,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, clientIdOffset);
+    fbBuilder.addInt8(2, kind.value);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'AcquireInputLeaseRequestT{sessionId: ${sessionId}, clientId: ${clientId}, kind: ${kind}}';
   }
 }
 
@@ -2435,6 +3340,40 @@ class ReleaseInputLeaseRequest {
   String toString() {
     return 'ReleaseInputLeaseRequest{sessionId: ${sessionId}, clientId: ${clientId}}';
   }
+
+  ReleaseInputLeaseRequestT unpack() =>
+      ReleaseInputLeaseRequestT(sessionId: sessionId, clientId: clientId);
+
+  static int pack(fb.Builder fbBuilder, ReleaseInputLeaseRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ReleaseInputLeaseRequestT implements fb.Packable {
+  String? sessionId;
+  String? clientId;
+
+  ReleaseInputLeaseRequestT({this.sessionId, this.clientId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, clientIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ReleaseInputLeaseRequestT{sessionId: ${sessionId}, clientId: ${clientId}}';
+  }
 }
 
 class _ReleaseInputLeaseRequestReader
@@ -2525,6 +3464,48 @@ class WriteInputRequestTable {
   @override
   String toString() {
     return 'WriteInputRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, bytes: ${bytes}}';
+  }
+
+  WriteInputRequestTableT unpack() => WriteInputRequestTableT(
+    sessionId: sessionId,
+    clientId: clientId,
+    bytes: bytes?.toList(),
+  );
+
+  static int pack(fb.Builder fbBuilder, WriteInputRequestTableT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class WriteInputRequestTableT implements fb.Packable {
+  String? sessionId;
+  String? clientId;
+  List<int>? bytes;
+
+  WriteInputRequestTableT({this.sessionId, this.clientId, this.bytes});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? clientIdOffset = clientId == null
+        ? null
+        : fbBuilder.writeString(clientId!);
+    final int? bytesOffset = bytes == null
+        ? null
+        : fbBuilder.writeListUint8(bytes!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, clientIdOffset);
+    fbBuilder.addOffset(2, bytesOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'WriteInputRequestTableT{sessionId: ${sessionId}, clientId: ${clientId}, bytes: ${bytes}}';
   }
 }
 
@@ -2629,6 +3610,39 @@ class ResizeSessionRequestTable {
   String toString() {
     return 'ResizeSessionRequestTable{sessionId: ${sessionId}, size: ${size}}';
   }
+
+  ResizeSessionRequestTableT unpack() =>
+      ResizeSessionRequestTableT(sessionId: sessionId, size: size?.unpack());
+
+  static int pack(fb.Builder fbBuilder, ResizeSessionRequestTableT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ResizeSessionRequestTableT implements fb.Packable {
+  String? sessionId;
+  SessionSizeT? size;
+
+  ResizeSessionRequestTableT({this.sessionId, this.size});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    if (size != null) {
+      fbBuilder.addStruct(1, size!.pack(fbBuilder));
+    }
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ResizeSessionRequestTableT{sessionId: ${sessionId}, size: ${size}}';
+  }
 }
 
 class _ResizeSessionRequestTableReader
@@ -2719,6 +3733,39 @@ class RestoreSessionRequestTable {
   String toString() {
     return 'RestoreSessionRequestTable{sessionId: ${sessionId}, size: ${size}}';
   }
+
+  RestoreSessionRequestTableT unpack() =>
+      RestoreSessionRequestTableT(sessionId: sessionId, size: size?.unpack());
+
+  static int pack(fb.Builder fbBuilder, RestoreSessionRequestTableT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class RestoreSessionRequestTableT implements fb.Packable {
+  String? sessionId;
+  SessionSizeT? size;
+
+  RestoreSessionRequestTableT({this.sessionId, this.size});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    if (size != null) {
+      fbBuilder.addStruct(1, size!.pack(fbBuilder));
+    }
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'RestoreSessionRequestTableT{sessionId: ${sessionId}, size: ${size}}';
+  }
 }
 
 class _RestoreSessionRequestTableReader
@@ -2807,6 +3854,35 @@ class SnapshotSessionRequest {
   String toString() {
     return 'SnapshotSessionRequest{sessionId: ${sessionId}}';
   }
+
+  SnapshotSessionRequestT unpack() =>
+      SnapshotSessionRequestT(sessionId: sessionId);
+
+  static int pack(fb.Builder fbBuilder, SnapshotSessionRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SnapshotSessionRequestT implements fb.Packable {
+  String? sessionId;
+
+  SnapshotSessionRequestT({this.sessionId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SnapshotSessionRequestT{sessionId: ${sessionId}}';
+  }
 }
 
 class _SnapshotSessionRequestReader
@@ -2884,6 +3960,39 @@ class StyledRowsRequestTable {
   @override
   String toString() {
     return 'StyledRowsRequestTable{sessionId: ${sessionId}, start: ${start}, end: ${end}}';
+  }
+
+  StyledRowsRequestTableT unpack() =>
+      StyledRowsRequestTableT(sessionId: sessionId, start: start, end: end);
+
+  static int pack(fb.Builder fbBuilder, StyledRowsRequestTableT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class StyledRowsRequestTableT implements fb.Packable {
+  String? sessionId;
+  int start;
+  int end;
+
+  StyledRowsRequestTableT({this.sessionId, this.start = 0, this.end = 0});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addUint32(1, start);
+    fbBuilder.addUint32(2, end);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'StyledRowsRequestTableT{sessionId: ${sessionId}, start: ${start}, end: ${end}}';
   }
 }
 
@@ -2976,6 +4085,35 @@ class ShutdownSessionRequest {
   @override
   String toString() {
     return 'ShutdownSessionRequest{sessionId: ${sessionId}}';
+  }
+
+  ShutdownSessionRequestT unpack() =>
+      ShutdownSessionRequestT(sessionId: sessionId);
+
+  static int pack(fb.Builder fbBuilder, ShutdownSessionRequestT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ShutdownSessionRequestT implements fb.Packable {
+  String? sessionId;
+
+  ShutdownSessionRequestT({this.sessionId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ShutdownSessionRequestT{sessionId: ${sessionId}}';
   }
 }
 
@@ -3125,6 +4263,12 @@ class ClientMessage {
           _bcOffset,
           8,
         );
+      case 15:
+        return PairingChallengeRequest.reader.vTableGetNullable(
+          _bc,
+          _bcOffset,
+          8,
+        );
       default:
         return null;
     }
@@ -3133,6 +4277,41 @@ class ClientMessage {
   @override
   String toString() {
     return 'ClientMessage{id: ${id}, payloadType: ${payloadType}, payload: ${payload}}';
+  }
+
+  ClientMessageT unpack() => ClientMessageT(
+    id: id,
+    payloadType: payloadType,
+    payload: payload?.unpack(),
+  );
+
+  static int pack(fb.Builder fbBuilder, ClientMessageT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ClientMessageT implements fb.Packable {
+  String? id;
+  ClientRequestPayloadTypeId? payloadType;
+  dynamic payload;
+
+  ClientMessageT({this.id, this.payloadType, this.payload});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? idOffset = id == null ? null : fbBuilder.writeString(id!);
+    final int? payloadOffset = payload?.pack(fbBuilder);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, idOffset);
+    fbBuilder.addUint8(1, payloadType?.value);
+    fbBuilder.addOffset(2, payloadOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ClientMessageT{id: ${id}, payloadType: ${payloadType}, payload: ${payload}}';
   }
 }
 
@@ -3223,6 +4402,26 @@ class UnitResult {
   String toString() {
     return 'UnitResult{}';
   }
+
+  UnitResultT unpack() => UnitResultT();
+
+  static int pack(fb.Builder fbBuilder, UnitResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class UnitResultT implements fb.Packable {
+  @override
+  int pack(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'UnitResultT{}';
+  }
 }
 
 class _UnitResultReader extends fb.TableReader<UnitResult> {
@@ -3272,6 +4471,39 @@ class HelloResult {
   @override
   String toString() {
     return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}}';
+  }
+
+  HelloResultT unpack() => HelloResultT(
+    protocolVersion: protocolVersion,
+    authenticated: authenticated,
+  );
+
+  static int pack(fb.Builder fbBuilder, HelloResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class HelloResultT implements fb.Packable {
+  String? protocolVersion;
+  bool authenticated;
+
+  HelloResultT({this.protocolVersion, this.authenticated = false});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? protocolVersionOffset = protocolVersion == null
+        ? null
+        : fbBuilder.writeString(protocolVersion!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, protocolVersionOffset);
+    fbBuilder.addBool(1, authenticated);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'HelloResultT{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}}';
   }
 }
 
@@ -3355,6 +4587,34 @@ class PairedResult {
   String toString() {
     return 'PairedResult{token: ${token}}';
   }
+
+  PairedResultT unpack() => PairedResultT(token: token);
+
+  static int pack(fb.Builder fbBuilder, PairedResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class PairedResultT implements fb.Packable {
+  String? token;
+
+  PairedResultT({this.token});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? tokenOffset = token == null
+        ? null
+        : fbBuilder.writeString(token!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, tokenOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'PairedResultT{token: ${token}}';
+  }
 }
 
 class _PairedResultReader extends fb.TableReader<PairedResult> {
@@ -3409,6 +4669,122 @@ class PairedResultObjectBuilder extends fb.ObjectBuilder {
   }
 }
 
+class PairingChallengeResult {
+  PairingChallengeResult._(this._bc, this._bcOffset);
+  factory PairingChallengeResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<PairingChallengeResult> reader =
+      _PairingChallengeResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get deviceCode =>
+      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  int get expiresAt => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+
+  @override
+  String toString() {
+    return 'PairingChallengeResult{deviceCode: ${deviceCode}, expiresAt: ${expiresAt}}';
+  }
+
+  PairingChallengeResultT unpack() =>
+      PairingChallengeResultT(deviceCode: deviceCode, expiresAt: expiresAt);
+
+  static int pack(fb.Builder fbBuilder, PairingChallengeResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class PairingChallengeResultT implements fb.Packable {
+  String? deviceCode;
+  int expiresAt;
+
+  PairingChallengeResultT({this.deviceCode, this.expiresAt = 0});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? deviceCodeOffset = deviceCode == null
+        ? null
+        : fbBuilder.writeString(deviceCode!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, deviceCodeOffset);
+    fbBuilder.addUint64(1, expiresAt);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'PairingChallengeResultT{deviceCode: ${deviceCode}, expiresAt: ${expiresAt}}';
+  }
+}
+
+class _PairingChallengeResultReader
+    extends fb.TableReader<PairingChallengeResult> {
+  const _PairingChallengeResultReader();
+
+  @override
+  PairingChallengeResult createObject(fb.BufferContext bc, int offset) =>
+      PairingChallengeResult._(bc, offset);
+}
+
+class PairingChallengeResultBuilder {
+  PairingChallengeResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addDeviceCodeOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int addExpiresAt(int? expiresAt) {
+    fbBuilder.addUint64(1, expiresAt);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class PairingChallengeResultObjectBuilder extends fb.ObjectBuilder {
+  final String? _deviceCode;
+  final int? _expiresAt;
+
+  PairingChallengeResultObjectBuilder({String? deviceCode, int? expiresAt})
+    : _deviceCode = deviceCode,
+      _expiresAt = expiresAt;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? deviceCodeOffset = _deviceCode == null
+        ? null
+        : fbBuilder.writeString(_deviceCode!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, deviceCodeOffset);
+    fbBuilder.addUint64(1, _expiresAt);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+
 class SessionIdsResult {
   SessionIdsResult._(this._bc, this._bcOffset);
   factory SessionIdsResult(List<int> bytes) {
@@ -3428,6 +4804,35 @@ class SessionIdsResult {
   @override
   String toString() {
     return 'SessionIdsResult{sessionIds: ${sessionIds}}';
+  }
+
+  SessionIdsResultT unpack() =>
+      SessionIdsResultT(sessionIds: sessionIds?.toList());
+
+  static int pack(fb.Builder fbBuilder, SessionIdsResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SessionIdsResultT implements fb.Packable {
+  List<String>? sessionIds;
+
+  SessionIdsResultT({this.sessionIds});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdsOffset = sessionIds == null
+        ? null
+        : fbBuilder.writeList(sessionIds!.map(fbBuilder.writeString).toList());
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, sessionIdsOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SessionIdsResultT{sessionIds: ${sessionIds}}';
   }
 }
 
@@ -3503,6 +4908,34 @@ class SessionIdResult {
   String toString() {
     return 'SessionIdResult{sessionId: ${sessionId}}';
   }
+
+  SessionIdResultT unpack() => SessionIdResultT(sessionId: sessionId);
+
+  static int pack(fb.Builder fbBuilder, SessionIdResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SessionIdResultT implements fb.Packable {
+  String? sessionId;
+
+  SessionIdResultT({this.sessionId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SessionIdResultT{sessionId: ${sessionId}}';
+  }
 }
 
 class _SessionIdResultReader extends fb.TableReader<SessionIdResult> {
@@ -3577,6 +5010,33 @@ class AttachSessionResult {
   String toString() {
     return 'AttachSessionResult{response: ${response}}';
   }
+
+  AttachSessionResultT unpack() =>
+      AttachSessionResultT(response: response?.unpack());
+
+  static int pack(fb.Builder fbBuilder, AttachSessionResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class AttachSessionResultT implements fb.Packable {
+  AttachSessionResponseT? response;
+
+  AttachSessionResultT({this.response});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? responseOffset = response?.pack(fbBuilder);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, responseOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'AttachSessionResultT{response: ${response}}';
+  }
 }
 
 class _AttachSessionResultReader extends fb.TableReader<AttachSessionResult> {
@@ -3649,6 +5109,35 @@ class SubscribedResult {
   @override
   String toString() {
     return 'SubscribedResult{subscriptionId: ${subscriptionId}}';
+  }
+
+  SubscribedResultT unpack() =>
+      SubscribedResultT(subscriptionId: subscriptionId);
+
+  static int pack(fb.Builder fbBuilder, SubscribedResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SubscribedResultT implements fb.Packable {
+  String? subscriptionId;
+
+  SubscribedResultT({this.subscriptionId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? subscriptionIdOffset = subscriptionId == null
+        ? null
+        : fbBuilder.writeString(subscriptionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, subscriptionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SubscribedResultT{subscriptionId: ${subscriptionId}}';
   }
 }
 
@@ -3724,6 +5213,32 @@ class LeaseChangeResult {
   String toString() {
     return 'LeaseChangeResult{change: ${change}}';
   }
+
+  LeaseChangeResultT unpack() => LeaseChangeResultT(change: change?.unpack());
+
+  static int pack(fb.Builder fbBuilder, LeaseChangeResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class LeaseChangeResultT implements fb.Packable {
+  LeaseChangeT? change;
+
+  LeaseChangeResultT({this.change});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? changeOffset = change?.pack(fbBuilder);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, changeOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'LeaseChangeResultT{change: ${change}}';
+  }
 }
 
 class _LeaseChangeResultReader extends fb.TableReader<LeaseChangeResult> {
@@ -3796,6 +5311,33 @@ class SessionSnapshotResult {
   @override
   String toString() {
     return 'SessionSnapshotResult{snapshot: ${snapshot}}';
+  }
+
+  SessionSnapshotResultT unpack() =>
+      SessionSnapshotResultT(snapshot: snapshot?.unpack());
+
+  static int pack(fb.Builder fbBuilder, SessionSnapshotResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SessionSnapshotResultT implements fb.Packable {
+  SessionSnapshotT? snapshot;
+
+  SessionSnapshotResultT({this.snapshot});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? snapshotOffset = snapshot?.pack(fbBuilder);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, snapshotOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SessionSnapshotResultT{snapshot: ${snapshot}}';
   }
 }
 
@@ -3870,6 +5412,32 @@ class StyledRowsResult {
   String toString() {
     return 'StyledRowsResult{response: ${response}}';
   }
+
+  StyledRowsResultT unpack() => StyledRowsResultT(response: response?.unpack());
+
+  static int pack(fb.Builder fbBuilder, StyledRowsResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class StyledRowsResultT implements fb.Packable {
+  StyledRowsResponseT? response;
+
+  StyledRowsResultT({this.response});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? responseOffset = response?.pack(fbBuilder);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, responseOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'StyledRowsResultT{response: ${response}}';
+  }
 }
 
 class _StyledRowsResultReader extends fb.TableReader<StyledRowsResult> {
@@ -3942,6 +5510,33 @@ class CompletedSessionResult {
   @override
   String toString() {
     return 'CompletedSessionResult{completed: ${completed}}';
+  }
+
+  CompletedSessionResultT unpack() =>
+      CompletedSessionResultT(completed: completed?.unpack());
+
+  static int pack(fb.Builder fbBuilder, CompletedSessionResultT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class CompletedSessionResultT implements fb.Packable {
+  CompletedSessionT? completed;
+
+  CompletedSessionResultT({this.completed});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? completedOffset = completed?.pack(fbBuilder);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, completedOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'CompletedSessionResultT{completed: ${completed}}';
   }
 }
 
@@ -4048,6 +5643,12 @@ class ResponsePayload {
           _bcOffset,
           8,
         );
+      case 12:
+        return PairingChallengeResult.reader.vTableGetNullable(
+          _bc,
+          _bcOffset,
+          8,
+        );
       default:
         return null;
     }
@@ -4056,6 +5657,41 @@ class ResponsePayload {
   @override
   String toString() {
     return 'ResponsePayload{id: ${id}, resultType: ${resultType}, result: ${result}}';
+  }
+
+  ResponsePayloadT unpack() => ResponsePayloadT(
+    id: id,
+    resultType: resultType,
+    result: result?.unpack(),
+  );
+
+  static int pack(fb.Builder fbBuilder, ResponsePayloadT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ResponsePayloadT implements fb.Packable {
+  String? id;
+  ServerResultPayloadTypeId? resultType;
+  dynamic result;
+
+  ResponsePayloadT({this.id, this.resultType, this.result});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? idOffset = id == null ? null : fbBuilder.writeString(id!);
+    final int? resultOffset = result?.pack(fbBuilder);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, idOffset);
+    fbBuilder.addUint8(1, resultType?.value);
+    fbBuilder.addOffset(2, resultOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ResponsePayloadT{id: ${id}, resultType: ${resultType}, result: ${result}}';
   }
 }
 
@@ -4153,6 +5789,40 @@ class ErrorPayload {
   String toString() {
     return 'ErrorPayload{id: ${id}, code: ${code}, message: ${message}}';
   }
+
+  ErrorPayloadT unpack() => ErrorPayloadT(id: id, code: code, message: message);
+
+  static int pack(fb.Builder fbBuilder, ErrorPayloadT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ErrorPayloadT implements fb.Packable {
+  String? id;
+  String? code;
+  String? message;
+
+  ErrorPayloadT({this.id, this.code, this.message});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? idOffset = id == null ? null : fbBuilder.writeString(id!);
+    final int? codeOffset = code == null ? null : fbBuilder.writeString(code!);
+    final int? messageOffset = message == null
+        ? null
+        : fbBuilder.writeString(message!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, idOffset);
+    fbBuilder.addOffset(1, codeOffset);
+    fbBuilder.addOffset(2, messageOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ErrorPayloadT{id: ${id}, code: ${code}, message: ${message}}';
+  }
 }
 
 class _ErrorPayloadReader extends fb.TableReader<ErrorPayload> {
@@ -4243,13 +5913,55 @@ class ResyncRequiredEvent {
 
   String? get sessionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get latestEventSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get latestEventSeq =>
+      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
   SessionSnapshot? get snapshot =>
       SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'ResyncRequiredEvent{sessionId: ${sessionId}, latestEventSeq: ${latestEventSeq}, snapshot: ${snapshot}}';
+  }
+
+  ResyncRequiredEventT unpack() => ResyncRequiredEventT(
+    sessionId: sessionId,
+    latestEventSeq: latestEventSeq,
+    snapshot: snapshot?.unpack(),
+  );
+
+  static int pack(fb.Builder fbBuilder, ResyncRequiredEventT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ResyncRequiredEventT implements fb.Packable {
+  String? sessionId;
+  int latestEventSeq;
+  SessionSnapshotT? snapshot;
+
+  ResyncRequiredEventT({
+    this.sessionId,
+    this.latestEventSeq = 0,
+    this.snapshot,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? snapshotOffset = snapshot?.pack(fbBuilder);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addUint64(1, latestEventSeq);
+    fbBuilder.addOffset(2, snapshotOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ResyncRequiredEventT{sessionId: ${sessionId}, latestEventSeq: ${latestEventSeq}, snapshot: ${snapshot}}';
   }
 }
 
@@ -4340,13 +6052,52 @@ class OutputEvent {
 
   String? get sessionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get outputSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
   List<int>? get bytes =>
       const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'OutputEvent{sessionId: ${sessionId}, outputSeq: ${outputSeq}, bytes: ${bytes}}';
+  }
+
+  OutputEventT unpack() => OutputEventT(
+    sessionId: sessionId,
+    outputSeq: outputSeq,
+    bytes: bytes?.toList(),
+  );
+
+  static int pack(fb.Builder fbBuilder, OutputEventT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class OutputEventT implements fb.Packable {
+  String? sessionId;
+  int outputSeq;
+  List<int>? bytes;
+
+  OutputEventT({this.sessionId, this.outputSeq = 0, this.bytes});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? bytesOffset = bytes == null
+        ? null
+        : fbBuilder.writeListUint8(bytes!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addUint64(1, outputSeq);
+    fbBuilder.addOffset(2, bytesOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'OutputEventT{sessionId: ${sessionId}, outputSeq: ${outputSeq}, bytes: ${bytes}}';
   }
 }
 
@@ -4446,6 +6197,38 @@ class SnapshotEvent {
   String toString() {
     return 'SnapshotEvent{sessionId: ${sessionId}, snapshot: ${snapshot}}';
   }
+
+  SnapshotEventT unpack() =>
+      SnapshotEventT(sessionId: sessionId, snapshot: snapshot?.unpack());
+
+  static int pack(fb.Builder fbBuilder, SnapshotEventT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SnapshotEventT implements fb.Packable {
+  String? sessionId;
+  SessionSnapshotT? snapshot;
+
+  SnapshotEventT({this.sessionId, this.snapshot});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? snapshotOffset = snapshot?.pack(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, snapshotOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SnapshotEventT{sessionId: ${sessionId}, snapshot: ${snapshot}}';
+  }
 }
 
 class _SnapshotEventReader extends fb.TableReader<SnapshotEvent> {
@@ -4532,6 +6315,38 @@ class LeaseChangedEvent {
   @override
   String toString() {
     return 'LeaseChangedEvent{sessionId: ${sessionId}, change: ${change}}';
+  }
+
+  LeaseChangedEventT unpack() =>
+      LeaseChangedEventT(sessionId: sessionId, change: change?.unpack());
+
+  static int pack(fb.Builder fbBuilder, LeaseChangedEventT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class LeaseChangedEventT implements fb.Packable {
+  String? sessionId;
+  LeaseChangeT? change;
+
+  LeaseChangedEventT({this.sessionId, this.change});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? changeOffset = change?.pack(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, changeOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'LeaseChangedEventT{sessionId: ${sessionId}, change: ${change}}';
   }
 }
 
@@ -4620,6 +6435,38 @@ class ExitedEvent {
   String toString() {
     return 'ExitedEvent{sessionId: ${sessionId}, completed: ${completed}}';
   }
+
+  ExitedEventT unpack() =>
+      ExitedEventT(sessionId: sessionId, completed: completed?.unpack());
+
+  static int pack(fb.Builder fbBuilder, ExitedEventT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ExitedEventT implements fb.Packable {
+  String? sessionId;
+  CompletedSessionT? completed;
+
+  ExitedEventT({this.sessionId, this.completed});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = sessionId == null
+        ? null
+        : fbBuilder.writeString(sessionId!);
+    final int? completedOffset = completed?.pack(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, completedOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ExitedEventT{sessionId: ${sessionId}, completed: ${completed}}';
+  }
 }
 
 class _ExitedEventReader extends fb.TableReader<ExitedEvent> {
@@ -4700,7 +6547,7 @@ class EventPayload {
 
   String? get subscriptionId =>
       const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get eventSeq => _vTableGetUint64(_bc, _bcOffset, 6, 0);
+  int get eventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
   SessionEventPayloadTypeId? get eventType =>
       SessionEventPayloadTypeId._createOrNull(
         const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 8),
@@ -4725,6 +6572,51 @@ class EventPayload {
   @override
   String toString() {
     return 'EventPayload{subscriptionId: ${subscriptionId}, eventSeq: ${eventSeq}, eventType: ${eventType}, event: ${event}}';
+  }
+
+  EventPayloadT unpack() => EventPayloadT(
+    subscriptionId: subscriptionId,
+    eventSeq: eventSeq,
+    eventType: eventType,
+    event: event?.unpack(),
+  );
+
+  static int pack(fb.Builder fbBuilder, EventPayloadT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class EventPayloadT implements fb.Packable {
+  String? subscriptionId;
+  int eventSeq;
+  SessionEventPayloadTypeId? eventType;
+  dynamic event;
+
+  EventPayloadT({
+    this.subscriptionId,
+    this.eventSeq = 0,
+    this.eventType,
+    this.event,
+  });
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? subscriptionIdOffset = subscriptionId == null
+        ? null
+        : fbBuilder.writeString(subscriptionId!);
+    final int? eventOffset = event?.pack(fbBuilder);
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, subscriptionIdOffset);
+    fbBuilder.addUint64(1, eventSeq);
+    fbBuilder.addUint8(2, eventType?.value);
+    fbBuilder.addOffset(3, eventOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'EventPayloadT{subscriptionId: ${subscriptionId}, eventSeq: ${eventSeq}, eventType: ${eventType}, event: ${event}}';
   }
 }
 
@@ -4830,6 +6722,35 @@ class SubscriptionClosedPayload {
   String toString() {
     return 'SubscriptionClosedPayload{subscriptionId: ${subscriptionId}}';
   }
+
+  SubscriptionClosedPayloadT unpack() =>
+      SubscriptionClosedPayloadT(subscriptionId: subscriptionId);
+
+  static int pack(fb.Builder fbBuilder, SubscriptionClosedPayloadT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class SubscriptionClosedPayloadT implements fb.Packable {
+  String? subscriptionId;
+
+  SubscriptionClosedPayloadT({this.subscriptionId});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? subscriptionIdOffset = subscriptionId == null
+        ? null
+        : fbBuilder.writeString(subscriptionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, subscriptionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'SubscriptionClosedPayloadT{subscriptionId: ${subscriptionId}}';
+  }
 }
 
 class _SubscriptionClosedPayloadReader
@@ -4924,6 +6845,35 @@ class ServerMessage {
   @override
   String toString() {
     return 'ServerMessage{payloadType: ${payloadType}, payload: ${payload}}';
+  }
+
+  ServerMessageT unpack() =>
+      ServerMessageT(payloadType: payloadType, payload: payload?.unpack());
+
+  static int pack(fb.Builder fbBuilder, ServerMessageT? object) {
+    if (object == null) return 0;
+    return object.pack(fbBuilder);
+  }
+}
+
+class ServerMessageT implements fb.Packable {
+  ServerMessagePayloadTypeId? payloadType;
+  dynamic payload;
+
+  ServerMessageT({this.payloadType, this.payload});
+
+  @override
+  int pack(fb.Builder fbBuilder) {
+    final int? payloadOffset = payload?.pack(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addUint8(0, payloadType?.value);
+    fbBuilder.addOffset(1, payloadOffset);
+    return fbBuilder.endTable();
+  }
+
+  @override
+  String toString() {
+    return 'ServerMessageT{payloadType: ${payloadType}, payload: ${payload}}';
   }
 }
 

@@ -111,6 +111,10 @@ impl SessionManagerConfig {
 /// Crockford Base32 alphabet (RFC 4648 variant): excludes I, L, O, U to reduce typos.
 const CROCKFORD_BASE32_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const PAIRING_CODE_LENGTH: usize = 8;
+const PAIRING_DEVICE_CODE_TTL: Duration = Duration::from_secs(15 * 60);
+const PAIRING_PIN_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_PENDING_PAIRING_CHALLENGES: usize = 64;
+const MAX_PAIRING_CLIENT_ID_LENGTH: usize = 128;
 
 /// Normalize a user-typed pairing code per Crockford Base32 rules:
 /// strip whitespace, uppercase, and map ambiguous characters (I/L → 1, O → 0).
@@ -126,13 +130,116 @@ fn normalize_pairing_code(input: &str) -> String {
         .collect()
 }
 
+fn unix_timestamp_secs() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
+}
+
+fn random_pairing_code() -> String {
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    (0..PAIRING_CODE_LENGTH)
+        .map(|_| {
+            let idx = rng.gen_range(0..CROCKFORD_BASE32_ALPHABET.len());
+            CROCKFORD_BASE32_ALPHABET[idx] as char
+        })
+        .collect()
+}
+
+fn unique_pairing_code(challenges: &HashMap<String, PendingPairingChallenge>) -> String {
+    loop {
+        let code = random_pairing_code();
+        if !challenges.contains_key(&code) {
+            return code;
+        }
+    }
+}
+
+fn unique_pairing_pin(challenges: &HashMap<String, PendingPairingChallenge>) -> String {
+    loop {
+        let code = random_pairing_code();
+        let in_use = challenges
+            .values()
+            .filter_map(|challenge| challenge.pin.as_ref())
+            .any(|pin| pin.code == code);
+        if !in_use {
+            return code;
+        }
+    }
+}
+
+fn prune_expired_pairing_challenges(
+    challenges: &mut HashMap<String, PendingPairingChallenge>,
+    now: Instant,
+) {
+    challenges.retain(|_, challenge| {
+        if challenge.expires_at <= now {
+            return false;
+        }
+        if challenge
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.expires_at <= now)
+        {
+            challenge.pin = None;
+        }
+        true
+    });
+}
+
+fn evict_oldest_unapproved_pairing_challenge(
+    challenges: &mut HashMap<String, PendingPairingChallenge>,
+) -> bool {
+    let device_code = challenges
+        .iter()
+        .filter(|(_, challenge)| challenge.pin.is_none())
+        .min_by_key(|(_, challenge)| challenge.expires_at)
+        .map(|(device_code, _)| device_code.clone());
+
+    if let Some(device_code) = device_code {
+        challenges.remove(&device_code);
+        return true;
+    }
+
+    false
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
-    pairing_codes: Mutex<HashMap<String, Instant>>,
+    pairing_challenges: Mutex<HashMap<String, PendingPairingChallenge>>,
     paired_devices: Mutex<HashMap<ClientId, String>>,
     require_pairing: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairingChallengeInfo {
+    pub device_code: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairingPinInfo {
+    pub pin: String,
+    pub expires_at: u64,
+    pub client_id: ClientId,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPairingChallenge {
+    client_id: ClientId,
+    expires_at: Instant,
+    expires_at_unix: u64,
+    pin: Option<PendingPairingPin>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPairingPin {
+    code: String,
+    expires_at: Instant,
 }
 
 enum ManagedSession {
@@ -234,7 +341,7 @@ impl SessionManager {
             config,
             next_session: AtomicU64::new(next_session),
             sessions: Mutex::new(sessions),
-            pairing_codes: Mutex::new(HashMap::new()),
+            pairing_challenges: Mutex::new(HashMap::new()),
             paired_devices: Mutex::new(paired_devices),
             require_pairing,
         }
@@ -255,10 +362,12 @@ impl SessionManager {
             .map_err(|_| anyhow!("session manager lock poisoned"))
     }
 
-    fn pairing_codes(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Instant>>> {
-        self.pairing_codes
+    fn pairing_challenges(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, PendingPairingChallenge>>> {
+        self.pairing_challenges
             .lock()
-            .map_err(|_| anyhow!("pairing codes lock poisoned"))
+            .map_err(|_| anyhow!("pairing challenges lock poisoned"))
     }
 
     fn paired_devices(&self) -> Result<std::sync::MutexGuard<'_, HashMap<ClientId, String>>> {
@@ -302,39 +411,98 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn generate_pairing_code(&self) -> Result<String> {
-        use rand::Rng;
+    pub fn request_pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallengeInfo> {
+        ensure!(
+            client_id.as_str().len() <= MAX_PAIRING_CLIENT_ID_LENGTH,
+            "pairing client id is too long"
+        );
 
-        let mut rng = rand::thread_rng();
-        let code: String = (0..PAIRING_CODE_LENGTH)
-            .map(|_| {
-                let idx = rng.gen_range(0..CROCKFORD_BASE32_ALPHABET.len());
-                CROCKFORD_BASE32_ALPHABET[idx] as char
-            })
-            .collect();
+        let now = Instant::now();
+        let now_unix = unix_timestamp_secs()?;
+        let mut challenges = self.pairing_challenges()?;
+        prune_expired_pairing_challenges(&mut challenges, now);
 
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            + 300; // 5 minutes expiry
-
-        let mut codes = self.pairing_codes()?;
-        codes.insert(code.clone(), Instant::now() + Duration::from_secs(300));
-
-        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
-        let info = serde_json::json!({
-            "code": code,
-            "expires_at": expires_at,
-        });
-        let json = serde_json::to_vec_pretty(&info)?;
-        if let Some(parent) = pairing_code_path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some((device_code, challenge)) = challenges
+            .iter()
+            .find(|(_, challenge)| &challenge.client_id == client_id)
+        {
+            return Ok(PairingChallengeInfo {
+                device_code: device_code.clone(),
+                expires_at: challenge.expires_at_unix,
+            });
         }
-        fs::write(&pairing_code_path, json)?;
 
-        tracing::info!("generated new device pairing PIN");
+        while challenges.len() >= MAX_PENDING_PAIRING_CHALLENGES {
+            if !evict_oldest_unapproved_pairing_challenge(&mut challenges) {
+                bail!("too many pending pairing challenges");
+            }
+        }
 
-        Ok(code)
+        let device_code = unique_pairing_code(&challenges);
+        let expires_at_unix = now_unix + PAIRING_DEVICE_CODE_TTL.as_secs();
+        challenges.insert(
+            device_code.clone(),
+            PendingPairingChallenge {
+                client_id: client_id.clone(),
+                expires_at: now + PAIRING_DEVICE_CODE_TTL,
+                expires_at_unix,
+                pin: None,
+            },
+        );
+
+        tracing::info!(client_id = %client_id, "issued pairing device code");
+
+        Ok(PairingChallengeInfo {
+            device_code,
+            expires_at: expires_at_unix,
+        })
+    }
+
+    pub fn approve_pairing_device_code(&self, device_code: &str) -> Result<PairingPinInfo> {
+        let normalized = normalize_pairing_code(device_code);
+        let now = Instant::now();
+        let now_unix = unix_timestamp_secs()?;
+        let mut challenges = self.pairing_challenges()?;
+        prune_expired_pairing_challenges(&mut challenges, now);
+
+        let (pin_code, challenge_expires_at, challenge_expires_at_unix) = {
+            let challenge = challenges
+                .get(&normalized)
+                .with_context(|| "invalid or expired pairing device code")?;
+
+            if challenge.expires_at <= now {
+                bail!("pairing device code has expired");
+            }
+
+            let pin_code = match &challenge.pin {
+                Some(pin) if pin.expires_at > now => Some(pin.code.clone()),
+                _ => None,
+            };
+
+            (pin_code, challenge.expires_at, challenge.expires_at_unix)
+        };
+
+        let pin_code = pin_code.unwrap_or_else(|| unique_pairing_pin(&challenges));
+        let pin_expires_at = std::cmp::min(now + PAIRING_PIN_TTL, challenge_expires_at);
+        let pin_expires_at_unix = std::cmp::min(
+            now_unix + PAIRING_PIN_TTL.as_secs(),
+            challenge_expires_at_unix,
+        );
+        let challenge = challenges
+            .get_mut(&normalized)
+            .with_context(|| "invalid or expired pairing device code")?;
+        challenge.pin = Some(PendingPairingPin {
+            code: pin_code.clone(),
+            expires_at: pin_expires_at,
+        });
+
+        tracing::info!(client_id = %challenge.client_id, "issued pairing PIN for device code");
+
+        Ok(PairingPinInfo {
+            pin: pin_code,
+            expires_at: pin_expires_at_unix,
+            client_id: challenge.client_id.clone(),
+        })
     }
 
     #[cfg(unix)]
@@ -1120,7 +1288,6 @@ fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
 fn is_triage_default_shell_wrapper(args: &[String]) -> bool {
     matches!(args, [flag, script]
         if matches!(flag.as_str(), "-lc" | "-c")
-            && script.contains("PROMPT_COMMAND")
             && script.contains("exec \"${SHELL:-/bin/sh}\""))
 }
 
@@ -2876,22 +3043,57 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
         }
     }
 
+    fn pairing_challenge(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<triage_transport_ws::PairingChallenge> {
+        let challenge = self.request_pairing_challenge(client_id)?;
+        Ok(triage_transport_ws::PairingChallenge {
+            device_code: challenge.device_code,
+            expires_at: challenge.expires_at,
+        })
+    }
+
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
         use rand::Rng;
         use sha2::{Digest, Sha256};
 
         let normalized = normalize_pairing_code(code);
-        let mut codes = self.pairing_codes()?;
-        if let Some(expiry) = codes.get(&normalized) {
-            if Instant::now() > *expiry {
-                codes.remove(&normalized);
-                anyhow::bail!("pairing PIN has expired");
-            }
-        } else {
-            anyhow::bail!("invalid pairing PIN");
-        }
+        {
+            let now = Instant::now();
+            let mut challenges = self.pairing_challenges()?;
+            challenges.retain(|_, challenge| challenge.expires_at > now);
 
-        codes.remove(&normalized);
+            let device_code = challenges.iter().find_map(|(device_code, challenge)| {
+                let pin = challenge.pin.as_ref()?;
+                if pin.code == normalized {
+                    Some((
+                        device_code.clone(),
+                        challenge.client_id.clone(),
+                        pin.expires_at,
+                    ))
+                } else {
+                    None
+                }
+            });
+
+            let Some((device_code, paired_client_id, pin_expires_at)) = device_code else {
+                bail!("invalid pairing PIN");
+            };
+
+            if &paired_client_id != client_id {
+                bail!("pairing PIN was issued for a different device");
+            }
+
+            if pin_expires_at <= now {
+                if let Some(challenge) = challenges.get_mut(&device_code) {
+                    challenge.pin = None;
+                }
+                bail!("pairing PIN has expired");
+            }
+
+            challenges.remove(&device_code);
+        }
 
         let mut token_bytes = [0u8; 32];
         rand::thread_rng().fill(&mut token_bytes);
@@ -4886,6 +5088,205 @@ mod tests {
             log_dir,
             PathBuf::from("/tmp/home").join(".local/state/triage/sessions")
         );
+    }
+
+    #[test]
+    fn pairing_challenges_are_device_specific() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let first_client = ClientId::new("browser-a").expect("client id");
+        let second_client = ClientId::new("browser-b").expect("client id");
+
+        let first = manager
+            .request_pairing_challenge(&first_client)
+            .expect("first challenge");
+        let repeated = manager
+            .request_pairing_challenge(&first_client)
+            .expect("repeat challenge");
+        let second = manager
+            .request_pairing_challenge(&second_client)
+            .expect("second challenge");
+
+        assert_eq!(first.device_code, repeated.device_code);
+        assert_ne!(first.device_code, second.device_code);
+
+        let pin = manager
+            .approve_pairing_device_code(&first.device_code)
+            .expect("issue pin");
+        let wrong_client_result =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &second_client);
+        assert!(wrong_client_result.is_err());
+
+        let token =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &first_client)
+                .expect("pair first client");
+        assert!(
+            triage_transport_ws::WebSocketAuthenticator::authenticate(
+                &manager,
+                &first_client,
+                &token,
+            )
+            .expect("authenticate first client")
+        );
+        assert!(
+            !triage_transport_ws::WebSocketAuthenticator::authenticate(
+                &manager,
+                &second_client,
+                &token,
+            )
+            .expect("reject second client")
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn pending_pairing_challenges_evict_oldest_unapproved_at_limit() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let first_client = ClientId::new("browser-0").expect("client id");
+        let first = manager
+            .request_pairing_challenge(&first_client)
+            .expect("first challenge");
+
+        for index in 1..MAX_PENDING_PAIRING_CHALLENGES {
+            let client_id = ClientId::new(format!("browser-{index}")).expect("client id");
+            manager
+                .request_pairing_challenge(&client_id)
+                .expect("challenge within limit");
+        }
+
+        manager
+            .request_pairing_challenge(&first_client)
+            .expect("existing challenge is reused at limit");
+
+        let overflow_client = ClientId::new("overflow-browser").expect("client id");
+        let overflow = manager
+            .request_pairing_challenge(&overflow_client)
+            .expect("overflow challenge evicts oldest unapproved challenge");
+
+        let challenges = manager
+            .pairing_challenges()
+            .expect("pairing challenges lock");
+        assert_eq!(challenges.len(), MAX_PENDING_PAIRING_CHALLENGES);
+        assert!(!challenges.contains_key(&first.device_code));
+        assert!(challenges.contains_key(&overflow.device_code));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn long_pairing_client_id_is_rejected() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client_id =
+            ClientId::new("x".repeat(MAX_PAIRING_CLIENT_ID_LENGTH + 1)).expect("client id");
+
+        let error = manager
+            .request_pairing_challenge(&client_id)
+            .expect_err("long client id should fail");
+        assert!(error.to_string().contains("client id is too long"));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn pairing_pin_expiry_is_clamped_to_device_code_expiry() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client_id = ClientId::new("browser").expect("client id");
+        let challenge = manager
+            .request_pairing_challenge(&client_id)
+            .expect("challenge");
+        let challenge_expires_at_unix = unix_timestamp_secs().expect("unix timestamp") + 60;
+
+        {
+            let mut challenges = manager
+                .pairing_challenges()
+                .expect("pairing challenges lock");
+            let stored = challenges
+                .get_mut(&challenge.device_code)
+                .expect("stored challenge");
+            stored.expires_at = Instant::now() + Duration::from_secs(60);
+            stored.expires_at_unix = challenge_expires_at_unix;
+        }
+
+        let pin = manager
+            .approve_pairing_device_code(&challenge.device_code)
+            .expect("issue pin");
+
+        assert_eq!(pin.expires_at, challenge_expires_at_unix);
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn expired_pairing_pin_is_rejected_and_can_be_regenerated() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client_id = ClientId::new("browser").expect("client id");
+        let challenge = manager
+            .request_pairing_challenge(&client_id)
+            .expect("challenge");
+        let pin = manager
+            .approve_pairing_device_code(&challenge.device_code)
+            .expect("issue pin");
+
+        {
+            let mut challenges = manager
+                .pairing_challenges()
+                .expect("pairing challenges lock");
+            let challenge = challenges
+                .get_mut(&challenge.device_code)
+                .expect("stored challenge");
+            challenge.pin.as_mut().expect("stored pin").expires_at =
+                Instant::now() - Duration::from_secs(1);
+        }
+
+        let expired_result =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &client_id);
+        assert!(expired_result.is_err());
+        assert!(
+            expired_result
+                .expect_err("expired pin should fail")
+                .to_string()
+                .contains("expired")
+        );
+
+        let replacement = manager
+            .approve_pairing_device_code(&challenge.device_code)
+            .expect("regenerate pin");
+        triage_transport_ws::WebSocketAuthenticator::pair(&manager, &replacement.pin, &client_id)
+            .expect("replacement pin pairs");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn expired_pairing_challenge_is_replaced_for_same_device() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client_id = ClientId::new("browser").expect("client id");
+        let first = manager
+            .request_pairing_challenge(&client_id)
+            .expect("first challenge");
+
+        {
+            let mut challenges = manager
+                .pairing_challenges()
+                .expect("pairing challenges lock");
+            challenges
+                .get_mut(&first.device_code)
+                .expect("stored challenge")
+                .expires_at = Instant::now() - Duration::from_secs(1);
+        }
+
+        let second = manager
+            .request_pairing_challenge(&client_id)
+            .expect("replacement challenge");
+
+        assert_ne!(first.device_code, second.device_code);
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     #[test]

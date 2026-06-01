@@ -46,6 +46,7 @@ impl SubscriptionId {
 pub trait WebSocketAuthenticator {
     fn require_pairing(&self) -> bool;
     fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool>;
+    fn pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallenge>;
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String>;
 }
 
@@ -56,9 +57,18 @@ impl<T: WebSocketAuthenticator + ?Sized> WebSocketAuthenticator for std::sync::A
     fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
         (**self).authenticate(client_id, token)
     }
+    fn pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallenge> {
+        (**self).pairing_challenge(client_id)
+    }
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
         (**self).pair(code, client_id)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingChallenge {
+    pub device_code: String,
+    pub expires_at: u64,
 }
 #[derive(Debug)]
 pub enum TransportError {
@@ -86,6 +96,12 @@ impl WebSocketAuthenticator for NoopAuthenticator {
     }
     fn authenticate(&self, _client_id: &ClientId, _token: &str) -> Result<bool> {
         Ok(true)
+    }
+    fn pairing_challenge(&self, _client_id: &ClientId) -> Result<PairingChallenge> {
+        Ok(PairingChallenge {
+            device_code: "NOOPPAIR".to_string(),
+            expires_at: 0,
+        })
     }
     fn pair(&self, _code: &str, _client_id: &ClientId) -> Result<String> {
         Ok("noop-token".to_string())
@@ -223,7 +239,9 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
     fn handle_request(&mut self, request: ClientRequest) -> Result<ServerResult> {
         if self.authenticator.require_pairing() && !self.authenticated {
             match &request {
-                ClientRequest::Hello { .. } | ClientRequest::Pair { .. } => {}
+                ClientRequest::Hello { .. }
+                | ClientRequest::PairingChallenge { .. }
+                | ClientRequest::Pair { .. } => {}
                 _ => bail!(TransportError::Unauthorized),
             }
         }
@@ -247,6 +265,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
+                })
+            }
+            ClientRequest::PairingChallenge { client_id } => {
+                let challenge = self.authenticator.pairing_challenge(&client_id)?;
+                Ok(ServerResult::PairingChallenge {
+                    device_code: challenge.device_code,
+                    expires_at: challenge.expires_at,
                 })
             }
             ClientRequest::Pair { code, client_id } => {
@@ -351,6 +376,9 @@ pub enum ClientRequest {
         code: String,
         client_id: ClientId,
     },
+    PairingChallenge {
+        client_id: ClientId,
+    },
     ListSessions,
     StartSession {
         request: StartSessionRequest,
@@ -420,6 +448,10 @@ pub enum ServerResult {
     },
     Paired {
         token: String,
+    },
+    PairingChallenge {
+        device_code: String,
+        expires_at: u64,
     },
     SessionIds {
         session_ids: Vec<SessionId>,
@@ -873,6 +905,16 @@ mod tests {
         fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
             Ok(client_id == &self.client_id && token == self.paired_token)
         }
+        fn pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallenge> {
+            if client_id == &self.client_id {
+                Ok(PairingChallenge {
+                    device_code: "DEVICE01".to_string(),
+                    expires_at: 123,
+                })
+            } else {
+                anyhow::bail!("invalid_client_id")
+            }
+        }
         fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
             if code == self.pairing_code && client_id == &self.client_id {
                 Ok(self.paired_token.clone())
@@ -946,6 +988,39 @@ mod tests {
             request: ClientRequest::ListSessions,
         });
         assert!(matches!(list_response, ServerMessage::Response { .. }));
+    }
+
+    #[test]
+    fn unauthenticated_connection_can_request_pairing_challenge() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth);
+
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("challenge-req")),
+            request: ClientRequest::PairingChallenge {
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        });
+
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!("challenge-req")));
+                assert_eq!(
+                    result,
+                    ServerResult::PairingChallenge {
+                        device_code: "DEVICE01".to_string(),
+                        expires_at: 123,
+                    }
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]
@@ -1064,6 +1139,60 @@ mod tests {
         let hello = resp.result_as_hello_result().unwrap();
         assert_eq!(hello.protocol_version().unwrap(), PROTOCOL_VERSION);
         assert!(hello.authenticated());
+    }
+
+    #[test]
+    fn flatbuffers_pairing_challenge_roundtrip_when_unauthenticated() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth);
+        let request = ClientMessage {
+            id: Some(json!("challenge-fb")),
+            request: ClientRequest::PairingChallenge {
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        };
+
+        let client_bytes = flatbuffers_proto::serialize_client_message(&request);
+        let parsed = flatbuffers::root::<fb::ClientMessage>(&client_bytes)
+            .ok()
+            .and_then(|msg| msg.payload_as_pairing_challenge_request())
+            .expect("pairing challenge request payload");
+        assert_eq!(parsed.client_id().unwrap(), "phone");
+
+        let response_bytes = connection.handle_binary_message(&client_bytes);
+        let root = flatbuffers::root::<fb::ServerMessage>(&response_bytes).unwrap();
+        assert_eq!(
+            root.payload_type(),
+            fb::ServerMessagePayload::ResponsePayload
+        );
+        let resp = root.payload_as_response_payload().unwrap();
+        assert_eq!(resp.id().unwrap(), "challenge-fb");
+        assert_eq!(
+            resp.result_type(),
+            fb::ServerResultPayload::PairingChallengeResult
+        );
+        let challenge = resp.result_as_pairing_challenge_result().unwrap();
+        assert_eq!(challenge.device_code().unwrap(), "DEVICE01");
+        assert_eq!(challenge.expires_at(), 123);
+
+        let borrowed = flatbuffers_proto::parse_fb_server_message_borrowed(&response_bytes)
+            .expect("borrowed pairing challenge response");
+        assert_eq!(
+            borrowed,
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("challenge-fb"),
+                result: flatbuffers_proto::ServerResultBorrowed::PairingChallenge {
+                    device_code: "DEVICE01",
+                    expires_at: 123,
+                },
+            }
+        );
     }
 
     #[test]

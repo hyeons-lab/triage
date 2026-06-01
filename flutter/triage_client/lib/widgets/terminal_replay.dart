@@ -19,6 +19,40 @@ StyledRow trimReplayTrailingWhitespace(StyledRow row) {
   return StyledRow(spans: newSpans);
 }
 
+StyledRow normalizeReplayRow(StyledRow row) {
+  final trimmed = trimReplayTrailingWhitespace(row);
+  final text = trimmed.spans.map((span) => span.text).join();
+  final leadingWhitespace = RegExp(r'^\s+').firstMatch(text);
+  if (leadingWhitespace == null || !_isShellPromptOnlyRow(text.trimLeft())) {
+    return trimmed;
+  }
+
+  var remaining = leadingWhitespace.group(0)!.length;
+  final spans = <StyledSpan>[];
+  for (final span in trimmed.spans) {
+    if (remaining >= span.text.length) {
+      remaining -= span.text.length;
+      continue;
+    }
+    if (remaining > 0) {
+      spans.add(
+        StyledSpan(text: span.text.substring(remaining), style: span.style),
+      );
+      remaining = 0;
+    } else {
+      spans.add(span);
+    }
+  }
+  return StyledRow(spans: spans);
+}
+
+bool _isShellPromptOnlyRow(String rowText) {
+  final trimmed = rowText.trimRight();
+  if (trimmed.isEmpty || trimmed.contains('\n')) return false;
+  return RegExp(r'^[^\s@]+@[^\s:]+:.+[$#>] ?$').hasMatch(trimmed) ||
+      RegExp(r'^[A-Za-z]:\\.*> ?$').hasMatch(trimmed);
+}
+
 bool isReplayStatusOrDividerRow(String rowText) {
   final trimmed = rowText.trim();
   if (trimmed.isEmpty) return true;
@@ -65,8 +99,19 @@ ReplayCursorPlacement computeReplayCursorPlacement({
   required int fittedRows,
   int? initialCursorRow,
   int? initialCursorCol,
+  bool isExited = true,
 }) {
   final rowCount = fallbackRows.length;
+  if (rowCount == 0) {
+    return const ReplayCursorPlacement(
+      sourceRow: 0,
+      sourceCol: 0,
+      startRow: 0,
+      endRow: 0,
+      terminalRow: 1,
+      terminalCol: 1,
+    );
+  }
   var cursorRow = initialCursorRow ?? 0;
   int? cursorCol = initialCursorCol;
 
@@ -98,13 +143,13 @@ ReplayCursorPlacement computeReplayCursorPlacement({
   var shouldClamp =
       cursorRow < 0 ||
       cursorRow >= rowCount ||
-      (!allRowsEmpty && cursorRow > lastActiveRow);
+      (isExited && !allRowsEmpty && cursorRow > lastActiveRow);
   if (!shouldClamp && cursorRow >= 0 && cursorRow < rowCount && !allRowsEmpty) {
     final cursorRowText = fallbackRows[cursorRow].spans
         .map((s) => s.text)
         .join()
         .trimRight();
-    shouldClamp = isReplayStatusOrDividerRow(cursorRowText);
+    shouldClamp = isExited && isReplayStatusOrDividerRow(cursorRowText);
   }
   if (shouldClamp) {
     for (var i = lastActiveRow + 1; i <= cursorRow; i++) {

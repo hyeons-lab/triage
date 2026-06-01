@@ -4,6 +4,8 @@ import 'storage_stub.dart'
 
 void persistToken(String token) => impl.persistToken(token);
 String? retrieveToken() => impl.retrieveToken();
+void clearToken() => impl.clearToken();
 
 void persistClientId(String clientId) => impl.persistClientId(clientId);
 String? retrieveClientId() => impl.retrieveClientId();
+void clearClientId() => impl.clearClientId();

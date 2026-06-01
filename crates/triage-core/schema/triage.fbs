@@ -125,6 +125,10 @@ table PairRequest {
     client_id: string;
 }
 
+table PairingChallengeRequest {
+    client_id: string;
+}
+
 table ListSessionsRequest {}
 
 table StartSessionRequestTable {
@@ -200,7 +204,8 @@ union ClientRequestPayload {
     RestoreSessionRequestTable,
     SnapshotSessionRequest,
     StyledRowsRequestTable,
-    ShutdownSessionRequest
+    ShutdownSessionRequest,
+    PairingChallengeRequest
 }
 
 table ClientMessage {
@@ -219,6 +224,11 @@ table HelloResult {
 
 table PairedResult {
     token: string;
+}
+
+table PairingChallengeResult {
+    device_code: string;
+    expires_at: uint64;
 }
 
 table SessionIdsResult {
@@ -264,7 +274,8 @@ union ServerResultPayload {
     LeaseChangeResult,
     SessionSnapshotResult,
     StyledRowsResult,
-    CompletedSessionResult
+    CompletedSessionResult,
+    PairingChallengeResult
 }
 
 table ResponsePayload {
