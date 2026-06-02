@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
+import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/storage.dart';
@@ -99,7 +100,27 @@ class SessionVm {
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
-  }) : terminalController = TerminalController();
+  }) : terminalController = TerminalController() {
+    terminal = xt.Terminal(
+      maxLines: 10000,
+      reflowEnabled: false,
+      onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
+    );
+    terminalController.addWriteListener((data) {
+      terminal.write(data);
+    });
+    terminalController.addClearListener(() {
+      try {
+        terminal.useMainBuffer();
+        terminal.mainBuffer.clear();
+        terminal.altBuffer.clear();
+        terminal.write('\x1b[H\x1b[2J\x1b[3J');
+      } catch (_) {}
+    });
+    terminalController.addResizeListener((cols, rows) {
+      terminal.resize(cols, rows);
+    });
+  }
 
   final String title;
   final String branch;
@@ -114,12 +135,17 @@ class SessionVm {
   int? initialCursorCol;
   bool isExited;
   int replayRevision = 0;
+  int resyncRevision = 0;
+  bool initialContentWritten = false;
   bool snapshotRefreshPending = false;
   int? lastFittedCols;
   int? lastFittedRows;
   int? inFlightCols;
   int? inFlightRows;
   int resizeRequestSeq = 0;
+
+  late final xt.Terminal terminal;
+  void Function(int w, int h, int pw, int ph)? onTerminalResize;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
@@ -1031,6 +1057,7 @@ class _TriageHomeState extends State<TriageHome> {
       );
       if (includeHistory) {
         session.replayRevision = 1;
+        session.resyncRevision = 1;
       }
       _setupSessionInputListener(session);
       return session;
@@ -1064,13 +1091,12 @@ class _TriageHomeState extends State<TriageHome> {
     }
 
     const headerHeight = 68.0;
-    const horizontalPadding = 32.0;
-    const averageCellWidth = 9.0;
+    const padding = 44.0; // 22.0 on each side of the terminal view
+    const averageCellWidth = 9.92;
     const averageCellHeight = 18.0;
     final sidebarWidth = _sidebarCollapsed ? 72.0 : 320.0;
-    final terminalWidth =
-        viewportSize.width - sidebarWidth - 1 - horizontalPadding;
-    final terminalHeight = viewportSize.height - headerHeight;
+    final terminalWidth = viewportSize.width - sidebarWidth - 1 - padding;
+    final terminalHeight = viewportSize.height - headerHeight - padding;
     final cols = (terminalWidth / averageCellWidth).floor().clamp(80, 240);
     final rows = (terminalHeight / averageCellHeight).floor().clamp(10, 80);
     return (rows, cols);
@@ -1242,37 +1268,12 @@ class _TriageHomeState extends State<TriageHome> {
             .replaceAll('\r\n', '\n')
             .replaceAll('\n', '\r\n');
 
-        // Write directly to xterm.js via the controller.
-        // This bypasses calling setState() on every small output chunk,
-        // avoiding Flutter widget tree rebuilds during active WebSocket sessions.
+        // Write directly to xterm via the controller. The daemon snapshot path
+        // (Snapshot / ResyncRequired / refresh) owns session.rows; live output
+        // intentionally does not mutate the fallback row buffer, since naive
+        // string-append corrupts it with literal ANSI escapes and CR overstrikes
+        // that the replay path would later re-execute as garbled duplicate text.
         session.terminalController.write(translatedText);
-
-        // Update backup logs silently (without calling setState).
-        final rows = session.rows;
-        final newLines = text.split('\n');
-        if (newLines.isNotEmpty) {
-          if (rows.isNotEmpty) {
-            final lastRow = rows.last;
-            if (lastRow.spans.isNotEmpty) {
-              final lastSpan = lastRow.spans.last;
-              final updatedSpan = StyledSpan(
-                text: lastSpan.text + newLines[0],
-                style: lastSpan.style,
-              );
-              final updatedSpans = List<StyledSpan>.from(lastRow.spans)
-                ..removeLast()
-                ..add(updatedSpan);
-              rows[rows.length - 1] = StyledRow(spans: updatedSpans);
-            } else {
-              rows[rows.length - 1] = _plainRow(newLines[0]);
-            }
-          } else {
-            rows.add(_plainRow(newLines[0]));
-          }
-          for (var i = 1; i < newLines.length; i++) {
-            rows.add(_plainRow(newLines[i]));
-          }
-        }
         session.outputSeq = outputSeq;
       } else if (event.containsKey('Exited')) {
         if (mounted) {
@@ -1370,6 +1371,7 @@ class _TriageHomeState extends State<TriageHome> {
           : const Color(0xff7fd1c7);
       if (includeHistory) {
         session.replayRevision += 1;
+        session.resyncRevision += 1;
       }
       if (cols != null && rowsVal != null) {
         session.lastFittedCols = cols;
@@ -2252,6 +2254,15 @@ class SessionWorkspace extends StatelessWidget {
             terminalId: session.title,
             controller: session.terminalController,
             fallbackRows: session.rows,
+            terminal: session.terminal,
+            onTerminalResizeBind: (callback) {
+              session.onTerminalResize = callback;
+            },
+            resyncRevision: session.resyncRevision,
+            initialContentWritten: session.initialContentWritten,
+            onInitialContentWritten: () {
+              session.initialContentWritten = true;
+            },
             initialCursorRow: session.initialCursorRow,
             initialCursorCol: session.initialCursorCol,
             isExited: session.status == 'exited',

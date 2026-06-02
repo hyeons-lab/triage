@@ -12,6 +12,11 @@ class TerminalPane extends StatefulWidget {
     required this.terminalId,
     required this.controller,
     required this.fallbackRows,
+    required this.terminal,
+    required this.onTerminalResizeBind,
+    required this.resyncRevision,
+    required this.initialContentWritten,
+    this.onInitialContentWritten,
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
@@ -22,6 +27,12 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
+  final xt.Terminal terminal;
+  final void Function(void Function(int w, int h, int pw, int ph)? callback)?
+  onTerminalResizeBind;
+  final int resyncRevision;
+  final bool initialContentWritten;
+  final VoidCallback? onInitialContentWritten;
   final int? initialCursorRow;
   final int? initialCursorCol;
   final bool isExited;
@@ -37,9 +48,7 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
-  late final xt.Terminal _terminal;
-  final List<String> _pendingLiveWriteBuffer = [];
-  bool _initialContentWritten = false;
+  xt.Terminal get _terminal => widget.terminal;
   bool _suppressInput = false;
   int _replaySuppressGeneration = 0;
   final FocusNode _focusNode = FocusNode();
@@ -82,43 +91,27 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
-    _terminal = xt.Terminal(
-      maxLines: 10000,
-      onResize: _onTerminalResize,
-      reflowEnabled: false,
-    );
+    widget.onTerminalResizeBind?.call(_onTerminalResize);
     _terminal.onOutput = _onTerminalOutput;
     _bindController();
   }
 
   void _bindController() {
-    widget.controller.addWriteListener(_onWrite);
-    widget.controller.addClearListener(_onClear);
-    widget.controller.addResizeListener(_onResize);
     widget.controller.addFitListener(_onFit);
   }
 
   void _unbindController(TerminalController controller) {
-    controller.removeWriteListener(_onWrite);
-    controller.removeClearListener(_onClear);
-    controller.removeResizeListener(_onResize);
     controller.removeFitListener(_onFit);
   }
 
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.isExited != widget.isExited) {
-      _triggerFullReplayOrReset();
+    if (oldWidget.onTerminalResizeBind != widget.onTerminalResizeBind) {
+      oldWidget.onTerminalResizeBind?.call(null);
+      widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
-    if (oldWidget.replayRevision != widget.replayRevision) {
-      _triggerFullReplayOrReset();
-    }
-    if (oldWidget.initialCursorRow != widget.initialCursorRow ||
-        oldWidget.initialCursorCol != widget.initialCursorCol) {
-      _triggerFullReplayOrReset();
-    }
-    if (oldWidget.replayPending && !widget.replayPending) {
+    if (oldWidget.resyncRevision != widget.resyncRevision) {
       _triggerFullReplayOrReset();
     }
     if (oldWidget.controller != widget.controller) {
@@ -130,28 +123,13 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   void dispose() {
+    widget.onTerminalResizeBind?.call(null);
     _unbindController(widget.controller);
     _focusNode.dispose();
     _replaySuppressTimer1?.cancel();
     _replaySuppressTimer2?.cancel();
     _resizeOutDebounceTimer?.cancel();
     super.dispose();
-  }
-
-  void _onWrite(String data) {
-    if (!_initialContentWritten) {
-      _pendingLiveWriteBuffer.add(data);
-    } else {
-      _terminal.write(data);
-    }
-  }
-
-  void _onClear() {
-    _resetTerminalSafe();
-  }
-
-  void _onResize(int cols, int rows) {
-    _terminal.resize(cols, rows);
   }
 
   void _onFit() {
@@ -170,9 +148,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelHeight,
   ) {
     if (width > 0 && height > 0) {
-      if (!_initialContentWritten) {
+      if (!widget.initialContentWritten) {
         scheduleMicrotask(() {
-          if (mounted && !_initialContentWritten) {
+          if (mounted && !widget.initialContentWritten) {
             _finishInitialContent(width, height);
           }
         });
@@ -183,9 +161,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _finishInitialContent(int fittedCols, int fittedRows) {
-    _initialContentWritten = true;
+    widget.onInitialContentWritten?.call();
     _writeInitialContent();
-    _pendingLiveWriteBuffer.clear();
     _sendResizeOutNow(fittedCols, fittedRows);
   }
 
@@ -196,7 +173,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _pendingResizeOutCols = cols;
     _pendingResizeOutRows = rows;
     _resizeOutDebounceTimer?.cancel();
-    _resizeOutDebounceTimer = Timer(const Duration(milliseconds: 260), () {
+    _resizeOutDebounceTimer = Timer(const Duration(milliseconds: 100), () {
       final pendingCols = _pendingResizeOutCols;
       final pendingRows = _pendingResizeOutRows;
       _pendingResizeOutCols = null;
@@ -298,18 +275,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _triggerFullReplayOrReset() {
-    if (_initialContentWritten) {
+    if (widget.initialContentWritten) {
       _resetTerminalSafe();
       _writeInitialContent();
     } else {
       _resetTerminalSafe();
-      _pendingLiveWriteBuffer.clear();
-      _initialContentWritten = false;
       final cols = _terminal.viewWidth;
       final rows = _terminal.viewHeight;
       if (cols > 0 && rows > 0) {
         scheduleMicrotask(() {
-          if (mounted && !_initialContentWritten) {
+          if (mounted && !widget.initialContentWritten) {
             _finishInitialContent(cols, rows);
           }
         });
@@ -370,23 +345,45 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     return Container(
       color: const Color(0xff0d1113),
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () {
-          _focusNode.requestFocus();
-        },
-        child: Padding(
-          padding: const EdgeInsets.all(22),
-          child: xt.TerminalView(
-            _terminal,
-            theme: _theme,
-            focusNode: _focusNode,
-            textStyle: const xt.TerminalStyle(
-              fontSize: 15,
-              fontFamily: 'monospace',
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          const double padding = 44.0;
+          const double averageCellWidth = 9.92;
+          const double averageCellHeight = 18.0;
+
+          final double usableWidth = (constraints.maxWidth - padding).clamp(0.0, double.infinity);
+          final double usableHeight = (constraints.maxHeight - padding).clamp(0.0, double.infinity);
+
+          final int cols = (usableWidth / averageCellWidth).floor().clamp(80, 240);
+          final int rows = (usableHeight / averageCellHeight).floor().clamp(10, 80);
+
+          if (_terminal.viewWidth != cols || _terminal.viewHeight != rows) {
+            scheduleMicrotask(() {
+              if (mounted) {
+                _terminal.resize(cols, rows);
+              }
+            });
+          }
+
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () {
+              _focusNode.requestFocus();
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(22),
+              child: xt.TerminalView(
+                _terminal,
+                theme: _theme,
+                focusNode: _focusNode,
+                textStyle: const xt.TerminalStyle(
+                  fontSize: 15,
+                  fontFamily: 'monospace',
+                ),
+              ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
   }

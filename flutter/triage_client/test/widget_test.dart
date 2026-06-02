@@ -648,8 +648,12 @@ void main() {
     await tester.tap(find.text('triage / flutter-spike').first);
     await tester.pump();
 
+    // Before the post-select refresh resolves, fallback rows only show the
+    // attach snapshot. Live output is held in xterm (not rendered in this
+    // FLUTTER_TEST fallback path) and lands in session.rows when the daemon
+    // snapshot refresh below catches up.
     expect(find.text('flutter-spike attached'), findsOneWidget);
-    expect(find.text('live output during attach'), findsOneWidget);
+    expect(find.text('live output during attach'), findsNothing);
 
     delayedRefresh.complete(
       client.attachSnapshotResponse('flutter-spike', [
@@ -658,6 +662,8 @@ void main() {
       ]),
     );
     await tester.pumpAndSettle();
+
+    expect(find.text('live output during attach'), findsOneWidget);
   });
 
   testWidgets('selects sessions and sends input over WebSocket', (
@@ -740,7 +746,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(client.restoreSessionCalls, contains('main'));
-      expect(client.restoreSessionSizes['main'], '94x40');
+      expect(client.restoreSessionSizes['main'], '84x38');
     },
   );
 
@@ -771,7 +777,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(
-      client.resizeSessionCalls.where((call) => call == 'flutter-spike:94:40'),
+      client.resizeSessionCalls.where((call) => call == 'flutter-spike:84:38'),
       isNotEmpty,
     );
     expect(

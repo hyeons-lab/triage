@@ -16,6 +16,11 @@ class TerminalPane extends StatefulWidget {
     required this.terminalId,
     required this.controller,
     required this.fallbackRows,
+    required this.terminal,
+    required this.onTerminalResizeBind,
+    required this.resyncRevision,
+    required this.initialContentWritten,
+    this.onInitialContentWritten,
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
@@ -26,6 +31,12 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
+  final dynamic terminal;
+  final void Function(void Function(int w, int h, int pw, int ph)? callback)?
+  onTerminalResizeBind;
+  final int resyncRevision;
+  final bool initialContentWritten;
+  final VoidCallback? onInitialContentWritten;
   final int? initialCursorRow;
   final int? initialCursorCol;
   final bool isExited;
