@@ -8,6 +8,7 @@
 - 2026-06-01T14:32-0700 — Claude Code (claude-opus-4-7) @ argus branch feat/flutter-mobile-client — picked up duplicate-text review finding and implemented Option A.
 - 2026-06-01T19:37-0700 — Antigravity — Implemented the persistent single-source terminal buffer long-term fix (Option B).
 - 2026-06-02T00:35-0700 — Antigravity — Wrapped interactive native terminal view inside a LayoutBuilder to calculate available cols/rows and resize terminal buffer dynamically on sidebar collapse/expand.
+- 2026-06-02T00:50-0700 — Antigravity — Restored didUpdateWidget lifecycle hooks in terminal_pane_stub.dart to watch replayRevision and trigger terminal replays upon PTY resize reflow snapshot updates.
 
 ## Intent
 - Scaffold mobile and macOS platform configurations for the triage client.
@@ -28,6 +29,7 @@
 - 2026-06-01T14:32-0700 — Adopt Option A for the dual-write terminal buffer bug: the WebSocket `Output` event handler now writes only to `terminalController` (xterm). The naive `session.rows` append was corrupting the fallback buffer with literal ANSI escapes and CR overstrikes, which were then re-executed during replay and showed up as "duplicate text" / mis-laid-out layout. `session.rows` is now owned by the snapshot path.
 - 2026-06-01T19:37-0700 — Adopt Option B for persistent single-source terminal buffers. Moved ownership of the native `xt.Terminal` instance onto `SessionVm` so it survives unmount/remount (tab switching). Setup write/clear/resize controller listeners in `SessionVm` so live websocket output is always written to the terminal instance, decoupling the state lifecycle of `TerminalPane` from the terminal model.
 - 2026-06-02T00:35-0700 — Wrap the native `TerminalView` inside a `LayoutBuilder` in `terminal_pane_stub.dart` to calculate exact terminal columns/rows on layout constraints updates (e.g. sidebar collapse). Resize `_terminal` safely within a `scheduleMicrotask` to avoid infinite `setState` rebuild loops and perfectly align logical terminal dimensions with the daemon PTY.
+- 2026-06-02T00:50-0700 — Keep didUpdateWidget lifecycle hooks for replayRevision, isExited, and replayPending in terminal_pane_stub.dart. When a session is resized and the daemon returns the newly reflowed snapshot, we must reset the persistent xt.Terminal and replay the new content, otherwise the stale pre-resize wrapped rows remain in the buffer and permanently corrupt the view.
 
 ## What Changed
 - `flutter/triage_client/pubspec.yaml` — Upgraded to `xterm: ^4.0.0` dependency.
@@ -49,6 +51,7 @@
 - `flutter/triage_client/lib/main.dart` — Moved `xt.Terminal` onto `SessionVm`, routing writes, clears, and resizes natively from `TerminalController`. Decoupled `SessionWorkspace`'s `TerminalPane` setup, passing the persistent terminal instance and delegates. Corrected size estimation vertical padding calculations.
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Refactored `TerminalPane` state to use the persistent terminal, removing direct write/clear listeners and simplifying layout/didUpdateWidget lifecycle logic.
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Wrapped native `TerminalView` with `LayoutBuilder` to compute and trigger terminal resizes dynamically during parent layout changes.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Added back didUpdateWidget check for `replayRevision`, `isExited`, and `replayPending` to trigger terminal buffer redraws on snapshot reflows.
 - `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Aligned constructor parameters to maintain cross-platform compilation.
 - `flutter/triage_client/test/widget_test.dart` — Updated the viewport-estimated dimensions assertions to match the corrected vertical padding dimensions (`92x38`).
 
@@ -56,7 +59,7 @@
 - c32d1e6 — feat: scaffold flutter mobile client and integrate native interactive terminal
 - aca982f — feat: scaffold Windows and Linux desktop runner platforms
 - c4aedc5 — feat(client): polish macOS triage client
-- HEAD — fix(client): implement persistent single-source terminal buffers and layout resize
+- HEAD — fix(client): restore terminal didUpdateWidget lifecycle hooks for resize reflow
 
 ## Progress
 - 2026-05-31T18:00-0700 — Created git worktree and branch `feat/flutter-mobile-client`.
@@ -77,3 +80,4 @@
 - 2026-06-01T22:10-0700 — Successfully compiled the Flutter web client and Flutter macOS client, built and installed `triage` and `triaged` release binaries to cargo bin, and copied the new Triage.app to `/Applications/Triage.app`.
 - 2026-06-02T00:15-0700 — Resolved a subtle cell width estimation bug (`averageCellWidth` was `9.0` instead of the actual font's `9.92`), which caused initial estimated/restored session widths to be larger than the actual fitted layout, leading to narrow-wrapping staircasing on sidebar collapse. Updated `averageCellWidth` to `9.92`, updated test assertions in `widget_test.dart` to expect `84` columns instead of `92`, successfully ran and passed all 73 widget tests, and rebuilt/redeployed the clients and binaries.
 - 2026-06-02T00:35-0700 — Wrapped the interactive native `TerminalView` with a `LayoutBuilder` to dynamically resize `_terminal` on sidebar collapse, successfully compiled web and macOS clients, built and installed release targets, redeployed Triage.app to `/Applications/Triage.app`, and verified all 73/73 tests pass.
+- 2026-06-02T00:50-0700 — Restored the didUpdateWidget lifecycle checks in terminal_pane_stub.dart, successfully compiled and deployed web, macOS, and Rust binary targets, and verified that the terminal layout correctly reflows in Triage.app without wrapping or split lines.

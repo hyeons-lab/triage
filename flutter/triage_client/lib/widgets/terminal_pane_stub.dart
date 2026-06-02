@@ -111,7 +111,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.onTerminalResizeBind?.call(null);
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
-    if (oldWidget.resyncRevision != widget.resyncRevision) {
+    if (oldWidget.resyncRevision != widget.resyncRevision ||
+        oldWidget.replayRevision != widget.replayRevision ||
+        oldWidget.isExited != widget.isExited ||
+        (oldWidget.replayPending && !widget.replayPending)) {
       _triggerFullReplayOrReset();
     }
     if (oldWidget.controller != widget.controller) {
