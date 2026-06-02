@@ -19,8 +19,10 @@ class TerminalPane extends StatefulWidget {
     required this.terminal,
     required this.onTerminalResizeBind,
     required this.resyncRevision,
+    required this.focusCursorRevision,
     required this.initialContentWritten,
     this.onInitialContentWritten,
+    this.onReplayContentWritten,
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
@@ -35,8 +37,10 @@ class TerminalPane extends StatefulWidget {
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
   final int resyncRevision;
+  final int focusCursorRevision;
   final bool initialContentWritten;
   final VoidCallback? onInitialContentWritten;
+  final VoidCallback? onReplayContentWritten;
   final int? initialCursorRow;
   final int? initialCursorCol;
   final bool isExited;
@@ -101,6 +105,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   dynamic _resizeObserver;
   late Object _inputRouteToken;
   late final FocusNode _focusNode;
+  late final StreamSubscription<html.MouseEvent>
+  _containerMouseDownSubscription;
   late final void Function(html.Event) _windowKeyDownListener;
   late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
   late final StreamSubscription<html.KeyboardEvent>
@@ -116,12 +122,14 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _liveOutputReceived = false;
   int? _lastFittedRows;
   int? _lastFittedCols;
+  bool _focusCursorAfterReplay = false;
   int _replaySuppressGeneration = 0;
   bool _suppressInput = false;
   Timer? _resizeDebounceTimer;
   double? _stableWidth;
   double? _stableHeight;
   Timer? _stabilityTimer;
+  Timer? _scrollToCursorTimer;
 
   @override
   void initState() {
@@ -152,6 +160,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _styleSheetLoaded = true;
       _bindController();
       _bindTerminalSubscriptions();
+      if (widget.focusCursorRevision > 0) {
+        _focusCursorNowAndAfterReplay();
+      }
     } else {
       _container = html.DivElement()
         ..style.width = '100%'
@@ -385,6 +396,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       } catch (_) {}
 
       _triggerFitWithDelayedRetries();
+      if (widget.focusCursorRevision > 0) {
+        _focusCursorNowAndAfterReplay();
+      }
 
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
@@ -636,6 +650,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _bindContainerEvents() {
+    _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
+      _focusNode.requestFocus();
+      if (_initialized) {
+        try {
+          _activateTerminal();
+        } catch (_) {}
+      }
+    });
+
     _containerClickSubscription = _container.onClick.listen((event) {
       _focusNode.requestFocus();
       if (_initialized) {
@@ -711,6 +734,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _initialContentWritten = true;
     _writeInitialContent();
     _flushPendingLiveWrites();
+    widget.onInitialContentWritten?.call();
+    _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
   }
 
@@ -806,6 +831,36 @@ class _TerminalPaneState extends State<TerminalPane> {
     Future.delayed(const Duration(milliseconds: 1500), _onFit);
   }
 
+  void _afterReplayContentWritten({required bool initialReplay}) {
+    widget.onReplayContentWritten?.call();
+    final shouldFocus = _focusCursorAfterReplay;
+    if (initialReplay || shouldFocus) {
+      _focusCursorAfterReplay = false;
+      _scrollToCursor(requestFocus: true);
+    }
+  }
+
+  void _focusCursorNowAndAfterReplay() {
+    _focusCursorAfterReplay = true;
+    _scrollToCursor(requestFocus: true);
+  }
+
+  void _scrollToCursor({required bool requestFocus}) {
+    void jump() {
+      if (!mounted || !_initialized) return;
+      try {
+        js_util.callMethod(_term, 'scrollToBottom', []);
+      } catch (_) {}
+      if (requestFocus) {
+        _activateTerminal();
+      }
+    }
+
+    Future.delayed(Duration.zero, jump);
+    _scrollToCursorTimer?.cancel();
+    _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
+  }
+
   String? _keyboardEventToInput(html.KeyboardEvent event) {
     final key = event.key;
     if (key == null) return null;
@@ -869,6 +924,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_initialContentWritten) {
         _resetTerminalSafe();
         _writeInitialContent();
+        _afterReplayContentWritten(initialReplay: false);
       } else {
         _resetTerminalSafe();
         _pendingLiveWriteBuffer.clear();
@@ -894,6 +950,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (oldWidget.replayRevision != widget.replayRevision) {
       _triggerFullReplayOrReset();
+    }
+    if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
+      _focusCursorNowAndAfterReplay();
     }
     if (oldWidget.initialCursorRow != widget.initialCursorRow ||
         oldWidget.initialCursorCol != widget.initialCursorCol) {
@@ -921,7 +980,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   void dispose() {
     _resizeDebounceTimer?.cancel();
     _stabilityTimer?.cancel();
+    _scrollToCursorTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
+    _containerMouseDownSubscription.cancel();
     _containerClickSubscription.cancel();
     _containerKeyDownSubscription.cancel();
     _container.removeEventListener('paste', _containerPasteListener, true);

@@ -15,8 +15,10 @@ class TerminalPane extends StatefulWidget {
     required this.terminal,
     required this.onTerminalResizeBind,
     required this.resyncRevision,
+    required this.focusCursorRevision,
     required this.initialContentWritten,
     this.onInitialContentWritten,
+    this.onReplayContentWritten,
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
@@ -31,8 +33,10 @@ class TerminalPane extends StatefulWidget {
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
   final int resyncRevision;
+  final int focusCursorRevision;
   final bool initialContentWritten;
   final VoidCallback? onInitialContentWritten;
+  final VoidCallback? onReplayContentWritten;
   final int? initialCursorRow;
   final int? initialCursorCol;
   final bool isExited;
@@ -52,7 +56,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _suppressInput = false;
   int _replaySuppressGeneration = 0;
   final FocusNode _focusNode = FocusNode();
+  final ScrollController _scrollController = ScrollController();
   Timer? _resizeOutDebounceTimer;
+  Timer? _scrollToCursorTimer;
   int? _pendingResizeOutCols;
   int? _pendingResizeOutRows;
   int? _lastResizeOutCols;
@@ -84,9 +90,28 @@ class _TerminalPaneState extends State<TerminalPane> {
     searchHitBackgroundCurrent: Color(0xff7fd1c7),
     searchHitForeground: Color(0xff1f2b30),
   );
+  static const _textStyle = xt.TerminalStyle(
+    fontSize: 15,
+    fontFamily: 'Menlo',
+    fontFamilyFallback: [
+      'Monaco',
+      'Consolas',
+      'Liberation Mono',
+      'Courier New',
+      'Noto Sans Mono CJK SC',
+      'Noto Sans Mono CJK TC',
+      'Noto Sans Mono CJK KR',
+      'Noto Sans Mono CJK JP',
+      'Noto Sans Mono CJK HK',
+      'Noto Color Emoji',
+      'Noto Sans Symbols',
+      'monospace',
+    ],
+  );
 
   Timer? _replaySuppressTimer1;
   Timer? _replaySuppressTimer2;
+  bool _focusCursorAfterReplay = false;
 
   @override
   void initState() {
@@ -94,6 +119,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _terminal.onOutput = _onTerminalOutput;
     _bindController();
+    if (widget.focusCursorRevision > 0) {
+      _focusCursorNowAndAfterReplay();
+    }
   }
 
   void _bindController() {
@@ -111,11 +139,25 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.onTerminalResizeBind?.call(null);
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
+    if (!identical(oldWidget.terminal, widget.terminal)) {
+      // The persistent terminal instance lives on SessionVm, so a session swap
+      // (e.g. the loading placeholder being replaced by the attached session,
+      // which shares the same `triage / <sid>` key) reuses this State without
+      // re-running initState. Rebind keyboard output to the new terminal —
+      // otherwise its onOutput stays null and every keystroke is silently
+      // dropped — and refocus so the swapped-in terminal accepts input.
+      oldWidget.terminal.onOutput = null;
+      _terminal.onOutput = _onTerminalOutput;
+      _focusCursorNowAndAfterReplay();
+    }
     if (oldWidget.resyncRevision != widget.resyncRevision ||
         oldWidget.replayRevision != widget.replayRevision ||
         oldWidget.isExited != widget.isExited ||
         (oldWidget.replayPending && !widget.replayPending)) {
       _triggerFullReplayOrReset();
+    }
+    if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
+      _focusCursorNowAndAfterReplay();
     }
     if (oldWidget.controller != widget.controller) {
       _unbindController(oldWidget.controller);
@@ -128,10 +170,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   void dispose() {
     widget.onTerminalResizeBind?.call(null);
     _unbindController(widget.controller);
+    _scrollController.dispose();
     _focusNode.dispose();
     _replaySuppressTimer1?.cancel();
     _replaySuppressTimer2?.cancel();
     _resizeOutDebounceTimer?.cancel();
+    _scrollToCursorTimer?.cancel();
     super.dispose();
   }
 
@@ -142,6 +186,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onTerminalOutput(String data) {
     if (_suppressInput) return;
     widget.controller.sendInput(data);
+  }
+
+  void _focusTerminal() {
+    _focusNode.requestFocus();
   }
 
   void _onTerminalResize(
@@ -164,8 +212,14 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _finishInitialContent(int fittedCols, int fittedRows) {
+    if (widget.replayPending) {
+      return;
+    }
+    if (!_writeInitialContent()) {
+      return;
+    }
     widget.onInitialContentWritten?.call();
-    _writeInitialContent();
+    _afterReplayContentWritten(initialReplay: true);
     _sendResizeOutNow(fittedCols, fittedRows);
   }
 
@@ -199,9 +253,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.sendResizeOut(cols, rows);
   }
 
-  void _writeInitialContent() {
+  bool _writeInitialContent() {
     if (widget.replayPending) {
-      return;
+      return false;
     }
     final cursor = computeReplayCursorPlacement(
       fallbackRows: widget.fallbackRows,
@@ -244,6 +298,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     sb.write('\x1B[${cursor.terminalRow};${cursor.terminalCol}H');
     _writeReplayContent(sb.toString());
+    return true;
   }
 
   void _writeReplayContent(String data) {
@@ -268,6 +323,37 @@ class _TerminalPaneState extends State<TerminalPane> {
     });
   }
 
+  void _afterReplayContentWritten({required bool initialReplay}) {
+    widget.onReplayContentWritten?.call();
+    final shouldFocus = _focusCursorAfterReplay;
+    if (initialReplay || shouldFocus) {
+      _focusCursorAfterReplay = false;
+      _scrollToCursor(requestFocus: true);
+    }
+  }
+
+  void _focusCursorNowAndAfterReplay() {
+    _focusCursorAfterReplay = true;
+    _scrollToCursor(requestFocus: true);
+  }
+
+  void _scrollToCursor({required bool requestFocus}) {
+    void jump() {
+      if (!mounted) return;
+      if (_scrollController.hasClients) {
+        final position = _scrollController.position;
+        position.jumpTo(position.maxScrollExtent);
+      }
+      if (requestFocus) {
+        _focusNode.requestFocus();
+      }
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) => jump());
+    _scrollToCursorTimer?.cancel();
+    _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
+  }
+
   void _resetTerminalSafe() {
     try {
       _terminal.useMainBuffer();
@@ -278,9 +364,14 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _triggerFullReplayOrReset() {
+    if (widget.replayPending) {
+      return;
+    }
     if (widget.initialContentWritten) {
       _resetTerminalSafe();
-      _writeInitialContent();
+      if (_writeInitialContent()) {
+        _afterReplayContentWritten(initialReplay: false);
+      }
     } else {
       _resetTerminalSafe();
       final cols = _terminal.viewWidth;
@@ -348,45 +439,30 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     return Container(
       color: const Color(0xff0d1113),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          const double padding = 44.0;
-          const double averageCellWidth = 9.92;
-          const double averageCellHeight = 18.0;
-
-          final double usableWidth = (constraints.maxWidth - padding).clamp(0.0, double.infinity);
-          final double usableHeight = (constraints.maxHeight - padding).clamp(0.0, double.infinity);
-
-          final int cols = (usableWidth / averageCellWidth).floor().clamp(80, 240);
-          final int rows = (usableHeight / averageCellHeight).floor().clamp(10, 80);
-
-          if (_terminal.viewWidth != cols || _terminal.viewHeight != rows) {
-            scheduleMicrotask(() {
-              if (mounted) {
-                _terminal.resize(cols, rows);
-              }
-            });
-          }
-
-          return GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () {
-              _focusNode.requestFocus();
-            },
-            child: Padding(
-              padding: const EdgeInsets.all(22),
-              child: xt.TerminalView(
-                _terminal,
-                theme: _theme,
-                focusNode: _focusNode,
-                textStyle: const xt.TerminalStyle(
-                  fontSize: 15,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          );
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          _focusTerminal();
         },
+        child: Padding(
+          padding: const EdgeInsets.all(22),
+          child: Listener(
+            onPointerDown: (_) {
+              _focusTerminal();
+            },
+            child: xt.TerminalView(
+              _terminal,
+              theme: _theme,
+              focusNode: _focusNode,
+              autofocus: true,
+              scrollController: _scrollController,
+              textStyle: _textStyle,
+              onTapUp: (_, __) {
+                _focusTerminal();
+              },
+            ),
+          ),
+        ),
       ),
     );
   }

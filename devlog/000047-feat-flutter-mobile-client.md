@@ -9,6 +9,17 @@
 - 2026-06-01T19:37-0700 — Antigravity — Implemented the persistent single-source terminal buffer long-term fix (Option B).
 - 2026-06-02T00:35-0700 — Antigravity — Wrapped interactive native terminal view inside a LayoutBuilder to calculate available cols/rows and resize terminal buffer dynamically on sidebar collapse/expand.
 - 2026-06-02T00:50-0700 — Antigravity — Restored didUpdateWidget lifecycle hooks in terminal_pane_stub.dart to watch replayRevision and trigger terminal replays upon PTY resize reflow snapshot updates.
+- 2026-06-02T00:55-0700 — Codex — Removed native terminal speculative layout resizing so package:xterm measured auto-resize owns display column counts.
+- 2026-06-02T01:04-0700 — Codex — Pinned the native terminal font to Menlo with explicit monospace fallbacks to keep glyph measurement and box-drawing rendering aligned on macOS.
+- 2026-06-02T01:12-0700 — Codex — Deferred native initial replay and reset while snapshot refresh is pending so first paint cannot be marked complete while blank.
+- 2026-06-02T01:46-0700 — Codex — Added sequence-aware persistent terminal write buffering across initial replay and live snapshot refresh.
+- 2026-06-02T10:10-0700 — Codex — Added streaming UTF-8 decode state for daemon output and snapshot catch-up handling for split box-drawing glyphs.
+- 2026-06-02T10:21-0700 — Codex — Rebuilt the Flutter macOS release app and installed the updated bundle to `/Applications/Triage.app`.
+- 2026-06-02T16:04-0700 — Codex — Added cursor-focused terminal scrolling for first display and session-rail selection.
+- 2026-06-02T16:12-0700 — Codex — Rebuilt and reinstalled `/Applications/Triage.app` with the cursor-focused terminal scrolling change.
+- 2026-06-02T16:29-0700 — Codex — Fixed terminal focus acquisition on initial display and direct terminal taps.
+- 2026-06-02T16:34-0700 — Codex — Rebuilt and reinstalled `/Applications/Triage.app` with the terminal input focus fix.
+- 2026-06-02T16:43-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Fixed dead keyboard input on the first session shown after the persistent-terminal swap.
 
 ## Intent
 - Scaffold mobile and macOS platform configurations for the triage client.
@@ -30,6 +41,15 @@
 - 2026-06-01T19:37-0700 — Adopt Option B for persistent single-source terminal buffers. Moved ownership of the native `xt.Terminal` instance onto `SessionVm` so it survives unmount/remount (tab switching). Setup write/clear/resize controller listeners in `SessionVm` so live websocket output is always written to the terminal instance, decoupling the state lifecycle of `TerminalPane` from the terminal model.
 - 2026-06-02T00:35-0700 — Wrap the native `TerminalView` inside a `LayoutBuilder` in `terminal_pane_stub.dart` to calculate exact terminal columns/rows on layout constraints updates (e.g. sidebar collapse). Resize `_terminal` safely within a `scheduleMicrotask` to avoid infinite `setState` rebuild loops and perfectly align logical terminal dimensions with the daemon PTY.
 - 2026-06-02T00:50-0700 — Keep didUpdateWidget lifecycle hooks for replayRevision, isExited, and replayPending in terminal_pane_stub.dart. When a session is resized and the daemon returns the newly reflowed snapshot, we must reset the persistent xt.Terminal and replay the new content, otherwise the stale pre-resize wrapped rows remain in the buffer and permanently corrupt the view.
+- 2026-06-02T00:55-0700 — Let native `TerminalView` own terminal resizing through its measured `autoResize` path. The previous `LayoutBuilder` calculation used hard-coded average cell dimensions, which could run before xterm's measured layout and replay content at the wrong column count, causing early visual wraps even when copied text looked correct.
+- 2026-06-02T01:04-0700 — Use Menlo as the native terminal's primary font rather than the generic `monospace` alias. If `monospace` resolves differently for metrics and fallback glyphs, copied text can remain correct while box-drawing and prompt lines visually wrap or misalign.
+- 2026-06-02T01:12-0700 — Do not call `onInitialContentWritten` until `_writeInitialContent` actually writes replay content. If a snapshot refresh is pending, native replay/reset is deferred instead of clearing or marking the terminal as initialized. This avoids blank first render states that recover only after a side-rail click triggers another replay.
+- 2026-06-02T01:46-0700 — Keep the daemon snapshot as the authority during replay. Live terminal output is buffered while replay is incomplete or a snapshot refresh is pending; after replay, buffered writes with `output_seq` already covered by the replayed snapshot are dropped, and newer writes are flushed in order.
+- 2026-06-02T02:02-0700 — Decode daemon `Output` bytes as a per-session stream instead of independently per event. Box-drawing glyphs such as `─` are multi-byte UTF-8 sequences; if an event boundary splits a glyph, stateless decoding inserts replacement characters and makes horizontal rules appear broken.
+- 2026-06-02T10:10-0700 — Track the `output_seq` for pending UTF-8 carry bytes. If a daemon snapshot has advanced beyond that output event, discard the stale carry so later live output cannot inherit bytes that the replay already covered.
+- 2026-06-02T16:04-0700 — Preserve terminal scroll position during ordinary replays/resizes, but explicitly scroll to the cursor after the first replay and after a session is selected from the left rail. Rail selection increments a per-session focus revision so the platform terminal pane can focus and jump to the cursor without treating every snapshot refresh as a user-requested scroll.
+- 2026-06-02T16:29-0700 — Initial replay must request focus as well as scroll, otherwise the cursor is visible but inactive and key input is ignored. Native `TerminalView` also needs pointer-level focus handling because its internal gesture recognizers can consume the wrapper tap before the outer `GestureDetector` focuses the terminal.
+- 2026-06-02T16:43-0700 — The native pane binds keyboard output (`_terminal.onOutput = _onTerminalOutput`) only in `initState`, but the persistent terminal lives on `SessionVm`. On startup the first selected session swaps its loading-placeholder `SessionVm` for the attached `SessionVm` under the same `triage / <sid>` key, so Flutter reuses the `_TerminalPaneState` (calls `didUpdateWidget`, not `initState`) and the new terminal's `onOutput` was never rebound — leaving input dead until a fresh pane mounts (new session, or switching away and back). Fix: rebind `onOutput` (and refocus) in `didUpdateWidget` when the terminal instance changes. The web pane already rebinds its `_sessionInputRouter` on controller change, so it was unaffected.
 
 ## What Changed
 - `flutter/triage_client/pubspec.yaml` — Upgraded to `xterm: ^4.0.0` dependency.
@@ -52,14 +72,31 @@
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Refactored `TerminalPane` state to use the persistent terminal, removing direct write/clear listeners and simplifying layout/didUpdateWidget lifecycle logic.
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Wrapped native `TerminalView` with `LayoutBuilder` to compute and trigger terminal resizes dynamically during parent layout changes.
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Added back didUpdateWidget check for `replayRevision`, `isExited`, and `replayPending` to trigger terminal buffer redraws on snapshot reflows.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Removed constant-based `LayoutBuilder` terminal resizing; the native xterm render path now resizes from measured glyph metrics and continues to report those dimensions through the existing `onResize` callback.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Pinned native `TerminalView` text rendering to Menlo with explicit monospace fallbacks.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Changed native initial replay to return success/failure and defer replay/reset while `replayPending` is true.
+- `flutter/triage_client/lib/main.dart` — Added `SessionVm` pending terminal writes with optional daemon output sequence metadata, snapshot-pending state helpers, and replay-complete flushing.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` and `terminal_pane_web.dart` — Added a replay-complete callback so `SessionVm` flushes only after the platform terminal has replayed snapshot content.
+- `flutter/triage_client/test/widget_test.dart` — Added direct tests for buffering live output before initial replay and during live snapshot refresh, including sequence-based duplicate suppression.
 - `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Aligned constructor parameters to maintain cross-platform compilation.
 - `flutter/triage_client/test/widget_test.dart` — Updated the viewport-estimated dimensions assertions to match the corrected vertical padding dimensions (`92x38`).
+- `flutter/triage_client/lib/main.dart` — Added per-session UTF-8 carry handling so incomplete trailing byte sequences are held until the next daemon `Output` event before decoding.
+- `flutter/triage_client/test/widget_test.dart` — Added coverage for a box-drawing glyph split across daemon output events and verified it does not render replacement characters.
+- `flutter/triage_client/lib/main.dart` — Associated pending UTF-8 carry bytes with daemon `output_seq` and clears them when snapshot replay has already covered the completed glyph.
+- `flutter/triage_client/test/widget_test.dart` — Added coverage for stale UTF-8 carry bytes being dropped after a snapshot catches up past a split glyph.
+- `flutter/triage_client/lib/main.dart` — Added a per-session `focusCursorRevision` and increments it when a session rail row is selected.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Added a native `ScrollController` for `TerminalView`; first replay scrolls to the cursor, and rail selection scrolls and focuses the terminal.
+- `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Mirrored the cursor-focus revision with `xterm.js` `scrollToBottom()` and terminal activation for the web client.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Focuses the native terminal after initial replay, enables `TerminalView` autofocus, and focuses on terminal pointer-down/tap.
+- `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Focuses the web terminal after initial replay and activates xterm on container mouse-down as well as click.
+- `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Rebind native terminal keyboard output (`onOutput`) and refocus in `didUpdateWidget` when the persistent `SessionVm.terminal` instance changes, so the first session shown accepts input after its loading-placeholder-to-attached swap reuses the same `_TerminalPaneState`.
 
 ## Commits
 - c32d1e6 — feat: scaffold flutter mobile client and integrate native interactive terminal
 - aca982f — feat: scaffold Windows and Linux desktop runner platforms
 - c4aedc5 — feat(client): polish macOS triage client
-- HEAD — fix(client): restore terminal didUpdateWidget lifecycle hooks for resize reflow
+- 64ec88f — fix(client): restore terminal didUpdateWidget lifecycle hooks for resize reflow
+- HEAD — fix(client): bind terminal input on session swap and land cursor-focus work
 
 ## Progress
 - 2026-05-31T18:00-0700 — Created git worktree and branch `feat/flutter-mobile-client`.
@@ -81,3 +118,16 @@
 - 2026-06-02T00:15-0700 — Resolved a subtle cell width estimation bug (`averageCellWidth` was `9.0` instead of the actual font's `9.92`), which caused initial estimated/restored session widths to be larger than the actual fitted layout, leading to narrow-wrapping staircasing on sidebar collapse. Updated `averageCellWidth` to `9.92`, updated test assertions in `widget_test.dart` to expect `84` columns instead of `92`, successfully ran and passed all 73 widget tests, and rebuilt/redeployed the clients and binaries.
 - 2026-06-02T00:35-0700 — Wrapped the interactive native `TerminalView` with a `LayoutBuilder` to dynamically resize `_terminal` on sidebar collapse, successfully compiled web and macOS clients, built and installed release targets, redeployed Triage.app to `/Applications/Triage.app`, and verified all 73/73 tests pass.
 - 2026-06-02T00:50-0700 — Restored the didUpdateWidget lifecycle checks in terminal_pane_stub.dart, successfully compiled and deployed web, macOS, and Rust binary targets, and verified that the terminal layout correctly reflows in Triage.app without wrapping or split lines.
+- 2026-06-02T00:55-0700 — Diagnosed remaining unnecessary visual wraps as a native sizing race between app-level estimated columns and `package:xterm` measured auto-resize. Removed the speculative resize so initial replay and resize-out requests use the measured terminal dimensions.
+- 2026-06-02T00:57-0700 — Verified the native terminal sizing change with `flutter test test/cursor_position_test.dart test/widget_test.dart` from `flutter/triage_client`; all 54 focused tests passed.
+- 2026-06-02T01:04-0700 — After the rebuilt app still rendered text incorrectly, treated the remaining issue as a native font/glyph metrics mismatch. Set the terminal primary font to Menlo and verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`; all 54 focused tests passed.
+- 2026-06-02T01:12-0700 — Diagnosed intermittent blank/stale first paint as native replay completion racing pending snapshot refreshes. Deferred initial replay completion and terminal reset while `replayPending` is true, then verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`; all 54 focused tests passed.
+- 2026-06-02T01:46-0700 — Addressed the critical review finding that live daemon output could mutate the persistent native terminal before replay completed. Added sequence-aware buffering in `SessionVm`, wired replay-complete callbacks through native and web panes, and verified with the full Flutter suite (`flutter test`); all 75 tests passed.
+- 2026-06-02T02:02-0700 — Fixed split horizontal rule rendering by preserving partial UTF-8 sequences across daemon output chunks. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart` and the full `flutter test`; all 76 tests passed.
+- 2026-06-02T10:10-0700 — Hardened split-glyph handling across snapshot replay by clearing stale pending UTF-8 carry bytes once the replayed snapshot has moved past them. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart` and the full `flutter test`; all 77 tests passed.
+- 2026-06-02T10:21-0700 — Built the macOS release app with `flutter build macos`, copied the rebuilt `Triage.app` to `/Applications/Triage.app`, and verified the installed bundle exists with size 41M.
+- 2026-06-02T16:04-0700 — Added cursor-focused terminal scrolling and focus on session-rail selection. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`, full `flutter test`, and `flutter build web`.
+- 2026-06-02T16:12-0700 — Built the macOS release app with `flutter build macos`, copied the rebuilt `Triage.app` to `/Applications/Triage.app`, and verified the installed bundle exists with size 41M.
+- 2026-06-02T16:29-0700 — Fixed terminal input focus after initial replay and direct terminal taps. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`, full `flutter test`, and `flutter build web`.
+- 2026-06-02T16:34-0700 — Built the macOS release app with `flutter build macos`, copied the rebuilt `Triage.app` to `/Applications/Triage.app`, and verified the installed bundle exists with size 41M.
+- 2026-06-02T16:43-0700 — Fixed dead keyboard input on the first session shown: the native pane now rebinds `xt.Terminal.onOutput` (and refocuses) in `didUpdateWidget` when the persistent `SessionVm.terminal` instance changes, since the loading-placeholder-to-attached swap reuses the same `_TerminalPaneState` under an identical `triage / <sid>` key. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`; all 58 tests passed.

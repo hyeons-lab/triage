@@ -7,6 +7,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:triage_client/main.dart';
+import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
@@ -503,6 +504,108 @@ Future<void> withPlatform(
 }
 
 void main() {
+  SessionVm terminalBufferSession() {
+    return SessionVm(
+      title: 'triage / live',
+      branch: 'main',
+      status: 'attached',
+      statusColor: const Color(0xff7fd1c7),
+      icon: const IconData(0xf0e2, fontFamily: 'MaterialIcons'),
+      rows: const [
+        StyledRow(
+          spans: [StyledSpan(text: 'snapshot', style: TerminalStyle())],
+        ),
+      ],
+      outputSeq: 0,
+      isRemote: true,
+    );
+  }
+
+  void resetTerminal(SessionVm session) {
+    session.terminal.useMainBuffer();
+    session.terminal.mainBuffer.clear();
+    session.terminal.altBuffer.clear();
+    session.terminal.write('\x1b[H\x1b[2J\x1b[3J');
+  }
+
+  test('buffers live terminal output until initial replay is written', () {
+    final session = terminalBufferSession();
+
+    session.terminalController.write('live-before-replay');
+    expect(session.terminal.buffer.lines[0].toString(), isEmpty);
+
+    session.terminal.write('snapshot');
+    session.markInitialContentWritten();
+    session.flushPendingTerminalWritesAfterReplay();
+
+    expect(
+      session.terminal.buffer.lines[0].toString(),
+      'snapshotlive-before-replay',
+    );
+  });
+
+  test('preserves box drawing glyphs split across output events', () {
+    final session = terminalBufferSession();
+    session.markInitialContentWritten();
+    final bytes = utf8.encode('──');
+
+    final firstChunk = session.decodeOutputBytes(
+      bytes.sublist(0, 2),
+      outputSeq: 1,
+    );
+    session.writeOutput(firstChunk, outputSeq: 1);
+    expect(session.terminal.buffer.lines[0].toString(), isEmpty);
+
+    final secondChunk = session.decodeOutputBytes(
+      bytes.sublist(2),
+      outputSeq: 2,
+    );
+    session.writeOutput(secondChunk, outputSeq: 2);
+
+    expect(session.terminal.buffer.lines[0].toString(), '──');
+    expect(session.terminal.buffer.lines[0].toString(), isNot(contains('�')));
+  });
+
+  test('drops pending utf8 bytes when snapshot covers the split glyph', () {
+    final session = terminalBufferSession();
+    final bytes = utf8.encode('─');
+
+    expect(
+      session.decodeOutputBytes(bytes.sublist(0, 2), outputSeq: 1),
+      isEmpty,
+    );
+    session.markReplaySnapshotOutputSeq(2);
+
+    expect(
+      session.decodeOutputBytes(utf8.encode('next'), outputSeq: 3),
+      'next',
+    );
+  });
+
+  test('buffers live terminal output while snapshot refresh is pending', () {
+    final session = terminalBufferSession();
+    session.markInitialContentWritten();
+    session.terminal.write('old');
+
+    session.setSnapshotRefreshPending(true);
+    session.writeOutput('covered-by-snapshot', outputSeq: 5);
+    session.writeOutput('newer-than-snapshot', outputSeq: 6);
+    expect(session.terminal.buffer.lines[0].toString(), 'old');
+
+    session.markReplaySnapshotOutputSeq(5);
+    session.setSnapshotRefreshPending(false);
+    expect(session.terminal.buffer.lines[0].toString(), 'old');
+
+    resetTerminal(session);
+    session.terminal.write('snapshot');
+    session.flushPendingTerminalWritesAfterReplay();
+
+    expect(
+      session.terminal.buffer.lines[0].toString(),
+      'snapshotnewer-than-snapshot',
+    );
+  });
+
   test('chooses new-session shell options by platform', () {
     expect(newSessionShellMenuOrderForPlatform(TargetPlatform.windows), [
       NewSessionShell.cmd,

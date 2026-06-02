@@ -107,7 +107,7 @@ class SessionVm {
       onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
     );
     terminalController.addWriteListener((data) {
-      terminal.write(data);
+      _writeTerminalOrBuffer(data);
     });
     terminalController.addClearListener(() {
       try {
@@ -136,6 +136,7 @@ class SessionVm {
   bool isExited;
   int replayRevision = 0;
   int resyncRevision = 0;
+  int focusCursorRevision = 0;
   bool initialContentWritten = false;
   bool snapshotRefreshPending = false;
   int? lastFittedCols;
@@ -146,13 +147,141 @@ class SessionVm {
 
   late final xt.Terminal terminal;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
+  final List<_PendingTerminalWrite> _pendingTerminalWrites = [];
+  final List<int> _pendingUtf8OutputBytes = [];
+  int? _pendingUtf8OutputSeq;
+  int? _nextTerminalWriteOutputSeq;
+  int? _lastReplayOutputSeq;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
     final parts = title.split(' / ');
     return parts.length > 1 ? parts[1] : null;
   }
+
+  bool get _shouldBufferTerminalWrites =>
+      !initialContentWritten || snapshotRefreshPending;
+
+  void writeOutput(String data, {int? outputSeq}) {
+    _nextTerminalWriteOutputSeq = outputSeq;
+    try {
+      terminalController.write(data);
+    } finally {
+      _nextTerminalWriteOutputSeq = null;
+    }
+  }
+
+  String decodeOutputBytes(List<int> bytes, {int? outputSeq}) {
+    final combined = _pendingUtf8OutputBytes.isEmpty
+        ? List<int>.from(bytes)
+        : <int>[..._pendingUtf8OutputBytes, ...bytes];
+    _pendingUtf8OutputBytes.clear();
+
+    final trailingIncomplete = _trailingIncompleteUtf8ByteCount(combined);
+    final decodeEnd = combined.length - trailingIncomplete;
+    if (trailingIncomplete > 0) {
+      _pendingUtf8OutputBytes.addAll(combined.sublist(decodeEnd));
+      _pendingUtf8OutputSeq = outputSeq ?? _pendingUtf8OutputSeq;
+    } else {
+      _pendingUtf8OutputSeq = null;
+    }
+    if (decodeEnd == 0) {
+      return '';
+    }
+    return utf8.decode(combined.sublist(0, decodeEnd), allowMalformed: true);
+  }
+
+  void _writeTerminalOrBuffer(String data) {
+    if (_shouldBufferTerminalWrites) {
+      _pendingTerminalWrites.add(
+        _PendingTerminalWrite(data, _nextTerminalWriteOutputSeq),
+      );
+      return;
+    }
+    terminal.write(data);
+  }
+
+  void markInitialContentWritten() {
+    initialContentWritten = true;
+  }
+
+  void setSnapshotRefreshPending(bool pending) {
+    snapshotRefreshPending = pending;
+  }
+
+  void markReplaySnapshotOutputSeq(int? outputSeq) {
+    _lastReplayOutputSeq = outputSeq;
+    final pendingUtf8OutputSeq = _pendingUtf8OutputSeq;
+    if (outputSeq != null &&
+        pendingUtf8OutputSeq != null &&
+        outputSeq > pendingUtf8OutputSeq) {
+      _pendingUtf8OutputBytes.clear();
+      _pendingUtf8OutputSeq = null;
+    }
+  }
+
+  void flushPendingTerminalWritesAfterReplay() {
+    if (_shouldBufferTerminalWrites || _pendingTerminalWrites.isEmpty) {
+      return;
+    }
+    final writes = List<_PendingTerminalWrite>.from(_pendingTerminalWrites);
+    _pendingTerminalWrites.clear();
+    for (final write in writes) {
+      final replayOutputSeq = _lastReplayOutputSeq;
+      final writeOutputSeq = write.outputSeq;
+      if (replayOutputSeq != null &&
+          writeOutputSeq != null &&
+          writeOutputSeq <= replayOutputSeq) {
+        continue;
+      }
+      terminal.write(write.data);
+    }
+    _lastReplayOutputSeq = null;
+  }
+
+  void focusCursorOnNextDisplay() {
+    focusCursorRevision += 1;
+  }
 }
+
+class _PendingTerminalWrite {
+  const _PendingTerminalWrite(this.data, this.outputSeq);
+
+  final String data;
+  final int? outputSeq;
+}
+
+int _trailingIncompleteUtf8ByteCount(List<int> bytes) {
+  if (bytes.isEmpty) return 0;
+  final startLimit = max(0, bytes.length - 4);
+  for (var start = bytes.length - 1; start >= startLimit; start--) {
+    final expectedLength = _utf8SequenceLength(bytes[start]);
+    if (expectedLength == 0) {
+      continue;
+    }
+    final available = bytes.length - start;
+    if (available >= expectedLength) {
+      return 0;
+    }
+    for (var index = start + 1; index < bytes.length; index++) {
+      if (!_isUtf8ContinuationByte(bytes[index])) {
+        return 0;
+      }
+    }
+    return available;
+  }
+  return 0;
+}
+
+int _utf8SequenceLength(int byte) {
+  if (byte < 0x80) return 1;
+  if (byte >= 0xC2 && byte <= 0xDF) return 2;
+  if (byte >= 0xE0 && byte <= 0xEF) return 3;
+  if (byte >= 0xF0 && byte <= 0xF4) return 4;
+  return 0;
+}
+
+bool _isUtf8ContinuationByte(int byte) => byte >= 0x80 && byte <= 0xBF;
 
 class TriageHome extends StatefulWidget {
   const TriageHome({super.key, this.client});
@@ -876,7 +1005,7 @@ class _TriageHomeState extends State<TriageHome> {
               }
               _sessions[existingIndex] = session;
               if (includeHistory) {
-                session.snapshotRefreshPending = true;
+                session.setSnapshotRefreshPending(true);
               }
             });
             _drainPendingEvents(sid);
@@ -1254,13 +1383,13 @@ class _TriageHomeState extends State<TriageHome> {
         final output = event['Output'] as Map<String, dynamic>;
         final outputSeq = output['output_seq'] as int? ?? 0;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
-        final text = utf8.decode(bytes, allowMalformed: true);
 
         // Filter out any duplicate welcome messages or output
         // already incorporated in the attached session snapshot.
         if (outputSeq <= session.outputSeq) {
           return;
         }
+        final text = session.decodeOutputBytes(bytes, outputSeq: outputSeq);
 
         // Translate bare newlines to \r\n to prevent stair-casing layout formatting issues in the client-side terminal emulator.
         // We use a high-performance two-step replacement to ensure compatibility on older JS engines.
@@ -1273,7 +1402,7 @@ class _TriageHomeState extends State<TriageHome> {
         // intentionally does not mutate the fallback row buffer, since naive
         // string-append corrupts it with literal ANSI escapes and CR overstrikes
         // that the replay path would later re-execute as garbled duplicate text.
-        session.terminalController.write(translatedText);
+        session.writeOutput(translatedText, outputSeq: outputSeq);
         session.outputSeq = outputSeq;
       } else if (event.containsKey('Exited')) {
         if (mounted) {
@@ -1361,7 +1490,11 @@ class _TriageHomeState extends State<TriageHome> {
       session.rows
         ..clear()
         ..addAll(rows);
-      session.outputSeq = snapshot['output_seq'] as int? ?? session.outputSeq;
+      final snapshotOutputSeq = snapshot['output_seq'] as int?;
+      session.markReplaySnapshotOutputSeq(snapshotOutputSeq);
+      if (snapshotOutputSeq != null) {
+        session.outputSeq = max(session.outputSeq, snapshotOutputSeq);
+      }
       session.initialCursorRow = initialCursorRow;
       session.initialCursorCol = initialCursorCol;
       session.isExited = exited;
@@ -1434,9 +1567,10 @@ class _TriageHomeState extends State<TriageHome> {
         session.isRemote &&
         _sessionIdFor(session) != null;
     setState(() {
+      session.focusCursorOnNextDisplay();
       _selectedIndex = index;
       if (shouldRefresh) {
-        session.snapshotRefreshPending = true;
+        session.setSnapshotRefreshPending(true);
       }
     });
     unawaited(
@@ -1458,7 +1592,7 @@ class _TriageHomeState extends State<TriageHome> {
     if (sessionId == null) return;
     if (markPending && mounted && !_disposed) {
       setState(() {
-        session.snapshotRefreshPending = true;
+        session.setSnapshotRefreshPending(true);
       });
     }
     try {
@@ -1538,7 +1672,7 @@ class _TriageHomeState extends State<TriageHome> {
     } finally {
       if (mounted && !_disposed) {
         setState(() {
-          session.snapshotRefreshPending = false;
+          session.setSnapshotRefreshPending(false);
         });
       }
     }
@@ -2259,9 +2393,13 @@ class SessionWorkspace extends StatelessWidget {
               session.onTerminalResize = callback;
             },
             resyncRevision: session.resyncRevision,
+            focusCursorRevision: session.focusCursorRevision,
             initialContentWritten: session.initialContentWritten,
             onInitialContentWritten: () {
-              session.initialContentWritten = true;
+              session.markInitialContentWritten();
+            },
+            onReplayContentWritten: () {
+              session.flushPendingTerminalWritesAfterReplay();
             },
             initialCursorRow: session.initialCursorRow,
             initialCursorCol: session.initialCursorCol,
