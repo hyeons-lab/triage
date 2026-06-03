@@ -1,6 +1,6 @@
 [package]
 name = "triaged"
-description = "Long-running daemon that owns Triage terminal session state."
+description = "Long-running daemon that owns Triage terminal session state and serves a built-in web client and WebSocket API for PIN-paired remote attach."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
