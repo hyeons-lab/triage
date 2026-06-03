@@ -20,14 +20,17 @@ Design choices:
 - A `.app` is a bundle (directory), so it is zipped with `ditto -c -k --keepParent`
   (preserves bundle structure / macOS metadata) before attaching.
 - `softprops/action-gh-release@v2` creates the `v<version>` tag + release and uploads
-  the asset; this needs top-level `permissions: contents: write`.
+  the asset; this needs `contents: write`, granted at the **job level on `release`
+  only** (least privilege) so the workflow stays `contents: read` and the `publish`
+  job and its third-party actions get no write access.
 - The app is ad-hoc signed (`CODE_SIGN_IDENTITY = "-"`), so the CI build needs no signing
   secrets.
 
 ## Plan
 
-1. `permissions: contents: read` -> `write`.
-2. Add a `version` output + `cargo metadata` step to the `publish` job.
+1. Keep workflow-level `permissions: contents: read`; grant `contents: write` only on the
+   `release` job.
+2. Add a `version` output + `cargo metadata --locked` step to the `publish` job.
 3. Add a `release` job (macos-latest, needs publish, if dry_run==false) that builds
    `Triage.app`, zips it, and creates the `v<version>` tag + GitHub release with the zip
    attached.

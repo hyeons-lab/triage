@@ -36,7 +36,7 @@ jobs:
       - name: Determine workspace version
         id: version
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 \
+          VERSION=$(cargo metadata --no-deps --locked --format-version 1 \
             | jq -r '.packages[] | select(.name == "triaged") | .version')
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             echo "Could not determine workspace version" >&2
