@@ -51,7 +51,7 @@ jobs:
           cache-bin: false
 
       - name: Install flatc
-        uses: Nugine/setup-flatc@v1
+        uses: ./.github/actions/setup-flatc
         with:
           version: "25.2.10"
 
