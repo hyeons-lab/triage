@@ -56,18 +56,51 @@ running shells.
 > [Pairing](#pairing)), so approving a remote client requires access to the
 > daemon machine itself.
 
-### Prebuilt macOS client
+### Prebuilt desktop clients
 
-Besides the browser UI, a native macOS desktop client — **`Triage.app`** — is
-published as an artifact on each GitHub release. Grab `Triage-macos-v<version>.zip`
-from the [Releases](https://github.com/hyeons-lab/triage/releases) page, unzip it,
-and point it at your daemon's address.
+Besides the browser UI, native desktop clients are published as artifacts on each
+GitHub release. Publishing a new `triaged` version automatically creates the
+`v<version>` tag, compiles the Flutter client on each platform, and attaches the
+builds to the [Releases](https://github.com/hyeons-lab/triage/releases) page:
 
-Each tagged version ships a matching build: publishing a new `triaged` version
-automatically creates the `v<version>` tag, compiles the macOS Flutter client, and
-attaches the zip to the release. The app is ad-hoc signed, so on first launch
-macOS Gatekeeper may require right-click → **Open** (or **System Settings →
-Privacy & Security → Open Anyway**).
+| Platform | Asset | Contains |
+| -------- | ----- | -------- |
+| macOS   | `Triage-macos-v<version>.zip`    | `Triage.app` |
+| Windows | `Triage-windows-v<version>.zip`  | `triage_client.exe` + DLLs + `data/` |
+| Linux   | `Triage-linux-v<version>.tar.gz` | `triage_client` + `lib/` + `data/` |
+
+Download the one for your OS, unpack it, and point it at your daemon's address.
+
+> **The release binaries are unsigned.** They are ad-hoc signed (macOS) or fully
+> unsigned (Windows/Linux) — no notarization and no code-signing certificate — so
+> each OS will warn before running them. This is expected for these builds; follow
+> the per-platform steps below, or build from source if you'd rather not bypass
+> those protections.
+
+**macOS** — unzip, then clear the download quarantine so Gatekeeper allows the app:
+
+```bash
+unzip Triage-macos-v<version>.zip
+# Remove the "downloaded from the internet" flag so macOS will run the unsigned app:
+xattr -dr com.apple.quarantine Triage.app
+open Triage.app
+```
+
+Without the terminal you can instead right-click `Triage.app` → **Open** → **Open**
+in the dialog (only needed once); if it's still blocked, allow it under **System
+Settings → Privacy & Security → Open Anyway**.
+
+**Windows** — unzip and run `triage_client.exe`. SmartScreen may show "Windows
+protected your PC" → choose **More info → Run anyway**.
+
+**Linux** — extract and run the binary. A Secret Service provider (e.g.
+`gnome-keyring`) must be available for the pairing token to persist:
+
+```bash
+tar -xzf Triage-linux-v<version>.tar.gz
+chmod +x triage_client
+./triage_client
+```
 
 ---
 
