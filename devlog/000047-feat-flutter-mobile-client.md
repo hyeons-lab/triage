@@ -20,6 +20,7 @@
 - 2026-06-02T16:29-0700 — Codex — Fixed terminal focus acquisition on initial display and direct terminal taps.
 - 2026-06-02T16:34-0700 — Codex — Rebuilt and reinstalled `/Applications/Triage.app` with the terminal input focus fix.
 - 2026-06-02T16:43-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Fixed dead keyboard input on the first session shown after the persistent-terminal swap.
+- 2026-06-02T17:00-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Persisted the native pairing token / client id in the platform Keychain so the macOS client no longer re-pairs on every launch.
 
 ## Intent
 - Scaffold mobile and macOS platform configurations for the triage client.
@@ -50,6 +51,9 @@
 - 2026-06-02T16:04-0700 — Preserve terminal scroll position during ordinary replays/resizes, but explicitly scroll to the cursor after the first replay and after a session is selected from the left rail. Rail selection increments a per-session focus revision so the platform terminal pane can focus and jump to the cursor without treating every snapshot refresh as a user-requested scroll.
 - 2026-06-02T16:29-0700 — Initial replay must request focus as well as scroll, otherwise the cursor is visible but inactive and key input is ignored. Native `TerminalView` also needs pointer-level focus handling because its internal gesture recognizers can consume the wrapper tap before the outer `GestureDetector` focuses the terminal.
 - 2026-06-02T16:43-0700 — The native pane binds keyboard output (`_terminal.onOutput = _onTerminalOutput`) only in `initState`, but the persistent terminal lives on `SessionVm`. On startup the first selected session swaps its loading-placeholder `SessionVm` for the attached `SessionVm` under the same `triage / <sid>` key, so Flutter reuses the `_TerminalPaneState` (calls `didUpdateWidget`, not `initState`) and the new terminal's `onOutput` was never rebound — leaving input dead until a fresh pane mounts (new session, or switching away and back). Fix: rebind `onOutput` (and refocus) in `didUpdateWidget` when the terminal instance changes. The web pane already rebinds its `_sessionInputRouter` on controller change, so it was unaffected.
+- 2026-06-02T17:00-0700 — Persist native credentials in the Keychain (`flutter_secure_storage`), not an in-memory stub. The old native `storage_stub.dart` only held the token/client id in static fields, so the macOS app lost them on quit and re-paired every launch; only the web build (localStorage) persisted. Chose the Keychain over a plaintext plist (`shared_preferences`) because the token is a bearer credential.
+- 2026-06-02T17:00-0700 — Bridge the sync storage API to the async Keychain by hydrating an in-memory cache once at startup (`loadCredentials()` awaited in `main()`), serving reads from the cache, and writing through to the Keychain in the background. Avoids making `initState` / the 2s credential watcher async.
+- 2026-06-02T17:00-0700 — Use the legacy file-based macOS keychain (`MacOsOptions(usesDataProtectionKeychain: false)`) and do NOT add a `keychain-access-groups` entitlement. The app is sandboxed and ad-hoc signed (`CODE_SIGN_IDENTITY = "-"`, no development team); the data-protection keychain would need a team-prefixed entitlement and fail with errSecMissingEntitlement (-34018), and adding the entitlement breaks the build by forcing development-certificate signing. A sandboxed app can read/write its own legacy-keychain items without that entitlement.
 
 ## What Changed
 - `flutter/triage_client/pubspec.yaml` — Upgraded to `xterm: ^4.0.0` dependency.
@@ -90,13 +94,23 @@
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Focuses the native terminal after initial replay, enables `TerminalView` autofocus, and focuses on terminal pointer-down/tap.
 - `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Focuses the web terminal after initial replay and activates xterm on container mouse-down as well as click.
 - `flutter/triage_client/lib/widgets/terminal_pane_stub.dart` — Rebind native terminal keyboard output (`onOutput`) and refocus in `didUpdateWidget` when the persistent `SessionVm.terminal` instance changes, so the first session shown accepts input after its loading-placeholder-to-attached swap reuses the same `_TerminalPaneState`.
+- `flutter/triage_client/lib/services/storage_native.dart` (renamed from `storage_stub.dart`) — Replaced the in-memory stub with Keychain-backed persistence via `flutter_secure_storage`: a sync in-memory cache hydrated by `loadCredentials()`, write-through persist/clear, and `MacOsOptions(usesDataProtectionKeychain: false)` for the legacy keychain. Guarded so it degrades to in-memory behavior when the plugin is absent (unit tests).
+- `flutter/triage_client/lib/services/storage.dart` — Switched the conditional import to `storage_native.dart` and exported the new async `loadCredentials()`.
+- `flutter/triage_client/lib/services/storage_web.dart` — Added a no-op `loadCredentials()` for parity (localStorage is already sync + persistent).
+- `flutter/triage_client/lib/main.dart` — Made `main()` async: `WidgetsFlutterBinding.ensureInitialized()` then `await loadCredentials()` before `runApp` so persisted credentials are available before the first frame.
+- `flutter/triage_client/pubspec.yaml` / `pubspec.lock` — Added `flutter_secure_storage`.
+- `flutter/triage_client/macos/Runner/{Release,DebugProfile}.entitlements` — Left unchanged after reverting a trial `keychain-access-groups` entitlement (incompatible with ad-hoc signing); the legacy keychain needs no entitlement.
+
+## Issues
+- 2026-06-02T17:00-0700 — Plan 000047-10 step 5 added a `keychain-access-groups` entitlement (per the flutter_secure_storage macOS docs), but `flutter build macos` failed: "Runner has entitlements that require signing with a development certificate." The project is ad-hoc signed (`CODE_SIGN_IDENTITY = "-"`, no `DEVELOPMENT_TEAM`), so a team-prefixed keychain group can't resolve. Deviation from the plan: dropped the entitlement entirely and switched macOS to the legacy keychain (`usesDataProtectionKeychain: false`), which a sandboxed app can use for its own items without any keychain entitlement. Verified at runtime: two consecutive launches leave the stored `triage_client_id` keychain item's creation date unchanged (single item, not regenerated), confirming read-back works.
 
 ## Commits
 - c32d1e6 — feat: scaffold flutter mobile client and integrate native interactive terminal
 - aca982f — feat: scaffold Windows and Linux desktop runner platforms
 - c4aedc5 — feat(client): polish macOS triage client
 - 64ec88f — fix(client): restore terminal didUpdateWidget lifecycle hooks for resize reflow
-- HEAD — fix(client): bind terminal input on session swap and land cursor-focus work
+- a0a08e7 — fix(client): bind terminal input on session swap
+- HEAD — fix(client): persist native pairing token in the Keychain
 
 ## Progress
 - 2026-05-31T18:00-0700 — Created git worktree and branch `feat/flutter-mobile-client`.
@@ -131,3 +145,4 @@
 - 2026-06-02T16:29-0700 — Fixed terminal input focus after initial replay and direct terminal taps. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`, full `flutter test`, and `flutter build web`.
 - 2026-06-02T16:34-0700 — Built the macOS release app with `flutter build macos`, copied the rebuilt `Triage.app` to `/Applications/Triage.app`, and verified the installed bundle exists with size 41M.
 - 2026-06-02T16:43-0700 — Fixed dead keyboard input on the first session shown: the native pane now rebinds `xt.Terminal.onOutput` (and refocuses) in `didUpdateWidget` when the persistent `SessionVm.terminal` instance changes, since the loading-placeholder-to-attached swap reuses the same `_TerminalPaneState` under an identical `triage / <sid>` key. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`; all 58 tests passed.
+- 2026-06-02T17:00-0700 — Fixed the macOS client re-pairing on every launch: native credentials were only held in an in-memory stub. Added Keychain persistence via `flutter_secure_storage` (sync cache hydrated by `loadCredentials()` awaited in `main()`, write-through, legacy macOS keychain). Reverted a trial `keychain-access-groups` entitlement that broke the ad-hoc-signed build. Verified `flutter test` (77 passed), `flutter build macos`, reinstalled `/Applications/Triage.app` (42M), and confirmed at runtime that the stored client-id keychain item is read back (stable creation date across two launches) rather than regenerated.

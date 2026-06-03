@@ -13,7 +13,11 @@ import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/storage.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Restore the persisted client id / pairing token from secure storage before
+  // the first frame so the app can reconnect without re-pairing on each launch.
+  await loadCredentials();
   runApp(const TriageClientApp());
 }
 
