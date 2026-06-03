@@ -1,0 +1,39 @@
+name: Setup flatc
+description: >-
+  Download a pinned FlatBuffers compiler (flatc) and add it to PATH. Implemented
+  as a composite action (no Node.js runtime) so it does not trigger the Node 20
+  deprecation warning that Nugine/setup-flatc@v1 does.
+
+inputs:
+  version:
+    description: FlatBuffers release version, without the leading "v".
+    required: false
+    default: "25.2.10"
+
+runs:
+  using: composite
+  steps:
+    # pwsh ships on all GitHub-hosted runners (Linux/macOS/Windows), so a single
+    # cross-platform step handles download + extraction without per-OS shells.
+    - name: Install flatc ${{ inputs.version }}
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = '${{ inputs.version }}'
+        $asset = switch ('${{ runner.os }}') {
+          'Linux'   { 'Linux.flatc.binary.clang++-18.zip' }
+          'macOS'   { 'Mac.flatc.binary.zip' }
+          'Windows' { 'Windows.flatc.binary.zip' }
+          default   { throw "Unsupported runner OS: ${{ runner.os }}" }
+        }
+        $url  = "https://github.com/google/flatbuffers/releases/download/v$version/$asset"
+        $dest = Join-Path $env:RUNNER_TEMP 'flatc'
+        $zip  = Join-Path $env:RUNNER_TEMP 'flatc.zip'
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        Write-Host "Downloading $url"
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Expand-Archive -Path $zip -DestinationPath $dest -Force
+        if ($IsLinux -or $IsMacOS) { chmod +x (Join-Path $dest 'flatc') }
+        # Put flatc on PATH for subsequent steps (triage-core's build.rs finds it there).
+        Add-Content -Path $env:GITHUB_PATH -Value $dest
+        & (Join-Path $dest ($IsWindows ? 'flatc.exe' : 'flatc')) --version

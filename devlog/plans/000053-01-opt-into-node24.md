@@ -26,3 +26,16 @@ action-gh-release) already support Node 24.
    of `.github/workflows/ci.yml` and `.github/workflows/publish.yml`.
 2. Validate YAML; commit devlog + plan + workflows; push; open PR. CI on the PR
    confirms the warning is gone and the build still passes.
+
+## Revision (2026-06-02T22:40-0700)
+
+Plan step 1 (`FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`) was tried and verified on CI: it
+switched setup-flatc to run on Node 24 but did NOT clear the warning — GitHub still
+flags any action whose manifest declares `using: node20` ("…being forced to run on
+Node.js 24"). Pivoted to the durable fix:
+
+1. Add a local composite action `.github/actions/setup-flatc/action.yml` (single
+   cross-platform `pwsh` step: download the pinned flatc for the runner OS, extract,
+   add to PATH). Composite actions have no Node runtime, so no deprecation warning.
+2. Replace the three `uses: Nugine/setup-flatc@v1` steps with `uses: ./.github/actions/setup-flatc`.
+3. Remove the `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` env (no node20 actions remain).
