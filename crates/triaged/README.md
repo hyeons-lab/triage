@@ -56,6 +56,19 @@ running shells.
 > [Pairing](#pairing)), so approving a remote client requires access to the
 > daemon machine itself.
 
+### Prebuilt macOS client
+
+Besides the browser UI, a native macOS desktop client — **`Triage.app`** — is
+published as an artifact on each GitHub release. Grab `Triage-macos-v<version>.zip`
+from the [Releases](https://github.com/hyeons-lab/triage/releases) page, unzip it,
+and point it at your daemon's address.
+
+Each tagged version ships a matching build: publishing a new `triaged` version
+automatically creates the `v<version>` tag, compiles the macOS Flutter client, and
+attaches the zip to the release. The app is ad-hoc signed, so on first launch
+macOS Gatekeeper may require right-click → **Open** (or **System Settings →
+Privacy & Security → Open Anyway**).
+
 ---
 
 ## Pairing

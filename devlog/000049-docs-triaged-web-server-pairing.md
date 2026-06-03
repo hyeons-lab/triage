@@ -9,6 +9,7 @@
 ## What Changed
 - 2026-06-02T18:53-0700 `crates/triaged/Cargo.toml` — Broadened the crates.io `description` to mention the built-in web client + WebSocket API and PIN-paired remote attach.
 - 2026-06-02T18:53-0700 `crates/triaged/README.md` — Added "Web Server & Connecting" (default `127.0.0.1:7777` loopback bind serving the web UI at `/`, the WebSocket API at `/ws`, and `/pair`; binding a routable address via `~/.config/triage/config.toml`) and "Pairing" (device-code → loopback-only PIN approval → bearer-token flow).
+- 2026-06-02T20:05-0700 `crates/triaged/README.md` — Added a "Prebuilt macOS client" subsection noting that `Triage.app` is attached to each GitHub release as `Triage-macos-v<version>.zip`, auto-built/tagged on publish by the workflow merged in PR #57, plus an ad-hoc-signing Gatekeeper note.
 
 ## Decisions
 - 2026-06-02T18:53-0700 Documented pairing around the loopback/same-host approval gate (`is_local_pairing_peer`): a remote client can request a challenge but only someone with local access to the daemon host can open `/pair`, approve the device code, and read the device-bound PIN.
