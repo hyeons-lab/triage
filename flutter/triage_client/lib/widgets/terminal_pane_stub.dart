@@ -14,7 +14,6 @@ class TerminalPane extends StatefulWidget {
     required this.fallbackRows,
     required this.terminal,
     required this.onTerminalResizeBind,
-    required this.resyncRevision,
     required this.focusCursorRevision,
     required this.initialContentWritten,
     this.onInitialContentWritten,
@@ -32,7 +31,6 @@ class TerminalPane extends StatefulWidget {
   final xt.Terminal terminal;
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
-  final int resyncRevision;
   final int focusCursorRevision;
   final bool initialContentWritten;
   final VoidCallback? onInitialContentWritten;
@@ -117,11 +115,24 @@ class _TerminalPaneState extends State<TerminalPane> {
   void initState() {
     super.initState();
     widget.onTerminalResizeBind?.call(_onTerminalResize);
-    _terminal.onOutput = _onTerminalOutput;
+    _bindTerminal(_terminal);
     _bindController();
     if (widget.focusCursorRevision > 0) {
       _focusCursorNowAndAfterReplay();
     }
+  }
+
+  // The persistent terminal lives on SessionVm, so it can be swapped underneath
+  // this State (a session swap reuses the State under the same `triage / <sid>`
+  // key). Bind keyboard output through a paired seam — mirroring the controller
+  // binding — so initState and didUpdateWidget can't drift and leave the new
+  // terminal's onOutput null (which silently drops every keystroke).
+  void _bindTerminal(xt.Terminal terminal) {
+    terminal.onOutput = _onTerminalOutput;
+  }
+
+  void _unbindTerminal(xt.Terminal terminal) {
+    terminal.onOutput = null;
   }
 
   void _bindController() {
@@ -139,22 +150,27 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.onTerminalResizeBind?.call(null);
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
+
+    // A session swap changes the terminal, the controller, and the replay
+    // revision in one update. Replaying is idempotent but expensive (a full
+    // buffer reset plus a complete ANSI rebuild of every row), so coalesce the
+    // triggers and run it at most once per update.
+    var replayed = false;
+    void replayOnce() {
+      if (replayed) return;
+      replayed = true;
+      _triggerFullReplayOrReset();
+    }
+
     if (!identical(oldWidget.terminal, widget.terminal)) {
-      // The persistent terminal instance lives on SessionVm, so a session swap
-      // (e.g. the loading placeholder being replaced by the attached session,
-      // which shares the same `triage / <sid>` key) reuses this State without
-      // re-running initState. Rebind keyboard output to the new terminal —
-      // otherwise its onOutput stays null and every keystroke is silently
-      // dropped — and refocus so the swapped-in terminal accepts input.
-      oldWidget.terminal.onOutput = null;
-      _terminal.onOutput = _onTerminalOutput;
+      _unbindTerminal(oldWidget.terminal);
+      _bindTerminal(widget.terminal);
       _focusCursorNowAndAfterReplay();
     }
-    if (oldWidget.resyncRevision != widget.resyncRevision ||
-        oldWidget.replayRevision != widget.replayRevision ||
+    if (oldWidget.replayRevision != widget.replayRevision ||
         oldWidget.isExited != widget.isExited ||
         (oldWidget.replayPending && !widget.replayPending)) {
-      _triggerFullReplayOrReset();
+      replayOnce();
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
@@ -162,13 +178,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (oldWidget.controller != widget.controller) {
       _unbindController(oldWidget.controller);
       _bindController();
-      _triggerFullReplayOrReset();
+      replayOnce();
     }
   }
 
   @override
   void dispose() {
     widget.onTerminalResizeBind?.call(null);
+    _unbindTerminal(_terminal);
     _unbindController(widget.controller);
     _scrollController.dispose();
     _focusNode.dispose();

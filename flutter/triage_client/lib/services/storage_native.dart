@@ -14,7 +14,6 @@ const _tokenStorageKey = 'triage_bearer_token';
 const _clientIdStorageKey = 'triage_client_id';
 
 const _secureStorage = FlutterSecureStorage(
-  aOptions: AndroidOptions(encryptedSharedPreferences: true),
   // The app is sandboxed and ad-hoc signed (no development team), so it cannot
   // use the data-protection keychain (that needs a team-prefixed
   // keychain-access-group entitlement and would fail with errSecMissingEntitlement
@@ -33,8 +32,14 @@ bool _loaded = false;
 Future<void> loadCredentials() async {
   if (_loaded) return;
   try {
-    _cachedToken = await _secureStorage.read(key: _tokenStorageKey);
-    _cachedClientId = await _secureStorage.read(key: _clientIdStorageKey);
+    // Independent reads — run them concurrently so we don't serialize two
+    // Keychain round trips ahead of the first frame.
+    final values = await Future.wait([
+      _secureStorage.read(key: _tokenStorageKey),
+      _secureStorage.read(key: _clientIdStorageKey),
+    ]);
+    _cachedToken = values[0];
+    _cachedClientId = values[1];
   } catch (_) {
     // Keychain unavailable; keep whatever is already in the cache.
   }
@@ -66,13 +71,9 @@ void clearClientId() {
 }
 
 void _writeThrough(String key, String value) {
-  try {
-    _secureStorage.write(key: key, value: value).catchError((_) {});
-  } catch (_) {}
+  _secureStorage.write(key: key, value: value).catchError((_) {});
 }
 
 void _deleteThrough(String key) {
-  try {
-    _secureStorage.delete(key: key).catchError((_) {});
-  } catch (_) {}
+  _secureStorage.delete(key: key).catchError((_) {});
 }

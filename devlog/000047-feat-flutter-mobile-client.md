@@ -21,6 +21,7 @@
 - 2026-06-02T16:34-0700 — Codex — Rebuilt and reinstalled `/Applications/Triage.app` with the terminal input focus fix.
 - 2026-06-02T16:43-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Fixed dead keyboard input on the first session shown after the persistent-terminal swap.
 - 2026-06-02T17:00-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Persisted the native pairing token / client id in the platform Keychain so the macOS client no longer re-pairs on every launch.
+- 2026-06-02T17:35-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Ran a 4-agent `/simplify` cleanup pass over the branch's client code (reuse, simplification, efficiency, altitude) and applied the contained, behavior-preserving fixes.
 
 ## Intent
 - Scaffold mobile and macOS platform configurations for the triage client.
@@ -100,6 +101,11 @@
 - `flutter/triage_client/lib/main.dart` — Made `main()` async: `WidgetsFlutterBinding.ensureInitialized()` then `await loadCredentials()` before `runApp` so persisted credentials are available before the first frame.
 - `flutter/triage_client/pubspec.yaml` / `pubspec.lock` — Added `flutter_secure_storage`.
 - `flutter/triage_client/macos/Runner/{Release,DebugProfile}.entitlements` — Left unchanged after reverting a trial `keychain-access-groups` entitlement (incompatible with ad-hoc signing); the legacy keychain needs no entitlement.
+- 2026-06-02T17:35-0700 (/simplify cleanup) — `terminal_pane_web.dart` — Dropped private `_clipRowToCols`/`_styledSpanToAnsi`/`_styledRowToAnsi` copies and call the shared `terminal_replay.dart` helpers, matching the native pane (~50 lines removed).
+- 2026-06-02T17:35-0700 (/simplify cleanup) — `main.dart`, `terminal_pane_stub.dart`, `terminal_pane_web.dart` — Removed the redundant `SessionVm.resyncRevision` (always mutated in lockstep with `replayRevision`, and a dead prop on the web pane): the field, both `TerminalPane` constructor params, both assignments, and the duplicate `didUpdateWidget` branch.
+- 2026-06-02T17:35-0700 (/simplify cleanup) — `main.dart` — Collapsed `_snapshotFromResponse`'s four-branch `is Map` ladder into a small `_asMap` helper.
+- 2026-06-02T17:35-0700 (/simplify cleanup) — `storage_native.dart` — Removed `try/catch` double-guarding around `.catchError` in the write-through helpers, ran the two startup Keychain reads concurrently via `Future.wait`, and dropped the deprecated `encryptedSharedPreferences` Android option.
+- 2026-06-02T17:35-0700 (/simplify cleanup) — `terminal_pane_stub.dart` — Centralized `xt.Terminal.onOutput` binding into a `_bindTerminal`/`_unbindTerminal` seam (used from initState/swap/dispose) so the two lifecycle paths can't drift, and coalesced `didUpdateWidget` so the expensive full replay runs at most once per update on a session swap.
 
 ## Issues
 - 2026-06-02T17:00-0700 — Plan 000047-10 step 5 added a `keychain-access-groups` entitlement (per the flutter_secure_storage macOS docs), but `flutter build macos` failed: "Runner has entitlements that require signing with a development certificate." The project is ad-hoc signed (`CODE_SIGN_IDENTITY = "-"`, no `DEVELOPMENT_TEAM`), so a team-prefixed keychain group can't resolve. Deviation from the plan: dropped the entitlement entirely and switched macOS to the legacy keychain (`usesDataProtectionKeychain: false`), which a sandboxed app can use for its own items without any keychain entitlement. Verified at runtime: two consecutive launches leave the stored `triage_client_id` keychain item's creation date unchanged (single item, not regenerated), confirming read-back works.
@@ -110,7 +116,8 @@
 - c4aedc5 — feat(client): polish macOS triage client
 - 64ec88f — fix(client): restore terminal didUpdateWidget lifecycle hooks for resize reflow
 - a0a08e7 — fix(client): bind terminal input on session swap
-- HEAD — fix(client): persist native pairing token in the Keychain
+- 5c47d9b — fix(client): persist native pairing token in the Keychain
+- HEAD — refactor(client): simplify terminal panes and native storage
 
 ## Progress
 - 2026-05-31T18:00-0700 — Created git worktree and branch `feat/flutter-mobile-client`.
@@ -146,3 +153,4 @@
 - 2026-06-02T16:34-0700 — Built the macOS release app with `flutter build macos`, copied the rebuilt `Triage.app` to `/Applications/Triage.app`, and verified the installed bundle exists with size 41M.
 - 2026-06-02T16:43-0700 — Fixed dead keyboard input on the first session shown: the native pane now rebinds `xt.Terminal.onOutput` (and refocuses) in `didUpdateWidget` when the persistent `SessionVm.terminal` instance changes, since the loading-placeholder-to-attached swap reuses the same `_TerminalPaneState` under an identical `triage / <sid>` key. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`; all 58 tests passed.
 - 2026-06-02T17:00-0700 — Fixed the macOS client re-pairing on every launch: native credentials were only held in an in-memory stub. Added Keychain persistence via `flutter_secure_storage` (sync cache hydrated by `loadCredentials()` awaited in `main()`, write-through, legacy macOS keychain). Reverted a trial `keychain-access-groups` entitlement that broke the ad-hoc-signed build. Verified `flutter test` (77 passed), `flutter build macos`, reinstalled `/Applications/Triage.app` (42M), and confirmed at runtime that the stored client-id keychain item is read back (stable creation date across two launches) rather than regenerated.
+- 2026-06-02T17:35-0700 — Ran a 4-agent `/simplify` cleanup pass (reuse/simplification/efficiency/altitude) over the branch client code and applied the contained fixes: web pane reuses shared ANSI helpers, removed the redundant `resyncRevision`, `_asMap` helper for snapshot extraction, concurrent startup Keychain reads, de-double-guarded write-through, `_bindTerminal` seam, and coalesced the double replay on session swap. Net −60 lines. Verified `flutter analyze` (no new issues), `flutter test` (77 passed), and `flutter build macos`. Skipped larger refactors (web `TerminalPane` contract split, shared replay-suppression state machine) as out of scope for a cleanup pass.

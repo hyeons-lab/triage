@@ -18,7 +18,6 @@ class TerminalPane extends StatefulWidget {
     required this.fallbackRows,
     required this.terminal,
     required this.onTerminalResizeBind,
-    required this.resyncRevision,
     required this.focusCursorRevision,
     required this.initialContentWritten,
     this.onInitialContentWritten,
@@ -36,7 +35,6 @@ class TerminalPane extends StatefulWidget {
   final dynamic terminal;
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
-  final int resyncRevision;
   final int focusCursorRevision;
   final bool initialContentWritten;
   final VoidCallback? onInitialContentWritten;
@@ -416,29 +414,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
-  StyledRow _clipRowToCols(StyledRow row, int cols) {
-    if (cols <= 0 || row.spans.isEmpty) return row;
-    final clippedSpans = <StyledSpan>[];
-    var used = 0;
-    for (final span in row.spans) {
-      if (used >= cols) break;
-      final remaining = cols - used;
-      if (span.text.length <= remaining) {
-        clippedSpans.add(span);
-        used += span.text.length;
-      } else {
-        clippedSpans.add(
-          StyledSpan(
-            text: span.text.substring(0, remaining),
-            style: span.style,
-          ),
-        );
-        break;
-      }
-    }
-    return StyledRow(spans: clippedSpans);
-  }
-
   void _writeInitialContent() {
     if (widget.replayPending) {
       return;
@@ -463,20 +438,20 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     // Write historical rows first to fill the scrollback buffer
     for (var i = 0; i < cursor.startRow; i++) {
-      final trimmedRow = _clipRowToCols(
+      final trimmedRow = clipRowToCols(
         normalizeReplayRow(widget.fallbackRows[i]),
         fittedCols,
       );
-      sb.write(_styledRowToAnsi(trimmedRow));
+      sb.write(styledRowToAnsi(trimmedRow));
       sb.write('\r\n');
     }
     // Write the active viewport rows
     for (var i = cursor.startRow; i < cursor.endRow; i++) {
-      final trimmedRow = _clipRowToCols(
+      final trimmedRow = clipRowToCols(
         normalizeReplayRow(widget.fallbackRows[i]),
         fittedCols,
       );
-      sb.write(_styledRowToAnsi(trimmedRow));
+      sb.write(styledRowToAnsi(trimmedRow));
       if (i < cursor.endRow - 1) {
         sb.write('\r\n');
       }
@@ -511,35 +486,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         _suppressInput = false;
       }
     }
-  }
-
-  String _styledSpanToAnsi(StyledSpan span) {
-    final sb = StringBuffer();
-    final style = span.style;
-    if (style.bold) sb.write('\x1B[1m');
-    if (style.dim) sb.write('\x1B[2m');
-    if (style.italic) sb.write('\x1B[3m');
-    if (style.underline) sb.write('\x1B[4m');
-    if (style.reverse) sb.write('\x1B[7m');
-    final fg = style.foreground;
-    if (fg != null) {
-      sb.write('\x1B[38;2;${fg.red};${fg.green};${fg.blue}m');
-    }
-    final bg = style.background;
-    if (bg != null) {
-      sb.write('\x1B[48;2;${bg.red};${bg.green};${bg.blue}m');
-    }
-    sb.write(span.text);
-    sb.write('\x1B[0m');
-    return sb.toString();
-  }
-
-  String _styledRowToAnsi(StyledRow row) {
-    final sb = StringBuffer();
-    for (final span in row.spans) {
-      sb.write(_styledSpanToAnsi(span));
-    }
-    return sb.toString();
   }
 
   void _resetTerminalSafe() {

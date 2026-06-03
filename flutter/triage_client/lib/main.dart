@@ -139,7 +139,6 @@ class SessionVm {
   int? initialCursorCol;
   bool isExited;
   int replayRevision = 0;
-  int resyncRevision = 0;
   int focusCursorRevision = 0;
   bool initialContentWritten = false;
   bool snapshotRefreshPending = false;
@@ -1190,7 +1189,6 @@ class _TriageHomeState extends State<TriageHome> {
       );
       if (includeHistory) {
         session.replayRevision = 1;
-        session.resyncRevision = 1;
       }
       _setupSessionInputListener(session);
       return session;
@@ -1258,35 +1256,15 @@ class _TriageHomeState extends State<TriageHome> {
     return _estimatedTerminalRestoreSize(fallbackSize);
   }
 
-  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
-    final direct = response['snapshot'];
-    if (direct is Map<String, dynamic>) {
-      return direct;
-    }
-    if (direct is Map) {
-      return Map<String, dynamic>.from(direct);
-    }
-
-    final responseObj = response['response'];
-    if (responseObj is Map<String, dynamic>) {
-      final nested = responseObj['snapshot'];
-      if (nested is Map<String, dynamic>) {
-        return nested;
-      }
-      if (nested is Map) {
-        return Map<String, dynamic>.from(nested);
-      }
-    }
-    if (responseObj is Map) {
-      final nested = responseObj['snapshot'];
-      if (nested is Map<String, dynamic>) {
-        return nested;
-      }
-      if (nested is Map) {
-        return Map<String, dynamic>.from(nested);
-      }
-    }
+  Map<String, dynamic>? _asMap(Object? value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) return Map<String, dynamic>.from(value);
     return null;
+  }
+
+  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
+    return _asMap(response['snapshot']) ??
+        _asMap(_asMap(response['response'])?['snapshot']);
   }
 
   bool _snapshotSizeMatches(
@@ -1508,7 +1486,6 @@ class _TriageHomeState extends State<TriageHome> {
           : const Color(0xff7fd1c7);
       if (includeHistory) {
         session.replayRevision += 1;
-        session.resyncRevision += 1;
       }
       if (cols != null && rowsVal != null) {
         session.lastFittedCols = cols;
@@ -2396,7 +2373,6 @@ class SessionWorkspace extends StatelessWidget {
             onTerminalResizeBind: (callback) {
               session.onTerminalResize = callback;
             },
-            resyncRevision: session.resyncRevision,
             focusCursorRevision: session.focusCursorRevision,
             initialContentWritten: session.initialContentWritten,
             onInitialContentWritten: () {
