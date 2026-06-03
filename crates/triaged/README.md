@@ -42,16 +42,19 @@ address in `~/.config/triage/config.toml`:
 [remote]
 bind = "0.0.0.0:7777"
 require_pairing = true
-
-# Optional: serve over TLS (enables https:// and wss://). Both must be set together.
-# tls_cert = "~/.config/triage/certs/dev.crt"
-# tls_key  = "~/.config/triage/certs/dev.key"
 ```
 
-Then point a client at `http(s)://<daemon-host>:7777` (web UI) or
-`ws(s)://<daemon-host>:7777/ws` (API). Because the daemon owns live PTYs and
+Then point a client at `http://<daemon-host>:7777` (web UI) or
+`ws://<daemon-host>:7777/ws` (API). The daemon serves plain HTTP and WebSocket
+only — it does not terminate TLS, so front it with a reverse proxy (e.g. Caddy
+or nginx) if you need `https`/`wss`. Because the daemon owns live PTYs and
 scrollback, you can detach and re-attach from any client without disturbing the
 running shells.
+
+> **Pairing still happens on the host.** Even with a routable bind, the `/pair`
+> approval page is only served to loopback / same-host connections (see
+> [Pairing](#pairing)), so approving a remote client requires access to the
+> daemon machine itself.
 
 ---
 
@@ -66,13 +69,14 @@ so a remote client can never authorize its own access.
    `client_id` (and a stored token, if it has one). With no valid token the
    daemon treats it as unauthenticated, and the client requests a *pairing
    challenge*. The daemon returns a short-lived `device_code`.
-2. **Approve (local only).** The client surfaces a link to
-   `http://<daemon-host>:7777/pair?device_code=<device_code>`. Someone with
-   access to the daemon machine opens it. The `/pair` page is only served to
-   **loopback or same-host peers** — a request coming from a remote client is
-   refused — so approval requires physical/local access to the host. The page
-   validates the device code and displays a one-time, **device-bound PIN** with
-   an expiry.
+2. **Approve (on the daemon host).** The client surfaces the device code. Open
+   the approval URL **on the machine running the daemon** —
+   `http://127.0.0.1:7777/pair?device_code=<device_code>`. The `/pair` page is
+   only served to **loopback / same-host connections** (`is_local_pairing_peer`),
+   so it cannot be opened from the remote client's own browser (that request
+   404s); approving a remote device means having local or SSH access to the
+   daemon host. The page validates the device code and displays a one-time,
+   **device-bound PIN** with an expiry.
 3. **Enter the PIN.** That PIN is typed back into the waiting client. The client
    exchanges it (`pair(pin, client_id)`) and the daemon — after verifying the PIN
    is bound to that exact client/device — issues a **bearer token**.
