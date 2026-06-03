@@ -9,6 +9,7 @@
 ## What Changed
 - 2026-06-02T22:43-0700 `Cargo.toml` — Set `[workspace.package].version` to `0.1.3` (inherited by all crates via `version.workspace = true`).
 - 2026-06-02T22:43-0700 `Cargo.lock` — Refreshed the six workspace crate entries (triage, triage-core, triage-mcp, triage-test-support, triage-transport-ws, triaged) to 0.1.3 via `cargo update --workspace`; third-party dependency versions untouched.
+- 2026-06-02T22:50-0700 `Cargo.toml` `[workspace.dependencies]` — Bumped the internal crate version pins (`triage-core`, `triage-transport-ws`, `triaged`) from `0.1.1` to `0.1.3` (PR #61 review). They had been left at `0.1.1` since the 0.1.2 release, so each published crate would declare a `^0.1.1` requirement on its internal deps instead of matching the release. Verified `cargo check --workspace --locked` still passes.
 
 ## Decisions
 - 2026-06-02T22:43-0700 Use `cargo update --workspace` rather than hand-editing `Cargo.lock` — it updates only the workspace members and keeps the lockfile internally consistent.
