@@ -10,7 +10,7 @@ on:
         default: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +21,8 @@ jobs:
     name: Build Client & Publish Crates
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -30,6 +32,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
+
+      - name: Determine workspace version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "triaged") | .version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not determine workspace version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Workspace version: $VERSION"
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -133,3 +147,49 @@ jobs:
           cargo publish -p triage --allow-dirty
 
           echo "All crates published successfully."
+
+  release:
+    name: Tag & GitHub Release (macOS App)
+    # Only on a real publish, and only if the crates published successfully.
+    needs: publish
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          channel: 'stable'
+          cache: true
+
+      # Build the macOS Triage Flutter desktop client (ad-hoc signed; the
+      # project uses CODE_SIGN_IDENTITY = "-", so no signing secrets are needed).
+      - name: Build macOS Triage.app
+        run: |
+          cd flutter/triage_client
+          flutter pub get
+          flutter build macos --release
+
+      # A .app is a bundle (directory); ditto produces a release-attachable zip
+      # that preserves bundle structure and macOS metadata.
+      - name: Package Triage.app
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          cd flutter/triage_client/build/macos/Build/Products/Release
+          ditto -c -k --keepParent Triage.app \
+            "$GITHUB_WORKSPACE/Triage-macos-v${VERSION}.zip"
+
+      - name: Create tag and GitHub release with the macOS app
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.publish.outputs.version }}
+          name: v${{ needs.publish.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: Triage-macos-v${{ needs.publish.outputs.version }}.zip
