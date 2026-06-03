@@ -17,6 +17,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Run JavaScript actions on Node.js 24. GitHub deprecates Node 20 on the
+  # runners (forced to Node 24 on 2026-06-16); opting in now silences the Node 20
+  # deprecation warning from Nugine/setup-flatc, which has no Node 24 release yet.
+  # The other actions in use (checkout, rust-cache, flutter-action,
+  # upload/download-artifact, action-gh-release) already support Node 24.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   check:
