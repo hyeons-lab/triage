@@ -148,17 +148,17 @@ jobs:
 
           echo "All crates published successfully."
 
-  release:
-    name: Tag & GitHub Release (macOS App)
-    # Only on a real publish, and only if the crates published successfully.
+  # Each desktop client is built on its native runner, packaged, and uploaded as
+  # a workflow artifact; the `release` job then attaches all three to one release.
+  # All three gate on a successful crate publish (needs: publish) and skip on dry
+  # runs, so no client is built and no release is cut unless the publish succeeded.
+
+  build-macos:
+    name: Build macOS client
     needs: publish
     if: ${{ github.event.inputs.dry_run == 'false' }}
     runs-on: macos-latest
     timeout-minutes: 40
-    # Least privilege: only this job needs write access to create the tag/release.
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -170,9 +170,9 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # Build the macOS Triage Flutter desktop client (ad-hoc signed; the
-      # project uses CODE_SIGN_IDENTITY = "-", so no signing secrets are needed).
-      - name: Build macOS Triage.app
+      # Ad-hoc signed (the project uses CODE_SIGN_IDENTITY = "-"), so no signing
+      # secrets are required.
+      - name: Build Triage.app
         run: |
           cd flutter/triage_client
           flutter pub get
@@ -188,11 +188,119 @@ jobs:
           ditto -c -k --keepParent Triage.app \
             "$GITHUB_WORKSPACE/Triage-macos-v${VERSION}.zip"
 
-      - name: Create tag and GitHub release with the macOS app
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-macos
+          path: Triage-macos-v${{ needs.publish.outputs.version }}.zip
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows client
+    needs: publish
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Build Windows client
+        run: |
+          cd flutter/triage_client
+          flutter pub get
+          flutter build windows --release
+
+      # Zip the Release output directory (exe + DLLs + data/).
+      - name: Package Windows client
+        shell: pwsh
+        run: |
+          $version = "${{ needs.publish.outputs.version }}"
+          Compress-Archive -Path flutter/triage_client/build/windows/x64/runner/Release/* `
+            -DestinationPath "Triage-windows-v$version.zip"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-windows
+          path: Triage-windows-v${{ needs.publish.outputs.version }}.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux client
+    needs: publish
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux desktop toolchain + native plugin deps:
+      # flutter_secure_storage_linux needs libsecret + jsoncpp.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev \
+            libsecret-1-dev libjsoncpp-dev
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Build Linux client
+        run: |
+          cd flutter/triage_client
+          flutter pub get
+          flutter build linux --release
+
+      # Tar the bundle directory (executable + lib/ + data/).
+      - name: Package Linux client
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          tar -czf "Triage-linux-v${VERSION}.tar.gz" \
+            -C flutter/triage_client/build/linux/x64/release/bundle .
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-linux
+          path: Triage-linux-v${{ needs.publish.outputs.version }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Tag & GitHub Release (all clients)
+    needs: [publish, build-macos, build-windows, build-linux]
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Least privilege: only this job needs write access to create the tag/release.
+    permissions:
+      contents: write
+    steps:
+      - name: Download client artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create tag and GitHub release with all clients
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.publish.outputs.version }}
           name: v${{ needs.publish.outputs.version }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: Triage-macos-v${{ needs.publish.outputs.version }}.zip
+          files: release-assets/**/Triage-*
