@@ -10,7 +10,7 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -155,6 +155,9 @@ jobs:
     if: ${{ github.event.inputs.dry_run == 'false' }}
     runs-on: macos-latest
     timeout-minutes: 40
+    # Least privilege: only this job needs write access to create the tag/release.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout

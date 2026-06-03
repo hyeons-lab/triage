@@ -8,7 +8,7 @@
 
 ## What Changed
 - 2026-06-02T18:59-0700 `.github/workflows/publish.yml` —
-  - Raised `permissions` to `contents: write` (needed to create tags/releases).
+  - Kept workflow-level `permissions: contents: read` and granted `contents: write` only on the `release` job (least privilege — addressed PR #57 review).
   - Added a `version` output to the `publish` job, derived via `cargo metadata` (triaged package == workspace version).
   - Added a `release` job on `macos-latest` that `needs: publish` and runs only when `dry_run == 'false'`: builds `flutter build macos --release`, zips `Triage.app` with `ditto`, and uses `softprops/action-gh-release@v2` to create the `v<version>` tag + GitHub release with the zip attached.
 
