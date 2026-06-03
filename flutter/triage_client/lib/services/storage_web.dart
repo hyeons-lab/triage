@@ -4,6 +4,10 @@ import 'dart:js_interop_unsafe';
 const _tokenStorageKey = 'triage_bearer_token';
 const _clientIdStorageKey = 'triage_client_id';
 
+// localStorage is already synchronous and persistent, so there is nothing to
+// pre-load. Present for parity with the native implementation.
+Future<void> loadCredentials() async {}
+
 void persistToken(String token) {
   try {
     final localStorage = js.globalContext.getProperty<js.JSObject>(

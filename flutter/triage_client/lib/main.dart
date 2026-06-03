@@ -8,15 +8,23 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
+import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/storage.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Restore the persisted client id / pairing token from secure storage before
+  // the first frame so the app can reconnect without re-pairing on each launch.
+  await loadCredentials();
   runApp(const TriageClientApp());
 }
 
 const int _defaultDaemonPort = 7777;
+const double _sessionRailCollapsedWidth = 72;
+const double _sessionRailExpandedWidth = 320;
+const Duration _sessionRailAnimationDuration = Duration(milliseconds: 220);
 
 @visibleForTesting
 Uri defaultWebSocketUriForBase(Uri base) {
@@ -96,7 +104,27 @@ class SessionVm {
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
-  }) : terminalController = TerminalController();
+  }) : terminalController = TerminalController() {
+    terminal = xt.Terminal(
+      maxLines: 10000,
+      reflowEnabled: false,
+      onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
+    );
+    terminalController.addWriteListener((data) {
+      _writeTerminalOrBuffer(data);
+    });
+    terminalController.addClearListener(() {
+      try {
+        terminal.useMainBuffer();
+        terminal.mainBuffer.clear();
+        terminal.altBuffer.clear();
+        terminal.write('\x1b[H\x1b[2J\x1b[3J');
+      } catch (_) {}
+    });
+    terminalController.addResizeListener((cols, rows) {
+      terminal.resize(cols, rows);
+    });
+  }
 
   final String title;
   final String branch;
@@ -111,18 +139,152 @@ class SessionVm {
   int? initialCursorCol;
   bool isExited;
   int replayRevision = 0;
+  int focusCursorRevision = 0;
+  bool initialContentWritten = false;
   bool snapshotRefreshPending = false;
   int? lastFittedCols;
   int? lastFittedRows;
   int? inFlightCols;
   int? inFlightRows;
+  int resizeRequestSeq = 0;
+
+  late final xt.Terminal terminal;
+  void Function(int w, int h, int pw, int ph)? onTerminalResize;
+  final List<_PendingTerminalWrite> _pendingTerminalWrites = [];
+  final List<int> _pendingUtf8OutputBytes = [];
+  int? _pendingUtf8OutputSeq;
+  int? _nextTerminalWriteOutputSeq;
+  int? _lastReplayOutputSeq;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
     final parts = title.split(' / ');
     return parts.length > 1 ? parts[1] : null;
   }
+
+  bool get _shouldBufferTerminalWrites =>
+      !initialContentWritten || snapshotRefreshPending;
+
+  void writeOutput(String data, {int? outputSeq}) {
+    _nextTerminalWriteOutputSeq = outputSeq;
+    try {
+      terminalController.write(data);
+    } finally {
+      _nextTerminalWriteOutputSeq = null;
+    }
+  }
+
+  String decodeOutputBytes(List<int> bytes, {int? outputSeq}) {
+    final combined = _pendingUtf8OutputBytes.isEmpty
+        ? List<int>.from(bytes)
+        : <int>[..._pendingUtf8OutputBytes, ...bytes];
+    _pendingUtf8OutputBytes.clear();
+
+    final trailingIncomplete = _trailingIncompleteUtf8ByteCount(combined);
+    final decodeEnd = combined.length - trailingIncomplete;
+    if (trailingIncomplete > 0) {
+      _pendingUtf8OutputBytes.addAll(combined.sublist(decodeEnd));
+      _pendingUtf8OutputSeq = outputSeq ?? _pendingUtf8OutputSeq;
+    } else {
+      _pendingUtf8OutputSeq = null;
+    }
+    if (decodeEnd == 0) {
+      return '';
+    }
+    return utf8.decode(combined.sublist(0, decodeEnd), allowMalformed: true);
+  }
+
+  void _writeTerminalOrBuffer(String data) {
+    if (_shouldBufferTerminalWrites) {
+      _pendingTerminalWrites.add(
+        _PendingTerminalWrite(data, _nextTerminalWriteOutputSeq),
+      );
+      return;
+    }
+    terminal.write(data);
+  }
+
+  void markInitialContentWritten() {
+    initialContentWritten = true;
+  }
+
+  void setSnapshotRefreshPending(bool pending) {
+    snapshotRefreshPending = pending;
+  }
+
+  void markReplaySnapshotOutputSeq(int? outputSeq) {
+    _lastReplayOutputSeq = outputSeq;
+    final pendingUtf8OutputSeq = _pendingUtf8OutputSeq;
+    if (outputSeq != null &&
+        pendingUtf8OutputSeq != null &&
+        outputSeq > pendingUtf8OutputSeq) {
+      _pendingUtf8OutputBytes.clear();
+      _pendingUtf8OutputSeq = null;
+    }
+  }
+
+  void flushPendingTerminalWritesAfterReplay() {
+    if (_shouldBufferTerminalWrites || _pendingTerminalWrites.isEmpty) {
+      return;
+    }
+    final writes = List<_PendingTerminalWrite>.from(_pendingTerminalWrites);
+    _pendingTerminalWrites.clear();
+    for (final write in writes) {
+      final replayOutputSeq = _lastReplayOutputSeq;
+      final writeOutputSeq = write.outputSeq;
+      if (replayOutputSeq != null &&
+          writeOutputSeq != null &&
+          writeOutputSeq <= replayOutputSeq) {
+        continue;
+      }
+      terminal.write(write.data);
+    }
+    _lastReplayOutputSeq = null;
+  }
+
+  void focusCursorOnNextDisplay() {
+    focusCursorRevision += 1;
+  }
 }
+
+class _PendingTerminalWrite {
+  const _PendingTerminalWrite(this.data, this.outputSeq);
+
+  final String data;
+  final int? outputSeq;
+}
+
+int _trailingIncompleteUtf8ByteCount(List<int> bytes) {
+  if (bytes.isEmpty) return 0;
+  final startLimit = max(0, bytes.length - 4);
+  for (var start = bytes.length - 1; start >= startLimit; start--) {
+    final expectedLength = _utf8SequenceLength(bytes[start]);
+    if (expectedLength == 0) {
+      continue;
+    }
+    final available = bytes.length - start;
+    if (available >= expectedLength) {
+      return 0;
+    }
+    for (var index = start + 1; index < bytes.length; index++) {
+      if (!_isUtf8ContinuationByte(bytes[index])) {
+        return 0;
+      }
+    }
+    return available;
+  }
+  return 0;
+}
+
+int _utf8SequenceLength(int byte) {
+  if (byte < 0x80) return 1;
+  if (byte >= 0xC2 && byte <= 0xDF) return 2;
+  if (byte >= 0xE0 && byte <= 0xEF) return 3;
+  if (byte >= 0xF0 && byte <= 0xF4) return 4;
+  return 0;
+}
+
+bool _isUtf8ContinuationByte(int byte) => byte >= 0x80 && byte <= 0xBF;
 
 class TriageHome extends StatefulWidget {
   const TriageHome({super.key, this.client});
@@ -528,6 +690,7 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
+          final requestSeq = ++session.resizeRequestSeq;
           unawaited(() async {
             try {
               final snapshot = _snapshotFromResponse(
@@ -538,6 +701,9 @@ class _TriageHomeState extends State<TriageHome> {
                 ),
               );
               if (snapshot != null && _sessionStillLoaded(session, sessionId)) {
+                if (requestSeq != session.resizeRequestSeq) {
+                  return;
+                }
                 final sizeChanged = _snapshotSizeDiffersFromSession(
                   session,
                   snapshot,
@@ -842,7 +1008,7 @@ class _TriageHomeState extends State<TriageHome> {
               }
               _sessions[existingIndex] = session;
               if (includeHistory) {
-                session.snapshotRefreshPending = true;
+                session.setSnapshotRefreshPending(true);
               }
             });
             _drainPendingEvents(sid);
@@ -1056,13 +1222,12 @@ class _TriageHomeState extends State<TriageHome> {
     }
 
     const headerHeight = 68.0;
-    const horizontalPadding = 32.0;
-    const averageCellWidth = 9.0;
+    const padding = 44.0; // 22.0 on each side of the terminal view
+    const averageCellWidth = 9.92;
     const averageCellHeight = 18.0;
     final sidebarWidth = _sidebarCollapsed ? 72.0 : 320.0;
-    final terminalWidth =
-        viewportSize.width - sidebarWidth - 1 - horizontalPadding;
-    final terminalHeight = viewportSize.height - headerHeight;
+    final terminalWidth = viewportSize.width - sidebarWidth - 1 - padding;
+    final terminalHeight = viewportSize.height - headerHeight - padding;
     final cols = (terminalWidth / averageCellWidth).floor().clamp(80, 240);
     final rows = (terminalHeight / averageCellHeight).floor().clamp(10, 80);
     return (rows, cols);
@@ -1091,35 +1256,15 @@ class _TriageHomeState extends State<TriageHome> {
     return _estimatedTerminalRestoreSize(fallbackSize);
   }
 
-  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
-    final direct = response['snapshot'];
-    if (direct is Map<String, dynamic>) {
-      return direct;
-    }
-    if (direct is Map) {
-      return Map<String, dynamic>.from(direct);
-    }
-
-    final responseObj = response['response'];
-    if (responseObj is Map<String, dynamic>) {
-      final nested = responseObj['snapshot'];
-      if (nested is Map<String, dynamic>) {
-        return nested;
-      }
-      if (nested is Map) {
-        return Map<String, dynamic>.from(nested);
-      }
-    }
-    if (responseObj is Map) {
-      final nested = responseObj['snapshot'];
-      if (nested is Map<String, dynamic>) {
-        return nested;
-      }
-      if (nested is Map) {
-        return Map<String, dynamic>.from(nested);
-      }
-    }
+  Map<String, dynamic>? _asMap(Object? value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) return Map<String, dynamic>.from(value);
     return null;
+  }
+
+  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
+    return _asMap(response['snapshot']) ??
+        _asMap(_asMap(response['response'])?['snapshot']);
   }
 
   bool _snapshotSizeMatches(
@@ -1220,13 +1365,13 @@ class _TriageHomeState extends State<TriageHome> {
         final output = event['Output'] as Map<String, dynamic>;
         final outputSeq = output['output_seq'] as int? ?? 0;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
-        final text = utf8.decode(bytes, allowMalformed: true);
 
         // Filter out any duplicate welcome messages or output
         // already incorporated in the attached session snapshot.
         if (outputSeq <= session.outputSeq) {
           return;
         }
+        final text = session.decodeOutputBytes(bytes, outputSeq: outputSeq);
 
         // Translate bare newlines to \r\n to prevent stair-casing layout formatting issues in the client-side terminal emulator.
         // We use a high-performance two-step replacement to ensure compatibility on older JS engines.
@@ -1234,37 +1379,12 @@ class _TriageHomeState extends State<TriageHome> {
             .replaceAll('\r\n', '\n')
             .replaceAll('\n', '\r\n');
 
-        // Write directly to xterm.js via the controller.
-        // This bypasses calling setState() on every small output chunk,
-        // avoiding Flutter widget tree rebuilds during active WebSocket sessions.
-        session.terminalController.write(translatedText);
-
-        // Update backup logs silently (without calling setState).
-        final rows = session.rows;
-        final newLines = text.split('\n');
-        if (newLines.isNotEmpty) {
-          if (rows.isNotEmpty) {
-            final lastRow = rows.last;
-            if (lastRow.spans.isNotEmpty) {
-              final lastSpan = lastRow.spans.last;
-              final updatedSpan = StyledSpan(
-                text: lastSpan.text + newLines[0],
-                style: lastSpan.style,
-              );
-              final updatedSpans = List<StyledSpan>.from(lastRow.spans)
-                ..removeLast()
-                ..add(updatedSpan);
-              rows[rows.length - 1] = StyledRow(spans: updatedSpans);
-            } else {
-              rows[rows.length - 1] = _plainRow(newLines[0]);
-            }
-          } else {
-            rows.add(_plainRow(newLines[0]));
-          }
-          for (var i = 1; i < newLines.length; i++) {
-            rows.add(_plainRow(newLines[i]));
-          }
-        }
+        // Write directly to xterm via the controller. The daemon snapshot path
+        // (Snapshot / ResyncRequired / refresh) owns session.rows; live output
+        // intentionally does not mutate the fallback row buffer, since naive
+        // string-append corrupts it with literal ANSI escapes and CR overstrikes
+        // that the replay path would later re-execute as garbled duplicate text.
+        session.writeOutput(translatedText, outputSeq: outputSeq);
         session.outputSeq = outputSeq;
       } else if (event.containsKey('Exited')) {
         if (mounted) {
@@ -1285,8 +1405,7 @@ class _TriageHomeState extends State<TriageHome> {
           final sizeChanged =
               cols != null &&
               rows != null &&
-              (currentCols != cols ||
-                  currentRows != rows);
+              (currentCols != cols || currentRows != rows);
           await _applySnapshotToSession(
             session,
             sessionId,
@@ -1353,7 +1472,11 @@ class _TriageHomeState extends State<TriageHome> {
       session.rows
         ..clear()
         ..addAll(rows);
-      session.outputSeq = snapshot['output_seq'] as int? ?? session.outputSeq;
+      final snapshotOutputSeq = snapshot['output_seq'] as int?;
+      session.markReplaySnapshotOutputSeq(snapshotOutputSeq);
+      if (snapshotOutputSeq != null) {
+        session.outputSeq = max(session.outputSeq, snapshotOutputSeq);
+      }
       session.initialCursorRow = initialCursorRow;
       session.initialCursorCol = initialCursorCol;
       session.isExited = exited;
@@ -1425,9 +1548,10 @@ class _TriageHomeState extends State<TriageHome> {
         session.isRemote &&
         _sessionIdFor(session) != null;
     setState(() {
+      session.focusCursorOnNextDisplay();
       _selectedIndex = index;
       if (shouldRefresh) {
-        session.snapshotRefreshPending = true;
+        session.setSnapshotRefreshPending(true);
       }
     });
     unawaited(
@@ -1449,7 +1573,7 @@ class _TriageHomeState extends State<TriageHome> {
     if (sessionId == null) return;
     if (markPending && mounted && !_disposed) {
       setState(() {
-        session.snapshotRefreshPending = true;
+        session.setSnapshotRefreshPending(true);
       });
     }
     try {
@@ -1529,7 +1653,7 @@ class _TriageHomeState extends State<TriageHome> {
     } finally {
       if (mounted && !_disposed) {
         setState(() {
-          session.snapshotRefreshPending = false;
+          session.setSnapshotRefreshPending(false);
         });
       }
     }
@@ -1866,170 +1990,204 @@ class SessionRail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final railWidth = isCollapsed
+        ? _sessionRailCollapsedWidth
+        : _sessionRailExpandedWidth;
+
+    return AnimatedContainer(
+      duration: _sessionRailAnimationDuration,
+      curve: Curves.easeOutCubic,
+      width: railWidth,
+      clipBehavior: Clip.hardEdge,
+      decoration: const BoxDecoration(color: Color(0xff151a1d)),
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 160),
+        switchInCurve: Curves.easeOut,
+        switchOutCurve: Curves.easeIn,
+        layoutBuilder: (currentChild, previousChildren) {
+          return Stack(
+            alignment: Alignment.topLeft,
+            children: [
+              ...previousChildren,
+              if (currentChild != null) currentChild,
+            ],
+          );
+        },
+        child: OverflowBox(
+          key: ValueKey<bool>(isCollapsed),
+          alignment: Alignment.topLeft,
+          minWidth: railWidth,
+          maxWidth: railWidth,
+          child: SizedBox(
+            width: railWidth,
+            child: isCollapsed ? _buildCollapsedRail() : _buildExpandedRail(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCollapsedRail() {
     if (isCollapsed) {
-      return Container(
-        width: 72,
-        color: const Color(0xff151a1d),
-        child: Column(
-          children: [
-            const SizedBox(height: 20),
-            IconButton(
-              onPressed: onToggleCollapse,
-              tooltip: 'Expand sidebar',
-              icon: const Icon(
-                Icons.chevron_right,
-                color: Color(0xff7fd1c7),
-                size: 26,
+      return Column(
+        children: [
+          const SizedBox(height: 20),
+          IconButton(
+            onPressed: onToggleCollapse,
+            tooltip: 'Expand sidebar',
+            icon: const Icon(
+              Icons.chevron_right,
+              color: Color(0xff7fd1c7),
+              size: 26,
+            ),
+          ),
+          const SizedBox(height: 16),
+          _NewSessionMenu(
+            selectedShell: selectedShell,
+            shellOptions: shellOptions,
+            showShellMenu: showShellMenu,
+            onCreateSession: onCreateSession,
+          ),
+          const SizedBox(height: 16),
+          Tooltip(
+            message: connectionStatus,
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: connectionStatusColor,
               ),
             ),
-            const SizedBox(height: 16),
-            _NewSessionMenu(
-              selectedShell: selectedShell,
-              shellOptions: shellOptions,
-              showShellMenu: showShellMenu,
-              onCreateSession: onCreateSession,
-            ),
-            const SizedBox(height: 16),
-            Tooltip(
-              message: connectionStatus,
-              child: Container(
-                width: 10,
-                height: 10,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: connectionStatusColor,
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            const Divider(height: 1, color: Color(0xff263033)),
-            const SizedBox(height: 8),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                child: Column(
-                  children: [
-                    for (final indexed in sessions.indexed)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 4),
-                        child: Tooltip(
-                          message: indexed.$2.title,
-                          child: InkWell(
-                            onTap: () => onSelectSession(indexed.$1),
-                            borderRadius: BorderRadius.circular(8),
-                            child: Container(
-                              width: 48,
-                              height: 48,
-                              decoration: BoxDecoration(
+          ),
+          const SizedBox(height: 20),
+          const Divider(height: 1, color: Color(0xff263033)),
+          const SizedBox(height: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Column(
+                children: [
+                  for (final indexed in sessions.indexed)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Tooltip(
+                        message: indexed.$2.title,
+                        child: InkWell(
+                          onTap: () => onSelectSession(indexed.$1),
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            width: 48,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              color: indexed.$1 == selectedIndex
+                                  ? const Color(0xff233033)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
                                 color: indexed.$1 == selectedIndex
-                                    ? const Color(0xff233033)
+                                    ? const Color(0xff3b5356)
                                     : Colors.transparent,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: indexed.$1 == selectedIndex
-                                      ? const Color(0xff3b5356)
-                                      : Colors.transparent,
-                                ),
                               ),
-                              child: Icon(
-                                indexed.$2.icon,
-                                color: indexed.$1 == selectedIndex
-                                    ? const Color(0xff7fd1c7)
-                                    : const Color(0xffcdd7d6),
-                                size: 22,
-                              ),
+                            ),
+                            child: Icon(
+                              indexed.$2.icon,
+                              color: indexed.$1 == selectedIndex
+                                  ? const Color(0xff7fd1c7)
+                                  : const Color(0xffcdd7d6),
+                              size: 22,
                             ),
                           ),
                         ),
                       ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return Container(
-      width: 320,
-      color: const Color(0xff151a1d),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 20, 10, 16),
-            child: Row(
-              children: [
-                const Icon(Icons.route, size: 24, color: Color(0xff7fd1c7)),
-                const SizedBox(width: 10),
-                const Text(
-                  'Triage',
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(width: 6),
-                IconButton(
-                  onPressed: onToggleCollapse,
-                  tooltip: 'Minimize sidebar',
-                  icon: const Icon(
-                    Icons.chevron_left,
-                    color: Color(0xff7f8b8d),
-                    size: 22,
-                  ),
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
-                ),
-                const Spacer(),
-                _NewSessionMenu(
-                  selectedShell: selectedShell,
-                  shellOptions: shellOptions,
-                  showShellMenu: showShellMenu,
-                  onCreateSession: onCreateSession,
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: _ConnectionStatus(
-              status: connectionStatus,
-              color: connectionStatusColor,
-            ),
-          ),
-          const SizedBox(height: 18),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 20),
-            child: Text(
-              'SESSIONS',
-              style: TextStyle(
-                color: Color(0xff7f8b8d),
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0,
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-              child: Column(
-                children: [
-                  for (final indexed in sessions.indexed)
-                    SessionListTile(
-                      selected: indexed.$1 == selectedIndex,
-                      title: indexed.$2.title,
-                      subtitle: indexed.$2.status,
-                      statusColor: indexed.$2.statusColor,
-                      icon: indexed.$2.icon,
-                      onTap: () => onSelectSession(indexed.$1),
                     ),
                 ],
               ),
             ),
           ),
         ],
-      ),
+      );
+    }
+
+    return const SizedBox.shrink();
+  }
+
+  Widget _buildExpandedRail() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 10, 16),
+          child: Row(
+            children: [
+              const Icon(Icons.terminal, size: 24, color: Color(0xff7fd1c7)),
+              const SizedBox(width: 10),
+              const Text(
+                'Triage',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(width: 6),
+              IconButton(
+                onPressed: onToggleCollapse,
+                tooltip: 'Minimize sidebar',
+                icon: const Icon(
+                  Icons.chevron_left,
+                  color: Color(0xff7f8b8d),
+                  size: 22,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
+              const Spacer(),
+              _NewSessionMenu(
+                selectedShell: selectedShell,
+                shellOptions: shellOptions,
+                showShellMenu: showShellMenu,
+                onCreateSession: onCreateSession,
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: _ConnectionStatus(
+            status: connectionStatus,
+            color: connectionStatusColor,
+          ),
+        ),
+        const SizedBox(height: 18),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 20),
+          child: Text(
+            'SESSIONS',
+            style: TextStyle(
+              color: Color(0xff7f8b8d),
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0,
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+            child: Column(
+              children: [
+                for (final indexed in sessions.indexed)
+                  SessionListTile(
+                    selected: indexed.$1 == selectedIndex,
+                    title: indexed.$2.title,
+                    subtitle: indexed.$2.status,
+                    statusColor: indexed.$2.statusColor,
+                    icon: indexed.$2.icon,
+                    onTap: () => onSelectSession(indexed.$1),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -2211,6 +2369,18 @@ class SessionWorkspace extends StatelessWidget {
             terminalId: session.title,
             controller: session.terminalController,
             fallbackRows: session.rows,
+            terminal: session.terminal,
+            onTerminalResizeBind: (callback) {
+              session.onTerminalResize = callback;
+            },
+            focusCursorRevision: session.focusCursorRevision,
+            initialContentWritten: session.initialContentWritten,
+            onInitialContentWritten: () {
+              session.markInitialContentWritten();
+            },
+            onReplayContentWritten: () {
+              session.flushPendingTerminalWritesAfterReplay();
+            },
             initialCursorRow: session.initialCursorRow,
             initialCursorCol: session.initialCursorCol,
             isExited: session.status == 'exited',
@@ -2371,8 +2541,9 @@ class _PairingViewState extends State<_PairingView> {
     );
   }
 
-  void _openVerificationUri(Uri uri) {
-    final opened = openExternalUri(uri);
+  Future<void> _openVerificationUri(Uri uri) async {
+    final opened = await openExternalUri(uri);
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(

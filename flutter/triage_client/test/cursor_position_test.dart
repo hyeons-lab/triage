@@ -160,6 +160,35 @@ void main() {
       expect(placement.terminalCol, equals(21));
     });
 
+    test('replay placement recognizes heavy-chevron prompt glyph', () {
+      final fallbackRows = [
+        const StyledRow(
+          spans: [StyledSpan(text: 'first prompt', style: TerminalStyle())],
+        ),
+        const StyledRow(
+          spans: [StyledSpan(text: '❯ ', style: TerminalStyle())],
+        ),
+        const StyledRow(
+          spans: [StyledSpan(text: '~/development', style: TerminalStyle())],
+        ),
+        const StyledRow(
+          spans: [StyledSpan(text: '❯ ', style: TerminalStyle())],
+        ),
+      ];
+
+      final placement = computeReplayCursorPlacement(
+        fallbackRows: fallbackRows,
+        fittedRows: 10,
+        initialCursorRow: 1,
+        initialCursorCol: 0,
+      );
+
+      expect(placement.sourceRow, equals(1));
+      expect(placement.sourceCol, equals(2));
+      expect(placement.terminalRow, equals(2));
+      expect(placement.terminalCol, equals(3));
+    });
+
     test('replay placement clamps status-row cursor to prompt row', () {
       final fallbackRows = [
         const StyledRow(

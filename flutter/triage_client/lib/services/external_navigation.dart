@@ -1,5 +1,5 @@
-import 'external_navigation_stub.dart'
-    if (dart.library.js_interop) 'external_navigation_web.dart'
-    as impl;
+import 'package:url_launcher/url_launcher.dart';
 
-bool openExternalUri(Uri uri) => impl.openExternalUri(uri);
+Future<bool> openExternalUri(Uri uri) {
+  return launchUrl(uri, mode: LaunchMode.externalApplication);
+}

@@ -16,6 +16,12 @@ class TerminalPane extends StatefulWidget {
     required this.terminalId,
     required this.controller,
     required this.fallbackRows,
+    required this.terminal,
+    required this.onTerminalResizeBind,
+    required this.focusCursorRevision,
+    required this.initialContentWritten,
+    this.onInitialContentWritten,
+    this.onReplayContentWritten,
     this.initialCursorRow,
     this.initialCursorCol,
     this.isExited = false,
@@ -26,6 +32,13 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final List<StyledRow> fallbackRows;
+  final dynamic terminal;
+  final void Function(void Function(int w, int h, int pw, int ph)? callback)?
+  onTerminalResizeBind;
+  final int focusCursorRevision;
+  final bool initialContentWritten;
+  final VoidCallback? onInitialContentWritten;
+  final VoidCallback? onReplayContentWritten;
   final int? initialCursorRow;
   final int? initialCursorCol;
   final bool isExited;
@@ -90,6 +103,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   dynamic _resizeObserver;
   late Object _inputRouteToken;
   late final FocusNode _focusNode;
+  late final StreamSubscription<html.MouseEvent>
+  _containerMouseDownSubscription;
   late final void Function(html.Event) _windowKeyDownListener;
   late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
   late final StreamSubscription<html.KeyboardEvent>
@@ -105,12 +120,14 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _liveOutputReceived = false;
   int? _lastFittedRows;
   int? _lastFittedCols;
+  bool _focusCursorAfterReplay = false;
   int _replaySuppressGeneration = 0;
   bool _suppressInput = false;
   Timer? _resizeDebounceTimer;
   double? _stableWidth;
   double? _stableHeight;
   Timer? _stabilityTimer;
+  Timer? _scrollToCursorTimer;
 
   @override
   void initState() {
@@ -141,6 +158,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _styleSheetLoaded = true;
       _bindController();
       _bindTerminalSubscriptions();
+      if (widget.focusCursorRevision > 0) {
+        _focusCursorNowAndAfterReplay();
+      }
     } else {
       _container = html.DivElement()
         ..style.width = '100%'
@@ -374,6 +394,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       } catch (_) {}
 
       _triggerFitWithDelayedRetries();
+      if (widget.focusCursorRevision > 0) {
+        _focusCursorNowAndAfterReplay();
+      }
 
       try {
         final fonts = js_util.getProperty(html.document, 'fonts');
@@ -389,29 +412,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (e) {
       debugPrint('Failed to initialize xterm.js: $e');
     }
-  }
-
-  StyledRow _clipRowToCols(StyledRow row, int cols) {
-    if (cols <= 0 || row.spans.isEmpty) return row;
-    final clippedSpans = <StyledSpan>[];
-    var used = 0;
-    for (final span in row.spans) {
-      if (used >= cols) break;
-      final remaining = cols - used;
-      if (span.text.length <= remaining) {
-        clippedSpans.add(span);
-        used += span.text.length;
-      } else {
-        clippedSpans.add(
-          StyledSpan(
-            text: span.text.substring(0, remaining),
-            style: span.style,
-          ),
-        );
-        break;
-      }
-    }
-    return StyledRow(spans: clippedSpans);
   }
 
   void _writeInitialContent() {
@@ -438,20 +438,20 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     // Write historical rows first to fill the scrollback buffer
     for (var i = 0; i < cursor.startRow; i++) {
-      final trimmedRow = _clipRowToCols(
+      final trimmedRow = clipRowToCols(
         normalizeReplayRow(widget.fallbackRows[i]),
         fittedCols,
       );
-      sb.write(_styledRowToAnsi(trimmedRow));
+      sb.write(styledRowToAnsi(trimmedRow));
       sb.write('\r\n');
     }
     // Write the active viewport rows
     for (var i = cursor.startRow; i < cursor.endRow; i++) {
-      final trimmedRow = _clipRowToCols(
+      final trimmedRow = clipRowToCols(
         normalizeReplayRow(widget.fallbackRows[i]),
         fittedCols,
       );
-      sb.write(_styledRowToAnsi(trimmedRow));
+      sb.write(styledRowToAnsi(trimmedRow));
       if (i < cursor.endRow - 1) {
         sb.write('\r\n');
       }
@@ -486,35 +486,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         _suppressInput = false;
       }
     }
-  }
-
-  String _styledSpanToAnsi(StyledSpan span) {
-    final sb = StringBuffer();
-    final style = span.style;
-    if (style.bold) sb.write('\x1B[1m');
-    if (style.dim) sb.write('\x1B[2m');
-    if (style.italic) sb.write('\x1B[3m');
-    if (style.underline) sb.write('\x1B[4m');
-    if (style.reverse) sb.write('\x1B[7m');
-    final fg = style.foreground;
-    if (fg != null) {
-      sb.write('\x1B[38;2;${fg.red};${fg.green};${fg.blue}m');
-    }
-    final bg = style.background;
-    if (bg != null) {
-      sb.write('\x1B[48;2;${bg.red};${bg.green};${bg.blue}m');
-    }
-    sb.write(span.text);
-    sb.write('\x1B[0m');
-    return sb.toString();
-  }
-
-  String _styledRowToAnsi(StyledRow row) {
-    final sb = StringBuffer();
-    for (final span in row.spans) {
-      sb.write(_styledSpanToAnsi(span));
-    }
-    return sb.toString();
   }
 
   void _resetTerminalSafe() {
@@ -625,6 +596,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _bindContainerEvents() {
+    _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
+      _focusNode.requestFocus();
+      if (_initialized) {
+        try {
+          _activateTerminal();
+        } catch (_) {}
+      }
+    });
+
     _containerClickSubscription = _container.onClick.listen((event) {
       _focusNode.requestFocus();
       if (_initialized) {
@@ -700,6 +680,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _initialContentWritten = true;
     _writeInitialContent();
     _flushPendingLiveWrites();
+    widget.onInitialContentWritten?.call();
+    _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
   }
 
@@ -795,6 +777,36 @@ class _TerminalPaneState extends State<TerminalPane> {
     Future.delayed(const Duration(milliseconds: 1500), _onFit);
   }
 
+  void _afterReplayContentWritten({required bool initialReplay}) {
+    widget.onReplayContentWritten?.call();
+    final shouldFocus = _focusCursorAfterReplay;
+    if (initialReplay || shouldFocus) {
+      _focusCursorAfterReplay = false;
+      _scrollToCursor(requestFocus: true);
+    }
+  }
+
+  void _focusCursorNowAndAfterReplay() {
+    _focusCursorAfterReplay = true;
+    _scrollToCursor(requestFocus: true);
+  }
+
+  void _scrollToCursor({required bool requestFocus}) {
+    void jump() {
+      if (!mounted || !_initialized) return;
+      try {
+        js_util.callMethod(_term, 'scrollToBottom', []);
+      } catch (_) {}
+      if (requestFocus) {
+        _activateTerminal();
+      }
+    }
+
+    Future.delayed(Duration.zero, jump);
+    _scrollToCursorTimer?.cancel();
+    _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
+  }
+
   String? _keyboardEventToInput(html.KeyboardEvent event) {
     final key = event.key;
     if (key == null) return null;
@@ -858,6 +870,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_initialContentWritten) {
         _resetTerminalSafe();
         _writeInitialContent();
+        _afterReplayContentWritten(initialReplay: false);
       } else {
         _resetTerminalSafe();
         _pendingLiveWriteBuffer.clear();
@@ -883,6 +896,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (oldWidget.replayRevision != widget.replayRevision) {
       _triggerFullReplayOrReset();
+    }
+    if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
+      _focusCursorNowAndAfterReplay();
     }
     if (oldWidget.initialCursorRow != widget.initialCursorRow ||
         oldWidget.initialCursorCol != widget.initialCursorCol) {
@@ -910,7 +926,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   void dispose() {
     _resizeDebounceTimer?.cancel();
     _stabilityTimer?.cancel();
+    _scrollToCursorTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
+    _containerMouseDownSubscription.cancel();
     _containerClickSubscription.cancel();
     _containerKeyDownSubscription.cancel();
     _container.removeEventListener('paste', _containerPasteListener, true);

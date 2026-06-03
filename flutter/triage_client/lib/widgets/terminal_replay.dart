@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:triage_client/models/terminal_models.dart';
 
 StyledRow trimReplayTrailingWhitespace(StyledRow row) {
@@ -77,7 +79,9 @@ bool isReplayStatusOrDividerRow(String rowText) {
 bool isReplayPromptRow(String rowText) {
   if (isReplayStatusOrDividerRow(rowText)) return false;
   final trimmed = rowText.trim();
-  return trimmed.contains('\$') || trimmed.contains('>');
+  return trimmed.contains('\$') ||
+      trimmed.contains('>') ||
+      trimmed.contains('❯');
 }
 
 int replayCursorColForRow(String rowTextRaw) {
@@ -85,7 +89,8 @@ int replayCursorColForRow(String rowTextRaw) {
   var cursorCol = rowTextTrimmed.length;
   final lastDollar = rowTextTrimmed.lastIndexOf('\$');
   final lastChevron = rowTextTrimmed.lastIndexOf('>');
-  final promptIndex = lastDollar > lastChevron ? lastDollar : lastChevron;
+  final lastHeavyChevron = rowTextTrimmed.lastIndexOf('❯');
+  final promptIndex = [lastDollar, lastChevron, lastHeavyChevron].reduce(max);
   if (promptIndex == rowTextTrimmed.length - 1 &&
       promptIndex + 1 < rowTextRaw.length &&
       rowTextRaw[promptIndex + 1] == ' ') {
@@ -227,4 +232,53 @@ class ReplayCursorPlacement {
   final int endRow;
   final int terminalRow;
   final int terminalCol;
+}
+
+StyledRow clipRowToCols(StyledRow row, int cols) {
+  if (cols <= 0 || row.spans.isEmpty) return row;
+  final clippedSpans = <StyledSpan>[];
+  var used = 0;
+  for (final span in row.spans) {
+    if (used >= cols) break;
+    final remaining = cols - used;
+    if (span.text.length <= remaining) {
+      clippedSpans.add(span);
+      used += span.text.length;
+    } else {
+      clippedSpans.add(
+        StyledSpan(text: span.text.substring(0, remaining), style: span.style),
+      );
+      break;
+    }
+  }
+  return StyledRow(spans: clippedSpans);
+}
+
+String styledSpanToAnsi(StyledSpan span) {
+  final sb = StringBuffer();
+  final style = span.style;
+  if (style.bold) sb.write('\x1B[1m');
+  if (style.dim) sb.write('\x1B[2m');
+  if (style.italic) sb.write('\x1B[3m');
+  if (style.underline) sb.write('\x1B[4m');
+  if (style.reverse) sb.write('\x1B[7m');
+  final fg = style.foreground;
+  if (fg != null) {
+    sb.write('\x1B[38;2;${fg.red};${fg.green};${fg.blue}m');
+  }
+  final bg = style.background;
+  if (bg != null) {
+    sb.write('\x1B[48;2;${bg.red};${bg.green};${bg.blue}m');
+  }
+  sb.write(span.text);
+  sb.write('\x1B[0m');
+  return sb.toString();
+}
+
+String styledRowToAnsi(StyledRow row) {
+  final sb = StringBuffer();
+  for (final span in row.spans) {
+    sb.write(styledSpanToAnsi(span));
+  }
+  return sb.toString();
 }
