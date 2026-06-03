@@ -22,6 +22,7 @@
 - 2026-06-02T16:43-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Fixed dead keyboard input on the first session shown after the persistent-terminal swap.
 - 2026-06-02T17:00-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Persisted the native pairing token / client id in the platform Keychain so the macOS client no longer re-pairs on every launch.
 - 2026-06-02T17:35-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Ran a 4-agent `/simplify` cleanup pass over the branch's client code (reuse, simplification, efficiency, altitude) and applied the contained, behavior-preserving fixes.
+- 2026-06-02T17:49-0700 — Claude Code (claude-opus-4-8) @ argus branch feat/flutter-mobile-client — Addressed the five Copilot PR #54 review comments on the scaffolded Windows runner.
 
 ## Intent
 - Scaffold mobile and macOS platform configurations for the triage client.
@@ -106,6 +107,9 @@
 - 2026-06-02T17:35-0700 (/simplify cleanup) — `main.dart` — Collapsed `_snapshotFromResponse`'s four-branch `is Map` ladder into a small `_asMap` helper.
 - 2026-06-02T17:35-0700 (/simplify cleanup) — `storage_native.dart` — Removed `try/catch` double-guarding around `.catchError` in the write-through helpers, ran the two startup Keychain reads concurrently via `Future.wait`, and dropped the deprecated `encryptedSharedPreferences` Android option.
 - 2026-06-02T17:35-0700 (/simplify cleanup) — `terminal_pane_stub.dart` — Centralized `xt.Terminal.onOutput` binding into a `_bindTerminal`/`_unbindTerminal` seam (used from initState/swap/dispose) so the two lifecycle paths can't drift, and coalesced `didUpdateWidget` so the expensive full replay runs at most once per update on a session swap.
+- 2026-06-02T17:49-0700 (PR #54 review) — `windows/runner/utils.cpp` — Fixed the stderr console redirect to dup `_fileno(stderr)` into FD 2 (was duplicating stdout's FD, so stderr wasn't redirected).
+- 2026-06-02T17:49-0700 (PR #54 review) — `windows/runner/flutter_window.cpp` — Guarded the `WM_FONTCHANGE` handler against a null `flutter_controller_` (the message can arrive before `OnCreate` finishes or during teardown).
+- 2026-06-02T17:49-0700 (PR #54 review) — `windows/runner/win32_window.cpp` — `MessageHandler`'s fallback now calls `DefWindowProc(hwnd, ...)` instead of the possibly-null `window_handle_`; and reworked teardown so `WM_DESTROY` invokes `OnDestroy()` directly while `Destroy()` only initiates `DestroyWindow` + class unregistration, eliminating the re-entrant double `OnDestroy()`.
 
 ## Issues
 - 2026-06-02T17:00-0700 — Plan 000047-10 step 5 added a `keychain-access-groups` entitlement (per the flutter_secure_storage macOS docs), but `flutter build macos` failed: "Runner has entitlements that require signing with a development certificate." The project is ad-hoc signed (`CODE_SIGN_IDENTITY = "-"`, no `DEVELOPMENT_TEAM`), so a team-prefixed keychain group can't resolve. Deviation from the plan: dropped the entitlement entirely and switched macOS to the legacy keychain (`usesDataProtectionKeychain: false`), which a sandboxed app can use for its own items without any keychain entitlement. Verified at runtime: two consecutive launches leave the stored `triage_client_id` keychain item's creation date unchanged (single item, not regenerated), confirming read-back works.
@@ -117,7 +121,8 @@
 - 64ec88f — fix(client): restore terminal didUpdateWidget lifecycle hooks for resize reflow
 - a0a08e7 — fix(client): bind terminal input on session swap
 - 5c47d9b — fix(client): persist native pairing token in the Keychain
-- HEAD — refactor(client): simplify terminal panes and native storage
+- fa00cc8 — refactor(client): simplify terminal panes and native storage
+- HEAD — fix(client): harden Windows runner per PR review
 
 ## Progress
 - 2026-05-31T18:00-0700 — Created git worktree and branch `feat/flutter-mobile-client`.
@@ -154,3 +159,4 @@
 - 2026-06-02T16:43-0700 — Fixed dead keyboard input on the first session shown: the native pane now rebinds `xt.Terminal.onOutput` (and refocuses) in `didUpdateWidget` when the persistent `SessionVm.terminal` instance changes, since the loading-placeholder-to-attached swap reuses the same `_TerminalPaneState` under an identical `triage / <sid>` key. Verified with `flutter test test/cursor_position_test.dart test/widget_test.dart`; all 58 tests passed.
 - 2026-06-02T17:00-0700 — Fixed the macOS client re-pairing on every launch: native credentials were only held in an in-memory stub. Added Keychain persistence via `flutter_secure_storage` (sync cache hydrated by `loadCredentials()` awaited in `main()`, write-through, legacy macOS keychain). Reverted a trial `keychain-access-groups` entitlement that broke the ad-hoc-signed build. Verified `flutter test` (77 passed), `flutter build macos`, reinstalled `/Applications/Triage.app` (42M), and confirmed at runtime that the stored client-id keychain item is read back (stable creation date across two launches) rather than regenerated.
 - 2026-06-02T17:35-0700 — Ran a 4-agent `/simplify` cleanup pass (reuse/simplification/efficiency/altitude) over the branch client code and applied the contained fixes: web pane reuses shared ANSI helpers, removed the redundant `resyncRevision`, `_asMap` helper for snapshot extraction, concurrent startup Keychain reads, de-double-guarded write-through, `_bindTerminal` seam, and coalesced the double replay on session swap. Net −60 lines. Verified `flutter analyze` (no new issues), `flutter test` (77 passed), and `flutter build macos`. Skipped larger refactors (web `TerminalPane` contract split, shared replay-suppression state machine) as out of scope for a cleanup pass.
+- 2026-06-02T17:49-0700 — Addressed the five Copilot review comments on PR #54, all on the `flutter create`-scaffolded Windows runner (`utils.cpp` stderr FD, `flutter_window.cpp` WM_FONTCHANGE null guard, `win32_window.cpp` DefWindowProc null handle + WM_DESTROY/Destroy re-entrant double OnDestroy). Fixes are standard Win32 hardening; not compile-verified locally since the Windows toolchain isn't available on macOS (Dart `flutter test` is unaffected — these are runner C++ files).

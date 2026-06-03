@@ -180,8 +180,13 @@ Win32Window::MessageHandler(HWND hwnd,
                             LPARAM const lparam) noexcept {
   switch (message) {
     case WM_DESTROY:
+      // The OS is tearing the window down. Run teardown here directly rather
+      // than via Destroy(); Destroy() calls DestroyWindow(), which re-enters
+      // this handler, so routing teardown through it would invoke OnDestroy()
+      // twice. Class unregistration stays in Destroy()/the destructor, where
+      // the active-window count is final.
       window_handle_ = nullptr;
-      Destroy();
+      OnDestroy();
       if (quit_on_close_) {
         PostQuitMessage(0);
       }
@@ -218,12 +223,13 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
   }
 
-  return DefWindowProc(window_handle_, message, wparam, lparam);
+  return DefWindowProc(hwnd, message, wparam, lparam);
 }
 
 void Win32Window::Destroy() {
-  OnDestroy();
-
+  // OnDestroy() is invoked from the WM_DESTROY handler. Here we only initiate
+  // window destruction (which posts WM_DESTROY) so teardown runs exactly once,
+  // and unregister the class once the last window object has been dropped.
   if (window_handle_) {
     DestroyWindow(window_handle_);
     window_handle_ = nullptr;

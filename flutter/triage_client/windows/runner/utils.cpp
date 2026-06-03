@@ -14,7 +14,7 @@ void CreateAndAttachConsole() {
       _dup2(_fileno(stdout), 1);
     }
     if (freopen_s(&unused, "CONOUT$", "w", stderr)) {
-      _dup2(_fileno(stdout), 2);
+      _dup2(_fileno(stderr), 2);
     }
     std::ios::sync_with_stdio();
     FlutterDesktopResyncOutputStreams();
