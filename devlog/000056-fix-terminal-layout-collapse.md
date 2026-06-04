@@ -234,6 +234,24 @@ if it regresses, fill cursor-skipped cells with `0x20` in the sink or treat
 interior empty cells as spaces on copy. (Today's clean paste likely reads
 space-filled StyledRows.)
 
+## Issues
+
+2026-06-04T00:00-0700 **e2e: blank on first show / select, content appears only
+after a window resize.** Root cause: the wiring dispatched `HistoryBytes` at
+attach time — *before* the `TerminalView` had laid out and auto-fitted — so the
+history replayed at the default 80x24 into a viewport that didn't match the real
+size, showing nothing until a resize refit surfaced it. The original (working)
+code wrote initial content on the first fit for exactly this reason. Fix:
+**defer the history replay to the view's first fit.** `applyHistory` now only
+dispatches `Attach` (so live chunks buffer in the store in arrival order) and
+stages the raw tail; the pane reports its fitted size via a new `onViewFit`
+callback → `SessionVm.noteViewFit` → `HistoryBytes` replays at the real size and
+the store flushes the buffered live. Both panes call `onViewFit` on fit; the web
+pane's separate `historyRawOutput` mount-replay was removed (the store now drives
+history through the controller for both platforms). This mirrors the old
+first-fit timing while keeping the single store write path. `flutter analyze`
+clean; 59 tests pass.
+
 ## Decision
 
 2026-06-03T20:52-0700 Phase 0 PASSED → proceed with the MVI raw-byte refactor.

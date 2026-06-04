@@ -1,7 +1,6 @@
 // ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
@@ -19,7 +18,7 @@ class TerminalPane extends StatefulWidget {
     required this.fallbackRows,
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
-    this.historyRawOutput = const [],
+    this.onViewFit,
     this.isExited = false,
   });
 
@@ -30,13 +29,14 @@ class TerminalPane extends StatefulWidget {
   /// Plain rows; unused by the live web view but kept for parity with native.
   final List<StyledRow> fallbackRows;
 
-  /// Raw output-history tail re-emulated into the xterm.js instance on first
-  /// mount (its write listener binds only after mount, so it cannot receive the
-  /// store's attach-time history through the controller).
-  final List<int> historyRawOutput;
-
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
+
+  /// Reports the fitted grid size after layout so the session replays its staged
+  /// history (through the store -> controller -> this view's write listener) at
+  /// the real terminal size.
+  final void Function(int cols, int rows)? onViewFit;
+
   final int focusCursorRevision;
   final bool isExited;
 
@@ -116,8 +116,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _lastFittedRows;
   int? _lastFittedCols;
   bool _focusCursorAfterReplay = false;
-  int _replaySuppressGeneration = 0;
-  bool _suppressInput = false;
+  final bool _suppressInput = false;
   Timer? _resizeDebounceTimer;
   double? _stableWidth;
   double? _stableHeight;
@@ -410,45 +409,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _writeInitialContent() {
-    // Single source of truth: re-emulate the raw output-history tail. xterm.js
-    // reconstructs the screen (cursor moves, frames) faithfully — no lossy
-    // styled-row reconstruction.
-    final raw = widget.historyRawOutput;
-    if (raw.isEmpty) {
-      return;
-    }
-    final text = utf8
-        .decode(raw, allowMalformed: true)
-        .replaceAll('\r\n', '\n')
-        .replaceAll('\n', '\r\n');
-    _writeReplayContent(text);
-  }
-
-  void _writeReplayContent(String data) {
-    final generation = ++_replaySuppressGeneration;
-    _suppressInput = true;
-
-    // Safety timeout to ensure key input is never permanently blocked
-    Timer(const Duration(milliseconds: 150), () {
-      if (mounted && _replaySuppressGeneration == generation) {
-        _suppressInput = false;
-      }
-    });
-
-    final complete = js_util.allowInterop(() {
-      Timer(const Duration(milliseconds: 50), () {
-        if (mounted && _replaySuppressGeneration == generation) {
-          _suppressInput = false;
-        }
-      });
-    });
-    try {
-      js_util.callMethod(_term, 'write', [data, complete]);
-    } catch (_) {
-      if (_replaySuppressGeneration == generation) {
-        _suppressInput = false;
-      }
-    }
+    // Signal the fitted size; the session replays its staged history through the
+    // store -> controller -> this view's write listener at the real size. The
+    // single source of truth is the raw byte stream, not styled-row rebuilds.
+    final fittedRows = (js_util.getProperty(_term, 'rows') as num).toInt();
+    final fittedCols = (js_util.getProperty(_term, 'cols') as num).toInt();
+    widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
   void _resetTerminalSafe() {

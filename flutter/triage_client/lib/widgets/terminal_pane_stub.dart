@@ -18,7 +18,7 @@ class TerminalPane extends StatefulWidget {
     required this.fallbackRows,
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
-    this.historyRawOutput = const [],
+    this.onViewFit,
     this.isExited = false,
   });
 
@@ -29,12 +29,13 @@ class TerminalPane extends StatefulWidget {
   /// Plain rows rendered only by the FLUTTER_TEST fallback view.
   final List<StyledRow> fallbackRows;
 
-  /// Unused on native (the store seeds the terminal directly); present so the
-  /// pane construction is platform-symmetric with the web view.
-  final List<int> historyRawOutput;
-
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
+
+  /// Reports the fitted grid size after layout, so the session can replay its
+  /// staged history at the real terminal size (deferred until first fit).
+  final void Function(int cols, int rows)? onViewFit;
+
   final int focusCursorRevision;
   final bool isExited;
 
@@ -175,6 +176,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   // the live byte stream renders the new layout. No replay here.
   void _onTerminalResize(int width, int height, int pixelWidth, int pixelHeight) {
     if (width > 0 && height > 0) {
+      // Report the fitted size so staged history replays at the real terminal
+      // size (the first fit triggers the deferred replay).
+      widget.onViewFit?.call(width, height);
       _scheduleResizeOut(width, height);
     }
   }

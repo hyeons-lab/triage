@@ -156,10 +156,15 @@ class SessionVm {
   // The sink wraps the controller, so both platform views render through their
   // existing listeners; decoding/buffering/CRLF/dedup all live in the store.
   late final TerminalStore store;
-  // Raw output-history tail retained for the web view to re-emulate on (re)mount
-  // — its xterm.js instance binds its write listener only after it mounts.
-  List<int> historyRawOutput = const [];
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
+
+  // Deferred history: replay must wait until the view is laid out and fitted, so
+  // it re-emulates at the real terminal size. Writing before the first fit
+  // renders at the default 80x24 and shows nothing until a resize refits.
+  _PendingHistory? _pendingHistory;
+  bool _viewReady = false;
+  int _viewCols = 80;
+  int _viewRows = 24;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
@@ -167,24 +172,43 @@ class SessionVm {
     return parts.length > 1 ? parts[1] : null;
   }
 
-  /// Apply attach/resync history: enter the attached lifecycle and replay the
-  /// raw output tail through the single write path. Live chunks at or below
-  /// [throughOutputSeq] are dropped by the store as duplicates. [rawOutput] is
-  /// retained for the web view to re-emulate on (re)mount.
+  /// Begin the attach/resync lifecycle and stage the raw output-history tail.
+  /// [Attach] is dispatched now so live chunks buffer in arrival order; the
+  /// actual [HistoryBytes] replay is deferred until the view reports its fitted
+  /// size (see [noteViewFit]). Live chunks at or below [throughOutputSeq] are
+  /// dropped by the store as duplicates.
   void applyHistory(
     List<int> rawOutput, {
     required int cols,
     required int rows,
     int? throughOutputSeq,
   }) {
-    historyRawOutput = rawOutput;
+    _pendingHistory = _PendingHistory(rawOutput, throughOutputSeq);
     store.dispatch(const Attach());
+    if (_viewReady) {
+      _flushPendingHistory();
+    }
+  }
+
+  /// The view fitted to a real grid size. Records it and replays any staged
+  /// history at that size. Idempotent on subsequent fits (no staged history).
+  void noteViewFit(int cols, int rows) {
+    _viewCols = cols;
+    _viewRows = rows;
+    _viewReady = true;
+    _flushPendingHistory();
+  }
+
+  void _flushPendingHistory() {
+    final pending = _pendingHistory;
+    if (pending == null) return;
+    _pendingHistory = null;
     store.dispatch(
       HistoryBytes(
-        rawOutput,
-        cols: cols,
-        rows: rows,
-        throughOutputSeq: throughOutputSeq,
+        pending.rawOutput,
+        cols: _viewCols,
+        rows: _viewRows,
+        throughOutputSeq: pending.throughOutputSeq,
       ),
     );
   }
@@ -209,6 +233,14 @@ class SessionVm {
     store.dispose();
     terminalController.dispose();
   }
+}
+
+/// Staged attach/resync history awaiting the view's first fit.
+class _PendingHistory {
+  const _PendingHistory(this.rawOutput, this.throughOutputSeq);
+
+  final List<int> rawOutput;
+  final int? throughOutputSeq;
 }
 
 class TriageHome extends StatefulWidget {
@@ -2124,10 +2156,10 @@ class SessionWorkspace extends StatelessWidget {
             controller: session.terminalController,
             terminal: session.terminal,
             fallbackRows: session.rows,
-            historyRawOutput: session.historyRawOutput,
             onTerminalResizeBind: (callback) {
               session.onTerminalResize = callback;
             },
+            onViewFit: (cols, rows) => session.noteViewFit(cols, rows),
             focusCursorRevision: session.focusCursorRevision,
             isExited: session.status == 'exited',
           ),
