@@ -147,6 +147,12 @@ class SessionVm {
   int? inFlightCols;
   int? inFlightRows;
   int resizeRequestSeq = 0;
+  // Coalesces resize-driven history replays: a resize animation (e.g. a
+  // sidebar toggle) emits a storm of snapshots, and forcing a full replay on
+  // each one re-inserts the scrollback repeatedly, leaving duplicated and
+  // fragmented text. Bumping `replayRevision` is debounced behind this timer so
+  // only the final, settled size triggers a single rebuild.
+  Timer? replayCoalesceTimer;
 
   late final xt.Terminal terminal;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
@@ -713,6 +719,7 @@ class _TriageHomeState extends State<TriageHome> {
                   sessionId,
                   snapshot,
                   includeHistory: sizeChanged,
+                  coalesceReplay: sizeChanged,
                 );
               }
             } catch (_) {}
@@ -1411,6 +1418,7 @@ class _TriageHomeState extends State<TriageHome> {
             sessionId,
             snapshot,
             includeHistory: sizeChanged,
+            coalesceReplay: sizeChanged,
           );
         }
       } else if (event.containsKey('ResyncRequired')) {
@@ -1433,6 +1441,7 @@ class _TriageHomeState extends State<TriageHome> {
     String sessionId,
     Map<String, dynamic> snapshot, {
     bool includeHistory = false,
+    bool coalesceReplay = false,
   }) async {
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     final cols = sizeObj?['cols'] as int?;
@@ -1484,7 +1493,11 @@ class _TriageHomeState extends State<TriageHome> {
       session.statusColor = exited
           ? const Color(0xff7f8b8d)
           : const Color(0xff7fd1c7);
-      if (includeHistory) {
+      // An immediate (non-coalesced) history replay — attach, resync, session
+      // select — rebuilds now and cancels any pending coalesced replay so we
+      // don't rebuild twice. Resize-driven replays are debounced below instead.
+      if (includeHistory && !coalesceReplay) {
+        session.replayCoalesceTimer?.cancel();
         session.replayRevision += 1;
       }
       if (cols != null && rowsVal != null) {
@@ -1496,6 +1509,24 @@ class _TriageHomeState extends State<TriageHome> {
         }
       }
     });
+
+    // Resize-driven replay: `session.rows` is already updated above, but defer
+    // the visual rebuild until the resize settles. Each snapshot in the storm
+    // reschedules this timer, so only the last (final-size) snapshot triggers a
+    // single `replayRevision` bump — collapsing the storm into one clean
+    // rebuild instead of one re-inserted copy per intermediate size.
+    if (includeHistory && coalesceReplay) {
+      session.replayCoalesceTimer?.cancel();
+      session.replayCoalesceTimer = Timer(
+        const Duration(milliseconds: 150),
+        () {
+          if (_disposed || !mounted) return;
+          setState(() {
+            session.replayRevision += 1;
+          });
+        },
+      );
+    }
   }
 
   void _onWebSocketError(dynamic error, int generation) {
@@ -1534,6 +1565,7 @@ class _TriageHomeState extends State<TriageHome> {
       _websocketSubscription?.cancel();
     }
     for (final s in _sessions) {
+      s.replayCoalesceTimer?.cancel();
       s.terminalController.dispose();
       TerminalPane.destroySession(s.title);
     }
@@ -1829,6 +1861,7 @@ class _TriageHomeState extends State<TriageHome> {
       final index = _sessions.indexOf(session);
       if (index != -1) {
         _sessions.removeAt(index);
+        session.replayCoalesceTimer?.cancel();
         session.terminalController.dispose();
         TerminalPane.destroySession(session.title);
         if (_selectedIndex >= _sessions.length) {

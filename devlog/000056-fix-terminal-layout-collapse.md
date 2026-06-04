@@ -54,9 +54,38 @@ headless buffer dump (the cell buffer is correct, which is why paste is clean).
 2026-06-03T18:40-0700 Held the push — local debug only, no CI needed until a real
 fix exists.
 
+## Root Cause (CONFIRMED via instrumented macOS run)
+
+The `[LAYOUTDBG]` metrics refuted the paint/width theory: `scaler=(no scaling)
+dpr=2.0 cell=9.031` and every ASCII glyph advance == 9.031 == cell. No overlap,
+no scaling — **not a font/width bug.**
+
+The real bug: the terminal is **fully torn down and rebuilt from a host history
+snapshot on every size change.** A single sidebar toggle emits a *storm* of size
+changes (logged: `cols 60→63→…→77→…→43`). For each, the host pushes a `Snapshot`;
+the client sees `sizeChanged` and applies it with history (main.dart Snapshot
+handler + the resize path at ~715), which bumps `replayRevision` →
+`_triggerFullReplayOrReset` → `resetTerminalSafe` + `writeInitialContent`,
+re-inserting the entire growing scrollback (`fallbackRows 119→125→188`) at each
+intermediate wrap width. These rebuilds race the live stream and each other,
+producing duplicated lines ("copies get inserted") and shredded fragments that
+read as collapsed spaces. The logs also showed `writeInitialContent` running
+twice while `initWritten=false` (a re-entrancy race) at startup.
+
+## Fix (parent-level coalescing — user's chosen approach)
+
+`_applySnapshotToSession` gains a `coalesceReplay` flag. Resize-driven snapshots
+(`Snapshot` with `sizeChanged`, both call sites) still update `session.rows`
+immediately but **debounce** the `replayRevision` bump behind a per-session
+150 ms `replayCoalesceTimer` — so a resize storm collapses into ONE rebuild at
+the final settled size. Attach / resync / session-select keep the immediate bump
+and cancel any pending coalesced replay so we never rebuild twice. Timer is
+cancelled on session removal and in the State `dispose`.
+
 ## Commits
 
-HEAD — debug(client): instrument terminal pane layout/metrics for the space-collapse bug
+HEAD — fix(client): coalesce resize-driven terminal replays to stop duplicated/fragmented text
+b16aa05 — debug(client): instrument terminal pane layout/metrics for the space-collapse bug
 
 ## Next Steps
 
