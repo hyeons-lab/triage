@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -117,6 +118,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _bindTerminal(_terminal);
     _bindController();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _logLayoutDiagnostics();
+    });
     if (widget.focusCursorRevision > 0) {
       _focusCursorNowAndAfterReplay();
     }
@@ -137,6 +141,44 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _bindController() {
     widget.controller.addFitListener(_onFit);
+  }
+
+  // TEMP LAYOUT DEBUG: log the real-runtime cell width vs. individual glyph
+  // advances (paint-overlap test) once per app run. Remove before merge.
+  static bool _loggedMetrics = false;
+  void _logLayoutDiagnostics() {
+    if (_loggedMetrics) return;
+    _loggedMetrics = true;
+    final scaler = MediaQuery.maybeTextScalerOf(context) ?? TextScaler.noScaling;
+    final dpr = View.of(context).devicePixelRatio;
+    double adv(String s) {
+      final b = ui.ParagraphBuilder(ui.ParagraphStyle(fontSize: 15))
+        ..pushStyle(
+          ui.TextStyle(
+            fontFamily: 'Menlo',
+            fontFamilyFallback: const ['Monaco', 'Consolas', 'monospace'],
+            fontSize: scaler.scale(15),
+          ),
+        )
+        ..addText(s);
+      final p = b.build()
+        ..layout(const ui.ParagraphConstraints(width: double.infinity));
+      return p.maxIntrinsicWidth;
+    }
+
+    final cell = adv('mmmmmmmmmm') / 10;
+    final samples = <String, String>{
+      'm': 'm', 'i': 'i', 'a': 'a', 'sp': ' ', '0': '0', 'M': 'M',
+      'tri': '⏵', 'dot': '·', 'arr': '←', 'cir': '●', 'box': '📦',
+    };
+    final sb = StringBuffer(
+      '[LAYOUTDBG] scaler=$scaler dpr=$dpr cell=${cell.toStringAsFixed(3)}',
+    );
+    samples.forEach((k, v) {
+      final a = adv(v);
+      sb.write(' | $k=${a.toStringAsFixed(3)}${a > cell + 0.05 ? "!OVER" : ""}');
+    });
+    debugPrint(sb.toString());
   }
 
   void _unbindController(TerminalController controller) {
@@ -215,6 +257,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelWidth,
     int pixelHeight,
   ) {
+    debugPrint(
+      '[LAYOUTDBG] resize cols=$width rows=$height pxW=$pixelWidth '
+      'pxH=$pixelHeight initWritten=${widget.initialContentWritten}',
+    );
     if (width > 0 && height > 0) {
       if (!widget.initialContentWritten) {
         scheduleMicrotask(() {
@@ -271,6 +317,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   bool _writeInitialContent() {
+    debugPrint(
+      '[LAYOUTDBG] writeInitialContent cols=${_terminal.viewWidth} '
+      'rows=${_terminal.viewHeight} fallbackRows=${widget.fallbackRows.length} '
+      'replayPending=${widget.replayPending}',
+    );
     if (widget.replayPending) {
       return false;
     }
@@ -372,6 +423,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _resetTerminalSafe() {
+    debugPrint('[LAYOUTDBG] resetTerminalSafe');
     try {
       _terminal.useMainBuffer();
       _terminal.mainBuffer.clear();
@@ -381,6 +433,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _triggerFullReplayOrReset() {
+    debugPrint(
+      '[LAYOUTDBG] triggerFullReplayOrReset replayPending=${widget.replayPending} '
+      'initWritten=${widget.initialContentWritten} '
+      'cols=${_terminal.viewWidth} rows=${_terminal.viewHeight}',
+    );
     if (widget.replayPending) {
       return;
     }
