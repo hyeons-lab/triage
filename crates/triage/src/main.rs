@@ -1907,6 +1907,8 @@ mod tests {
                 }),
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -1948,6 +1950,8 @@ mod tests {
                 }),
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -1991,6 +1995,8 @@ mod tests {
                 }),
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2047,6 +2053,8 @@ mod tests {
                 context: None,
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2086,6 +2094,8 @@ mod tests {
                 context: None,
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2367,6 +2377,8 @@ mod tests {
             context: None,
             bracketed_paste_enabled: false,
             exited: false,
+            raw_output: Vec::new(),
+            raw_output_start: 0,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_some());
@@ -2396,6 +2408,8 @@ mod tests {
             context: None,
             bracketed_paste_enabled: false,
             exited: false,
+            raw_output: Vec::new(),
+            raw_output_start: 0,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 1).is_none());
@@ -2445,6 +2459,8 @@ mod tests {
                 context: None,
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,

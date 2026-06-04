@@ -61,7 +61,49 @@ de-dupe (live + queued), resize-emits-no-replay/clear + distinct-size forwarding
 sub-min ignore, split-UTF-8, CRLF normalization + split, input forward/suppress,
 sink echo routing, detached-ignore. `flutter analyze` clean.
 
+2026-06-03T21:35-0700 **Part B, migration step 2: host streams a raw-output
+history tail.** `crates/triage-core/schema/triage.fbs` — appended `raw_output:
+[ubyte]` + `raw_output_start: uint64` to `SessionSnapshot` (append-only; old
+hosts/clients interop). Regenerated Dart bindings (`flatc --dart
+--gen-object-api` + `dart format`) in `flutter/triage_client/lib/generated/`.
+`crates/triage-core/src/session.rs` — two new struct fields (`#[serde(default)]`).
+`crates/triage-core/src/flatbuffers_proto.rs` — `build_session_snapshot`
+serializes them (vector omitted when empty so old clients see an absent field);
++2 round-trip tests. `crates/triaged/src/session.rs` — `read_raw_output_tail`
+(reads the last `RAW_OUTPUT_TAIL_CAP = 1 MiB` of the unbuffered log, returns
+`(start, bytes)`), `SessionActor::snapshot_with_history` +
+`HistoricalSession::snapshot_with_history` (overlay the tail), wired into the
+attach/explicit-snapshot command handler, `resync_envelope`, and both Historical
+attach/snapshot sites — **but not the resize broadcast** (`snapshot()` stays
+history-free so resizes never carry 1 MiB). +1 boundary test. Filled the two new
+fields (`Vec::new()`/`0`) in all 16 other `SessionSnapshot {}` literals (triage
+TUI/lib, mcp, transport-ws lib + benches). `triage_websocket_client.dart`
+`_parseSessionSnapshot` exposes `raw_output`/`raw_output_start`. All Rust tests
+green (triage-core 18, triaged 81, transport-ws 16, triage 25, mcp 41); workspace
+`--all-targets` builds clean.
+
 ## Decisions
+
+2026-06-03T21:35-0700 `raw_output` carried only on attach/resync/explicit-snapshot
+(not resize broadcasts) — reasoning: the in-actor `snapshot()` feeds the frequent
+resize `SnapshotEvent`; loading a 1 MiB tail there would bloat every resize to
+every subscriber. A dedicated `snapshot_with_history()` overlays the tail only on
+the history-bearing paths.
+
+2026-06-03T21:35-0700 `RAW_OUTPUT_TAIL_CAP = 1 MiB` (plan suggested 4 MiB) —
+reasoning: the Phase 0 spike showed a 64 KiB tail of a real Claude log
+reconstructs identically to the full 7.5 MB replay (Claude repaints a full frame
+every render, so any tail with ≥1 frame self-heals). 1 MiB is ~16× headroom for
+full-screen TUIs (vim/less) run inside a session while keeping attach payloads
+small over remote links. Plain bounded tail (no anchor-trimming) — the spike
+proved it sufficient for the real workload; anchor-snap noted as a future option.
+
+2026-06-03T21:35-0700 History and live are byte-identical: live `Output{bytes}`
+broadcasts the same RAW (untranslated) bytes as the log
+(`session.rs:1820`), and `raw_output` is the raw log tail ending at
+`bytes_logged` (== `output_seq` S). The client drops live `Output` with
+`output_seq <= S` — exact, gapless de-dup. CRLF normalization happens once in the
+client store for both streams.
 
 2026-06-03T18:40-0700 Reproduce via instrumentation + a real macOS run (user's
 choice) rather than a headless test — the bug is paint-layer and won't show in a
@@ -174,7 +216,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 
 ## Commits
 
-HEAD — feat(client): add unidirectional MVI terminal seam (intent/state/sink/store)
+HEAD — feat(host): stream a raw-output history tail in SessionSnapshot
+435ff57 — feat(client): add unidirectional MVI terminal seam (intent/state/sink/store)
 b80318a — fix(client): coalesce resize-driven terminal replays to stop duplicated/fragmented text
 b16aa05 — debug(client): instrument terminal pane layout/metrics for the space-collapse bug
 

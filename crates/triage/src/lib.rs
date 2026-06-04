@@ -844,6 +844,8 @@ mod tests {
             context: None,
             bracketed_paste_enabled: false,
             exited: true,
+            raw_output: Vec::new(),
+            raw_output_start: 0,
         };
 
         let mut app = LocalSessionApp::start_with_manager(
@@ -1486,6 +1488,8 @@ mod tests {
                 context: None,
                 bracketed_paste_enabled: false,
                 exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
             },
             lease: InputLeaseState::default(),
             last_completed: None,
@@ -1574,6 +1578,8 @@ mod tests {
                     context: None,
                     bracketed_paste_enabled: false,
                     exited: false,
+                    raw_output: Vec::new(),
+                    raw_output_start: 0,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
@@ -1751,6 +1757,8 @@ mod tests {
                     context: None,
                     bracketed_paste_enabled: false,
                     exited: false,
+                    raw_output: Vec::new(),
+                    raw_output_start: 0,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {

@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -821,7 +821,7 @@ impl SessionApi for SessionManager {
                 })
             }
             ManagedSession::Historical { session, lease } => Ok(AttachSessionResponse {
-                snapshot: session.snapshot(),
+                snapshot: session.snapshot_with_history(),
                 lease: lease.clone(),
             }),
             ManagedSession::Restoring { .. } => {
@@ -1055,7 +1055,7 @@ impl SessionApi for SessionManager {
             .with_context(|| format!("session {session_id} not found"))?;
         match session {
             ManagedSession::Live { actor, .. } => actor.snapshot(),
-            ManagedSession::Historical { session, .. } => Ok(session.snapshot()),
+            ManagedSession::Historical { session, .. } => Ok(session.snapshot_with_history()),
             ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
         }
     }
@@ -1415,6 +1415,21 @@ impl HistoricalSession {
             self.context.clone(),
             true,
         )
+    }
+
+    /// As [`Self::snapshot`], but carrying the raw output-history tail for
+    /// client-side re-emulation. Historical sessions are only ever read on the
+    /// attach/snapshot paths, so this is always history-bearing.
+    fn snapshot_with_history(&self) -> SessionSnapshot {
+        let mut snapshot = self.snapshot();
+        let (start, raw) = read_raw_output_tail(
+            &self.persisted.log_path,
+            self.output.bytes_logged,
+            RAW_OUTPUT_TAIL_CAP,
+        );
+        snapshot.raw_output = raw;
+        snapshot.raw_output_start = start;
+        snapshot
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -1838,7 +1853,7 @@ impl ActorState {
                 false
             }
             ActorCommand::Snapshot { response } => {
-                let _ = response.send(Ok(self.snapshot()));
+                let _ = response.send(Ok(self.snapshot_with_history()));
                 false
             }
             ActorCommand::StyledRows {
@@ -1916,6 +1931,21 @@ impl ActorState {
             self.context.clone(),
             self.exited,
         )
+    }
+
+    /// A snapshot carrying the raw output-history tail for client-side
+    /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
+    /// the plain [`Self::snapshot`] so they never carry history.
+    fn snapshot_with_history(&self) -> SessionSnapshot {
+        let mut snapshot = self.snapshot();
+        let (start, raw) = read_raw_output_tail(
+            &self.log_path,
+            self.output.bytes_logged,
+            RAW_OUTPUT_TAIL_CAP,
+        );
+        snapshot.raw_output = raw;
+        snapshot.raw_output_start = start;
+        snapshot
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -2045,7 +2075,7 @@ impl ActorState {
             event: SessionEvent::ResyncRequired {
                 session_id,
                 latest_event_seq,
-                snapshot: self.snapshot(),
+                snapshot: self.snapshot_with_history(),
             },
         }
     }
@@ -2470,6 +2500,47 @@ fn snapshot_from_output(
         context,
         bracketed_paste_enabled: output.terminal.bracketed_paste_enabled(),
         exited,
+        // History (raw_output) is attached only on the attach/resync/snapshot
+        // paths via `*_with_history`; resize broadcasts carry none.
+        raw_output: Vec::new(),
+        raw_output_start: 0,
+    }
+}
+
+/// Maximum bytes of raw output history carried in a snapshot for client-side
+/// re-emulation. Bounded because a repainting TUI (e.g. Claude Code) self-heals
+/// its whole viewport within one frame; the Phase 0 spike confirmed a small tail
+/// reconstructs the screen exactly (a 64 KiB tail matched full replay). 1 MiB
+/// gives generous headroom for full-screen TUIs run inside a session.
+const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
+
+/// Reads the last `cap` bytes of the raw output log, returning the byte offset of
+/// the first returned byte (`raw_output_start`) and the bytes. These are the
+/// untranslated PTY bytes — byte-identical to the live Output stream — so client
+/// history and live writes are consistent and de-duplicate cleanly by
+/// `output_seq`. `File` writes are unbuffered, so the on-disk tail is current.
+fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, Vec<u8>) {
+    if bytes_logged == 0 {
+        return (0, Vec::new());
+    }
+    let start = bytes_logged.saturating_sub(cap);
+    let read = (|| -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(log_path)?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    })();
+    match read {
+        Ok(buf) => (start, buf),
+        Err(error) => {
+            tracing::warn!(
+                log_path = %log_path.display(),
+                ?error,
+                "failed to read raw output tail; sending empty history"
+            );
+            (0, Vec::new())
+        }
     }
 }
 
@@ -5029,6 +5100,38 @@ mod tests {
             std::thread::current().id()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn read_raw_output_tail_respects_cap_and_offset() {
+        let path = std::env::temp_dir().join(format!(
+            "triage-rawtail-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"0123456789").unwrap(); // 10 bytes
+
+        // cap larger than the log -> whole log from offset 0.
+        let (start, bytes) = read_raw_output_tail(&path, 10, 1024);
+        assert_eq!(start, 0);
+        assert_eq!(bytes, b"0123456789");
+
+        // cap smaller than the log -> last `cap` bytes, offset advanced.
+        let (start, bytes) = read_raw_output_tail(&path, 10, 4);
+        assert_eq!(start, 6);
+        assert_eq!(bytes, b"6789");
+
+        // empty session -> empty, no read.
+        let (start, bytes) = read_raw_output_tail(&path, 0, 1024);
+        assert_eq!(start, 0);
+        assert!(bytes.is_empty());
+
+        // missing log -> empty, no panic.
+        let _ = std::fs::remove_file(&path);
+        let (start, bytes) = read_raw_output_tail(&path, 10, 1024);
+        assert_eq!(start, 0);
+        assert!(bytes.is_empty());
     }
 
     fn test_output_state(log_path: &PathBuf, size: SessionSize) -> OutputState {

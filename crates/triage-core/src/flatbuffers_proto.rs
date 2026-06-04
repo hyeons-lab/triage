@@ -137,6 +137,8 @@ pub fn build_session_snapshot<'a>(
         .context
         .as_ref()
         .map(|c| build_session_context(builder, c));
+    let raw_output = (!snap.raw_output.is_empty())
+        .then(|| builder.create_vector(&snap.raw_output));
 
     fb::SessionSnapshot::create(
         builder,
@@ -152,6 +154,8 @@ pub fn build_session_snapshot<'a>(
             context,
             bracketed_paste_enabled: snap.bracketed_paste_enabled,
             exited: snap.exited,
+            raw_output,
+            raw_output_start: snap.raw_output_start,
         },
     )
 }
@@ -270,4 +274,55 @@ pub fn build_styled_rows_response<'a>(
             rows: Some(rows_vec),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionSize, TerminalCursor};
+
+    fn sample(raw_output: Vec<u8>, raw_output_start: u64) -> SessionSnapshot {
+        SessionSnapshot {
+            output_seq: 7,
+            bytes_logged: 100,
+            size: SessionSize::default(),
+            visible_rows: Vec::new(),
+            styled_rows_start: 0,
+            styled_rows: Vec::new(),
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            context: None,
+            bracketed_paste_enabled: false,
+            exited: false,
+            raw_output,
+            raw_output_start,
+        }
+    }
+
+    #[test]
+    fn session_snapshot_round_trips_raw_output() {
+        let mut builder = FlatBufferBuilder::new();
+        let off = build_session_snapshot(&mut builder, &sample(vec![1, 2, 3, 0xff], 96));
+        builder.finish(off, None);
+        let snap =
+            flatbuffers::root::<fb::SessionSnapshot>(builder.finished_data()).unwrap();
+        assert_eq!(snap.raw_output_start(), 96);
+        assert_eq!(snap.raw_output().unwrap().bytes(), &[1, 2, 3, 0xff]);
+    }
+
+    #[test]
+    fn empty_raw_output_is_omitted_for_old_client_compat() {
+        let mut builder = FlatBufferBuilder::new();
+        let off = build_session_snapshot(&mut builder, &sample(Vec::new(), 0));
+        builder.finish(off, None);
+        let snap =
+            flatbuffers::root::<fb::SessionSnapshot>(builder.finished_data()).unwrap();
+        // Append-only field absent when empty: old clients see a missing vector.
+        assert!(snap.raw_output().is_none());
+        assert_eq!(snap.raw_output_start(), 0);
+    }
 }
