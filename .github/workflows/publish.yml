@@ -178,6 +178,26 @@ jobs:
           flutter pub get
           flutter build macos --release
 
+      # The runner has no Developer ID, so `flutter build macos --release` falls
+      # back to ad-hoc signing and Xcode injects `com.apple.security.get-task-allow`
+      # (a debug entitlement) into the app. macOS will not persist an "Always Allow"
+      # Keychain decision for a debuggable app, so flutter_secure_storage re-prompts
+      # the user on every launch. Re-sign with the Release entitlements (which omit
+      # get-task-allow) to stop the repeated Keychain prompts. The app stays ad-hoc
+      # signed (users clear quarantine on first launch) but is no longer debuggable.
+      - name: Strip get-task-allow (fix repeated Keychain prompts)
+        run: |
+          cd flutter/triage_client
+          APP=build/macos/Build/Products/Release/Triage.app
+          codesign --force --deep --sign - \
+            --entitlements macos/Runner/Release.entitlements "$APP"
+          # Fail the build if the debug entitlement survived the re-sign.
+          if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q 'get-task-allow'; then
+            echo "::error::get-task-allow still present after re-sign" >&2
+            exit 1
+          fi
+          codesign --verify --strict "$APP"
+
       # A .app is a bundle (directory); ditto produces a release-attachable zip
       # that preserves bundle structure and macOS metadata.
       - name: Package Triage.app
