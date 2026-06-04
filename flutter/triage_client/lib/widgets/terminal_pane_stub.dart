@@ -176,9 +176,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   // the live byte stream renders the new layout. No replay here.
   void _onTerminalResize(int width, int height, int pixelWidth, int pixelHeight) {
     if (width > 0 && height > 0) {
-      // Report the fitted size so staged history replays at the real terminal
-      // size (the first fit triggers the deferred replay).
-      widget.onViewFit?.call(width, height);
+      // This fires from inside RenderTerminal.performLayout (the view auto-fits
+      // by calling terminal.resize). Replaying history writes to the terminal,
+      // which would mark the render object dirty during its own layout — illegal.
+      // Defer out of the layout pass via a microtask so the write lands after
+      // layout completes (the terminal is already at the fitted size by then).
+      scheduleMicrotask(() {
+        if (mounted) {
+          widget.onViewFit?.call(width, height);
+        }
+      });
       _scheduleResizeOut(width, height);
     }
   }

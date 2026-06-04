@@ -249,8 +249,19 @@ callback → `SessionVm.noteViewFit` → `HistoryBytes` replays at the real size
 the store flushes the buffered live. Both panes call `onViewFit` on fit; the web
 pane's separate `historyRawOutput` mount-replay was removed (the store now drives
 history through the controller for both platforms). This mirrors the old
-first-fit timing while keeping the single store write path. `flutter analyze`
-clean; 59 tests pass.
+first-fit timing while keeping the single store write path.
+
+2026-06-04T00:30-0700 First defer attempt still blank — and surfaced the true
+cause via a thrown assertion: *"A RenderTerminal was mutated in its own
+performLayout."* The native `TerminalView` auto-fits by calling `terminal.resize`
+**inside** `RenderTerminal.performLayout`, which fires `onResize` → `onViewFit` →
+`HistoryBytes` → `terminal.write` → `markNeedsLayout` while the render object is
+still laying out (illegal; the write is dropped, hence blank until a later
+out-of-layout resize). Fix: the native pane defers the `onViewFit` call to a
+`scheduleMicrotask` so the history/live write lands after layout completes (the
+terminal is already at the fitted size by then) — the same microtask trick the
+pre-refactor `_finishInitialContent` used. Web is unaffected (xterm.js is not a
+Flutter render object). `flutter analyze` clean; 59 tests pass.
 
 ## Decision
 
