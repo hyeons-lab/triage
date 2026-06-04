@@ -82,6 +82,33 @@ TUI/lib, mcp, transport-ws lib + benches). `triage_websocket_client.dart`
 green (triage-core 18, triaged 81, transport-ws 16, triage 25, mcp 41); workspace
 `--all-targets` builds clean.
 
+2026-06-03T22:04-0700 **Wiring (migration steps 3-6): client renders through the
+store; StyledRow replay deleted.** The `TerminalController` is already the shared
+write seam (native: SessionVm's listener -> `xterm.dart` `Terminal`; web: the web
+pane's listener -> xterm.js), so one `lib/terminal/terminal_controller_sink.dart`
+serves both platforms (resize is a no-op — the views own auto-fit). `main.dart`
+`SessionVm` now owns a `TerminalStore` over that sink and exposes `applyHistory`
+/`applyLiveBytes`/`echoLocalBytes`/`markExited`; all the old output machinery
+(`writeOutput`/`decodeOutputBytes`/`_writeTerminalOrBuffer`/
+`markInitialContentWritten`/`flushPendingTerminalWritesAfterReplay`/`markReplaySnapshotOutputSeq`/
+`setSnapshotRefreshPending`/`replayRevision`/`replayCoalesceTimer`/UTF-8 carry/
+`_PendingTerminalWrite`) is removed. Event loop: `Output`->`applyLiveBytes`,
+attach/resync/select/new-session/refresh->`Attach`+`HistoryBytes(raw_output, size,
+output_seq)`, `Exited`->`markExited`, and the resize **Snapshot broadcast is
+ignored** (raw clients re-render from the live stream). Resize-out just tells the
+host the new size (no replay). Native pane (`terminal_pane_stub.dart`) rewritten
+as a thin view (TerminalView + focus/scroll + input + debounced resize-out) — all
+replay/reset/suppression/`[LAYOUTDBG]` gone. Web pane: `_writeInitialContent` now
+re-emulates `historyRawOutput` bytes (UTF-8 + CRLF) instead of styled rows;
+replay-revision/cursor/pending props removed. Deleted `terminal_replay.dart`,
+`SessionVm.rows`-as-render-source (kept only as a plain mirror for the
+FLUTTER_TEST fallback, fed by `_plainRowsFromSnapshot`), `_mergeVisibleAndStyledRows`,
+and `cursor_position_test.dart`. Local/demo sessions seed + echo through the
+store too (one pipeline). Regenerated Dart bindings already carry
+`rawOutput`/`rawOutputStart` (Part B). `flutter analyze` clean (0 errors); 59
+Flutter tests pass (incl. the 12-case reducer suite); 4 obsolete SessionVm-buffering
+widget tests removed (re-homed to `terminal_store_test.dart`). Rust workspace builds.
+
 ## Decisions
 
 2026-06-03T21:35-0700 `raw_output` carried only on attach/resync/explicit-snapshot
@@ -216,7 +243,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 
 ## Commits
 
-HEAD — feat(host): stream a raw-output history tail in SessionSnapshot
+HEAD — refactor(client): render terminal through the MVI store from raw bytes
+84551b1 — feat(host): stream a raw-output history tail in SessionSnapshot
 435ff57 — feat(client): add unidirectional MVI terminal seam (intent/state/sink/store)
 b80318a — fix(client): coalesce resize-driven terminal replays to stop duplicated/fragmented text
 b16aa05 — debug(client): instrument terminal pane layout/metrics for the space-collapse bug

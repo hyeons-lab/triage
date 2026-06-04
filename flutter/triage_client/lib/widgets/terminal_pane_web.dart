@@ -1,6 +1,7 @@
 // ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
@@ -8,42 +9,36 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'terminal_pane.dart';
-import 'terminal_replay.dart';
 
 class TerminalPane extends StatefulWidget {
   const TerminalPane({
     super.key,
     required this.terminalId,
     required this.controller,
-    required this.fallbackRows,
     required this.terminal,
+    required this.fallbackRows,
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
-    required this.initialContentWritten,
-    this.onInitialContentWritten,
-    this.onReplayContentWritten,
-    this.initialCursorRow,
-    this.initialCursorCol,
+    this.historyRawOutput = const [],
     this.isExited = false,
-    this.replayRevision = 0,
-    this.replayPending = false,
   });
 
   final String terminalId;
   final TerminalController controller;
-  final List<StyledRow> fallbackRows;
   final dynamic terminal;
+
+  /// Plain rows; unused by the live web view but kept for parity with native.
+  final List<StyledRow> fallbackRows;
+
+  /// Raw output-history tail re-emulated into the xterm.js instance on first
+  /// mount (its write listener binds only after mount, so it cannot receive the
+  /// store's attach-time history through the controller).
+  final List<int> historyRawOutput;
+
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
   final int focusCursorRevision;
-  final bool initialContentWritten;
-  final VoidCallback? onInitialContentWritten;
-  final VoidCallback? onReplayContentWritten;
-  final int? initialCursorRow;
-  final int? initialCursorCol;
   final bool isExited;
-  final int replayRevision;
-  final bool replayPending;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -415,50 +410,18 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _writeInitialContent() {
-    if (widget.replayPending) {
+    // Single source of truth: re-emulate the raw output-history tail. xterm.js
+    // reconstructs the screen (cursor moves, frames) faithfully — no lossy
+    // styled-row reconstruction.
+    final raw = widget.historyRawOutput;
+    if (raw.isEmpty) {
       return;
     }
-    final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
-    final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
-    final fittedRows = fittedRowsNum.toInt();
-    final fittedCols = fittedColsNum.toInt();
-    final cursor = computeReplayCursorPlacement(
-      fallbackRows: widget.fallbackRows,
-      fittedRows: fittedRows,
-      initialCursorRow: widget.initialCursorRow,
-      initialCursorCol: widget.initialCursorCol,
-      isExited: widget.isExited,
-    );
-
-    final sb = StringBuffer();
-    if (widget.isExited) {
-      sb.write('\x1b[?25l');
-    } else {
-      sb.write('\x1b[?25h');
-    }
-    // Write historical rows first to fill the scrollback buffer
-    for (var i = 0; i < cursor.startRow; i++) {
-      final trimmedRow = clipRowToCols(
-        normalizeReplayRow(widget.fallbackRows[i]),
-        fittedCols,
-      );
-      sb.write(styledRowToAnsi(trimmedRow));
-      sb.write('\r\n');
-    }
-    // Write the active viewport rows
-    for (var i = cursor.startRow; i < cursor.endRow; i++) {
-      final trimmedRow = clipRowToCols(
-        normalizeReplayRow(widget.fallbackRows[i]),
-        fittedCols,
-      );
-      sb.write(styledRowToAnsi(trimmedRow));
-      if (i < cursor.endRow - 1) {
-        sb.write('\r\n');
-      }
-    }
-
-    sb.write('\x1B[${cursor.terminalRow};${cursor.terminalCol}H');
-    _writeReplayContent(sb.toString());
+    final text = utf8
+        .decode(raw, allowMalformed: true)
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\n', '\r\n');
+    _writeReplayContent(text);
   }
 
   void _writeReplayContent(String data) {
@@ -680,7 +643,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _initialContentWritten = true;
     _writeInitialContent();
     _flushPendingLiveWrites();
-    widget.onInitialContentWritten?.call();
     _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
   }
@@ -729,9 +691,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
 
           if (!_initialContentWritten) {
-            if (widget.replayPending) {
-              return;
-            }
             if (!_styleSheetLoaded) {
               return;
             }
@@ -746,9 +705,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               _stableHeight = dHeight;
               _stabilityTimer?.cancel();
               _stabilityTimer = Timer(const Duration(milliseconds: 250), () {
-                if (mounted &&
-                    !_initialContentWritten &&
-                    !widget.replayPending) {
+                if (mounted && !_initialContentWritten) {
                   _finishInitialContent(fittedCols, fittedRows);
                 }
               });
@@ -778,7 +735,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _afterReplayContentWritten({required bool initialReplay}) {
-    widget.onReplayContentWritten?.call();
     final shouldFocus = _focusCursorAfterReplay;
     if (initialReplay || shouldFocus) {
       _focusCursorAfterReplay = false;
@@ -894,18 +850,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       _triggerFullReplayOrReset();
     }
-    if (oldWidget.replayRevision != widget.replayRevision) {
-      _triggerFullReplayOrReset();
-    }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
-    }
-    if (oldWidget.initialCursorRow != widget.initialCursorRow ||
-        oldWidget.initialCursorCol != widget.initialCursorCol) {
-      _triggerFullReplayOrReset();
-    }
-    if (oldWidget.replayPending && !widget.replayPending) {
-      _triggerFullReplayOrReset();
     }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeWriteListener(_onWrite);
