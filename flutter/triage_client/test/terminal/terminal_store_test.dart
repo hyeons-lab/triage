@@ -213,6 +213,32 @@ void main() {
     },
   );
 
+  test(
+    'UTF-8 rune split across the history/live boundary decodes correctly',
+    () {
+      store.dispatch(const Attach());
+      final rune = utf8.encode('é'); // 0xC3 0xA9
+      // History tail ends mid-rune (only the lead byte); the carry must persist
+      // into the first live chunk rather than emitting a replacement character.
+      store.dispatch(
+        HistoryBytes([rune[0]], cols: 80, rows: 24, throughOutputSeq: 1),
+      );
+      store.dispatch(LiveBytes([rune[1]], outputSeq: 2));
+      expect(sink.written.toString(), 'é');
+    },
+  );
+
+  test('CSI > ... m split across the history/live boundary is stripped', () {
+    store.dispatch(const Attach());
+    // The private sequence begins in history and completes in the first live
+    // chunk; it must still be stripped, not leak through as bogus SGR.
+    store.dispatch(
+      HistoryBytes(b('hi\x1b[>4'), cols: 80, rows: 24, throughOutputSeq: 1),
+    );
+    store.dispatch(LiveBytes(b(';2mthere'), outputSeq: 2));
+    expect(sink.written.toString(), 'hithere');
+  });
+
   test('re-delivered live outputSeq is dropped (re-delivery de-dup)', () {
     store.dispatch(const Attach());
     store.dispatch(const HistoryBytes([], cols: 80, rows: 24));

@@ -184,9 +184,9 @@ class TerminalStore extends ChangeNotifier {
     int rows,
     int? throughOutputSeq,
   ) {
-    // Replay at the size the bytes were generated for, so cursor-addressed TUI
-    // frames reconstruct without wrap fragmentation. A later viewport [Resize]
-    // reflows and the live repaint self-heals.
+    // Replay at the client's target grid size ([cols] x [rows], the current
+    // emulator/view size chosen by the caller — not the host capture size). A
+    // later viewport [Resize] reflows and the live repaint self-heals.
     var next = s;
     if (cols >= kMinTerminalCols && rows >= kMinTerminalRows) {
       _applyResizeToSink(cols, rows);
@@ -194,12 +194,16 @@ class TerminalStore extends ChangeNotifier {
     }
 
     _sink.clear();
+    // Reset carries so history starts a fresh decode stream; history then
+    // decodes through the same streaming path as live, so a UTF-8 rune, CRLF
+    // pair, or `CSI > … m` sequence split across the history→live boundary (the
+    // snapshot tail can end mid-sequence) carries into the first live chunk.
     _resetCarries();
     // Replaying the raw tail re-feeds the program's own terminal queries to the
     // emulator, which auto-answers them; suppress those answers so they are not
     // echoed to the host as user input.
     _beginHostInputSuppression();
-    _writeDecoded(bytes, isHistory: true);
+    _writeDecoded(bytes);
 
     next = next.copyWith(
       phase: AttachPhase.live,
@@ -292,7 +296,7 @@ class TerminalStore extends ChangeNotifier {
   /// Write a live chunk through the decode path and advance the applied-seq
   /// high-water so a later re-delivery of the same chunk is dropped.
   void _applyLive(List<int> bytes, int? outputSeq) {
-    _writeDecoded(bytes, isHistory: false);
+    _writeDecoded(bytes);
     if (outputSeq != null) {
       _appliedLiveSeq = _appliedLiveSeq == null
           ? outputSeq
@@ -318,30 +322,27 @@ class TerminalStore extends ChangeNotifier {
     });
   }
 
-  /// Decode raw bytes to text and write them through the sink. History is a
-  /// self-contained range (no carry across calls); live persists the UTF-8 and
-  /// trailing-CR carries across chunks.
-  void _writeDecoded(List<int> bytes, {required bool isHistory}) {
-    List<int> toDecode;
-    if (isHistory) {
-      toDecode = bytes;
-    } else {
-      toDecode = _utf8Carry.isEmpty
-          ? List<int>.from(bytes)
-          : <int>[..._utf8Carry, ...bytes];
-      _utf8Carry.clear();
-      final trailing = _trailingIncompleteUtf8ByteCount(toDecode);
-      if (trailing > 0) {
-        _utf8Carry.addAll(toDecode.sublist(toDecode.length - trailing));
-        toDecode = toDecode.sublist(0, toDecode.length - trailing);
-      }
+  /// Decode raw bytes to text and write them through the sink. A single
+  /// streaming path for both history and live: trailing incomplete UTF-8, a
+  /// dangling CR, and an unterminated `CSI > …` are held in carries and joined
+  /// with the next bytes, so a sequence split across chunks — or across the
+  /// history→live boundary — is decoded correctly. [Attach]/[Clear]/history
+  /// reset the carries to start a fresh stream.
+  void _writeDecoded(List<int> bytes) {
+    var toDecode = _utf8Carry.isEmpty
+        ? List<int>.from(bytes)
+        : <int>[..._utf8Carry, ...bytes];
+    _utf8Carry.clear();
+    final trailing = _trailingIncompleteUtf8ByteCount(toDecode);
+    if (trailing > 0) {
+      _utf8Carry.addAll(toDecode.sublist(toDecode.length - trailing));
+      toDecode = toDecode.sublist(0, toDecode.length - trailing);
     }
     if (toDecode.isEmpty) return;
     final sanitized = _stripUnsupportedPrivateCsi(
       utf8.decode(toDecode, allowMalformed: true),
-      live: !isHistory,
     );
-    final text = _normalizeNewlines(sanitized, live: !isHistory);
+    final text = _normalizeNewlines(sanitized);
     if (text.isNotEmpty) {
       _sink.write(text);
     }
@@ -351,12 +352,12 @@ class TerminalStore extends ChangeNotifier {
   /// Claude Code emits at startup). xterm.dart ignores the `>` private marker
   /// and misparses them as plain SGR — e.g. `CSI > 4 ; 2 m` becomes SGR 4
   /// (underline), which poisons every subsequent cell and erase with a spurious
-  /// underline. The emulator does not support these sequences anyway. For the
-  /// live stream a trailing, not-yet-terminated `CSI > …` is held back so a
-  /// sequence split across chunks is still caught.
-  String _stripUnsupportedPrivateCsi(String input, {required bool live}) {
+  /// underline. The emulator does not support these sequences anyway. A
+  /// trailing, not-yet-terminated `CSI > …` is held back so a sequence split
+  /// across chunks (or the history→live boundary) is still caught.
+  String _stripUnsupportedPrivateCsi(String input) {
     var s = input;
-    if (live && _privateCsiCarry.isNotEmpty) {
+    if (_privateCsiCarry.isNotEmpty) {
       s = _privateCsiCarry + s;
       _privateCsiCarry = '';
     }
@@ -365,28 +366,26 @@ class TerminalStore extends ChangeNotifier {
     if (!s.contains('\x1b')) {
       return s;
     }
-    if (live) {
-      final partial = _partialPrivateCsi.firstMatch(s);
-      // Only hold a bounded partial; otherwise let it flush to avoid unbounded
-      // growth on a stream that never completes the sequence.
-      if (partial != null && (s.length - partial.start) <= 24) {
-        _privateCsiCarry = s.substring(partial.start);
-        s = s.substring(0, partial.start);
-      }
+    final partial = _partialPrivateCsi.firstMatch(s);
+    // Only hold a bounded partial; otherwise let it flush to avoid unbounded
+    // growth on a stream that never completes the sequence.
+    if (partial != null && (s.length - partial.start) <= 24) {
+      _privateCsiCarry = s.substring(partial.start);
+      s = s.substring(0, partial.start);
     }
     return s.replaceAll(_completePrivateCsi, '');
   }
 
   /// Normalize bare LF to CRLF (leaving existing CRLF intact) so the emulator
-  /// does not stair-step. For the live stream a trailing '\r' is held back so a
-  /// CRLF split across chunks is not doubled.
-  String _normalizeNewlines(String input, {required bool live}) {
+  /// does not stair-step. A trailing '\r' is held back so a CRLF split across
+  /// chunks (or the history→live boundary) is not doubled.
+  String _normalizeNewlines(String input) {
     var s = input;
-    if (live && _pendingCarriageReturn) {
+    if (_pendingCarriageReturn) {
       s = '\r$s';
       _pendingCarriageReturn = false;
     }
-    if (live && s.endsWith('\r')) {
+    if (s.endsWith('\r')) {
       _pendingCarriageReturn = true;
       s = s.substring(0, s.length - 1);
     }

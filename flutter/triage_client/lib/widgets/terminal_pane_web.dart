@@ -112,7 +112,6 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   double? _lastWidth;
   double? _lastHeight;
-  bool _liveOutputReceived = false;
   int? _lastFittedRows;
   int? _lastFittedCols;
   bool _focusCursorAfterReplay = false;
@@ -176,7 +175,6 @@ class _TerminalPaneState extends State<TerminalPane> {
                 _initialContentWritten = false;
                 _stableWidth = null;
                 _stableHeight = null;
-                _liveOutputReceived = false;
                 _triggerFitWithDelayedRetries();
               } catch (_) {}
             }
@@ -195,7 +193,6 @@ class _TerminalPaneState extends State<TerminalPane> {
               _initialContentWritten = false;
               _stableWidth = null;
               _stableHeight = null;
-              _liveOutputReceived = false;
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
@@ -586,7 +583,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       _pendingLiveWriteBuffer.add(data);
     } else {
       if (!_initialized) return;
-      _liveOutputReceived = true;
       js_util.callMethod(_term, 'write', [data]);
     }
   }
@@ -615,7 +611,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
     _pendingLiveWriteBuffer.clear();
-    _liveOutputReceived = true;
     for (final data in pendingWrites) {
       js_util.callMethod(_term, 'write', [data]);
     }
@@ -676,13 +671,12 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (_stabilityTimer == null || !_stabilityTimer!.isActive) {
               _finishInitialContent(fittedCols, fittedRows);
             }
-          } else if (widget.isExited) {
-            _resetTerminalSafe();
-            _writeInitialContent();
-          } else if (sizeChanged && !_liveOutputReceived) {
-            _resetTerminalSafe();
-            _writeInitialContent();
           }
+          // No clear-and-rewrite on resize: `_writeInitialContent` only signals
+          // the fitted size now (it no longer writes content), so clearing here
+          // would blank the terminal — for an exited session permanently, since
+          // no live repaint follows. xterm.js reflows its own buffer on fit(),
+          // and active sessions repaint via the live stream after the resize-out.
         }
       }
     } catch (_) {}
@@ -795,7 +789,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         _initialContentWritten = false;
         _stableWidth = null;
         _stableHeight = null;
-        _liveOutputReceived = false;
         _triggerFitWithDelayedRetries();
       }
     } catch (_) {}

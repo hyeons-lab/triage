@@ -37,6 +37,26 @@ only, and only reproduce in the real macOS font runtime:
 
 ## What Changed
 
+2026-06-05T06:42-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`,
+`lib/terminal/terminal_store.dart`, `test/terminal/terminal_store_test.dart` —
+**second PR-review round.** (1) **Web blank-on-resize / blank-exited bug:**
+`_onFit` cleared the xterm.js buffer (`_resetTerminalSafe`) and then called
+`_writeInitialContent`, which after the MVI refactor only *signals* `onViewFit`
+and no longer writes content — so resizes (and exited sessions, where the branch
+fired on every fit with no live repaint to follow) went blank. Removed both
+clear-and-rewrite resize branches; xterm.js reflows its own buffer on `fit()` and
+active sessions repaint via the live stream after the resize-out. Removed the now
+write-only `_liveOutputReceived` field. (2) **History decoded without carry:**
+`_writeDecoded` special-cased history as a self-contained block, so a UTF-8 rune,
+CRLF pair, or `CSI > … m` sequence split across the history→live boundary (the
+snapshot tail can end mid-sequence) produced replacement chars / a doubled CR / a
+leaked underline-poisoning sequence. History now decodes through the **same**
+streaming carry path as live (carries persist from history's tail into the first
+live chunk); dropped the `isHistory`/`live` params from `_writeDecoded` /
+`_stripUnsupportedPrivateCsi` / `_normalizeNewlines`. (3) Fixed the misleading
+`_reduceHistory` comment (replays at the client target size, not the host capture
+size). Added two boundary tests (UTF-8 and `CSI > … m` split across history→live).
+
 2026-06-04T22:52-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`
 — **shift-click extends the terminal text selection.** The native pane now owns
 an xterm `TerminalController` (passed to `TerminalView`) and observes it to keep
@@ -470,7 +490,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — feat(client): shift-click extends terminal text selection
+HEAD — fix(client): web blank-on-resize + history decode carry (PR review round 2)
+62168d2 — feat(client): shift-click extends terminal text selection
 8e80a80 — fix(client): re-sync host to fitted size on first view fit (first-load wrap fragmentation)
 7db33c2 — fix(client): address PR review (lookbehind-free CRLF, clear buffer on attach/clear, drop dead resize branch + unused replay size)
 53e36e7 — fix(client): suppress replay-echoed input, bound pre-size buffer, consolidate de-dup
