@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HardwareKeyboard;
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'terminal_pane.dart';
@@ -58,6 +59,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _lastResizeOutCols;
   int? _lastResizeOutRows;
 
+  // Selection state. The view owns selection through this xterm controller; we
+  // observe it to keep the live anchor (the cell a selection started from) so a
+  // later shift-click can extend the range to a new cell — even after scrolling,
+  // since anchors track buffer lines, not viewport rows.
+  final xt.TerminalController _xtermController = xt.TerminalController();
+  xt.CellOffset? _selectionAnchor;
+  // True while we are programmatically extending, so our own selection change
+  // does not overwrite the anchor (it must stay fixed across repeated extends).
+  bool _extendingSelection = false;
+
   // Premium design system theme matching the web terminal
   static const _theme = xt.TerminalTheme(
     cursor: Color(0xff7fd1c7),
@@ -109,6 +120,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _bindTerminal(_terminal);
     widget.controller.addFitListener(_onFit);
+    _xtermController.addListener(_recordSelectionAnchor);
     if (widget.focusCursorRevision > 0) {
       _scrollToCursor(requestFocus: true);
     }
@@ -136,6 +148,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!identical(oldWidget.terminal, widget.terminal)) {
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
+      // The anchor referenced the previous terminal's buffer; drop it.
+      _selectionAnchor = null;
       _scrollToCursor(requestFocus: true);
     }
     if (oldWidget.controller != widget.controller) {
@@ -152,6 +166,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.onTerminalResizeBind?.call(null);
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
+    _xtermController.removeListener(_recordSelectionAnchor);
+    _xtermController.dispose();
     _scrollController.dispose();
     _focusNode.dispose();
     _resizeOutDebounceTimer?.cancel();
@@ -161,6 +177,43 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _onFit() {
     setState(() {});
+  }
+
+  // Remember where the current selection is anchored so a shift-click can extend
+  // from it. Skipped while we are doing the extending ourselves so the anchor
+  // stays pinned to the original start across repeated shift-clicks.
+  void _recordSelectionAnchor() {
+    if (_extendingSelection) return;
+    final selection = _xtermController.selection;
+    if (selection != null) {
+      _selectionAnchor = selection.begin;
+    }
+  }
+
+  // Shift-click: extend the selection from the saved anchor to [target]. xterm
+  // clears the live selection on tap-down, so we rebuild it from the anchor we
+  // recorded before the click. Anchors are buffer-line based, so this is correct
+  // even if the view was scrolled between the original selection and the click.
+  void _extendSelectionTo(xt.CellOffset target) {
+    final anchor = _selectionAnchor;
+    if (anchor == null) return;
+    final buffer = _terminal.buffer;
+    final lastRow = buffer.lines.length - 1;
+    if (lastRow < 0) return;
+    // Guard against a buffer that shrank (clear / scrollback trim) since the
+    // anchor was recorded, so createAnchorFromOffset never indexes out of range.
+    final safeAnchor = anchor.y > lastRow
+        ? xt.CellOffset(anchor.x, lastRow)
+        : anchor;
+    _extendingSelection = true;
+    try {
+      _xtermController.setSelection(
+        buffer.createAnchorFromOffset(safeAnchor),
+        buffer.createAnchorFromOffset(target),
+      );
+    } finally {
+      _extendingSelection = false;
+    }
   }
 
   void _onTerminalOutput(String data) {
@@ -174,7 +227,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   // The TerminalView auto-fits and calls this when the grid size changes. We
   // forward the settled size to the host (debounced); the program repaints and
   // the live byte stream renders the new layout. No replay here.
-  void _onTerminalResize(int width, int height, int pixelWidth, int pixelHeight) {
+  void _onTerminalResize(
+    int width,
+    int height,
+    int pixelWidth,
+    int pixelHeight,
+  ) {
     if (width > 0 && height > 0) {
       // This fires from inside RenderTerminal.performLayout (the view auto-fits
       // by calling terminal.resize). Replaying history writes to the terminal,
@@ -302,6 +360,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             },
             child: xt.TerminalView(
               _terminal,
+              controller: _xtermController,
               theme: _theme,
               focusNode: _focusNode,
               autofocus: true,
@@ -313,8 +372,13 @@ class _TerminalPaneState extends State<TerminalPane> {
               // pressed") and swallows keystrokes; this is the standard desktop
               // terminal fix.
               hardwareKeyboardOnly: true,
-              onTapUp: (_, __) {
+              onTapUp: (_, cellOffset) {
                 _focusTerminal();
+                // Shift-click extends the existing selection to the clicked
+                // cell instead of clearing it (xterm cleared it on tap-down).
+                if (HardwareKeyboard.instance.isShiftPressed) {
+                  _extendSelectionTo(cellOffset);
+                }
               },
             ),
           ),

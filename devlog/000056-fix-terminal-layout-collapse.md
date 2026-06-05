@@ -37,6 +37,20 @@ only, and only reproduce in the real macOS font runtime:
 
 ## What Changed
 
+2026-06-04T22:52-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`
+— **shift-click extends the terminal text selection.** The native pane now owns
+an xterm `TerminalController` (passed to `TerminalView`) and observes it to keep
+the live selection's anchor (`selection.begin`) as a buffer-absolute `CellOffset`.
+On a shift-click — which xterm clears on tap-down — `onTapUp` rebuilds the range
+from the saved anchor to the clicked cell via `setSelection` +
+`buffer.createAnchorFromOffset`. Anchors are buffer-line based, so the extend is
+correct after scrolling (select → scroll → shift-click selects the new range).
+An `_extendingSelection` guard keeps the anchor pinned across repeated
+shift-clicks; the anchor is cleared on a terminal swap and its row is clamped
+against a shrunk buffer (clear / scrollback trim) so `createAnchorFromOffset`
+never indexes out of range. Web (xterm.js) already supports shift-click natively,
+so only the native pane changed.
+
 2026-06-04T22:40-0700 `flutter/triage_client/lib/main.dart`,
 `test/widget_test.dart` — **fixed first-load wrap fragmentation.** On a fresh
 attach the snapshot's `raw_output` is authored at the **host PTY width**, but the
@@ -456,7 +470,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — fix(client): re-sync host to fitted size on first view fit (first-load wrap fragmentation)
+HEAD — feat(client): shift-click extends terminal text selection
+8e80a80 — fix(client): re-sync host to fitted size on first view fit (first-load wrap fragmentation)
 7db33c2 — fix(client): address PR review (lookbehind-free CRLF, clear buffer on attach/clear, drop dead resize branch + unused replay size)
 53e36e7 — fix(client): suppress replay-echoed input, bound pre-size buffer, consolidate de-dup
 f04cc19 — refactor: simplify terminal pipeline per /simplify review
