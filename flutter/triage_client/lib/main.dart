@@ -169,14 +169,10 @@ class SessionVm {
   /// Begin the attach/resync lifecycle and stage the raw output-history tail.
   /// [Attach] is dispatched now so live chunks buffer in arrival order; the
   /// actual [HistoryBytes] replay is deferred until the view reports its fitted
-  /// size (see [noteViewFit]). Live chunks at or below [throughOutputSeq] are
+  /// size (see [noteViewFit]) and replays at that size — the host capture size
+  /// is intentionally not used. Live chunks at or below [throughOutputSeq] are
   /// dropped by the store as duplicates.
-  void applyHistory(
-    List<int> rawOutput, {
-    required int cols,
-    required int rows,
-    int? throughOutputSeq,
-  }) {
+  void applyHistory(List<int> rawOutput, {int? throughOutputSeq}) {
     _pendingHistory = _PendingHistory(rawOutput, throughOutputSeq);
     store.dispatch(const Attach());
     if (_viewReady) {
@@ -367,7 +363,7 @@ class _TriageHomeState extends State<TriageHome> {
       _setupSessionInputListener(s);
       // Seed the demo/local sessions into the store's live phase so their
       // placeholder content renders and local echo works through one pipeline.
-      s.applyHistory(_seedBytesFromRows(s.rows), cols: 80, rows: 24);
+      s.applyHistory(_seedBytesFromRows(s.rows));
     }
     final isMockMode = Uri.base.queryParameters['mock'] == 'true';
     if (isMockMode) {
@@ -1000,9 +996,6 @@ class _TriageHomeState extends State<TriageHome> {
 
       final plainRows = _plainRowsFromSnapshot(snapshot);
       final exited = snapshot?['exited'] as bool? ?? false;
-      final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
-      final cols = sizeObj?['cols'] as int? ?? 80;
-      final rowsVal = sizeObj?['rows'] as int? ?? 24;
       final outputSeq = snapshot?['output_seq'] as int? ?? 0;
 
       final session = SessionVm(
@@ -1021,8 +1014,6 @@ class _TriageHomeState extends State<TriageHome> {
       // chunks already covered by this snapshot are dropped by output_seq.
       session.applyHistory(
         _rawOutputFromSnapshot(snapshot ?? const {}),
-        cols: cols,
-        rows: rowsVal,
         throughOutputSeq: outputSeq,
       );
       _setupSessionInputListener(session);
@@ -1229,12 +1220,7 @@ class _TriageHomeState extends State<TriageHome> {
     // Replay history through the single write path — raw PTY bytes, not the
     // lossy styled-row reconstruction. The store clears and re-emulates, then
     // resumes live (de-duplicating by output_seq).
-    session.applyHistory(
-      rawOutput,
-      cols: cols,
-      rows: rowsVal,
-      throughOutputSeq: snapshotOutputSeq,
-    );
+    session.applyHistory(rawOutput, throughOutputSeq: snapshotOutputSeq);
 
     setState(() {
       // Plain mirror for the test fallback view only; not used for real render.
@@ -1478,9 +1464,6 @@ class _TriageHomeState extends State<TriageHome> {
 
           final plainRows = _plainRowsFromSnapshot(snapshot);
           final exited = snapshot?['exited'] as bool? ?? false;
-          final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
-          final cols = sizeObj?['cols'] as int? ?? 80;
-          final rowsVal = sizeObj?['rows'] as int? ?? 24;
           final outputSeq = snapshot?['output_seq'] as int? ?? 0;
 
           final session = SessionVm(
@@ -1500,8 +1483,6 @@ class _TriageHomeState extends State<TriageHome> {
           _setupSessionInputListener(session);
           session.applyHistory(
             _rawOutputFromSnapshot(snapshot ?? const {}),
-            cols: cols,
-            rows: rowsVal,
             throughOutputSeq: outputSeq,
           );
 

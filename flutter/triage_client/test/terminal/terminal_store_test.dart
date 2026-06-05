@@ -249,6 +249,22 @@ void main() {
     });
   });
 
+  test('re-Attach drops live buffered against the prior attach', () {
+    store.dispatch(const Attach());
+    store.dispatch(LiveBytes(b('stale'))); // queued in awaitingHistory
+    store.dispatch(const Attach()); // fresh lifecycle -> discard the queue
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    expect(sink.written.toString(), isEmpty, reason: 'no cross-attach leakage');
+  });
+
+  test('Clear drops queued pre-size live so it cannot re-populate', () {
+    store.dispatch(const Attach());
+    store.dispatch(LiveBytes(b('stale')));
+    store.dispatch(const Clear());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    expect(sink.written.toString(), isEmpty);
+  });
+
   test('pre-size live buffer is bounded; oldest chunks drop past the cap', () {
     store.dispatch(const Attach()); // awaitingHistory -> live chunks queue
     final chunk = List<int>.filled(256 * 1024, 0x61); // 256 KiB of 'a'

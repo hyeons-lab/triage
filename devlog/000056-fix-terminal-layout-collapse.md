@@ -37,6 +37,22 @@ only, and only reproduce in the real macOS font runtime:
 
 ## What Changed
 
+2026-06-04T22:20-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`,
+`lib/terminal/terminal_intent.dart`, `lib/main.dart`,
+`test/terminal/terminal_store_test.dart` — **addressed the Copilot PR review (6
+inline comments).** (a) `_normalizeNewlines` no longer uses a `(?<!\r)\n`
+lookbehind regex — replaced with `replaceAll('\r\n','\n').replaceAll('\n','\r\n')`
+(equivalent, but lookbehind-free; older Safari/iOS WebKit, a Flutter Web target,
+throws on regex lookbehind). (b) `Attach` and `Clear` now `_clearPendingLive()`
+so live buffered against a prior attach can't leak into the next session as
+ghost output. (c) Dropped the unreachable `else if (!s.sized)` branch in
+`_reduceResize` (`sizeChanged` already includes `|| !s.sized`). (d) Removed the
+unused `cols`/`rows` params from `SessionVm.applyHistory` (replay always uses the
+fitted view size, by design) and the now-dead `sizeObj`/`cols`/`rowsVal` locals
+at the two attach call sites; clarified the `HistoryBytes`/`applyHistory` docs
+that cols×rows is the client's target replay size, not the host capture size.
+Added re-Attach/Clear buffer-clearing tests (68 tests pass).
+
 2026-06-04T21:50-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`,
 `lib/main.dart`, `test/terminal/terminal_store_test.dart`, `pubspec.yaml` —
 **addressed the high-effort `/code-review` findings (5 fixes).** (1) **Replay
@@ -407,7 +423,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — fix(client): suppress replay-echoed input, bound pre-size buffer, consolidate de-dup
+HEAD — fix(client): address PR review (lookbehind-free CRLF, clear buffer on attach/clear, drop dead resize branch + unused replay size)
+53e36e7 — fix(client): suppress replay-echoed input, bound pre-size buffer, consolidate de-dup
 f04cc19 — refactor: simplify terminal pipeline per /simplify review
 d5ebe7e — style(host): rustfmt build_session_snapshot (CI cargo fmt --check)
 3e941de — fix(client): use hardware-keyboard input path so typing works on desktop

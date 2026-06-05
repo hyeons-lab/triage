@@ -25,10 +25,11 @@ final class LiveBytes extends TerminalIntent {
 
 /// Raw output-history tail delivered on attach/resync (the host's `raw_output`).
 ///
-/// The bytes are replayed at the size they were generated for ([cols] x [rows],
-/// the host-reported PTY size at capture). [throughOutputSeq] is the host's
-/// `output_seq` at the byte boundary the tail ends on; live chunks with
-/// `outputSeq <= throughOutputSeq` are dropped as duplicates.
+/// The bytes are re-emulated at [cols] x [rows] — the client's target replay
+/// size, i.e. the current emulator/view grid (the client re-emulates raw bytes
+/// at its own size rather than the host's capture size). [throughOutputSeq] is
+/// the host's `output_seq` at the byte boundary the tail ends on; live chunks
+/// with `outputSeq <= throughOutputSeq` are dropped as duplicates.
 final class HistoryBytes extends TerminalIntent {
   const HistoryBytes(
     this.bytes, {

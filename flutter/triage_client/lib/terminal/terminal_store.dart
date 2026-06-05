@@ -27,11 +27,11 @@ const int kPendingLiveByteCap = 1024 * 1024;
 const Duration kHistoryInputSuppression = Duration(milliseconds: 50);
 
 // Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
-// `Output`): a trailing not-yet-terminated `CSI > …`, a complete `CSI > … m`
-// private sequence, and a bare LF not already preceded by CR.
+// `Output`): a trailing not-yet-terminated `CSI > …` and a complete
+// `CSI > … m` private sequence. (Newline normalization deliberately avoids a
+// regex — see `_normalizeNewlines`.)
 final RegExp _partialPrivateCsi = RegExp(r'\x1b\[>[0-9;]*$');
 final RegExp _completePrivateCsi = RegExp(r'\x1b\[>[0-9;]*m');
-final RegExp _bareLf = RegExp(r'(?<!\r)\n');
 
 /// The single reducer for the terminal pipeline.
 ///
@@ -103,7 +103,11 @@ class TerminalStore extends ChangeNotifier {
   TerminalState _reduce(TerminalState s, TerminalIntent intent) {
     switch (intent) {
       case Attach():
+        // Start of a fresh attach lifecycle: drop any carries and any live
+        // chunks buffered against a prior attach so they cannot leak into this
+        // session once HistoryBytes arrives.
         _resetCarries();
+        _clearPendingLive();
         return s.copyWith(
           phase: AttachPhase.awaitingHistory,
           exited: false,
@@ -117,8 +121,11 @@ class TerminalStore extends ChangeNotifier {
         return s.copyWith(exited: true);
 
       case Clear():
+        // Hard reset: also drop queued pre-size/await-history live so it cannot
+        // later re-populate the cleared terminal.
         _sink.clear();
         _resetCarries();
+        _clearPendingLive();
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -149,12 +156,12 @@ class TerminalStore extends ChangeNotifier {
     }
 
     var next = s;
+    // `sizeChanged` already covers the not-yet-sized case (`|| !s.sized`), so a
+    // change always re-applies the size and marks it sized — no separate branch.
     final sizeChanged = cols != s.cols || rows != s.rows || !s.sized;
     if (sizeChanged) {
       _applyResizeToSink(cols, rows);
       next = next.copyWith(cols: cols, rows: rows, sized: true);
-    } else if (!s.sized) {
-      next = next.copyWith(sized: true);
     }
 
     // Now that we have a size, drain anything we buffered (only once live).
@@ -265,11 +272,15 @@ class TerminalStore extends ChangeNotifier {
     }
   }
 
+  void _clearPendingLive() {
+    _pendingLive.clear();
+    _pendingLiveBytes = 0;
+  }
+
   void _flushPendingLive(int? highWaterSeq) {
     if (_pendingLive.isEmpty) return;
     final queued = List<_QueuedLive>.from(_pendingLive);
-    _pendingLive.clear();
-    _pendingLiveBytes = 0;
+    _clearPendingLive();
     for (final q in queued) {
       if (_isDuplicate(q.outputSeq, highWaterSeq)) {
         continue;
@@ -383,8 +394,11 @@ class TerminalStore extends ChangeNotifier {
     if (!s.contains('\n')) {
       return s;
     }
-    // Any LF not already preceded by CR becomes CRLF.
-    return s.replaceAll(_bareLf, '\r\n');
+    // Promote every bare LF to CRLF while leaving existing CRLF intact. Done by
+    // collapsing CRLF to LF then expanding all LF to CRLF — equivalent to a
+    // `(?<!\r)\n` lookbehind but lookbehind-free, since older Safari/iOS WebKit
+    // (Flutter Web targets) lack regex lookbehind and throw on it at runtime.
+    return s.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n');
   }
 
   void _resetCarries() {
