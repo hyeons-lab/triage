@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -161,7 +161,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
@@ -209,7 +209,7 @@ jobs:
             "$GITHUB_WORKSPACE/Triage-macos-v${VERSION}.zip"
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: client-macos
           path: Triage-macos-v${{ needs.publish.outputs.version }}.zip
@@ -223,7 +223,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
@@ -247,7 +247,7 @@ jobs:
             -DestinationPath "Triage-windows-v$version.zip"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: client-windows
           path: Triage-windows-v${{ needs.publish.outputs.version }}.zip
@@ -261,7 +261,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Linux desktop toolchain + native plugin deps:
       # flutter_secure_storage_linux needs libsecret + jsoncpp.
@@ -295,7 +295,7 @@ jobs:
             -C flutter/triage_client/build/linux/x64/release/bundle .
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: client-linux
           path: Triage-linux-v${{ needs.publish.outputs.version }}.tar.gz
@@ -312,12 +312,12 @@ jobs:
       contents: write
     steps:
       - name: Download client artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
 
       - name: Create tag and GitHub release with all clients
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.publish.outputs.version }}
           name: v${{ needs.publish.outputs.version }}
