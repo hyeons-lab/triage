@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_state.dart';
@@ -55,6 +56,8 @@ void main() {
     store.onHostResize = (c, r) => hostResize.add('$c,$r');
   });
 
+  tearDown(() => store.dispose());
+
   List<int> b(String s) => utf8.encode(s);
 
   test('live bytes are buffered until sized, then flushed in order', () {
@@ -79,7 +82,9 @@ void main() {
 
   test('outputSeq <= history high-water is dropped as duplicate', () {
     store.dispatch(const Attach());
-    store.dispatch(HistoryBytes(b('H'), cols: 80, rows: 24, throughOutputSeq: 5));
+    store.dispatch(
+      HistoryBytes(b('H'), cols: 80, rows: 24, throughOutputSeq: 5),
+    );
     store.dispatch(LiveBytes(b('dup'), outputSeq: 5)); // <= 5 -> drop
     store.dispatch(LiveBytes(b('old'), outputSeq: 3)); // < 5 -> drop
     store.dispatch(LiveBytes(b('new'), outputSeq: 6)); // > 5 -> keep
@@ -92,7 +97,9 @@ void main() {
     store.dispatch(LiveBytes(b('A'), outputSeq: 4));
     store.dispatch(LiveBytes(b('B'), outputSeq: 7));
     expect(sink.ops, isEmpty);
-    store.dispatch(HistoryBytes(b('H'), cols: 80, rows: 24, throughOutputSeq: 5));
+    store.dispatch(
+      HistoryBytes(b('H'), cols: 80, rows: 24, throughOutputSeq: 5),
+    );
     // A(4) <=5 dropped, B(7) replayed.
     expect(sink.ops, ['resize:80,24', 'clear', 'write:H', 'write:B']);
   });
@@ -158,9 +165,10 @@ void main() {
   });
 
   test('sink output/resize echo route through the reducer', () {
+    // No recent history replay here, so the input-suppression window is closed
+    // and an emulator keystroke routes straight through (see the suppression
+    // tests for the during-replay behavior).
     store.dispatch(const Attach());
-    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
-    hostResize.clear();
     sink.emitOutput('x'); // user keystroke from emulator
     sink.emitResize(70, 20); // emulator fit
     expect(hostInput, ['x']);
@@ -189,5 +197,68 @@ void main() {
     store.dispatch(LiveBytes(b('a\x1b[>4'))); // sequence split mid-way
     store.dispatch(LiveBytes(b(';2mb')));
     expect(sink.written.toString(), 'ab');
+  });
+
+  test(
+    'absolute-column cursor jumps pass through history and live verbatim',
+    () {
+      // The original "ClaudeCode" collapse came from rewriting cursor-addressed
+      // gaps. The store must forward `CSI n G` column jumps to the emulator
+      // untouched (only the unsupported `CSI > ... m` form is stripped).
+      store.dispatch(const Attach());
+      const banner = '\x1b[6GClaude\x1b[13GCode';
+      store.dispatch(HistoryBytes(b(banner), cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[20Gtail')));
+      expect(sink.written.toString(), '$banner\x1b[20Gtail');
+    },
+  );
+
+  test('re-delivered live outputSeq is dropped (re-delivery de-dup)', () {
+    store.dispatch(const Attach());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('one'), outputSeq: 10));
+    store.dispatch(LiveBytes(b('dup'), outputSeq: 10)); // re-delivery -> drop
+    store.dispatch(LiveBytes(b('back'), outputSeq: 9)); // older -> drop
+    store.dispatch(LiveBytes(b('two'), outputSeq: 11)); // newer -> keep
+    expect(sink.written.toString(), 'onetwo');
+  });
+
+  test('emulator output is suppressed during a history replay', () {
+    store.dispatch(const Attach());
+    store.dispatch(HistoryBytes(b('H'), cols: 80, rows: 24));
+    // The replay re-feeds the program's queries; xterm.dart answers them
+    // synchronously inside write. Those answers must not reach the host.
+    expect(store.isSuppressingHostInput, isTrue);
+    store.dispatch(const UserInput('\x1b[1;1R')); // a replayed cursor report
+    expect(hostInput, isEmpty);
+  });
+
+  test('host-input suppression lifts after the window', () {
+    fakeAsync((async) {
+      final s = TerminalStore(FakeTerminalSink());
+      final got = <String>[];
+      s.onHostInput = got.add;
+      s.dispatch(const Attach());
+      s.dispatch(HistoryBytes(b('H'), cols: 80, rows: 24));
+      s.dispatch(const UserInput('blocked'));
+      async.elapse(kHistoryInputSuppression + const Duration(milliseconds: 1));
+      s.dispatch(const UserInput('allowed'));
+      expect(got, ['allowed']);
+      s.dispose();
+    });
+  });
+
+  test('pre-size live buffer is bounded; oldest chunks drop past the cap', () {
+    store.dispatch(const Attach()); // awaitingHistory -> live chunks queue
+    final chunk = List<int>.filled(256 * 1024, 0x61); // 256 KiB of 'a'
+    // Queue well past the 1 MiB cap without ever sizing/flushing.
+    for (var i = 0; i < 8; i++) {
+      store.dispatch(LiveBytes(chunk, outputSeq: i + 1));
+    }
+    // Flush by going live; the most-recent chunks survive, oldest were dropped.
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    expect(sink.written.length, lessThanOrEqualTo(kPendingLiveByteCap));
+    expect(sink.written.length, greaterThan(0));
   });
 }

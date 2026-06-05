@@ -37,6 +37,31 @@ only, and only reproduce in the real macOS font runtime:
 
 ## What Changed
 
+2026-06-04T21:50-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`,
+`lib/main.dart`, `test/terminal/terminal_store_test.dart`, `pubspec.yaml` —
+**addressed the high-effort `/code-review` findings (5 fixes).** (1) **Replay
+input-echo regression:** the deleted `_suppressInput` guard was never
+re-established — replaying the raw tail re-feeds the program's own terminal
+queries (DSR/cursor reports) to the emulator, which auto-answers them via
+`onOutput`→`controller.sendInput`→the host. The store now opens a 50 ms
+suppression window (`_beginHostInputSuppression`, exposed as
+`isSuppressingHostInput`) around the history write; `_setupSessionInputListener`
+consults it before forwarding, covering both platforms (both funnel through the
+shared controller's input listeners). (2) **Unbounded pre-size buffer:** a
+backgrounded attached session (its pane never mounts/fits) queued live output
+without limit; `_enqueuePendingLive` now bounds `_pendingLive` at
+`kPendingLiveByteCap` (1 MiB), dropping oldest whole chunks (safe — selecting a
+remote session always refetches a fresh snapshot). (3) **Hot-path regexes:**
+`_stripUnsupportedPrivateCsi`/`_normalizeNewlines` now fast-path out via
+`contains('\x1b')`/`contains('\n')` before the full-string `replaceAll`. (4)
+**Test coverage** replacing the deleted `cursor_position_test.dart`: a reducer
+test asserts absolute-column `CSI n G` jumps pass through history+live verbatim
+(the original "ClaudeCode" collapse), plus re-delivery de-dup, suppression
+(sync + windowed via `fake_async`), and buffer-cap tests. (5) **Consolidated
+de-dup:** removed the redundant `main.dart` gate and `SessionVm.outputSeq`
+mirror; the store now owns all `output_seq` de-duplication (history high-water +
+a new `_appliedLiveSeq` re-delivery guard).
+
 2026-06-03T18:40-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`
 — **TEMPORARY debug instrumentation** (to be removed before merge):
 `_logLayoutDiagnostics()` logs the real-runtime cell width (`mmmmmmmmmm`/10) vs.
@@ -110,6 +135,24 @@ Flutter tests pass (incl. the 12-case reducer suite); 4 obsolete SessionVm-buffe
 widget tests removed (re-homed to `terminal_store_test.dart`). Rust workspace builds.
 
 ## Decisions
+
+2026-06-04T21:50-0700 **Suppress replayed terminal-query answers in the store,
+not by re-adding a pane flag.** The old `_suppressInput` lived in the pane and
+bracketed the (now-deleted) pane-side replay. Since replay moved into the
+store's `_reduceHistory`, the store owns the suppression decision and exposes
+`isSuppressingHostInput`; the single host-forwarding chokepoint
+(`_setupSessionInputListener`'s controller input listener, shared by native and
+web) consults it. Window = 50 ms, matching the proven original (xterm.dart
+answers synchronously inside `write`; xterm.js a tick later, so a sync-only flag
+would miss web).
+
+2026-06-04T21:50-0700 **Bound `_pendingLive` rather than guarantee a flush for
+unmounted panes.** Only `_selectedSession` mounts a `TerminalPane`, so a
+backgrounded attached session never fires `noteViewFit`. Forcing a default-size
+flush would replay at the wrong size; instead the buffer is capped, and because
+selecting a remote session always calls `_refreshSessionSnapshot(includeHistory:
+true)`, dropped chunks are always superseded by the fresh snapshot — no visible
+loss.
 
 2026-06-03T21:35-0700 `raw_output` carried only on attach/resync/explicit-snapshot
 (not resize broadcasts) — reasoning: the in-actor `snapshot()` feeds the frequent
@@ -236,6 +279,19 @@ space-filled StyledRows.)
 
 ## Issues
 
+2026-06-04T21:50-0700 **Code-review caught a real input-echo regression.** The
+high-effort `/code-review` (7 finder angles → verify) surfaced that deleting the
+pane's `_suppressInput` left replayed cursor/device-report answers free to reach
+the host on every attach/resync — confirmed against `origin/main`, which guarded
+exactly this. Refuted candidates (recorded so they aren't re-investigated):
+`output_seq` is 1-based so the both-zero `_isDuplicate` drop can't happen;
+`read_raw_output_tail` can't over-read past `bytes_logged` (single-threaded
+actor ⇒ file length == `bytes_logged`); old-host empty `raw_output` is out of
+scope (lockstep release). One existing reducer test
+(`sink output/resize echo route through the reducer`) started failing correctly
+once suppression landed — it replayed history immediately before emitting, so
+the keystroke was (rightly) suppressed; decoupled it from the replay setup.
+
 2026-06-04T00:00-0700 **e2e: blank on first show / select, content appears only
 after a window resize.** Root cause: the wiring dispatched `HistoryBytes` at
 attach time — *before* the `TerminalView` had laid out and auto-fitted — so the
@@ -351,7 +407,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — refactor: simplify terminal pipeline per /simplify review
+HEAD — fix(client): suppress replay-echoed input, bound pre-size buffer, consolidate de-dup
+f04cc19 — refactor: simplify terminal pipeline per /simplify review
 d5ebe7e — style(host): rustfmt build_session_snapshot (CI cargo fmt --check)
 3e941de — fix(client): use hardware-keyboard input path so typing works on desktop
 7444c39 — feat(client): bundle JetBrains Mono as the terminal font

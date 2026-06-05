@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -10,6 +11,20 @@ import 'terminal_state.dart';
 /// Smallest grid we will apply; below this we ignore resize noise.
 const int kMinTerminalCols = 2;
 const int kMinTerminalRows = 1;
+
+/// Upper bound on the pre-size / await-history live buffer. A session whose view
+/// never lays out (a backgrounded tab) would otherwise queue live output without
+/// limit; when it is finally selected it refetches a fresh snapshot anyway, so
+/// dropping the oldest queued chunks past this cap only ever discards output the
+/// new snapshot supersedes.
+const int kPendingLiveByteCap = 1024 * 1024;
+
+/// How long emulator-emitted bytes stay suppressed after a history replay. The
+/// program's own terminal queries (DSR/cursor reports) are replayed into the
+/// emulator, which auto-answers them; those answers must not be forwarded to the
+/// host as fake user input. xterm.dart answers synchronously inside `write`,
+/// xterm.js a tick later — this window covers both.
+const Duration kHistoryInputSuppression = Duration(milliseconds: 50);
 
 // Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
 // `Output`): a trailing not-yet-terminated `CSI > …`, a complete `CSI > … m`
@@ -49,12 +64,29 @@ class TerminalStore extends ChangeNotifier {
   // split across live chunks is still stripped before reaching the emulator.
   String _privateCsiCarry = '';
 
-  // Live chunks received before we are sized / while awaiting history.
+  // Live chunks received before we are sized / while awaiting history, plus a
+  // running byte total so the buffer can be bounded (see [kPendingLiveByteCap]).
   final List<_QueuedLive> _pendingLive = <_QueuedLive>[];
+  int _pendingLiveBytes = 0;
+
+  // Highest live `output_seq` already applied. Combined with the history
+  // high-water, this is the single de-duplication baseline — it also drops a
+  // live chunk re-delivered out of order over a flaky connection.
+  int? _appliedLiveSeq;
 
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
+
+  // True for a brief window after a history replay; while set, emulator output
+  // (the program's own query auto-answers) is not forwarded to the host.
+  bool _suppressHostInput = false;
+  Timer? _suppressTimer;
+
+  /// True while emulator-emitted bytes must not reach the host as user input
+  /// (during and just after a history replay). The view's input forwarding
+  /// consults this so replayed cursor/device reports are not echoed back.
+  bool get isSuppressingHostInput => _suppressHostInput;
 
   // ---- Public API -----------------------------------------------------------
 
@@ -93,17 +125,17 @@ class TerminalStore extends ChangeNotifier {
         return _reduceResize(s, cols, rows);
 
       case UserInput(:final data):
-        if (!s.exited) {
+        if (!s.exited && !_suppressHostInput) {
           onHostInput?.call(data);
         }
         return s;
 
       case HistoryBytes(
-          :final bytes,
-          :final cols,
-          :final rows,
-          :final throughOutputSeq,
-        ):
+        :final bytes,
+        :final cols,
+        :final rows,
+        :final throughOutputSeq,
+      ):
         return _reduceHistory(s, bytes, cols, rows, throughOutputSeq);
 
       case LiveBytes(:final bytes, :final outputSeq):
@@ -156,6 +188,10 @@ class TerminalStore extends ChangeNotifier {
 
     _sink.clear();
     _resetCarries();
+    // Replaying the raw tail re-feeds the program's own terminal queries to the
+    // emulator, which auto-answers them; suppress those answers so they are not
+    // echoed to the host as user input.
+    _beginHostInputSuppression();
     _writeDecoded(bytes, isHistory: true);
 
     next = next.copyWith(
@@ -178,10 +214,10 @@ class TerminalStore extends ChangeNotifier {
       return s;
     }
     if (!s.sized || s.phase == AttachPhase.awaitingHistory) {
-      _pendingLive.add(_QueuedLive(bytes, outputSeq));
+      _enqueuePendingLive(_QueuedLive(bytes, outputSeq));
       return s;
     }
-    _writeDecoded(bytes, isHistory: false);
+    _applyLive(bytes, outputSeq);
     return s;
   }
 
@@ -209,22 +245,66 @@ class TerminalStore extends ChangeNotifier {
 
   // ---- Byte plumbing (the one decode path) ----------------------------------
 
+  /// Queue a live chunk received before we can write it, bounding the buffer so
+  /// a never-fitted (backgrounded) session cannot grow it without limit.
+  void _enqueuePendingLive(_QueuedLive q) {
+    _pendingLive.add(q);
+    _pendingLiveBytes += q.bytes.length;
+    if (_pendingLiveBytes <= kPendingLiveByteCap) return;
+    var dropped = 0;
+    while (_pendingLive.length > 1 && _pendingLiveBytes > kPendingLiveByteCap) {
+      final old = _pendingLive.removeAt(0);
+      _pendingLiveBytes -= old.bytes.length;
+      dropped += old.bytes.length;
+    }
+    if (dropped > 0) {
+      debugPrint(
+        'TerminalStore: dropped $dropped buffered live bytes '
+        '(pre-size buffer exceeded ${kPendingLiveByteCap}B)',
+      );
+    }
+  }
+
   void _flushPendingLive(int? highWaterSeq) {
     if (_pendingLive.isEmpty) return;
     final queued = List<_QueuedLive>.from(_pendingLive);
     _pendingLive.clear();
+    _pendingLiveBytes = 0;
     for (final q in queued) {
       if (_isDuplicate(q.outputSeq, highWaterSeq)) {
         continue;
       }
-      _writeDecoded(q.bytes, isHistory: false);
+      _applyLive(q.bytes, q.outputSeq);
     }
   }
 
+  /// Write a live chunk through the decode path and advance the applied-seq
+  /// high-water so a later re-delivery of the same chunk is dropped.
+  void _applyLive(List<int> bytes, int? outputSeq) {
+    _writeDecoded(bytes, isHistory: false);
+    if (outputSeq != null) {
+      _appliedLiveSeq = _appliedLiveSeq == null
+          ? outputSeq
+          : max(_appliedLiveSeq!, outputSeq);
+    }
+  }
+
+  /// A live chunk is a duplicate when its `output_seq` is at or below either the
+  /// history high-water (already covered by the replayed tail) or the highest
+  /// live seq we have already applied (a re-delivery).
   bool _isDuplicate(int? outputSeq, int? highWaterSeq) {
-    return outputSeq != null &&
-        highWaterSeq != null &&
-        outputSeq <= highWaterSeq;
+    if (outputSeq == null) return false;
+    if (highWaterSeq != null && outputSeq <= highWaterSeq) return true;
+    if (_appliedLiveSeq != null && outputSeq <= _appliedLiveSeq!) return true;
+    return false;
+  }
+
+  void _beginHostInputSuppression() {
+    _suppressHostInput = true;
+    _suppressTimer?.cancel();
+    _suppressTimer = Timer(kHistoryInputSuppression, () {
+      _suppressHostInput = false;
+    });
   }
 
   /// Decode raw bytes to text and write them through the sink. History is a
@@ -269,6 +349,11 @@ class TerminalStore extends ChangeNotifier {
       s = _privateCsiCarry + s;
       _privateCsiCarry = '';
     }
+    // Fast path: no ESC (and no carry, which always begins with ESC) -> nothing
+    // to strip, so skip the partial scan and the full-string regex replace.
+    if (!s.contains('\x1b')) {
+      return s;
+    }
     if (live) {
       final partial = _partialPrivateCsi.firstMatch(s);
       // Only hold a bounded partial; otherwise let it flush to avoid unbounded
@@ -294,6 +379,10 @@ class TerminalStore extends ChangeNotifier {
       _pendingCarriageReturn = true;
       s = s.substring(0, s.length - 1);
     }
+    // Fast path: no LF means nothing to normalize.
+    if (!s.contains('\n')) {
+      return s;
+    }
     // Any LF not already preceded by CR becomes CRLF.
     return s.replaceAll(_bareLf, '\r\n');
   }
@@ -302,10 +391,12 @@ class TerminalStore extends ChangeNotifier {
     _utf8Carry.clear();
     _pendingCarriageReturn = false;
     _privateCsiCarry = '';
+    _appliedLiveSeq = null;
   }
 
   @override
   void dispose() {
+    _suppressTimer?.cancel();
     _sink.onOutput = null;
     _sink.onResize = null;
     _sink.dispose();

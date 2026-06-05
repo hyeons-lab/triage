@@ -102,7 +102,6 @@ class SessionVm {
     required this.statusColor,
     required this.icon,
     required this.rows,
-    required this.outputSeq,
     this.isRemote = false,
     this.isExited = false,
   }) : terminalController = TerminalController() {
@@ -137,7 +136,6 @@ class SessionVm {
   // real rendering goes through [store]/[terminal] from raw bytes.
   final List<StyledRow> rows;
   final TerminalController terminalController;
-  int outputSeq;
   final bool isRemote;
   bool isExited;
   int focusCursorRevision = 0;
@@ -336,7 +334,6 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('awaiting input: define TerminalPane bridge boundary'),
         ],
-        outputSeq: 0,
       ),
       SessionVm(
         title: 'triage / websocket-session-api',
@@ -351,7 +348,6 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('running: websocket integration notes'),
         ],
-        outputSeq: 0,
       ),
       SessionVm(
         title: 'triage / main',
@@ -365,7 +361,6 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('idle'),
         ],
-        outputSeq: 0,
       ),
     ];
     for (final s in _sessions) {
@@ -514,6 +509,13 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _setupSessionInputListener(SessionVm session) {
     session.terminalController.addInputListener((keys) {
+      // While the store replays history, the emulator auto-answers the
+      // program's own terminal queries (DSR/cursor reports) re-fed from the
+      // tail. Those answers surface here as emulator output; they must not be
+      // forwarded to the host as fake user input.
+      if (session.store.isSuppressingHostInput) {
+        return;
+      }
       if (_isRemoteSession(session)) {
         if (session.status != 'attached') {
           return;
@@ -902,10 +904,7 @@ class _TriageHomeState extends State<TriageHome> {
         final activeSession = _sessions[_selectedIndex];
         if (activeSession.status == 'attached') {
           unawaited(
-            _refreshSessionSnapshot(
-              activeSession,
-              includeHistory: true,
-            ),
+            _refreshSessionSnapshot(activeSession, includeHistory: true),
           );
         }
       }
@@ -922,7 +921,6 @@ class _TriageHomeState extends State<TriageHome> {
       statusColor: const Color(0xffffc857),
       icon: Icons.terminal,
       rows: [_plainRow('Loading session $sessionId...')],
-      outputSeq: 0,
       isRemote: true,
     );
   }
@@ -1016,7 +1014,6 @@ class _TriageHomeState extends State<TriageHome> {
         rows: plainRows.isEmpty
             ? [_plainRow('Attached to session $sid')]
             : plainRows,
-        outputSeq: outputSeq,
         isRemote: true,
         isExited: exited,
       );
@@ -1181,15 +1178,10 @@ class _TriageHomeState extends State<TriageHome> {
         final outputSeq = output['output_seq'] as int? ?? 0;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
 
-        // Drop output already incorporated into the attach snapshot; the store
-        // also de-duplicates against the history high-water seq.
-        if (outputSeq <= session.outputSeq) {
-          return;
-        }
         // Single write path: raw bytes flow through the store, which owns UTF-8
-        // carry, CRLF normalization, buffering, and output_seq de-duplication.
+        // carry, CRLF normalization, buffering, and all output_seq
+        // de-duplication (against both the history high-water and re-deliveries).
         session.applyLiveBytes(bytes, outputSeq: outputSeq);
-        session.outputSeq = outputSeq;
       } else if (event.containsKey('Exited')) {
         session.markExited();
         if (mounted) {
@@ -1249,9 +1241,6 @@ class _TriageHomeState extends State<TriageHome> {
       session.rows
         ..clear()
         ..addAll(_plainRowsFromSnapshot(snapshot));
-      if (snapshotOutputSeq != null) {
-        session.outputSeq = max(session.outputSeq, snapshotOutputSeq);
-      }
       session.isExited = exited;
       session.status = exited ? 'exited' : 'attached';
       session.statusColor = exited
@@ -1283,7 +1272,8 @@ class _TriageHomeState extends State<TriageHome> {
     final styled = snapshot['styled_rows'] as List<dynamic>?;
     if (styled != null && styled.isNotEmpty) {
       return styled.map((row) {
-        final spans = (row as Map<String, dynamic>?)?['spans'] as List<dynamic>?;
+        final spans =
+            (row as Map<String, dynamic>?)?['spans'] as List<dynamic>?;
         final text =
             spans
                 ?.map(
@@ -1353,12 +1343,7 @@ class _TriageHomeState extends State<TriageHome> {
       _selectedIndex = index;
     });
     if (shouldRefresh) {
-      unawaited(
-        _refreshSessionSnapshot(
-          session,
-          includeHistory: true,
-        ),
-      );
+      unawaited(_refreshSessionSnapshot(session, includeHistory: true));
     }
   }
 
@@ -1509,7 +1494,6 @@ class _TriageHomeState extends State<TriageHome> {
             rows: plainRows.isEmpty
                 ? [_plainRow('Attached to session $sessionId')]
                 : plainRows,
-            outputSeq: outputSeq,
             isRemote: true,
             isExited: exited,
           );
@@ -1535,12 +1519,7 @@ class _TriageHomeState extends State<TriageHome> {
               _onWebSocketEvent(msg);
             }
           }
-          unawaited(
-            _refreshSessionSnapshot(
-              session,
-              includeHistory: true,
-            ),
-          );
+          unawaited(_refreshSessionSnapshot(session, includeHistory: true));
         }
       } catch (e) {
         // Roll back partial state so a failed create doesn't strand a subscription
@@ -1572,7 +1551,6 @@ class _TriageHomeState extends State<TriageHome> {
         _plainRow(''),
         _plainRow('ready'),
       ],
-      outputSeq: 0,
     );
     _setupSessionInputListener(session);
 
