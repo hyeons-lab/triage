@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.3"
+version = "0.1.4"
 license = "Apache-2.0"
 repository = "https://github.com/hyeons-lab/triage"
 homepage = "https://github.com/hyeons-lab/triage"
@@ -19,9 +19,9 @@ unsafe_code = "deny"
 all = "warn"
 
 [workspace.dependencies]
-triage-core = { version = "0.1.3", path = "crates/triage-core" }
-triage-transport-ws = { version = "0.1.3", path = "crates/triage-transport-ws" }
-triaged = { version = "0.1.3", path = "crates/triaged" }
+triage-core = { version = "0.1.4", path = "crates/triage-core" }
+triage-transport-ws = { version = "0.1.4", path = "crates/triage-transport-ws" }
+triaged = { version = "0.1.4", path = "crates/triaged" }
 anyhow = "1"
 base64 = "0.22"
 crossterm = "0.28"
