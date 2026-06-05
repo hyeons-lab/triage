@@ -294,6 +294,27 @@ the Flutter-served `assets/fonts/JetBrainsMono-*.ttf` (no duplicate files) and s
 the xterm.js `fontFamily` to `'JetBrains Mono', Consolas, …`. `flutter analyze`
 clean; 61 tests pass.
 
+2026-06-04T21:10-0700 **e2e: cannot type in any session.** On Flutter 3.44.1 it
+surfaced as a thrown `HardwareKeyboard` assertion — *"A KeyDownEvent is
+dispatched, but the state shows that the physical key is already pressed"* (on
+Enter) — which aborts key dispatch before it reaches `terminal.onOutput`, so
+keystrokes are dropped. Root cause: xterm.dart's `TerminalView` defaults to
+`hardwareKeyboardOnly: false`, opening a hidden IME `TextInput` connection
+(`CustomTextEdit`); on macOS desktop that IME-vs-hardware-keyboard interaction
+desyncs Flutter's keyboard state. Fix: pass `hardwareKeyboardOnly: true` on the
+native `TerminalView` (uses xterm's `CustomKeyboardListener` Focus/onKeyEvent
+path — the standard desktop terminal fix). Input now works; the only tradeoff is
+no IME composition (CJK/dead-keys) in the terminal, fine for ASCII/dev use. Done
+while upgrading the SDK (below).
+
+2026-06-04T21:10-0700 `flutter` toolchain upgraded **3.41.2 → 3.44.1** (stable;
+the user's global install) so the SDK-pinned dev deps move up
+(`matcher` 0.12.18→0.12.19, `meta` 1.17→1.18, `test_api` 0.7.9→0.7.11);
+`vector_math`/`url_launcher_android`/`flutter_secure_storage_darwin` remain pinned
+by their parent plugins. `pubspec.lock` updated; `flutter clean` was needed once
+to regenerate the Material `ink_sparkle.frag` shader manifest after the bump. 61
+tests pass on 3.44.1; `flutter analyze` clean.
+
 ## Decision
 
 2026-06-03T20:52-0700 Phase 0 PASSED → proceed with the MVI raw-byte refactor.
@@ -303,15 +324,19 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 
 ## Commits
 
-HEAD — feat(client): bundle JetBrains Mono as the terminal font
-d89dd2d — fix(client): strip CSI > ... m so xterm stops poisoning the screen with underline
-2ae48e1 — fix(client): defer native first-fit history replay out of performLayout
-fc6c1e0 — fix(client): defer terminal history replay to the view's first fit
-0041842 — refactor(client): render terminal through the MVI store from raw bytes
-84551b1 — feat(host): stream a raw-output history tail in SessionSnapshot
-435ff57 — feat(client): add unidirectional MVI terminal seam (intent/state/sink/store)
-b80318a — fix(client): coalesce resize-driven terminal replays to stop duplicated/fragmented text
-b16aa05 — debug(client): instrument terminal pane layout/metrics for the space-collapse bug
+Note: hashes below reconciled after rebasing the branch onto origin/main
+(c389d0d, PR #62).
+
+HEAD — fix(client): use hardware-keyboard input path so typing works on desktop
+7444c39 — feat(client): bundle JetBrains Mono as the terminal font
+5a39973 — fix(client): strip CSI > ... m so xterm stops poisoning the screen with underline
+e6befbc — fix(client): defer native first-fit history replay out of performLayout
+fc77f82 — fix(client): defer terminal history replay to the view's first fit
+29e80fd — refactor(client): render terminal through the MVI store from raw bytes
+f294c33 — feat(host): stream a raw-output history tail in SessionSnapshot
+fda35dd — feat(client): add unidirectional MVI terminal seam (intent/state/sink/store)
+ae85f5e — fix(client): coalesce resize-driven terminal replays to stop duplicated/fragmented text
+269e26d — debug(client): instrument terminal pane layout/metrics for the space-collapse bug
 
 ## Next Steps
 

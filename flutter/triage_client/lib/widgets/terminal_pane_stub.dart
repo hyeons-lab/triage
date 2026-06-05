@@ -307,6 +307,12 @@ class _TerminalPaneState extends State<TerminalPane> {
               autofocus: true,
               scrollController: _scrollController,
               textStyle: _textStyle,
+              // Use the hardware-keyboard path instead of xterm's hidden IME
+              // TextInput connection. On macOS desktop the IME path desyncs
+              // Flutter's HardwareKeyboard state ("physical key already
+              // pressed") and swallows keystrokes; this is the standard desktop
+              // terminal fix.
+              hardwareKeyboardOnly: true,
               onTapUp: (_, __) {
                 _focusTerminal();
               },
