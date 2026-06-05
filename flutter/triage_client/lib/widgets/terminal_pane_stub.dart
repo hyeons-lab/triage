@@ -1,48 +1,47 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HardwareKeyboard;
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'terminal_pane.dart';
-import 'terminal_replay.dart';
 
+/// Native terminal view. A thin presentation layer over the persistent
+/// `xterm.dart` [xt.Terminal] owned by the session: all content is written
+/// through the session's `TerminalStore` -> controller -> this terminal, so the
+/// pane only renders, forwards input/resize-out, and manages focus/scroll.
 class TerminalPane extends StatefulWidget {
   const TerminalPane({
     super.key,
     required this.terminalId,
     required this.controller,
-    required this.fallbackRows,
     required this.terminal,
+    required this.fallbackRows,
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
-    required this.initialContentWritten,
-    this.onInitialContentWritten,
-    this.onReplayContentWritten,
-    this.initialCursorRow,
-    this.initialCursorCol,
+    this.onViewFit,
     this.isExited = false,
-    this.replayRevision = 0,
-    this.replayPending = false,
   });
 
   final String terminalId;
   final TerminalController controller;
-  final List<StyledRow> fallbackRows;
   final xt.Terminal terminal;
+
+  /// Plain rows rendered only by the FLUTTER_TEST fallback view.
+  final List<StyledRow> fallbackRows;
+
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
+
+  /// Reports the fitted grid size after layout, so the session can replay its
+  /// staged history at the real terminal size (deferred until first fit).
+  final void Function(int cols, int rows)? onViewFit;
+
   final int focusCursorRevision;
-  final bool initialContentWritten;
-  final VoidCallback? onInitialContentWritten;
-  final VoidCallback? onReplayContentWritten;
-  final int? initialCursorRow;
-  final int? initialCursorCol;
   final bool isExited;
-  final int replayRevision;
-  final bool replayPending;
 
   static void destroySession(String terminalId) {
-    // Native implementation doesn't cache session DOM nodes
+    // Native implementation doesn't cache session DOM nodes.
   }
 
   @override
@@ -51,8 +50,6 @@ class TerminalPane extends StatefulWidget {
 
 class _TerminalPaneState extends State<TerminalPane> {
   xt.Terminal get _terminal => widget.terminal;
-  bool _suppressInput = false;
-  int _replaySuppressGeneration = 0;
   final FocusNode _focusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
   Timer? _resizeOutDebounceTimer;
@@ -61,6 +58,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pendingResizeOutRows;
   int? _lastResizeOutCols;
   int? _lastResizeOutRows;
+
+  // Selection state. The view owns selection through this xterm controller; we
+  // observe it to keep the live anchor (the cell a selection started from) so a
+  // later shift-click can extend the range to a new cell — even after scrolling,
+  // since anchors track buffer lines, not viewport rows.
+  final xt.TerminalController _xtermController = xt.TerminalController();
+  xt.CellOffset? _selectionAnchor;
+  // True while we are programmatically extending, so our own selection change
+  // does not overwrite the anchor (it must stay fixed across repeated extends).
+  bool _extendingSelection = false;
 
   // Premium design system theme matching the web terminal
   static const _theme = xt.TerminalTheme(
@@ -90,10 +97,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   );
   static const _textStyle = xt.TerminalStyle(
     fontSize: 15,
-    fontFamily: 'Menlo',
+    fontFamily: 'JetBrains Mono',
     fontFamilyFallback: [
+      'Menlo',
       'Monaco',
-      'Consolas',
       'Liberation Mono',
       'Courier New',
       'Noto Sans Mono CJK SC',
@@ -107,40 +114,28 @@ class _TerminalPaneState extends State<TerminalPane> {
     ],
   );
 
-  Timer? _replaySuppressTimer1;
-  Timer? _replaySuppressTimer2;
-  bool _focusCursorAfterReplay = false;
-
   @override
   void initState() {
     super.initState();
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _bindTerminal(_terminal);
-    _bindController();
+    widget.controller.addFitListener(_onFit);
+    _xtermController.addListener(_recordSelectionAnchor);
     if (widget.focusCursorRevision > 0) {
-      _focusCursorNowAndAfterReplay();
+      _scrollToCursor(requestFocus: true);
     }
   }
 
   // The persistent terminal lives on SessionVm, so it can be swapped underneath
   // this State (a session swap reuses the State under the same `triage / <sid>`
-  // key). Bind keyboard output through a paired seam — mirroring the controller
-  // binding — so initState and didUpdateWidget can't drift and leave the new
-  // terminal's onOutput null (which silently drops every keystroke).
+  // key). Bind keyboard output through a paired seam so initState and
+  // didUpdateWidget can't leave the new terminal's onOutput null.
   void _bindTerminal(xt.Terminal terminal) {
     terminal.onOutput = _onTerminalOutput;
   }
 
   void _unbindTerminal(xt.Terminal terminal) {
     terminal.onOutput = null;
-  }
-
-  void _bindController() {
-    widget.controller.addFitListener(_onFit);
-  }
-
-  void _unbindController(TerminalController controller) {
-    controller.removeFitListener(_onFit);
   }
 
   @override
@@ -150,35 +145,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.onTerminalResizeBind?.call(null);
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
-
-    // A session swap changes the terminal, the controller, and the replay
-    // revision in one update. Replaying is idempotent but expensive (a full
-    // buffer reset plus a complete ANSI rebuild of every row), so coalesce the
-    // triggers and run it at most once per update.
-    var replayed = false;
-    void replayOnce() {
-      if (replayed) return;
-      replayed = true;
-      _triggerFullReplayOrReset();
-    }
-
     if (!identical(oldWidget.terminal, widget.terminal)) {
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
-      _focusCursorNowAndAfterReplay();
-    }
-    if (oldWidget.replayRevision != widget.replayRevision ||
-        oldWidget.isExited != widget.isExited ||
-        (oldWidget.replayPending && !widget.replayPending)) {
-      replayOnce();
-    }
-    if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
-      _focusCursorNowAndAfterReplay();
+      // The anchor referenced the previous terminal's buffer; drop it.
+      _selectionAnchor = null;
+      _scrollToCursor(requestFocus: true);
     }
     if (oldWidget.controller != widget.controller) {
-      _unbindController(oldWidget.controller);
-      _bindController();
-      replayOnce();
+      oldWidget.controller.removeFitListener(_onFit);
+      widget.controller.addFitListener(_onFit);
+    }
+    if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
+      _scrollToCursor(requestFocus: true);
     }
   }
 
@@ -186,11 +165,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   void dispose() {
     widget.onTerminalResizeBind?.call(null);
     _unbindTerminal(_terminal);
-    _unbindController(widget.controller);
+    widget.controller.removeFitListener(_onFit);
+    _xtermController.removeListener(_recordSelectionAnchor);
+    _xtermController.dispose();
     _scrollController.dispose();
     _focusNode.dispose();
-    _replaySuppressTimer1?.cancel();
-    _replaySuppressTimer2?.cancel();
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     super.dispose();
@@ -200,8 +179,44 @@ class _TerminalPaneState extends State<TerminalPane> {
     setState(() {});
   }
 
+  // Remember where the current selection is anchored so a shift-click can extend
+  // from it. Skipped while we are doing the extending ourselves so the anchor
+  // stays pinned to the original start across repeated shift-clicks.
+  void _recordSelectionAnchor() {
+    if (_extendingSelection) return;
+    final selection = _xtermController.selection;
+    if (selection != null) {
+      _selectionAnchor = selection.begin;
+    }
+  }
+
+  // Shift-click: extend the selection from the saved anchor to [target]. xterm
+  // clears the live selection on tap-down, so we rebuild it from the anchor we
+  // recorded before the click. Anchors are buffer-line based, so this is correct
+  // even if the view was scrolled between the original selection and the click.
+  void _extendSelectionTo(xt.CellOffset target) {
+    final anchor = _selectionAnchor;
+    if (anchor == null) return;
+    final buffer = _terminal.buffer;
+    final lastRow = buffer.lines.length - 1;
+    if (lastRow < 0) return;
+    // Guard against a buffer that shrank (clear / scrollback trim) since the
+    // anchor was recorded, so createAnchorFromOffset never indexes out of range.
+    final safeAnchor = anchor.y > lastRow
+        ? xt.CellOffset(anchor.x, lastRow)
+        : anchor;
+    _extendingSelection = true;
+    try {
+      _xtermController.setSelection(
+        buffer.createAnchorFromOffset(safeAnchor),
+        buffer.createAnchorFromOffset(target),
+      );
+    } finally {
+      _extendingSelection = false;
+    }
+  }
+
   void _onTerminalOutput(String data) {
-    if (_suppressInput) return;
     widget.controller.sendInput(data);
   }
 
@@ -209,6 +224,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _focusNode.requestFocus();
   }
 
+  // The TerminalView auto-fits and calls this when the grid size changes. We
+  // forward the settled size to the host (debounced); the program repaints and
+  // the live byte stream renders the new layout. No replay here.
   void _onTerminalResize(
     int width,
     int height,
@@ -216,28 +234,18 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelHeight,
   ) {
     if (width > 0 && height > 0) {
-      if (!widget.initialContentWritten) {
-        scheduleMicrotask(() {
-          if (mounted && !widget.initialContentWritten) {
-            _finishInitialContent(width, height);
-          }
-        });
-      } else {
-        _scheduleResizeOut(width, height);
-      }
+      // This fires from inside RenderTerminal.performLayout (the view auto-fits
+      // by calling terminal.resize). Replaying history writes to the terminal,
+      // which would mark the render object dirty during its own layout — illegal.
+      // Defer out of the layout pass via a microtask so the write lands after
+      // layout completes (the terminal is already at the fitted size by then).
+      scheduleMicrotask(() {
+        if (mounted) {
+          widget.onViewFit?.call(width, height);
+        }
+      });
+      _scheduleResizeOut(width, height);
     }
-  }
-
-  void _finishInitialContent(int fittedCols, int fittedRows) {
-    if (widget.replayPending) {
-      return;
-    }
-    if (!_writeInitialContent()) {
-      return;
-    }
-    widget.onInitialContentWritten?.call();
-    _afterReplayContentWritten(initialReplay: true);
-    _sendResizeOutNow(fittedCols, fittedRows);
   }
 
   void _scheduleResizeOut(int cols, int rows) {
@@ -270,90 +278,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.sendResizeOut(cols, rows);
   }
 
-  bool _writeInitialContent() {
-    if (widget.replayPending) {
-      return false;
-    }
-    final cursor = computeReplayCursorPlacement(
-      fallbackRows: widget.fallbackRows,
-      fittedRows: _terminal.viewHeight > 0
-          ? _terminal.viewHeight
-          : widget.fallbackRows.length,
-      initialCursorRow: widget.initialCursorRow,
-      initialCursorCol: widget.initialCursorCol,
-      isExited: widget.isExited,
-    );
-
-    final sb = StringBuffer();
-    if (widget.isExited) {
-      sb.write('\x1b[?25l');
-    } else {
-      sb.write('\x1b[?25h');
-    }
-
-    // Write historical rows first to fill the scrollback buffer
-    for (var i = 0; i < cursor.startRow; i++) {
-      final trimmedRow = clipRowToCols(
-        normalizeReplayRow(widget.fallbackRows[i]),
-        _terminal.viewWidth > 0 ? _terminal.viewWidth : 80,
-      );
-      sb.write(styledRowToAnsi(trimmedRow));
-      sb.write('\r\n');
-    }
-
-    // Write the active viewport rows
-    for (var i = cursor.startRow; i < cursor.endRow; i++) {
-      final trimmedRow = clipRowToCols(
-        normalizeReplayRow(widget.fallbackRows[i]),
-        _terminal.viewWidth > 0 ? _terminal.viewWidth : 80,
-      );
-      sb.write(styledRowToAnsi(trimmedRow));
-      if (i < cursor.endRow - 1) {
-        sb.write('\r\n');
-      }
-    }
-
-    sb.write('\x1B[${cursor.terminalRow};${cursor.terminalCol}H');
-    _writeReplayContent(sb.toString());
-    return true;
-  }
-
-  void _writeReplayContent(String data) {
-    final generation = ++_replaySuppressGeneration;
-    _suppressInput = true;
-
-    // Safety timeout to ensure key input is never permanently blocked
-    _replaySuppressTimer1?.cancel();
-    _replaySuppressTimer1 = Timer(const Duration(milliseconds: 150), () {
-      if (mounted && _replaySuppressGeneration == generation) {
-        _suppressInput = false;
-      }
-    });
-
-    _terminal.write(data);
-
-    _replaySuppressTimer2?.cancel();
-    _replaySuppressTimer2 = Timer(const Duration(milliseconds: 50), () {
-      if (mounted && _replaySuppressGeneration == generation) {
-        _suppressInput = false;
-      }
-    });
-  }
-
-  void _afterReplayContentWritten({required bool initialReplay}) {
-    widget.onReplayContentWritten?.call();
-    final shouldFocus = _focusCursorAfterReplay;
-    if (initialReplay || shouldFocus) {
-      _focusCursorAfterReplay = false;
-      _scrollToCursor(requestFocus: true);
-    }
-  }
-
-  void _focusCursorNowAndAfterReplay() {
-    _focusCursorAfterReplay = true;
-    _scrollToCursor(requestFocus: true);
-  }
-
   void _scrollToCursor({required bool requestFocus}) {
     void jump() {
       if (!mounted) return;
@@ -371,41 +295,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
   }
 
-  void _resetTerminalSafe() {
-    try {
-      _terminal.useMainBuffer();
-      _terminal.mainBuffer.clear();
-      _terminal.altBuffer.clear();
-      _terminal.write('\x1b[H\x1b[2J\x1b[3J');
-    } catch (_) {}
-  }
-
-  void _triggerFullReplayOrReset() {
-    if (widget.replayPending) {
-      return;
-    }
-    if (widget.initialContentWritten) {
-      _resetTerminalSafe();
-      if (_writeInitialContent()) {
-        _afterReplayContentWritten(initialReplay: false);
-      }
-    } else {
-      _resetTerminalSafe();
-      final cols = _terminal.viewWidth;
-      final rows = _terminal.viewHeight;
-      if (cols > 0 && rows > 0) {
-        scheduleMicrotask(() {
-          if (mounted && !widget.initialContentWritten) {
-            _finishInitialContent(cols, rows);
-          }
-        });
-      }
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
-    // Detect if we are running inside a widget test environment to preserve finder-based assertions.
+    // Detect if we are running inside a widget test environment to preserve
+    // finder-based assertions on the plain fallback rows.
     final isTest = Platform.environment.containsKey('FLUTTER_TEST');
     if (isTest) {
       return Container(
@@ -426,7 +319,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                           TextSpan(
                             text: span.text.isEmpty ? ' ' : span.text,
                             style: TextStyle(
-                              fontFamily: 'Consolas',
+                              fontFamily: 'JetBrains Mono',
                               fontSize: 15,
                               height: 1.35,
                               color:
@@ -458,9 +351,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       color: const Color(0xff0d1113),
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () {
-          _focusTerminal();
-        },
+        onTap: _focusTerminal,
         child: Padding(
           padding: const EdgeInsets.all(22),
           child: Listener(
@@ -469,13 +360,25 @@ class _TerminalPaneState extends State<TerminalPane> {
             },
             child: xt.TerminalView(
               _terminal,
+              controller: _xtermController,
               theme: _theme,
               focusNode: _focusNode,
               autofocus: true,
               scrollController: _scrollController,
               textStyle: _textStyle,
-              onTapUp: (_, __) {
+              // Use the hardware-keyboard path instead of xterm's hidden IME
+              // TextInput connection. On macOS desktop the IME path desyncs
+              // Flutter's HardwareKeyboard state ("physical key already
+              // pressed") and swallows keystrokes; this is the standard desktop
+              // terminal fix.
+              hardwareKeyboardOnly: true,
+              onTapUp: (_, cellOffset) {
                 _focusTerminal();
+                // Shift-click extends the existing selection to the clicked
+                // cell instead of clearing it (xterm cleared it on tap-down).
+                if (HardwareKeyboard.instance.isShiftPressed) {
+                  _extendSelectionTo(cellOffset);
+                }
               },
             ),
           ),

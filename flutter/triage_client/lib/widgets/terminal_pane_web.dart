@@ -8,42 +8,37 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'terminal_pane.dart';
-import 'terminal_replay.dart';
 
 class TerminalPane extends StatefulWidget {
   const TerminalPane({
     super.key,
     required this.terminalId,
     required this.controller,
-    required this.fallbackRows,
     required this.terminal,
+    required this.fallbackRows,
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
-    required this.initialContentWritten,
-    this.onInitialContentWritten,
-    this.onReplayContentWritten,
-    this.initialCursorRow,
-    this.initialCursorCol,
+    this.onViewFit,
     this.isExited = false,
-    this.replayRevision = 0,
-    this.replayPending = false,
   });
 
   final String terminalId;
   final TerminalController controller;
-  final List<StyledRow> fallbackRows;
   final dynamic terminal;
+
+  /// Plain rows; unused by the live web view but kept for parity with native.
+  final List<StyledRow> fallbackRows;
+
   final void Function(void Function(int w, int h, int pw, int ph)? callback)?
   onTerminalResizeBind;
+
+  /// Reports the fitted grid size after layout so the session replays its staged
+  /// history (through the store -> controller -> this view's write listener) at
+  /// the real terminal size.
+  final void Function(int cols, int rows)? onViewFit;
+
   final int focusCursorRevision;
-  final bool initialContentWritten;
-  final VoidCallback? onInitialContentWritten;
-  final VoidCallback? onReplayContentWritten;
-  final int? initialCursorRow;
-  final int? initialCursorCol;
   final bool isExited;
-  final int replayRevision;
-  final bool replayPending;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -117,12 +112,9 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   double? _lastWidth;
   double? _lastHeight;
-  bool _liveOutputReceived = false;
   int? _lastFittedRows;
   int? _lastFittedCols;
   bool _focusCursorAfterReplay = false;
-  int _replaySuppressGeneration = 0;
-  bool _suppressInput = false;
   Timer? _resizeDebounceTimer;
   double? _stableWidth;
   double? _stableHeight;
@@ -183,7 +175,6 @@ class _TerminalPaneState extends State<TerminalPane> {
                 _initialContentWritten = false;
                 _stableWidth = null;
                 _stableHeight = null;
-                _liveOutputReceived = false;
                 _triggerFitWithDelayedRetries();
               } catch (_) {}
             }
@@ -202,7 +193,6 @@ class _TerminalPaneState extends State<TerminalPane> {
               _initialContentWritten = false;
               _stableWidth = null;
               _stableHeight = null;
-              _liveOutputReceived = false;
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
@@ -360,7 +350,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(
         options,
         'fontFamily',
-        'Consolas, Courier New, monospace',
+        "'JetBrains Mono', Consolas, 'Courier New', monospace",
       );
       js_util.setProperty(options, 'fontSize', 15);
       js_util.setProperty(options, 'cursorStyle', 'block');
@@ -415,77 +405,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _writeInitialContent() {
-    if (widget.replayPending) {
-      return;
-    }
-    final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
-    final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
-    final fittedRows = fittedRowsNum.toInt();
-    final fittedCols = fittedColsNum.toInt();
-    final cursor = computeReplayCursorPlacement(
-      fallbackRows: widget.fallbackRows,
-      fittedRows: fittedRows,
-      initialCursorRow: widget.initialCursorRow,
-      initialCursorCol: widget.initialCursorCol,
-      isExited: widget.isExited,
-    );
-
-    final sb = StringBuffer();
-    if (widget.isExited) {
-      sb.write('\x1b[?25l');
-    } else {
-      sb.write('\x1b[?25h');
-    }
-    // Write historical rows first to fill the scrollback buffer
-    for (var i = 0; i < cursor.startRow; i++) {
-      final trimmedRow = clipRowToCols(
-        normalizeReplayRow(widget.fallbackRows[i]),
-        fittedCols,
-      );
-      sb.write(styledRowToAnsi(trimmedRow));
-      sb.write('\r\n');
-    }
-    // Write the active viewport rows
-    for (var i = cursor.startRow; i < cursor.endRow; i++) {
-      final trimmedRow = clipRowToCols(
-        normalizeReplayRow(widget.fallbackRows[i]),
-        fittedCols,
-      );
-      sb.write(styledRowToAnsi(trimmedRow));
-      if (i < cursor.endRow - 1) {
-        sb.write('\r\n');
-      }
-    }
-
-    sb.write('\x1B[${cursor.terminalRow};${cursor.terminalCol}H');
-    _writeReplayContent(sb.toString());
-  }
-
-  void _writeReplayContent(String data) {
-    final generation = ++_replaySuppressGeneration;
-    _suppressInput = true;
-
-    // Safety timeout to ensure key input is never permanently blocked
-    Timer(const Duration(milliseconds: 150), () {
-      if (mounted && _replaySuppressGeneration == generation) {
-        _suppressInput = false;
-      }
-    });
-
-    final complete = js_util.allowInterop(() {
-      Timer(const Duration(milliseconds: 50), () {
-        if (mounted && _replaySuppressGeneration == generation) {
-          _suppressInput = false;
-        }
-      });
-    });
-    try {
-      js_util.callMethod(_term, 'write', [data, complete]);
-    } catch (_) {
-      if (_replaySuppressGeneration == generation) {
-        _suppressInput = false;
-      }
-    }
+    // Signal the fitted size; the session replays its staged history through the
+    // store -> controller -> this view's write listener at the real size. The
+    // single source of truth is the raw byte stream, not styled-row rebuilds.
+    final fittedRows = (js_util.getProperty(_term, 'rows') as num).toInt();
+    final fittedCols = (js_util.getProperty(_term, 'cols') as num).toInt();
+    widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
   void _resetTerminalSafe() {
@@ -506,9 +431,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        if (_suppressInput) {
-          return;
-        }
         _sessionInputRouter.sendInput(sessionId, data);
       });
       _onDataSubscription = js_util.callMethod(_term, 'onData', [
@@ -661,7 +583,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       _pendingLiveWriteBuffer.add(data);
     } else {
       if (!_initialized) return;
-      _liveOutputReceived = true;
       js_util.callMethod(_term, 'write', [data]);
     }
   }
@@ -680,7 +601,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _initialContentWritten = true;
     _writeInitialContent();
     _flushPendingLiveWrites();
-    widget.onInitialContentWritten?.call();
     _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
   }
@@ -691,7 +611,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
     _pendingLiveWriteBuffer.clear();
-    _liveOutputReceived = true;
     for (final data in pendingWrites) {
       js_util.callMethod(_term, 'write', [data]);
     }
@@ -729,9 +648,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
 
           if (!_initialContentWritten) {
-            if (widget.replayPending) {
-              return;
-            }
             if (!_styleSheetLoaded) {
               return;
             }
@@ -746,9 +662,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               _stableHeight = dHeight;
               _stabilityTimer?.cancel();
               _stabilityTimer = Timer(const Duration(milliseconds: 250), () {
-                if (mounted &&
-                    !_initialContentWritten &&
-                    !widget.replayPending) {
+                if (mounted && !_initialContentWritten) {
                   _finishInitialContent(fittedCols, fittedRows);
                 }
               });
@@ -757,13 +671,12 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (_stabilityTimer == null || !_stabilityTimer!.isActive) {
               _finishInitialContent(fittedCols, fittedRows);
             }
-          } else if (widget.isExited) {
-            _resetTerminalSafe();
-            _writeInitialContent();
-          } else if (sizeChanged && !_liveOutputReceived) {
-            _resetTerminalSafe();
-            _writeInitialContent();
           }
+          // No clear-and-rewrite on resize: `_writeInitialContent` only signals
+          // the fitted size now (it no longer writes content), so clearing here
+          // would blank the terminal — for an exited session permanently, since
+          // no live repaint follows. xterm.js reflows its own buffer on fit(),
+          // and active sessions repaint via the live stream after the resize-out.
         }
       }
     } catch (_) {}
@@ -778,7 +691,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _afterReplayContentWritten({required bool initialReplay}) {
-    widget.onReplayContentWritten?.call();
     final shouldFocus = _focusCursorAfterReplay;
     if (initialReplay || shouldFocus) {
       _focusCursorAfterReplay = false;
@@ -877,7 +789,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         _initialContentWritten = false;
         _stableWidth = null;
         _stableHeight = null;
-        _liveOutputReceived = false;
         _triggerFitWithDelayedRetries();
       }
     } catch (_) {}
@@ -894,18 +805,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       _triggerFullReplayOrReset();
     }
-    if (oldWidget.replayRevision != widget.replayRevision) {
-      _triggerFullReplayOrReset();
-    }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
-    }
-    if (oldWidget.initialCursorRow != widget.initialCursorRow ||
-        oldWidget.initialCursorCol != widget.initialCursorCol) {
-      _triggerFullReplayOrReset();
-    }
-    if (oldWidget.replayPending && !widget.replayPending) {
-      _triggerFullReplayOrReset();
     }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeWriteListener(_onWrite);

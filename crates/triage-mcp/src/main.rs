@@ -595,6 +595,8 @@ mod tests {
                     context: None,
                     bracketed_paste_enabled: false,
                     exited: false,
+                    raw_output: Vec::new(),
+                    raw_output_start: 0,
                 },
                 snapshot_error: None,
             }

@@ -12,6 +12,9 @@ import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/storage.dart';
+import 'package:triage_client/terminal/terminal_intent.dart';
+import 'package:triage_client/terminal/terminal_store.dart';
+import 'package:triage_client/terminal/terminal_controller_sink.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -99,10 +102,7 @@ class SessionVm {
     required this.statusColor,
     required this.icon,
     required this.rows,
-    required this.outputSeq,
     this.isRemote = false,
-    this.initialCursorRow,
-    this.initialCursorCol,
     this.isExited = false,
   }) : terminalController = TerminalController() {
     terminal = xt.Terminal(
@@ -111,7 +111,7 @@ class SessionVm {
       onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
     );
     terminalController.addWriteListener((data) {
-      _writeTerminalOrBuffer(data);
+      terminal.write(data);
     });
     terminalController.addClearListener(() {
       try {
@@ -124,6 +124,7 @@ class SessionVm {
     terminalController.addResizeListener((cols, rows) {
       terminal.resize(cols, rows);
     });
+    store = TerminalStore(TerminalControllerSink(terminalController));
   }
 
   final String title;
@@ -131,30 +132,36 @@ class SessionVm {
   String status;
   Color statusColor;
   final IconData icon;
+  // Plain visible rows kept for the test fallback view and demo seeding only;
+  // real rendering goes through [store]/[terminal] from raw bytes.
   final List<StyledRow> rows;
   final TerminalController terminalController;
-  int outputSeq;
   final bool isRemote;
-  int? initialCursorRow;
-  int? initialCursorCol;
   bool isExited;
-  int replayRevision = 0;
   int focusCursorRevision = 0;
-  bool initialContentWritten = false;
-  bool snapshotRefreshPending = false;
   int? lastFittedCols;
   int? lastFittedRows;
+  // Set once the view first reports its real fitted size after a fresh attach.
+  // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
+  bool hasFitted = false;
   int? inFlightCols;
   int? inFlightRows;
   int resizeRequestSeq = 0;
 
   late final xt.Terminal terminal;
+  // The single, ordered write path for all terminal output (live + history).
+  // The sink wraps the controller, so both platform views render through their
+  // existing listeners; decoding/buffering/CRLF/dedup all live in the store.
+  late final TerminalStore store;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
-  final List<_PendingTerminalWrite> _pendingTerminalWrites = [];
-  final List<int> _pendingUtf8OutputBytes = [];
-  int? _pendingUtf8OutputSeq;
-  int? _nextTerminalWriteOutputSeq;
-  int? _lastReplayOutputSeq;
+
+  // Deferred history: replay must wait until the view is laid out and fitted, so
+  // it re-emulates at the real terminal size. Writing before the first fit
+  // renders at the default 80x24 and shows nothing until a resize refits.
+  _PendingHistory? _pendingHistory;
+  bool _viewReady = false;
+  int _viewCols = 80;
+  int _viewRows = 24;
 
   String? get remoteSessionId {
     if (!isRemote) return null;
@@ -162,129 +169,72 @@ class SessionVm {
     return parts.length > 1 ? parts[1] : null;
   }
 
-  bool get _shouldBufferTerminalWrites =>
-      !initialContentWritten || snapshotRefreshPending;
-
-  void writeOutput(String data, {int? outputSeq}) {
-    _nextTerminalWriteOutputSeq = outputSeq;
-    try {
-      terminalController.write(data);
-    } finally {
-      _nextTerminalWriteOutputSeq = null;
+  /// Begin the attach/resync lifecycle and stage the raw output-history tail.
+  /// [Attach] is dispatched now so live chunks buffer in arrival order; the
+  /// actual [HistoryBytes] replay is deferred until the view reports its fitted
+  /// size (see [noteViewFit]) and replays at that size — the host capture size
+  /// is intentionally not used. Live chunks at or below [throughOutputSeq] are
+  /// dropped by the store as duplicates.
+  void applyHistory(List<int> rawOutput, {int? throughOutputSeq}) {
+    _pendingHistory = _PendingHistory(rawOutput, throughOutputSeq);
+    store.dispatch(const Attach());
+    if (_viewReady) {
+      _flushPendingHistory();
     }
   }
 
-  String decodeOutputBytes(List<int> bytes, {int? outputSeq}) {
-    final combined = _pendingUtf8OutputBytes.isEmpty
-        ? List<int>.from(bytes)
-        : <int>[..._pendingUtf8OutputBytes, ...bytes];
-    _pendingUtf8OutputBytes.clear();
-
-    final trailingIncomplete = _trailingIncompleteUtf8ByteCount(combined);
-    final decodeEnd = combined.length - trailingIncomplete;
-    if (trailingIncomplete > 0) {
-      _pendingUtf8OutputBytes.addAll(combined.sublist(decodeEnd));
-      _pendingUtf8OutputSeq = outputSeq ?? _pendingUtf8OutputSeq;
-    } else {
-      _pendingUtf8OutputSeq = null;
-    }
-    if (decodeEnd == 0) {
-      return '';
-    }
-    return utf8.decode(combined.sublist(0, decodeEnd), allowMalformed: true);
+  /// The view fitted to a real grid size. Records it and replays any staged
+  /// history at that size. Idempotent on subsequent fits (no staged history).
+  void noteViewFit(int cols, int rows) {
+    _viewCols = cols;
+    _viewRows = rows;
+    _viewReady = true;
+    _flushPendingHistory();
   }
 
-  void _writeTerminalOrBuffer(String data) {
-    if (_shouldBufferTerminalWrites) {
-      _pendingTerminalWrites.add(
-        _PendingTerminalWrite(data, _nextTerminalWriteOutputSeq),
-      );
-      return;
-    }
-    terminal.write(data);
+  void _flushPendingHistory() {
+    final pending = _pendingHistory;
+    if (pending == null) return;
+    _pendingHistory = null;
+    store.dispatch(
+      HistoryBytes(
+        pending.rawOutput,
+        cols: _viewCols,
+        rows: _viewRows,
+        throughOutputSeq: pending.throughOutputSeq,
+      ),
+    );
   }
 
-  void markInitialContentWritten() {
-    initialContentWritten = true;
+  /// Apply a live raw output chunk (remote PTY bytes) through the write path.
+  void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
+    store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
   }
 
-  void setSnapshotRefreshPending(bool pending) {
-    snapshotRefreshPending = pending;
+  /// Echo locally produced bytes for local/demo sessions (no remote PTY).
+  void echoLocalBytes(List<int> bytes) {
+    store.dispatch(LiveBytes(bytes));
   }
 
-  void markReplaySnapshotOutputSeq(int? outputSeq) {
-    _lastReplayOutputSeq = outputSeq;
-    final pendingUtf8OutputSeq = _pendingUtf8OutputSeq;
-    if (outputSeq != null &&
-        pendingUtf8OutputSeq != null &&
-        outputSeq > pendingUtf8OutputSeq) {
-      _pendingUtf8OutputBytes.clear();
-      _pendingUtf8OutputSeq = null;
-    }
-  }
-
-  void flushPendingTerminalWritesAfterReplay() {
-    if (_shouldBufferTerminalWrites || _pendingTerminalWrites.isEmpty) {
-      return;
-    }
-    final writes = List<_PendingTerminalWrite>.from(_pendingTerminalWrites);
-    _pendingTerminalWrites.clear();
-    for (final write in writes) {
-      final replayOutputSeq = _lastReplayOutputSeq;
-      final writeOutputSeq = write.outputSeq;
-      if (replayOutputSeq != null &&
-          writeOutputSeq != null &&
-          writeOutputSeq <= replayOutputSeq) {
-        continue;
-      }
-      terminal.write(write.data);
-    }
-    _lastReplayOutputSeq = null;
-  }
+  void markExited() => store.dispatch(const Exited());
 
   void focusCursorOnNextDisplay() {
     focusCursorRevision += 1;
   }
-}
 
-class _PendingTerminalWrite {
-  const _PendingTerminalWrite(this.data, this.outputSeq);
-
-  final String data;
-  final int? outputSeq;
-}
-
-int _trailingIncompleteUtf8ByteCount(List<int> bytes) {
-  if (bytes.isEmpty) return 0;
-  final startLimit = max(0, bytes.length - 4);
-  for (var start = bytes.length - 1; start >= startLimit; start--) {
-    final expectedLength = _utf8SequenceLength(bytes[start]);
-    if (expectedLength == 0) {
-      continue;
-    }
-    final available = bytes.length - start;
-    if (available >= expectedLength) {
-      return 0;
-    }
-    for (var index = start + 1; index < bytes.length; index++) {
-      if (!_isUtf8ContinuationByte(bytes[index])) {
-        return 0;
-      }
-    }
-    return available;
+  void dispose() {
+    store.dispose();
+    terminalController.dispose();
   }
-  return 0;
 }
 
-int _utf8SequenceLength(int byte) {
-  if (byte < 0x80) return 1;
-  if (byte >= 0xC2 && byte <= 0xDF) return 2;
-  if (byte >= 0xE0 && byte <= 0xEF) return 3;
-  if (byte >= 0xF0 && byte <= 0xF4) return 4;
-  return 0;
-}
+/// Staged attach/resync history awaiting the view's first fit.
+class _PendingHistory {
+  const _PendingHistory(this.rawOutput, this.throughOutputSeq);
 
-bool _isUtf8ContinuationByte(int byte) => byte >= 0x80 && byte <= 0xBF;
+  final List<int> rawOutput;
+  final int? throughOutputSeq;
+}
 
 class TriageHome extends StatefulWidget {
   const TriageHome({super.key, this.client});
@@ -335,86 +285,13 @@ class _TriageHomeState extends State<TriageHome> {
     );
   }
 
-  Future<List<StyledRow>> _mergeVisibleAndStyledRows({
-    required String sessionId,
-    required List<dynamic>? visibleRowsJson,
-    required List<dynamic>? styledRowsJson,
-    bool includeHistory = true,
-    List<StyledRow>? existingRows,
-  }) async {
-    final List<StyledRow> rows = [];
-    final styledRows =
-        styledRowsJson
-            ?.map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
-            .toList() ??
-        [];
-
-    if (!includeHistory && styledRows.isNotEmpty) {
-      if (existingRows != null && existingRows.length > styledRows.length) {
-        final historyCount = existingRows.length - styledRows.length;
-        rows.addAll(existingRows.take(historyCount));
-        rows.addAll(styledRows);
-        return rows;
-      }
-      return styledRows;
-    }
-
-    if (visibleRowsJson != null) {
-      final visibleRows = visibleRowsJson.cast<String>();
-      final styledRowsStart = visibleRows.length - styledRows.length;
-      if (styledRowsStart > 0) {
-        try {
-          final fetchStart = (visibleRows.length - 200) < 0
-              ? 0
-              : visibleRows.length - 200;
-          final historyRes = await _client.styledRows(
-            sessionId: sessionId,
-            start: fetchStart,
-            end: visibleRows.length,
-          );
-          final responseObj = historyRes['response'] as Map<String, dynamic>?;
-          final rowsList = responseObj?['rows'] as List<dynamic>?;
-          if (rowsList != null) {
-            final fetchedRows = rowsList
-                .map((e) => StyledRow.fromJson(e as Map<String, dynamic>))
-                .toList();
-            for (var i = 0; i < visibleRows.length; i++) {
-              if (i < fetchStart) {
-                rows.add(_plainRow(visibleRows[i]));
-              } else {
-                final fetchedIndex = i - fetchStart;
-                if (fetchedIndex < fetchedRows.length) {
-                  rows.add(fetchedRows[fetchedIndex]);
-                } else {
-                  rows.add(_plainRow(visibleRows[i]));
-                }
-              }
-            }
-          } else {
-            for (var i = 0; i < visibleRows.length; i++) {
-              if (i < styledRowsStart) {
-                rows.add(_plainRow(visibleRows[i]));
-              } else {
-                rows.add(styledRows[i - styledRowsStart]);
-              }
-            }
-          }
-        } catch (_) {
-          for (var i = 0; i < visibleRows.length; i++) {
-            if (i < styledRowsStart) {
-              rows.add(_plainRow(visibleRows[i]));
-            } else {
-              rows.add(styledRows[i - styledRowsStart]);
-            }
-          }
-        }
-      } else {
-        rows.addAll(styledRows);
-      }
-    } else {
-      rows.addAll(styledRows);
-    }
-    return rows;
+  /// Flattens demo/local placeholder rows into plain CRLF-terminated bytes for
+  /// seeding a session's store (styling is dropped — these are placeholders).
+  List<int> _seedBytesFromRows(List<StyledRow> rows) {
+    final text = rows
+        .map((row) => row.spans.map((span) => span.text).join())
+        .join('\r\n');
+    return utf8.encode(text);
   }
 
   StyledRow _promptRow(String command) {
@@ -456,7 +333,6 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('awaiting input: define TerminalPane bridge boundary'),
         ],
-        outputSeq: 0,
       ),
       SessionVm(
         title: 'triage / websocket-session-api',
@@ -471,7 +347,6 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('running: websocket integration notes'),
         ],
-        outputSeq: 0,
       ),
       SessionVm(
         title: 'triage / main',
@@ -485,11 +360,13 @@ class _TriageHomeState extends State<TriageHome> {
           _plainRow(''),
           _plainRow('idle'),
         ],
-        outputSeq: 0,
       ),
     ];
     for (final s in _sessions) {
       _setupSessionInputListener(s);
+      // Seed the demo/local sessions into the store's live phase so their
+      // placeholder content renders and local echo works through one pipeline.
+      s.applyHistory(_seedBytesFromRows(s.rows));
     }
     final isMockMode = Uri.base.queryParameters['mock'] == 'true';
     if (isMockMode) {
@@ -631,6 +508,13 @@ class _TriageHomeState extends State<TriageHome> {
 
   void _setupSessionInputListener(SessionVm session) {
     session.terminalController.addInputListener((keys) {
+      // While the store replays history, the emulator auto-answers the
+      // program's own terminal queries (DSR/cursor reports) re-fed from the
+      // tail. Those answers surface here as emulator output; they must not be
+      // forwarded to the host as fake user input.
+      if (session.store.isSuppressingHostInput) {
+        return;
+      }
       if (_isRemoteSession(session)) {
         if (session.status != 'attached') {
           return;
@@ -655,33 +539,15 @@ class _TriageHomeState extends State<TriageHome> {
               });
         }
       } else {
-        setState(() {
-          if (keys == '\r') {
-            session.rows.add(_plainRow(''));
-            session.terminalController.write('\r\n');
-          } else if (keys == '\x7f' || keys == '\x08') {
-            if (session.rows.isNotEmpty && session.rows.last.spans.isNotEmpty) {
-              final text = session.rows.last.spans.last.text;
-              if (text.isNotEmpty) {
-                final newText = text.substring(0, text.length - 1);
-                final lastIndex = session.rows.last.spans.length - 1;
-                session.rows.last.spans[lastIndex] = StyledSpan(
-                  text: newText,
-                  style: session.rows.last.spans.last.style,
-                );
-                session.terminalController.write('\x08 \x08');
-              }
-            }
-          } else {
-            if (session.rows.isEmpty) {
-              session.rows.add(_plainRow(''));
-            }
-            session.rows.last.spans.add(
-              StyledSpan(text: keys, style: const TerminalStyle()),
-            );
-            session.terminalController.write(keys);
-          }
-        });
+        // Local/demo session: echo keystrokes through the same single write
+        // path the remote stream uses, so there is one rendering pipeline.
+        if (keys == '\r') {
+          session.echoLocalBytes(const [0x0d, 0x0a]); // CR LF
+        } else if (keys == '\x7f' || keys == '\x08') {
+          session.echoLocalBytes(const [0x08, 0x20, 0x08]); // backspace-erase
+        } else {
+          session.echoLocalBytes(utf8.encode(keys));
+        }
       }
     });
 
@@ -690,31 +556,18 @@ class _TriageHomeState extends State<TriageHome> {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
-          final requestSeq = ++session.resizeRequestSeq;
+          ++session.resizeRequestSeq;
+          // Tell the host its new PTY size; the program repaints and the live
+          // byte stream self-heals the view. No history replay on resize.
+          session.lastFittedCols = cols;
+          session.lastFittedRows = rows;
           unawaited(() async {
             try {
-              final snapshot = _snapshotFromResponse(
-                await _client.resizeSession(
-                  sessionId: sessionId,
-                  cols: cols,
-                  rows: rows,
-                ),
+              await _client.resizeSession(
+                sessionId: sessionId,
+                cols: cols,
+                rows: rows,
               );
-              if (snapshot != null && _sessionStillLoaded(session, sessionId)) {
-                if (requestSeq != session.resizeRequestSeq) {
-                  return;
-                }
-                final sizeChanged = _snapshotSizeDiffersFromSession(
-                  session,
-                  snapshot,
-                );
-                await _applySnapshotToSession(
-                  session,
-                  sessionId,
-                  snapshot,
-                  includeHistory: sizeChanged,
-                );
-              }
             } catch (_) {}
           }());
         }
@@ -1002,14 +855,11 @@ class _TriageHomeState extends State<TriageHome> {
               );
               if (existingIndex == -1) return;
               final oldSession = _sessions[existingIndex];
-              oldSession.terminalController.dispose();
+              oldSession.dispose();
               if (oldSession.title != session.title) {
                 TerminalPane.destroySession(oldSession.title);
               }
               _sessions[existingIndex] = session;
-              if (includeHistory) {
-                session.setSnapshotRefreshPending(true);
-              }
             });
             _drainPendingEvents(sid);
           } catch (e) {
@@ -1049,18 +899,9 @@ class _TriageHomeState extends State<TriageHome> {
         });
       }
 
-      if (_sessions.isNotEmpty) {
-        final activeSession = _sessions[_selectedIndex];
-        if (activeSession.status == 'attached') {
-          unawaited(
-            _refreshSessionSnapshot(
-              activeSession,
-              markPending: false,
-              includeHistory: true,
-            ),
-          );
-        }
-      }
+      // The active session re-syncs to its real width on its first view fit
+      // (_onSessionViewFit). Doing it here would use an estimated size, since
+      // the terminal view has not laid out yet.
     } catch (_) {
       // Fallback
     }
@@ -1074,7 +915,6 @@ class _TriageHomeState extends State<TriageHome> {
       statusColor: const Color(0xffffc857),
       icon: Icons.terminal,
       rows: [_plainRow('Loading session $sessionId...')],
-      outputSeq: 0,
       isRemote: true,
     );
   }
@@ -1152,27 +992,9 @@ class _TriageHomeState extends State<TriageHome> {
       final contextObj = snapshot?['context'] as Map<String, dynamic>?;
       final branch = contextObj?['branch']?.toString() ?? 'main';
 
-      final visibleRowsJson = snapshot?['visible_rows'] as List<dynamic>?;
-      final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-
-      final List<StyledRow> rows = await _mergeVisibleAndStyledRows(
-        sessionId: sid,
-        visibleRowsJson: visibleRowsJson,
-        styledRowsJson: styledRowsJson,
-        includeHistory: includeHistory,
-      );
-
-      final cursorObj = snapshot?['cursor'] as Map<String, dynamic>?;
-      final absoluteCursorRow = cursorObj?['row'] as int?;
-      final initialCursorCol = cursorObj?['col'] as int?;
-      int? initialCursorRow;
-      if (absoluteCursorRow != null) {
-        final totalLength = visibleRowsJson?.length ?? rows.length;
-        final startOffset = totalLength - rows.length;
-        initialCursorRow = absoluteCursorRow - startOffset;
-      }
-
+      final plainRows = _plainRowsFromSnapshot(snapshot);
       final exited = snapshot?['exited'] as bool? ?? false;
+      final outputSeq = snapshot?['output_seq'] as int? ?? 0;
 
       final session = SessionVm(
         title: 'triage / $sid',
@@ -1180,16 +1002,18 @@ class _TriageHomeState extends State<TriageHome> {
         status: exited ? 'exited' : 'attached',
         statusColor: exited ? const Color(0xff7f8b8d) : const Color(0xff7fd1c7),
         icon: Icons.terminal,
-        rows: rows.isEmpty ? [_plainRow('Attached to session $sid')] : rows,
-        outputSeq: snapshot?['output_seq'] as int? ?? 0,
+        rows: plainRows.isEmpty
+            ? [_plainRow('Attached to session $sid')]
+            : plainRows,
         isRemote: true,
-        initialCursorRow: initialCursorRow,
-        initialCursorCol: initialCursorCol,
         isExited: exited,
       );
-      if (includeHistory) {
-        session.replayRevision = 1;
-      }
+      // Replay the raw output-history tail through the single write path. Live
+      // chunks already covered by this snapshot are dropped by output_seq.
+      session.applyHistory(
+        _rawOutputFromSnapshot(snapshot ?? const {}),
+        throughOutputSeq: outputSeq,
+      );
       _setupSessionInputListener(session);
       return session;
     } catch (e) {
@@ -1276,29 +1100,6 @@ class _TriageHomeState extends State<TriageHome> {
         sizeObj?['cols'] == targetSize.$2;
   }
 
-  bool _snapshotSizeDiffersFromSession(
-    SessionVm session,
-    Map<String, dynamic> snapshot,
-  ) {
-    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-    final cols = sizeObj?['cols'] as int?;
-    final rows = sizeObj?['rows'] as int?;
-    final currentCols = session.inFlightCols ?? session.lastFittedCols;
-    final currentRows = session.inFlightRows ?? session.lastFittedRows;
-    return cols != null &&
-        rows != null &&
-        (currentCols != cols || currentRows != rows);
-  }
-
-  bool _sessionStillLoaded(SessionVm session, String sessionId) {
-    if (_disposed || !mounted) return false;
-    return _sessions.any(
-      (candidate) =>
-          identical(candidate, session) &&
-          _sessionIdFor(candidate) == sessionId,
-    );
-  }
-
   void _onWebSocketEvent(Map<String, dynamic> message) {
     if (_disposed) return;
     _websocketEventQueue.add(message);
@@ -1366,27 +1167,12 @@ class _TriageHomeState extends State<TriageHome> {
         final outputSeq = output['output_seq'] as int? ?? 0;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
 
-        // Filter out any duplicate welcome messages or output
-        // already incorporated in the attached session snapshot.
-        if (outputSeq <= session.outputSeq) {
-          return;
-        }
-        final text = session.decodeOutputBytes(bytes, outputSeq: outputSeq);
-
-        // Translate bare newlines to \r\n to prevent stair-casing layout formatting issues in the client-side terminal emulator.
-        // We use a high-performance two-step replacement to ensure compatibility on older JS engines.
-        final translatedText = text
-            .replaceAll('\r\n', '\n')
-            .replaceAll('\n', '\r\n');
-
-        // Write directly to xterm via the controller. The daemon snapshot path
-        // (Snapshot / ResyncRequired / refresh) owns session.rows; live output
-        // intentionally does not mutate the fallback row buffer, since naive
-        // string-append corrupts it with literal ANSI escapes and CR overstrikes
-        // that the replay path would later re-execute as garbled duplicate text.
-        session.writeOutput(translatedText, outputSeq: outputSeq);
-        session.outputSeq = outputSeq;
+        // Single write path: raw bytes flow through the store, which owns UTF-8
+        // carry, CRLF normalization, buffering, and all output_seq
+        // de-duplication (against both the history high-water and re-deliveries).
+        session.applyLiveBytes(bytes, outputSeq: outputSeq);
       } else if (event.containsKey('Exited')) {
+        session.markExited();
         if (mounted) {
           setState(() {
             session.status = 'exited';
@@ -1395,34 +1181,22 @@ class _TriageHomeState extends State<TriageHome> {
           });
         }
       } else if (event.containsKey('Snapshot')) {
+        // Resize-driven snapshot broadcast. Raw clients re-emulate from the live
+        // byte stream (the program repaints on resize), so there is no history
+        // to replay here — ignore it. Track the settled size for resize bookkeeping.
         final snapshot = event['Snapshot']['snapshot'] as Map<String, dynamic>?;
-        if (snapshot != null) {
-          final size = snapshot['size'] as Map<String, dynamic>?;
-          final cols = size?['cols'] as int?;
-          final rows = size?['rows'] as int?;
-          final currentCols = session.inFlightCols ?? session.lastFittedCols;
-          final currentRows = session.inFlightRows ?? session.lastFittedRows;
-          final sizeChanged =
-              cols != null &&
-              rows != null &&
-              (currentCols != cols || currentRows != rows);
-          await _applySnapshotToSession(
-            session,
-            sessionId,
-            snapshot,
-            includeHistory: sizeChanged,
-          );
+        final size = snapshot?['size'] as Map<String, dynamic>?;
+        final cols = size?['cols'] as int?;
+        final rows = size?['rows'] as int?;
+        if (cols != null && rows != null) {
+          session.lastFittedCols = cols;
+          session.lastFittedRows = rows;
         }
       } else if (event.containsKey('ResyncRequired')) {
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
-          await _applySnapshotToSession(
-            session,
-            sessionId,
-            snapshot,
-            includeHistory: true,
-          );
+          await _applySnapshotToSession(session, sessionId, snapshot);
         }
       }
     }
@@ -1431,71 +1205,72 @@ class _TriageHomeState extends State<TriageHome> {
   Future<void> _applySnapshotToSession(
     SessionVm session,
     String sessionId,
-    Map<String, dynamic> snapshot, {
-    bool includeHistory = false,
-  }) async {
+    Map<String, dynamic> snapshot,
+  ) async {
+    if (_disposed) return;
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-    final cols = sizeObj?['cols'] as int?;
-    final rowsVal = sizeObj?['rows'] as int?;
-    if (cols != null && rowsVal != null) {
-      session.inFlightCols = cols;
-      session.inFlightRows = rowsVal;
-    }
-
-    final visibleRowsJson = snapshot['visible_rows'] as List<dynamic>?;
-    final styledRowsJson = snapshot['styled_rows'] as List<dynamic>?;
-    final rows = await _mergeVisibleAndStyledRows(
-      sessionId: sessionId,
-      visibleRowsJson: visibleRowsJson,
-      styledRowsJson: styledRowsJson,
-      includeHistory: includeHistory,
-      existingRows: session.rows,
-    );
-    if (_disposed || rows.isEmpty) {
-      session.inFlightCols = null;
-      session.inFlightRows = null;
-      return;
-    }
-
-    final cursorObj = snapshot['cursor'] as Map<String, dynamic>?;
-    final absoluteCursorRow = cursorObj?['row'] as int?;
-    final initialCursorCol = cursorObj?['col'] as int?;
-    int? initialCursorRow;
-    if (absoluteCursorRow != null) {
-      final totalLength = visibleRowsJson?.length ?? rows.length;
-      final startOffset = totalLength - rows.length;
-      initialCursorRow = absoluteCursorRow - startOffset;
-    }
+    final cols = sizeObj?['cols'] as int? ?? 80;
+    final rowsVal = sizeObj?['rows'] as int? ?? 24;
+    final rawOutput = _rawOutputFromSnapshot(snapshot);
+    final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
 
+    // Replay history through the single write path — raw PTY bytes, not the
+    // lossy styled-row reconstruction. The store clears and re-emulates, then
+    // resumes live (de-duplicating by output_seq).
+    session.applyHistory(rawOutput, throughOutputSeq: snapshotOutputSeq);
+
     setState(() {
+      // Plain mirror for the test fallback view only; not used for real render.
       session.rows
         ..clear()
-        ..addAll(rows);
-      final snapshotOutputSeq = snapshot['output_seq'] as int?;
-      session.markReplaySnapshotOutputSeq(snapshotOutputSeq);
-      if (snapshotOutputSeq != null) {
-        session.outputSeq = max(session.outputSeq, snapshotOutputSeq);
-      }
-      session.initialCursorRow = initialCursorRow;
-      session.initialCursorCol = initialCursorCol;
+        ..addAll(_plainRowsFromSnapshot(snapshot));
       session.isExited = exited;
       session.status = exited ? 'exited' : 'attached';
       session.statusColor = exited
           ? const Color(0xff7f8b8d)
           : const Color(0xff7fd1c7);
-      if (includeHistory) {
-        session.replayRevision += 1;
-      }
-      if (cols != null && rowsVal != null) {
-        session.lastFittedCols = cols;
-        session.lastFittedRows = rowsVal;
-        if (session.inFlightCols == cols && session.inFlightRows == rowsVal) {
-          session.inFlightCols = null;
-          session.inFlightRows = null;
-        }
-      }
+      session.lastFittedCols = cols;
+      session.lastFittedRows = rowsVal;
+      session.inFlightCols = null;
+      session.inFlightRows = null;
     });
+  }
+
+  /// Extracts the raw output-history tail from a parsed snapshot map. Empty when
+  /// the host did not carry history (old host, or a resize broadcast).
+  List<int> _rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
+    final raw = snapshot['raw_output'];
+    return raw is List ? raw.cast<int>() : const <int>[];
+  }
+
+  /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
+  /// fallback view; production rendering is driven by the store from raw bytes.
+  /// Prefers visible_rows, falling back to the flattened text of styled_rows.
+  List<StyledRow> _plainRowsFromSnapshot(Map<String, dynamic>? snapshot) {
+    if (snapshot == null) return const <StyledRow>[];
+    final visible = snapshot['visible_rows'] as List<dynamic>?;
+    if (visible != null && visible.isNotEmpty) {
+      return visible.map((row) => _plainRow(row?.toString() ?? '')).toList();
+    }
+    final styled = snapshot['styled_rows'] as List<dynamic>?;
+    if (styled != null && styled.isNotEmpty) {
+      return styled.map((row) {
+        final spans =
+            (row as Map<String, dynamic>?)?['spans'] as List<dynamic>?;
+        final text =
+            spans
+                ?.map(
+                  (span) =>
+                      (span as Map<String, dynamic>?)?['text']?.toString() ??
+                      '',
+                )
+                .join() ??
+            '';
+        return _plainRow(text);
+      }).toList();
+    }
+    return const <StyledRow>[];
   }
 
   void _onWebSocketError(dynamic error, int generation) {
@@ -1534,10 +1309,30 @@ class _TriageHomeState extends State<TriageHome> {
       _websocketSubscription?.cancel();
     }
     for (final s in _sessions) {
-      s.terminalController.dispose();
+      s.dispose();
       TerminalPane.destroySession(s.title);
     }
     super.dispose();
+  }
+
+  /// The terminal view reported its fitted grid size. Always replay any staged
+  /// history at that size; on the *first* fit after a fresh attach, also re-sync
+  /// the host to it. The attach snapshot's raw output was authored at the host
+  /// PTY width, which may differ from ours — replaying it at our width
+  /// wrap-fragments the frame. Resizing the host to our real width (the same
+  /// thing the select path does) makes the program redraw at our width and the
+  /// live stream paint a clean frame. One-shot per attach so ordinary window
+  /// resizes still self-heal through the live stream, not a re-snapshot.
+  void _onSessionViewFit(SessionVm session, int cols, int rows) {
+    session.lastFittedCols = cols;
+    session.lastFittedRows = rows;
+    session.noteViewFit(cols, rows);
+    if (!session.hasFitted) {
+      session.hasFitted = true;
+      if (session.isRemote && _client.isConnected) {
+        unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+      }
+    }
   }
 
   void _selectSession(int index) {
@@ -1550,32 +1345,19 @@ class _TriageHomeState extends State<TriageHome> {
     setState(() {
       session.focusCursorOnNextDisplay();
       _selectedIndex = index;
-      if (shouldRefresh) {
-        session.setSnapshotRefreshPending(true);
-      }
     });
-    unawaited(
-      _refreshSessionSnapshot(
-        session,
-        markPending: false,
-        includeHistory: true,
-      ),
-    );
+    if (shouldRefresh) {
+      unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+    }
   }
 
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
-    bool markPending = true,
     bool includeHistory = false,
   }) async {
     if (!_client.isConnected || !session.isRemote) return;
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
-    if (markPending && mounted && !_disposed) {
-      setState(() {
-        session.setSnapshotRefreshPending(true);
-      });
-    }
     try {
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
@@ -1642,21 +1424,9 @@ class _TriageHomeState extends State<TriageHome> {
             }
           } catch (_) {}
         }
-        await _applySnapshotToSession(
-          session,
-          sessionId,
-          finalSnapshot,
-          includeHistory: includeHistory,
-        );
+        await _applySnapshotToSession(session, sessionId, finalSnapshot);
       }
-    } catch (_) {
-    } finally {
-      if (mounted && !_disposed) {
-        setState(() {
-          session.setSnapshotRefreshPending(false);
-        });
-      }
-    }
+    } catch (_) {}
   }
 
   String? _sessionIdFor(SessionVm session) {
@@ -1710,27 +1480,9 @@ class _TriageHomeState extends State<TriageHome> {
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
           final branch = contextObj?['branch']?.toString() ?? 'main';
 
-          final visibleRowsJson = snapshot?['visible_rows'] as List<dynamic>?;
-          final styledRowsJson = snapshot?['styled_rows'] as List<dynamic>?;
-
-          final List<StyledRow> rows = await _mergeVisibleAndStyledRows(
-            sessionId: sessionId,
-            visibleRowsJson: visibleRowsJson,
-            styledRowsJson: styledRowsJson,
-            includeHistory: false,
-          );
-
-          final cursorObj = snapshot?['cursor'] as Map<String, dynamic>?;
-          final absoluteCursorRow = cursorObj?['row'] as int?;
-          final initialCursorCol = cursorObj?['col'] as int?;
-          int? initialCursorRow;
-          if (absoluteCursorRow != null) {
-            final totalLength = visibleRowsJson?.length ?? rows.length;
-            final startOffset = totalLength - rows.length;
-            initialCursorRow = absoluteCursorRow - startOffset;
-          }
-
+          final plainRows = _plainRowsFromSnapshot(snapshot);
           final exited = snapshot?['exited'] as bool? ?? false;
+          final outputSeq = snapshot?['output_seq'] as int? ?? 0;
 
           final session = SessionVm(
             title: 'triage / $sessionId',
@@ -1740,16 +1492,17 @@ class _TriageHomeState extends State<TriageHome> {
                 ? const Color(0xff7f8b8d)
                 : const Color(0xff7fd1c7),
             icon: Icons.terminal,
-            rows: rows.isEmpty
+            rows: plainRows.isEmpty
                 ? [_plainRow('Attached to session $sessionId')]
-                : rows,
-            outputSeq: snapshot?['output_seq'] as int? ?? 0,
+                : plainRows,
             isRemote: true,
-            initialCursorRow: initialCursorRow,
-            initialCursorCol: initialCursorCol,
             isExited: exited,
           );
           _setupSessionInputListener(session);
+          session.applyHistory(
+            _rawOutputFromSnapshot(snapshot ?? const {}),
+            throughOutputSeq: outputSeq,
+          );
 
           setState(() {
             _sessions.insert(0, session);
@@ -1765,13 +1518,9 @@ class _TriageHomeState extends State<TriageHome> {
               _onWebSocketEvent(msg);
             }
           }
-          unawaited(
-            _refreshSessionSnapshot(
-              session,
-              markPending: false,
-              includeHistory: true,
-            ),
-          );
+          // Host re-sync to our real width is deferred to the first view fit
+          // (_onSessionViewFit); doing it here would use an estimated size,
+          // since the terminal view has not laid out yet.
         }
       } catch (e) {
         // Roll back partial state so a failed create doesn't strand a subscription
@@ -1803,7 +1552,6 @@ class _TriageHomeState extends State<TriageHome> {
         _plainRow(''),
         _plainRow('ready'),
       ],
-      outputSeq: 0,
     );
     _setupSessionInputListener(session);
 
@@ -1829,7 +1577,7 @@ class _TriageHomeState extends State<TriageHome> {
       final index = _sessions.indexOf(session);
       if (index != -1) {
         _sessions.removeAt(index);
-        session.terminalController.dispose();
+        session.dispose();
         TerminalPane.destroySession(session.title);
         if (_selectedIndex >= _sessions.length) {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
@@ -1951,6 +1699,8 @@ class _TriageHomeState extends State<TriageHome> {
                   : SessionWorkspace(
                       session: _selectedSession,
                       onCloseSession: () => _closeSession(_selectedSession),
+                      onViewFit: (cols, rows) =>
+                          _onSessionViewFit(_selectedSession, cols, rows),
                     ),
             ),
           ],
@@ -2353,10 +2103,12 @@ class SessionWorkspace extends StatelessWidget {
     super.key,
     required this.session,
     this.onCloseSession,
+    this.onViewFit,
   });
 
   final SessionVm session;
   final VoidCallback? onCloseSession;
+  final void Function(int cols, int rows)? onViewFit;
 
   @override
   Widget build(BuildContext context) {
@@ -2368,24 +2120,15 @@ class SessionWorkspace extends StatelessWidget {
             key: ValueKey(session.title),
             terminalId: session.title,
             controller: session.terminalController,
-            fallbackRows: session.rows,
             terminal: session.terminal,
+            fallbackRows: session.rows,
             onTerminalResizeBind: (callback) {
               session.onTerminalResize = callback;
             },
+            onViewFit: (cols, rows) =>
+                (onViewFit ?? session.noteViewFit)(cols, rows),
             focusCursorRevision: session.focusCursorRevision,
-            initialContentWritten: session.initialContentWritten,
-            onInitialContentWritten: () {
-              session.markInitialContentWritten();
-            },
-            onReplayContentWritten: () {
-              session.flushPendingTerminalWritesAfterReplay();
-            },
-            initialCursorRow: session.initialCursorRow,
-            initialCursorCol: session.initialCursorCol,
             isExited: session.status == 'exited',
-            replayRevision: session.replayRevision,
-            replayPending: session.snapshotRefreshPending,
           ),
         ),
       ],

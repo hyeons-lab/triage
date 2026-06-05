@@ -1303,10 +1303,14 @@ class SessionSnapshot {
   bool get bracketedPasteEnabled =>
       const fb.BoolReader().vTableGet(_bc, _bcOffset, 22, false);
   bool get exited => const fb.BoolReader().vTableGet(_bc, _bcOffset, 24, false);
+  List<int>? get rawOutput =>
+      const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 26);
+  int get rawOutputStart =>
+      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 28, 0);
 
   @override
   String toString() {
-    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}}';
+    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}}';
   }
 
   SessionSnapshotT unpack() => SessionSnapshotT(
@@ -1321,6 +1325,8 @@ class SessionSnapshot {
     context: context?.unpack(),
     bracketedPasteEnabled: bracketedPasteEnabled,
     exited: exited,
+    rawOutput: rawOutput?.toList(),
+    rawOutputStart: rawOutputStart,
   );
 
   static int pack(fb.Builder fbBuilder, SessionSnapshotT? object) {
@@ -1341,6 +1347,8 @@ class SessionSnapshotT implements fb.Packable {
   SessionContextT? context;
   bool bracketedPasteEnabled;
   bool exited;
+  List<int>? rawOutput;
+  int rawOutputStart;
 
   SessionSnapshotT({
     this.outputSeq = 0,
@@ -1354,6 +1362,8 @@ class SessionSnapshotT implements fb.Packable {
     this.context,
     this.bracketedPasteEnabled = false,
     this.exited = false,
+    this.rawOutput,
+    this.rawOutputStart = 0,
   });
 
   @override
@@ -1370,7 +1380,10 @@ class SessionSnapshotT implements fb.Packable {
         ? null
         : fbBuilder.writeString(currentWorkingDirectory!);
     final int? contextOffset = context?.pack(fbBuilder);
-    fbBuilder.startTable(11);
+    final int? rawOutputOffset = rawOutput == null
+        ? null
+        : fbBuilder.writeListUint8(rawOutput!);
+    fbBuilder.startTable(13);
     fbBuilder.addUint64(0, outputSeq);
     fbBuilder.addUint64(1, bytesLogged);
     if (size != null) {
@@ -1386,12 +1399,14 @@ class SessionSnapshotT implements fb.Packable {
     fbBuilder.addOffset(8, contextOffset);
     fbBuilder.addBool(9, bracketedPasteEnabled);
     fbBuilder.addBool(10, exited);
+    fbBuilder.addOffset(11, rawOutputOffset);
+    fbBuilder.addUint64(12, rawOutputStart);
     return fbBuilder.endTable();
   }
 
   @override
   String toString() {
-    return 'SessionSnapshotT{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}}';
+    return 'SessionSnapshotT{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}}';
   }
 }
 
@@ -1409,7 +1424,7 @@ class SessionSnapshotBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(11);
+    fbBuilder.startTable(13);
   }
 
   int addOutputSeq(int? outputSeq) {
@@ -1467,6 +1482,16 @@ class SessionSnapshotBuilder {
     return fbBuilder.offset;
   }
 
+  int addRawOutputOffset(int? offset) {
+    fbBuilder.addOffset(11, offset);
+    return fbBuilder.offset;
+  }
+
+  int addRawOutputStart(int? rawOutputStart) {
+    fbBuilder.addUint64(12, rawOutputStart);
+    return fbBuilder.offset;
+  }
+
   int finish() {
     return fbBuilder.endTable();
   }
@@ -1484,6 +1509,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
   final SessionContextObjectBuilder? _context;
   final bool? _bracketedPasteEnabled;
   final bool? _exited;
+  final List<int>? _rawOutput;
+  final int? _rawOutputStart;
 
   SessionSnapshotObjectBuilder({
     int? outputSeq,
@@ -1497,6 +1524,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     SessionContextObjectBuilder? context,
     bool? bracketedPasteEnabled,
     bool? exited,
+    List<int>? rawOutput,
+    int? rawOutputStart,
   }) : _outputSeq = outputSeq,
        _bytesLogged = bytesLogged,
        _size = size,
@@ -1507,7 +1536,9 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
        _currentWorkingDirectory = currentWorkingDirectory,
        _context = context,
        _bracketedPasteEnabled = bracketedPasteEnabled,
-       _exited = exited;
+       _exited = exited,
+       _rawOutput = rawOutput,
+       _rawOutputStart = rawOutputStart;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -1526,7 +1557,10 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
         ? null
         : fbBuilder.writeString(_currentWorkingDirectory!);
     final int? contextOffset = _context?.getOrCreateOffset(fbBuilder);
-    fbBuilder.startTable(11);
+    final int? rawOutputOffset = _rawOutput == null
+        ? null
+        : fbBuilder.writeListUint8(_rawOutput!);
+    fbBuilder.startTable(13);
     fbBuilder.addUint64(0, _outputSeq);
     fbBuilder.addUint64(1, _bytesLogged);
     if (_size != null) {
@@ -1542,6 +1576,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.addOffset(8, contextOffset);
     fbBuilder.addBool(9, _bracketedPasteEnabled);
     fbBuilder.addBool(10, _exited);
+    fbBuilder.addOffset(11, rawOutputOffset);
+    fbBuilder.addUint64(12, _rawOutputStart);
     return fbBuilder.endTable();
   }
 

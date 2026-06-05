@@ -109,6 +109,16 @@ pub struct SessionSnapshot {
     pub context: Option<SessionContext>,
     pub bracketed_paste_enabled: bool,
     pub exited: bool,
+    /// Raw (untranslated) PTY output tail for client-side re-emulation — the
+    /// single source of truth for history, byte-identical to the live Output
+    /// stream. Empty when history is not carried (e.g. resize broadcasts) or
+    /// from old hosts.
+    #[serde(default)]
+    pub raw_output: Vec<u8>,
+    /// Byte offset of the first byte of [`Self::raw_output`] within the
+    /// session's full output log (`bytes_logged` is the end offset).
+    #[serde(default)]
+    pub raw_output_start: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

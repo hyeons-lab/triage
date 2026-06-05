@@ -511,6 +511,10 @@ class TriageWebSocketClient {
       'context': _parseSessionContext(snap.context),
       'bracketed_paste_enabled': snap.bracketedPasteEnabled,
       'exited': snap.exited,
+      // Raw output-history tail for client-side re-emulation (empty from old
+      // hosts). raw_output_start is its byte offset in the full output log.
+      'raw_output': snap.rawOutput,
+      'raw_output_start': snap.rawOutputStart,
     };
   }
 

@@ -77,6 +77,12 @@ table SessionSnapshot {
     context: SessionContext;
     bracketed_paste_enabled: bool;
     exited: bool;
+    // Raw (untranslated) PTY output tail for client-side re-emulation — the
+    // single source of truth for history. Byte-identical to the live Output
+    // stream. Empty from old hosts. raw_output_start is the byte offset of the
+    // first byte within the session's full output log (bytes_logged is the end).
+    raw_output: [ubyte];
+    raw_output_start: uint64;
 }
 
 table CompletedSession {
