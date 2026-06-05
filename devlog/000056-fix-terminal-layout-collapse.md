@@ -282,6 +282,18 @@ sequence split across live chunks is still caught. +2 reducer tests; 61 pass.
 (Separately confirmed the painter preserves cursor-positioned gaps — the banner's
 `\x1b[12G…\x1b[19G…` absolute-column layout renders with correct spacing.)
 
+2026-06-04T20:15-0700 `flutter/triage_client/fonts/JetBrainsMono-*.ttf` (+
+`OFL.txt`), `pubspec.yaml`, `terminal_pane_stub.dart`, `terminal_pane_web.dart`,
+`web/index.html` — **bundle JetBrains Mono** as the terminal font so rendering is
+consistent across macOS/Windows/Linux/web instead of relying on system fonts
+(native was Menlo, web/test were Consolas which fall through to generic monospace
+off-Windows). Native `_textStyle` and the FLUTTER_TEST fallback use
+`'JetBrains Mono'` (Menlo/Monaco/Noto kept as fallbacks). For web, xterm.js uses
+the browser font system, so added `@font-face` rules in `index.html` pointing at
+the Flutter-served `assets/fonts/JetBrainsMono-*.ttf` (no duplicate files) and set
+the xterm.js `fontFamily` to `'JetBrains Mono', Consolas, …`. `flutter analyze`
+clean; 61 tests pass.
+
 ## Decision
 
 2026-06-03T20:52-0700 Phase 0 PASSED → proceed with the MVI raw-byte refactor.
@@ -291,7 +303,11 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 
 ## Commits
 
-HEAD — refactor(client): render terminal through the MVI store from raw bytes
+HEAD — feat(client): bundle JetBrains Mono as the terminal font
+d89dd2d — fix(client): strip CSI > ... m so xterm stops poisoning the screen with underline
+2ae48e1 — fix(client): defer native first-fit history replay out of performLayout
+fc6c1e0 — fix(client): defer terminal history replay to the view's first fit
+0041842 — refactor(client): render terminal through the MVI store from raw bytes
 84551b1 — feat(host): stream a raw-output history tail in SessionSnapshot
 435ff57 — feat(client): add unidirectional MVI terminal seam (intent/state/sink/store)
 b80318a — fix(client): coalesce resize-driven terminal replays to stop duplicated/fragmented text

@@ -86,10 +86,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   );
   static const _textStyle = xt.TerminalStyle(
     fontSize: 15,
-    fontFamily: 'Menlo',
+    fontFamily: 'JetBrains Mono',
     fontFamilyFallback: [
+      'Menlo',
       'Monaco',
-      'Consolas',
       'Liberation Mono',
       'Courier New',
       'Noto Sans Mono CJK SC',
@@ -261,7 +261,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                           TextSpan(
                             text: span.text.isEmpty ? ' ' : span.text,
                             style: TextStyle(
-                              fontFamily: 'Consolas',
+                              fontFamily: 'JetBrains Mono',
                               fontSize: 15,
                               height: 1.35,
                               color:

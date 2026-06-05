@@ -354,7 +354,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(
         options,
         'fontFamily',
-        'Consolas, Courier New, monospace',
+        "'JetBrains Mono', Consolas, 'Courier New', monospace",
       );
       js_util.setProperty(options, 'fontSize', 15);
       js_util.setProperty(options, 'cursorStyle', 'block');

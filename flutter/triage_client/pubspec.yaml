@@ -64,6 +64,21 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # Bundled terminal font (OFL-licensed; see fonts/OFL.txt) so the terminal
+  # renders identically across macOS/Windows/Linux instead of relying on
+  # system-installed fonts.
+  fonts:
+    - family: JetBrains Mono
+      fonts:
+        - asset: fonts/JetBrainsMono-Regular.ttf
+        - asset: fonts/JetBrainsMono-Italic.ttf
+          style: italic
+        - asset: fonts/JetBrainsMono-Bold.ttf
+          weight: 700
+        - asset: fonts/JetBrainsMono-BoldItalic.ttf
+          weight: 700
+          style: italic
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg
