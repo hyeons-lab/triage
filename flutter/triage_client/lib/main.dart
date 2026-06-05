@@ -141,6 +141,9 @@ class SessionVm {
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
+  // Set once the view first reports its real fitted size after a fresh attach.
+  // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
+  bool hasFitted = false;
   int? inFlightCols;
   int? inFlightRows;
   int resizeRequestSeq = 0;
@@ -896,14 +899,9 @@ class _TriageHomeState extends State<TriageHome> {
         });
       }
 
-      if (_sessions.isNotEmpty) {
-        final activeSession = _sessions[_selectedIndex];
-        if (activeSession.status == 'attached') {
-          unawaited(
-            _refreshSessionSnapshot(activeSession, includeHistory: true),
-          );
-        }
-      }
+      // The active session re-syncs to its real width on its first view fit
+      // (_onSessionViewFit). Doing it here would use an estimated size, since
+      // the terminal view has not laid out yet.
     } catch (_) {
       // Fallback
     }
@@ -1317,6 +1315,26 @@ class _TriageHomeState extends State<TriageHome> {
     super.dispose();
   }
 
+  /// The terminal view reported its fitted grid size. Always replay any staged
+  /// history at that size; on the *first* fit after a fresh attach, also re-sync
+  /// the host to it. The attach snapshot's raw output was authored at the host
+  /// PTY width, which may differ from ours — replaying it at our width
+  /// wrap-fragments the frame. Resizing the host to our real width (the same
+  /// thing the select path does) makes the program redraw at our width and the
+  /// live stream paint a clean frame. One-shot per attach so ordinary window
+  /// resizes still self-heal through the live stream, not a re-snapshot.
+  void _onSessionViewFit(SessionVm session, int cols, int rows) {
+    session.lastFittedCols = cols;
+    session.lastFittedRows = rows;
+    session.noteViewFit(cols, rows);
+    if (!session.hasFitted) {
+      session.hasFitted = true;
+      if (session.isRemote && _client.isConnected) {
+        unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+      }
+    }
+  }
+
   void _selectSession(int index) {
     if (index < 0 || index >= _sessions.length) return;
     final session = _sessions[index];
@@ -1500,7 +1518,9 @@ class _TriageHomeState extends State<TriageHome> {
               _onWebSocketEvent(msg);
             }
           }
-          unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+          // Host re-sync to our real width is deferred to the first view fit
+          // (_onSessionViewFit); doing it here would use an estimated size,
+          // since the terminal view has not laid out yet.
         }
       } catch (e) {
         // Roll back partial state so a failed create doesn't strand a subscription
@@ -1679,6 +1699,8 @@ class _TriageHomeState extends State<TriageHome> {
                   : SessionWorkspace(
                       session: _selectedSession,
                       onCloseSession: () => _closeSession(_selectedSession),
+                      onViewFit: (cols, rows) =>
+                          _onSessionViewFit(_selectedSession, cols, rows),
                     ),
             ),
           ],
@@ -2081,10 +2103,12 @@ class SessionWorkspace extends StatelessWidget {
     super.key,
     required this.session,
     this.onCloseSession,
+    this.onViewFit,
   });
 
   final SessionVm session;
   final VoidCallback? onCloseSession;
+  final void Function(int cols, int rows)? onViewFit;
 
   @override
   Widget build(BuildContext context) {
@@ -2101,7 +2125,8 @@ class SessionWorkspace extends StatelessWidget {
             onTerminalResizeBind: (callback) {
               session.onTerminalResize = callback;
             },
-            onViewFit: (cols, rows) => session.noteViewFit(cols, rows),
+            onViewFit: (cols, rows) =>
+                (onViewFit ?? session.noteViewFit)(cols, rows),
             focusCursorRevision: session.focusCursorRevision,
             isExited: session.status == 'exited',
           ),

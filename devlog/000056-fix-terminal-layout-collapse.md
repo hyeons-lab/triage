@@ -37,6 +37,25 @@ only, and only reproduce in the real macOS font runtime:
 
 ## What Changed
 
+2026-06-04T22:40-0700 `flutter/triage_client/lib/main.dart`,
+`test/widget_test.dart` — **fixed first-load wrap fragmentation.** On a fresh
+attach the snapshot's `raw_output` is authored at the **host PTY width**, but the
+client re-emulates it at the **view's auto-fit width**; when they differ the
+frame wrap-fragments (e.g. Claude's "Feature of the week…" line broke early with
+stray right-edge characters, though copy/paste was correct — a display-only
+width mismatch). The **select** path already reconciled this (resize the host to
+the fitted size → empty-history snapshot clears the terminal → the program's
+live redraw repaints cleanly), but the **create**/load paths ran that re-sync
+*before* the view fitted, so it used an estimated size. Moved the host re-sync to
+the terminal view's **first fit** (`_onSessionViewFit`, one-shot per attach via
+`SessionVm.hasFitted`), when the real fitted size is known — so create now
+reconciles exactly like select. Removed the two pre-fit estimate re-syncs (create
+path and connect/load-active path). Ordinary window resizes still self-heal
+through the live stream (no re-snapshot). Updated the scratch-session test: create
+is now a single attach (the re-sync is fit-driven and the headless test fallback
+has no `TerminalView`, so it never fits); fit-driven re-sync stays covered by the
+select-refresh test.
+
 2026-06-04T22:20-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`,
 `lib/terminal/terminal_intent.dart`, `lib/main.dart`,
 `test/terminal/terminal_store_test.dart` — **addressed the Copilot PR review (6
@@ -295,6 +314,20 @@ space-filled StyledRows.)
 
 ## Issues
 
+2026-06-04T22:40-0700 **First-load wrap fragmentation (display-only).** Root
+cause: raw history is authored at the host PTY width; the client re-emulates at
+the view auto-fit width; the view *owns* the terminal width (xterm.dart
+`TerminalView` auto-fits and the controller sink's `resize` is intentionally a
+no-op), so history can't simply be replayed at the authoring width. There is no
+way to re-layout past bytes for a new width — only the program can, by redrawing
+after a PTY resize. The host's `resize()` returns a `snapshot()` with empty
+`raw_output`, so the re-sync path clears the terminal and the program's live
+redraw (post-SIGWINCH) is the authoritative clean frame. The fix routes
+create/load through that same mechanism, but timed at the first fit (real size)
+rather than before layout (estimated size). Note: this is the inverse trade of
+the original collapse bug — we accept a brief approximate frame, then converge to
+a correct live redraw, instead of a lossy grid stringify.
+
 2026-06-04T21:50-0700 **Code-review caught a real input-echo regression.** The
 high-effort `/code-review` (7 finder angles → verify) surfaced that deleting the
 pane's `_suppressInput` left replayed cursor/device-report answers free to reach
@@ -423,7 +456,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — fix(client): address PR review (lookbehind-free CRLF, clear buffer on attach/clear, drop dead resize branch + unused replay size)
+HEAD — fix(client): re-sync host to fitted size on first view fit (first-load wrap fragmentation)
+7db33c2 — fix(client): address PR review (lookbehind-free CRLF, clear buffer on attach/clear, drop dead resize branch + unused replay size)
 53e36e7 — fix(client): suppress replay-echoed input, bound pre-size buffer, consolidate de-dup
 f04cc19 — refactor: simplify terminal pipeline per /simplify review
 d5ebe7e — style(host): rustfmt build_session_snapshot (CI cargo fmt --check)

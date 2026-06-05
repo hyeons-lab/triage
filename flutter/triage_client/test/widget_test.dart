@@ -873,9 +873,13 @@ void main() {
       expect(find.text('triage / scratch-1'), findsWidgets);
       expect(find.text('line 1 from scratch-1'), findsOneWidget);
       expect(client.startSessionCommands, ['cmd.exe']);
+      // One attach on create. The host re-sync (a second attach) is now
+      // deferred to the terminal view's first fit, which the headless test
+      // fallback (a plain Container, not a TerminalView) never triggers; the
+      // fit-driven re-sync is covered by the select-refresh test above.
       expect(
         client.attachSessionCalls.where((sid) => sid == 'scratch-1'),
-        hasLength(2),
+        hasLength(1),
       );
     });
   });
