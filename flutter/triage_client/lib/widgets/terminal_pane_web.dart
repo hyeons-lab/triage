@@ -116,7 +116,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _lastFittedRows;
   int? _lastFittedCols;
   bool _focusCursorAfterReplay = false;
-  final bool _suppressInput = false;
   Timer? _resizeDebounceTimer;
   double? _stableWidth;
   double? _stableHeight;
@@ -435,9 +434,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        if (_suppressInput) {
-          return;
-        }
         _sessionInputRouter.sendInput(sessionId, data);
       });
       _onDataSubscription = js_util.callMethod(_term, 'onData', [

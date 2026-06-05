@@ -1421,15 +1421,11 @@ impl HistoricalSession {
     /// client-side re-emulation. Historical sessions are only ever read on the
     /// attach/snapshot paths, so this is always history-bearing.
     fn snapshot_with_history(&self) -> SessionSnapshot {
-        let mut snapshot = self.snapshot();
-        let (start, raw) = read_raw_output_tail(
+        overlay_raw_output_history(
+            self.snapshot(),
             &self.persisted.log_path,
             self.output.bytes_logged,
-            RAW_OUTPUT_TAIL_CAP,
-        );
-        snapshot.raw_output = raw;
-        snapshot.raw_output_start = start;
-        snapshot
+        )
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -1937,15 +1933,7 @@ impl ActorState {
     /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
     /// the plain [`Self::snapshot`] so they never carry history.
     fn snapshot_with_history(&self) -> SessionSnapshot {
-        let mut snapshot = self.snapshot();
-        let (start, raw) = read_raw_output_tail(
-            &self.log_path,
-            self.output.bytes_logged,
-            RAW_OUTPUT_TAIL_CAP,
-        );
-        snapshot.raw_output = raw;
-        snapshot.raw_output_start = start;
-        snapshot
+        overlay_raw_output_history(self.snapshot(), &self.log_path, self.output.bytes_logged)
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -2513,6 +2501,20 @@ fn snapshot_from_output(
 /// reconstructs the screen exactly (a 64 KiB tail matched full replay). 1 MiB
 /// gives generous headroom for full-screen TUIs run inside a session.
 const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
+
+/// Overlays the raw output-history tail onto a snapshot for client-side
+/// re-emulation. Used by the attach/resync/snapshot paths; the resize broadcast
+/// keeps the plain `snapshot()` so it never carries the tail.
+fn overlay_raw_output_history(
+    mut snapshot: SessionSnapshot,
+    log_path: &Path,
+    bytes_logged: u64,
+) -> SessionSnapshot {
+    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, RAW_OUTPUT_TAIL_CAP);
+    snapshot.raw_output = raw;
+    snapshot.raw_output_start = start;
+    snapshot
+}
 
 /// Reads the last `cap` bytes of the raw output log, returning the byte offset of
 /// the first returned byte (`raw_output_start`) and the bytes. These are the

@@ -11,6 +11,13 @@ import 'terminal_state.dart';
 const int kMinTerminalCols = 2;
 const int kMinTerminalRows = 1;
 
+// Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
+// `Output`): a trailing not-yet-terminated `CSI > …`, a complete `CSI > … m`
+// private sequence, and a bare LF not already preceded by CR.
+final RegExp _partialPrivateCsi = RegExp(r'\x1b\[>[0-9;]*$');
+final RegExp _completePrivateCsi = RegExp(r'\x1b\[>[0-9;]*m');
+final RegExp _bareLf = RegExp(r'(?<!\r)\n');
+
 /// The single reducer for the terminal pipeline.
 ///
 /// All terminal mutations arrive as [TerminalIntent]s via [dispatch], are
@@ -263,7 +270,7 @@ class TerminalStore extends ChangeNotifier {
       _privateCsiCarry = '';
     }
     if (live) {
-      final partial = RegExp(r'\x1b\[>[0-9;]*$').firstMatch(s);
+      final partial = _partialPrivateCsi.firstMatch(s);
       // Only hold a bounded partial; otherwise let it flush to avoid unbounded
       // growth on a stream that never completes the sequence.
       if (partial != null && (s.length - partial.start) <= 24) {
@@ -271,7 +278,7 @@ class TerminalStore extends ChangeNotifier {
         s = s.substring(0, partial.start);
       }
     }
-    return s.replaceAll(RegExp(r'\x1b\[>[0-9;]*m'), '');
+    return s.replaceAll(_completePrivateCsi, '');
   }
 
   /// Normalize bare LF to CRLF (leaving existing CRLF intact) so the emulator
@@ -288,7 +295,7 @@ class TerminalStore extends ChangeNotifier {
       s = s.substring(0, s.length - 1);
     }
     // Any LF not already preceded by CR becomes CRLF.
-    return s.replaceAll(RegExp(r'(?<!\r)\n'), '\r\n');
+    return s.replaceAll(_bareLf, '\r\n');
   }
 
   void _resetCarries() {

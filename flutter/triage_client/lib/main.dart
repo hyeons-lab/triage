@@ -104,8 +104,6 @@ class SessionVm {
     required this.rows,
     required this.outputSeq,
     this.isRemote = false,
-    this.initialCursorRow,
-    this.initialCursorCol,
     this.isExited = false,
   }) : terminalController = TerminalController() {
     terminal = xt.Terminal(
@@ -141,8 +139,6 @@ class SessionVm {
   final TerminalController terminalController;
   int outputSeq;
   final bool isRemote;
-  int? initialCursorRow;
-  int? initialCursorCol;
   bool isExited;
   int focusCursorRevision = 0;
   int? lastFittedCols;
@@ -908,7 +904,6 @@ class _TriageHomeState extends State<TriageHome> {
           unawaited(
             _refreshSessionSnapshot(
               activeSession,
-              markPending: false,
               includeHistory: true,
             ),
           );
@@ -1006,8 +1001,6 @@ class _TriageHomeState extends State<TriageHome> {
       final branch = contextObj?['branch']?.toString() ?? 'main';
 
       final plainRows = _plainRowsFromSnapshot(snapshot);
-      final cursorObj = snapshot?['cursor'] as Map<String, dynamic>?;
-      final initialCursorCol = cursorObj?['col'] as int?;
       final exited = snapshot?['exited'] as bool? ?? false;
       final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
       final cols = sizeObj?['cols'] as int? ?? 80;
@@ -1025,7 +1018,6 @@ class _TriageHomeState extends State<TriageHome> {
             : plainRows,
         outputSeq: outputSeq,
         isRemote: true,
-        initialCursorCol: initialCursorCol,
         isExited: exited,
       );
       // Replay the raw output-history tail through the single write path. Live
@@ -1240,8 +1232,6 @@ class _TriageHomeState extends State<TriageHome> {
     final rowsVal = sizeObj?['rows'] as int? ?? 24;
     final rawOutput = _rawOutputFromSnapshot(snapshot);
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
-    final cursorObj = snapshot['cursor'] as Map<String, dynamic>?;
-    final initialCursorCol = cursorObj?['col'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
 
     // Replay history through the single write path — raw PTY bytes, not the
@@ -1262,7 +1252,6 @@ class _TriageHomeState extends State<TriageHome> {
       if (snapshotOutputSeq != null) {
         session.outputSeq = max(session.outputSeq, snapshotOutputSeq);
       }
-      session.initialCursorCol = initialCursorCol;
       session.isExited = exited;
       session.status = exited ? 'exited' : 'attached';
       session.statusColor = exited
@@ -1367,7 +1356,6 @@ class _TriageHomeState extends State<TriageHome> {
       unawaited(
         _refreshSessionSnapshot(
           session,
-          markPending: false,
           includeHistory: true,
         ),
       );
@@ -1376,7 +1364,6 @@ class _TriageHomeState extends State<TriageHome> {
 
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
-    bool markPending = true,
     bool includeHistory = false,
   }) async {
     if (!_client.isConnected || !session.isRemote) return;
@@ -1505,8 +1492,6 @@ class _TriageHomeState extends State<TriageHome> {
           final branch = contextObj?['branch']?.toString() ?? 'main';
 
           final plainRows = _plainRowsFromSnapshot(snapshot);
-          final cursorObj = snapshot?['cursor'] as Map<String, dynamic>?;
-          final initialCursorCol = cursorObj?['col'] as int?;
           final exited = snapshot?['exited'] as bool? ?? false;
           final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
           final cols = sizeObj?['cols'] as int? ?? 80;
@@ -1526,7 +1511,6 @@ class _TriageHomeState extends State<TriageHome> {
                 : plainRows,
             outputSeq: outputSeq,
             isRemote: true,
-            initialCursorCol: initialCursorCol,
             isExited: exited,
           );
           _setupSessionInputListener(session);
@@ -1554,7 +1538,6 @@ class _TriageHomeState extends State<TriageHome> {
           unawaited(
             _refreshSessionSnapshot(
               session,
-              markPending: false,
               includeHistory: true,
             ),
           );

@@ -323,6 +323,22 @@ rustfmt-canonical (I'd hand-formatted them). Ran `cargo fmt --all` (only
 re-pushing. CI is Rust-only (no Flutter/dart steps), so the 61 Flutter tests run
 locally only.
 
+2026-06-04T22:00-0700 **`/simplify` cleanup pass** (4 review agents: reuse /
+simplification / efficiency / altitude). Applied: hoisted the 3 per-live-chunk
+RegExps in `terminal_store.dart` (`_partialPrivateCsi`/`_completePrivateCsi`/
+`_bareLf`) to top-level finals (they were recompiled on every `Output`); extracted
+the duplicated `snapshot_with_history` overlay into one
+`overlay_raw_output_history` helper (`triaged/session.rs`); removed dead
+`markPending` param from `_refreshSessionSnapshot`, the vestigial
+`initialCursorRow`/`initialCursorCol` SessionVm state (written, never read after
+the cursor-placement deletion), and the always-false `_suppressInput` field +
+branch in the web pane. Skipped (noted): the `List.from` "copy" (input is a lazy
+`cast<int>()` view — materialize-once vs iterate-twice is a wash), Rust
+tail-caching (snapshots are infrequent, caching adds invalidation risk), the
+three-carry consolidation (correct + bounded; future work), and the snapshot
+field-extraction helper (marginal — sites diverge, indirection ≈ benefit).
+`flutter analyze`/`cargo clippy` clean; 61 tests pass.
+
 ## Decision
 
 2026-06-03T20:52-0700 Phase 0 PASSED → proceed with the MVI raw-byte refactor.
@@ -335,7 +351,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — style(host): rustfmt build_session_snapshot (CI cargo fmt --check)
+HEAD — refactor: simplify terminal pipeline per /simplify review
+d5ebe7e — style(host): rustfmt build_session_snapshot (CI cargo fmt --check)
 3e941de — fix(client): use hardware-keyboard input path so typing works on desktop
 7444c39 — feat(client): bundle JetBrains Mono as the terminal font
 5a39973 — fix(client): strip CSI > ... m so xterm stops poisoning the screen with underline
