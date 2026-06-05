@@ -263,6 +263,25 @@ terminal is already at the fitted size by then) — the same microtask trick the
 pre-refactor `_finishInitialContent` used. Web is unaffected (xterm.js is not a
 Flutter render object). `flutter analyze` clean; 59 tests pass.
 
+2026-06-04T20:10-0700 **e2e (live session): text/spacing correct (paste clean —
+buffer is fixed), but horizontal lines/box-borders render wrong everywhere.**
+Diagnosed headlessly by replaying the live session log
+(`~/.local/state/triage/sessions/session-14.log`) into a bare `package:xterm`
+`Terminal` and dumping per-cell attributes: **every cell had the underline flag
+set** (`getAttributes(i) & 1<<3`), including untouched/erased cells — so the pen
+underline was stuck on and bled into every write and `\x1b[K` erase. The log
+contains **no SGR 4** at all. Bisecting the byte stream, underline first appears
+at the sequence `\x1b[>4;2m` — `CSI > 4 ; 2 m` = **XTMODKEYS / modifyOtherKeys**
+(a keyboard-protocol negotiation Claude emits once at startup). xterm.dart
+**ignores the `>` private marker and parses it as plain SGR `4;2` → underline +
+faint**, permanently. Verified: stripping `\x1b[>…m` drops underlined cells from
+97/row to 0. Fix: `TerminalStore._stripUnsupportedPrivateCsi` removes
+`CSI > … m` private sequences in the single write path before they reach the
+emulator (it doesn't support modifyOtherKeys anyway), with a bounded carry so a
+sequence split across live chunks is still caught. +2 reducer tests; 61 pass.
+(Separately confirmed the painter preserves cursor-positioned gaps — the banner's
+`\x1b[12G…\x1b[19G…` absolute-column layout renders with correct spacing.)
+
 ## Decision
 
 2026-06-03T20:52-0700 Phase 0 PASSED → proceed with the MVI raw-byte refactor.

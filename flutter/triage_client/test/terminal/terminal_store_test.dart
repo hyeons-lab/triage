@@ -171,4 +171,23 @@ void main() {
     store.dispatch(LiveBytes(b('ghost')));
     expect(sink.ops, isEmpty);
   });
+
+  test('strips CSI > ... m private sequences (xterm misparses as SGR)', () {
+    store.dispatch(const Attach());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    sink.ops.clear();
+    // modifyOtherKeys / XTMODKEYS — must not reach the emulator (it parses the
+    // private `>` form as SGR 4 -> underline, poisoning the screen).
+    store.dispatch(LiveBytes(b('\x1b[>4;2mhello')));
+    expect(sink.written.toString(), 'hello');
+  });
+
+  test('strips CSI > ... m split across live chunks', () {
+    store.dispatch(const Attach());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('a\x1b[>4'))); // sequence split mid-way
+    store.dispatch(LiveBytes(b(';2mb')));
+    expect(sink.written.toString(), 'ab');
+  });
 }

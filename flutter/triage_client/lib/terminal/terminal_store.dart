@@ -38,6 +38,9 @@ class TerminalStore extends ChangeNotifier {
   // Live-stream byte carries (history is decoded as a self-contained unit).
   final List<int> _utf8Carry = <int>[];
   bool _pendingCarriageReturn = false;
+  // Holds a trailing, not-yet-terminated `CSI > …` so a private-mode sequence
+  // split across live chunks is still stripped before reaching the emulator.
+  String _privateCsiCarry = '';
 
   // Live chunks received before we are sized / while awaiting history.
   final List<_QueuedLive> _pendingLive = <_QueuedLive>[];
@@ -236,13 +239,39 @@ class TerminalStore extends ChangeNotifier {
       }
     }
     if (toDecode.isEmpty) return;
-    final text = _normalizeNewlines(
+    final sanitized = _stripUnsupportedPrivateCsi(
       utf8.decode(toDecode, allowMalformed: true),
       live: !isHistory,
     );
+    final text = _normalizeNewlines(sanitized, live: !isHistory);
     if (text.isNotEmpty) {
       _sink.write(text);
     }
+  }
+
+  /// Strips `CSI > … m` private sequences (XTMODKEYS / modifyOtherKeys, which
+  /// Claude Code emits at startup). xterm.dart ignores the `>` private marker
+  /// and misparses them as plain SGR — e.g. `CSI > 4 ; 2 m` becomes SGR 4
+  /// (underline), which poisons every subsequent cell and erase with a spurious
+  /// underline. The emulator does not support these sequences anyway. For the
+  /// live stream a trailing, not-yet-terminated `CSI > …` is held back so a
+  /// sequence split across chunks is still caught.
+  String _stripUnsupportedPrivateCsi(String input, {required bool live}) {
+    var s = input;
+    if (live && _privateCsiCarry.isNotEmpty) {
+      s = _privateCsiCarry + s;
+      _privateCsiCarry = '';
+    }
+    if (live) {
+      final partial = RegExp(r'\x1b\[>[0-9;]*$').firstMatch(s);
+      // Only hold a bounded partial; otherwise let it flush to avoid unbounded
+      // growth on a stream that never completes the sequence.
+      if (partial != null && (s.length - partial.start) <= 24) {
+        _privateCsiCarry = s.substring(partial.start);
+        s = s.substring(0, partial.start);
+      }
+    }
+    return s.replaceAll(RegExp(r'\x1b\[>[0-9;]*m'), '');
   }
 
   /// Normalize bare LF to CRLF (leaving existing CRLF intact) so the emulator
@@ -265,6 +294,7 @@ class TerminalStore extends ChangeNotifier {
   void _resetCarries() {
     _utf8Carry.clear();
     _pendingCarriageReturn = false;
+    _privateCsiCarry = '';
   }
 
   @override
