@@ -315,6 +315,14 @@ by their parent plugins. `pubspec.lock` updated; `flutter clean` was needed once
 to regenerate the Material `ink_sparkle.frag` shader manifest after the bump. 61
 tests pass on 3.44.1; `flutter analyze` clean.
 
+2026-06-04T21:30-0700 **CI (PR #63) red on `cargo fmt --all --check`** — the
+`build_session_snapshot` raw_output line and two test `let snap =` lines weren't
+rustfmt-canonical (I'd hand-formatted them). Ran `cargo fmt --all` (only
+`flatbuffers_proto.rs` changed) and verified `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings` is clean locally before
+re-pushing. CI is Rust-only (no Flutter/dart steps), so the 61 Flutter tests run
+locally only.
+
 ## Decision
 
 2026-06-03T20:52-0700 Phase 0 PASSED → proceed with the MVI raw-byte refactor.
@@ -327,7 +335,8 @@ the StyledRow render/replay path. Spike files were throwaway and removed.
 Note: hashes below reconciled after rebasing the branch onto origin/main
 (c389d0d, PR #62).
 
-HEAD — fix(client): use hardware-keyboard input path so typing works on desktop
+HEAD — style(host): rustfmt build_session_snapshot (CI cargo fmt --check)
+3e941de — fix(client): use hardware-keyboard input path so typing works on desktop
 7444c39 — feat(client): bundle JetBrains Mono as the terminal font
 5a39973 — fix(client): strip CSI > ... m so xterm stops poisoning the screen with underline
 e6befbc — fix(client): defer native first-fit history replay out of performLayout
