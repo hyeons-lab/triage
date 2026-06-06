@@ -323,12 +323,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   static const Duration _wakeWatchdogInterval = Duration(seconds: 4);
   static const Duration _wakeWatchdogGap = Duration(seconds: 30);
 
-  // Flip to false to silence wake diagnostics once the path is confirmed.
-  static const bool _wakeDebug = true;
-  void _wakeLog(String message) {
-    if (_wakeDebug) debugPrint('[WAKEDBG] $message');
-  }
-
   @override
   void initState() {
     super.initState();
@@ -339,8 +333,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final gap = now.difference(_lastWatchdogTick);
       _lastWatchdogTick = now;
       if (gap > _wakeWatchdogGap) {
-        _wakeLog('watchdog gap ${gap.inSeconds}s -> wake; redrawing active');
-        _redrawActiveSessionOnResume('watchdog');
+        _redrawActiveSessionOnResume();
       }
     });
     _clientId = _loadOrCreateClientId();
@@ -417,7 +410,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    _wakeLog('lifecycle -> $state (wasOccluded=$_wasOccluded)');
     switch (state) {
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
@@ -425,7 +417,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       case AppLifecycleState.resumed:
         if (_wasOccluded) {
           _wasOccluded = false;
-          _redrawActiveSessionOnResume('lifecycle');
+          _redrawActiveSessionOnResume();
         }
       case AppLifecycleState.inactive:
       case AppLifecycleState.detached:
@@ -441,21 +433,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // it render correctly and then switch to incorrect. A same-size resize sends no
   // SIGWINCH, so the jiggle guarantees a repaint even when the host already
   // believes it is at our size.
-  void _redrawActiveSessionOnResume(String trigger) {
-    if (_disposed || !_client.isConnected || _sessions.isEmpty) {
-      _wakeLog(
-        'redraw[$trigger] bail: disposed=$_disposed connected=${_client.isConnected} sessions=${_sessions.length}',
-      );
-      return;
-    }
+  void _redrawActiveSessionOnResume() {
+    if (_disposed || !_client.isConnected || _sessions.isEmpty) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
-    if (!session.isRemote || session.status != 'attached') {
-      _wakeLog(
-        'redraw[$trigger] bail: remote=${session.isRemote} status=${session.status}',
-      );
-      return;
-    }
+    if (!session.isRemote || session.status != 'attached') return;
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
     // Target the xterm's ACTUAL grid size — the one true width the client renders
@@ -465,10 +447,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // the program repaint at exactly our render width.
     final cols = session.terminal.viewWidth;
     final rows = session.terminal.viewHeight;
-    _wakeLog(
-      'redraw[$trigger] jiggle $sessionId to ${cols}x$rows '
-      '(xterm=${cols}x$rows lastFitted=${session.lastFittedCols}x${session.lastFittedRows})',
-    );
     if (cols < 2 || rows < 2) return;
     unawaited(() async {
       try {
@@ -478,15 +456,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           rows: rows - 1,
         );
         if (_disposed) return;
-        await _client.resizeSession(
-          sessionId: sessionId,
-          cols: cols,
-          rows: rows,
-        );
-        _wakeLog('redraw[$trigger] jiggle sent ${cols}x$rows');
-      } catch (e) {
-        _wakeLog('redraw[$trigger] jiggle failed: $e');
-      }
+        await _client.resizeSession(sessionId: sessionId, cols: cols, rows: rows);
+      } catch (_) {}
     }());
   }
 
@@ -912,7 +883,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   Future<void> _loadDaemonSessions() async {
     if (!_client.isConnected) return;
-    _wakeLog('loadDaemonSessions (rebuilds sessions + replays history)');
 
     try {
       final sessionIds = await _client.listSessions();
@@ -1399,7 +1369,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
-    _wakeLog('ws closed (gen=$generation)');
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
@@ -1441,11 +1410,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// live stream paint a clean frame. One-shot per attach so ordinary window
   /// resizes still self-heal through the live stream, not a re-snapshot.
   void _onSessionViewFit(SessionVm session, int cols, int rows) {
-    _wakeLog(
-      'viewFit ${_sessionIdFor(session)} ${cols}x$rows '
-      '(was ${session.lastFittedCols}x${session.lastFittedRows}, '
-      'hasFitted=${session.hasFitted})',
-    );
     session.lastFittedCols = cols;
     session.lastFittedRows = rows;
     session.noteViewFit(cols, rows);

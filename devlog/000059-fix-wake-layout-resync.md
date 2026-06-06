@@ -114,6 +114,16 @@ long time… it's correct if I resize it").
   `inactive` both ways. Turned this into a stronger assertion that `inactive` alone does
   not trigger a resync.
 
+## Outcome
+
+- 2026-06-05T21:25-0700 CONFIRMED FIXED on the real device: after sleep/wake the active
+  terminal repaints to the correct layout, no manual resize needed ("it worked"). The
+  decisive change was targeting the jiggle at `terminal.viewWidth/viewHeight` (the
+  xterm's real grid) instead of `lastFittedCols`.
+- 2026-06-05T21:25-0700 Stripped the `[WAKEDBG]` diagnostics (`_wakeLog`/`_wakeDebug`,
+  the `trigger` param, and all log call sites). Kept the sleep watchdog as a cheap
+  lifecycle-independent fallback; the lifecycle hook is what fires in practice.
+
 ## Verification
 
 - `flutter test` — 71 passed (70 prior + the new resume redraw test).
@@ -131,4 +141,5 @@ long time… it's correct if I resize it").
 
 - 9771fcf — fix(client): redraw active terminal on app resume after occlusion
 - d53e870 — fix(client): add sleep watchdog + wake diagnostics for layout heal
-- HEAD — fix(client): jiggle host to xterm's real render width on resume
+- 17b3fde — fix(client): jiggle host to xterm's real render width on resume
+- HEAD — chore(client): strip wake diagnostics after confirming the fix
