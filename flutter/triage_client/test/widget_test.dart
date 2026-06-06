@@ -809,6 +809,42 @@ void main() {
     expect(find.text('line 1 from flutter-spike'), findsNothing);
   });
 
+  testWidgets('redraws the active session when resuming after occlusion', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    int resizesFor(String sid) =>
+        client.resizeSessionCalls.where((c) => c.startsWith('$sid:')).length;
+    // 'flutter-spike' is the default-selected remote session.
+    final baseline = resizesFor('flutter-spike');
+
+    // Merely losing and regaining focus (inactive, no occlusion) must NOT
+    // redraw — otherwise we'd jiggle the PTY on every desktop focus change.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(resizesFor('flutter-spike'), baseline);
+
+    // Full occlusion (screen sleep / hidden) then resume jiggles the host PTY
+    // size (rows-1, then back) so the program repaints over the live stream at
+    // our width — the same heal a manual resize triggers, with no history replay.
+    // Desktop walks through `inactive` on the way down and back up.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    // Two resizes: the jiggle down to rows-1 and back to the real size.
+    expect(resizesFor('flutter-spike'), baseline + 2);
+  });
+
   testWidgets(
     'marks replay pending while selected session snapshot refreshes',
     (WidgetTester tester) async {

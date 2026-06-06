@@ -245,7 +245,7 @@ class TriageHome extends StatefulWidget {
   State<TriageHome> createState() => _TriageHomeState();
 }
 
-class _TriageHomeState extends State<TriageHome> {
+class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   late TriageWebSocketClient _client;
   bool _clientInitialized = false;
   bool _isConnecting = false;
@@ -309,9 +309,15 @@ class _TriageHomeState extends State<TriageHome> {
     );
   }
 
+  // True while the app is occluded (screen sleep / hidden / backgrounded). Gates
+  // the resume re-sync so we only reconcile width after genuine occlusion, not on
+  // every desktop focus change (which would re-attach + replay far too often).
+  bool _wasOccluded = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _clientId = _loadOrCreateClientId();
     _startCredentialStorageWatcher();
     _newSessionShell = newSessionShellMenuOrderForPlatform(
@@ -375,6 +381,64 @@ class _TriageHomeState extends State<TriageHome> {
     } else {
       _connectWebSocket();
     }
+  }
+
+  // After waking from sleep / un-hiding, the active terminal's buffer is wrapped
+  // for a host PTY width that drifted from our view width, so the frame fragments
+  // (words split mid-token, lines re-wrapped narrow). A manual resize fixes it
+  // because it forces the host program to repaint over the live byte stream at
+  // our width. Reproduce that on resume. Gated on prior occlusion so we don't
+  // do it on every desktop focus change.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+        _wasOccluded = true;
+      case AppLifecycleState.resumed:
+        if (_wasOccluded) {
+          _wasOccluded = false;
+          _redrawActiveSessionOnResume();
+        }
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.detached:
+        break;
+    }
+  }
+
+  // Heal the active session's layout on resume by mimicking a manual resize:
+  // jiggle the host PTY size (one row shorter, then back to our real size) so the
+  // program receives SIGWINCH and repaints over the live stream at our current
+  // width. We deliberately do NOT replay history — re-emulating the raw-output
+  // tail re-introduces the width-mismatched/truncated frame, which is what makes
+  // it render correctly and then switch to incorrect. A same-size resize sends no
+  // SIGWINCH, so the jiggle guarantees a repaint even when the host already
+  // believes it is at our size.
+  void _redrawActiveSessionOnResume() {
+    if (_disposed || !_client.isConnected || _sessions.isEmpty) return;
+    if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
+    final session = _selectedSession;
+    if (!session.isRemote || session.status != 'attached') return;
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    final (rows, cols) = _currentReplayTerminalSize(session, null);
+    if (cols < 2 || rows < 2) return;
+    unawaited(() async {
+      try {
+        await _client.resizeSession(
+          sessionId: sessionId,
+          cols: cols,
+          rows: rows - 1,
+        );
+        if (_disposed) return;
+        await _client.resizeSession(
+          sessionId: sessionId,
+          cols: cols,
+          rows: rows,
+        );
+      } catch (_) {}
+    }());
   }
 
   String _loadOrCreateClientId() {
@@ -1301,6 +1365,7 @@ class _TriageHomeState extends State<TriageHome> {
   @override
   void dispose() {
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
