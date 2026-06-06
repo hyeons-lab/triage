@@ -45,6 +45,36 @@ selection, and there is no way to select more text than is visible on screen.
 - 2026-06-05T20:56-0700 Native pane only — that is the macOS desktop client the report is
   about; the web pane (`terminal_pane_web.dart`) is a separate path.
 
+## Code review fixes (max-effort /code-review)
+
+- 2026-06-06 `_extendSelectionTo` — apply `+1` to the trailing column when extending
+  forward (`target.x >= anchor.x`), matching xterm's own `selectCharacters`
+  (render.dart:289-291). Without it a forward shift-click dropped the clicked character
+  from the selection/copy. (Finding #1, confirmed.)
+- 2026-06-06 `_extendSelectionTo` — bail when `_terminal.buffer` is not identical to the
+  buffer the anchor was recorded against, so a shift-click after a main↔alternate screen
+  switch doesn't select an unrelated region of the now-active buffer. Capture the buffer in
+  `_recordSelectionAnchor`. (Finding #4.)
+- 2026-06-06 `_extendSelectionTo` — clamp the anchor's `x` (not just `y`) into the current
+  grid, so a stale anchor after a clear / scrollback trim / width-reducing resize can't
+  produce an out-of-range column. (Finding #6.)
+- 2026-06-06 `_handlePointerUp` — wrap the `state.renderTerminal` access in try/catch:
+  the getter asserts the viewport is mounted (`currentContext!`), which can be false if the
+  pointer-up lands during a teardown/rebuild. (Finding #2.)
+- 2026-06-06 Pointer tracking — key the in-progress shift-click by `event.pointer`
+  (`_shiftClickPointer`/`_shiftClickDownPosition`) instead of a single shared slot, so
+  concurrent pointers (multi-touch/trackpad) don't cross contexts; add an
+  `onPointerCancel` handler and reset the pointer fields on terminal swap in
+  `didUpdateWidget`. (Findings #3, #8.)
+- 2026-06-06 NOT changed (documented): trackpad `buttons==0` shift-clicks (#7 — keeping the
+  primary-button gate so shift+right-click doesn't extend; desktop mouse is fine),
+  MediaQuery.padding off-by-padding (#9 — desktop padding is zero, latent), focus on every
+  pointer button (#10 — pre-existing/minor), inherited SelectionMode (left as-is to keep
+  intentional block-mode selection working), and the cleanup/altitude items
+  (#11/#13 — the raw-Listener seam is the pragmatic workaround for xterm's dead onTapUp).
+  Refuted: "shift-click pivots on the wrong end" — anchoring on the drag start and moving
+  the other end is the standard text-selection model.
+
 ## Verification
 
 - `flutter analyze lib/widgets/terminal_pane_stub.dart` — clean.
@@ -56,4 +86,5 @@ selection, and there is no way to select more text than is visible on screen.
 
 ## Commits
 
-- HEAD — fix(client): make shift-click extend terminal selection (xterm onTapUp is dead)
+- 16bd006 — fix(client): make shift-click extend terminal selection (xterm onTapUp is dead)
+- HEAD — fix(client): harden shift-click selection (code-review findings)

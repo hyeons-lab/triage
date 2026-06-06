@@ -71,12 +71,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   // drive shift-click from the Listener below instead of that dead callback.
   final GlobalKey<xt.TerminalViewState> _terminalViewKey = GlobalKey();
   xt.CellOffset? _selectionAnchor;
+  // The screen buffer (main vs alternate) the anchor was recorded against.
+  // Extending across a buffer switch would land on the wrong screen, so we bail.
+  Object? _selectionAnchorBuffer;
   // True while we are programmatically extending, so our own selection change
   // does not overwrite the anchor (it must stay fixed across repeated extends).
   bool _extendingSelection = false;
-  // Pointer-down context, captured to recognise a shift-click on pointer-up.
-  Offset? _pointerDownPosition;
-  bool _shiftAtPointerDown = false;
+  // In-progress shift+primary press, keyed by pointer id so concurrent pointers
+  // (multi-touch) and cancelled gestures can't corrupt the click context.
+  int? _shiftClickPointer;
+  Offset? _shiftClickDownPosition;
   static const double _clickMoveSlop = 4.0;
 
   // Premium design system theme matching the web terminal
@@ -158,8 +162,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!identical(oldWidget.terminal, widget.terminal)) {
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
-      // The anchor referenced the previous terminal's buffer; drop it.
+      // The anchor and any in-flight shift-click referenced the previous
+      // terminal's buffer; drop all of it so we never extend across the swap.
       _selectionAnchor = null;
+      _selectionAnchorBuffer = null;
+      _shiftClickPointer = null;
+      _shiftClickDownPosition = null;
       _scrollToCursor(requestFocus: true);
     }
     if (oldWidget.controller != widget.controller) {
@@ -197,6 +205,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     final selection = _xtermController.selection;
     if (selection != null) {
       _selectionAnchor = selection.begin;
+      _selectionAnchorBuffer = _terminal.buffer;
     }
   }
 
@@ -208,33 +217,47 @@ class _TerminalPaneState extends State<TerminalPane> {
     final anchor = _selectionAnchor;
     if (anchor == null) return;
     final buffer = _terminal.buffer;
+    // The anchor was recorded against a specific screen buffer; if the program
+    // switched between the main and alternate screen since, extending would
+    // select an unrelated region of the now-active buffer.
+    if (!identical(buffer, _selectionAnchorBuffer)) return;
     final lastRow = buffer.lines.length - 1;
     if (lastRow < 0) return;
-    // Guard against a buffer that shrank (clear / scrollback trim) since the
-    // anchor was recorded, so createAnchorFromOffset never indexes out of range.
-    final safeAnchor = anchor.y > lastRow
-        ? xt.CellOffset(anchor.x, lastRow)
-        : anchor;
+    final maxCol = _terminal.viewWidth - 1;
+    // Clamp the (possibly stale) anchor into the current grid — a clear,
+    // scrollback trim, or width-reducing resize since it was recorded can put it
+    // out of range — so createAnchorFromOffset never indexes past the bounds.
+    final safeAnchor = xt.CellOffset(
+      anchor.x.clamp(0, maxCol),
+      anchor.y.clamp(0, lastRow),
+    );
+    // Include the clicked cell when extending forward, matching xterm's own
+    // selectCharacters (which adds 1 to the trailing column); without this the
+    // character under a forward shift-click is dropped from the selection.
+    final extentX = target.x >= safeAnchor.x ? target.x + 1 : target.x;
+    final extent = xt.CellOffset(extentX, target.y);
     _extendingSelection = true;
     try {
       _xtermController.setSelection(
         buffer.createAnchorFromOffset(safeAnchor),
-        buffer.createAnchorFromOffset(target),
+        buffer.createAnchorFromOffset(extent),
       );
     } finally {
       _extendingSelection = false;
     }
   }
 
-  // Capture pointer-down context so pointer-up can tell a shift-click from a
-  // drag. xterm's own tap-down clears any live selection here; our anchor is
-  // preserved because _recordSelectionAnchor ignores the resulting null.
+  // Track a shift+primary press (keyed by pointer id) so pointer-up can tell a
+  // shift-click from a drag. xterm's own tap-down clears any live selection
+  // here; our anchor is preserved because _recordSelectionAnchor ignores the
+  // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
     _focusTerminal();
-    _pointerDownPosition = event.position;
-    _shiftAtPointerDown =
-        HardwareKeyboard.instance.isShiftPressed &&
-        (event.buttons & kPrimaryButton) != 0;
+    if (HardwareKeyboard.instance.isShiftPressed &&
+        (event.buttons & kPrimaryButton) != 0) {
+      _shiftClickPointer = event.pointer;
+      _shiftClickDownPosition = event.position;
+    }
   }
 
   // Shift-click (a click, not a drag) extends the selection to the clicked cell.
@@ -242,17 +265,31 @@ class _TerminalPaneState extends State<TerminalPane> {
   // 4.0.0; raw pointer handling also sidesteps the gesture arena, so normal
   // drag-select keeps working.
   void _handlePointerUp(PointerUpEvent event) {
-    final downPosition = _pointerDownPosition;
-    final wasShiftClick = _shiftAtPointerDown;
-    _pointerDownPosition = null;
-    _shiftAtPointerDown = false;
-    if (!wasShiftClick || downPosition == null) return;
+    if (event.pointer != _shiftClickPointer) return;
+    final downPosition = _shiftClickDownPosition;
+    _shiftClickPointer = null;
+    _shiftClickDownPosition = null;
+    if (downPosition == null) return;
     if ((event.position - downPosition).distance > _clickMoveSlop) return;
     final state = _terminalViewKey.currentState;
     if (state == null) return;
-    final render = state.renderTerminal;
-    final target = render.getCellOffset(render.globalToLocal(event.position));
+    // renderTerminal asserts the viewport is mounted; it may not be if the
+    // pointer-up lands during a teardown/rebuild, so guard the access.
+    xt.CellOffset? target;
+    try {
+      final render = state.renderTerminal;
+      target = render.getCellOffset(render.globalToLocal(event.position));
+    } catch (_) {
+      return;
+    }
     _extendSelectionTo(target);
+  }
+
+  void _handlePointerCancel(PointerCancelEvent event) {
+    if (event.pointer == _shiftClickPointer) {
+      _shiftClickPointer = null;
+      _shiftClickDownPosition = null;
+    }
   }
 
   void _onTerminalOutput(String data) {
@@ -396,6 +433,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           child: Listener(
             onPointerDown: _handlePointerDown,
             onPointerUp: _handlePointerUp,
+            onPointerCancel: _handlePointerCancel,
             child: xt.TerminalView(
               _terminal,
               key: _terminalViewKey,
