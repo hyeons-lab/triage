@@ -51,6 +51,18 @@ assess web-pane parity.
   shift-click — it needs xterm.js private internals; documented as a separate item rather
   than shipping a fragile version-coupled hack.
 
+## PR review fixes (Copilot, PR #68)
+
+- 2026-06-06 `_applyDragExtend` — added a `mounted` guard at the top so the scheduled
+  microtask or an auto-scroll tick that fires after the State is disposed can't call
+  `_xtermController.setSelection()` post-dispose (would throw).
+- 2026-06-06 `_onAutoScrollTick` — guard on `!mounted` (stop the ticker) so a tick during
+  teardown doesn't touch disposed controllers/state.
+- 2026-06-06 `_handlePointerDown` — if the anchor cell can't be resolved at pointer-down
+  (`_cellAtGlobal` returns null during a teardown/rebuild), don't own the drag; let xterm
+  handle it, rather than auto-scrolling with no pinned start (which would let the built-in
+  selection drift).
+
 ## Verification
 
 - `flutter analyze lib/widgets/terminal_pane_stub.dart` — clean.
@@ -62,4 +74,5 @@ assess web-pane parity.
 
 ## Commits
 
-- HEAD — feat(client): drag-edge auto-scroll for terminal selection
+- 454817b — feat(client): drag-edge auto-scroll for terminal selection
+- HEAD — fix(client): guard drag-select against teardown races (PR #68 review)

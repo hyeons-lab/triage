@@ -301,10 +301,15 @@ class _TerminalPaneState extends State<TerminalPane> {
     } else {
       // Plain primary: a potential drag-select. The anchor is the cell under the
       // press; we don't start selecting until the pointer moves past the slop.
+      // If we can't resolve the anchor cell (view not laid out / mid-rebuild),
+      // don't own the drag — let xterm handle it rather than auto-scrolling with
+      // no pinned start (which would let the built-in selection drift).
+      final anchor = _cellAtGlobal(event.position);
+      if (anchor == null) return;
       _dragPointer = event.pointer;
       _dragDownPosition = event.position;
       _dragLastPosition = event.position;
-      _dragAnchorCell = _cellAtGlobal(event.position);
+      _dragAnchorCell = anchor;
       _dragSelecting = false;
     }
   }
@@ -375,6 +380,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _applyDragExtend() {
+    // The microtask or auto-scroll tick can fire after this State is disposed;
+    // touching _xtermController then (post-dispose) would throw.
+    if (!mounted) return;
     if (!_dragSelecting) return;
     final anchor = _dragAnchorCell;
     final position = _dragLastPosition;
@@ -425,7 +433,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onAutoScrollTick(Timer _) {
-    if (!_dragSelecting || _autoScrollVelocity == 0) {
+    if (!mounted || !_dragSelecting || _autoScrollVelocity == 0) {
       _stopAutoScroll();
       return;
     }
