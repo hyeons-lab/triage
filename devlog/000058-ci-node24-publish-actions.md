@@ -16,6 +16,14 @@ approach (eliminate Node 20 actions, not mask with `FORCE_JAVASCRIPT_ACTIONS_TO_
   their first Node 24 majors: `actions/checkout@v4`→`@v5` (4×),
   `actions/upload-artifact@v4`→`@v6` (3×), `actions/download-artifact@v4`→`@v8` (1×),
   `softprops/action-gh-release@v2`→`@v3` (1×). Inputs are unchanged drop-ins.
+- 2026-06-05T07:45-0700 `.github/workflows/publish.yml` — SHA-pinned all four bumped
+  actions to the commit each Node 24 major resolves to, with a `# owner/action@vMAJOR`
+  comment above (matching `ci.yml`'s convention): checkout
+  `93cb6efe18208431cddfb8368fd83d5badbf9bfd`, upload-artifact
+  `b7c566a772e6b6bfb58ed0dc250532a479d7789f`, download-artifact
+  `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`, action-gh-release
+  `b4309332981a82ec1c5618f44dd2e27cc8bfbfda`. Addresses Copilot's supply-chain pinning
+  comments on PR #65; checkout's SHA is identical to the one `ci.yml` already pins.
 
 ## Decisions
 
@@ -38,9 +46,10 @@ approach (eliminate Node 20 actions, not mask with `FORCE_JAVASCRIPT_ACTIONS_TO_
 
 ## Next Steps
 
-- Verified at the next publish run (the 0.1.4 release, or the next bump) that the warning
+- Verify at the next publish run (the 0.1.4 release, or the next bump) that the warning
   is gone and the clients still attach to the GitHub release.
 
 ## Commits
 
-- HEAD — ci(publish): bump Node 20 actions to Node 24 majors
+- a297cc4 — ci(publish): bump Node 20 actions to Node 24 majors
+- HEAD — ci(publish): SHA-pin the bumped publish actions (PR #65 review)
