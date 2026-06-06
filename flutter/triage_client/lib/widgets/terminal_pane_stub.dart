@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/gestures.dart' show kPrimaryButton;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show HardwareKeyboard;
 import 'package:xterm/xterm.dart' as xt;
@@ -64,10 +65,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // later shift-click can extend the range to a new cell — even after scrolling,
   // since anchors track buffer lines, not viewport rows.
   final xt.TerminalController _xtermController = xt.TerminalController();
+  // Lets us hit-test a pointer position to a buffer cell (getCellOffset) for
+  // shift-click extension. xterm 4.0.0's TerminalView.onTapUp never fires (the
+  // TapGestureRecognizer only routes to the unforwarded onSingleTapUp), so we
+  // drive shift-click from the Listener below instead of that dead callback.
+  final GlobalKey<xt.TerminalViewState> _terminalViewKey = GlobalKey();
   xt.CellOffset? _selectionAnchor;
   // True while we are programmatically extending, so our own selection change
   // does not overwrite the anchor (it must stay fixed across repeated extends).
   bool _extendingSelection = false;
+  // Pointer-down context, captured to recognise a shift-click on pointer-up.
+  Offset? _pointerDownPosition;
+  bool _shiftAtPointerDown = false;
+  static const double _clickMoveSlop = 4.0;
 
   // Premium design system theme matching the web terminal
   static const _theme = xt.TerminalTheme(
@@ -216,6 +226,35 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  // Capture pointer-down context so pointer-up can tell a shift-click from a
+  // drag. xterm's own tap-down clears any live selection here; our anchor is
+  // preserved because _recordSelectionAnchor ignores the resulting null.
+  void _handlePointerDown(PointerDownEvent event) {
+    _focusTerminal();
+    _pointerDownPosition = event.position;
+    _shiftAtPointerDown =
+        HardwareKeyboard.instance.isShiftPressed &&
+        (event.buttons & kPrimaryButton) != 0;
+  }
+
+  // Shift-click (a click, not a drag) extends the selection to the clicked cell.
+  // Done from raw pointer events because TerminalView.onTapUp is dead in xterm
+  // 4.0.0; raw pointer handling also sidesteps the gesture arena, so normal
+  // drag-select keeps working.
+  void _handlePointerUp(PointerUpEvent event) {
+    final downPosition = _pointerDownPosition;
+    final wasShiftClick = _shiftAtPointerDown;
+    _pointerDownPosition = null;
+    _shiftAtPointerDown = false;
+    if (!wasShiftClick || downPosition == null) return;
+    if ((event.position - downPosition).distance > _clickMoveSlop) return;
+    final state = _terminalViewKey.currentState;
+    if (state == null) return;
+    final render = state.renderTerminal;
+    final target = render.getCellOffset(render.globalToLocal(event.position));
+    _extendSelectionTo(target);
+  }
+
   void _onTerminalOutput(String data) {
     widget.controller.sendInput(data);
   }
@@ -355,11 +394,11 @@ class _TerminalPaneState extends State<TerminalPane> {
         child: Padding(
           padding: const EdgeInsets.all(22),
           child: Listener(
-            onPointerDown: (_) {
-              _focusTerminal();
-            },
+            onPointerDown: _handlePointerDown,
+            onPointerUp: _handlePointerUp,
             child: xt.TerminalView(
               _terminal,
+              key: _terminalViewKey,
               controller: _xtermController,
               theme: _theme,
               focusNode: _focusNode,
@@ -372,14 +411,6 @@ class _TerminalPaneState extends State<TerminalPane> {
               // pressed") and swallows keystrokes; this is the standard desktop
               // terminal fix.
               hardwareKeyboardOnly: true,
-              onTapUp: (_, cellOffset) {
-                _focusTerminal();
-                // Shift-click extends the existing selection to the clicked
-                // cell instead of clearing it (xterm cleared it on tap-down).
-                if (HardwareKeyboard.instance.isShiftPressed) {
-                  _extendSelectionTo(cellOffset);
-                }
-              },
             ),
           ),
         ),
