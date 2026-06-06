@@ -458,10 +458,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
-    final (rows, cols) = _currentReplayTerminalSize(session, null);
+    // Target the xterm's ACTUAL grid size — the one true width the client renders
+    // at. lastFittedCols can be polluted by host-size broadcasts from other
+    // controllers, so jiggling to it repaints the program at the wrong width and
+    // the frame stays fragmented. Matching the host to terminal.viewWidth makes
+    // the program repaint at exactly our render width.
+    final cols = session.terminal.viewWidth;
+    final rows = session.terminal.viewHeight;
     _wakeLog(
       'redraw[$trigger] jiggle $sessionId to ${cols}x$rows '
-      '(lastFitted=${session.lastFittedCols}x${session.lastFittedRows})',
+      '(xterm=${cols}x$rows lastFitted=${session.lastFittedCols}x${session.lastFittedRows})',
     );
     if (cols < 2 || rows < 2) return;
     unawaited(() async {

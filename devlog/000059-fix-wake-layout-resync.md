@@ -69,6 +69,28 @@ long time… it's correct if I resize it").
   thrash the PTY. `hidden`/`paused` are the closest signal to display sleep /
   backgrounding.
 
+## Research & Discoveries (spike against the real log)
+
+- 2026-06-05T21:05-0700 ROOT CAUSE PROVEN. Two facts converged:
+  1. Device `[WAKEDBG]` logs: the client xterm rendered at **85x27** (`viewFit
+     session-20 85x27`), but the resume jiggle sized the HOST to **97x37**
+     (`lastFitted=97x37`) — because `lastFittedCols` had been polluted to 97 by a
+     host-size broadcast from another controller. So the program repainted at 97 into
+     an 85-wide view → still fragmented. The lifecycle DOES fire on macOS sleep/wake
+     (`inactive→hidden→inactive→resumed`), so the watchdog was not the missing piece.
+  2. A throwaway spike replayed the real `~/.local/state/triage/sessions/session-20.log`
+     into a bare `xterm` Terminal at several widths:
+     - render at 85 → fragmented, byte-for-byte matching the user screenshots
+       (`flag large filey`/`ouc`/`ould`, `Remote Cont`/`rol active`).
+     - render at 97 → perfectly clean (content was authored at 97).
+     - render at 85 then reflow to 97 → STILL fragmented: an xterm reflow cannot undo
+       wrong-width emulation.
+  Conclusion: the frame is only correct when the client renders at the width the
+  content was authored at, and the only way to make a 97-authored frame correct in an
+  85-wide view is to resize the HOST to the client's real render width and let the
+  program repaint at that width. The fix must therefore jiggle the host to the xterm's
+  ACTUAL grid size (`terminal.viewWidth/viewHeight`), not `lastFittedCols`.
+
 ## Issues
 
 - 2026-06-05T20:35-0700 BOTH the replay approach and the redraw-jiggle approach failed
@@ -108,4 +130,5 @@ long time… it's correct if I resize it").
 ## Commits
 
 - 9771fcf — fix(client): redraw active terminal on app resume after occlusion
-- HEAD — fix(client): add sleep watchdog + wake diagnostics for layout heal
+- d53e870 — fix(client): add sleep watchdog + wake diagnostics for layout heal
+- HEAD — fix(client): jiggle host to xterm's real render width on resume
