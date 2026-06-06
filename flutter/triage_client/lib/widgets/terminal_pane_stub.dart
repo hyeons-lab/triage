@@ -83,6 +83,26 @@ class _TerminalPaneState extends State<TerminalPane> {
   Offset? _shiftClickDownPosition;
   static const double _clickMoveSlop = 4.0;
 
+  // Drag-select with edge auto-scroll. We own the drag from raw pointer events so
+  // the selection start stays pinned to a buffer cell while the view scrolls
+  // (xterm's built-in drag pins the start to a viewport pixel, which drifts as the
+  // content scrolls). _dragAnchorCell is an absolute buffer cell (getCellOffset
+  // already folds in the scroll offset). Selection is (re)applied in a microtask
+  // so it deterministically overrides xterm's own per-frame selection.
+  int? _dragPointer;
+  Offset? _dragDownPosition;
+  Offset? _dragLastPosition;
+  xt.CellOffset? _dragAnchorCell;
+  bool _dragSelecting = false;
+  bool _dragExtendScheduled = false;
+  Timer? _autoScrollTimer;
+  double _autoScrollVelocity = 0;
+  // Distance from the top/bottom viewport edge that triggers auto-scroll, the
+  // tick cadence, and the max scroll step per tick (scaled by edge depth).
+  static const double _autoScrollEdge = 28.0;
+  static const Duration _autoScrollTick = Duration(milliseconds: 16);
+  static const double _autoScrollMaxStep = 28.0;
+
   // Premium design system theme matching the web terminal
   static const _theme = xt.TerminalTheme(
     cursor: Color(0xff7fd1c7),
@@ -162,12 +182,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!identical(oldWidget.terminal, widget.terminal)) {
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
-      // The anchor and any in-flight shift-click referenced the previous
+      // The anchor and any in-flight shift-click/drag referenced the previous
       // terminal's buffer; drop all of it so we never extend across the swap.
       _selectionAnchor = null;
       _selectionAnchorBuffer = null;
       _shiftClickPointer = null;
       _shiftClickDownPosition = null;
+      _endDrag();
       _scrollToCursor(requestFocus: true);
     }
     if (oldWidget.controller != widget.controller) {
@@ -190,6 +211,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _focusNode.dispose();
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
+    _autoScrollTimer?.cancel();
     super.dispose();
   }
 
@@ -216,26 +238,30 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _extendSelectionTo(xt.CellOffset target) {
     final anchor = _selectionAnchor;
     if (anchor == null) return;
-    final buffer = _terminal.buffer;
     // The anchor was recorded against a specific screen buffer; if the program
     // switched between the main and alternate screen since, extending would
     // select an unrelated region of the now-active buffer.
-    if (!identical(buffer, _selectionAnchorBuffer)) return;
+    if (!identical(_terminal.buffer, _selectionAnchorBuffer)) return;
+    _applySelection(anchor, target);
+  }
+
+  // Set the live selection from [anchorCell] to [targetCell] (both absolute
+  // buffer cells). Clamps a possibly-stale anchor into the current grid and adds
+  // the +1 trailing column on forward selections, matching xterm's own
+  // selectCharacters so the clicked/dragged cell is included.
+  void _applySelection(xt.CellOffset anchorCell, xt.CellOffset targetCell) {
+    final buffer = _terminal.buffer;
     final lastRow = buffer.lines.length - 1;
     if (lastRow < 0) return;
     final maxCol = _terminal.viewWidth - 1;
-    // Clamp the (possibly stale) anchor into the current grid — a clear,
-    // scrollback trim, or width-reducing resize since it was recorded can put it
-    // out of range — so createAnchorFromOffset never indexes past the bounds.
     final safeAnchor = xt.CellOffset(
-      anchor.x.clamp(0, maxCol),
-      anchor.y.clamp(0, lastRow),
+      anchorCell.x.clamp(0, maxCol),
+      anchorCell.y.clamp(0, lastRow),
     );
-    // Include the clicked cell when extending forward, matching xterm's own
-    // selectCharacters (which adds 1 to the trailing column); without this the
-    // character under a forward shift-click is dropped from the selection.
-    final extentX = target.x >= safeAnchor.x ? target.x + 1 : target.x;
-    final extent = xt.CellOffset(extentX, target.y);
+    final extentX = targetCell.x >= safeAnchor.x
+        ? targetCell.x + 1
+        : targetCell.x;
+    final extent = xt.CellOffset(extentX, targetCell.y.clamp(0, lastRow));
     _extendingSelection = true;
     try {
       _xtermController.setSelection(
@@ -247,17 +273,53 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  // Hit-test a global pointer position to an absolute buffer cell. Returns null
+  // if the view isn't mounted/laid out (renderTerminal asserts the viewport is
+  // present), so callers can bail safely during a teardown/rebuild.
+  xt.CellOffset? _cellAtGlobal(Offset globalPosition) {
+    final state = _terminalViewKey.currentState;
+    if (state == null) return null;
+    try {
+      final render = state.renderTerminal;
+      return render.getCellOffset(render.globalToLocal(globalPosition));
+    } catch (_) {
+      return null;
+    }
+  }
+
   // Track a shift+primary press (keyed by pointer id) so pointer-up can tell a
   // shift-click from a drag. xterm's own tap-down clears any live selection
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
     _focusTerminal();
-    if (HardwareKeyboard.instance.isShiftPressed &&
-        (event.buttons & kPrimaryButton) != 0) {
+    if ((event.buttons & kPrimaryButton) == 0) return;
+    if (HardwareKeyboard.instance.isShiftPressed) {
+      // Shift+primary: a click extends the existing selection on pointer-up.
       _shiftClickPointer = event.pointer;
       _shiftClickDownPosition = event.position;
+    } else {
+      // Plain primary: a potential drag-select. The anchor is the cell under the
+      // press; we don't start selecting until the pointer moves past the slop.
+      _dragPointer = event.pointer;
+      _dragDownPosition = event.position;
+      _dragLastPosition = event.position;
+      _dragAnchorCell = _cellAtGlobal(event.position);
+      _dragSelecting = false;
     }
+  }
+
+  void _handlePointerMove(PointerMoveEvent event) {
+    if (event.pointer != _dragPointer) return;
+    _dragLastPosition = event.position;
+    if (!_dragSelecting) {
+      final down = _dragDownPosition;
+      if (down == null) return;
+      if ((event.position - down).distance <= _clickMoveSlop) return;
+      _dragSelecting = true;
+    }
+    _updateAutoScroll(event.position);
+    _scheduleDragExtend();
   }
 
   // Shift-click (a click, not a drag) extends the selection to the clicked cell.
@@ -265,31 +327,126 @@ class _TerminalPaneState extends State<TerminalPane> {
   // 4.0.0; raw pointer handling also sidesteps the gesture arena, so normal
   // drag-select keeps working.
   void _handlePointerUp(PointerUpEvent event) {
+    if (event.pointer == _dragPointer) {
+      _endDrag();
+      return;
+    }
     if (event.pointer != _shiftClickPointer) return;
     final downPosition = _shiftClickDownPosition;
     _shiftClickPointer = null;
     _shiftClickDownPosition = null;
     if (downPosition == null) return;
     if ((event.position - downPosition).distance > _clickMoveSlop) return;
-    final state = _terminalViewKey.currentState;
-    if (state == null) return;
-    // renderTerminal asserts the viewport is mounted; it may not be if the
-    // pointer-up lands during a teardown/rebuild, so guard the access.
-    xt.CellOffset? target;
-    try {
-      final render = state.renderTerminal;
-      target = render.getCellOffset(render.globalToLocal(event.position));
-    } catch (_) {
-      return;
-    }
+    final target = _cellAtGlobal(event.position);
+    if (target == null) return;
     _extendSelectionTo(target);
   }
 
   void _handlePointerCancel(PointerCancelEvent event) {
+    if (event.pointer == _dragPointer) {
+      _endDrag();
+      return;
+    }
     if (event.pointer == _shiftClickPointer) {
       _shiftClickPointer = null;
       _shiftClickDownPosition = null;
     }
+  }
+
+  void _endDrag() {
+    _stopAutoScroll();
+    _dragPointer = null;
+    _dragDownPosition = null;
+    _dragLastPosition = null;
+    _dragAnchorCell = null;
+    _dragSelecting = false;
+  }
+
+  // Apply the drag selection (anchor -> current pointer cell) in a microtask, so
+  // it runs after xterm's own onDragUpdate within the same frame and wins. Deduped
+  // so multiple moves/ticks in one frame collapse to a single apply.
+  void _scheduleDragExtend() {
+    if (_dragExtendScheduled) return;
+    _dragExtendScheduled = true;
+    scheduleMicrotask(() {
+      _dragExtendScheduled = false;
+      _applyDragExtend();
+    });
+  }
+
+  void _applyDragExtend() {
+    if (!_dragSelecting) return;
+    final anchor = _dragAnchorCell;
+    final position = _dragLastPosition;
+    if (anchor == null || position == null) return;
+    final target = _cellAtGlobal(position);
+    if (target == null) return;
+    _applySelection(anchor, target);
+    // Keep the shift-click anchor in sync so a later shift-click extends from the
+    // drag's start, against the current buffer.
+    _selectionAnchor = anchor;
+    _selectionAnchorBuffer = _terminal.buffer;
+  }
+
+  // Set the auto-scroll velocity from how deep [globalPosition] is into the top or
+  // bottom edge zone, starting/stopping the ticker as needed.
+  void _updateAutoScroll(Offset globalPosition) {
+    final state = _terminalViewKey.currentState;
+    double velocity = 0;
+    if (state != null) {
+      try {
+        final render = state.renderTerminal;
+        final localY = render.globalToLocal(globalPosition).dy;
+        final height = render.size.height;
+        if (localY < _autoScrollEdge) {
+          final depth = ((_autoScrollEdge - localY) / _autoScrollEdge).clamp(
+            0.0,
+            1.0,
+          );
+          velocity = -depth * _autoScrollMaxStep;
+        } else if (localY > height - _autoScrollEdge) {
+          final depth =
+              ((localY - (height - _autoScrollEdge)) / _autoScrollEdge).clamp(
+                0.0,
+                1.0,
+              );
+          velocity = depth * _autoScrollMaxStep;
+        }
+      } catch (_) {
+        velocity = 0;
+      }
+    }
+    _autoScrollVelocity = velocity;
+    if (velocity == 0) {
+      _stopAutoScroll();
+    } else {
+      _autoScrollTimer ??= Timer.periodic(_autoScrollTick, _onAutoScrollTick);
+    }
+  }
+
+  void _onAutoScrollTick(Timer _) {
+    if (!_dragSelecting || _autoScrollVelocity == 0) {
+      _stopAutoScroll();
+      return;
+    }
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    final target = (position.pixels + _autoScrollVelocity).clamp(
+      0.0,
+      position.maxScrollExtent,
+    );
+    if (target != position.pixels) {
+      position.jumpTo(target);
+    }
+    // Re-extend at the (unchanged) pointer position against the new scroll
+    // offset so the selection grows as content scrolls under the held pointer.
+    _applyDragExtend();
+  }
+
+  void _stopAutoScroll() {
+    _autoScrollTimer?.cancel();
+    _autoScrollTimer = null;
+    _autoScrollVelocity = 0;
   }
 
   void _onTerminalOutput(String data) {
@@ -432,6 +589,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           padding: const EdgeInsets.all(22),
           child: Listener(
             onPointerDown: _handlePointerDown,
+            onPointerMove: _handlePointerMove,
             onPointerUp: _handlePointerUp,
             onPointerCancel: _handlePointerCancel,
             child: xt.TerminalView(
