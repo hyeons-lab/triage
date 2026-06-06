@@ -71,6 +71,21 @@ long time… it's correct if I resize it").
 
 ## Issues
 
+- 2026-06-05T20:35-0700 BOTH the replay approach and the redraw-jiggle approach failed
+  on a real device — layout still fragments after wake (user screenshots). Leading
+  hypothesis: on macOS the app is NOT backgrounded on display/system sleep, so
+  `didChangeAppLifecycleState(resumed)` never fires and neither fix ever ran.
+  Mitigations added this round:
+  - Wall-clock SLEEP WATCHDOG: a 4s `Timer.periodic` whose tick gap exceeds 30s implies
+    the process was frozen (system sleep) → triggers the same redraw jiggle. Independent
+    of Flutter lifecycle delivery.
+  - `[WAKEDBG]` diagnostics (const-gated `_wakeDebug`) across the lifecycle handler,
+    watchdog, redraw (entry/sizes/bail/jiggle-sent), `_onSessionViewFit` (real fitted
+    size vs `lastFittedCols`, to detect a stale-wide value driving the jiggle to the
+    wrong width), `_onWebSocketClosed`, and `_loadDaemonSessions` (reconnect→replay).
+  Next: read the device logs across a sleep/wake to learn which trigger fires and whether
+  the jiggle targets the correct width, then converge on the real fix and strip the
+  diagnostics.
 - 2026-06-05T19:45-0700 The test framework validates lifecycle transitions
   (`AppLifecycleListener`): direct `resumed→hidden` or `resumed→resumed` jumps throw
   "Invalid state transition". Fixed by driving the desktop-realistic path through
@@ -92,4 +107,5 @@ long time… it's correct if I resize it").
 
 ## Commits
 
-- HEAD — fix(client): redraw active terminal on app resume after occlusion
+- 9771fcf — fix(client): redraw active terminal on app resume after occlusion
+- HEAD — fix(client): add sleep watchdog + wake diagnostics for layout heal

@@ -310,14 +310,39 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   // True while the app is occluded (screen sleep / hidden / backgrounded). Gates
-  // the resume re-sync so we only reconcile width after genuine occlusion, not on
-  // every desktop focus change (which would re-attach + replay far too often).
+  // the resume redraw so we only repaint after genuine occlusion, not on every
+  // desktop focus change.
   bool _wasOccluded = false;
+
+  // Wall-clock watchdog for system sleep. macOS does not background a running app
+  // on display/system sleep, so the lifecycle hook may never fire — but the
+  // process IS frozen during system sleep, which stalls this periodic timer. A
+  // tick that arrives far later than its interval means we just woke; redraw then.
+  Timer? _wakeWatchdogTimer;
+  DateTime _lastWatchdogTick = DateTime.now();
+  static const Duration _wakeWatchdogInterval = Duration(seconds: 4);
+  static const Duration _wakeWatchdogGap = Duration(seconds: 30);
+
+  // Flip to false to silence wake diagnostics once the path is confirmed.
+  static const bool _wakeDebug = true;
+  void _wakeLog(String message) {
+    if (_wakeDebug) debugPrint('[WAKEDBG] $message');
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _lastWatchdogTick = DateTime.now();
+    _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
+      final now = DateTime.now();
+      final gap = now.difference(_lastWatchdogTick);
+      _lastWatchdogTick = now;
+      if (gap > _wakeWatchdogGap) {
+        _wakeLog('watchdog gap ${gap.inSeconds}s -> wake; redrawing active');
+        _redrawActiveSessionOnResume('watchdog');
+      }
+    });
     _clientId = _loadOrCreateClientId();
     _startCredentialStorageWatcher();
     _newSessionShell = newSessionShellMenuOrderForPlatform(
@@ -392,6 +417,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
+    _wakeLog('lifecycle -> $state (wasOccluded=$_wasOccluded)');
     switch (state) {
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
@@ -399,7 +425,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       case AppLifecycleState.resumed:
         if (_wasOccluded) {
           _wasOccluded = false;
-          _redrawActiveSessionOnResume();
+          _redrawActiveSessionOnResume('lifecycle');
         }
       case AppLifecycleState.inactive:
       case AppLifecycleState.detached:
@@ -415,14 +441,28 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // it render correctly and then switch to incorrect. A same-size resize sends no
   // SIGWINCH, so the jiggle guarantees a repaint even when the host already
   // believes it is at our size.
-  void _redrawActiveSessionOnResume() {
-    if (_disposed || !_client.isConnected || _sessions.isEmpty) return;
+  void _redrawActiveSessionOnResume(String trigger) {
+    if (_disposed || !_client.isConnected || _sessions.isEmpty) {
+      _wakeLog(
+        'redraw[$trigger] bail: disposed=$_disposed connected=${_client.isConnected} sessions=${_sessions.length}',
+      );
+      return;
+    }
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
-    if (!session.isRemote || session.status != 'attached') return;
+    if (!session.isRemote || session.status != 'attached') {
+      _wakeLog(
+        'redraw[$trigger] bail: remote=${session.isRemote} status=${session.status}',
+      );
+      return;
+    }
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
     final (rows, cols) = _currentReplayTerminalSize(session, null);
+    _wakeLog(
+      'redraw[$trigger] jiggle $sessionId to ${cols}x$rows '
+      '(lastFitted=${session.lastFittedCols}x${session.lastFittedRows})',
+    );
     if (cols < 2 || rows < 2) return;
     unawaited(() async {
       try {
@@ -437,7 +477,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           cols: cols,
           rows: rows,
         );
-      } catch (_) {}
+        _wakeLog('redraw[$trigger] jiggle sent ${cols}x$rows');
+      } catch (e) {
+        _wakeLog('redraw[$trigger] jiggle failed: $e');
+      }
     }());
   }
 
@@ -863,6 +906,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   Future<void> _loadDaemonSessions() async {
     if (!_client.isConnected) return;
+    _wakeLog('loadDaemonSessions (rebuilds sessions + replays history)');
 
     try {
       final sessionIds = await _client.listSessions();
@@ -1349,6 +1393,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
+    _wakeLog('ws closed (gen=$generation)');
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
@@ -1366,6 +1411,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void dispose() {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
+    _wakeWatchdogTimer?.cancel();
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
@@ -1389,6 +1435,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// live stream paint a clean frame. One-shot per attach so ordinary window
   /// resizes still self-heal through the live stream, not a re-snapshot.
   void _onSessionViewFit(SessionVm session, int cols, int rows) {
+    _wakeLog(
+      'viewFit ${_sessionIdFor(session)} ${cols}x$rows '
+      '(was ${session.lastFittedCols}x${session.lastFittedRows}, '
+      'hasFitted=${session.hasFitted})',
+    );
     session.lastFittedCols = cols;
     session.lastFittedRows = rows;
     session.noteViewFit(cols, rows);
