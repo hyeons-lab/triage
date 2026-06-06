@@ -124,6 +124,19 @@ long time… it's correct if I resize it").
   the `trigger` param, and all log call sites). Kept the sleep watchdog as a cheap
   lifecycle-independent fallback; the lifecycle hook is what fires in practice.
 
+## PR review (Copilot, PR #66)
+
+- 2026-06-05T22:10-0700 Guarded `_redrawActiveSessionOnResume` on `_clientInitialized`
+  before reading `_client.isConnected`. `_client` is `late` and only assigned by
+  `_connectWebSocket`; in mock mode it is never set, so a resume could throw
+  `LateInitializationError`. Real bug — fixed.
+- 2026-06-05T22:10-0700 Reset `_lastWatchdogTick` in the `resumed` case so the watchdog's
+  next tick doesn't also see the sleep gap and heal a second time after the lifecycle
+  event already did. Harmless before (the jiggle is idempotent) but avoids a duplicate.
+- 2026-06-05T22:10-0700 Added explicit `break`s to the lifecycle `switch`. Copilot
+  claimed it "won't compile" — a false positive (Dart 3 cases don't fall through, and it
+  compiled/passed analyze + tests), but the explicit breaks remove the ambiguity.
+
 ## Verification
 
 - `flutter test` — 71 passed (70 prior + the new resume redraw test).
@@ -142,4 +155,5 @@ long time… it's correct if I resize it").
 - 9771fcf — fix(client): redraw active terminal on app resume after occlusion
 - d53e870 — fix(client): add sleep watchdog + wake diagnostics for layout heal
 - 17b3fde — fix(client): jiggle host to xterm's real render width on resume
-- HEAD — chore(client): strip wake diagnostics after confirming the fix
+- c1703a7 — chore(client): strip wake diagnostics after confirming the fix (rebased)
+- HEAD — fix(client): guard mock-mode resume + dedup watchdog (PR #66 review)

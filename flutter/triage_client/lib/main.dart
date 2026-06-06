@@ -414,11 +414,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
         _wasOccluded = true;
+        break;
       case AppLifecycleState.resumed:
         if (_wasOccluded) {
           _wasOccluded = false;
+          // The lifecycle event handles this wake; reset the watchdog baseline so
+          // its next tick doesn't also see the sleep gap and heal a second time.
+          _lastWatchdogTick = DateTime.now();
           _redrawActiveSessionOnResume();
         }
+        break;
       case AppLifecycleState.inactive:
       case AppLifecycleState.detached:
         break;
@@ -434,7 +439,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // SIGWINCH, so the jiggle guarantees a repaint even when the host already
   // believes it is at our size.
   void _redrawActiveSessionOnResume() {
-    if (_disposed || !_client.isConnected || _sessions.isEmpty) return;
+    // `_client` is `late` and only assigned by _connectWebSocket; in mock mode it
+    // is never set, so guard on _clientInitialized before touching it.
+    if (_disposed || !_clientInitialized || _sessions.isEmpty) return;
+    if (!_client.isConnected) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
     if (!session.isRemote || session.status != 'attached') return;
