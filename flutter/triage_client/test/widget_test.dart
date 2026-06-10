@@ -845,6 +845,43 @@ void main() {
     expect(resizesFor('flutter-spike'), baseline + 2);
   });
 
+  testWidgets('refocuses the active session when resuming after occlusion', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // The terminal pane refocuses its view whenever `focusCursorRevision`
+    // changes (see TerminalPane.didUpdateWidget); the real FocusNode lives on
+    // the xterm view, which is stubbed out under FLUTTER_TEST, so we assert on
+    // that revision — the contract the fix relies on — rather than raw focus.
+    int revision() =>
+        tester.widget<TerminalPane>(find.byType(TerminalPane)).focusCursorRevision;
+    final baseline = revision();
+
+    // A bare inactive→resumed cycle (desktop focus change, no occlusion) must
+    // NOT refocus — otherwise we'd steal focus on every app switch.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(revision(), baseline);
+
+    // Full occlusion (hidden) then resume bumps the revision so the pane
+    // re-requests focus and the session accepts input again without a manual
+    // session switch. Desktop walks through `inactive` on the way down and up.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(revision(), greaterThan(baseline));
+  });
+
   testWidgets(
     'marks replay pending while selected session snapshot refreshes',
     (WidgetTester tester) async {
