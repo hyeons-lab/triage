@@ -225,25 +225,30 @@ class _TerminalPaneState extends State<TerminalPane> {
               _sendInput('\t');
             }
           } else if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
+            // Prefer xterm.js's own selection: it rebuilds the row text from the
+            // buffer with the inter-column spaces intact. The browser-native
+            // window.getSelection() serializes the DOM-renderer's per-cell spans
+            // instead, which concatenates the columns and drops those spaces —
+            // so only fall back to it when xterm has no selection of its own.
             var selection = '';
-            final selectionObj = html.window.getSelection();
-            if (selectionObj != null) {
-              try {
-                selection =
-                    js_util.callMethod(selectionObj, 'toString', [])
-                        as String? ??
-                    '';
-              } catch (_) {}
-            }
-            if (selection == 'Instance of \'Selection\'') {
-              selection = '';
-            }
+            try {
+              selection =
+                  js_util.callMethod(_term, 'getSelection', []) as String? ??
+                  '';
+            } catch (_) {}
             if (selection.isEmpty) {
-              try {
-                selection =
-                    js_util.callMethod(_term, 'getSelection', []) as String? ??
-                    '';
-              } catch (_) {}
+              final selectionObj = html.window.getSelection();
+              if (selectionObj != null) {
+                try {
+                  selection =
+                      js_util.callMethod(selectionObj, 'toString', [])
+                          as String? ??
+                      '';
+                } catch (_) {}
+              }
+              if (selection == 'Instance of \'Selection\'') {
+                selection = '';
+              }
             }
             if (selection.isNotEmpty) {
               event.preventDefault();
