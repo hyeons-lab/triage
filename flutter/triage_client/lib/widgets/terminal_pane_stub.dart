@@ -1,10 +1,20 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/gestures.dart' show kPrimaryButton;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show HardwareKeyboard;
+import 'package:flutter/services.dart'
+    show
+        Clipboard,
+        ClipboardData,
+        HardwareKeyboard,
+        KeyDownEvent,
+        KeyEvent,
+        LogicalKeyboardKey;
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
+import 'package:triage_client/terminal/terminal_selection.dart';
 import 'terminal_pane.dart';
 
 /// Native terminal view. A thin presentation layer over the persistent
@@ -542,6 +552,48 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
   }
 
+  // xterm.dart copies selected text via BufferLine.getText, which drops every
+  // blank (codePoint 0) cell — so columns a TUI lays out by moving the cursor
+  // (rather than writing literal spaces) concatenate on copy. Intercept the
+  // copy chord before xterm's shortcut manager runs (TerminalView.onKeyEvent
+  // short-circuits it when we return a non-ignored result) and rebuild the text
+  // with the gap spaces restored. Returning `ignored` for everything else
+  // leaves xterm's normal key handling — including Ctrl+C -> SIGINT — untouched.
+  KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.keyC) {
+      return KeyEventResult.ignored;
+    }
+    if (!_isCopyChord()) return KeyEventResult.ignored;
+    final selection = _xtermController.selection;
+    if (selection == null) return KeyEventResult.ignored;
+    final text = terminalSelectionText(_terminal.buffer, selection);
+    if (text.isEmpty) return KeyEventResult.ignored;
+    Clipboard.setData(ClipboardData(text: text));
+    _xtermController.clearSelection();
+    return KeyEventResult.handled;
+  }
+
+  // The platform copy chord, matching xterm's defaultTerminalShortcuts so plain
+  // Ctrl+C still reaches the program as SIGINT: meta-only on Apple platforms,
+  // control+shift elsewhere.
+  bool _isCopyChord() {
+    final keys = HardwareKeyboard.instance;
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.macOS:
+      case TargetPlatform.iOS:
+        return keys.isMetaPressed &&
+            !keys.isControlPressed &&
+            !keys.isAltPressed &&
+            !keys.isShiftPressed;
+      default:
+        return keys.isControlPressed &&
+            keys.isShiftPressed &&
+            !keys.isMetaPressed &&
+            !keys.isAltPressed;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // Detect if we are running inside a widget test environment to preserve
@@ -614,6 +666,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               focusNode: _focusNode,
               autofocus: true,
               scrollController: _scrollController,
+              onKeyEvent: _handleTerminalKeyEvent,
               textStyle: _textStyle,
               // Use the hardware-keyboard path instead of xterm's hidden IME
               // TextInput connection. On macOS desktop the IME path desyncs
