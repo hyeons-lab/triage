@@ -1,4 +1,7 @@
-# 000061 — fix: terminal copy preserves spaces (native client)
+# 000062 — fix: terminal copy preserves spaces (native client)
+
+> Renumbered from 000061 → 000062 to avoid colliding with PR #68's
+> `000061-selection-autoscroll`, which claimed the number first.
 
 **Agent:** Claude (claude-opus-4-8) @ argus branch fix/terminal-copy-preserves-spaces
 
@@ -80,6 +83,11 @@ to the **web** client, which had a latent variant of the bug.
   automated coverage: the web pane is conditionally imported behind
   `dart.library.js_util` and needs a browser with xterm.js loaded; verified by
   `flutter analyze` only, pending manual check in a browser.
+- 2026-06-10T07:17-0700 (PR #69 review) `terminal_pane_stub.dart` — wrapped the
+  fire-and-forget `Clipboard.setData` in `unawaited(...)` (`dart:async`) so the
+  synchronous key handler does not leave a dangling future
+  (`unawaited_futures`). Renumbered this devlog 000061 → 000062 to avoid a
+  number collision with PR #68's `000061-selection-autoscroll`.
 
 ## Issues
 
@@ -96,4 +104,5 @@ to the **web** client, which had a latent variant of the bug.
 ## Commits
 
 - 5883345 — fix(client): preserve spaces when copying terminal selection
-- HEAD — fix(client): prefer xterm.js getSelection on web to keep spaces
+- 270a7f1 — fix(client): prefer xterm.js getSelection on web to keep spaces
+- HEAD — fix(client): unawait clipboard write; renumber devlog (PR #69 review)

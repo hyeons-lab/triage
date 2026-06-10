@@ -569,7 +569,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (selection == null) return KeyEventResult.ignored;
     final text = terminalSelectionText(_terminal.buffer, selection);
     if (text.isEmpty) return KeyEventResult.ignored;
-    Clipboard.setData(ClipboardData(text: text));
+    // Fire-and-forget: the handler is synchronous, so detach the clipboard
+    // write rather than leaving a dangling future (unawaited_futures).
+    unawaited(Clipboard.setData(ClipboardData(text: text)));
     _xtermController.clearSelection();
     return KeyEventResult.handled;
   }
