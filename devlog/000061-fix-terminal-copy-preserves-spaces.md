@@ -6,7 +6,8 @@
 
 Copying selected text from a terminal session in the **native** Flutter client
 strips the spaces — words and columns run together ("everything is concatenated
-without spaces"). The web client is unaffected. Restore the spaces on copy.
+without spaces"). Restore the spaces on copy. A follow-up applied the same fix
+to the **web** client, which had a latent variant of the bug.
 
 ## Research & Discoveries
 
@@ -49,6 +50,12 @@ without spaces"). The web client is unaffected. Restore the spaces on copy.
 - 2026-06-09T23:58-0700 Copy chord mirrors xterm's `defaultTerminalShortcuts`
   (meta-only on Apple, control+shift elsewhere) so plain Ctrl+C → SIGINT is
   untouched.
+- 2026-06-10T06:10-0700 Web: flip the copy source priority to prefer xterm.js's
+  own `getSelection()` over `window.getSelection()`. No renderer addon is loaded
+  so xterm.js uses its default DOM renderer; `window.getSelection().toString()`
+  serializes the per-cell row spans and drops the inter-column spaces, while
+  xterm.js rebuilds the row text from the buffer with spaces intact. The
+  browser-native selection stays as a fallback for when xterm has no selection.
 
 ## What Changed
 
@@ -67,6 +74,12 @@ without spaces"). The web client is unaffected. Restore the spaces on copy.
   — unit tests for interior gaps, trailing-blank trimming, literal-space
   preservation, wide-glyph handling, sub-ranges, and a real-`Terminal`
   integration case (cursor-move gap + multi-row newline join).
+- 2026-06-10T06:10-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`
+  — Ctrl/Cmd+C handler now reads xterm.js `getSelection()` first and only falls
+  back to `window.getSelection()` when xterm reports nothing selected. No
+  automated coverage: the web pane is conditionally imported behind
+  `dart.library.js_util` and needs a browser with xterm.js loaded; verified by
+  `flutter analyze` only, pending manual check in a browser.
 
 ## Issues
 
@@ -82,4 +95,5 @@ without spaces"). The web client is unaffected. Restore the spaces on copy.
 
 ## Commits
 
-- HEAD — fix(client): preserve spaces when copying terminal selection
+- 5883345 — fix(client): preserve spaces when copying terminal selection
+- HEAD — fix(client): prefer xterm.js getSelection on web to keep spaces
