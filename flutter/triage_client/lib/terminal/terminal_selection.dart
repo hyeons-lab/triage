@@ -7,8 +7,11 @@ import 'package:xterm/xterm.dart' as xt;
 /// blank cells a program leaves behind when it lays out columns by *moving the
 /// cursor* (`ESC[C`, a tab, `ESC[G`) instead of writing literal spaces vanish on
 /// copy and the visible columns concatenate. ratatui-style TUIs (e.g. Claude
-/// Code) render exactly this way. xterm.js backfills those nulls with spaces,
-/// which is why only the native client is affected.
+/// Code) render exactly this way. This helper is the native (xterm.dart)
+/// counterpart of the web copy path: xterm.js's own `getSelection()` already
+/// backfills those nulls with spaces, so on web the fix is to prefer it over
+/// the browser's DOM selection rather than to reconstruct text here (see
+/// `terminal_pane_web.dart`).
 ///
 /// The output is a strict superset of `Buffer.getText`'s: glyph cells (literal
 /// spaces included) are written verbatim, interior blank cells become a single

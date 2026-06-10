@@ -88,6 +88,18 @@ to the **web** client, which had a latent variant of the bug.
   synchronous key handler does not leave a dangling future
   (`unawaited_futures`). Renumbered this devlog 000061 → 000062 to avoid a
   number collision with PR #68's `000061-selection-autoscroll`.
+- 2026-06-10T10:09-0700 (PR #69 review, 2nd pass) `terminal_selection.dart` —
+  reworded the doc comment that said "only the native client is affected": the
+  helper is the native (xterm.dart) counterpart of the web copy path, and web
+  has its own fix (prefer xterm.js `getSelection()` over the DOM selection), so
+  the old wording wrongly implied web copy could never be affected. Rebased the
+  branch onto `origin/main` after #68 merged (clean; #68's drag code and this
+  branch's copy handler occupy different regions of `terminal_pane_stub.dart`).
+- 2026-06-10T10:09-0700 (PR #69 review, 2nd pass) Declined the suggestion to add
+  `KeyEventResult` to the `flutter/services.dart` show-list: it is a
+  widgets-layer type (not exported by `services.dart`) and already resolves via
+  the unprefixed `package:flutter/material.dart` import — `flutter analyze` and
+  the full test suite confirm it compiles.
 
 ## Issues
 
@@ -103,6 +115,10 @@ to the **web** client, which had a latent variant of the bug.
 
 ## Commits
 
-- 5883345 — fix(client): preserve spaces when copying terminal selection
-- 270a7f1 — fix(client): prefer xterm.js getSelection on web to keep spaces
-- HEAD — fix(client): unawait clipboard write; renumber devlog (PR #69 review)
+- 522ecd2 — fix(client): preserve spaces when copying terminal selection
+- 10187f2 — fix(client): prefer xterm.js getSelection on web to keep spaces
+- 26ae4a8 — fix(client): unawait clipboard write; renumber devlog (PR #69 review)
+- HEAD — docs(client): clarify selection helper scope (PR #69 review)
+
+> Hashes for the first three were rewritten by the rebase onto `origin/main`
+> after #68 merged; messages are stable.
