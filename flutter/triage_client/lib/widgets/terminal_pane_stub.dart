@@ -258,9 +258,15 @@ class _TerminalPaneState extends State<TerminalPane> {
       anchorCell.x.clamp(0, maxCol),
       anchorCell.y.clamp(0, lastRow),
     );
-    final extentX = targetCell.x >= safeAnchor.x
-        ? targetCell.x + 1
-        : targetCell.x;
+    // Forward/backward follows the full (row, col) order, not the column alone:
+    // a target on a later row is forward even when its column is smaller. xterm's
+    // selectCharacters adds 1 to the trailing column so the pointed cell is
+    // included; deciding that on column alone drops the last character of a
+    // diagonal forward (multi-row) selection.
+    final forward =
+        targetCell.y > safeAnchor.y ||
+        (targetCell.y == safeAnchor.y && targetCell.x >= safeAnchor.x);
+    final extentX = forward ? targetCell.x + 1 : targetCell.x;
     final extent = xt.CellOffset(extentX, targetCell.y.clamp(0, lastRow));
     _extendingSelection = true;
     try {

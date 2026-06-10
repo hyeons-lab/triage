@@ -62,6 +62,11 @@ assess web-pane parity.
   (`_cellAtGlobal` returns null during a teardown/rebuild), don't own the drag; let xterm
   handle it, rather than auto-scrolling with no pinned start (which would let the built-in
   selection drift).
+- 2026-06-10 `_applySelection` — decide forward/backward by the full (row, col) order, not
+  the column alone. xterm's `selectCharacters` adds 1 to the trailing column so the pointed
+  cell is included; the old `targetCell.x >= safeAnchor.x` test treated a diagonal forward
+  drag onto a later row with a smaller column as backward, dropping the last character of
+  the selection. (PR #68 review, second pass.)
 
 ## Verification
 
@@ -75,4 +80,5 @@ assess web-pane parity.
 ## Commits
 
 - 454817b — feat(client): drag-edge auto-scroll for terminal selection
-- HEAD — fix(client): guard drag-select against teardown races (PR #68 review)
+- 65f4639 — fix(client): guard drag-select against teardown races (PR #68 review)
+- HEAD — fix(client): include final cell on diagonal forward selection (PR #68 review)
