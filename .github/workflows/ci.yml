@@ -29,6 +29,9 @@ jobs:
         # actions/checkout@v5
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
+      - name: Check version consistency
+        run: ./scripts/bump-version.sh --check
+
       - name: Install Rust toolchain
         # dtolnay/rust-toolchain@v1
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
