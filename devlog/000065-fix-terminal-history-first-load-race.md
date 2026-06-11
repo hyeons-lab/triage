@@ -54,6 +54,30 @@ history. Cancelled+nulled in `_finishInitialContent`, in both stylesheet-reset
 paths (onLoad +150ms, 600ms fallback) so it re-arms for the fresh fit cycle, and
 in `dispose()`. `flutter analyze` clean.
 
+2026-06-11T08:40-0700 `lib/widgets/terminal_pane_web.dart` — addressed PR #72
+review (Copilot): `_writeInitialContent` re-read `rows`/`cols` from `_term` at
+finalize time, ignoring the size passed into `_finishInitialContent`. Under the
+churn the backstop guards against, `_term` can momentarily sit below the minimum
+grid; signaling that too-narrow size leaves the store unsized
+(`_reduceHistory`/`_reduceResize` skip below `kMinTerminalCols`/`kMinTerminalRows`),
+which suppresses the live-output flush. Added optional `overrideCols/overrideRows`
+to `_writeInitialContent`; `_finishInitialContent` now passes its validated
+`fittedCols/fittedRows` (the backstop only finalizes with a last fit ≥ minimums),
+so `onViewFit` and the daemon resize-out agree on the intended size. The
+re-replay path (`_triggerFullReplayOrReset`, content already written, layout
+settled) still re-reads `_term`, which is correct there.
+
+## Verification
+
+2026-06-11T08:40-0700 Built the real Flutter Web app and drove it headless
+(Playwright, `?mock=true`, reading `window.activeTerm.buffer`). Benign cold loads:
+8/8 render history on both branch and pre-fix main (a fixed viewport never
+triggers the race). Discriminator — continuous sub-250ms viewport churn (never
+switching sessions): pre-fix main NEVER renders during 4s of churn (bug
+reproduced); branch renders despite churn (backstop fires ~by t=2s), confirmed
+again after the Copilot fix.
+
 ## Commits
 
-HEAD — fix(client): force-finalize first-fit so session history renders on load
+HEAD — fix(client): use validated fit size when force-finalizing first-fit
+a3c492e — fix(client): force-finalize first-fit so session history renders on load

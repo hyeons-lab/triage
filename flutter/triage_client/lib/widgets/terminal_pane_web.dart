@@ -419,12 +419,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
-  void _writeInitialContent() {
+  void _writeInitialContent({int? overrideCols, int? overrideRows}) {
     // Signal the fitted size; the session replays its staged history through the
     // store -> controller -> this view's write listener at the real size. The
     // single source of truth is the raw byte stream, not styled-row rebuilds.
-    final fittedRows = (js_util.getProperty(_term, 'rows') as num).toInt();
-    final fittedCols = (js_util.getProperty(_term, 'cols') as num).toInt();
+    //
+    // Callers that already hold a validated size (the first-fit finalize, incl.
+    // the force-finalize backstop) pass it in so we don't re-read `_term` here:
+    // during the size churn the backstop guards against, `_term` can momentarily
+    // sit below the minimum grid, and signaling that too-narrow size leaves the
+    // store unsized — which suppresses the live-output flush. The re-replay path
+    // (content already written, layout settled) passes nothing and reads the
+    // real current size, which is what it wants.
+    final fittedRows =
+        overrideRows ?? (js_util.getProperty(_term, 'rows') as num).toInt();
+    final fittedCols =
+        overrideCols ?? (js_util.getProperty(_term, 'cols') as num).toInt();
     widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
@@ -617,7 +627,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _forceFinalizeTimer = null;
     _initialContentWritten = true;
-    _writeInitialContent();
+    _writeInitialContent(overrideCols: fittedCols, overrideRows: fittedRows);
     _flushPendingLiveWrites();
     _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
