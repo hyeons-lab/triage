@@ -119,6 +119,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   double? _stableWidth;
   double? _stableHeight;
   Timer? _stabilityTimer;
+  // Backstop for the first-fit handshake: armed once at the first valid sized
+  // fit and NOT reset on subsequent size changes, unlike _stabilityTimer. If
+  // the size never holds still long enough for the stability debounce to fire,
+  // this force-finalizes the initial content (and thus calls onViewFit, which
+  // flushes the session's staged history) using the last fitted size.
+  Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
 
   @override
@@ -175,6 +181,8 @@ class _TerminalPaneState extends State<TerminalPane> {
                 _initialContentWritten = false;
                 _stableWidth = null;
                 _stableHeight = null;
+                _forceFinalizeTimer?.cancel();
+                _forceFinalizeTimer = null;
                 _triggerFitWithDelayedRetries();
               } catch (_) {}
             }
@@ -193,6 +201,8 @@ class _TerminalPaneState extends State<TerminalPane> {
               _initialContentWritten = false;
               _stableWidth = null;
               _stableHeight = null;
+              _forceFinalizeTimer?.cancel();
+              _forceFinalizeTimer = null;
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
@@ -603,6 +613,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _finishInitialContent(int fittedCols, int fittedRows) {
+    _stabilityTimer?.cancel();
+    _forceFinalizeTimer?.cancel();
+    _forceFinalizeTimer = null;
     _initialContentWritten = true;
     _writeInitialContent();
     _flushPendingLiveWrites();
@@ -660,6 +673,19 @@ class _TerminalPaneState extends State<TerminalPane> {
               // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
               return;
             }
+            // Backstop: arm once now that we have a valid sized fit. The
+            // stability debounce below restarts on every size change, so if the
+            // layout keeps nudging the size it may never fire within the
+            // one-shot retry ladder — leaving staged history unflushed until a
+            // resize/tab-switch. This deadline force-finalizes regardless.
+            _forceFinalizeTimer ??= Timer(const Duration(milliseconds: 800), () {
+              if (mounted &&
+                  !_initialContentWritten &&
+                  (_lastFittedRows ?? 0) >= 5 &&
+                  (_lastFittedCols ?? 0) >= 10) {
+                _finishInitialContent(_lastFittedCols!, _lastFittedRows!);
+              }
+            });
             final dWidth = width.toDouble();
             final dHeight = height.toDouble();
             if (_stableWidth != dWidth || _stableHeight != dHeight) {
@@ -832,6 +858,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void dispose() {
     _resizeDebounceTimer?.cancel();
     _stabilityTimer?.cancel();
+    _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _containerMouseDownSubscription.cancel();
