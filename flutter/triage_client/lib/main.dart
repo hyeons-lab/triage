@@ -334,6 +334,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _lastWatchdogTick = now;
       if (gap > _wakeWatchdogGap) {
         _redrawActiveSessionOnResume();
+        _refocusActiveSessionOnResume();
       }
     });
     _clientId = _loadOrCreateClientId();
@@ -422,6 +423,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // its next tick doesn't also see the sleep gap and heal a second time.
           _lastWatchdogTick = DateTime.now();
           _redrawActiveSessionOnResume();
+          _refocusActiveSessionOnResume();
         }
         break;
       case AppLifecycleState.inactive:
@@ -467,6 +469,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         await _client.resizeSession(sessionId: sessionId, cols: cols, rows: rows);
       } catch (_) {}
     }());
+  }
+
+  // Resuming from sleep/occlusion drops the terminal's keyboard focus, so the
+  // active session silently ignores input until the user switches sessions and
+  // back. Re-request focus here through the same channel that the session
+  // switch uses: bumping the session's focus revision makes the pane refocus on
+  // its next rebuild (honored by both the native and web panes). Kept separate
+  // from the resize-heal above so it also covers local / not-yet-attached
+  // sessions, which that path intentionally skips.
+  void _refocusActiveSessionOnResume() {
+    if (_disposed || !mounted || _sessions.isEmpty) return;
+    if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
+    setState(() {
+      _selectedSession.focusCursorOnNextDisplay();
+    });
   }
 
   String _loadOrCreateClientId() {
