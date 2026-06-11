@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "triage"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "triage-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "triage-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -3422,7 +3422,7 @@ dependencies = [
 
 [[package]]
 name = "triage-test-support"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
  "insta",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "triage-transport-ws"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3447,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "triaged"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bytes",
