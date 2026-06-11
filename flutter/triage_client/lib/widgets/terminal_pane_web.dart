@@ -119,6 +119,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   double? _stableWidth;
   double? _stableHeight;
   Timer? _stabilityTimer;
+  // Backstop for the first-fit handshake: armed once at the first valid sized
+  // fit and NOT reset on subsequent size changes, unlike _stabilityTimer. If
+  // the size never holds still long enough for the stability debounce to fire,
+  // this force-finalizes the initial content (and thus calls onViewFit, which
+  // flushes the session's staged history) using the last fitted size.
+  Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
 
   @override
@@ -175,6 +181,8 @@ class _TerminalPaneState extends State<TerminalPane> {
                 _initialContentWritten = false;
                 _stableWidth = null;
                 _stableHeight = null;
+                _forceFinalizeTimer?.cancel();
+                _forceFinalizeTimer = null;
                 _triggerFitWithDelayedRetries();
               } catch (_) {}
             }
@@ -193,6 +201,8 @@ class _TerminalPaneState extends State<TerminalPane> {
               _initialContentWritten = false;
               _stableWidth = null;
               _stableHeight = null;
+              _forceFinalizeTimer?.cancel();
+              _forceFinalizeTimer = null;
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
@@ -409,12 +419,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
-  void _writeInitialContent() {
+  void _writeInitialContent({int? overrideCols, int? overrideRows}) {
     // Signal the fitted size; the session replays its staged history through the
     // store -> controller -> this view's write listener at the real size. The
     // single source of truth is the raw byte stream, not styled-row rebuilds.
-    final fittedRows = (js_util.getProperty(_term, 'rows') as num).toInt();
-    final fittedCols = (js_util.getProperty(_term, 'cols') as num).toInt();
+    //
+    // Callers that already hold a validated size (the first-fit finalize, incl.
+    // the force-finalize backstop) pass it in so we don't re-read `_term` here:
+    // during the size churn the backstop guards against, `_term` can momentarily
+    // sit below the minimum grid, and signaling that too-narrow size leaves the
+    // store unsized — which suppresses the live-output flush. The re-replay path
+    // (content already written, layout settled) passes nothing and reads the
+    // real current size, which is what it wants.
+    final fittedRows =
+        overrideRows ?? (js_util.getProperty(_term, 'rows') as num).toInt();
+    final fittedCols =
+        overrideCols ?? (js_util.getProperty(_term, 'cols') as num).toInt();
     widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
@@ -603,8 +623,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _finishInitialContent(int fittedCols, int fittedRows) {
+    _stabilityTimer?.cancel();
+    _forceFinalizeTimer?.cancel();
+    _forceFinalizeTimer = null;
     _initialContentWritten = true;
-    _writeInitialContent();
+    _writeInitialContent(overrideCols: fittedCols, overrideRows: fittedRows);
     _flushPendingLiveWrites();
     _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
@@ -660,6 +683,19 @@ class _TerminalPaneState extends State<TerminalPane> {
               // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
               return;
             }
+            // Backstop: arm once now that we have a valid sized fit. The
+            // stability debounce below restarts on every size change, so if the
+            // layout keeps nudging the size it may never fire within the
+            // one-shot retry ladder — leaving staged history unflushed until a
+            // resize/tab-switch. This deadline force-finalizes regardless.
+            _forceFinalizeTimer ??= Timer(const Duration(milliseconds: 800), () {
+              if (mounted &&
+                  !_initialContentWritten &&
+                  (_lastFittedRows ?? 0) >= 5 &&
+                  (_lastFittedCols ?? 0) >= 10) {
+                _finishInitialContent(_lastFittedCols!, _lastFittedRows!);
+              }
+            });
             final dWidth = width.toDouble();
             final dHeight = height.toDouble();
             if (_stableWidth != dWidth || _stableHeight != dHeight) {
@@ -832,6 +868,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void dispose() {
     _resizeDebounceTimer?.cancel();
     _stabilityTimer?.cancel();
+    _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _containerMouseDownSubscription.cancel();
