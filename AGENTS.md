@@ -91,6 +91,21 @@ Every push to GitHub triggers CI. CI runs are expensive — minimize waste:
 - `cargo test --workspace` — run all tests
 - `cargo run -p triaged` — start the daemon (writes to `$HOME/.local/state/triage/triaged.log`)
 
+## Versioning and releases
+
+- The repo version is a single source of truth in the top-level `VERSION` file.
+- To change it, run `scripts/bump-version.sh <X.Y.Z>` — it writes `VERSION` and propagates
+  the number to `Cargo.toml` (`[workspace.package].version`, inherited by every crate via
+  `version.workspace = true`, plus the internal `[workspace.dependencies]` pins), refreshes
+  `Cargo.lock`, and updates `flutter/triage_client/pubspec.yaml` (the build name; the `+N`
+  build suffix is preserved). The Flutter build name surfaces in the desktop About panel.
+- Run with no argument to re-sync all files to the current `VERSION`; run `--check` to
+  verify there is no drift without writing (suitable for CI).
+- The publish workflow reads the version from `cargo metadata` (the `triaged` crate), so
+  Cargo remains authoritative for the `v<X.Y.Z>` tag and release assets; the script just
+  keeps `VERSION`, Cargo, and the Flutter client in lockstep.
+- Don't hand-edit version literals across these files — use the script so they can't drift.
+
 ## Style
 
 - No AI slop. Keep prose neutral and factual — no pitch-deck framing, epigraphs, or second-person scene-setting.

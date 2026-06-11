@@ -87,4 +87,5 @@ actions), #66 (heal terminal layout after sleep), #67 (shift-click extend select
 
 ## Commits
 
-- HEAD — chore: bump version to 0.1.5
+- 901b816 — chore: bump version to 0.1.5
+- HEAD — chore: add VERSION file and bump-version script
