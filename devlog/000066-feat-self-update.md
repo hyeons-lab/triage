@@ -30,6 +30,16 @@ latest GitHub release tag, and let the user update in place:
   `protocol_version`). One API, many transports.
 - 2026-06-11T22:22-0700 Add a handover protocol-version check with graceful
   fallback to persist-and-restart when old↔new daemon are incompatible.
+- 2026-06-11T22:41-0700 Plan revised after a code-grounded critical review (see
+  Issues). Self-update handover is rewritten around a health-gated, abortable
+  pre-flight with rollback intent; the incompatible-version fallback requires
+  explicit user confirmation (it kills live sessions). Update push uses a new
+  connection-level `ServerNotice`, not `SessionEventPayload`. Version check
+  defaults to `git ls-remote --tags` (no outbound TLS dep); asset URLs add TLS
+  only when downloading. Signing split into Phase 0b (minisign keys as CI
+  secrets) and is a prerequisite for download-install. Flutter in-app install
+  demoted to a later sub-phase gated on notarization; browser-download is the
+  default. Revisions captured in the plan's "Revisions" section.
 
 ## Research & Discoveries
 
@@ -53,6 +63,21 @@ latest GitHub release tag, and let the user update in place:
 
 See `devlog/plans/000066-01-self-update.md`.
 
+## Issues
+
+- 2026-06-11T22:41-0700 Critical review found two false assumptions in v1 of the
+  plan, verified against code: (1) no outbound HTTP/TLS client exists in `triaged`
+  (`hyper` is server-only; no `reqwest`/`rustls` in the workspace), so the GitHub
+  poll needs a new TLS stack — avoided for the version check by using `git
+  ls-remote`; (2) the event system is session-subscription-scoped only
+  (`EventPayload.subscription_id`), so a daemon-global update push needs a new
+  connection-level `ServerMessagePayload` variant, not `SessionEventPayload`.
+  Also surfaced: handover failure orphans live PTYs with no rollback (now
+  health-gated/abortable); persist-and-restart fallback silently kills sessions
+  (now requires confirmation); macOS in-app install fights Gatekeeper under
+  ad-hoc signing (now browser-download default). Full findings F1–F9 in the plan.
+
 ## Commits
 
-- (none yet — planning)
+- 63b9117 — docs(devlog): plan self-update & update notifications
+- HEAD — docs(devlog): revise self-update plan after critical review

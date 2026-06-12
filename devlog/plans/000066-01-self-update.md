@@ -196,3 +196,139 @@ browser" fallback if install fails.
 - PR 4: Phase 3 daemon self-update via handover + wire the TUI `U` action.
 - PR 5: Phase 5 Flutter banner + in-app install.
 - PR 6: Phase 6 docs/tests cleanup.
+
+---
+
+## Revisions (from critical review, 2026-06-11)
+
+This section supersedes the phases it names. The original plan above is kept for
+history; where they conflict, the revisions win. A code-grounded review surfaced
+that the plan systematically under-weighted failure modes and that two of its
+assumptions are false against the current codebase. Findings, then the revised
+phasing.
+
+### Findings that change the design
+
+- **F1 — A failed handover loses every live session; there is no rollback.** In
+  the 3-phase sync the old daemon tears down its readers on the successor's
+  adopt signal (`0x01`), *before* the successor proves it can serve. If the new
+  binary panics/misconfigures/links wrong after adopting FDs, the PTYs are
+  orphaned in a dead process. Acceptable for a rare manual `--handover`;
+  unacceptable for a routine auto-update button. **An updater whose failure mode
+  is "lose all your work" is not shippable.** Requires a health-gated, abortable
+  pre-flight before the point of no return.
+- **F2 — The "persist-and-restart" fallback also kills sessions.** Phase 8
+  persistence restores metadata + scrollback only; shell recreation is unbuilt
+  and arbitrary programs are never resurrected. So the incompatible-handover
+  fallback terminates every live shell/agent. It must be an explicit user
+  confirmation ("this update will end your running sessions — proceed?"), never
+  silent.
+- **F3 — macOS in-app install is likely infeasible with current signing.** The
+  release is ad-hoc signed; downloaded bundles get `com.apple.quarantine` and a
+  self-swapped relaunch hits Gatekeeper. Seamless install needs Developer ID +
+  notarization (absent today). Demote to browser-download default; gate in-app
+  install on a future signing/notarization prerequisite. Same class on Windows
+  (SmartScreen).
+- **F4 — The update event is at the wrong protocol layer (confirmed in schema).**
+  Events are entirely session-subscription-scoped (`EventPayload.subscription_id`);
+  there is no connection-level server push. A daemon-global update notice must be
+  a **new connection-level `ServerMessagePayload` variant** (e.g. `ServerNotice`),
+  not an entry in `SessionEventPayload`.
+- **F5 — There is no outbound HTTP/TLS client (confirmed in Cargo.toml).**
+  `triaged` has `hyper` with `server`+`http1` only; the workspace has no
+  `reqwest`/`rustls`/`ureq`. Polling `api.github.com` adds a full outbound TLS
+  stack + a mandatory `User-Agent`. Cheaper alternative for the *version* check:
+  `git ls-remote --tags` over the git protocol (no API limit, no TLS client);
+  only **asset download URLs** actually need the releases API.
+- **F6 — The handover-versioning migration is itself the breaking moment.**
+  `HandoverState` has no version field and uses plain `serde_json`. The first
+  version that adds `handover_protocol_version` must treat "field absent" as
+  "legacy/compatible" by construction; 0.1.5 can never be taught anything
+  retroactively.
+- **F7 — Signing is a subsystem, not a bullet.** Scheme undecided (prefer
+  **minisign/ed25519** over GPG — trivial Dart-side verification vs GPG's poor
+  Dart support). Keys are currently loose untracked files and must become CI
+  secrets; `private-key.asc` in the repo root is a latent leak to remove
+  regardless. Public key pinned at compile time → plan a rotation story.
+- **F8 — Successor daemonization + supervisor conflict.** The successor is
+  spawned as a child of the dying daemon and must `setsid`/detach/redirect stdio.
+  No launchd/systemd units ship today, but a supervised daemon would fight
+  handover-self-update (supervisor restarts the dead pid; port already held).
+  Document "if supervised, let the supervisor restart."
+- **F9 — Misc:** Linux glibc-vs-musl and macOS universal-vs-arch download
+  matching (silent footgun); state the daemon/client skew compat policy
+  explicitly (flatbuffers added-field forward-compat covers `HelloResult`); pick
+  the TUI update key against the reserved `g w`/`g a`/`g r` namespace; the Phase 3
+  two-binary handover integration test is a real test-infra effort; multi-OS/arch
+  Rust release builds materially grow CI minutes.
+
+### Revised guiding principle
+
+Ship value cheaply and safely first; gate the two high-risk capabilities
+(handover auto-update, in-app install) behind explicit prerequisites. Most of the
+value is the banner + a correct manual path; almost all the risk is in the
+seamless paths.
+
+### Revised phasing
+
+**Phase 0 — Release: prebuilt binaries + signing (split).**
+- 0a: build + attach prebuilt `triaged`/`triage` (+`triage-mcp`) per OS/arch,
+  documenting the asset-name convention. Address glibc/musl + macOS universal.
+- 0b (**prerequisite for any download-install**): signing infrastructure —
+  minisign keys as CI secrets, `.minisig` per asset, remove loose key files from
+  the working tree, decide key-pinning/rotation. Until 0b lands, download paths
+  verify checksums only and the daemon self-update prefers `cargo install`.
+
+**Phase 1 — Update check (revised per F5).** Default the *version* check to
+`git ls-remote --tags` (no new TLS dep). Add an outbound TLS client *only* when
+asset URLs are needed for download, and isolate it behind a feature/module. ETag
+where applicable, N-hour interval, `User-Agent`, non-blocking, failures swallowed.
+
+**Phase 2 — Surface (revised per F4).** Add `server_version` + `UpdateInfo` to
+`HelloResult`, and a new connection-level `ServerNotice` variant on
+`ServerMessagePayload` for mid-session pushes — *not* `SessionEventPayload`.
+State the skew compat policy in the PR.
+
+**Phase 3 — Daemon self-update via health-gated, abortable handover (rewritten;
+supersedes original Phase 3; addresses F1, F2, F6, F8).**
+1. Pre-flight: place the new binary, then spawn it in a **probe mode** that binds
+   a throwaway socket and self-checks *without* requesting FD adoption. Only on a
+   healthy probe does the real `--handover` proceed. If the probe fails, abort —
+   the running daemon never tore anything down; report the error.
+2. Add `handover_protocol_version` to the handover handshake with the F6 migration
+   rule (absent ⇒ legacy/compatible). On mismatch, **do not** silently fall back —
+   return "incompatible; updating will end live sessions" and require explicit
+   user confirmation (F2) before any persist-and-restart.
+3. Rollback intent: structure the sync so that until the successor confirms it is
+   serving, the old daemon can still resume. (Full crash-after-adopt recovery is
+   bounded by the existing protocol; document the residual risk window honestly.)
+4. Daemonize the successor (`setsid`/detach/stdio) so it survives the parent's
+   exit (F8). Detect supervised launch and defer to the supervisor instead.
+5. `update_now` IPC action streams progress; binary acquisition = verified
+   prebuilt download (checksum now, signature after 0b) else `cargo install
+   --force`, placed at `current_exe()` via temp+rename, failing closed if the
+   exec path is not writable.
+6. Tests: probe-fail aborts with sessions intact; incompatible-version path
+   requires confirmation; happy path preserves a live session across the swap.
+
+**Phase 4 — TUI banner (unchanged), plus:** the `U`-equivalent action routes
+through the Phase 3 pre-flight; show the explicit session-loss confirmation when
+the path is the killing fallback. Pick the key against the reserved namespace.
+
+**Phase 5 — Flutter (revised per F3).** Banner + **browser-download as the
+default** ("Update" opens the matching release asset/page via `url_launcher`).
+In-app download + install + relaunch is a **later sub-phase gated on Phase 0b
+notarization**; until then it is opt-in/experimental with the browser fallback
+always available. Web → reload affordance; mobile → banner only.
+
+**Phase 6 — Docs/tests (unchanged), plus:** document the skew compat policy, the
+supervised-daemon guidance, and the residual crash-window risk of in-place
+upgrade.
+
+### Revised PR slicing
+- PR 1: Phase 0a (prebuilt binaries, checksums) — independently shippable.
+- PR 2: Phases 1–2 (check via `ls-remote` + `HelloResult`/`ServerNotice`).
+- PR 3: Phase 4 read-only TUI banner.
+- PR 4: Phase 0b signing + Phase 3 health-gated handover self-update.
+- PR 5: Phase 5 Flutter banner + browser-download (in-app install deferred).
+- PR 6: docs/tests; in-app install only after notarization exists.
