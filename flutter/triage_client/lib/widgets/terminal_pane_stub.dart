@@ -14,6 +14,7 @@ import 'package:flutter/services.dart'
         LogicalKeyboardKey;
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
+import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'terminal_pane.dart';
 
@@ -63,6 +64,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
+
+  // Keeps the viewport pinned to a scrollback line while the user is scrolled
+  // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
+  final TerminalScrollAnchor _scrollAnchor = TerminalScrollAnchor();
+  // True while we drive `_scrollController` ourselves, so the resulting scroll
+  // notification doesn't re-capture the anchor from our own correction.
+  bool _suppressAnchorCapture = false;
+  bool _repinScheduled = false;
+
   Timer? _resizeOutDebounceTimer;
   Timer? _scrollToCursorTimer;
   int? _pendingResizeOutCols;
@@ -162,6 +172,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void initState() {
     super.initState();
     widget.onTerminalResizeBind?.call(_onTerminalResize);
+    _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
     widget.controller.addFitListener(_onFit);
     _xtermController.addListener(_recordSelectionAnchor);
@@ -176,10 +187,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   // didUpdateWidget can't leave the new terminal's onOutput null.
   void _bindTerminal(xt.Terminal terminal) {
     terminal.onOutput = _onTerminalOutput;
+    terminal.addListener(_onTerminalContentChanged);
   }
 
   void _unbindTerminal(xt.Terminal terminal) {
     terminal.onOutput = null;
+    terminal.removeListener(_onTerminalContentChanged);
   }
 
   @override
@@ -198,6 +211,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _selectionAnchorBuffer = null;
       _shiftClickPointer = null;
       _shiftClickDownPosition = null;
+      // The scroll anchor pointed at the old terminal's buffer line; drop it so
+      // the new session starts following the bottom.
+      _scrollAnchor.clear();
       _endDrag();
       _scrollToCursor(requestFocus: true);
     }
@@ -217,6 +233,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.removeFitListener(_onFit);
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.dispose();
+    _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
     _focusNode.dispose();
     _resizeOutDebounceTimer?.cancel();
@@ -533,6 +550,72 @@ class _TerminalPaneState extends State<TerminalPane> {
     _lastResizeOutCols = cols;
     _lastResizeOutRows = rows;
     widget.controller.sendResizeOut(cols, rows);
+  }
+
+  // --- Scroll anchoring: keep the viewport stable across scrollback trims ---
+
+  /// Height of one rendered terminal line in pixels, or null if the view isn't
+  /// laid out yet (the render object asserts a present viewport).
+  double? _lineHeight() {
+    final state = _terminalViewKey.currentState;
+    if (state == null) return null;
+    try {
+      return state.renderTerminal.lineHeight;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // The user scrolled: pin to the buffer line at the top of the viewport, or
+  // clear the anchor when at the bottom so xterm.dart's stick-to-bottom follows
+  // new output. Ignored for our own corrections and during drag-select.
+  void _onScrollChanged() {
+    if (_suppressAnchorCapture || _dragSelecting) return;
+    _captureScrollAnchor();
+  }
+
+  void _captureScrollAnchor() {
+    if (!_scrollController.hasClients) return;
+    final lineHeight = _lineHeight();
+    if (lineHeight == null) return;
+    final position = _scrollController.position;
+    _scrollAnchor.capture(
+      buffer: _terminal.buffer,
+      pixels: position.pixels,
+      maxScrollExtent: position.maxScrollExtent,
+      lineHeight: lineHeight,
+    );
+  }
+
+  void _onTerminalContentChanged() {
+    // Re-pin after xterm.dart's layout has applied the new content dimensions;
+    // coalesce bursts of writes into one correction per frame. No anchor means
+    // we're following the bottom and xterm.dart already handles it.
+    if (!_scrollAnchor.hasAnchor || _repinScheduled) return;
+    _repinScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _repinScheduled = false;
+      _repinScrollAnchor();
+    });
+  }
+
+  // Re-pin the viewport to the anchored buffer line. As lines trim off the top
+  // the line's `index` drops, so jumping to `index * lineHeight` cancels the
+  // drift that would otherwise scroll the user's content out from under them.
+  void _repinScrollAnchor() {
+    if (!mounted || !_scrollController.hasClients) return;
+    final lineHeight = _lineHeight();
+    if (lineHeight == null) return;
+    final position = _scrollController.position;
+    final desired = _scrollAnchor.desiredOffset(
+      maxScrollExtent: position.maxScrollExtent,
+      lineHeight: lineHeight,
+    );
+    if (desired == null) return;
+    if ((desired - position.pixels).abs() < 0.5) return;
+    _suppressAnchorCapture = true;
+    position.jumpTo(desired);
+    _suppressAnchorCapture = false;
   }
 
   void _scrollToCursor({required bool requestFocus}) {
