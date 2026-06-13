@@ -18,6 +18,7 @@ pub struct Config {
     pub grpc: GrpcConfig,
     pub approval: ApprovalConfig,
     pub keybindings: KeybindingsConfig,
+    pub summarizer: SummarizerConfig,
 }
 
 impl Config {
@@ -51,6 +52,7 @@ impl Config {
         self.grpc.validate()?;
         self.approval.validate()?;
         self.keybindings.validate()?;
+        self.summarizer.validate()?;
         Ok(())
     }
 }
@@ -325,6 +327,66 @@ impl Default for KeybindingsConfig {
     }
 }
 
+/// Local-LLM session summarizer: generates a short one-line description of what
+/// each session is doing, shown in the client's side rail.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SummarizerConfig {
+    /// Master switch. When false, no model is loaded and no snippets are produced.
+    pub enabled: bool,
+    /// LeapBundles bundle id, e.g. `LFM2.5-1.2B-Instruct-GGUF`.
+    pub bundle_id: String,
+    /// Quantization tag, e.g. `Q4_0`.
+    pub quant: String,
+    /// Inference context window (tokens). Kept small — we only summarize one screen.
+    pub context_size: u32,
+    /// Upper bound on generated tokens per snippet.
+    pub max_tokens: u32,
+    /// How long a session's output must be quiet before we (re)summarize it.
+    pub settle_ms: u64,
+    /// Minimum interval between regenerations for a single session.
+    pub min_regen_ms: u64,
+    /// Where to cache downloaded model files. `None` → `~/.cache/triage/models`.
+    pub cache_dir: Option<String>,
+}
+
+impl SummarizerConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        ensure_non_empty("summarizer.bundle_id", &self.bundle_id)?;
+        ensure_non_empty("summarizer.quant", &self.quant)?;
+        ensure!(
+            self.context_size > 0,
+            "summarizer.context_size must be greater than zero"
+        );
+        ensure!(
+            self.max_tokens > 0,
+            "summarizer.max_tokens must be greater than zero"
+        );
+        if let Some(ref dir) = self.cache_dir {
+            ensure_non_empty("summarizer.cache_dir", dir)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bundle_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+            quant: "Q4_0".to_string(),
+            context_size: 1024,
+            max_tokens: 24,
+            settle_ms: 1500,
+            min_regen_ms: 5000,
+            cache_dir: None,
+        }
+    }
+}
+
 fn parse_socket_addr(field: &str, value: &str) -> Result<SocketAddr> {
     ensure_non_empty(field, value)?;
     value
@@ -419,6 +481,10 @@ pause_all = "ctrl+p"
         assert_eq!(config.mcp.tcp_bind, "127.0.0.1:7778");
         assert!(!config.grpc.enabled);
         assert_eq!(config.keybindings.next_attention, "g w");
+        assert!(config.summarizer.enabled);
+        assert_eq!(config.summarizer.bundle_id, "LFM2.5-1.2B-Instruct-GGUF");
+        assert_eq!(config.summarizer.quant, "Q4_0");
+        assert_eq!(config.summarizer.context_size, 1024);
     }
 
     #[test]

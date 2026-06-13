@@ -6,6 +6,8 @@ library triage.generated;
 import 'dart:typed_data' show Uint8List;
 import 'package:flat_buffers/flat_buffers.dart' as fb;
 
+
+
 enum AttachMode {
   Observer(0),
   InteractiveController(1),
@@ -16,14 +18,10 @@ enum AttachMode {
 
   factory AttachMode.fromValue(int value) {
     switch (value) {
-      case 0:
-        return AttachMode.Observer;
-      case 1:
-        return AttachMode.InteractiveController;
-      case 2:
-        return AttachMode.AgentController;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return AttachMode.Observer;
+      case 1: return AttachMode.InteractiveController;
+      case 2: return AttachMode.AgentController;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -55,12 +53,9 @@ enum InputControllerKind {
 
   factory InputControllerKind.fromValue(int value) {
     switch (value) {
-      case 0:
-        return InputControllerKind.Interactive;
-      case 1:
-        return InputControllerKind.Agent;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return InputControllerKind.Interactive;
+      case 1: return InputControllerKind.Agent;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -69,8 +64,7 @@ enum InputControllerKind {
 
   static const int minValue = 0;
   static const int maxValue = 1;
-  static const fb.Reader<InputControllerKind> reader =
-      _InputControllerKindReader();
+  static const fb.Reader<InputControllerKind> reader = _InputControllerKindReader();
 }
 
 class _InputControllerKindReader extends fb.Reader<InputControllerKind> {
@@ -94,14 +88,10 @@ enum LeaseChangeAction {
 
   factory LeaseChangeAction.fromValue(int value) {
     switch (value) {
-      case 0:
-        return LeaseChangeAction.Acquired;
-      case 1:
-        return LeaseChangeAction.Released;
-      case 2:
-        return LeaseChangeAction.TakenOver;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return LeaseChangeAction.Acquired;
+      case 1: return LeaseChangeAction.Released;
+      case 2: return LeaseChangeAction.TakenOver;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -140,47 +130,32 @@ enum ClientRequestPayloadTypeId {
   SnapshotSessionRequest(12),
   StyledRowsRequestTable(13),
   ShutdownSessionRequest(14),
-  PairingChallengeRequest(15);
+  PairingChallengeRequest(15),
+  ListSessionSnippetsRequest(16);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
 
   factory ClientRequestPayloadTypeId.fromValue(int value) {
     switch (value) {
-      case 0:
-        return ClientRequestPayloadTypeId.NONE;
-      case 1:
-        return ClientRequestPayloadTypeId.HelloRequest;
-      case 2:
-        return ClientRequestPayloadTypeId.PairRequest;
-      case 3:
-        return ClientRequestPayloadTypeId.ListSessionsRequest;
-      case 4:
-        return ClientRequestPayloadTypeId.StartSessionRequestTable;
-      case 5:
-        return ClientRequestPayloadTypeId.AttachSessionRequestTable;
-      case 6:
-        return ClientRequestPayloadTypeId.SubscribeSessionEventsRequestTable;
-      case 7:
-        return ClientRequestPayloadTypeId.AcquireInputLeaseRequest;
-      case 8:
-        return ClientRequestPayloadTypeId.ReleaseInputLeaseRequest;
-      case 9:
-        return ClientRequestPayloadTypeId.WriteInputRequestTable;
-      case 10:
-        return ClientRequestPayloadTypeId.ResizeSessionRequestTable;
-      case 11:
-        return ClientRequestPayloadTypeId.RestoreSessionRequestTable;
-      case 12:
-        return ClientRequestPayloadTypeId.SnapshotSessionRequest;
-      case 13:
-        return ClientRequestPayloadTypeId.StyledRowsRequestTable;
-      case 14:
-        return ClientRequestPayloadTypeId.ShutdownSessionRequest;
-      case 15:
-        return ClientRequestPayloadTypeId.PairingChallengeRequest;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return ClientRequestPayloadTypeId.NONE;
+      case 1: return ClientRequestPayloadTypeId.HelloRequest;
+      case 2: return ClientRequestPayloadTypeId.PairRequest;
+      case 3: return ClientRequestPayloadTypeId.ListSessionsRequest;
+      case 4: return ClientRequestPayloadTypeId.StartSessionRequestTable;
+      case 5: return ClientRequestPayloadTypeId.AttachSessionRequestTable;
+      case 6: return ClientRequestPayloadTypeId.SubscribeSessionEventsRequestTable;
+      case 7: return ClientRequestPayloadTypeId.AcquireInputLeaseRequest;
+      case 8: return ClientRequestPayloadTypeId.ReleaseInputLeaseRequest;
+      case 9: return ClientRequestPayloadTypeId.WriteInputRequestTable;
+      case 10: return ClientRequestPayloadTypeId.ResizeSessionRequestTable;
+      case 11: return ClientRequestPayloadTypeId.RestoreSessionRequestTable;
+      case 12: return ClientRequestPayloadTypeId.SnapshotSessionRequest;
+      case 13: return ClientRequestPayloadTypeId.StyledRowsRequestTable;
+      case 14: return ClientRequestPayloadTypeId.ShutdownSessionRequest;
+      case 15: return ClientRequestPayloadTypeId.PairingChallengeRequest;
+      case 16: return ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -188,13 +163,11 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 15;
-  static const fb.Reader<ClientRequestPayloadTypeId> reader =
-      _ClientRequestPayloadTypeIdReader();
+  static const int maxValue = 16;
+  static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
-class _ClientRequestPayloadTypeIdReader
-    extends fb.Reader<ClientRequestPayloadTypeId> {
+class _ClientRequestPayloadTypeIdReader extends fb.Reader<ClientRequestPayloadTypeId> {
   const _ClientRequestPayloadTypeIdReader();
 
   @override
@@ -202,9 +175,7 @@ class _ClientRequestPayloadTypeIdReader
 
   @override
   ClientRequestPayloadTypeId read(fb.BufferContext bc, int offset) =>
-      ClientRequestPayloadTypeId.fromValue(
-        const fb.Uint8Reader().read(bc, offset),
-      );
+      ClientRequestPayloadTypeId.fromValue(const fb.Uint8Reader().read(bc, offset));
 }
 
 enum ServerResultPayloadTypeId {
@@ -220,41 +191,29 @@ enum ServerResultPayloadTypeId {
   SessionSnapshotResult(9),
   StyledRowsResult(10),
   CompletedSessionResult(11),
-  PairingChallengeResult(12);
+  PairingChallengeResult(12),
+  SessionSnippetsResult(13);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
 
   factory ServerResultPayloadTypeId.fromValue(int value) {
     switch (value) {
-      case 0:
-        return ServerResultPayloadTypeId.NONE;
-      case 1:
-        return ServerResultPayloadTypeId.UnitResult;
-      case 2:
-        return ServerResultPayloadTypeId.HelloResult;
-      case 3:
-        return ServerResultPayloadTypeId.PairedResult;
-      case 4:
-        return ServerResultPayloadTypeId.SessionIdsResult;
-      case 5:
-        return ServerResultPayloadTypeId.SessionIdResult;
-      case 6:
-        return ServerResultPayloadTypeId.AttachSessionResult;
-      case 7:
-        return ServerResultPayloadTypeId.SubscribedResult;
-      case 8:
-        return ServerResultPayloadTypeId.LeaseChangeResult;
-      case 9:
-        return ServerResultPayloadTypeId.SessionSnapshotResult;
-      case 10:
-        return ServerResultPayloadTypeId.StyledRowsResult;
-      case 11:
-        return ServerResultPayloadTypeId.CompletedSessionResult;
-      case 12:
-        return ServerResultPayloadTypeId.PairingChallengeResult;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return ServerResultPayloadTypeId.NONE;
+      case 1: return ServerResultPayloadTypeId.UnitResult;
+      case 2: return ServerResultPayloadTypeId.HelloResult;
+      case 3: return ServerResultPayloadTypeId.PairedResult;
+      case 4: return ServerResultPayloadTypeId.SessionIdsResult;
+      case 5: return ServerResultPayloadTypeId.SessionIdResult;
+      case 6: return ServerResultPayloadTypeId.AttachSessionResult;
+      case 7: return ServerResultPayloadTypeId.SubscribedResult;
+      case 8: return ServerResultPayloadTypeId.LeaseChangeResult;
+      case 9: return ServerResultPayloadTypeId.SessionSnapshotResult;
+      case 10: return ServerResultPayloadTypeId.StyledRowsResult;
+      case 11: return ServerResultPayloadTypeId.CompletedSessionResult;
+      case 12: return ServerResultPayloadTypeId.PairingChallengeResult;
+      case 13: return ServerResultPayloadTypeId.SessionSnippetsResult;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -262,13 +221,11 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 12;
-  static const fb.Reader<ServerResultPayloadTypeId> reader =
-      _ServerResultPayloadTypeIdReader();
+  static const int maxValue = 13;
+  static const fb.Reader<ServerResultPayloadTypeId> reader = _ServerResultPayloadTypeIdReader();
 }
 
-class _ServerResultPayloadTypeIdReader
-    extends fb.Reader<ServerResultPayloadTypeId> {
+class _ServerResultPayloadTypeIdReader extends fb.Reader<ServerResultPayloadTypeId> {
   const _ServerResultPayloadTypeIdReader();
 
   @override
@@ -276,9 +233,7 @@ class _ServerResultPayloadTypeIdReader
 
   @override
   ServerResultPayloadTypeId read(fb.BufferContext bc, int offset) =>
-      ServerResultPayloadTypeId.fromValue(
-        const fb.Uint8Reader().read(bc, offset),
-      );
+      ServerResultPayloadTypeId.fromValue(const fb.Uint8Reader().read(bc, offset));
 }
 
 enum SessionEventPayloadTypeId {
@@ -294,20 +249,13 @@ enum SessionEventPayloadTypeId {
 
   factory SessionEventPayloadTypeId.fromValue(int value) {
     switch (value) {
-      case 0:
-        return SessionEventPayloadTypeId.NONE;
-      case 1:
-        return SessionEventPayloadTypeId.ResyncRequiredEvent;
-      case 2:
-        return SessionEventPayloadTypeId.OutputEvent;
-      case 3:
-        return SessionEventPayloadTypeId.SnapshotEvent;
-      case 4:
-        return SessionEventPayloadTypeId.LeaseChangedEvent;
-      case 5:
-        return SessionEventPayloadTypeId.ExitedEvent;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return SessionEventPayloadTypeId.NONE;
+      case 1: return SessionEventPayloadTypeId.ResyncRequiredEvent;
+      case 2: return SessionEventPayloadTypeId.OutputEvent;
+      case 3: return SessionEventPayloadTypeId.SnapshotEvent;
+      case 4: return SessionEventPayloadTypeId.LeaseChangedEvent;
+      case 5: return SessionEventPayloadTypeId.ExitedEvent;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -316,12 +264,10 @@ enum SessionEventPayloadTypeId {
 
   static const int minValue = 0;
   static const int maxValue = 5;
-  static const fb.Reader<SessionEventPayloadTypeId> reader =
-      _SessionEventPayloadTypeIdReader();
+  static const fb.Reader<SessionEventPayloadTypeId> reader = _SessionEventPayloadTypeIdReader();
 }
 
-class _SessionEventPayloadTypeIdReader
-    extends fb.Reader<SessionEventPayloadTypeId> {
+class _SessionEventPayloadTypeIdReader extends fb.Reader<SessionEventPayloadTypeId> {
   const _SessionEventPayloadTypeIdReader();
 
   @override
@@ -329,9 +275,7 @@ class _SessionEventPayloadTypeIdReader
 
   @override
   SessionEventPayloadTypeId read(fb.BufferContext bc, int offset) =>
-      SessionEventPayloadTypeId.fromValue(
-        const fb.Uint8Reader().read(bc, offset),
-      );
+      SessionEventPayloadTypeId.fromValue(const fb.Uint8Reader().read(bc, offset));
 }
 
 enum ServerMessagePayloadTypeId {
@@ -339,25 +283,21 @@ enum ServerMessagePayloadTypeId {
   ResponsePayload(1),
   ErrorPayload(2),
   EventPayload(3),
-  SubscriptionClosedPayload(4);
+  SubscriptionClosedPayload(4),
+  SessionSnippetUpdatedPayload(5);
 
   final int value;
   const ServerMessagePayloadTypeId(this.value);
 
   factory ServerMessagePayloadTypeId.fromValue(int value) {
     switch (value) {
-      case 0:
-        return ServerMessagePayloadTypeId.NONE;
-      case 1:
-        return ServerMessagePayloadTypeId.ResponsePayload;
-      case 2:
-        return ServerMessagePayloadTypeId.ErrorPayload;
-      case 3:
-        return ServerMessagePayloadTypeId.EventPayload;
-      case 4:
-        return ServerMessagePayloadTypeId.SubscriptionClosedPayload;
-      default:
-        throw StateError('Invalid value $value for bit flag enum');
+      case 0: return ServerMessagePayloadTypeId.NONE;
+      case 1: return ServerMessagePayloadTypeId.ResponsePayload;
+      case 2: return ServerMessagePayloadTypeId.ErrorPayload;
+      case 3: return ServerMessagePayloadTypeId.EventPayload;
+      case 4: return ServerMessagePayloadTypeId.SubscriptionClosedPayload;
+      case 5: return ServerMessagePayloadTypeId.SessionSnippetUpdatedPayload;
+      default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
 
@@ -365,13 +305,11 @@ enum ServerMessagePayloadTypeId {
       value == null ? null : ServerMessagePayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 4;
-  static const fb.Reader<ServerMessagePayloadTypeId> reader =
-      _ServerMessagePayloadTypeIdReader();
+  static const int maxValue = 5;
+  static const fb.Reader<ServerMessagePayloadTypeId> reader = _ServerMessagePayloadTypeIdReader();
 }
 
-class _ServerMessagePayloadTypeIdReader
-    extends fb.Reader<ServerMessagePayloadTypeId> {
+class _ServerMessagePayloadTypeIdReader extends fb.Reader<ServerMessagePayloadTypeId> {
   const _ServerMessagePayloadTypeIdReader();
 
   @override
@@ -379,9 +317,7 @@ class _ServerMessagePayloadTypeIdReader
 
   @override
   ServerMessagePayloadTypeId read(fb.BufferContext bc, int offset) =>
-      ServerMessagePayloadTypeId.fromValue(
-        const fb.Uint8Reader().read(bc, offset),
-      );
+      ServerMessagePayloadTypeId.fromValue(const fb.Uint8Reader().read(bc, offset));
 }
 
 class SessionSize {
@@ -402,50 +338,6 @@ class SessionSize {
   String toString() {
     return 'SessionSize{rows: ${rows}, cols: ${cols}, pixelWidth: ${pixelWidth}, pixelHeight: ${pixelHeight}, dpi: ${dpi}}';
   }
-
-  SessionSizeT unpack() => SessionSizeT(
-    rows: rows,
-    cols: cols,
-    pixelWidth: pixelWidth,
-    pixelHeight: pixelHeight,
-    dpi: dpi,
-  );
-
-  static int pack(fb.Builder fbBuilder, SessionSizeT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SessionSizeT implements fb.Packable {
-  int rows;
-  int cols;
-  int pixelWidth;
-  int pixelHeight;
-  int dpi;
-
-  SessionSizeT({
-    required this.rows,
-    required this.cols,
-    required this.pixelWidth,
-    required this.pixelHeight,
-    required this.dpi,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    fbBuilder.putUint32(dpi);
-    fbBuilder.putUint32(pixelHeight);
-    fbBuilder.putUint32(pixelWidth);
-    fbBuilder.putUint32(cols);
-    fbBuilder.putUint32(rows);
-    return fbBuilder.offset;
-  }
-
-  @override
-  String toString() {
-    return 'SessionSizeT{rows: ${rows}, cols: ${cols}, pixelWidth: ${pixelWidth}, pixelHeight: ${pixelHeight}, dpi: ${dpi}}';
-  }
 }
 
 class _SessionSizeReader extends fb.StructReader<SessionSize> {
@@ -455,8 +347,8 @@ class _SessionSizeReader extends fb.StructReader<SessionSize> {
   int get size => 20;
 
   @override
-  SessionSize createObject(fb.BufferContext bc, int offset) =>
-      SessionSize._(bc, offset);
+  SessionSize createObject(fb.BufferContext bc, int offset) => 
+    SessionSize._(bc, offset);
 }
 
 class SessionSizeBuilder {
@@ -472,6 +364,7 @@ class SessionSizeBuilder {
     fbBuilder.putUint32(rows);
     return fbBuilder.offset;
   }
+
 }
 
 class SessionSizeObjectBuilder extends fb.ObjectBuilder {
@@ -487,11 +380,12 @@ class SessionSizeObjectBuilder extends fb.ObjectBuilder {
     required int pixelWidth,
     required int pixelHeight,
     required int dpi,
-  }) : _rows = rows,
-       _cols = cols,
-       _pixelWidth = pixelWidth,
-       _pixelHeight = pixelHeight,
-       _dpi = dpi;
+  })
+      : _rows = rows,
+        _cols = cols,
+        _pixelWidth = pixelWidth,
+        _pixelHeight = pixelHeight,
+        _dpi = dpi;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -512,7 +406,6 @@ class SessionSizeObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class TerminalCursor {
   TerminalCursor._(this._bc, this._bcOffset);
 
@@ -529,40 +422,6 @@ class TerminalCursor {
   String toString() {
     return 'TerminalCursor{row: ${row}, col: ${col}, visible: ${visible}}';
   }
-
-  TerminalCursorT unpack() =>
-      TerminalCursorT(row: row, col: col, visible: visible);
-
-  static int pack(fb.Builder fbBuilder, TerminalCursorT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class TerminalCursorT implements fb.Packable {
-  int row;
-  int col;
-  bool visible;
-
-  TerminalCursorT({
-    required this.row,
-    required this.col,
-    required this.visible,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    fbBuilder.pad(3);
-    fbBuilder.putBool(visible);
-    fbBuilder.putUint32(col);
-    fbBuilder.putUint32(row);
-    return fbBuilder.offset;
-  }
-
-  @override
-  String toString() {
-    return 'TerminalCursorT{row: ${row}, col: ${col}, visible: ${visible}}';
-  }
 }
 
 class _TerminalCursorReader extends fb.StructReader<TerminalCursor> {
@@ -572,8 +431,8 @@ class _TerminalCursorReader extends fb.StructReader<TerminalCursor> {
   int get size => 12;
 
   @override
-  TerminalCursor createObject(fb.BufferContext bc, int offset) =>
-      TerminalCursor._(bc, offset);
+  TerminalCursor createObject(fb.BufferContext bc, int offset) => 
+    TerminalCursor._(bc, offset);
 }
 
 class TerminalCursorBuilder {
@@ -588,6 +447,7 @@ class TerminalCursorBuilder {
     fbBuilder.putUint32(row);
     return fbBuilder.offset;
   }
+
 }
 
 class TerminalCursorObjectBuilder extends fb.ObjectBuilder {
@@ -599,9 +459,10 @@ class TerminalCursorObjectBuilder extends fb.ObjectBuilder {
     required int row,
     required int col,
     required bool visible,
-  }) : _row = row,
-       _col = col,
-       _visible = visible;
+  })
+      : _row = row,
+        _col = col,
+        _visible = visible;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -621,7 +482,6 @@ class TerminalCursorObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class TerminalColor {
   TerminalColor._(this._bc, this._bcOffset);
 
@@ -638,34 +498,6 @@ class TerminalColor {
   String toString() {
     return 'TerminalColor{red: ${red}, green: ${green}, blue: ${blue}}';
   }
-
-  TerminalColorT unpack() => TerminalColorT(red: red, green: green, blue: blue);
-
-  static int pack(fb.Builder fbBuilder, TerminalColorT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class TerminalColorT implements fb.Packable {
-  int red;
-  int green;
-  int blue;
-
-  TerminalColorT({required this.red, required this.green, required this.blue});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    fbBuilder.putUint8(blue);
-    fbBuilder.putUint8(green);
-    fbBuilder.putUint8(red);
-    return fbBuilder.offset;
-  }
-
-  @override
-  String toString() {
-    return 'TerminalColorT{red: ${red}, green: ${green}, blue: ${blue}}';
-  }
 }
 
 class _TerminalColorReader extends fb.StructReader<TerminalColor> {
@@ -675,8 +507,8 @@ class _TerminalColorReader extends fb.StructReader<TerminalColor> {
   int get size => 3;
 
   @override
-  TerminalColor createObject(fb.BufferContext bc, int offset) =>
-      TerminalColor._(bc, offset);
+  TerminalColor createObject(fb.BufferContext bc, int offset) => 
+    TerminalColor._(bc, offset);
 }
 
 class TerminalColorBuilder {
@@ -690,6 +522,7 @@ class TerminalColorBuilder {
     fbBuilder.putUint8(red);
     return fbBuilder.offset;
   }
+
 }
 
 class TerminalColorObjectBuilder extends fb.ObjectBuilder {
@@ -701,9 +534,10 @@ class TerminalColorObjectBuilder extends fb.ObjectBuilder {
     required int red,
     required int green,
     required int blue,
-  }) : _red = red,
-       _green = green,
-       _blue = blue;
+  })
+      : _red = red,
+        _green = green,
+        _blue = blue;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -722,7 +556,6 @@ class TerminalColorObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class TerminalStyle {
   TerminalStyle._(this._bc, this._bcOffset);
 
@@ -745,66 +578,6 @@ class TerminalStyle {
   String toString() {
     return 'TerminalStyle{foreground: ${foreground}, hasForeground: ${hasForeground}, background: ${background}, hasBackground: ${hasBackground}, bold: ${bold}, dim: ${dim}, italic: ${italic}, underline: ${underline}, reverse: ${reverse}}';
   }
-
-  TerminalStyleT unpack() => TerminalStyleT(
-    foreground: foreground.unpack(),
-    hasForeground: hasForeground,
-    background: background.unpack(),
-    hasBackground: hasBackground,
-    bold: bold,
-    dim: dim,
-    italic: italic,
-    underline: underline,
-    reverse: reverse,
-  );
-
-  static int pack(fb.Builder fbBuilder, TerminalStyleT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class TerminalStyleT implements fb.Packable {
-  TerminalColorT foreground;
-  bool hasForeground;
-  TerminalColorT background;
-  bool hasBackground;
-  bool bold;
-  bool dim;
-  bool italic;
-  bool underline;
-  bool reverse;
-
-  TerminalStyleT({
-    required this.foreground,
-    required this.hasForeground,
-    required this.background,
-    required this.hasBackground,
-    required this.bold,
-    required this.dim,
-    required this.italic,
-    required this.underline,
-    required this.reverse,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    fbBuilder.putBool(reverse);
-    fbBuilder.putBool(underline);
-    fbBuilder.putBool(italic);
-    fbBuilder.putBool(dim);
-    fbBuilder.putBool(bold);
-    fbBuilder.putBool(hasBackground);
-    background.pack(fbBuilder);
-    fbBuilder.putBool(hasForeground);
-    foreground.pack(fbBuilder);
-    return fbBuilder.offset;
-  }
-
-  @override
-  String toString() {
-    return 'TerminalStyleT{foreground: ${foreground}, hasForeground: ${hasForeground}, background: ${background}, hasBackground: ${hasBackground}, bold: ${bold}, dim: ${dim}, italic: ${italic}, underline: ${underline}, reverse: ${reverse}}';
-  }
 }
 
 class _TerminalStyleReader extends fb.StructReader<TerminalStyle> {
@@ -814,8 +587,8 @@ class _TerminalStyleReader extends fb.StructReader<TerminalStyle> {
   int get size => 13;
 
   @override
-  TerminalStyle createObject(fb.BufferContext bc, int offset) =>
-      TerminalStyle._(bc, offset);
+  TerminalStyle createObject(fb.BufferContext bc, int offset) => 
+    TerminalStyle._(bc, offset);
 }
 
 class TerminalStyleBuilder {
@@ -823,17 +596,7 @@ class TerminalStyleBuilder {
 
   final fb.Builder fbBuilder;
 
-  int finish(
-    fb.StructBuilder foreground,
-    bool hasForeground,
-    fb.StructBuilder background,
-    bool hasBackground,
-    bool bold,
-    bool dim,
-    bool italic,
-    bool underline,
-    bool reverse,
-  ) {
+  int finish(fb.StructBuilder foreground, bool hasForeground, fb.StructBuilder background, bool hasBackground, bool bold, bool dim, bool italic, bool underline, bool reverse) {
     fbBuilder.putBool(reverse);
     fbBuilder.putBool(underline);
     fbBuilder.putBool(italic);
@@ -845,6 +608,7 @@ class TerminalStyleBuilder {
     foreground();
     return fbBuilder.offset;
   }
+
 }
 
 class TerminalStyleObjectBuilder extends fb.ObjectBuilder {
@@ -868,15 +632,16 @@ class TerminalStyleObjectBuilder extends fb.ObjectBuilder {
     required bool italic,
     required bool underline,
     required bool reverse,
-  }) : _foreground = foreground,
-       _hasForeground = hasForeground,
-       _background = background,
-       _hasBackground = hasBackground,
-       _bold = bold,
-       _dim = dim,
-       _italic = italic,
-       _underline = underline,
-       _reverse = reverse;
+  })
+      : _foreground = foreground,
+        _hasForeground = hasForeground,
+        _background = background,
+        _hasBackground = hasBackground,
+        _bold = bold,
+        _dim = dim,
+        _italic = italic,
+        _underline = underline,
+        _reverse = reverse;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -901,7 +666,6 @@ class TerminalStyleObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class StyledSpan {
   StyledSpan._(this._bc, this._bcOffset);
   factory StyledSpan(List<int> bytes) {
@@ -914,44 +678,12 @@ class StyledSpan {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get text =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  TerminalStyle? get style =>
-      TerminalStyle.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  String? get text => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  TerminalStyle? get style => TerminalStyle.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'StyledSpan{text: ${text}, style: ${style}}';
-  }
-
-  StyledSpanT unpack() => StyledSpanT(text: text, style: style?.unpack());
-
-  static int pack(fb.Builder fbBuilder, StyledSpanT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class StyledSpanT implements fb.Packable {
-  String? text;
-  TerminalStyleT? style;
-
-  StyledSpanT({this.text, this.style});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? textOffset = text == null ? null : fbBuilder.writeString(text!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, textOffset);
-    if (style != null) {
-      fbBuilder.addStruct(1, style!.pack(fbBuilder));
-    }
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'StyledSpanT{text: ${text}, style: ${style}}';
   }
 }
 
@@ -959,8 +691,8 @@ class _StyledSpanReader extends fb.TableReader<StyledSpan> {
   const _StyledSpanReader();
 
   @override
-  StyledSpan createObject(fb.BufferContext bc, int offset) =>
-      StyledSpan._(bc, offset);
+  StyledSpan createObject(fb.BufferContext bc, int offset) => 
+    StyledSpan._(bc, offset);
 }
 
 class StyledSpanBuilder {
@@ -976,7 +708,6 @@ class StyledSpanBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addStyle(int offset) {
     fbBuilder.addStruct(1, offset);
     return fbBuilder.offset;
@@ -991,15 +722,17 @@ class StyledSpanObjectBuilder extends fb.ObjectBuilder {
   final String? _text;
   final TerminalStyleObjectBuilder? _style;
 
-  StyledSpanObjectBuilder({String? text, TerminalStyleObjectBuilder? style})
-    : _text = text,
-      _style = style;
+  StyledSpanObjectBuilder({
+    String? text,
+    TerminalStyleObjectBuilder? style,
+  })
+      : _text = text,
+        _style = style;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? textOffset = _text == null
-        ? null
+    final int? textOffset = _text == null ? null
         : fbBuilder.writeString(_text!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, textOffset);
@@ -1017,7 +750,6 @@ class StyledSpanObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class StyledRow {
   StyledRow._(this._bc, this._bcOffset);
   factory StyledRow(List<int> bytes) {
@@ -1030,42 +762,11 @@ class StyledRow {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  List<StyledSpan>? get spans => const fb.ListReader<StyledSpan>(
-    StyledSpan.reader,
-  ).vTableGetNullable(_bc, _bcOffset, 4);
+  List<StyledSpan>? get spans => const fb.ListReader<StyledSpan>(StyledSpan.reader).vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'StyledRow{spans: ${spans}}';
-  }
-
-  StyledRowT unpack() =>
-      StyledRowT(spans: spans?.map((e) => e.unpack()).toList());
-
-  static int pack(fb.Builder fbBuilder, StyledRowT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class StyledRowT implements fb.Packable {
-  List<StyledSpanT>? spans;
-
-  StyledRowT({this.spans});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? spansOffset = spans == null
-        ? null
-        : fbBuilder.writeList(spans!.map((b) => b.pack(fbBuilder)).toList());
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, spansOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'StyledRowT{spans: ${spans}}';
   }
 }
 
@@ -1073,8 +774,8 @@ class _StyledRowReader extends fb.TableReader<StyledRow> {
   const _StyledRowReader();
 
   @override
-  StyledRow createObject(fb.BufferContext bc, int offset) =>
-      StyledRow._(bc, offset);
+  StyledRow createObject(fb.BufferContext bc, int offset) => 
+    StyledRow._(bc, offset);
 }
 
 class StyledRowBuilder {
@@ -1099,17 +800,16 @@ class StyledRowBuilder {
 class StyledRowObjectBuilder extends fb.ObjectBuilder {
   final List<StyledSpanObjectBuilder>? _spans;
 
-  StyledRowObjectBuilder({List<StyledSpanObjectBuilder>? spans})
-    : _spans = spans;
+  StyledRowObjectBuilder({
+    List<StyledSpanObjectBuilder>? spans,
+  })
+      : _spans = spans;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? spansOffset = _spans == null
-        ? null
-        : fbBuilder.writeList(
-            _spans!.map((b) => b.getOrCreateOffset(fbBuilder)).toList(),
-          );
+    final int? spansOffset = _spans == null ? null
+        : fbBuilder.writeList(_spans!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, spansOffset);
     return fbBuilder.endTable();
@@ -1123,7 +823,6 @@ class StyledRowObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SessionContext {
   SessionContext._(this._bc, this._bcOffset);
   factory SessionContext(List<int> bytes) {
@@ -1136,58 +835,13 @@ class SessionContext {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get repositoryRoot =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get worktreeRoot =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
-  String? get branch =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get repositoryRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'SessionContext{repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
-  }
-
-  SessionContextT unpack() => SessionContextT(
-    repositoryRoot: repositoryRoot,
-    worktreeRoot: worktreeRoot,
-    branch: branch,
-  );
-
-  static int pack(fb.Builder fbBuilder, SessionContextT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SessionContextT implements fb.Packable {
-  String? repositoryRoot;
-  String? worktreeRoot;
-  String? branch;
-
-  SessionContextT({this.repositoryRoot, this.worktreeRoot, this.branch});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? repositoryRootOffset = repositoryRoot == null
-        ? null
-        : fbBuilder.writeString(repositoryRoot!);
-    final int? worktreeRootOffset = worktreeRoot == null
-        ? null
-        : fbBuilder.writeString(worktreeRoot!);
-    final int? branchOffset = branch == null
-        ? null
-        : fbBuilder.writeString(branch!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, repositoryRootOffset);
-    fbBuilder.addOffset(1, worktreeRootOffset);
-    fbBuilder.addOffset(2, branchOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SessionContextT{repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
   }
 }
 
@@ -1195,8 +849,8 @@ class _SessionContextReader extends fb.TableReader<SessionContext> {
   const _SessionContextReader();
 
   @override
-  SessionContext createObject(fb.BufferContext bc, int offset) =>
-      SessionContext._(bc, offset);
+  SessionContext createObject(fb.BufferContext bc, int offset) => 
+    SessionContext._(bc, offset);
 }
 
 class SessionContextBuilder {
@@ -1212,12 +866,10 @@ class SessionContextBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addWorktreeRootOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addBranchOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -1237,21 +889,19 @@ class SessionContextObjectBuilder extends fb.ObjectBuilder {
     String? repositoryRoot,
     String? worktreeRoot,
     String? branch,
-  }) : _repositoryRoot = repositoryRoot,
-       _worktreeRoot = worktreeRoot,
-       _branch = branch;
+  })
+      : _repositoryRoot = repositoryRoot,
+        _worktreeRoot = worktreeRoot,
+        _branch = branch;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? repositoryRootOffset = _repositoryRoot == null
-        ? null
+    final int? repositoryRootOffset = _repositoryRoot == null ? null
         : fbBuilder.writeString(_repositoryRoot!);
-    final int? worktreeRootOffset = _worktreeRoot == null
-        ? null
+    final int? worktreeRootOffset = _worktreeRoot == null ? null
         : fbBuilder.writeString(_worktreeRoot!);
-    final int? branchOffset = _branch == null
-        ? null
+    final int? branchOffset = _branch == null ? null
         : fbBuilder.writeString(_branch!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, repositoryRootOffset);
@@ -1268,7 +918,6 @@ class SessionContextObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SessionSnapshot {
   SessionSnapshot._(this._bc, this._bcOffset);
   factory SessionSnapshot(List<int> bytes) {
@@ -1282,131 +931,23 @@ class SessionSnapshot {
   final int _bcOffset;
 
   int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  int get bytesLogged =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
-  SessionSize? get size =>
-      SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 8);
-  List<String>? get visibleRows => const fb.ListReader<String>(
-    fb.StringReader(),
-  ).vTableGetNullable(_bc, _bcOffset, 10);
-  int get styledRowsStart =>
-      const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 12, 0);
-  List<StyledRow>? get styledRows => const fb.ListReader<StyledRow>(
-    StyledRow.reader,
-  ).vTableGetNullable(_bc, _bcOffset, 14);
-  TerminalCursor? get cursor =>
-      TerminalCursor.reader.vTableGetNullable(_bc, _bcOffset, 16);
-  String? get currentWorkingDirectory =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 18);
-  SessionContext? get context =>
-      SessionContext.reader.vTableGetNullable(_bc, _bcOffset, 20);
-  bool get bracketedPasteEnabled =>
-      const fb.BoolReader().vTableGet(_bc, _bcOffset, 22, false);
+  int get bytesLogged => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 8);
+  List<String>? get visibleRows => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 10);
+  int get styledRowsStart => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 12, 0);
+  List<StyledRow>? get styledRows => const fb.ListReader<StyledRow>(StyledRow.reader).vTableGetNullable(_bc, _bcOffset, 14);
+  TerminalCursor? get cursor => TerminalCursor.reader.vTableGetNullable(_bc, _bcOffset, 16);
+  String? get currentWorkingDirectory => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 18);
+  SessionContext? get context => SessionContext.reader.vTableGetNullable(_bc, _bcOffset, 20);
+  bool get bracketedPasteEnabled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 22, false);
   bool get exited => const fb.BoolReader().vTableGet(_bc, _bcOffset, 24, false);
-  List<int>? get rawOutput =>
-      const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 26);
-  int get rawOutputStart =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 28, 0);
+  List<int>? get rawOutput => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 26);
+  int get rawOutputStart => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 28, 0);
+  String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 30);
 
   @override
   String toString() {
-    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}}';
-  }
-
-  SessionSnapshotT unpack() => SessionSnapshotT(
-    outputSeq: outputSeq,
-    bytesLogged: bytesLogged,
-    size: size?.unpack(),
-    visibleRows: visibleRows?.toList(),
-    styledRowsStart: styledRowsStart,
-    styledRows: styledRows?.map((e) => e.unpack()).toList(),
-    cursor: cursor?.unpack(),
-    currentWorkingDirectory: currentWorkingDirectory,
-    context: context?.unpack(),
-    bracketedPasteEnabled: bracketedPasteEnabled,
-    exited: exited,
-    rawOutput: rawOutput?.toList(),
-    rawOutputStart: rawOutputStart,
-  );
-
-  static int pack(fb.Builder fbBuilder, SessionSnapshotT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SessionSnapshotT implements fb.Packable {
-  int outputSeq;
-  int bytesLogged;
-  SessionSizeT? size;
-  List<String>? visibleRows;
-  int styledRowsStart;
-  List<StyledRowT>? styledRows;
-  TerminalCursorT? cursor;
-  String? currentWorkingDirectory;
-  SessionContextT? context;
-  bool bracketedPasteEnabled;
-  bool exited;
-  List<int>? rawOutput;
-  int rawOutputStart;
-
-  SessionSnapshotT({
-    this.outputSeq = 0,
-    this.bytesLogged = 0,
-    this.size,
-    this.visibleRows,
-    this.styledRowsStart = 0,
-    this.styledRows,
-    this.cursor,
-    this.currentWorkingDirectory,
-    this.context,
-    this.bracketedPasteEnabled = false,
-    this.exited = false,
-    this.rawOutput,
-    this.rawOutputStart = 0,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? visibleRowsOffset = visibleRows == null
-        ? null
-        : fbBuilder.writeList(visibleRows!.map(fbBuilder.writeString).toList());
-    final int? styledRowsOffset = styledRows == null
-        ? null
-        : fbBuilder.writeList(
-            styledRows!.map((b) => b.pack(fbBuilder)).toList(),
-          );
-    final int? currentWorkingDirectoryOffset = currentWorkingDirectory == null
-        ? null
-        : fbBuilder.writeString(currentWorkingDirectory!);
-    final int? contextOffset = context?.pack(fbBuilder);
-    final int? rawOutputOffset = rawOutput == null
-        ? null
-        : fbBuilder.writeListUint8(rawOutput!);
-    fbBuilder.startTable(13);
-    fbBuilder.addUint64(0, outputSeq);
-    fbBuilder.addUint64(1, bytesLogged);
-    if (size != null) {
-      fbBuilder.addStruct(2, size!.pack(fbBuilder));
-    }
-    fbBuilder.addOffset(3, visibleRowsOffset);
-    fbBuilder.addUint32(4, styledRowsStart);
-    fbBuilder.addOffset(5, styledRowsOffset);
-    if (cursor != null) {
-      fbBuilder.addStruct(6, cursor!.pack(fbBuilder));
-    }
-    fbBuilder.addOffset(7, currentWorkingDirectoryOffset);
-    fbBuilder.addOffset(8, contextOffset);
-    fbBuilder.addBool(9, bracketedPasteEnabled);
-    fbBuilder.addBool(10, exited);
-    fbBuilder.addOffset(11, rawOutputOffset);
-    fbBuilder.addUint64(12, rawOutputStart);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SessionSnapshotT{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}}';
+    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}}';
   }
 }
 
@@ -1414,8 +955,8 @@ class _SessionSnapshotReader extends fb.TableReader<SessionSnapshot> {
   const _SessionSnapshotReader();
 
   @override
-  SessionSnapshot createObject(fb.BufferContext bc, int offset) =>
-      SessionSnapshot._(bc, offset);
+  SessionSnapshot createObject(fb.BufferContext bc, int offset) => 
+    SessionSnapshot._(bc, offset);
 }
 
 class SessionSnapshotBuilder {
@@ -1424,71 +965,63 @@ class SessionSnapshotBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(13);
+    fbBuilder.startTable(14);
   }
 
   int addOutputSeq(int? outputSeq) {
     fbBuilder.addUint64(0, outputSeq);
     return fbBuilder.offset;
   }
-
   int addBytesLogged(int? bytesLogged) {
     fbBuilder.addUint64(1, bytesLogged);
     return fbBuilder.offset;
   }
-
   int addSize(int offset) {
     fbBuilder.addStruct(2, offset);
     return fbBuilder.offset;
   }
-
   int addVisibleRowsOffset(int? offset) {
     fbBuilder.addOffset(3, offset);
     return fbBuilder.offset;
   }
-
   int addStyledRowsStart(int? styledRowsStart) {
     fbBuilder.addUint32(4, styledRowsStart);
     return fbBuilder.offset;
   }
-
   int addStyledRowsOffset(int? offset) {
     fbBuilder.addOffset(5, offset);
     return fbBuilder.offset;
   }
-
   int addCursor(int offset) {
     fbBuilder.addStruct(6, offset);
     return fbBuilder.offset;
   }
-
   int addCurrentWorkingDirectoryOffset(int? offset) {
     fbBuilder.addOffset(7, offset);
     return fbBuilder.offset;
   }
-
   int addContextOffset(int? offset) {
     fbBuilder.addOffset(8, offset);
     return fbBuilder.offset;
   }
-
   int addBracketedPasteEnabled(bool? bracketedPasteEnabled) {
     fbBuilder.addBool(9, bracketedPasteEnabled);
     return fbBuilder.offset;
   }
-
   int addExited(bool? exited) {
     fbBuilder.addBool(10, exited);
     return fbBuilder.offset;
   }
-
   int addRawOutputOffset(int? offset) {
     fbBuilder.addOffset(11, offset);
     return fbBuilder.offset;
   }
-
   int addRawOutputStart(int? rawOutputStart) {
     fbBuilder.addUint64(12, rawOutputStart);
+    return fbBuilder.offset;
+  }
+  int addSnippetOffset(int? offset) {
+    fbBuilder.addOffset(13, offset);
     return fbBuilder.offset;
   }
 
@@ -1511,6 +1044,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
   final bool? _exited;
   final List<int>? _rawOutput;
   final int? _rawOutputStart;
+  final String? _snippet;
 
   SessionSnapshotObjectBuilder({
     int? outputSeq,
@@ -1526,41 +1060,38 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     bool? exited,
     List<int>? rawOutput,
     int? rawOutputStart,
-  }) : _outputSeq = outputSeq,
-       _bytesLogged = bytesLogged,
-       _size = size,
-       _visibleRows = visibleRows,
-       _styledRowsStart = styledRowsStart,
-       _styledRows = styledRows,
-       _cursor = cursor,
-       _currentWorkingDirectory = currentWorkingDirectory,
-       _context = context,
-       _bracketedPasteEnabled = bracketedPasteEnabled,
-       _exited = exited,
-       _rawOutput = rawOutput,
-       _rawOutputStart = rawOutputStart;
+    String? snippet,
+  })
+      : _outputSeq = outputSeq,
+        _bytesLogged = bytesLogged,
+        _size = size,
+        _visibleRows = visibleRows,
+        _styledRowsStart = styledRowsStart,
+        _styledRows = styledRows,
+        _cursor = cursor,
+        _currentWorkingDirectory = currentWorkingDirectory,
+        _context = context,
+        _bracketedPasteEnabled = bracketedPasteEnabled,
+        _exited = exited,
+        _rawOutput = rawOutput,
+        _rawOutputStart = rawOutputStart,
+        _snippet = snippet;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? visibleRowsOffset = _visibleRows == null
-        ? null
-        : fbBuilder.writeList(
-            _visibleRows!.map(fbBuilder.writeString).toList(),
-          );
-    final int? styledRowsOffset = _styledRows == null
-        ? null
-        : fbBuilder.writeList(
-            _styledRows!.map((b) => b.getOrCreateOffset(fbBuilder)).toList(),
-          );
-    final int? currentWorkingDirectoryOffset = _currentWorkingDirectory == null
-        ? null
+    final int? visibleRowsOffset = _visibleRows == null ? null
+        : fbBuilder.writeList(_visibleRows!.map(fbBuilder.writeString).toList());
+    final int? styledRowsOffset = _styledRows == null ? null
+        : fbBuilder.writeList(_styledRows!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
+    final int? currentWorkingDirectoryOffset = _currentWorkingDirectory == null ? null
         : fbBuilder.writeString(_currentWorkingDirectory!);
     final int? contextOffset = _context?.getOrCreateOffset(fbBuilder);
-    final int? rawOutputOffset = _rawOutput == null
-        ? null
+    final int? rawOutputOffset = _rawOutput == null ? null
         : fbBuilder.writeListUint8(_rawOutput!);
-    fbBuilder.startTable(13);
+    final int? snippetOffset = _snippet == null ? null
+        : fbBuilder.writeString(_snippet!);
+    fbBuilder.startTable(14);
     fbBuilder.addUint64(0, _outputSeq);
     fbBuilder.addUint64(1, _bytesLogged);
     if (_size != null) {
@@ -1578,6 +1109,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.addBool(10, _exited);
     fbBuilder.addOffset(11, rawOutputOffset);
     fbBuilder.addUint64(12, _rawOutputStart);
+    fbBuilder.addOffset(13, snippetOffset);
     return fbBuilder.endTable();
   }
 
@@ -1589,7 +1121,6 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class CompletedSession {
   CompletedSession._(this._bc, this._bcOffset);
   factory CompletedSession(List<int> bytes) {
@@ -1603,55 +1134,12 @@ class CompletedSession {
   final int _bcOffset;
 
   int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  int get bytesLogged =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
-  List<String>? get visibleRows => const fb.ListReader<String>(
-    fb.StringReader(),
-  ).vTableGetNullable(_bc, _bcOffset, 8);
+  int get bytesLogged => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  List<String>? get visibleRows => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'CompletedSession{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, visibleRows: ${visibleRows}}';
-  }
-
-  CompletedSessionT unpack() => CompletedSessionT(
-    outputSeq: outputSeq,
-    bytesLogged: bytesLogged,
-    visibleRows: visibleRows?.toList(),
-  );
-
-  static int pack(fb.Builder fbBuilder, CompletedSessionT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class CompletedSessionT implements fb.Packable {
-  int outputSeq;
-  int bytesLogged;
-  List<String>? visibleRows;
-
-  CompletedSessionT({
-    this.outputSeq = 0,
-    this.bytesLogged = 0,
-    this.visibleRows,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? visibleRowsOffset = visibleRows == null
-        ? null
-        : fbBuilder.writeList(visibleRows!.map(fbBuilder.writeString).toList());
-    fbBuilder.startTable(3);
-    fbBuilder.addUint64(0, outputSeq);
-    fbBuilder.addUint64(1, bytesLogged);
-    fbBuilder.addOffset(2, visibleRowsOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'CompletedSessionT{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, visibleRows: ${visibleRows}}';
   }
 }
 
@@ -1659,8 +1147,8 @@ class _CompletedSessionReader extends fb.TableReader<CompletedSession> {
   const _CompletedSessionReader();
 
   @override
-  CompletedSession createObject(fb.BufferContext bc, int offset) =>
-      CompletedSession._(bc, offset);
+  CompletedSession createObject(fb.BufferContext bc, int offset) => 
+    CompletedSession._(bc, offset);
 }
 
 class CompletedSessionBuilder {
@@ -1676,12 +1164,10 @@ class CompletedSessionBuilder {
     fbBuilder.addUint64(0, outputSeq);
     return fbBuilder.offset;
   }
-
   int addBytesLogged(int? bytesLogged) {
     fbBuilder.addUint64(1, bytesLogged);
     return fbBuilder.offset;
   }
-
   int addVisibleRowsOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -1701,18 +1187,16 @@ class CompletedSessionObjectBuilder extends fb.ObjectBuilder {
     int? outputSeq,
     int? bytesLogged,
     List<String>? visibleRows,
-  }) : _outputSeq = outputSeq,
-       _bytesLogged = bytesLogged,
-       _visibleRows = visibleRows;
+  })
+      : _outputSeq = outputSeq,
+        _bytesLogged = bytesLogged,
+        _visibleRows = visibleRows;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? visibleRowsOffset = _visibleRows == null
-        ? null
-        : fbBuilder.writeList(
-            _visibleRows!.map(fbBuilder.writeString).toList(),
-          );
+    final int? visibleRowsOffset = _visibleRows == null ? null
+        : fbBuilder.writeList(_visibleRows!.map(fbBuilder.writeString).toList());
     fbBuilder.startTable(3);
     fbBuilder.addUint64(0, _outputSeq);
     fbBuilder.addUint64(1, _bytesLogged);
@@ -1728,7 +1212,6 @@ class CompletedSessionObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class InputLeaseHolder {
   InputLeaseHolder._(this._bc, this._bcOffset);
   factory InputLeaseHolder(List<int> bytes) {
@@ -1741,49 +1224,12 @@ class InputLeaseHolder {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  InputControllerKind get kind => InputControllerKind.fromValue(
-    const fb.Int8Reader().vTableGet(_bc, _bcOffset, 6, 0),
-  );
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  InputControllerKind get kind => InputControllerKind.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 6, 0));
 
   @override
   String toString() {
     return 'InputLeaseHolder{clientId: ${clientId}, kind: ${kind}}';
-  }
-
-  InputLeaseHolderT unpack() =>
-      InputLeaseHolderT(clientId: clientId, kind: kind);
-
-  static int pack(fb.Builder fbBuilder, InputLeaseHolderT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class InputLeaseHolderT implements fb.Packable {
-  String? clientId;
-  InputControllerKind kind;
-
-  InputLeaseHolderT({
-    this.clientId,
-    this.kind = InputControllerKind.Interactive,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, clientIdOffset);
-    fbBuilder.addInt8(1, kind.value);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'InputLeaseHolderT{clientId: ${clientId}, kind: ${kind}}';
   }
 }
 
@@ -1791,8 +1237,8 @@ class _InputLeaseHolderReader extends fb.TableReader<InputLeaseHolder> {
   const _InputLeaseHolderReader();
 
   @override
-  InputLeaseHolder createObject(fb.BufferContext bc, int offset) =>
-      InputLeaseHolder._(bc, offset);
+  InputLeaseHolder createObject(fb.BufferContext bc, int offset) => 
+    InputLeaseHolder._(bc, offset);
 }
 
 class InputLeaseHolderBuilder {
@@ -1808,7 +1254,6 @@ class InputLeaseHolderBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addKind(InputControllerKind? kind) {
     fbBuilder.addInt8(1, kind?.value);
     return fbBuilder.offset;
@@ -1823,15 +1268,17 @@ class InputLeaseHolderObjectBuilder extends fb.ObjectBuilder {
   final String? _clientId;
   final InputControllerKind? _kind;
 
-  InputLeaseHolderObjectBuilder({String? clientId, InputControllerKind? kind})
-    : _clientId = clientId,
-      _kind = kind;
+  InputLeaseHolderObjectBuilder({
+    String? clientId,
+    InputControllerKind? kind,
+  })
+      : _clientId = clientId,
+        _kind = kind;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, clientIdOffset);
@@ -1847,7 +1294,6 @@ class InputLeaseHolderObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class InputLeaseState {
   InputLeaseState._(this._bc, this._bcOffset);
   factory InputLeaseState(List<int> bytes) {
@@ -1860,42 +1306,12 @@ class InputLeaseState {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  InputLeaseHolder? get holder =>
-      InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  InputLeaseHolder? get holder => InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 4);
   int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
     return 'InputLeaseState{holder: ${holder}, generation: ${generation}}';
-  }
-
-  InputLeaseStateT unpack() =>
-      InputLeaseStateT(holder: holder?.unpack(), generation: generation);
-
-  static int pack(fb.Builder fbBuilder, InputLeaseStateT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class InputLeaseStateT implements fb.Packable {
-  InputLeaseHolderT? holder;
-  int generation;
-
-  InputLeaseStateT({this.holder, this.generation = 0});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? holderOffset = holder?.pack(fbBuilder);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, holderOffset);
-    fbBuilder.addUint64(1, generation);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'InputLeaseStateT{holder: ${holder}, generation: ${generation}}';
   }
 }
 
@@ -1903,8 +1319,8 @@ class _InputLeaseStateReader extends fb.TableReader<InputLeaseState> {
   const _InputLeaseStateReader();
 
   @override
-  InputLeaseState createObject(fb.BufferContext bc, int offset) =>
-      InputLeaseState._(bc, offset);
+  InputLeaseState createObject(fb.BufferContext bc, int offset) => 
+    InputLeaseState._(bc, offset);
 }
 
 class InputLeaseStateBuilder {
@@ -1920,7 +1336,6 @@ class InputLeaseStateBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addGeneration(int? generation) {
     fbBuilder.addUint64(1, generation);
     return fbBuilder.offset;
@@ -1938,8 +1353,9 @@ class InputLeaseStateObjectBuilder extends fb.ObjectBuilder {
   InputLeaseStateObjectBuilder({
     InputLeaseHolderObjectBuilder? holder,
     int? generation,
-  }) : _holder = holder,
-       _generation = generation;
+  })
+      : _holder = holder,
+        _generation = generation;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -1959,7 +1375,6 @@ class InputLeaseStateObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class LeaseChange {
   LeaseChange._(this._bc, this._bcOffset);
   factory LeaseChange(List<int> bytes) {
@@ -1973,60 +1388,13 @@ class LeaseChange {
   final int _bcOffset;
 
   int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  InputLeaseHolder? get previous =>
-      InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 6);
-  InputLeaseHolder? get current =>
-      InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 8);
-  LeaseChangeAction get action => LeaseChangeAction.fromValue(
-    const fb.Int8Reader().vTableGet(_bc, _bcOffset, 10, 0),
-  );
+  InputLeaseHolder? get previous => InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  InputLeaseHolder? get current => InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 8);
+  LeaseChangeAction get action => LeaseChangeAction.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 10, 0));
 
   @override
   String toString() {
     return 'LeaseChange{generation: ${generation}, previous: ${previous}, current: ${current}, action: ${action}}';
-  }
-
-  LeaseChangeT unpack() => LeaseChangeT(
-    generation: generation,
-    previous: previous?.unpack(),
-    current: current?.unpack(),
-    action: action,
-  );
-
-  static int pack(fb.Builder fbBuilder, LeaseChangeT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class LeaseChangeT implements fb.Packable {
-  int generation;
-  InputLeaseHolderT? previous;
-  InputLeaseHolderT? current;
-  LeaseChangeAction action;
-
-  LeaseChangeT({
-    this.generation = 0,
-    this.previous,
-    this.current,
-    this.action = LeaseChangeAction.Acquired,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? previousOffset = previous?.pack(fbBuilder);
-    final int? currentOffset = current?.pack(fbBuilder);
-    fbBuilder.startTable(4);
-    fbBuilder.addUint64(0, generation);
-    fbBuilder.addOffset(1, previousOffset);
-    fbBuilder.addOffset(2, currentOffset);
-    fbBuilder.addInt8(3, action.value);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'LeaseChangeT{generation: ${generation}, previous: ${previous}, current: ${current}, action: ${action}}';
   }
 }
 
@@ -2034,8 +1402,8 @@ class _LeaseChangeReader extends fb.TableReader<LeaseChange> {
   const _LeaseChangeReader();
 
   @override
-  LeaseChange createObject(fb.BufferContext bc, int offset) =>
-      LeaseChange._(bc, offset);
+  LeaseChange createObject(fb.BufferContext bc, int offset) => 
+    LeaseChange._(bc, offset);
 }
 
 class LeaseChangeBuilder {
@@ -2051,17 +1419,14 @@ class LeaseChangeBuilder {
     fbBuilder.addUint64(0, generation);
     return fbBuilder.offset;
   }
-
   int addPreviousOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addCurrentOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
   }
-
   int addAction(LeaseChangeAction? action) {
     fbBuilder.addInt8(3, action?.value);
     return fbBuilder.offset;
@@ -2083,10 +1448,11 @@ class LeaseChangeObjectBuilder extends fb.ObjectBuilder {
     InputLeaseHolderObjectBuilder? previous,
     InputLeaseHolderObjectBuilder? current,
     LeaseChangeAction? action,
-  }) : _generation = generation,
-       _previous = previous,
-       _current = current,
-       _action = action;
+  })
+      : _generation = generation,
+        _previous = previous,
+        _current = current,
+        _action = action;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -2109,7 +1475,6 @@ class LeaseChangeObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class AttachSessionResponse {
   AttachSessionResponse._(this._bc, this._bcOffset);
   factory AttachSessionResponse(List<int> bytes) {
@@ -2117,62 +1482,26 @@ class AttachSessionResponse {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<AttachSessionResponse> reader =
-      _AttachSessionResponseReader();
+  static const fb.Reader<AttachSessionResponse> reader = _AttachSessionResponseReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  SessionSnapshot? get snapshot =>
-      SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 4);
-  InputLeaseState? get lease =>
-      InputLeaseState.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  SessionSnapshot? get snapshot => SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  InputLeaseState? get lease => InputLeaseState.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'AttachSessionResponse{snapshot: ${snapshot}, lease: ${lease}}';
   }
-
-  AttachSessionResponseT unpack() => AttachSessionResponseT(
-    snapshot: snapshot?.unpack(),
-    lease: lease?.unpack(),
-  );
-
-  static int pack(fb.Builder fbBuilder, AttachSessionResponseT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class AttachSessionResponseT implements fb.Packable {
-  SessionSnapshotT? snapshot;
-  InputLeaseStateT? lease;
-
-  AttachSessionResponseT({this.snapshot, this.lease});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? snapshotOffset = snapshot?.pack(fbBuilder);
-    final int? leaseOffset = lease?.pack(fbBuilder);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, snapshotOffset);
-    fbBuilder.addOffset(1, leaseOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'AttachSessionResponseT{snapshot: ${snapshot}, lease: ${lease}}';
-  }
-}
-
-class _AttachSessionResponseReader
-    extends fb.TableReader<AttachSessionResponse> {
+class _AttachSessionResponseReader extends fb.TableReader<AttachSessionResponse> {
   const _AttachSessionResponseReader();
 
   @override
-  AttachSessionResponse createObject(fb.BufferContext bc, int offset) =>
-      AttachSessionResponse._(bc, offset);
+  AttachSessionResponse createObject(fb.BufferContext bc, int offset) => 
+    AttachSessionResponse._(bc, offset);
 }
 
 class AttachSessionResponseBuilder {
@@ -2188,7 +1517,6 @@ class AttachSessionResponseBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addLeaseOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -2206,8 +1534,9 @@ class AttachSessionResponseObjectBuilder extends fb.ObjectBuilder {
   AttachSessionResponseObjectBuilder({
     SessionSnapshotObjectBuilder? snapshot,
     InputLeaseStateObjectBuilder? lease,
-  }) : _snapshot = snapshot,
-       _lease = lease;
+  })
+      : _snapshot = snapshot,
+        _lease = lease;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -2228,7 +1557,6 @@ class AttachSessionResponseObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class StyledRowsResponse {
   StyledRowsResponse._(this._bc, this._bcOffset);
   factory StyledRowsResponse(List<int> bytes) {
@@ -2236,57 +1564,18 @@ class StyledRowsResponse {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<StyledRowsResponse> reader =
-      _StyledRowsResponseReader();
+  static const fb.Reader<StyledRowsResponse> reader = _StyledRowsResponseReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
   int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
   int get start => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 6, 0);
-  List<StyledRow>? get rows => const fb.ListReader<StyledRow>(
-    StyledRow.reader,
-  ).vTableGetNullable(_bc, _bcOffset, 8);
+  List<StyledRow>? get rows => const fb.ListReader<StyledRow>(StyledRow.reader).vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'StyledRowsResponse{outputSeq: ${outputSeq}, start: ${start}, rows: ${rows}}';
-  }
-
-  StyledRowsResponseT unpack() => StyledRowsResponseT(
-    outputSeq: outputSeq,
-    start: start,
-    rows: rows?.map((e) => e.unpack()).toList(),
-  );
-
-  static int pack(fb.Builder fbBuilder, StyledRowsResponseT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class StyledRowsResponseT implements fb.Packable {
-  int outputSeq;
-  int start;
-  List<StyledRowT>? rows;
-
-  StyledRowsResponseT({this.outputSeq = 0, this.start = 0, this.rows});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? rowsOffset = rows == null
-        ? null
-        : fbBuilder.writeList(rows!.map((b) => b.pack(fbBuilder)).toList());
-    fbBuilder.startTable(3);
-    fbBuilder.addUint64(0, outputSeq);
-    fbBuilder.addUint32(1, start);
-    fbBuilder.addOffset(2, rowsOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'StyledRowsResponseT{outputSeq: ${outputSeq}, start: ${start}, rows: ${rows}}';
   }
 }
 
@@ -2294,8 +1583,8 @@ class _StyledRowsResponseReader extends fb.TableReader<StyledRowsResponse> {
   const _StyledRowsResponseReader();
 
   @override
-  StyledRowsResponse createObject(fb.BufferContext bc, int offset) =>
-      StyledRowsResponse._(bc, offset);
+  StyledRowsResponse createObject(fb.BufferContext bc, int offset) => 
+    StyledRowsResponse._(bc, offset);
 }
 
 class StyledRowsResponseBuilder {
@@ -2311,12 +1600,10 @@ class StyledRowsResponseBuilder {
     fbBuilder.addUint64(0, outputSeq);
     return fbBuilder.offset;
   }
-
   int addStart(int? start) {
     fbBuilder.addUint32(1, start);
     return fbBuilder.offset;
   }
-
   int addRowsOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -2336,18 +1623,16 @@ class StyledRowsResponseObjectBuilder extends fb.ObjectBuilder {
     int? outputSeq,
     int? start,
     List<StyledRowObjectBuilder>? rows,
-  }) : _outputSeq = outputSeq,
-       _start = start,
-       _rows = rows;
+  })
+      : _outputSeq = outputSeq,
+        _start = start,
+        _rows = rows;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? rowsOffset = _rows == null
-        ? null
-        : fbBuilder.writeList(
-            _rows!.map((b) => b.getOrCreateOffset(fbBuilder)).toList(),
-          );
+    final int? rowsOffset = _rows == null ? null
+        : fbBuilder.writeList(_rows!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
     fbBuilder.startTable(3);
     fbBuilder.addUint64(0, _outputSeq);
     fbBuilder.addUint32(1, _start);
@@ -2363,7 +1648,6 @@ class StyledRowsResponseObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class HelloRequest {
   HelloRequest._(this._bc, this._bcOffset);
   factory HelloRequest(List<int> bytes) {
@@ -2376,47 +1660,12 @@ class HelloRequest {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get token =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get token => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'HelloRequest{clientId: ${clientId}, token: ${token}}';
-  }
-
-  HelloRequestT unpack() => HelloRequestT(clientId: clientId, token: token);
-
-  static int pack(fb.Builder fbBuilder, HelloRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class HelloRequestT implements fb.Packable {
-  String? clientId;
-  String? token;
-
-  HelloRequestT({this.clientId, this.token});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    final int? tokenOffset = token == null
-        ? null
-        : fbBuilder.writeString(token!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, clientIdOffset);
-    fbBuilder.addOffset(1, tokenOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'HelloRequestT{clientId: ${clientId}, token: ${token}}';
   }
 }
 
@@ -2424,8 +1673,8 @@ class _HelloRequestReader extends fb.TableReader<HelloRequest> {
   const _HelloRequestReader();
 
   @override
-  HelloRequest createObject(fb.BufferContext bc, int offset) =>
-      HelloRequest._(bc, offset);
+  HelloRequest createObject(fb.BufferContext bc, int offset) => 
+    HelloRequest._(bc, offset);
 }
 
 class HelloRequestBuilder {
@@ -2441,7 +1690,6 @@ class HelloRequestBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addTokenOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -2456,18 +1704,19 @@ class HelloRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _clientId;
   final String? _token;
 
-  HelloRequestObjectBuilder({String? clientId, String? token})
-    : _clientId = clientId,
-      _token = token;
+  HelloRequestObjectBuilder({
+    String? clientId,
+    String? token,
+  })
+      : _clientId = clientId,
+        _token = token;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
-    final int? tokenOffset = _token == null
-        ? null
+    final int? tokenOffset = _token == null ? null
         : fbBuilder.writeString(_token!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, clientIdOffset);
@@ -2483,7 +1732,6 @@ class HelloRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class PairRequest {
   PairRequest._(this._bc, this._bcOffset);
   factory PairRequest(List<int> bytes) {
@@ -2496,45 +1744,12 @@ class PairRequest {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get code =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get code => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'PairRequest{code: ${code}, clientId: ${clientId}}';
-  }
-
-  PairRequestT unpack() => PairRequestT(code: code, clientId: clientId);
-
-  static int pack(fb.Builder fbBuilder, PairRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class PairRequestT implements fb.Packable {
-  String? code;
-  String? clientId;
-
-  PairRequestT({this.code, this.clientId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? codeOffset = code == null ? null : fbBuilder.writeString(code!);
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, codeOffset);
-    fbBuilder.addOffset(1, clientIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'PairRequestT{code: ${code}, clientId: ${clientId}}';
   }
 }
 
@@ -2542,8 +1757,8 @@ class _PairRequestReader extends fb.TableReader<PairRequest> {
   const _PairRequestReader();
 
   @override
-  PairRequest createObject(fb.BufferContext bc, int offset) =>
-      PairRequest._(bc, offset);
+  PairRequest createObject(fb.BufferContext bc, int offset) => 
+    PairRequest._(bc, offset);
 }
 
 class PairRequestBuilder {
@@ -2559,7 +1774,6 @@ class PairRequestBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addClientIdOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -2574,18 +1788,19 @@ class PairRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _code;
   final String? _clientId;
 
-  PairRequestObjectBuilder({String? code, String? clientId})
-    : _code = code,
-      _clientId = clientId;
+  PairRequestObjectBuilder({
+    String? code,
+    String? clientId,
+  })
+      : _code = code,
+        _clientId = clientId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? codeOffset = _code == null
-        ? null
+    final int? codeOffset = _code == null ? null
         : fbBuilder.writeString(_code!);
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, codeOffset);
@@ -2601,7 +1816,6 @@ class PairRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class PairingChallengeRequest {
   PairingChallengeRequest._(this._bc, this._bcOffset);
   factory PairingChallengeRequest(List<int> bytes) {
@@ -2609,57 +1823,25 @@ class PairingChallengeRequest {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<PairingChallengeRequest> reader =
-      _PairingChallengeRequestReader();
+  static const fb.Reader<PairingChallengeRequest> reader = _PairingChallengeRequestReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'PairingChallengeRequest{clientId: ${clientId}}';
   }
-
-  PairingChallengeRequestT unpack() =>
-      PairingChallengeRequestT(clientId: clientId);
-
-  static int pack(fb.Builder fbBuilder, PairingChallengeRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class PairingChallengeRequestT implements fb.Packable {
-  String? clientId;
-
-  PairingChallengeRequestT({this.clientId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, clientIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'PairingChallengeRequestT{clientId: ${clientId}}';
-  }
-}
-
-class _PairingChallengeRequestReader
-    extends fb.TableReader<PairingChallengeRequest> {
+class _PairingChallengeRequestReader extends fb.TableReader<PairingChallengeRequest> {
   const _PairingChallengeRequestReader();
 
   @override
-  PairingChallengeRequest createObject(fb.BufferContext bc, int offset) =>
-      PairingChallengeRequest._(bc, offset);
+  PairingChallengeRequest createObject(fb.BufferContext bc, int offset) => 
+    PairingChallengeRequest._(bc, offset);
 }
 
 class PairingChallengeRequestBuilder {
@@ -2684,14 +1866,15 @@ class PairingChallengeRequestBuilder {
 class PairingChallengeRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _clientId;
 
-  PairingChallengeRequestObjectBuilder({String? clientId})
-    : _clientId = clientId;
+  PairingChallengeRequestObjectBuilder({
+    String? clientId,
+  })
+      : _clientId = clientId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, clientIdOffset);
@@ -2706,7 +1889,6 @@ class PairingChallengeRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ListSessionsRequest {
   ListSessionsRequest._(this._bc, this._bcOffset);
   factory ListSessionsRequest(List<int> bytes) {
@@ -2714,35 +1896,15 @@ class ListSessionsRequest {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<ListSessionsRequest> reader =
-      _ListSessionsRequestReader();
+  static const fb.Reader<ListSessionsRequest> reader = _ListSessionsRequestReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
+
   @override
   String toString() {
     return 'ListSessionsRequest{}';
-  }
-
-  ListSessionsRequestT unpack() => ListSessionsRequestT();
-
-  static int pack(fb.Builder fbBuilder, ListSessionsRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ListSessionsRequestT implements fb.Packable {
-  @override
-  int pack(fb.Builder fbBuilder) {
-    fbBuilder.startTable(0);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ListSessionsRequestT{}';
   }
 }
 
@@ -2750,11 +1912,12 @@ class _ListSessionsRequestReader extends fb.TableReader<ListSessionsRequest> {
   const _ListSessionsRequestReader();
 
   @override
-  ListSessionsRequest createObject(fb.BufferContext bc, int offset) =>
-      ListSessionsRequest._(bc, offset);
+  ListSessionsRequest createObject(fb.BufferContext bc, int offset) => 
+    ListSessionsRequest._(bc, offset);
 }
 
 class ListSessionsRequestObjectBuilder extends fb.ObjectBuilder {
+
   ListSessionsRequestObjectBuilder();
 
   /// Finish building, and store into the [fbBuilder].
@@ -2772,7 +1935,6 @@ class ListSessionsRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class StartSessionRequestTable {
   StartSessionRequestTable._(this._bc, this._bcOffset);
   factory StartSessionRequestTable(List<int> bytes) {
@@ -2780,80 +1942,28 @@ class StartSessionRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<StartSessionRequestTable> reader =
-      _StartSessionRequestTableReader();
+  static const fb.Reader<StartSessionRequestTable> reader = _StartSessionRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get command =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  List<String>? get args => const fb.ListReader<String>(
-    fb.StringReader(),
-  ).vTableGetNullable(_bc, _bcOffset, 6);
-  String? get cwd =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
-  SessionSize? get size =>
-      SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 10);
+  String? get command => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  List<String>? get args => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 6);
+  String? get cwd => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 10);
 
   @override
   String toString() {
     return 'StartSessionRequestTable{command: ${command}, args: ${args}, cwd: ${cwd}, size: ${size}}';
   }
-
-  StartSessionRequestTableT unpack() => StartSessionRequestTableT(
-    command: command,
-    args: args?.toList(),
-    cwd: cwd,
-    size: size?.unpack(),
-  );
-
-  static int pack(fb.Builder fbBuilder, StartSessionRequestTableT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class StartSessionRequestTableT implements fb.Packable {
-  String? command;
-  List<String>? args;
-  String? cwd;
-  SessionSizeT? size;
-
-  StartSessionRequestTableT({this.command, this.args, this.cwd, this.size});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? commandOffset = command == null
-        ? null
-        : fbBuilder.writeString(command!);
-    final int? argsOffset = args == null
-        ? null
-        : fbBuilder.writeList(args!.map(fbBuilder.writeString).toList());
-    final int? cwdOffset = cwd == null ? null : fbBuilder.writeString(cwd!);
-    fbBuilder.startTable(4);
-    fbBuilder.addOffset(0, commandOffset);
-    fbBuilder.addOffset(1, argsOffset);
-    fbBuilder.addOffset(2, cwdOffset);
-    if (size != null) {
-      fbBuilder.addStruct(3, size!.pack(fbBuilder));
-    }
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'StartSessionRequestTableT{command: ${command}, args: ${args}, cwd: ${cwd}, size: ${size}}';
-  }
-}
-
-class _StartSessionRequestTableReader
-    extends fb.TableReader<StartSessionRequestTable> {
+class _StartSessionRequestTableReader extends fb.TableReader<StartSessionRequestTable> {
   const _StartSessionRequestTableReader();
 
   @override
-  StartSessionRequestTable createObject(fb.BufferContext bc, int offset) =>
-      StartSessionRequestTable._(bc, offset);
+  StartSessionRequestTable createObject(fb.BufferContext bc, int offset) => 
+    StartSessionRequestTable._(bc, offset);
 }
 
 class StartSessionRequestTableBuilder {
@@ -2869,17 +1979,14 @@ class StartSessionRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addArgsOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addCwdOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
   }
-
   int addSize(int offset) {
     fbBuilder.addStruct(3, offset);
     return fbBuilder.offset;
@@ -2901,21 +2008,21 @@ class StartSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
     List<String>? args,
     String? cwd,
     SessionSizeObjectBuilder? size,
-  }) : _command = command,
-       _args = args,
-       _cwd = cwd,
-       _size = size;
+  })
+      : _command = command,
+        _args = args,
+        _cwd = cwd,
+        _size = size;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? commandOffset = _command == null
-        ? null
+    final int? commandOffset = _command == null ? null
         : fbBuilder.writeString(_command!);
-    final int? argsOffset = _args == null
-        ? null
+    final int? argsOffset = _args == null ? null
         : fbBuilder.writeList(_args!.map(fbBuilder.writeString).toList());
-    final int? cwdOffset = _cwd == null ? null : fbBuilder.writeString(_cwd!);
+    final int? cwdOffset = _cwd == null ? null
+        : fbBuilder.writeString(_cwd!);
     fbBuilder.startTable(4);
     fbBuilder.addOffset(0, commandOffset);
     fbBuilder.addOffset(1, argsOffset);
@@ -2934,7 +2041,6 @@ class StartSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class AttachSessionRequestTable {
   AttachSessionRequestTable._(this._bc, this._bcOffset);
   factory AttachSessionRequestTable(List<int> bytes) {
@@ -2942,76 +2048,27 @@ class AttachSessionRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<AttachSessionRequestTable> reader =
-      _AttachSessionRequestTableReader();
+  static const fb.Reader<AttachSessionRequestTable> reader = _AttachSessionRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
-  AttachMode get mode => AttachMode.fromValue(
-    const fb.Int8Reader().vTableGet(_bc, _bcOffset, 8, 0),
-  );
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  AttachMode get mode => AttachMode.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 8, 0));
 
   @override
   String toString() {
     return 'AttachSessionRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}}';
   }
-
-  AttachSessionRequestTableT unpack() => AttachSessionRequestTableT(
-    sessionId: sessionId,
-    clientId: clientId,
-    mode: mode,
-  );
-
-  static int pack(fb.Builder fbBuilder, AttachSessionRequestTableT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class AttachSessionRequestTableT implements fb.Packable {
-  String? sessionId;
-  String? clientId;
-  AttachMode mode;
-
-  AttachSessionRequestTableT({
-    this.sessionId,
-    this.clientId,
-    this.mode = AttachMode.Observer,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, clientIdOffset);
-    fbBuilder.addInt8(2, mode.value);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'AttachSessionRequestTableT{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}}';
-  }
-}
-
-class _AttachSessionRequestTableReader
-    extends fb.TableReader<AttachSessionRequestTable> {
+class _AttachSessionRequestTableReader extends fb.TableReader<AttachSessionRequestTable> {
   const _AttachSessionRequestTableReader();
 
   @override
-  AttachSessionRequestTable createObject(fb.BufferContext bc, int offset) =>
-      AttachSessionRequestTable._(bc, offset);
+  AttachSessionRequestTable createObject(fb.BufferContext bc, int offset) => 
+    AttachSessionRequestTable._(bc, offset);
 }
 
 class AttachSessionRequestTableBuilder {
@@ -3027,12 +2084,10 @@ class AttachSessionRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addClientIdOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addMode(AttachMode? mode) {
     fbBuilder.addInt8(2, mode?.value);
     return fbBuilder.offset;
@@ -3052,18 +2107,17 @@ class AttachSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
     String? sessionId,
     String? clientId,
     AttachMode? mode,
-  }) : _sessionId = sessionId,
-       _clientId = clientId,
-       _mode = mode;
+  })
+      : _sessionId = sessionId,
+        _clientId = clientId,
+        _mode = mode;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3080,7 +2134,6 @@ class AttachSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SubscribeSessionEventsRequestTable {
   SubscribeSessionEventsRequestTable._(this._bc, this._bcOffset);
   factory SubscribeSessionEventsRequestTable(List<int> bytes) {
@@ -3088,69 +2141,26 @@ class SubscribeSessionEventsRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<SubscribeSessionEventsRequestTable> reader =
-      _SubscribeSessionEventsRequestTableReader();
+  static const fb.Reader<SubscribeSessionEventsRequestTable> reader = _SubscribeSessionEventsRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get afterEventSeq =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  int get afterEventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
     return 'SubscribeSessionEventsRequestTable{sessionId: ${sessionId}, afterEventSeq: ${afterEventSeq}}';
   }
-
-  SubscribeSessionEventsRequestTableT unpack() =>
-      SubscribeSessionEventsRequestTableT(
-        sessionId: sessionId,
-        afterEventSeq: afterEventSeq,
-      );
-
-  static int pack(
-    fb.Builder fbBuilder,
-    SubscribeSessionEventsRequestTableT? object,
-  ) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class SubscribeSessionEventsRequestTableT implements fb.Packable {
-  String? sessionId;
-  int afterEventSeq;
-
-  SubscribeSessionEventsRequestTableT({this.sessionId, this.afterEventSeq = 0});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint64(1, afterEventSeq);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SubscribeSessionEventsRequestTableT{sessionId: ${sessionId}, afterEventSeq: ${afterEventSeq}}';
-  }
-}
-
-class _SubscribeSessionEventsRequestTableReader
-    extends fb.TableReader<SubscribeSessionEventsRequestTable> {
+class _SubscribeSessionEventsRequestTableReader extends fb.TableReader<SubscribeSessionEventsRequestTable> {
   const _SubscribeSessionEventsRequestTableReader();
 
   @override
-  SubscribeSessionEventsRequestTable createObject(
-    fb.BufferContext bc,
-    int offset,
-  ) => SubscribeSessionEventsRequestTable._(bc, offset);
+  SubscribeSessionEventsRequestTable createObject(fb.BufferContext bc, int offset) => 
+    SubscribeSessionEventsRequestTable._(bc, offset);
 }
 
 class SubscribeSessionEventsRequestTableBuilder {
@@ -3166,7 +2176,6 @@ class SubscribeSessionEventsRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addAfterEventSeq(int? afterEventSeq) {
     fbBuilder.addUint64(1, afterEventSeq);
     return fbBuilder.offset;
@@ -3184,14 +2193,14 @@ class SubscribeSessionEventsRequestTableObjectBuilder extends fb.ObjectBuilder {
   SubscribeSessionEventsRequestTableObjectBuilder({
     String? sessionId,
     int? afterEventSeq,
-  }) : _sessionId = sessionId,
-       _afterEventSeq = afterEventSeq;
+  })
+      : _sessionId = sessionId,
+        _afterEventSeq = afterEventSeq;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3207,7 +2216,6 @@ class SubscribeSessionEventsRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class AcquireInputLeaseRequest {
   AcquireInputLeaseRequest._(this._bc, this._bcOffset);
   factory AcquireInputLeaseRequest(List<int> bytes) {
@@ -3215,76 +2223,27 @@ class AcquireInputLeaseRequest {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<AcquireInputLeaseRequest> reader =
-      _AcquireInputLeaseRequestReader();
+  static const fb.Reader<AcquireInputLeaseRequest> reader = _AcquireInputLeaseRequestReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
-  InputControllerKind get kind => InputControllerKind.fromValue(
-    const fb.Int8Reader().vTableGet(_bc, _bcOffset, 8, 0),
-  );
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  InputControllerKind get kind => InputControllerKind.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 8, 0));
 
   @override
   String toString() {
     return 'AcquireInputLeaseRequest{sessionId: ${sessionId}, clientId: ${clientId}, kind: ${kind}}';
   }
-
-  AcquireInputLeaseRequestT unpack() => AcquireInputLeaseRequestT(
-    sessionId: sessionId,
-    clientId: clientId,
-    kind: kind,
-  );
-
-  static int pack(fb.Builder fbBuilder, AcquireInputLeaseRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class AcquireInputLeaseRequestT implements fb.Packable {
-  String? sessionId;
-  String? clientId;
-  InputControllerKind kind;
-
-  AcquireInputLeaseRequestT({
-    this.sessionId,
-    this.clientId,
-    this.kind = InputControllerKind.Interactive,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, clientIdOffset);
-    fbBuilder.addInt8(2, kind.value);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'AcquireInputLeaseRequestT{sessionId: ${sessionId}, clientId: ${clientId}, kind: ${kind}}';
-  }
-}
-
-class _AcquireInputLeaseRequestReader
-    extends fb.TableReader<AcquireInputLeaseRequest> {
+class _AcquireInputLeaseRequestReader extends fb.TableReader<AcquireInputLeaseRequest> {
   const _AcquireInputLeaseRequestReader();
 
   @override
-  AcquireInputLeaseRequest createObject(fb.BufferContext bc, int offset) =>
-      AcquireInputLeaseRequest._(bc, offset);
+  AcquireInputLeaseRequest createObject(fb.BufferContext bc, int offset) => 
+    AcquireInputLeaseRequest._(bc, offset);
 }
 
 class AcquireInputLeaseRequestBuilder {
@@ -3300,12 +2259,10 @@ class AcquireInputLeaseRequestBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addClientIdOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addKind(InputControllerKind? kind) {
     fbBuilder.addInt8(2, kind?.value);
     return fbBuilder.offset;
@@ -3325,18 +2282,17 @@ class AcquireInputLeaseRequestObjectBuilder extends fb.ObjectBuilder {
     String? sessionId,
     String? clientId,
     InputControllerKind? kind,
-  }) : _sessionId = sessionId,
-       _clientId = clientId,
-       _kind = kind;
+  })
+      : _sessionId = sessionId,
+        _clientId = clientId,
+        _kind = kind;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3353,7 +2309,6 @@ class AcquireInputLeaseRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ReleaseInputLeaseRequest {
   ReleaseInputLeaseRequest._(this._bc, this._bcOffset);
   factory ReleaseInputLeaseRequest(List<int> bytes) {
@@ -3361,64 +2316,26 @@ class ReleaseInputLeaseRequest {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<ReleaseInputLeaseRequest> reader =
-      _ReleaseInputLeaseRequestReader();
+  static const fb.Reader<ReleaseInputLeaseRequest> reader = _ReleaseInputLeaseRequestReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'ReleaseInputLeaseRequest{sessionId: ${sessionId}, clientId: ${clientId}}';
   }
-
-  ReleaseInputLeaseRequestT unpack() =>
-      ReleaseInputLeaseRequestT(sessionId: sessionId, clientId: clientId);
-
-  static int pack(fb.Builder fbBuilder, ReleaseInputLeaseRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class ReleaseInputLeaseRequestT implements fb.Packable {
-  String? sessionId;
-  String? clientId;
-
-  ReleaseInputLeaseRequestT({this.sessionId, this.clientId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, clientIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ReleaseInputLeaseRequestT{sessionId: ${sessionId}, clientId: ${clientId}}';
-  }
-}
-
-class _ReleaseInputLeaseRequestReader
-    extends fb.TableReader<ReleaseInputLeaseRequest> {
+class _ReleaseInputLeaseRequestReader extends fb.TableReader<ReleaseInputLeaseRequest> {
   const _ReleaseInputLeaseRequestReader();
 
   @override
-  ReleaseInputLeaseRequest createObject(fb.BufferContext bc, int offset) =>
-      ReleaseInputLeaseRequest._(bc, offset);
+  ReleaseInputLeaseRequest createObject(fb.BufferContext bc, int offset) => 
+    ReleaseInputLeaseRequest._(bc, offset);
 }
 
 class ReleaseInputLeaseRequestBuilder {
@@ -3434,7 +2351,6 @@ class ReleaseInputLeaseRequestBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addClientIdOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -3449,18 +2365,19 @@ class ReleaseInputLeaseRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
   final String? _clientId;
 
-  ReleaseInputLeaseRequestObjectBuilder({String? sessionId, String? clientId})
-    : _sessionId = sessionId,
-      _clientId = clientId;
+  ReleaseInputLeaseRequestObjectBuilder({
+    String? sessionId,
+    String? clientId,
+  })
+      : _sessionId = sessionId,
+        _clientId = clientId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3476,7 +2393,6 @@ class ReleaseInputLeaseRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class WriteInputRequestTable {
   WriteInputRequestTable._(this._bc, this._bcOffset);
   factory WriteInputRequestTable(List<int> bytes) {
@@ -3484,74 +2400,27 @@ class WriteInputRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<WriteInputRequestTable> reader =
-      _WriteInputRequestTableReader();
+  static const fb.Reader<WriteInputRequestTable> reader = _WriteInputRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get clientId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
-  List<int>? get bytes =>
-      const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  List<int>? get bytes => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'WriteInputRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, bytes: ${bytes}}';
   }
-
-  WriteInputRequestTableT unpack() => WriteInputRequestTableT(
-    sessionId: sessionId,
-    clientId: clientId,
-    bytes: bytes?.toList(),
-  );
-
-  static int pack(fb.Builder fbBuilder, WriteInputRequestTableT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class WriteInputRequestTableT implements fb.Packable {
-  String? sessionId;
-  String? clientId;
-  List<int>? bytes;
-
-  WriteInputRequestTableT({this.sessionId, this.clientId, this.bytes});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? clientIdOffset = clientId == null
-        ? null
-        : fbBuilder.writeString(clientId!);
-    final int? bytesOffset = bytes == null
-        ? null
-        : fbBuilder.writeListUint8(bytes!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, clientIdOffset);
-    fbBuilder.addOffset(2, bytesOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'WriteInputRequestTableT{sessionId: ${sessionId}, clientId: ${clientId}, bytes: ${bytes}}';
-  }
-}
-
-class _WriteInputRequestTableReader
-    extends fb.TableReader<WriteInputRequestTable> {
+class _WriteInputRequestTableReader extends fb.TableReader<WriteInputRequestTable> {
   const _WriteInputRequestTableReader();
 
   @override
-  WriteInputRequestTable createObject(fb.BufferContext bc, int offset) =>
-      WriteInputRequestTable._(bc, offset);
+  WriteInputRequestTable createObject(fb.BufferContext bc, int offset) => 
+    WriteInputRequestTable._(bc, offset);
 }
 
 class WriteInputRequestTableBuilder {
@@ -3567,12 +2436,10 @@ class WriteInputRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addClientIdOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addBytesOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -3592,21 +2459,19 @@ class WriteInputRequestTableObjectBuilder extends fb.ObjectBuilder {
     String? sessionId,
     String? clientId,
     List<int>? bytes,
-  }) : _sessionId = sessionId,
-       _clientId = clientId,
-       _bytes = bytes;
+  })
+      : _sessionId = sessionId,
+        _clientId = clientId,
+        _bytes = bytes;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
-    final int? clientIdOffset = _clientId == null
-        ? null
+    final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
-    final int? bytesOffset = _bytes == null
-        ? null
+    final int? bytesOffset = _bytes == null ? null
         : fbBuilder.writeListUint8(_bytes!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3623,7 +2488,6 @@ class WriteInputRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ResizeSessionRequestTable {
   ResizeSessionRequestTable._(this._bc, this._bcOffset);
   factory ResizeSessionRequestTable(List<int> bytes) {
@@ -3631,63 +2495,26 @@ class ResizeSessionRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<ResizeSessionRequestTable> reader =
-      _ResizeSessionRequestTableReader();
+  static const fb.Reader<ResizeSessionRequestTable> reader = _ResizeSessionRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  SessionSize? get size =>
-      SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'ResizeSessionRequestTable{sessionId: ${sessionId}, size: ${size}}';
   }
-
-  ResizeSessionRequestTableT unpack() =>
-      ResizeSessionRequestTableT(sessionId: sessionId, size: size?.unpack());
-
-  static int pack(fb.Builder fbBuilder, ResizeSessionRequestTableT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class ResizeSessionRequestTableT implements fb.Packable {
-  String? sessionId;
-  SessionSizeT? size;
-
-  ResizeSessionRequestTableT({this.sessionId, this.size});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    if (size != null) {
-      fbBuilder.addStruct(1, size!.pack(fbBuilder));
-    }
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ResizeSessionRequestTableT{sessionId: ${sessionId}, size: ${size}}';
-  }
-}
-
-class _ResizeSessionRequestTableReader
-    extends fb.TableReader<ResizeSessionRequestTable> {
+class _ResizeSessionRequestTableReader extends fb.TableReader<ResizeSessionRequestTable> {
   const _ResizeSessionRequestTableReader();
 
   @override
-  ResizeSessionRequestTable createObject(fb.BufferContext bc, int offset) =>
-      ResizeSessionRequestTable._(bc, offset);
+  ResizeSessionRequestTable createObject(fb.BufferContext bc, int offset) => 
+    ResizeSessionRequestTable._(bc, offset);
 }
 
 class ResizeSessionRequestTableBuilder {
@@ -3703,7 +2530,6 @@ class ResizeSessionRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addSize(int offset) {
     fbBuilder.addStruct(1, offset);
     return fbBuilder.offset;
@@ -3721,14 +2547,14 @@ class ResizeSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
   ResizeSessionRequestTableObjectBuilder({
     String? sessionId,
     SessionSizeObjectBuilder? size,
-  }) : _sessionId = sessionId,
-       _size = size;
+  })
+      : _sessionId = sessionId,
+        _size = size;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3746,7 +2572,6 @@ class ResizeSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class RestoreSessionRequestTable {
   RestoreSessionRequestTable._(this._bc, this._bcOffset);
   factory RestoreSessionRequestTable(List<int> bytes) {
@@ -3754,63 +2579,26 @@ class RestoreSessionRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<RestoreSessionRequestTable> reader =
-      _RestoreSessionRequestTableReader();
+  static const fb.Reader<RestoreSessionRequestTable> reader = _RestoreSessionRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  SessionSize? get size =>
-      SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'RestoreSessionRequestTable{sessionId: ${sessionId}, size: ${size}}';
   }
-
-  RestoreSessionRequestTableT unpack() =>
-      RestoreSessionRequestTableT(sessionId: sessionId, size: size?.unpack());
-
-  static int pack(fb.Builder fbBuilder, RestoreSessionRequestTableT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class RestoreSessionRequestTableT implements fb.Packable {
-  String? sessionId;
-  SessionSizeT? size;
-
-  RestoreSessionRequestTableT({this.sessionId, this.size});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    if (size != null) {
-      fbBuilder.addStruct(1, size!.pack(fbBuilder));
-    }
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'RestoreSessionRequestTableT{sessionId: ${sessionId}, size: ${size}}';
-  }
-}
-
-class _RestoreSessionRequestTableReader
-    extends fb.TableReader<RestoreSessionRequestTable> {
+class _RestoreSessionRequestTableReader extends fb.TableReader<RestoreSessionRequestTable> {
   const _RestoreSessionRequestTableReader();
 
   @override
-  RestoreSessionRequestTable createObject(fb.BufferContext bc, int offset) =>
-      RestoreSessionRequestTable._(bc, offset);
+  RestoreSessionRequestTable createObject(fb.BufferContext bc, int offset) => 
+    RestoreSessionRequestTable._(bc, offset);
 }
 
 class RestoreSessionRequestTableBuilder {
@@ -3826,7 +2614,6 @@ class RestoreSessionRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addSize(int offset) {
     fbBuilder.addStruct(1, offset);
     return fbBuilder.offset;
@@ -3844,14 +2631,14 @@ class RestoreSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
   RestoreSessionRequestTableObjectBuilder({
     String? sessionId,
     SessionSizeObjectBuilder? size,
-  }) : _sessionId = sessionId,
-       _size = size;
+  })
+      : _sessionId = sessionId,
+        _size = size;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3869,7 +2656,6 @@ class RestoreSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SnapshotSessionRequest {
   SnapshotSessionRequest._(this._bc, this._bcOffset);
   factory SnapshotSessionRequest(List<int> bytes) {
@@ -3877,57 +2663,25 @@ class SnapshotSessionRequest {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<SnapshotSessionRequest> reader =
-      _SnapshotSessionRequestReader();
+  static const fb.Reader<SnapshotSessionRequest> reader = _SnapshotSessionRequestReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'SnapshotSessionRequest{sessionId: ${sessionId}}';
   }
-
-  SnapshotSessionRequestT unpack() =>
-      SnapshotSessionRequestT(sessionId: sessionId);
-
-  static int pack(fb.Builder fbBuilder, SnapshotSessionRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class SnapshotSessionRequestT implements fb.Packable {
-  String? sessionId;
-
-  SnapshotSessionRequestT({this.sessionId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SnapshotSessionRequestT{sessionId: ${sessionId}}';
-  }
-}
-
-class _SnapshotSessionRequestReader
-    extends fb.TableReader<SnapshotSessionRequest> {
+class _SnapshotSessionRequestReader extends fb.TableReader<SnapshotSessionRequest> {
   const _SnapshotSessionRequestReader();
 
   @override
-  SnapshotSessionRequest createObject(fb.BufferContext bc, int offset) =>
-      SnapshotSessionRequest._(bc, offset);
+  SnapshotSessionRequest createObject(fb.BufferContext bc, int offset) => 
+    SnapshotSessionRequest._(bc, offset);
 }
 
 class SnapshotSessionRequestBuilder {
@@ -3952,14 +2706,15 @@ class SnapshotSessionRequestBuilder {
 class SnapshotSessionRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
 
-  SnapshotSessionRequestObjectBuilder({String? sessionId})
-    : _sessionId = sessionId;
+  SnapshotSessionRequestObjectBuilder({
+    String? sessionId,
+  })
+      : _sessionId = sessionId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -3974,7 +2729,6 @@ class SnapshotSessionRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class StyledRowsRequestTable {
   StyledRowsRequestTable._(this._bc, this._bcOffset);
   factory StyledRowsRequestTable(List<int> bytes) {
@@ -3982,14 +2736,12 @@ class StyledRowsRequestTable {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<StyledRowsRequestTable> reader =
-      _StyledRowsRequestTableReader();
+  static const fb.Reader<StyledRowsRequestTable> reader = _StyledRowsRequestTableReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   int get start => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 6, 0);
   int get end => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 8, 0);
 
@@ -3997,48 +2749,14 @@ class StyledRowsRequestTable {
   String toString() {
     return 'StyledRowsRequestTable{sessionId: ${sessionId}, start: ${start}, end: ${end}}';
   }
-
-  StyledRowsRequestTableT unpack() =>
-      StyledRowsRequestTableT(sessionId: sessionId, start: start, end: end);
-
-  static int pack(fb.Builder fbBuilder, StyledRowsRequestTableT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class StyledRowsRequestTableT implements fb.Packable {
-  String? sessionId;
-  int start;
-  int end;
-
-  StyledRowsRequestTableT({this.sessionId, this.start = 0, this.end = 0});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint32(1, start);
-    fbBuilder.addUint32(2, end);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'StyledRowsRequestTableT{sessionId: ${sessionId}, start: ${start}, end: ${end}}';
-  }
-}
-
-class _StyledRowsRequestTableReader
-    extends fb.TableReader<StyledRowsRequestTable> {
+class _StyledRowsRequestTableReader extends fb.TableReader<StyledRowsRequestTable> {
   const _StyledRowsRequestTableReader();
 
   @override
-  StyledRowsRequestTable createObject(fb.BufferContext bc, int offset) =>
-      StyledRowsRequestTable._(bc, offset);
+  StyledRowsRequestTable createObject(fb.BufferContext bc, int offset) => 
+    StyledRowsRequestTable._(bc, offset);
 }
 
 class StyledRowsRequestTableBuilder {
@@ -4054,12 +2772,10 @@ class StyledRowsRequestTableBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addStart(int? start) {
     fbBuilder.addUint32(1, start);
     return fbBuilder.offset;
   }
-
   int addEnd(int? end) {
     fbBuilder.addUint32(2, end);
     return fbBuilder.offset;
@@ -4075,16 +2791,19 @@ class StyledRowsRequestTableObjectBuilder extends fb.ObjectBuilder {
   final int? _start;
   final int? _end;
 
-  StyledRowsRequestTableObjectBuilder({String? sessionId, int? start, int? end})
-    : _sessionId = sessionId,
-      _start = start,
-      _end = end;
+  StyledRowsRequestTableObjectBuilder({
+    String? sessionId,
+    int? start,
+    int? end,
+  })
+      : _sessionId = sessionId,
+        _start = start,
+        _end = end;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -4101,7 +2820,6 @@ class StyledRowsRequestTableObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ShutdownSessionRequest {
   ShutdownSessionRequest._(this._bc, this._bcOffset);
   factory ShutdownSessionRequest(List<int> bytes) {
@@ -4109,57 +2827,25 @@ class ShutdownSessionRequest {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<ShutdownSessionRequest> reader =
-      _ShutdownSessionRequestReader();
+  static const fb.Reader<ShutdownSessionRequest> reader = _ShutdownSessionRequestReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'ShutdownSessionRequest{sessionId: ${sessionId}}';
   }
-
-  ShutdownSessionRequestT unpack() =>
-      ShutdownSessionRequestT(sessionId: sessionId);
-
-  static int pack(fb.Builder fbBuilder, ShutdownSessionRequestT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class ShutdownSessionRequestT implements fb.Packable {
-  String? sessionId;
-
-  ShutdownSessionRequestT({this.sessionId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ShutdownSessionRequestT{sessionId: ${sessionId}}';
-  }
-}
-
-class _ShutdownSessionRequestReader
-    extends fb.TableReader<ShutdownSessionRequest> {
+class _ShutdownSessionRequestReader extends fb.TableReader<ShutdownSessionRequest> {
   const _ShutdownSessionRequestReader();
 
   @override
-  ShutdownSessionRequest createObject(fb.BufferContext bc, int offset) =>
-      ShutdownSessionRequest._(bc, offset);
+  ShutdownSessionRequest createObject(fb.BufferContext bc, int offset) => 
+    ShutdownSessionRequest._(bc, offset);
 }
 
 class ShutdownSessionRequestBuilder {
@@ -4184,14 +2870,15 @@ class ShutdownSessionRequestBuilder {
 class ShutdownSessionRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
 
-  ShutdownSessionRequestObjectBuilder({String? sessionId})
-    : _sessionId = sessionId;
+  ShutdownSessionRequestObjectBuilder({
+    String? sessionId,
+  })
+      : _sessionId = sessionId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -4206,7 +2893,52 @@ class ShutdownSessionRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class ListSessionSnippetsRequest {
+  ListSessionSnippetsRequest._(this._bc, this._bcOffset);
+  factory ListSessionSnippetsRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
 
+  static const fb.Reader<ListSessionSnippetsRequest> reader = _ListSessionSnippetsRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'ListSessionSnippetsRequest{}';
+  }
+}
+
+class _ListSessionSnippetsRequestReader extends fb.TableReader<ListSessionSnippetsRequest> {
+  const _ListSessionSnippetsRequestReader();
+
+  @override
+  ListSessionSnippetsRequest createObject(fb.BufferContext bc, int offset) => 
+    ListSessionSnippetsRequest._(bc, offset);
+}
+
+class ListSessionSnippetsRequestObjectBuilder extends fb.ObjectBuilder {
+
+  ListSessionSnippetsRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ClientMessage {
   ClientMessage._(this._bc, this._bcOffset);
   factory ClientMessage(List<int> bytes) {
@@ -4219,94 +2951,27 @@ class ClientMessage {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get id =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  ClientRequestPayloadTypeId? get payloadType =>
-      ClientRequestPayloadTypeId._createOrNull(
-        const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 6),
-      );
+  String? get id => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  ClientRequestPayloadTypeId? get payloadType => ClientRequestPayloadTypeId._createOrNull(const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 6));
   dynamic get payload {
     switch (payloadType?.value) {
-      case 1:
-        return HelloRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 2:
-        return PairRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 3:
-        return ListSessionsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 4:
-        return StartSessionRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 5:
-        return AttachSessionRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 6:
-        return SubscribeSessionEventsRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 7:
-        return AcquireInputLeaseRequest.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 8:
-        return ReleaseInputLeaseRequest.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 9:
-        return WriteInputRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 10:
-        return ResizeSessionRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 11:
-        return RestoreSessionRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 12:
-        return SnapshotSessionRequest.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 13:
-        return StyledRowsRequestTable.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 14:
-        return ShutdownSessionRequest.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 15:
-        return PairingChallengeRequest.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      default:
-        return null;
+      case 1: return HelloRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 2: return PairRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 3: return ListSessionsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 4: return StartSessionRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 5: return AttachSessionRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 6: return SubscribeSessionEventsRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 7: return AcquireInputLeaseRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 8: return ReleaseInputLeaseRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 9: return WriteInputRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 10: return ResizeSessionRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 11: return RestoreSessionRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 12: return SnapshotSessionRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 13: return StyledRowsRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 14: return ShutdownSessionRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 15: return PairingChallengeRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 16: return ListSessionSnippetsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      default: return null;
     }
   }
 
@@ -4314,49 +2979,14 @@ class ClientMessage {
   String toString() {
     return 'ClientMessage{id: ${id}, payloadType: ${payloadType}, payload: ${payload}}';
   }
-
-  ClientMessageT unpack() => ClientMessageT(
-    id: id,
-    payloadType: payloadType,
-    payload: payload?.unpack(),
-  );
-
-  static int pack(fb.Builder fbBuilder, ClientMessageT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ClientMessageT implements fb.Packable {
-  String? id;
-  ClientRequestPayloadTypeId? payloadType;
-  dynamic payload;
-
-  ClientMessageT({this.id, this.payloadType, this.payload});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? idOffset = id == null ? null : fbBuilder.writeString(id!);
-    final int? payloadOffset = payload?.pack(fbBuilder);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, idOffset);
-    fbBuilder.addUint8(1, payloadType?.value);
-    fbBuilder.addOffset(2, payloadOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ClientMessageT{id: ${id}, payloadType: ${payloadType}, payload: ${payload}}';
-  }
 }
 
 class _ClientMessageReader extends fb.TableReader<ClientMessage> {
   const _ClientMessageReader();
 
   @override
-  ClientMessage createObject(fb.BufferContext bc, int offset) =>
-      ClientMessage._(bc, offset);
+  ClientMessage createObject(fb.BufferContext bc, int offset) => 
+    ClientMessage._(bc, offset);
 }
 
 class ClientMessageBuilder {
@@ -4372,12 +3002,10 @@ class ClientMessageBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addPayloadType(ClientRequestPayloadTypeId? payloadType) {
     fbBuilder.addUint8(1, payloadType?.value);
     return fbBuilder.offset;
   }
-
   int addPayloadOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -4397,14 +3025,16 @@ class ClientMessageObjectBuilder extends fb.ObjectBuilder {
     String? id,
     ClientRequestPayloadTypeId? payloadType,
     dynamic payload,
-  }) : _id = id,
-       _payloadType = payloadType,
-       _payload = payload;
+  })
+      : _id = id,
+        _payloadType = payloadType,
+        _payload = payload;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? idOffset = _id == null ? null : fbBuilder.writeString(_id!);
+    final int? idOffset = _id == null ? null
+        : fbBuilder.writeString(_id!);
     final int? payloadOffset = _payload?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, idOffset);
@@ -4421,7 +3051,6 @@ class ClientMessageObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class UnitResult {
   UnitResult._(this._bc, this._bcOffset);
   factory UnitResult(List<int> bytes) {
@@ -4434,29 +3063,10 @@ class UnitResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
+
   @override
   String toString() {
     return 'UnitResult{}';
-  }
-
-  UnitResultT unpack() => UnitResultT();
-
-  static int pack(fb.Builder fbBuilder, UnitResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class UnitResultT implements fb.Packable {
-  @override
-  int pack(fb.Builder fbBuilder) {
-    fbBuilder.startTable(0);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'UnitResultT{}';
   }
 }
 
@@ -4464,11 +3074,12 @@ class _UnitResultReader extends fb.TableReader<UnitResult> {
   const _UnitResultReader();
 
   @override
-  UnitResult createObject(fb.BufferContext bc, int offset) =>
-      UnitResult._(bc, offset);
+  UnitResult createObject(fb.BufferContext bc, int offset) => 
+    UnitResult._(bc, offset);
 }
 
 class UnitResultObjectBuilder extends fb.ObjectBuilder {
+
   UnitResultObjectBuilder();
 
   /// Finish building, and store into the [fbBuilder].
@@ -4486,7 +3097,6 @@ class UnitResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class HelloResult {
   HelloResult._(this._bc, this._bcOffset);
   factory HelloResult(List<int> bytes) {
@@ -4499,47 +3109,12 @@ class HelloResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get protocolVersion =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  bool get authenticated =>
-      const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+  String? get protocolVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  bool get authenticated => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
 
   @override
   String toString() {
     return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}}';
-  }
-
-  HelloResultT unpack() => HelloResultT(
-    protocolVersion: protocolVersion,
-    authenticated: authenticated,
-  );
-
-  static int pack(fb.Builder fbBuilder, HelloResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class HelloResultT implements fb.Packable {
-  String? protocolVersion;
-  bool authenticated;
-
-  HelloResultT({this.protocolVersion, this.authenticated = false});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? protocolVersionOffset = protocolVersion == null
-        ? null
-        : fbBuilder.writeString(protocolVersion!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, protocolVersionOffset);
-    fbBuilder.addBool(1, authenticated);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'HelloResultT{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}}';
   }
 }
 
@@ -4547,8 +3122,8 @@ class _HelloResultReader extends fb.TableReader<HelloResult> {
   const _HelloResultReader();
 
   @override
-  HelloResult createObject(fb.BufferContext bc, int offset) =>
-      HelloResult._(bc, offset);
+  HelloResult createObject(fb.BufferContext bc, int offset) => 
+    HelloResult._(bc, offset);
 }
 
 class HelloResultBuilder {
@@ -4564,7 +3139,6 @@ class HelloResultBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addAuthenticated(bool? authenticated) {
     fbBuilder.addBool(1, authenticated);
     return fbBuilder.offset;
@@ -4579,15 +3153,17 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
   final String? _protocolVersion;
   final bool? _authenticated;
 
-  HelloResultObjectBuilder({String? protocolVersion, bool? authenticated})
-    : _protocolVersion = protocolVersion,
-      _authenticated = authenticated;
+  HelloResultObjectBuilder({
+    String? protocolVersion,
+    bool? authenticated,
+  })
+      : _protocolVersion = protocolVersion,
+        _authenticated = authenticated;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? protocolVersionOffset = _protocolVersion == null
-        ? null
+    final int? protocolVersionOffset = _protocolVersion == null ? null
         : fbBuilder.writeString(_protocolVersion!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, protocolVersionOffset);
@@ -4603,7 +3179,6 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class PairedResult {
   PairedResult._(this._bc, this._bcOffset);
   factory PairedResult(List<int> bytes) {
@@ -4616,40 +3191,11 @@ class PairedResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get token =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get token => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'PairedResult{token: ${token}}';
-  }
-
-  PairedResultT unpack() => PairedResultT(token: token);
-
-  static int pack(fb.Builder fbBuilder, PairedResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class PairedResultT implements fb.Packable {
-  String? token;
-
-  PairedResultT({this.token});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? tokenOffset = token == null
-        ? null
-        : fbBuilder.writeString(token!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, tokenOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'PairedResultT{token: ${token}}';
   }
 }
 
@@ -4657,8 +3203,8 @@ class _PairedResultReader extends fb.TableReader<PairedResult> {
   const _PairedResultReader();
 
   @override
-  PairedResult createObject(fb.BufferContext bc, int offset) =>
-      PairedResult._(bc, offset);
+  PairedResult createObject(fb.BufferContext bc, int offset) => 
+    PairedResult._(bc, offset);
 }
 
 class PairedResultBuilder {
@@ -4683,13 +3229,15 @@ class PairedResultBuilder {
 class PairedResultObjectBuilder extends fb.ObjectBuilder {
   final String? _token;
 
-  PairedResultObjectBuilder({String? token}) : _token = token;
+  PairedResultObjectBuilder({
+    String? token,
+  })
+      : _token = token;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? tokenOffset = _token == null
-        ? null
+    final int? tokenOffset = _token == null ? null
         : fbBuilder.writeString(_token!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, tokenOffset);
@@ -4704,7 +3252,6 @@ class PairedResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class PairingChallengeResult {
   PairingChallengeResult._(this._bc, this._bcOffset);
   factory PairingChallengeResult(List<int> bytes) {
@@ -4712,60 +3259,26 @@ class PairingChallengeResult {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<PairingChallengeResult> reader =
-      _PairingChallengeResultReader();
+  static const fb.Reader<PairingChallengeResult> reader = _PairingChallengeResultReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get deviceCode =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get deviceCode => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   int get expiresAt => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
     return 'PairingChallengeResult{deviceCode: ${deviceCode}, expiresAt: ${expiresAt}}';
   }
-
-  PairingChallengeResultT unpack() =>
-      PairingChallengeResultT(deviceCode: deviceCode, expiresAt: expiresAt);
-
-  static int pack(fb.Builder fbBuilder, PairingChallengeResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class PairingChallengeResultT implements fb.Packable {
-  String? deviceCode;
-  int expiresAt;
-
-  PairingChallengeResultT({this.deviceCode, this.expiresAt = 0});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? deviceCodeOffset = deviceCode == null
-        ? null
-        : fbBuilder.writeString(deviceCode!);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, deviceCodeOffset);
-    fbBuilder.addUint64(1, expiresAt);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'PairingChallengeResultT{deviceCode: ${deviceCode}, expiresAt: ${expiresAt}}';
-  }
-}
-
-class _PairingChallengeResultReader
-    extends fb.TableReader<PairingChallengeResult> {
+class _PairingChallengeResultReader extends fb.TableReader<PairingChallengeResult> {
   const _PairingChallengeResultReader();
 
   @override
-  PairingChallengeResult createObject(fb.BufferContext bc, int offset) =>
-      PairingChallengeResult._(bc, offset);
+  PairingChallengeResult createObject(fb.BufferContext bc, int offset) => 
+    PairingChallengeResult._(bc, offset);
 }
 
 class PairingChallengeResultBuilder {
@@ -4781,7 +3294,6 @@ class PairingChallengeResultBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addExpiresAt(int? expiresAt) {
     fbBuilder.addUint64(1, expiresAt);
     return fbBuilder.offset;
@@ -4796,15 +3308,17 @@ class PairingChallengeResultObjectBuilder extends fb.ObjectBuilder {
   final String? _deviceCode;
   final int? _expiresAt;
 
-  PairingChallengeResultObjectBuilder({String? deviceCode, int? expiresAt})
-    : _deviceCode = deviceCode,
-      _expiresAt = expiresAt;
+  PairingChallengeResultObjectBuilder({
+    String? deviceCode,
+    int? expiresAt,
+  })
+      : _deviceCode = deviceCode,
+        _expiresAt = expiresAt;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? deviceCodeOffset = _deviceCode == null
-        ? null
+    final int? deviceCodeOffset = _deviceCode == null ? null
         : fbBuilder.writeString(_deviceCode!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, deviceCodeOffset);
@@ -4820,7 +3334,6 @@ class PairingChallengeResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SessionIdsResult {
   SessionIdsResult._(this._bc, this._bcOffset);
   factory SessionIdsResult(List<int> bytes) {
@@ -4833,42 +3346,11 @@ class SessionIdsResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  List<String>? get sessionIds => const fb.ListReader<String>(
-    fb.StringReader(),
-  ).vTableGetNullable(_bc, _bcOffset, 4);
+  List<String>? get sessionIds => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'SessionIdsResult{sessionIds: ${sessionIds}}';
-  }
-
-  SessionIdsResultT unpack() =>
-      SessionIdsResultT(sessionIds: sessionIds?.toList());
-
-  static int pack(fb.Builder fbBuilder, SessionIdsResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SessionIdsResultT implements fb.Packable {
-  List<String>? sessionIds;
-
-  SessionIdsResultT({this.sessionIds});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdsOffset = sessionIds == null
-        ? null
-        : fbBuilder.writeList(sessionIds!.map(fbBuilder.writeString).toList());
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, sessionIdsOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SessionIdsResultT{sessionIds: ${sessionIds}}';
   }
 }
 
@@ -4876,8 +3358,8 @@ class _SessionIdsResultReader extends fb.TableReader<SessionIdsResult> {
   const _SessionIdsResultReader();
 
   @override
-  SessionIdsResult createObject(fb.BufferContext bc, int offset) =>
-      SessionIdsResult._(bc, offset);
+  SessionIdsResult createObject(fb.BufferContext bc, int offset) => 
+    SessionIdsResult._(bc, offset);
 }
 
 class SessionIdsResultBuilder {
@@ -4902,14 +3384,15 @@ class SessionIdsResultBuilder {
 class SessionIdsResultObjectBuilder extends fb.ObjectBuilder {
   final List<String>? _sessionIds;
 
-  SessionIdsResultObjectBuilder({List<String>? sessionIds})
-    : _sessionIds = sessionIds;
+  SessionIdsResultObjectBuilder({
+    List<String>? sessionIds,
+  })
+      : _sessionIds = sessionIds;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdsOffset = _sessionIds == null
-        ? null
+    final int? sessionIdsOffset = _sessionIds == null ? null
         : fbBuilder.writeList(_sessionIds!.map(fbBuilder.writeString).toList());
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, sessionIdsOffset);
@@ -4924,7 +3407,6 @@ class SessionIdsResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SessionIdResult {
   SessionIdResult._(this._bc, this._bcOffset);
   factory SessionIdResult(List<int> bytes) {
@@ -4937,40 +3419,11 @@ class SessionIdResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'SessionIdResult{sessionId: ${sessionId}}';
-  }
-
-  SessionIdResultT unpack() => SessionIdResultT(sessionId: sessionId);
-
-  static int pack(fb.Builder fbBuilder, SessionIdResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SessionIdResultT implements fb.Packable {
-  String? sessionId;
-
-  SessionIdResultT({this.sessionId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SessionIdResultT{sessionId: ${sessionId}}';
   }
 }
 
@@ -4978,8 +3431,8 @@ class _SessionIdResultReader extends fb.TableReader<SessionIdResult> {
   const _SessionIdResultReader();
 
   @override
-  SessionIdResult createObject(fb.BufferContext bc, int offset) =>
-      SessionIdResult._(bc, offset);
+  SessionIdResult createObject(fb.BufferContext bc, int offset) => 
+    SessionIdResult._(bc, offset);
 }
 
 class SessionIdResultBuilder {
@@ -5004,13 +3457,15 @@ class SessionIdResultBuilder {
 class SessionIdResultObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
 
-  SessionIdResultObjectBuilder({String? sessionId}) : _sessionId = sessionId;
+  SessionIdResultObjectBuilder({
+    String? sessionId,
+  })
+      : _sessionId = sessionId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -5025,7 +3480,6 @@ class SessionIdResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class AttachSessionResult {
   AttachSessionResult._(this._bc, this._bcOffset);
   factory AttachSessionResult(List<int> bytes) {
@@ -5033,45 +3487,16 @@ class AttachSessionResult {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<AttachSessionResult> reader =
-      _AttachSessionResultReader();
+  static const fb.Reader<AttachSessionResult> reader = _AttachSessionResultReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  AttachSessionResponse? get response =>
-      AttachSessionResponse.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  AttachSessionResponse? get response => AttachSessionResponse.reader.vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'AttachSessionResult{response: ${response}}';
-  }
-
-  AttachSessionResultT unpack() =>
-      AttachSessionResultT(response: response?.unpack());
-
-  static int pack(fb.Builder fbBuilder, AttachSessionResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class AttachSessionResultT implements fb.Packable {
-  AttachSessionResponseT? response;
-
-  AttachSessionResultT({this.response});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? responseOffset = response?.pack(fbBuilder);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, responseOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'AttachSessionResultT{response: ${response}}';
   }
 }
 
@@ -5079,8 +3504,8 @@ class _AttachSessionResultReader extends fb.TableReader<AttachSessionResult> {
   const _AttachSessionResultReader();
 
   @override
-  AttachSessionResult createObject(fb.BufferContext bc, int offset) =>
-      AttachSessionResult._(bc, offset);
+  AttachSessionResult createObject(fb.BufferContext bc, int offset) => 
+    AttachSessionResult._(bc, offset);
 }
 
 class AttachSessionResultBuilder {
@@ -5107,7 +3532,8 @@ class AttachSessionResultObjectBuilder extends fb.ObjectBuilder {
 
   AttachSessionResultObjectBuilder({
     AttachSessionResponseObjectBuilder? response,
-  }) : _response = response;
+  })
+      : _response = response;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -5126,7 +3552,6 @@ class AttachSessionResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SubscribedResult {
   SubscribedResult._(this._bc, this._bcOffset);
   factory SubscribedResult(List<int> bytes) {
@@ -5139,41 +3564,11 @@ class SubscribedResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get subscriptionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get subscriptionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'SubscribedResult{subscriptionId: ${subscriptionId}}';
-  }
-
-  SubscribedResultT unpack() =>
-      SubscribedResultT(subscriptionId: subscriptionId);
-
-  static int pack(fb.Builder fbBuilder, SubscribedResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SubscribedResultT implements fb.Packable {
-  String? subscriptionId;
-
-  SubscribedResultT({this.subscriptionId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? subscriptionIdOffset = subscriptionId == null
-        ? null
-        : fbBuilder.writeString(subscriptionId!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, subscriptionIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SubscribedResultT{subscriptionId: ${subscriptionId}}';
   }
 }
 
@@ -5181,8 +3576,8 @@ class _SubscribedResultReader extends fb.TableReader<SubscribedResult> {
   const _SubscribedResultReader();
 
   @override
-  SubscribedResult createObject(fb.BufferContext bc, int offset) =>
-      SubscribedResult._(bc, offset);
+  SubscribedResult createObject(fb.BufferContext bc, int offset) => 
+    SubscribedResult._(bc, offset);
 }
 
 class SubscribedResultBuilder {
@@ -5207,14 +3602,15 @@ class SubscribedResultBuilder {
 class SubscribedResultObjectBuilder extends fb.ObjectBuilder {
   final String? _subscriptionId;
 
-  SubscribedResultObjectBuilder({String? subscriptionId})
-    : _subscriptionId = subscriptionId;
+  SubscribedResultObjectBuilder({
+    String? subscriptionId,
+  })
+      : _subscriptionId = subscriptionId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? subscriptionIdOffset = _subscriptionId == null
-        ? null
+    final int? subscriptionIdOffset = _subscriptionId == null ? null
         : fbBuilder.writeString(_subscriptionId!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, subscriptionIdOffset);
@@ -5229,7 +3625,6 @@ class SubscribedResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class LeaseChangeResult {
   LeaseChangeResult._(this._bc, this._bcOffset);
   factory LeaseChangeResult(List<int> bytes) {
@@ -5242,38 +3637,11 @@ class LeaseChangeResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  LeaseChange? get change =>
-      LeaseChange.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  LeaseChange? get change => LeaseChange.reader.vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'LeaseChangeResult{change: ${change}}';
-  }
-
-  LeaseChangeResultT unpack() => LeaseChangeResultT(change: change?.unpack());
-
-  static int pack(fb.Builder fbBuilder, LeaseChangeResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class LeaseChangeResultT implements fb.Packable {
-  LeaseChangeT? change;
-
-  LeaseChangeResultT({this.change});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? changeOffset = change?.pack(fbBuilder);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, changeOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'LeaseChangeResultT{change: ${change}}';
   }
 }
 
@@ -5281,8 +3649,8 @@ class _LeaseChangeResultReader extends fb.TableReader<LeaseChangeResult> {
   const _LeaseChangeResultReader();
 
   @override
-  LeaseChangeResult createObject(fb.BufferContext bc, int offset) =>
-      LeaseChangeResult._(bc, offset);
+  LeaseChangeResult createObject(fb.BufferContext bc, int offset) => 
+    LeaseChangeResult._(bc, offset);
 }
 
 class LeaseChangeResultBuilder {
@@ -5307,8 +3675,10 @@ class LeaseChangeResultBuilder {
 class LeaseChangeResultObjectBuilder extends fb.ObjectBuilder {
   final LeaseChangeObjectBuilder? _change;
 
-  LeaseChangeResultObjectBuilder({LeaseChangeObjectBuilder? change})
-    : _change = change;
+  LeaseChangeResultObjectBuilder({
+    LeaseChangeObjectBuilder? change,
+  })
+      : _change = change;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -5327,7 +3697,6 @@ class LeaseChangeResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SessionSnapshotResult {
   SessionSnapshotResult._(this._bc, this._bcOffset);
   factory SessionSnapshotResult(List<int> bytes) {
@@ -5335,55 +3704,25 @@ class SessionSnapshotResult {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<SessionSnapshotResult> reader =
-      _SessionSnapshotResultReader();
+  static const fb.Reader<SessionSnapshotResult> reader = _SessionSnapshotResultReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  SessionSnapshot? get snapshot =>
-      SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  SessionSnapshot? get snapshot => SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'SessionSnapshotResult{snapshot: ${snapshot}}';
   }
-
-  SessionSnapshotResultT unpack() =>
-      SessionSnapshotResultT(snapshot: snapshot?.unpack());
-
-  static int pack(fb.Builder fbBuilder, SessionSnapshotResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class SessionSnapshotResultT implements fb.Packable {
-  SessionSnapshotT? snapshot;
-
-  SessionSnapshotResultT({this.snapshot});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? snapshotOffset = snapshot?.pack(fbBuilder);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, snapshotOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SessionSnapshotResultT{snapshot: ${snapshot}}';
-  }
-}
-
-class _SessionSnapshotResultReader
-    extends fb.TableReader<SessionSnapshotResult> {
+class _SessionSnapshotResultReader extends fb.TableReader<SessionSnapshotResult> {
   const _SessionSnapshotResultReader();
 
   @override
-  SessionSnapshotResult createObject(fb.BufferContext bc, int offset) =>
-      SessionSnapshotResult._(bc, offset);
+  SessionSnapshotResult createObject(fb.BufferContext bc, int offset) => 
+    SessionSnapshotResult._(bc, offset);
 }
 
 class SessionSnapshotResultBuilder {
@@ -5408,8 +3747,10 @@ class SessionSnapshotResultBuilder {
 class SessionSnapshotResultObjectBuilder extends fb.ObjectBuilder {
   final SessionSnapshotObjectBuilder? _snapshot;
 
-  SessionSnapshotResultObjectBuilder({SessionSnapshotObjectBuilder? snapshot})
-    : _snapshot = snapshot;
+  SessionSnapshotResultObjectBuilder({
+    SessionSnapshotObjectBuilder? snapshot,
+  })
+      : _snapshot = snapshot;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -5428,7 +3769,6 @@ class SessionSnapshotResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class StyledRowsResult {
   StyledRowsResult._(this._bc, this._bcOffset);
   factory StyledRowsResult(List<int> bytes) {
@@ -5441,38 +3781,11 @@ class StyledRowsResult {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  StyledRowsResponse? get response =>
-      StyledRowsResponse.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  StyledRowsResponse? get response => StyledRowsResponse.reader.vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'StyledRowsResult{response: ${response}}';
-  }
-
-  StyledRowsResultT unpack() => StyledRowsResultT(response: response?.unpack());
-
-  static int pack(fb.Builder fbBuilder, StyledRowsResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class StyledRowsResultT implements fb.Packable {
-  StyledRowsResponseT? response;
-
-  StyledRowsResultT({this.response});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? responseOffset = response?.pack(fbBuilder);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, responseOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'StyledRowsResultT{response: ${response}}';
   }
 }
 
@@ -5480,8 +3793,8 @@ class _StyledRowsResultReader extends fb.TableReader<StyledRowsResult> {
   const _StyledRowsResultReader();
 
   @override
-  StyledRowsResult createObject(fb.BufferContext bc, int offset) =>
-      StyledRowsResult._(bc, offset);
+  StyledRowsResult createObject(fb.BufferContext bc, int offset) => 
+    StyledRowsResult._(bc, offset);
 }
 
 class StyledRowsResultBuilder {
@@ -5506,8 +3819,10 @@ class StyledRowsResultBuilder {
 class StyledRowsResultObjectBuilder extends fb.ObjectBuilder {
   final StyledRowsResponseObjectBuilder? _response;
 
-  StyledRowsResultObjectBuilder({StyledRowsResponseObjectBuilder? response})
-    : _response = response;
+  StyledRowsResultObjectBuilder({
+    StyledRowsResponseObjectBuilder? response,
+  })
+      : _response = response;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -5526,7 +3841,6 @@ class StyledRowsResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class CompletedSessionResult {
   CompletedSessionResult._(this._bc, this._bcOffset);
   factory CompletedSessionResult(List<int> bytes) {
@@ -5534,55 +3848,25 @@ class CompletedSessionResult {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<CompletedSessionResult> reader =
-      _CompletedSessionResultReader();
+  static const fb.Reader<CompletedSessionResult> reader = _CompletedSessionResultReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  CompletedSession? get completed =>
-      CompletedSession.reader.vTableGetNullable(_bc, _bcOffset, 4);
+  CompletedSession? get completed => CompletedSession.reader.vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'CompletedSessionResult{completed: ${completed}}';
   }
-
-  CompletedSessionResultT unpack() =>
-      CompletedSessionResultT(completed: completed?.unpack());
-
-  static int pack(fb.Builder fbBuilder, CompletedSessionResultT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class CompletedSessionResultT implements fb.Packable {
-  CompletedSessionT? completed;
-
-  CompletedSessionResultT({this.completed});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? completedOffset = completed?.pack(fbBuilder);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, completedOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'CompletedSessionResultT{completed: ${completed}}';
-  }
-}
-
-class _CompletedSessionResultReader
-    extends fb.TableReader<CompletedSessionResult> {
+class _CompletedSessionResultReader extends fb.TableReader<CompletedSessionResult> {
   const _CompletedSessionResultReader();
 
   @override
-  CompletedSessionResult createObject(fb.BufferContext bc, int offset) =>
-      CompletedSessionResult._(bc, offset);
+  CompletedSessionResult createObject(fb.BufferContext bc, int offset) => 
+    CompletedSessionResult._(bc, offset);
 }
 
 class CompletedSessionResultBuilder {
@@ -5609,7 +3893,8 @@ class CompletedSessionResultObjectBuilder extends fb.ObjectBuilder {
 
   CompletedSessionResultObjectBuilder({
     CompletedSessionObjectBuilder? completed,
-  }) : _completed = completed;
+  })
+      : _completed = completed;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -5628,7 +3913,163 @@ class CompletedSessionResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionSnippetEntry {
+  SessionSnippetEntry._(this._bc, this._bcOffset);
+  factory SessionSnippetEntry(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
 
+  static const fb.Reader<SessionSnippetEntry> reader = _SessionSnippetEntryReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+
+  @override
+  String toString() {
+    return 'SessionSnippetEntry{sessionId: ${sessionId}, snippet: ${snippet}}';
+  }
+}
+
+class _SessionSnippetEntryReader extends fb.TableReader<SessionSnippetEntry> {
+  const _SessionSnippetEntryReader();
+
+  @override
+  SessionSnippetEntry createObject(fb.BufferContext bc, int offset) => 
+    SessionSnippetEntry._(bc, offset);
+}
+
+class SessionSnippetEntryBuilder {
+  SessionSnippetEntryBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSnippetOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionSnippetEntryObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _snippet;
+
+  SessionSnippetEntryObjectBuilder({
+    String? sessionId,
+    String? snippet,
+  })
+      : _sessionId = sessionId,
+        _snippet = snippet;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? snippetOffset = _snippet == null ? null
+        : fbBuilder.writeString(_snippet!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, snippetOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SessionSnippetsResult {
+  SessionSnippetsResult._(this._bc, this._bcOffset);
+  factory SessionSnippetsResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionSnippetsResult> reader = _SessionSnippetsResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<SessionSnippetEntry>? get entries => const fb.ListReader<SessionSnippetEntry>(SessionSnippetEntry.reader).vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'SessionSnippetsResult{entries: ${entries}}';
+  }
+}
+
+class _SessionSnippetsResultReader extends fb.TableReader<SessionSnippetsResult> {
+  const _SessionSnippetsResultReader();
+
+  @override
+  SessionSnippetsResult createObject(fb.BufferContext bc, int offset) => 
+    SessionSnippetsResult._(bc, offset);
+}
+
+class SessionSnippetsResultBuilder {
+  SessionSnippetsResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addEntriesOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionSnippetsResultObjectBuilder extends fb.ObjectBuilder {
+  final List<SessionSnippetEntryObjectBuilder>? _entries;
+
+  SessionSnippetsResultObjectBuilder({
+    List<SessionSnippetEntryObjectBuilder>? entries,
+  })
+      : _entries = entries;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? entriesOffset = _entries == null ? null
+        : fbBuilder.writeList(_entries!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, entriesOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ResponsePayload {
   ResponsePayload._(this._bc, this._bcOffset);
   factory ResponsePayload(List<int> bytes) {
@@ -5641,52 +4082,24 @@ class ResponsePayload {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get id =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  ServerResultPayloadTypeId? get resultType =>
-      ServerResultPayloadTypeId._createOrNull(
-        const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 6),
-      );
+  String? get id => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  ServerResultPayloadTypeId? get resultType => ServerResultPayloadTypeId._createOrNull(const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 6));
   dynamic get result {
     switch (resultType?.value) {
-      case 1:
-        return UnitResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 2:
-        return HelloResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 3:
-        return PairedResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 4:
-        return SessionIdsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 5:
-        return SessionIdResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 6:
-        return AttachSessionResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 7:
-        return SubscribedResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 8:
-        return LeaseChangeResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 9:
-        return SessionSnapshotResult.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 10:
-        return StyledRowsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
-      case 11:
-        return CompletedSessionResult.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      case 12:
-        return PairingChallengeResult.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          8,
-        );
-      default:
-        return null;
+      case 1: return UnitResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 2: return HelloResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 3: return PairedResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 4: return SessionIdsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 5: return SessionIdResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 6: return AttachSessionResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 7: return SubscribedResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 8: return LeaseChangeResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 9: return SessionSnapshotResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 10: return StyledRowsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 11: return CompletedSessionResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 12: return PairingChallengeResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 13: return SessionSnippetsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      default: return null;
     }
   }
 
@@ -5694,49 +4107,14 @@ class ResponsePayload {
   String toString() {
     return 'ResponsePayload{id: ${id}, resultType: ${resultType}, result: ${result}}';
   }
-
-  ResponsePayloadT unpack() => ResponsePayloadT(
-    id: id,
-    resultType: resultType,
-    result: result?.unpack(),
-  );
-
-  static int pack(fb.Builder fbBuilder, ResponsePayloadT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ResponsePayloadT implements fb.Packable {
-  String? id;
-  ServerResultPayloadTypeId? resultType;
-  dynamic result;
-
-  ResponsePayloadT({this.id, this.resultType, this.result});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? idOffset = id == null ? null : fbBuilder.writeString(id!);
-    final int? resultOffset = result?.pack(fbBuilder);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, idOffset);
-    fbBuilder.addUint8(1, resultType?.value);
-    fbBuilder.addOffset(2, resultOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ResponsePayloadT{id: ${id}, resultType: ${resultType}, result: ${result}}';
-  }
 }
 
 class _ResponsePayloadReader extends fb.TableReader<ResponsePayload> {
   const _ResponsePayloadReader();
 
   @override
-  ResponsePayload createObject(fb.BufferContext bc, int offset) =>
-      ResponsePayload._(bc, offset);
+  ResponsePayload createObject(fb.BufferContext bc, int offset) => 
+    ResponsePayload._(bc, offset);
 }
 
 class ResponsePayloadBuilder {
@@ -5752,12 +4130,10 @@ class ResponsePayloadBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addResultType(ServerResultPayloadTypeId? resultType) {
     fbBuilder.addUint8(1, resultType?.value);
     return fbBuilder.offset;
   }
-
   int addResultOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -5777,14 +4153,16 @@ class ResponsePayloadObjectBuilder extends fb.ObjectBuilder {
     String? id,
     ServerResultPayloadTypeId? resultType,
     dynamic result,
-  }) : _id = id,
-       _resultType = resultType,
-       _result = result;
+  })
+      : _id = id,
+        _resultType = resultType,
+        _result = result;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? idOffset = _id == null ? null : fbBuilder.writeString(_id!);
+    final int? idOffset = _id == null ? null
+        : fbBuilder.writeString(_id!);
     final int? resultOffset = _result?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, idOffset);
@@ -5801,7 +4179,6 @@ class ResponsePayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ErrorPayload {
   ErrorPayload._(this._bc, this._bcOffset);
   factory ErrorPayload(List<int> bytes) {
@@ -5814,50 +4191,13 @@ class ErrorPayload {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get id =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  String? get code =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
-  String? get message =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get id => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get code => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get message => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'ErrorPayload{id: ${id}, code: ${code}, message: ${message}}';
-  }
-
-  ErrorPayloadT unpack() => ErrorPayloadT(id: id, code: code, message: message);
-
-  static int pack(fb.Builder fbBuilder, ErrorPayloadT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ErrorPayloadT implements fb.Packable {
-  String? id;
-  String? code;
-  String? message;
-
-  ErrorPayloadT({this.id, this.code, this.message});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? idOffset = id == null ? null : fbBuilder.writeString(id!);
-    final int? codeOffset = code == null ? null : fbBuilder.writeString(code!);
-    final int? messageOffset = message == null
-        ? null
-        : fbBuilder.writeString(message!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, idOffset);
-    fbBuilder.addOffset(1, codeOffset);
-    fbBuilder.addOffset(2, messageOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ErrorPayloadT{id: ${id}, code: ${code}, message: ${message}}';
   }
 }
 
@@ -5865,8 +4205,8 @@ class _ErrorPayloadReader extends fb.TableReader<ErrorPayload> {
   const _ErrorPayloadReader();
 
   @override
-  ErrorPayload createObject(fb.BufferContext bc, int offset) =>
-      ErrorPayload._(bc, offset);
+  ErrorPayload createObject(fb.BufferContext bc, int offset) => 
+    ErrorPayload._(bc, offset);
 }
 
 class ErrorPayloadBuilder {
@@ -5882,12 +4222,10 @@ class ErrorPayloadBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addCodeOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
   }
-
   int addMessageOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -5903,20 +4241,23 @@ class ErrorPayloadObjectBuilder extends fb.ObjectBuilder {
   final String? _code;
   final String? _message;
 
-  ErrorPayloadObjectBuilder({String? id, String? code, String? message})
-    : _id = id,
-      _code = code,
-      _message = message;
+  ErrorPayloadObjectBuilder({
+    String? id,
+    String? code,
+    String? message,
+  })
+      : _id = id,
+        _code = code,
+        _message = message;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? idOffset = _id == null ? null : fbBuilder.writeString(_id!);
-    final int? codeOffset = _code == null
-        ? null
+    final int? idOffset = _id == null ? null
+        : fbBuilder.writeString(_id!);
+    final int? codeOffset = _code == null ? null
         : fbBuilder.writeString(_code!);
-    final int? messageOffset = _message == null
-        ? null
+    final int? messageOffset = _message == null ? null
         : fbBuilder.writeString(_message!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, idOffset);
@@ -5933,7 +4274,6 @@ class ErrorPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ResyncRequiredEvent {
   ResyncRequiredEvent._(this._bc, this._bcOffset);
   factory ResyncRequiredEvent(List<int> bytes) {
@@ -5941,63 +4281,18 @@ class ResyncRequiredEvent {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<ResyncRequiredEvent> reader =
-      _ResyncRequiredEventReader();
+  static const fb.Reader<ResyncRequiredEvent> reader = _ResyncRequiredEventReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get latestEventSeq =>
-      const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
-  SessionSnapshot? get snapshot =>
-      SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 8);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  int get latestEventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  SessionSnapshot? get snapshot => SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'ResyncRequiredEvent{sessionId: ${sessionId}, latestEventSeq: ${latestEventSeq}, snapshot: ${snapshot}}';
-  }
-
-  ResyncRequiredEventT unpack() => ResyncRequiredEventT(
-    sessionId: sessionId,
-    latestEventSeq: latestEventSeq,
-    snapshot: snapshot?.unpack(),
-  );
-
-  static int pack(fb.Builder fbBuilder, ResyncRequiredEventT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ResyncRequiredEventT implements fb.Packable {
-  String? sessionId;
-  int latestEventSeq;
-  SessionSnapshotT? snapshot;
-
-  ResyncRequiredEventT({
-    this.sessionId,
-    this.latestEventSeq = 0,
-    this.snapshot,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? snapshotOffset = snapshot?.pack(fbBuilder);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint64(1, latestEventSeq);
-    fbBuilder.addOffset(2, snapshotOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ResyncRequiredEventT{sessionId: ${sessionId}, latestEventSeq: ${latestEventSeq}, snapshot: ${snapshot}}';
   }
 }
 
@@ -6005,8 +4300,8 @@ class _ResyncRequiredEventReader extends fb.TableReader<ResyncRequiredEvent> {
   const _ResyncRequiredEventReader();
 
   @override
-  ResyncRequiredEvent createObject(fb.BufferContext bc, int offset) =>
-      ResyncRequiredEvent._(bc, offset);
+  ResyncRequiredEvent createObject(fb.BufferContext bc, int offset) => 
+    ResyncRequiredEvent._(bc, offset);
 }
 
 class ResyncRequiredEventBuilder {
@@ -6022,12 +4317,10 @@ class ResyncRequiredEventBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addLatestEventSeq(int? latestEventSeq) {
     fbBuilder.addUint64(1, latestEventSeq);
     return fbBuilder.offset;
   }
-
   int addSnapshotOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -6047,15 +4340,15 @@ class ResyncRequiredEventObjectBuilder extends fb.ObjectBuilder {
     String? sessionId,
     int? latestEventSeq,
     SessionSnapshotObjectBuilder? snapshot,
-  }) : _sessionId = sessionId,
-       _latestEventSeq = latestEventSeq,
-       _snapshot = snapshot;
+  })
+      : _sessionId = sessionId,
+        _latestEventSeq = latestEventSeq,
+        _snapshot = snapshot;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     final int? snapshotOffset = _snapshot?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(3);
@@ -6073,7 +4366,6 @@ class ResyncRequiredEventObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class OutputEvent {
   OutputEvent._(this._bc, this._bcOffset);
   factory OutputEvent(List<int> bytes) {
@@ -6086,54 +4378,13 @@ class OutputEvent {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
-  List<int>? get bytes =>
-      const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
+  List<int>? get bytes => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
     return 'OutputEvent{sessionId: ${sessionId}, outputSeq: ${outputSeq}, bytes: ${bytes}}';
-  }
-
-  OutputEventT unpack() => OutputEventT(
-    sessionId: sessionId,
-    outputSeq: outputSeq,
-    bytes: bytes?.toList(),
-  );
-
-  static int pack(fb.Builder fbBuilder, OutputEventT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class OutputEventT implements fb.Packable {
-  String? sessionId;
-  int outputSeq;
-  List<int>? bytes;
-
-  OutputEventT({this.sessionId, this.outputSeq = 0, this.bytes});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? bytesOffset = bytes == null
-        ? null
-        : fbBuilder.writeListUint8(bytes!);
-    fbBuilder.startTable(3);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint64(1, outputSeq);
-    fbBuilder.addOffset(2, bytesOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'OutputEventT{sessionId: ${sessionId}, outputSeq: ${outputSeq}, bytes: ${bytes}}';
   }
 }
 
@@ -6141,8 +4392,8 @@ class _OutputEventReader extends fb.TableReader<OutputEvent> {
   const _OutputEventReader();
 
   @override
-  OutputEvent createObject(fb.BufferContext bc, int offset) =>
-      OutputEvent._(bc, offset);
+  OutputEvent createObject(fb.BufferContext bc, int offset) => 
+    OutputEvent._(bc, offset);
 }
 
 class OutputEventBuilder {
@@ -6158,12 +4409,10 @@ class OutputEventBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addOutputSeq(int? outputSeq) {
     fbBuilder.addUint64(1, outputSeq);
     return fbBuilder.offset;
   }
-
   int addBytesOffset(int? offset) {
     fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
@@ -6183,18 +4432,17 @@ class OutputEventObjectBuilder extends fb.ObjectBuilder {
     String? sessionId,
     int? outputSeq,
     List<int>? bytes,
-  }) : _sessionId = sessionId,
-       _outputSeq = outputSeq,
-       _bytes = bytes;
+  })
+      : _sessionId = sessionId,
+        _outputSeq = outputSeq,
+        _bytes = bytes;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
-    final int? bytesOffset = _bytes == null
-        ? null
+    final int? bytesOffset = _bytes == null ? null
         : fbBuilder.writeListUint8(_bytes!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
@@ -6211,7 +4459,6 @@ class OutputEventObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SnapshotEvent {
   SnapshotEvent._(this._bc, this._bcOffset);
   factory SnapshotEvent(List<int> bytes) {
@@ -6224,46 +4471,12 @@ class SnapshotEvent {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  SessionSnapshot? get snapshot =>
-      SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  SessionSnapshot? get snapshot => SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'SnapshotEvent{sessionId: ${sessionId}, snapshot: ${snapshot}}';
-  }
-
-  SnapshotEventT unpack() =>
-      SnapshotEventT(sessionId: sessionId, snapshot: snapshot?.unpack());
-
-  static int pack(fb.Builder fbBuilder, SnapshotEventT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class SnapshotEventT implements fb.Packable {
-  String? sessionId;
-  SessionSnapshotT? snapshot;
-
-  SnapshotEventT({this.sessionId, this.snapshot});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? snapshotOffset = snapshot?.pack(fbBuilder);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, snapshotOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SnapshotEventT{sessionId: ${sessionId}, snapshot: ${snapshot}}';
   }
 }
 
@@ -6271,8 +4484,8 @@ class _SnapshotEventReader extends fb.TableReader<SnapshotEvent> {
   const _SnapshotEventReader();
 
   @override
-  SnapshotEvent createObject(fb.BufferContext bc, int offset) =>
-      SnapshotEvent._(bc, offset);
+  SnapshotEvent createObject(fb.BufferContext bc, int offset) => 
+    SnapshotEvent._(bc, offset);
 }
 
 class SnapshotEventBuilder {
@@ -6288,7 +4501,6 @@ class SnapshotEventBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addSnapshotOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -6306,14 +4518,14 @@ class SnapshotEventObjectBuilder extends fb.ObjectBuilder {
   SnapshotEventObjectBuilder({
     String? sessionId,
     SessionSnapshotObjectBuilder? snapshot,
-  }) : _sessionId = sessionId,
-       _snapshot = snapshot;
+  })
+      : _sessionId = sessionId,
+        _snapshot = snapshot;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     final int? snapshotOffset = _snapshot?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(2);
@@ -6330,7 +4542,6 @@ class SnapshotEventObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class LeaseChangedEvent {
   LeaseChangedEvent._(this._bc, this._bcOffset);
   factory LeaseChangedEvent(List<int> bytes) {
@@ -6343,46 +4554,12 @@ class LeaseChangedEvent {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  LeaseChange? get change =>
-      LeaseChange.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  LeaseChange? get change => LeaseChange.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'LeaseChangedEvent{sessionId: ${sessionId}, change: ${change}}';
-  }
-
-  LeaseChangedEventT unpack() =>
-      LeaseChangedEventT(sessionId: sessionId, change: change?.unpack());
-
-  static int pack(fb.Builder fbBuilder, LeaseChangedEventT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class LeaseChangedEventT implements fb.Packable {
-  String? sessionId;
-  LeaseChangeT? change;
-
-  LeaseChangedEventT({this.sessionId, this.change});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? changeOffset = change?.pack(fbBuilder);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, changeOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'LeaseChangedEventT{sessionId: ${sessionId}, change: ${change}}';
   }
 }
 
@@ -6390,8 +4567,8 @@ class _LeaseChangedEventReader extends fb.TableReader<LeaseChangedEvent> {
   const _LeaseChangedEventReader();
 
   @override
-  LeaseChangedEvent createObject(fb.BufferContext bc, int offset) =>
-      LeaseChangedEvent._(bc, offset);
+  LeaseChangedEvent createObject(fb.BufferContext bc, int offset) => 
+    LeaseChangedEvent._(bc, offset);
 }
 
 class LeaseChangedEventBuilder {
@@ -6407,7 +4584,6 @@ class LeaseChangedEventBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addChangeOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -6425,14 +4601,14 @@ class LeaseChangedEventObjectBuilder extends fb.ObjectBuilder {
   LeaseChangedEventObjectBuilder({
     String? sessionId,
     LeaseChangeObjectBuilder? change,
-  }) : _sessionId = sessionId,
-       _change = change;
+  })
+      : _sessionId = sessionId,
+        _change = change;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     final int? changeOffset = _change?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(2);
@@ -6449,7 +4625,6 @@ class LeaseChangedEventObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class ExitedEvent {
   ExitedEvent._(this._bc, this._bcOffset);
   factory ExitedEvent(List<int> bytes) {
@@ -6462,46 +4637,12 @@ class ExitedEvent {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get sessionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  CompletedSession? get completed =>
-      CompletedSession.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  CompletedSession? get completed => CompletedSession.reader.vTableGetNullable(_bc, _bcOffset, 6);
 
   @override
   String toString() {
     return 'ExitedEvent{sessionId: ${sessionId}, completed: ${completed}}';
-  }
-
-  ExitedEventT unpack() =>
-      ExitedEventT(sessionId: sessionId, completed: completed?.unpack());
-
-  static int pack(fb.Builder fbBuilder, ExitedEventT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ExitedEventT implements fb.Packable {
-  String? sessionId;
-  CompletedSessionT? completed;
-
-  ExitedEventT({this.sessionId, this.completed});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = sessionId == null
-        ? null
-        : fbBuilder.writeString(sessionId!);
-    final int? completedOffset = completed?.pack(fbBuilder);
-    fbBuilder.startTable(2);
-    fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addOffset(1, completedOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ExitedEventT{sessionId: ${sessionId}, completed: ${completed}}';
   }
 }
 
@@ -6509,8 +4650,8 @@ class _ExitedEventReader extends fb.TableReader<ExitedEvent> {
   const _ExitedEventReader();
 
   @override
-  ExitedEvent createObject(fb.BufferContext bc, int offset) =>
-      ExitedEvent._(bc, offset);
+  ExitedEvent createObject(fb.BufferContext bc, int offset) => 
+    ExitedEvent._(bc, offset);
 }
 
 class ExitedEventBuilder {
@@ -6526,7 +4667,6 @@ class ExitedEventBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addCompletedOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -6544,14 +4684,14 @@ class ExitedEventObjectBuilder extends fb.ObjectBuilder {
   ExitedEventObjectBuilder({
     String? sessionId,
     CompletedSessionObjectBuilder? completed,
-  }) : _sessionId = sessionId,
-       _completed = completed;
+  })
+      : _sessionId = sessionId,
+        _completed = completed;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? sessionIdOffset = _sessionId == null
-        ? null
+    final int? sessionIdOffset = _sessionId == null ? null
         : fbBuilder.writeString(_sessionId!);
     final int? completedOffset = _completed?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(2);
@@ -6568,7 +4708,6 @@ class ExitedEventObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class EventPayload {
   EventPayload._(this._bc, this._bcOffset);
   factory EventPayload(List<int> bytes) {
@@ -6581,27 +4720,17 @@ class EventPayload {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get subscriptionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get subscriptionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   int get eventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
-  SessionEventPayloadTypeId? get eventType =>
-      SessionEventPayloadTypeId._createOrNull(
-        const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 8),
-      );
+  SessionEventPayloadTypeId? get eventType => SessionEventPayloadTypeId._createOrNull(const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 8));
   dynamic get event {
     switch (eventType?.value) {
-      case 1:
-        return ResyncRequiredEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
-      case 2:
-        return OutputEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
-      case 3:
-        return SnapshotEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
-      case 4:
-        return LeaseChangedEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
-      case 5:
-        return ExitedEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
-      default:
-        return null;
+      case 1: return ResyncRequiredEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
+      case 2: return OutputEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
+      case 3: return SnapshotEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
+      case 4: return LeaseChangedEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
+      case 5: return ExitedEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
+      default: return null;
     }
   }
 
@@ -6609,59 +4738,14 @@ class EventPayload {
   String toString() {
     return 'EventPayload{subscriptionId: ${subscriptionId}, eventSeq: ${eventSeq}, eventType: ${eventType}, event: ${event}}';
   }
-
-  EventPayloadT unpack() => EventPayloadT(
-    subscriptionId: subscriptionId,
-    eventSeq: eventSeq,
-    eventType: eventType,
-    event: event?.unpack(),
-  );
-
-  static int pack(fb.Builder fbBuilder, EventPayloadT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class EventPayloadT implements fb.Packable {
-  String? subscriptionId;
-  int eventSeq;
-  SessionEventPayloadTypeId? eventType;
-  dynamic event;
-
-  EventPayloadT({
-    this.subscriptionId,
-    this.eventSeq = 0,
-    this.eventType,
-    this.event,
-  });
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? subscriptionIdOffset = subscriptionId == null
-        ? null
-        : fbBuilder.writeString(subscriptionId!);
-    final int? eventOffset = event?.pack(fbBuilder);
-    fbBuilder.startTable(4);
-    fbBuilder.addOffset(0, subscriptionIdOffset);
-    fbBuilder.addUint64(1, eventSeq);
-    fbBuilder.addUint8(2, eventType?.value);
-    fbBuilder.addOffset(3, eventOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'EventPayloadT{subscriptionId: ${subscriptionId}, eventSeq: ${eventSeq}, eventType: ${eventType}, event: ${event}}';
-  }
 }
 
 class _EventPayloadReader extends fb.TableReader<EventPayload> {
   const _EventPayloadReader();
 
   @override
-  EventPayload createObject(fb.BufferContext bc, int offset) =>
-      EventPayload._(bc, offset);
+  EventPayload createObject(fb.BufferContext bc, int offset) => 
+    EventPayload._(bc, offset);
 }
 
 class EventPayloadBuilder {
@@ -6677,17 +4761,14 @@ class EventPayloadBuilder {
     fbBuilder.addOffset(0, offset);
     return fbBuilder.offset;
   }
-
   int addEventSeq(int? eventSeq) {
     fbBuilder.addUint64(1, eventSeq);
     return fbBuilder.offset;
   }
-
   int addEventType(SessionEventPayloadTypeId? eventType) {
     fbBuilder.addUint8(2, eventType?.value);
     return fbBuilder.offset;
   }
-
   int addEventOffset(int? offset) {
     fbBuilder.addOffset(3, offset);
     return fbBuilder.offset;
@@ -6709,16 +4790,16 @@ class EventPayloadObjectBuilder extends fb.ObjectBuilder {
     int? eventSeq,
     SessionEventPayloadTypeId? eventType,
     dynamic event,
-  }) : _subscriptionId = subscriptionId,
-       _eventSeq = eventSeq,
-       _eventType = eventType,
-       _event = event;
+  })
+      : _subscriptionId = subscriptionId,
+        _eventSeq = eventSeq,
+        _eventType = eventType,
+        _event = event;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? subscriptionIdOffset = _subscriptionId == null
-        ? null
+    final int? subscriptionIdOffset = _subscriptionId == null ? null
         : fbBuilder.writeString(_subscriptionId!);
     final int? eventOffset = _event?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(4);
@@ -6737,7 +4818,6 @@ class EventPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
-
 class SubscriptionClosedPayload {
   SubscriptionClosedPayload._(this._bc, this._bcOffset);
   factory SubscriptionClosedPayload(List<int> bytes) {
@@ -6745,57 +4825,25 @@ class SubscriptionClosedPayload {
     return reader.read(rootRef, 0);
   }
 
-  static const fb.Reader<SubscriptionClosedPayload> reader =
-      _SubscriptionClosedPayloadReader();
+  static const fb.Reader<SubscriptionClosedPayload> reader = _SubscriptionClosedPayloadReader();
 
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  String? get subscriptionId =>
-      const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get subscriptionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
 
   @override
   String toString() {
     return 'SubscriptionClosedPayload{subscriptionId: ${subscriptionId}}';
   }
-
-  SubscriptionClosedPayloadT unpack() =>
-      SubscriptionClosedPayloadT(subscriptionId: subscriptionId);
-
-  static int pack(fb.Builder fbBuilder, SubscriptionClosedPayloadT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
 }
 
-class SubscriptionClosedPayloadT implements fb.Packable {
-  String? subscriptionId;
-
-  SubscriptionClosedPayloadT({this.subscriptionId});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? subscriptionIdOffset = subscriptionId == null
-        ? null
-        : fbBuilder.writeString(subscriptionId!);
-    fbBuilder.startTable(1);
-    fbBuilder.addOffset(0, subscriptionIdOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'SubscriptionClosedPayloadT{subscriptionId: ${subscriptionId}}';
-  }
-}
-
-class _SubscriptionClosedPayloadReader
-    extends fb.TableReader<SubscriptionClosedPayload> {
+class _SubscriptionClosedPayloadReader extends fb.TableReader<SubscriptionClosedPayload> {
   const _SubscriptionClosedPayloadReader();
 
   @override
-  SubscriptionClosedPayload createObject(fb.BufferContext bc, int offset) =>
-      SubscriptionClosedPayload._(bc, offset);
+  SubscriptionClosedPayload createObject(fb.BufferContext bc, int offset) => 
+    SubscriptionClosedPayload._(bc, offset);
 }
 
 class SubscriptionClosedPayloadBuilder {
@@ -6820,14 +4868,15 @@ class SubscriptionClosedPayloadBuilder {
 class SubscriptionClosedPayloadObjectBuilder extends fb.ObjectBuilder {
   final String? _subscriptionId;
 
-  SubscriptionClosedPayloadObjectBuilder({String? subscriptionId})
-    : _subscriptionId = subscriptionId;
+  SubscriptionClosedPayloadObjectBuilder({
+    String? subscriptionId,
+  })
+      : _subscriptionId = subscriptionId;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    final int? subscriptionIdOffset = _subscriptionId == null
-        ? null
+    final int? subscriptionIdOffset = _subscriptionId == null ? null
         : fbBuilder.writeString(_subscriptionId!);
     fbBuilder.startTable(1);
     fbBuilder.addOffset(0, subscriptionIdOffset);
@@ -6842,7 +4891,99 @@ class SubscriptionClosedPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionSnippetUpdatedPayload {
+  SessionSnippetUpdatedPayload._(this._bc, this._bcOffset);
+  factory SessionSnippetUpdatedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
 
+  static const fb.Reader<SessionSnippetUpdatedPayload> reader = _SessionSnippetUpdatedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 8, 0);
+
+  @override
+  String toString() {
+    return 'SessionSnippetUpdatedPayload{sessionId: ${sessionId}, snippet: ${snippet}, outputSeq: ${outputSeq}}';
+  }
+}
+
+class _SessionSnippetUpdatedPayloadReader extends fb.TableReader<SessionSnippetUpdatedPayload> {
+  const _SessionSnippetUpdatedPayloadReader();
+
+  @override
+  SessionSnippetUpdatedPayload createObject(fb.BufferContext bc, int offset) => 
+    SessionSnippetUpdatedPayload._(bc, offset);
+}
+
+class SessionSnippetUpdatedPayloadBuilder {
+  SessionSnippetUpdatedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(3);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSnippetOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addOutputSeq(int? outputSeq) {
+    fbBuilder.addUint64(2, outputSeq);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionSnippetUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _snippet;
+  final int? _outputSeq;
+
+  SessionSnippetUpdatedPayloadObjectBuilder({
+    String? sessionId,
+    String? snippet,
+    int? outputSeq,
+  })
+      : _sessionId = sessionId,
+        _snippet = snippet,
+        _outputSeq = outputSeq;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? snippetOffset = _snippet == null ? null
+        : fbBuilder.writeString(_snippet!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, snippetOffset);
+    fbBuilder.addUint64(2, _outputSeq);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ServerMessage {
   ServerMessage._(this._bc, this._bcOffset);
   factory ServerMessage(List<int> bytes) {
@@ -6855,26 +4996,15 @@ class ServerMessage {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  ServerMessagePayloadTypeId? get payloadType =>
-      ServerMessagePayloadTypeId._createOrNull(
-        const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 4),
-      );
+  ServerMessagePayloadTypeId? get payloadType => ServerMessagePayloadTypeId._createOrNull(const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 4));
   dynamic get payload {
     switch (payloadType?.value) {
-      case 1:
-        return ResponsePayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
-      case 2:
-        return ErrorPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
-      case 3:
-        return EventPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
-      case 4:
-        return SubscriptionClosedPayload.reader.vTableGetNullable(
-          _bc,
-          _bcOffset,
-          6,
-        );
-      default:
-        return null;
+      case 1: return ResponsePayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 2: return ErrorPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 3: return EventPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 4: return SubscriptionClosedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 5: return SessionSnippetUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      default: return null;
     }
   }
 
@@ -6882,43 +5012,14 @@ class ServerMessage {
   String toString() {
     return 'ServerMessage{payloadType: ${payloadType}, payload: ${payload}}';
   }
-
-  ServerMessageT unpack() =>
-      ServerMessageT(payloadType: payloadType, payload: payload?.unpack());
-
-  static int pack(fb.Builder fbBuilder, ServerMessageT? object) {
-    if (object == null) return 0;
-    return object.pack(fbBuilder);
-  }
-}
-
-class ServerMessageT implements fb.Packable {
-  ServerMessagePayloadTypeId? payloadType;
-  dynamic payload;
-
-  ServerMessageT({this.payloadType, this.payload});
-
-  @override
-  int pack(fb.Builder fbBuilder) {
-    final int? payloadOffset = payload?.pack(fbBuilder);
-    fbBuilder.startTable(2);
-    fbBuilder.addUint8(0, payloadType?.value);
-    fbBuilder.addOffset(1, payloadOffset);
-    return fbBuilder.endTable();
-  }
-
-  @override
-  String toString() {
-    return 'ServerMessageT{payloadType: ${payloadType}, payload: ${payload}}';
-  }
 }
 
 class _ServerMessageReader extends fb.TableReader<ServerMessage> {
   const _ServerMessageReader();
 
   @override
-  ServerMessage createObject(fb.BufferContext bc, int offset) =>
-      ServerMessage._(bc, offset);
+  ServerMessage createObject(fb.BufferContext bc, int offset) => 
+    ServerMessage._(bc, offset);
 }
 
 class ServerMessageBuilder {
@@ -6934,7 +5035,6 @@ class ServerMessageBuilder {
     fbBuilder.addUint8(0, payloadType?.value);
     return fbBuilder.offset;
   }
-
   int addPayloadOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
     return fbBuilder.offset;
@@ -6952,8 +5052,9 @@ class ServerMessageObjectBuilder extends fb.ObjectBuilder {
   ServerMessageObjectBuilder({
     ServerMessagePayloadTypeId? payloadType,
     dynamic payload,
-  }) : _payloadType = payloadType,
-       _payload = payload;
+  })
+      : _payloadType = payloadType,
+        _payload = payload;
 
   /// Finish building, and store into the [fbBuilder].
   @override

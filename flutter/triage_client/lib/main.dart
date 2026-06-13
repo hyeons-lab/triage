@@ -131,6 +131,9 @@ class SessionVm {
   final String branch;
   String status;
   Color statusColor;
+  // Local-LLM one-line description of what the session is doing, shown in the
+  // side rail. Null until the daemon generates one (or summarization is off).
+  String? snippet;
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
   // real rendering goes through [store]/[terminal] from raw bytes.
@@ -1008,11 +1011,32 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         });
       }
 
+      // Seed side-rail snippets for all sessions (best-effort; no-op if the
+      // daemon's summarizer is disabled). Live updates arrive via push events.
+      await _seedSessionSnippets();
+
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
       // the terminal view has not laid out yet.
     } catch (_) {
       // Fallback
+    }
+  }
+
+  Future<void> _seedSessionSnippets() async {
+    try {
+      final snippets = await _client.listSessionSnippets();
+      if (_disposed || snippets.isEmpty) return;
+      setState(() {
+        for (final session in _sessions) {
+          final sid = session.remoteSessionId;
+          if (sid != null && snippets.containsKey(sid)) {
+            session.snippet = snippets[sid];
+          }
+        }
+      });
+    } catch (_) {
+      // Snippets are best-effort metadata; ignore failures.
     }
   }
 
@@ -1117,6 +1141,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         isRemote: true,
         isExited: exited,
       );
+      // Snapshot carries the current snippet for the attached session (the list
+      // seed + push events cover the rest).
+      session.snippet = snapshot?['snippet'] as String?;
       // Replay the raw output-history tail through the single write path. Live
       // chunks already covered by this snapshot are dropped by output_seq.
       session.applyHistory(
@@ -1234,6 +1261,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
       _onWebSocketClosed(_connectGeneration);
+      return;
+    }
+
+    if (type == 'session_snippet_updated') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null) return;
+      final snippet = message['snippet'] as String?;
+      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (index == -1) return;
+      void apply() => _sessions[index].snippet = snippet;
+      if (mounted) {
+        setState(apply);
+      } else {
+        apply();
+      }
       return;
     }
 
@@ -2042,6 +2084,7 @@ class SessionRail extends StatelessWidget {
                     subtitle: indexed.$2.status,
                     statusColor: indexed.$2.statusColor,
                     icon: indexed.$2.icon,
+                    snippet: indexed.$2.snippet,
                     onTap: () => onSelectSession(indexed.$1),
                   ),
               ],
@@ -2133,6 +2176,7 @@ class SessionListTile extends StatelessWidget {
     required this.statusColor,
     required this.icon,
     required this.onTap,
+    this.snippet,
     this.selected = false,
   });
 
@@ -2141,6 +2185,8 @@ class SessionListTile extends StatelessWidget {
   final Color statusColor;
   final IconData icon;
   final VoidCallback onTap;
+  // Local-LLM one-line description of the session; hidden when null/empty.
+  final String? snippet;
   final bool selected;
 
   @override
@@ -2198,6 +2244,19 @@ class SessionListTile extends StatelessWidget {
                         ),
                       ],
                     ),
+                    if (snippet != null && snippet!.isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        snippet!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xff6f7b7d),
+                          fontSize: 12,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),

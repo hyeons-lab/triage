@@ -5,6 +5,7 @@ pub mod http;
 #[cfg(unix)]
 pub mod ipc;
 pub mod session;
+pub mod summarizer;
 pub mod ws;
 
 #[cfg(all(unix, test))]

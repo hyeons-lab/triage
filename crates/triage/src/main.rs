@@ -429,6 +429,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             continue;
         }
 
+        // The `Event::Mouse` arm's inner `if` can't become a match guard (it
+        // uses `?`), so this newer-clippy collapse suggestion doesn't apply.
+        #[allow(clippy::collapsible_match)]
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Press => {}
             Event::Key(key) if should_exit(key) => {
@@ -1909,6 +1912,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                snippet: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -1952,6 +1956,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                snippet: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -1997,6 +2002,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                snippet: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2055,6 +2061,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                snippet: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2096,6 +2103,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                snippet: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2379,6 +2387,7 @@ mod tests {
             exited: false,
             raw_output: Vec::new(),
             raw_output_start: 0,
+            snippet: None,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_some());
@@ -2410,6 +2419,7 @@ mod tests {
             exited: false,
             raw_output: Vec::new(),
             raw_output_start: 0,
+            snippet: None,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 1).is_none());
@@ -2461,6 +2471,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                snippet: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,

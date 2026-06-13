@@ -57,6 +57,10 @@ fn run() -> anyhow::Result<()> {
         triage_core::config::Config::default()
     };
 
+    // Start the local-LLM session summarizer (on by default; model loads lazily
+    // on first activity, so this never blocks startup). No-op when disabled.
+    manager.start_summarizer(config.summarizer.clone());
+
     let bind_addr = config.remote.bind_addr()?;
 
     // Bind TCP listener (either inherited or brand new)

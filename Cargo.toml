@@ -45,5 +45,9 @@ rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
 flatbuffers = "24.3.25"
+# Local LLM inference engine for session snippets (LFM2/LFM2.5 GGUF). The
+# `remote` feature pulls in the HuggingFace bundle downloader; `mmap` (default)
+# memory-maps GGUF weights.
+cera = { version = "0.1", features = ["remote"] }
 
 

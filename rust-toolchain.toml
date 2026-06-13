@@ -1,3 +1,8 @@
+# Nightly is required by the `cera` inference engine (session summarizer): on
+# aarch64 it uses the still-unstable NEON dotprod / prefetch intrinsics
+# (`stdarch_neon_dotprod`, `stdarch_aarch64_prefetch`). triage/triaged ship as
+# apps, not libraries, so pinning a nightly toolchain is acceptable. Pinned for
+# reproducible local + CI builds; bump deliberately.
 [toolchain]
-channel = "1.94.1"
+channel = "nightly-2026-04-02"
 components = ["rustfmt", "clippy"]

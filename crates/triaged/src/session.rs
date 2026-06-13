@@ -33,7 +33,10 @@ use triage_core::session::{
     StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
     TerminalStyle, WriteInputRequest,
 };
+use triage_transport_ws::ServerMessage;
 use unicode_width::UnicodeWidthStr;
+
+use crate::summarizer::{SnippetResult, SummarizeJob, Summarizer, build_prompt_text};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const EVENT_REPLAY_BUFFER: usize = 1024;
@@ -213,7 +216,29 @@ pub struct SessionManager {
     pairing_challenges: Mutex<HashMap<String, PendingPairingChallenge>>,
     paired_devices: Mutex<HashMap<ClientId, String>>,
     require_pairing: bool,
+    /// Latest generated snippet per session (in-memory only; not persisted).
+    snippets: Mutex<HashMap<SessionId, SessionSnippet>>,
+    /// The local-LLM summarizer worker. Disabled until `start_summarizer` runs.
+    summarizer: Mutex<crate::summarizer::Summarizer>,
+    /// Sender handed to session actors so they report output activity to the
+    /// debounce loop. `None` until `start_summarizer` runs.
+    dirty_tx: Mutex<Option<DirtySender>>,
+    /// Per-connection push channels for connection-wide broadcasts (snippet
+    /// updates). Senders are pruned when their client disconnects.
+    global_senders: Mutex<Vec<SyncSender<ServerMessage>>>,
 }
+
+/// A session's most recent snippet plus the output sequence it was generated at,
+/// used to drop out-of-order worker results.
+#[derive(Debug, Clone)]
+struct SessionSnippet {
+    text: String,
+    generated_at_output_seq: u64,
+}
+
+/// Bounded capacity for each connection's global-push channel. If a client
+/// can't keep up, snippet updates are dropped (the next regeneration resends).
+const GLOBAL_PUSH_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PairingChallengeInfo {
@@ -344,12 +369,180 @@ impl SessionManager {
             pairing_challenges: Mutex::new(HashMap::new()),
             paired_devices: Mutex::new(paired_devices),
             require_pairing,
+            snippets: Mutex::new(HashMap::new()),
+            summarizer: Mutex::new(Summarizer::disabled()),
+            dirty_tx: Mutex::new(None),
+            global_senders: Mutex::new(Vec::new()),
         }
     }
 
     fn allocate_session_id(&self) -> Result<SessionId> {
         let sequence = self.next_session.fetch_add(1, Ordering::Relaxed);
         SessionId::new(format!("session-{sequence}"))
+    }
+
+    /// Clones the dirty-activity sender handed to new session actors. `None`
+    /// until the summarizer is started (or if it is disabled).
+    fn dirty_tx(&self) -> Option<DirtySender> {
+        self.dirty_tx.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Current snippet text for a session, if one has been generated.
+    fn snippet_for(&self, session_id: &SessionId) -> Option<String> {
+        self.snippets
+            .lock()
+            .ok()?
+            .get(session_id)
+            .map(|snippet| snippet.text.clone())
+    }
+
+    /// Overlays the cached snippet onto a snapshot before it is returned to a
+    /// client. The actor builds snapshots without snippet (it has no cache).
+    fn overlay_snippet(
+        &self,
+        mut snapshot: SessionSnapshot,
+        session_id: &SessionId,
+    ) -> SessionSnapshot {
+        snapshot.snippet = self.snippet_for(session_id);
+        snapshot
+    }
+
+    /// Registers a connection-wide push channel. The returned receiver is
+    /// drained by the WebSocket connection alongside its subscription events.
+    pub fn register_global_receiver(&self) -> Receiver<ServerMessage> {
+        let (tx, rx) = mpsc::sync_channel(GLOBAL_PUSH_CHANNEL_CAPACITY);
+        if let Ok(mut senders) = self.global_senders.lock() {
+            senders.push(tx);
+        }
+        rx
+    }
+
+    /// Broadcasts a message to every connected client, pruning dead channels.
+    fn broadcast_global(&self, message: ServerMessage) {
+        let Ok(mut senders) = self.global_senders.lock() else {
+            return;
+        };
+        senders.retain(|sender| match sender.try_send(message.clone()) {
+            Ok(()) => true,
+            // Full: client is slow; keep it (a later update will resend).
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+    }
+
+    /// Records a freshly generated snippet (newest `output_seq` wins) and pushes
+    /// the update to all connected clients. Called on the summarizer worker thread.
+    fn apply_snippet(&self, result: SnippetResult) {
+        {
+            let Ok(mut snippets) = self.snippets.lock() else {
+                return;
+            };
+            match snippets.get(&result.session_id) {
+                Some(existing)
+                    if existing.generated_at_output_seq > result.generated_at_output_seq => {}
+                _ => {
+                    snippets.insert(
+                        result.session_id.clone(),
+                        SessionSnippet {
+                            text: result.text.clone(),
+                            generated_at_output_seq: result.generated_at_output_seq,
+                        },
+                    );
+                }
+            }
+        }
+        self.broadcast_global(ServerMessage::SessionSnippetUpdated {
+            session_id: result.session_id,
+            snippet: result.text,
+            output_seq: result.generated_at_output_seq,
+        });
+    }
+
+    /// Drops a session's cached snippet (on shutdown/removal).
+    fn forget_snippet(&self, session_id: &SessionId) {
+        if let Ok(mut snippets) = self.snippets.lock() {
+            snippets.remove(session_id);
+        }
+    }
+
+    /// Starts the local-LLM summarizer: loads the model lazily on a worker
+    /// thread, wires session activity into a debounce loop, and pushes generated
+    /// snippets to clients. No-op when disabled. Safe to call once at startup.
+    pub fn start_summarizer(self: &Arc<Self>, config: triage_core::config::SummarizerConfig) {
+        if !config.enabled {
+            return;
+        }
+        let cache_dir = config
+            .cache_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(default_model_cache_dir);
+        let worker_config = crate::summarizer::SummarizerConfig {
+            bundle_id: config.bundle_id.clone(),
+            quant: config.quant.clone(),
+            context_size: config.context_size,
+            max_tokens: config.max_tokens,
+            cache_dir,
+            queue_depth: 8,
+        };
+
+        let on_result = {
+            let weak = Arc::downgrade(self);
+            move |result: SnippetResult| {
+                if let Some(manager) = weak.upgrade() {
+                    manager.apply_snippet(result);
+                }
+            }
+        };
+        let summarizer = Summarizer::spawn(worker_config, on_result);
+        if !summarizer.is_enabled() {
+            return;
+        }
+
+        let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyTick>();
+        if let Ok(mut guard) = self.dirty_tx.lock() {
+            *guard = Some(dirty_tx);
+        }
+        if let Ok(mut guard) = self.summarizer.lock() {
+            *guard = summarizer.clone();
+        }
+
+        let weak = Arc::downgrade(self);
+        let settle = Duration::from_millis(config.settle_ms);
+        let min_regen = Duration::from_millis(config.min_regen_ms);
+        let loop_summarizer = summarizer.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("triage-summarizer-debounce".into())
+            .spawn(move || {
+                run_debounce_loop(weak, loop_summarizer, dirty_rx, settle, min_regen);
+            })
+        {
+            tracing::error!(%error, "failed to spawn summarizer debounce thread");
+            return;
+        }
+
+        // Seed: summarize sessions that already exist (e.g. adopted on handover)
+        // so they get a snippet without waiting for new output.
+        self.seed_initial_summaries(&summarizer);
+    }
+
+    /// Enqueues a one-shot summary for every currently-live session.
+    fn seed_initial_summaries(&self, summarizer: &Summarizer) {
+        let session_ids = match self.list_sessions() {
+            Ok(ids) => ids,
+            Err(_) => return,
+        };
+        for session_id in session_ids {
+            if let Ok(snapshot) = self.snapshot_session(session_id.clone())
+                && let Some(prompt_text) = build_prompt_text(&snapshot.visible_rows)
+            {
+                summarizer.try_enqueue(SummarizeJob {
+                    session_id,
+                    prompt_text,
+                    output_seq: snapshot.output_seq,
+                });
+            }
+        }
     }
 
     fn log_path(&self, session_id: &SessionId) -> PathBuf {
@@ -613,6 +806,7 @@ impl SessionManager {
             };
 
             let event_session_id = Some(h_sess.id.clone());
+            let dirty_tx = self.dirty_tx();
 
             let PtyRuntime {
                 master,
@@ -654,6 +848,7 @@ impl SessionManager {
                         current_working_directory: initial_working_directory,
                         context: initial_context,
                         event_session_id,
+                        dirty_tx,
                         subscribers: Vec::new(),
                         event_log: VecDeque::new(),
                         next_event_seq: 1,
@@ -772,7 +967,7 @@ impl SessionApi for SessionManager {
             log_path,
         };
         let launch = PersistedSessionLaunch::from(&config);
-        let actor = SessionActor::spawn_managed(config, session_id.clone())?;
+        let actor = SessionActor::spawn_managed(config, session_id.clone(), self.dirty_tx())?;
 
         let mut sessions = self.sessions()?;
         sessions.insert(
@@ -815,15 +1010,21 @@ impl SessionApi for SessionManager {
                     })?;
                 }
 
+                let snapshot = actor.snapshot()?;
+                let lease = lease.clone();
                 Ok(AttachSessionResponse {
-                    snapshot: actor.snapshot()?,
-                    lease: lease.clone(),
+                    snapshot: self.overlay_snippet(snapshot, &request.session_id),
+                    lease,
                 })
             }
-            ManagedSession::Historical { session, lease } => Ok(AttachSessionResponse {
-                snapshot: session.snapshot_with_history(),
-                lease: lease.clone(),
-            }),
+            ManagedSession::Historical { session, lease } => {
+                let snapshot = session.snapshot_with_history();
+                let lease = lease.clone();
+                Ok(AttachSessionResponse {
+                    snapshot: self.overlay_snippet(snapshot, &request.session_id),
+                    lease,
+                })
+            }
             ManagedSession::Restoring { .. } => {
                 bail!("session {} is being restored", request.session_id)
             }
@@ -940,15 +1141,16 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        match session {
-            ManagedSession::Live { actor, .. } => actor.resize(request.size),
+        let snapshot = match session {
+            ManagedSession::Live { actor, .. } => actor.resize(request.size)?,
             ManagedSession::Historical { .. } => {
                 bail!("restored historical sessions cannot be resized")
             }
             ManagedSession::Restoring { .. } => {
                 bail!("session {} is being restored", request.session_id)
             }
-        }
+        };
+        Ok(self.overlay_snippet(snapshot, &request.session_id))
     }
 
     fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
@@ -993,13 +1195,15 @@ impl SessionApi for SessionManager {
             log_path: persisted.log_path.clone(),
         };
         let launch = PersistedSessionLaunch::from(&config);
-        let actor = match SessionActor::spawn_restored(config, request.session_id.clone()) {
-            Ok(actor) => actor,
-            Err(error) => {
-                self.rollback_restoring_session(request.session_id)?;
-                return Err(error);
-            }
-        };
+        let actor =
+            match SessionActor::spawn_restored(config, request.session_id.clone(), self.dirty_tx())
+            {
+                Ok(actor) => actor,
+                Err(error) => {
+                    self.rollback_restoring_session(request.session_id)?;
+                    return Err(error);
+                }
+            };
         let snapshot = match actor.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1044,8 +1248,9 @@ impl SessionApi for SessionManager {
             }
             return Err(error);
         }
+        drop(sessions);
 
-        Ok(snapshot)
+        Ok(self.overlay_snippet(snapshot, &request.session_id))
     }
 
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -1053,11 +1258,12 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        match session {
-            ManagedSession::Live { actor, .. } => actor.snapshot(),
-            ManagedSession::Historical { session, .. } => Ok(session.snapshot_with_history()),
+        let snapshot = match session {
+            ManagedSession::Live { actor, .. } => actor.snapshot()?,
+            ManagedSession::Historical { session, .. } => session.snapshot_with_history(),
             ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
-        }
+        };
+        Ok(self.overlay_snippet(snapshot, &session_id))
     }
 
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
@@ -1088,11 +1294,27 @@ impl SessionApi for SessionManager {
             }
             session
         };
+        self.forget_snippet(&session_id);
         match session {
             ManagedSession::Live { actor, .. } => actor.shutdown(),
             ManagedSession::Historical { session, .. } => Ok(session.completed_session()),
             ManagedSession::Restoring { session, .. } => Ok(session.completed_session()),
         }
+    }
+
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+        let session_ids = self.list_sessions()?;
+        let snippets = self
+            .snippets
+            .lock()
+            .map_err(|_| anyhow!("snippet cache lock poisoned"))?;
+        Ok(session_ids
+            .into_iter()
+            .map(|session_id| {
+                let snippet = snippets.get(&session_id).map(|s| s.text.clone());
+                (session_id, snippet)
+            })
+            .collect())
     }
 }
 
@@ -1168,6 +1390,132 @@ fn default_log_dir_from_env(
             home.join(".local/state")
         })
         .join("triage/sessions")
+}
+
+/// Default cache directory for downloaded summarizer model files. Mirrors
+/// [`default_log_dir`] but rooted at the XDG *cache* dir (`~/.cache`), since
+/// models are re-downloadable caches, not persistent application state.
+pub fn default_model_cache_dir() -> PathBuf {
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            home.join(".cache")
+        });
+    cache_root.join("triage/models")
+}
+
+/// State the debounce loop tracks per session between ticks.
+struct PendingDirty {
+    last_output_seq: u64,
+    last_tick_at: Instant,
+}
+
+/// Debounce loop: receives [`DirtyTick`]s from session actors and, once a
+/// session's output has been quiet for `settle`, enqueues a summarization job —
+/// subject to a per-session rate limit and content-change checks. Runs on its
+/// own thread; exits when the manager is dropped or the dirty channel closes.
+fn run_debounce_loop(
+    manager: std::sync::Weak<SessionManager>,
+    summarizer: Summarizer,
+    dirty_rx: Receiver<DirtyTick>,
+    settle: Duration,
+    min_regen: Duration,
+) {
+    let mut pending: HashMap<SessionId, PendingDirty> = HashMap::new();
+    let mut last_enqueue: HashMap<SessionId, Instant> = HashMap::new();
+    let mut last_summarized_seq: HashMap<SessionId, u64> = HashMap::new();
+    let mut last_prompt_hash: HashMap<SessionId, u64> = HashMap::new();
+
+    loop {
+        // Block up to `settle` for the next tick so we re-evaluate readiness
+        // even when no new output arrives.
+        match dirty_rx.recv_timeout(settle) {
+            Ok(tick) => record_tick(&mut pending, tick),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Coalesce any other immediately-available ticks.
+        while let Ok(tick) = dirty_rx.try_recv() {
+            record_tick(&mut pending, tick);
+        }
+
+        let Some(manager) = manager.upgrade() else {
+            break;
+        };
+        let now = Instant::now();
+
+        let ready: Vec<SessionId> = pending
+            .iter()
+            .filter(|(_, pd)| now.duration_since(pd.last_tick_at) >= settle)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+
+        for session_id in ready {
+            let pd = pending
+                .remove(&session_id)
+                .expect("ready ids come from pending");
+
+            // Already summarized this exact output position.
+            if last_summarized_seq.get(&session_id) == Some(&pd.last_output_seq) {
+                continue;
+            }
+            // Per-session rate limit; keep it pending to retry after the window.
+            if let Some(last) = last_enqueue.get(&session_id)
+                && now.duration_since(*last) < min_regen
+            {
+                pending.insert(session_id, pd);
+                continue;
+            }
+
+            let Ok(snapshot) = manager.snapshot_session(session_id.clone()) else {
+                // Session likely gone; drop tracking state for it.
+                last_enqueue.remove(&session_id);
+                last_summarized_seq.remove(&session_id);
+                last_prompt_hash.remove(&session_id);
+                continue;
+            };
+            let Some(prompt_text) = build_prompt_text(&snapshot.visible_rows) else {
+                continue;
+            };
+
+            let hash = hash_prompt(&prompt_text);
+            // Screen text unchanged since last summary (e.g. spinner repaint).
+            if last_prompt_hash.get(&session_id) == Some(&hash) {
+                last_summarized_seq.insert(session_id, pd.last_output_seq);
+                continue;
+            }
+
+            if summarizer.try_enqueue(SummarizeJob {
+                session_id: session_id.clone(),
+                prompt_text,
+                output_seq: pd.last_output_seq,
+            }) {
+                last_enqueue.insert(session_id.clone(), now);
+                last_prompt_hash.insert(session_id.clone(), hash);
+                last_summarized_seq.insert(session_id, pd.last_output_seq);
+            }
+        }
+    }
+}
+
+fn record_tick(pending: &mut HashMap<SessionId, PendingDirty>, tick: DirtyTick) {
+    let entry = pending.entry(tick.session_id).or_insert(PendingDirty {
+        last_output_seq: tick.output_seq,
+        last_tick_at: Instant::now(),
+    });
+    entry.last_output_seq = tick.output_seq;
+    entry.last_tick_at = Instant::now();
+}
+
+fn hash_prompt(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn load_paired_devices(log_dir: &Path) -> HashMap<ClientId, String> {
@@ -1453,20 +1801,39 @@ impl HistoricalSession {
 
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        Self::spawn_with_events(config, None, LogInitialization::Truncate)
+        Self::spawn_with_events(config, None, None, LogInitialization::Truncate)
     }
 
-    fn spawn_managed(config: SessionConfig, session_id: SessionId) -> Result<Self> {
-        Self::spawn_with_events(config, Some(session_id), LogInitialization::Truncate)
+    fn spawn_managed(
+        config: SessionConfig,
+        session_id: SessionId,
+        dirty_tx: Option<DirtySender>,
+    ) -> Result<Self> {
+        Self::spawn_with_events(
+            config,
+            Some(session_id),
+            dirty_tx,
+            LogInitialization::Truncate,
+        )
     }
 
-    fn spawn_restored(config: SessionConfig, session_id: SessionId) -> Result<Self> {
-        Self::spawn_with_events(config, Some(session_id), LogInitialization::ReplayExisting)
+    fn spawn_restored(
+        config: SessionConfig,
+        session_id: SessionId,
+        dirty_tx: Option<DirtySender>,
+    ) -> Result<Self> {
+        Self::spawn_with_events(
+            config,
+            Some(session_id),
+            dirty_tx,
+            LogInitialization::ReplayExisting,
+        )
     }
 
     fn spawn_with_events(
         config: SessionConfig,
         event_session_id: Option<SessionId>,
+        dirty_tx: Option<DirtySender>,
         log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
@@ -1506,6 +1873,7 @@ impl SessionActor {
                     current_working_directory: initial_working_directory,
                     context: initial_context,
                     event_session_id,
+                    dirty_tx,
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
@@ -1630,6 +1998,17 @@ impl Drop for SessionActor {
     }
 }
 
+/// Notification that a session produced output, sent from the actor's output
+/// hot path to the summarizer's debounce loop. Deliberately tiny: one
+/// non-blocking `Sender::send` per output chunk, no lock and no I/O.
+#[derive(Debug, Clone)]
+pub(crate) struct DirtyTick {
+    pub session_id: SessionId,
+    pub output_seq: u64,
+}
+
+pub(crate) type DirtySender = std::sync::mpsc::Sender<DirtyTick>;
+
 struct ActorState {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -1643,6 +2022,9 @@ struct ActorState {
     current_working_directory: Option<PathBuf>,
     context: Option<SessionContext>,
     event_session_id: Option<SessionId>,
+    /// When set, the actor reports output activity here so the summarizer can
+    /// (re)generate this session's snippet once its output settles.
+    dirty_tx: Option<DirtySender>,
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
     next_event_seq: u64,
@@ -1813,6 +2195,14 @@ impl ActorState {
                         self.current_working_directory = Some(current_working_directory);
                     }
                     if let Some(session_id) = self.event_session_id.clone() {
+                        // Non-blocking nudge to the summarizer; a full or dropped
+                        // channel is fine — the debounce loop re-checks on settle.
+                        if let Some(dirty_tx) = &self.dirty_tx {
+                            let _ = dirty_tx.send(DirtyTick {
+                                session_id: session_id.clone(),
+                                output_seq: self.output.output_seq,
+                            });
+                        }
                         self.broadcast(SessionEvent::Output {
                             session_id,
                             output_seq: self.output.output_seq,
@@ -2492,6 +2882,9 @@ fn snapshot_from_output(
         // paths via `*_with_history`; resize broadcasts carry none.
         raw_output: Vec::new(),
         raw_output_start: 0,
+        // Populated by the manager from its snippet cache when a snapshot is
+        // returned to a caller; the actor has no access to the cache.
+        snippet: None,
     }
 }
 

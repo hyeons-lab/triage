@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,10 @@ pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     authenticated: bool,
     next_subscription_id: u64,
     subscriptions: HashMap<SubscriptionId, SessionEventReceiver>,
+    /// Connection-wide push channel, independent of session subscriptions. The
+    /// daemon broadcasts `ServerMessage`s (e.g. snippet updates) here so the
+    /// client learns about sessions it never attached to.
+    global_rx: Option<Receiver<ServerMessage>>,
     pub format: ProtocolFormat,
 }
 
@@ -126,6 +130,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            global_rx: None,
             format: ProtocolFormat::Json,
         }
     }
@@ -139,12 +144,20 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            global_rx: None,
             format: ProtocolFormat::Json,
         }
     }
 
     pub fn with_format(mut self, format: ProtocolFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Attaches a connection-wide push receiver. Messages sent here are drained
+    /// alongside subscription events and forwarded to the client.
+    pub fn with_global_receiver(mut self, rx: Receiver<ServerMessage>) -> Self {
+        self.global_rx = Some(rx);
         self
     }
 
@@ -231,6 +244,25 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         for subscription_id in closed_subscriptions {
             self.subscriptions.remove(&subscription_id);
             messages.push(ServerMessage::SubscriptionClosed { subscription_id });
+        }
+
+        // Connection-wide pushes (snippet updates, etc.). A disconnected sender
+        // just means the daemon dropped this connection's slot; drop the channel.
+        if let Some(rx) = &self.global_rx {
+            let mut disconnected = false;
+            for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
+                match rx.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                self.global_rx = None;
+            }
         }
 
         messages
@@ -330,6 +362,18 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 let completed = self.api.shutdown_session(session_id)?;
                 Ok(ServerResult::CompletedSession { completed })
             }
+            ClientRequest::ListSessionSnippets => {
+                let entries = self
+                    .api
+                    .list_session_snippets()?
+                    .into_iter()
+                    .map(|(session_id, snippet)| SessionSnippetEntry {
+                        session_id,
+                        snippet,
+                    })
+                    .collect();
+                Ok(ServerResult::SessionSnippets { entries })
+            }
         }
     }
 
@@ -414,6 +458,15 @@ pub enum ClientRequest {
     ShutdownSession {
         session_id: SessionId,
     },
+    ListSessionSnippets,
+}
+
+/// One session's current snippet, as carried in [`ServerResult::SessionSnippets`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnippetEntry {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -435,6 +488,13 @@ pub enum ServerMessage {
     },
     SubscriptionClosed {
         subscription_id: SubscriptionId,
+    },
+    /// Connection-wide push: a session's snippet was (re)generated. Delivered to
+    /// every connected client regardless of subscriptions (see `drain_global`).
+    SessionSnippetUpdated {
+        session_id: SessionId,
+        snippet: String,
+        output_seq: u64,
     },
 }
 
@@ -476,6 +536,9 @@ pub enum ServerResult {
     },
     CompletedSession {
         completed: CompletedSession,
+    },
+    SessionSnippets {
+        entries: Vec<SessionSnippetEntry>,
     },
 }
 
@@ -854,6 +917,7 @@ mod tests {
             exited: false,
             raw_output: Vec::new(),
             raw_output_start: 0,
+            snippet: None,
         }
     }
 
