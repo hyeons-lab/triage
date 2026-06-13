@@ -58,6 +58,7 @@ See plan: `devlog/plans/000066-01-session-snippets.md`.
 - 2026-06-12T16:48-07:00 flutter/triage_client/lib/services/triage_websocket_client.dart — parse `session_snippet_updated` push, `SessionSnippetsResult`, snapshot `snippet`; `listSessionSnippets()`; build `list_session_snippets` request.
 - 2026-06-12T16:48-07:00 flutter/triage_client/lib/main.dart — `SessionVm.snippet`; handle push event; `_seedSessionSnippets` on load; snippet from snapshot; render muted italic 3rd line in `SessionListTile`.
 - 2026-06-12T17:20-07:00 rust-toolchain.toml, .github/workflows/{ci.yml,publish.yml} — pin toolchain to `nightly-2026-04-02` (required by cera on aarch64). crates/triage-transport-ws/src/bin/stress_client.rs + crates/triage/src/main.rs — `#[allow(clippy::collapsible_match)]` for two pre-existing sites newly flagged by nightly clippy.
+- 2026-06-12T20:53-07:00 crates/triaged/src/{session.rs,main.rs} — seed snippets for sessions adopted on handover. `start_summarizer` seeds at startup (line 62), but that runs *before* inherited-session adoption (main.rs line 109), so on handover the startup seed hits an empty session list and adopted sessions had no snippet until their next output. Added public `SessionManager::seed_session_snippets` (re-runs `seed_initial_summaries` against the now-live sessions; no-op when summarizer disabled) and call it right after `adopt_sessions` in the handover path. Fresh starts skip the block entirely, so no double-seed.
 
 ## Issues
 
@@ -68,6 +69,7 @@ See plan: `devlog/plans/000066-01-session-snippets.md`.
 
 - 2026-06-12T17:35-07:00 `cargo test -p triaged --release -- --ignored end_to_end --nocapture` — downloaded LFM2.5-1.2B-Instruct-GGUF/Q4_0 (cached under `~/.cache/triage/models`), ran one inference on a sample `cargo test` screen, generated snippet `"Building and testing project version"`, passed. Full path: BundleRepo download → from_bundle_id load → apply_chat_template → generate → OneLineSink → sanitize.
 - CI-equivalent local runs on nightly-2026-04-02: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✓, `cargo doc --workspace --all-features -D warnings` ✓, `cargo test --workspace --all-features --locked` ✓, `flutter analyze` ✓ (no new issues).
+- 2026-06-12T20:53-07:00 Post-adoption seed fix: `cargo build -p triaged` ✓, `cargo clippy -p triaged --all-targets --all-features` ✓ (clean), `cargo fmt -p triaged` ✓. Empirically motivated — a live `triaged --handover` upgrade (PID 30758 → 94333) completed during this session; adopted sessions are exactly the case this fix seeds.
 
 ## Lessons Learned
 
@@ -77,4 +79,5 @@ See plan: `devlog/plans/000066-01-session-snippets.md`.
 
 ## Commits
 
-- HEAD — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
+- b0662c5 — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
+- HEAD — fix(triaged): seed snippets for sessions adopted on handover

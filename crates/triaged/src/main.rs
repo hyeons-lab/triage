@@ -107,6 +107,9 @@ fn run() -> anyhow::Result<()> {
 
                     tracing::info!("Adopting {} inherited live sessions", state.sessions.len());
                     manager.adopt_sessions(state, fds)?;
+                    // Seed snippets now that adopted sessions are live, so the
+                    // rail shows a description for each immediately after handover.
+                    manager.seed_session_snippets();
                 }
             }
         }

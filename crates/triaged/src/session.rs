@@ -521,9 +521,23 @@ impl SessionManager {
             return;
         }
 
-        // Seed: summarize sessions that already exist (e.g. adopted on handover)
-        // so they get a snippet without waiting for new output.
+        // Seed any sessions that already exist at this point. On a fresh start
+        // there are none; on handover, adoption runs *after* this, so callers
+        // must also invoke `seed_session_snippets` post-adoption.
         self.seed_initial_summaries(&summarizer);
+    }
+
+    /// Re-runs the initial seed against the current live sessions. Call this
+    /// after handover adoption so adopted (possibly idle) sessions get a snippet
+    /// without waiting for new output. No-op when the summarizer is disabled.
+    pub fn seed_session_snippets(&self) {
+        let summarizer = match self.summarizer.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        if summarizer.is_enabled() {
+            self.seed_initial_summaries(&summarizer);
+        }
     }
 
     /// Enqueues a one-shot summary for every currently-live session.
