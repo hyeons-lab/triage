@@ -77,7 +77,44 @@ See plan: `devlog/plans/000066-01-session-snippets.md`.
 - triage transport delivers server events only per-subscription; a connection-wide push needs a separate global channel drained in `drain_events` (done).
 - The Rust TUI talks to the daemon in-process via `SessionApi`, not the WS borrowed parser — only Flutter + the stress_client use the wire protocol.
 
+## Deployment / Handover Testing (2026-06-12T21:26-07:00)
+
+**Goal:** replace `/Applications/Triage.app` + restart `triaged` + the web client so the user can test snippets live. The Claude Code session has been CRASHING / losing context on daemon+UI restarts — so this section is the durable state-of-the-world. Read this first on resume.
+
+### Built artifacts (all current, branch feat/session-snippets)
+- triaged binary: `target/release/triaged` (built ~21:23 WITH the uncommitted summary_rows refactor) → installed to `~/.cargo/bin/triaged`. Old binary backed up as `~/.cargo/bin/triaged.old-*`.
+- Flutter web: `flutter/triage_client/build/web/` (embedded into triaged via rust-embed `#[folder = "../../flutter/triage_client/build/web/"]`, served on :7777).
+- Flutter macOS app: `flutter/triage_client/build/macos/Build/Products/Release/Triage.app` (NOT yet copied to /Applications).
+
+### Runtime topology
+- `triaged` at `~/.cargo/bin/triaged`; binds `127.0.0.1:7777` (HTTP+WS); no config file → defaults → **summarizer enabled**.
+- Handover unix socket: `/var/folders/zn/.../T/triage-501/triage.sock` (`default_socket_path()`).
+- **Daemon log: `~/.local/state/triage/triaged.log`** (tracing-appender rolling::never). The `/tmp/triaged-*.log` files are stdout and have been EMPTY — diagnose via the state log, not /tmp.
+- Sessions: `~/.local/state/triage/sessions/` (28 logs); pairing persists in `paired_devices.json`.
+- App is standalone (`com.example.triageClient`, adhoc); connects over WS; does NOT spawn the daemon.
+
+### Restart mechanism + OPEN PROBLEM
+- `triaged --handover` (`-U`): new process connects to old daemon's `triage.sock`, inherits the TCP listener FD + live session PTYs, old exits, new continues IN THE SAME PROCESS (no re-exec). `main.rs` order: handover-client → SessionManager::default → load config → **start_summarizer** → bind → adopt inherited sessions → **seed_session_snippets** (commit 94a3374).
+- **PROBLEM:** launching the daemon detached from the Claude Code Bash tool via `nohup ... & disown` does NOT survive — terminal showed `zsh: warning: 1 jobs SIGHUPed`; the daemon dies AND the Claude Code session loses context on the crash. NEXT TIME use the Bash tool's `run_in_background: true` (persists across turns) or a real double-fork/`launchctl submit` — NOT bare `nohup &`.
+- "the handover doesn't seem to work" (user) — root cause unconfirmed; first read `~/.local/state/triage/triaged.log`. Candidates: (a) daemon not surviving detachment, (b) adoption failing, (c) snippets not generating. pid 321 (`triaged --handover`, started 21:10) was on :7777 at diagnosis time.
+
+### Uncommitted work (COMPLETE) — summary_rows off-lock refactor
+The summarizer used `snapshot_session`, which holds the global `sessions` Mutex across the actor round-trip AND reads up to 1 MB of raw-output log tail + builds styled rows — wasteful and a lock-starvation risk on the debounce/seed hot path. Replaced with a cheap, off-lock path:
+- New `ActorCommand::SummaryRows` → returns visible rows + output_seq only (no styled rows, no disk read). Handler + shutdown-reject arm added.
+- `request_summary_rows(tx)` helper (`session.rs:3069`); `SessionManager::summary_rows(id)` clones the live actor `tx` under a brief lock then calls it OFF-LOCK.
+- `seed_initial_summaries` + `run_debounce_loop` switched to `summary_rows`.
+- Added debug logs (`apply_snippet` cached+broadcast, seed total/enqueued/skipped_blank, worker empty-output drop) for the live test.
+Complete + defined; needs `cargo build -p triaged` confirm, then commit.
+
+### Next steps (in order)
+1. `cargo build -p triaged` — confirm the refactor compiles.
+2. Commit the summary_rows refactor (update Commits below).
+3. Read `~/.local/state/triage/triaged.log` to diagnose the handover failure.
+4. Restart daemon robustly (`run_in_background`, not `nohup &`); verify pid + :7777 + adoption via the log.
+5. `cp -R` built `Triage.app` over `/Applications/Triage.app`; relaunch; reload web at http://127.0.0.1:7777.
+
 ## Commits
 
 - b0662c5 — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
-- HEAD — fix(triaged): seed snippets for sessions adopted on handover
+- 94a3374 — fix(triaged): seed snippets for sessions adopted on handover
+- HEAD — perf(triaged): off-lock cheap visible-rows snapshot for summarizer

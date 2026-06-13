@@ -387,6 +387,22 @@ impl SessionManager {
         self.dirty_tx.lock().ok().and_then(|guard| guard.clone())
     }
 
+    /// Cheap visible-rows snapshot for the summarizer. Clones the live actor's
+    /// command channel under a brief lock, then does the round-trip OFF-LOCK so
+    /// it never holds the global `sessions` mutex during actor I/O (which would
+    /// starve interactive session operations). Returns `None` for
+    /// non-live/missing sessions.
+    fn summary_rows(&self, session_id: &SessionId) -> Option<(Vec<String>, u64)> {
+        let cmd_tx = {
+            let sessions = self.sessions().ok()?;
+            match sessions.get(session_id) {
+                Some(ManagedSession::Live { actor, .. }) => actor.tx.clone(),
+                _ => return None,
+            }
+        };
+        request_summary_rows(&cmd_tx).ok()
+    }
+
     /// Current snippet text for a session, if one has been generated.
     fn snippet_for(&self, session_id: &SessionId) -> Option<String> {
         self.snippets
@@ -451,6 +467,12 @@ impl SessionManager {
                 }
             }
         }
+        tracing::debug!(
+            session_id = %result.session_id,
+            output_seq = result.generated_at_output_seq,
+            text = %result.text,
+            "cached + broadcasting session snippet"
+        );
         self.broadcast_global(ServerMessage::SessionSnippetUpdated {
             session_id: result.session_id,
             snippet: result.text,
@@ -546,17 +568,30 @@ impl SessionManager {
             Ok(ids) => ids,
             Err(_) => return,
         };
+        let total = session_ids.len();
+        let mut enqueued = 0usize;
+        let mut skipped_blank = 0usize;
         for session_id in session_ids {
-            if let Ok(snapshot) = self.snapshot_session(session_id.clone())
-                && let Some(prompt_text) = build_prompt_text(&snapshot.visible_rows)
-            {
-                summarizer.try_enqueue(SummarizeJob {
-                    session_id,
-                    prompt_text,
-                    output_seq: snapshot.output_seq,
-                });
+            if let Some((rows, output_seq)) = self.summary_rows(&session_id) {
+                if let Some(prompt_text) = build_prompt_text(&rows) {
+                    if summarizer.try_enqueue(SummarizeJob {
+                        session_id,
+                        prompt_text,
+                        output_seq,
+                    }) {
+                        enqueued += 1;
+                    }
+                } else {
+                    skipped_blank += 1;
+                }
             }
         }
+        tracing::debug!(
+            total,
+            enqueued,
+            skipped_blank,
+            "seeded session snippets"
+        );
     }
 
     fn log_path(&self, session_id: &SessionId) -> PathBuf {
@@ -1485,14 +1520,16 @@ fn run_debounce_loop(
                 continue;
             }
 
-            let Ok(snapshot) = manager.snapshot_session(session_id.clone()) else {
+            // Off-lock cheap snapshot: never holds the global sessions mutex
+            // during the actor round-trip, so it can't starve interactive ops.
+            let Some((rows, _output_seq)) = manager.summary_rows(&session_id) else {
                 // Session likely gone; drop tracking state for it.
                 last_enqueue.remove(&session_id);
                 last_summarized_seq.remove(&session_id);
                 last_prompt_hash.remove(&session_id);
                 continue;
             };
-            let Some(prompt_text) = build_prompt_text(&snapshot.visible_rows) else {
+            let Some(prompt_text) = build_prompt_text(&rows) else {
                 continue;
             };
 
@@ -2086,6 +2123,12 @@ enum ActorCommand {
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
+    /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
+    /// no raw-output-history disk read, so it never blocks on I/O. Returns the
+    /// plain visible rows plus the current output sequence.
+    SummaryRows {
+        response: Sender<ActorResult<(Vec<String>, u64)>>,
+    },
     StyledRows {
         start: usize,
         end: usize,
@@ -2254,6 +2297,11 @@ impl ActorState {
             }
             ActorCommand::Snapshot { response } => {
                 let _ = response.send(Ok(self.snapshot_with_history()));
+                false
+            }
+            ActorCommand::SummaryRows { response } => {
+                let rows = visible_rows(&self.output.terminal);
+                let _ = response.send(Ok((rows, self.output.output_seq)));
                 false
             }
             ActorCommand::StyledRows {
@@ -3015,6 +3063,16 @@ fn recv_actor_result<T>(rx: Receiver<ActorResult<T>>, context: &'static str) -> 
         .with_context(|| context)
 }
 
+/// Requests a cheap visible-rows snapshot via a cloned actor command channel.
+/// The caller clones `tx` while briefly holding the sessions lock, then calls
+/// this OFF-LOCK so the actor round-trip never blocks other session operations.
+fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<(Vec<String>, u64)> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::SummaryRows { response: resp_tx })
+        .context("sending session summary-rows command")?;
+    recv_actor_result(resp_rx, "reading session summary rows")
+}
+
 fn reject_command_during_shutdown(command: ActorCommand) {
     let error = anyhow!("session is shutting down");
     match command {
@@ -3025,6 +3083,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SummaryRows { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::StyledRows { response, .. } => {

@@ -139,7 +139,12 @@ fn run_worker(
                     text,
                     generated_at_output_seq: job.output_seq,
                 }),
-                Ok(None) => {}
+                Ok(None) => {
+                    tracing::debug!(
+                        session_id = %job.session_id,
+                        "snippet generation produced empty output (dropped)"
+                    )
+                }
                 Err(error) => {
                     tracing::warn!(%error, session_id = %job.session_id, "snippet generation failed")
                 }
