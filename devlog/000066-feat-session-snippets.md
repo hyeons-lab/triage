@@ -71,6 +71,11 @@ See plan: `devlog/plans/000066-01-session-snippets.md`.
 - CI-equivalent local runs on nightly-2026-04-02: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✓, `cargo doc --workspace --all-features -D warnings` ✓, `cargo test --workspace --all-features --locked` ✓, `flutter analyze` ✓ (no new issues).
 - 2026-06-12T20:53-07:00 Post-adoption seed fix: `cargo build -p triaged` ✓, `cargo clippy -p triaged --all-targets --all-features` ✓ (clean), `cargo fmt -p triaged` ✓. Empirically motivated — a live `triaged --handover` upgrade (PID 30758 → 94333) completed during this session; adopted sessions are exactly the case this fix seeds.
 
+## Issues (continued)
+
+- 2026-06-12T21:50-07:00 **Live snippet push never reached the client (bug found via real-app testing).** In `triage_websocket_client.dart` `_handleIncomingMessage`, only `response`/`error`/`event`/`subscription_closed` types were forwarded to `_eventController`; the new top-level `session_snippet_updated` push had no branch, so it was dropped before reaching `_processWebSocketEvent`. Symptom: a session present at connect (seeded via `listSessionSnippets`, a request *response*) showed its snippet, but a session created *after* connect (relies on the live push) never updated. Caught when a Claude Code session (session-34) created mid-run never got a snippet while session-33 did. Fix: add the `session_snippet_updated` branch to forward it to the stream. The seed path masked this in earlier checks because the first session was seeded, not pushed.
+- 2026-06-15T12:11-07:00 **Fix verified end-to-end in the deployed macOS app.** With the push branch in place, the user confirms the rail shows snippets that change over time on active sessions — the live push path (not just seed-on-connect) is working.
+
 ## Lessons Learned
 
 - cera text-only chat has no `append_chat`; render via `cera::tokenizer::apply_chat_template(tokenizer, &messages, true)` then `session.append_text(rendered)`. `remote` feature is opt-in (HF downloader); `EngineConfig.context_size` is `usize`.
@@ -106,15 +111,29 @@ The summarizer used `snapshot_session`, which holds the global `sessions` Mutex 
 - Added debug logs (`apply_snippet` cached+broadcast, seed total/enqueued/skipped_blank, worker empty-output drop) for the live test.
 Complete + defined; needs `cargo build -p triaged` confirm, then commit.
 
-### Next steps (in order)
-1. `cargo build -p triaged` — confirm the refactor compiles.
-2. Commit the summary_rows refactor (update Commits below).
-3. Read `~/.local/state/triage/triaged.log` to diagnose the handover failure.
-4. Restart daemon robustly (`run_in_background`, not `nohup &`); verify pid + :7777 + adoption via the log.
-5. `cp -R` built `Triage.app` over `/Applications/Triage.app`; relaunch; reload web at http://127.0.0.1:7777.
+### DIAGNOSIS (2026-06-12T21:27-07:00) — backend works; the issue is the stale app + fragile detach
+Read `~/.local/state/triage/triaged.log` (the state log, NOT /tmp). Findings:
+- **The feature WORKS end-to-end on real sessions.** The 04:10 UTC handover succeeded: "Adopting 9 inherited live sessions" → "loaded session summarizer model" → genuinely good snippets generated + broadcast for every session, e.g. session-30 "Analyzing session logs and daemon status", session-23 "Setting up EMSDK environment", session-32 "Building Flutter macOS app completed", session-21 "Checking terminal settings". Seed log: `total:9 enqueued:8`.
+- **Daemon pid 321 is HEALTHY**: `curl http://127.0.0.1:7777/` → 200 in 0.4ms. Runs a ~21:07 binary (has 94a3374 seed-fix + debug logging; LACKS the e9561a1 summary_rows perf refactor — perf-only, not needed to test).
+- **Why "handover doesn't work":** a SECOND handover at 04:23 UTC (to deploy the summary_rows binary) reached "Initiating Phase 3 (teardown)" then the log DEAD-STOPS — the new process was launched detached via `nohup ... & disown` and got **SIGHUPed** by the Bash-tool process-group cleanup, dying mid-handover. That both (a) leaves the daemon in a half-torn-down state and (b) is what crashes the Claude Code session. **Never launch the daemon via `nohup &` from the Bash tool.** Use `run_in_background: true`.
+- **Why the user can't SEE snippets:** `/Applications/Triage.app` (what the running app pid launched from) is the OLD 8:41PM build with NO snippet rendering. The new build at `flutter/.../build/macos/Build/Products/Release/Triage.app` was never copied over.
+
+### Plan (low-risk; NO daemon restart)
+The daemon already works and generating a restart risks the SIGHUP crash + losing the user's live sessions. So:
+1. ✓ Commit summary_rows refactor (e9561a1) — done.
+2. Deploy the app ONLY: quit old app → `rm -rf /Applications/Triage.app` → `cp -R` new build → `open`. (File copy + app relaunch can't crash the session.)
+3. New app connects to the working daemon (pid 321), calls listSessionSnippets (seeded) + receives pushes → snippets render in the rail. Verify via the daemon log showing a new WS connection.
+4. LEAVE the daemon as-is. If the summary_rows perf binary is wanted later, restart via `run_in_background` (clean start or careful handover) — NOT now, not via nohup.
+
+### UPDATE (2026-06-12T21:30-07:00) — daemon CONFIRMED stuck; clean restart required
+After deploying the new app and relaunching it, the daemon log is STILL frozen at 04:23:56 — no "Upgraded WebSocket client connected" (which logs at debug, and debug IS enabled since the snippet debug logs appear). curl returns 200 (HTTP accept task alive) but the daemon processes no WS sessions → pid 321 is wedged in the aborted-handover Phase-3 teardown. So:
+- New `/Applications/Triage.app` IS deployed (the new snippet-rendering build, ditto-copied 21:28). App relaunches but can't get a working session from the wedged daemon.
+- **Action: clean restart.** Rebuild release from HEAD (summary_rows e9561a1), install to `~/.cargo/bin/triaged`, `kill` pid 321, start fresh `triaged` (NO --handover) via the Bash tool's `run_in_background: true` (survives; nohup did not). Fresh start loses the wedged live PTYs — unavoidable; the 28 persisted sessions reload as Historical (restorable).
+- **Known nuance (acceptable):** the summary_rows refactor only reads LIVE actors, so on a fresh (non-handover) start, Historical sessions are NOT seeded a snippet until restored→live→produce output. Reasonable (a non-running session isn't "doing" anything). To SEE snippets after restart: start a new session / restore one and run a command → debounce generates a snippet within ~settle.
 
 ## Commits
 
 - b0662c5 — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
 - 94a3374 — fix(triaged): seed snippets for sessions adopted on handover
-- HEAD — perf(triaged): off-lock cheap visible-rows snapshot for summarizer
+- e9561a1 — perf(triaged): off-lock cheap visible-rows snapshot for summarizer
+- HEAD — fix(client): forward session_snippet_updated push to the rail

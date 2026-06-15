@@ -99,6 +99,10 @@ class TriageWebSocketClient {
         _eventController.add(message);
       } else if (type == 'subscription_closed') {
         _eventController.add(message);
+      } else if (type == 'session_snippet_updated') {
+        // Connection-wide push (not tied to a request or subscription); forward
+        // to the app so it can update the session's rail snippet live.
+        _eventController.add(message);
       }
     } catch (error) {
       debugPrint(
