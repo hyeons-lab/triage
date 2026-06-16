@@ -233,6 +233,9 @@ pub struct SessionManager {
 #[derive(Debug, Clone)]
 struct SessionSnippet {
     text: String,
+    /// Longer-form summary for the hover popover / search. `None` until the
+    /// detail pass produces something usable.
+    detail: Option<String>,
     generated_at_output_seq: u64,
 }
 
@@ -403,13 +406,16 @@ impl SessionManager {
         request_summary_rows(&cmd_tx).ok()
     }
 
-    /// Current snippet text for a session, if one has been generated.
-    fn snippet_for(&self, session_id: &SessionId) -> Option<String> {
-        self.snippets
-            .lock()
-            .ok()?
-            .get(session_id)
-            .map(|snippet| snippet.text.clone())
+    /// Current snippet (one-liner, detail) for a session, if one has been
+    /// generated. Returns `(None, None)` when no snippet exists.
+    fn snippet_for(&self, session_id: &SessionId) -> (Option<String>, Option<String>) {
+        let Ok(snippets) = self.snippets.lock() else {
+            return (None, None);
+        };
+        match snippets.get(session_id) {
+            Some(snippet) => (Some(snippet.text.clone()), snippet.detail.clone()),
+            None => (None, None),
+        }
     }
 
     /// Overlays the cached snippet onto a snapshot before it is returned to a
@@ -419,7 +425,9 @@ impl SessionManager {
         mut snapshot: SessionSnapshot,
         session_id: &SessionId,
     ) -> SessionSnapshot {
-        snapshot.snippet = self.snippet_for(session_id);
+        let (snippet, detail) = self.snippet_for(session_id);
+        snapshot.snippet = snippet;
+        snapshot.snippet_detail = detail;
         snapshot
     }
 
@@ -461,6 +469,7 @@ impl SessionManager {
                         result.session_id.clone(),
                         SessionSnippet {
                             text: result.text.clone(),
+                            detail: result.detail.clone(),
                             generated_at_output_seq: result.generated_at_output_seq,
                         },
                     );
@@ -476,6 +485,7 @@ impl SessionManager {
         self.broadcast_global(ServerMessage::SessionSnippetUpdated {
             session_id: result.session_id,
             snippet: result.text,
+            detail: result.detail,
             output_seq: result.generated_at_output_seq,
         });
     }
@@ -504,6 +514,7 @@ impl SessionManager {
             quant: config.quant.clone(),
             context_size: config.context_size,
             max_tokens: config.max_tokens,
+            detail_max_tokens: config.detail_max_tokens,
             cache_dir,
             queue_depth: 8,
         };
@@ -1417,7 +1428,8 @@ impl SessionApi for SessionManager {
         }
     }
 
-    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+    #[allow(clippy::type_complexity)]
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         let session_ids = self.list_sessions()?;
         let snippets = self
             .snippets
@@ -1426,8 +1438,11 @@ impl SessionApi for SessionManager {
         Ok(session_ids
             .into_iter()
             .map(|session_id| {
-                let snippet = snippets.get(&session_id).map(|s| s.text.clone());
-                (session_id, snippet)
+                let (snippet, detail) = match snippets.get(&session_id) {
+                    Some(s) => (Some(s.text.clone()), s.detail.clone()),
+                    None => (None, None),
+                };
+                (session_id, snippet, detail)
             })
             .collect())
     }
@@ -3025,6 +3040,7 @@ fn snapshot_from_output(
         // Populated by the manager from its snippet cache when a snapshot is
         // returned to a caller; the actor has no access to the cache.
         snippet: None,
+        snippet_detail: None,
     }
 }
 

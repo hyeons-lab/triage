@@ -86,6 +86,9 @@ table SessionSnapshot {
     // Local-LLM one-line description of what this session is doing, if generated.
     // Empty/absent when summarization is disabled or not yet produced.
     snippet: string;
+    // Local-LLM longer-form summary (a few sentences) for the side-rail hover
+    // popover and future session search. Empty/absent when not yet produced.
+    snippet_detail: string;
 }
 
 table CompletedSession {
@@ -278,6 +281,7 @@ table CompletedSessionResult {
 table SessionSnippetEntry {
     session_id: string;
     snippet: string;
+    detail: string;
 }
 
 table SessionSnippetsResult {
@@ -363,6 +367,7 @@ table SessionSnippetUpdatedPayload {
     session_id: string;
     snippet: string;
     output_seq: uint64;
+    detail: string;
 }
 
 union ServerMessagePayload {

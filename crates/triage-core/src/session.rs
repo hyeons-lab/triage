@@ -123,6 +123,10 @@ pub struct SessionSnapshot {
     /// been generated. `None` when summarization is disabled or not yet produced.
     #[serde(default)]
     pub snippet: Option<String>,
+    /// Local-LLM longer-form summary (a few sentences) for the side-rail hover
+    /// popover and future search. `None` until the detail pass produces it.
+    #[serde(default)]
+    pub snippet_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,9 +429,11 @@ pub trait SessionApi {
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot>;
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse>;
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
-    /// Current snippet for every session (id, snippet). Sessions without a
-    /// snippet yet carry `None`. Default: no snippets (summarization unsupported).
-    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+    /// Current snippet for every session (id, one-liner, detail). Sessions
+    /// without a snippet yet carry `None`. Default: no snippets (summarization
+    /// unsupported).
+    #[allow(clippy::type_complexity)]
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         Ok(Vec::new())
     }
 }
@@ -479,7 +485,8 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         (**self).shutdown_session(session_id)
     }
-    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+    #[allow(clippy::type_complexity)]
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         (**self).list_session_snippets()
     }
 }

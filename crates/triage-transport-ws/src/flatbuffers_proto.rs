@@ -835,11 +835,13 @@ pub fn build_server_message<'a>(
                     for entry in entries {
                         let sid = builder.create_string(entry.session_id.as_str());
                         let snip = entry.snippet.as_ref().map(|s| builder.create_string(s));
+                        let det = entry.detail.as_ref().map(|s| builder.create_string(s));
                         entry_offsets.push(fb::SessionSnippetEntry::create(
                             builder,
                             &fb::SessionSnippetEntryArgs {
                                 session_id: Some(sid),
                                 snippet: snip,
+                                detail: det,
                             },
                         ));
                     }
@@ -1016,16 +1018,19 @@ pub fn build_server_message<'a>(
         ServerMessage::SessionSnippetUpdated {
             session_id,
             snippet,
+            detail,
             output_seq,
         } => {
             let sid = builder.create_string(session_id.as_str());
             let snip = builder.create_string(snippet);
+            let det = detail.as_ref().map(|s| builder.create_string(s));
             let updated = fb::SessionSnippetUpdatedPayload::create(
                 builder,
                 &fb::SessionSnippetUpdatedPayloadArgs {
                     session_id: Some(sid),
                     snippet: Some(snip),
                     output_seq: *output_seq,
+                    detail: det,
                 },
             );
             (
@@ -1119,6 +1124,7 @@ pub enum ServerMessageBorrowed<'a> {
     SessionSnippetUpdated {
         session_id: &'a str,
         snippet: &'a str,
+        detail: Option<&'a str>,
         output_seq: u64,
     },
 }
@@ -1301,6 +1307,7 @@ pub fn parse_fb_server_message_borrowed<'a>(
             Ok(ServerMessageBorrowed::SessionSnippetUpdated {
                 session_id: updated.session_id().unwrap_or(""),
                 snippet: updated.snippet().unwrap_or(""),
+                detail: updated.detail(),
                 output_seq: updated.output_seq(),
             })
         }

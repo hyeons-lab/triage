@@ -342,6 +342,9 @@ pub struct SummarizerConfig {
     pub context_size: u32,
     /// Upper bound on generated tokens per snippet.
     pub max_tokens: u32,
+    /// Upper bound on generated tokens for the longer-form detail summary
+    /// (hover popover / search). Larger than `max_tokens`.
+    pub detail_max_tokens: u32,
     /// How long a session's output must be quiet before we (re)summarize it.
     pub settle_ms: u64,
     /// Minimum interval between regenerations for a single session.
@@ -365,6 +368,10 @@ impl SummarizerConfig {
             self.max_tokens > 0,
             "summarizer.max_tokens must be greater than zero"
         );
+        ensure!(
+            self.detail_max_tokens > 0,
+            "summarizer.detail_max_tokens must be greater than zero"
+        );
         if let Some(ref dir) = self.cache_dir {
             ensure_non_empty("summarizer.cache_dir", dir)?;
         }
@@ -380,6 +387,7 @@ impl Default for SummarizerConfig {
             quant: "Q4_0".to_string(),
             context_size: 1024,
             max_tokens: 24,
+            detail_max_tokens: 110,
             settle_ms: 1500,
             min_regen_ms: 5000,
             cache_dir: None,
