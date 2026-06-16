@@ -115,6 +115,28 @@ genuine UI change; updated the assertion.
   adds a second back-to-back inference in the same job (same loaded engine).
 - `shared_preferences` is NOT yet a Flutter dependency.
 
+## Issues (cont. 2)
+
+2026-06-16T00:24-0700 CI "Format and Lint" failed on PR #75: adding
+`SessionSnapshot.snippet_detail` left 13 test-snapshot literals missing the new
+field (`E0063` in `crates/triage/src/lib.rs`, `crates/triage/src/main.rs`,
+`crates/triage-mcp/src/main.rs`) — `--all-targets` compiles tests, so clippy
+broke before Tests could run. Production constructors (`build_snapshot`,
+flatbuffers encode, transport-ws helper) already had it; only the hand-written
+test fixtures lagged. Added `snippet_detail: None` to each. Local
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`,
+`cargo fmt --all --check`, and `cargo test -p triage -p triage-mcp
+-p triage-transport-ws` all clean.
+
 ## Commits
 
-HEAD — feat: side-rail glance (branch/repo/worktree, hover detail popover, drag reorder)
+- 4e21017 — feat: side-rail glance (branch/repo/worktree, hover detail popover, drag reorder)
+- HEAD — fix(test): add snippet_detail to SessionSnapshot test fixtures
+
+## Research & Discoveries (cont.)
+
+2026-06-15T23:05-0700 PR: https://github.com/hyeons-lab/triage/pull/75 (review-ready).
+Deploy: client reinstalled to /Applications; daemon updated via
+`triaged --handover` (`perform_handover_client` connects to the running
+daemon's socket, pulls PTY fds + TCP listener via SCM_RIGHTS, old daemon
+detaches sessions and exits) so the second-LLM detail summary populates.

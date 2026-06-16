@@ -1913,6 +1913,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -1957,6 +1958,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2003,6 +2005,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2062,6 +2065,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2104,6 +2108,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2388,6 +2393,7 @@ mod tests {
             raw_output: Vec::new(),
             raw_output_start: 0,
             snippet: None,
+            snippet_detail: None,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_some());
@@ -2420,6 +2426,7 @@ mod tests {
             raw_output: Vec::new(),
             raw_output_start: 0,
             snippet: None,
+            snippet_detail: None,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 1).is_none());
@@ -2472,6 +2479,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,

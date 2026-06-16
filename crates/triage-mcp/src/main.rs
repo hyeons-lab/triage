@@ -598,6 +598,7 @@ mod tests {
                     raw_output: Vec::new(),
                     raw_output_start: 0,
                     snippet: None,
+                    snippet_detail: None,
                 },
                 snapshot_error: None,
             }
