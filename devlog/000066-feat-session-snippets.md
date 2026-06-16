@@ -144,7 +144,7 @@ Fix (daemon, `crates/triaged/src/session.rs`):
 - `restore_session` calls it first, so the existing restore path then finds `Historical` and re-spawns normally.
 - Regression test `restore_revives_live_session_whose_process_died`: start a live `/bin/sh`, `exit\n` it, wait for the manager to observe `exited`, assert `restore_session` revives it (was panicking on the "already live" bail before the fix) and accepts input again. Full triaged suite: 85 pass; my code fmt-clean + clippy-clean.
 
-Pre-existing note: `cargo fmt --all --check` flags session.rs:586 (the `seed_initial_summaries` debug log) even with my changes stashed — committed drift, likely a rustfmt-version mismatch from the `rust-toolchain.toml` change on this branch. Not touched here; flag for CI.
+Pre-existing note: `cargo fmt --all --check` flagged session.rs:586 (the `seed_initial_summaries` debug log) — committed drift from b0662c5. RESOLVED in a later `style:` commit: confirmed it is NOT a rustfmt-version mismatch (the local toolchain resolves to the same pinned `nightly-2026-04-02` / rustfmt 1.9.0 that CI uses), so it was a genuine format violation; `cargo fmt` collapsed the multi-line macro call. Workspace fmt now clean.
 
 NOT YET DONE (pending user confirmation — daemon redeploy is disruptive to the one remaining live session): deploy the rebuilt daemon (`target/release/triaged` + `~/.cargo/bin/triaged`) and move the user onto the snippet-capable client.
 

@@ -586,12 +586,7 @@ impl SessionManager {
                 }
             }
         }
-        tracing::debug!(
-            total,
-            enqueued,
-            skipped_blank,
-            "seeded session snippets"
-        );
+        tracing::debug!(total, enqueued, skipped_blank, "seeded session snippets");
     }
 
     fn log_path(&self, session_id: &SessionId) -> PathBuf {
