@@ -37,7 +37,7 @@ class TerminalScrollAnchor {
     final lineCount = buffer.lines.length;
     if (lineHeight <= 0 ||
         lineCount <= 0 ||
-        pixels >= maxScrollExtent - 1.0) {
+        pixels >= maxScrollExtent - lineHeight) {
       _line = null;
       return;
     }

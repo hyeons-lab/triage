@@ -53,6 +53,22 @@ heavy output.
   desired offset follows the pinned line through trims, stays put at the bottom,
   and drops once the line is trimmed away.
 
+### Copilot review feedback (PR #73)
+
+- 2026-06-15T21:36-0700 `terminal_scroll_anchor.dart` — bottom-detection
+  threshold was a fixed `1.0px`; the docstring promised "within a line". Switched
+  to `maxScrollExtent - lineHeight` so the anchor releases a full line shy of the
+  bottom and matches xterm.dart's stick-to-bottom hand-off.
+- 2026-06-15T21:36-0700 `terminal_pane_stub.dart` — wrapped `position.jumpTo` in
+  `_repinScrollAnchor` in `try/finally` so `_suppressAnchorCapture` always resets;
+  a throwing `jumpTo` (transient scroll-range issue) would otherwise wedge the
+  guard on and silently stop all future anchor capture.
+- 2026-06-15T21:36-0700 `terminal_scroll_anchor_test.dart` — `_fullTerminal` now
+  writes 3 extra lines after the buffer caps so the trim path actually runs before
+  assertions (matching its docstring), and tests compute `maxScrollExtent` as
+  `(lineCount - viewHeight) * lineHeight` via a `_maxExtent` helper instead of full
+  content height, so clamping/bottom-detection see the value the widget passes in.
+
 ## Issues
 
 - 2026-06-11T22:24-0700 `TerminalPane` renders a plain fallback view under
@@ -72,4 +88,5 @@ heavy output.
 
 ## Commits
 
-- HEAD — fix(client): keep terminal scroll position anchored across scrollback trims
+- d0f25b6 — fix(client): keep terminal scroll position anchored across scrollback trims
+- HEAD — fix(client): address PR #73 review (anchor threshold, jumpTo guard, test extents)

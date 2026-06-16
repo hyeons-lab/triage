@@ -614,8 +614,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (desired == null) return;
     if ((desired - position.pixels).abs() < 0.5) return;
     _suppressAnchorCapture = true;
-    position.jumpTo(desired);
-    _suppressAnchorCapture = false;
+    try {
+      position.jumpTo(desired);
+    } finally {
+      // Guarantee the guard resets even if jumpTo throws on a transient
+      // scroll-range issue — otherwise user scrolls would stop capturing.
+      _suppressAnchorCapture = false;
+    }
   }
 
   void _scrollToCursor({required bool requestFocus}) {

@@ -2,17 +2,29 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:xterm/xterm.dart' as xt;
 
+const _viewHeight = 5;
+
 /// Fills the terminal until its buffer is full (every further write trims a line
-/// off the top), then writes a few extra lines so the buffer is firmly capped.
-xt.Terminal _fullTerminal({required int maxLines, int viewHeight = 5}) {
+/// off the top), then writes a few extra lines so the buffer is firmly capped
+/// and the trim path has actually run before the test inspects it.
+xt.Terminal _fullTerminal({required int maxLines, int viewHeight = _viewHeight}) {
   final terminal = xt.Terminal(maxLines: maxLines);
   terminal.resize(40, viewHeight);
   var i = 0;
   while (terminal.buffer.lines.length < maxLines) {
     terminal.write('line${i++}\r\n');
   }
+  for (var extra = 0; extra < 3; extra++) {
+    terminal.write('cap$extra\r\n');
+  }
   return terminal;
 }
+
+/// The scroll position's `maxScrollExtent` is the content height minus the
+/// viewport height — not the full content height — so anchor clamping and
+/// bottom detection see the same value the widget wiring passes in.
+double _maxExtent(xt.Terminal terminal, double lineHeight) =>
+    (terminal.buffer.lines.length - _viewHeight) * lineHeight;
 
 void main() {
   const lineHeight = 10.0;
@@ -30,7 +42,7 @@ void main() {
     test('capturing at the bottom follows the bottom (no anchor)', () {
       final terminal = _fullTerminal(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = terminal.buffer.lines.length * lineHeight;
+      final maxExtent = _maxExtent(terminal, lineHeight);
 
       anchor.capture(
         buffer: terminal.buffer,
@@ -45,7 +57,7 @@ void main() {
     test('capturing above the bottom pins the top viewport line', () {
       final terminal = _fullTerminal(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = terminal.buffer.lines.length * lineHeight;
+      final maxExtent = _maxExtent(terminal, lineHeight);
       const pixels = 100.0; // topRow == 10
 
       anchor.capture(
@@ -65,7 +77,7 @@ void main() {
     test('pinned offset tracks the anchored line as scrollback trims', () {
       final terminal = _fullTerminal(maxLines: 30);
       final buffer = terminal.buffer;
-      final maxExtent = buffer.lines.length * lineHeight;
+      final maxExtent = _maxExtent(terminal, lineHeight);
       const anchorRow = 10;
 
       // The same BufferLine the anchor will capture, tracked independently so we
@@ -102,7 +114,7 @@ void main() {
     test('anchor is dropped once its line is trimmed out of the buffer', () {
       final terminal = _fullTerminal(maxLines: 30);
       final buffer = terminal.buffer;
-      final maxExtent = buffer.lines.length * lineHeight;
+      final maxExtent = _maxExtent(terminal, lineHeight);
       const anchorRow = 3; // near the top, trimmed away quickly
 
       final anchor = TerminalScrollAnchor();
