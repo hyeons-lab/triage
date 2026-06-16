@@ -503,7 +503,12 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
 
     tracing::info!("Received adoption sync byte (0x01). Initiating Phase 3 (teardown)...");
 
-    manager.clear_all_live_sessions();
+    // Detach — do NOT kill. The successor daemon has already adopted these
+    // sessions via the transferred master fds; sending each actor a shutdown
+    // (which calls child.kill()) is what made handovers tear down every session.
+    // We process::exit(0) below, so the OS reaps our threads and fds without
+    // touching the children.
+    manager.detach_all_live_sessions();
 
     let mut out_stream = stream;
     out_stream

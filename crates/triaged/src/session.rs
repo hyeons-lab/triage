@@ -653,6 +653,78 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Converts a `Live` session whose child process has already exited into a
+    /// `Historical` session in place, so it can be restored. Nothing else moves
+    /// a dead `Live` session to `Historical` (that only happens on a daemon
+    /// restart via the manifest), so without this a session that dies while live
+    /// — notably one adopted across a handover — can never be re-spawned.
+    ///
+    /// Returns `Ok(())` when the session is left unchanged (still running, not
+    /// `Live`, or not a restorable shell) or successfully demoted; returns `Err`
+    /// only when the session is a confirmed-exited restorable `Live` whose log
+    /// could not be rebuilt, so the caller can report the real cause instead of
+    /// a misleading "already live".
+    fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
+        // Phase 1 (brief lock): grab the actor command channel + launch of a
+        // `Live` session, without doing the actor round-trip under the lock.
+        let (cmd_tx, launch) = {
+            let sessions = self.sessions()?;
+            let Some(ManagedSession::Live { actor, launch, .. }) = sessions.get(session_id) else {
+                return Ok(());
+            };
+            (actor.tx.clone(), launch.clone())
+        };
+
+        // Off-lock: only a cleanly-exited actor is a demote candidate. A snapshot
+        // *error* means the worker thread is gone, so we cannot confirm the child
+        // died — leave it rather than risk reaping a still-running child and
+        // spawning a duplicate shell.
+        if !matches!(request_snapshot(&cmd_tx), Ok(snapshot) if snapshot.exited) {
+            return Ok(());
+        }
+
+        // Only restorable shells can be re-spawned; don't reap a non-restorable
+        // session's actor and downgrade it for a restore that would bail anyway.
+        let persisted = launch.into_persisted(session_id.clone(), true);
+        if !is_restorable_shell_launch(&persisted) {
+            return Ok(());
+        }
+
+        // Off-lock: rebuild the historical view, which reads and replays the
+        // session log — too slow to do while holding the global sessions lock.
+        let historical = HistoricalSession::restore(persisted)
+            .with_context(|| format!("rebuilding exited session {session_id} for restore"))?;
+
+        // Phase 3 (brief lock): swap only if it is still a `Live` entry — a
+        // concurrent restore may already have replaced it. A confirmed-exited
+        // process cannot revive, so no second round-trip is needed here.
+        let mut sessions = self.sessions()?;
+        if !matches!(sessions.get(session_id), Some(ManagedSession::Live { .. })) {
+            return Ok(());
+        }
+        if let Some(ManagedSession::Live { actor, lease, .. }) = sessions.remove(session_id) {
+            if let Err(error) = actor.shutdown() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?error,
+                    "failed to reap exited actor while demoting to historical"
+                );
+            }
+            sessions.insert(
+                session_id.clone(),
+                ManagedSession::Historical {
+                    session: Box::new(historical),
+                    lease,
+                },
+            );
+            // Keep the on-disk manifest consistent with the in-memory swap, as
+            // every other map-mutating path does.
+            self.persist_manifest(&sessions)
+                .with_context(|| format!("persisting manifest after demoting {session_id}"))?;
+        }
+        Ok(())
+    }
+
     pub fn request_pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallengeInfo> {
         ensure!(
             client_id.as_str().len() <= MAX_PAIRING_CLIENT_ID_LENGTH,
@@ -806,27 +878,19 @@ impl SessionManager {
         Ok((state, fds))
     }
 
+    /// Detaches every live session from this daemon for a process handover:
+    /// removes them from the map and disarms their actors (no shutdown signal, no
+    /// `child.kill()`) so the shared child processes survive into the successor
+    /// daemon, which already holds their master fds. The daemon `process::exit`s
+    /// right after, so the OS reaps the detached worker threads and fds.
     #[cfg(unix)]
-    pub fn clear_all_live_sessions(&self) {
+    pub fn detach_all_live_sessions(&self) {
         if let Ok(mut sessions) = self.sessions() {
-            let keys: Vec<_> = sessions.keys().cloned().collect();
-            for id in keys {
-                if let Some(ManagedSession::Live {
-                    mut actor,
-                    lease: _,
-                    launch: _,
-                }) = sessions.remove(&id)
-                {
-                    let (tx, rx) = mpsc::channel();
-                    if let Err(err) = actor.tx.send(ActorCommand::Shutdown { response: tx }) {
-                        tracing::warn!(session_id = %id, ?err, "Failed to send shutdown command to actor");
-                    } else {
-                        let _ = rx.recv();
-                    }
-                    actor.join_threads();
+            for (_, managed) in sessions.drain() {
+                if let ManagedSession::Live { actor, .. } = managed {
+                    actor.detach();
                 }
             }
-            sessions.clear();
         }
     }
 
@@ -1204,6 +1268,13 @@ impl SessionApi for SessionManager {
 
     fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
         request.size.validate()?;
+        // A session whose child process dies while `Live` is never demoted to
+        // `Historical` on its own, so the block below would reject it as "already
+        // live" and it would stay stuck/uninputtable until a daemon restart —
+        // e.g. sessions adopted across a handover whose process later exits.
+        // Demote a dead `Live` session here so the normal restore path re-spawns
+        // it; surfaces a real error if its log can't be rebuilt.
+        self.demote_dead_live_session(&request.session_id)?;
         let (persisted, current_working_directory) = {
             let mut sessions = self.sessions()?;
             let existing = sessions
@@ -2028,6 +2099,18 @@ impl SessionActor {
         if let Some(reader) = self.reader.take() {
             join_thread_with_timeout(reader, "session actor reader");
         }
+    }
+
+    /// Disarms the actor for a process handover: drops the worker/reader join
+    /// handles WITHOUT signalling shutdown, so the worker thread keeps owning the
+    /// live PTY child until this process exits. The successor daemon already owns
+    /// the session through the transferred master fd; killing the child here (as
+    /// [`Self::shutdown`] and [`Drop`] do) is exactly what tears every session
+    /// down across a handover.
+    fn detach(mut self) {
+        self.worker = None;
+        self.reader = None;
+        // `self` drops here; the `Drop` impl is a no-op once `worker` is `None`.
     }
 }
 
@@ -3071,6 +3154,16 @@ fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<(Vec<String>, u64)>
     tx.send(ActorCommand::SummaryRows { response: resp_tx })
         .context("sending session summary-rows command")?;
     recv_actor_result(resp_rx, "reading session summary rows")
+}
+
+/// Requests a full snapshot via a cloned actor command channel. Mirrors
+/// [`request_summary_rows`]: clone `tx` under a brief lock, then call this
+/// OFF-LOCK so the actor round-trip never blocks other session operations.
+fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::Snapshot { response: resp_tx })
+        .context("sending session snapshot command")?;
+    recv_actor_result(resp_rx, "reading session snapshot")
 }
 
 fn reject_command_during_shutdown(command: ActorCommand) {
@@ -4987,6 +5080,176 @@ mod tests {
         manager
             .shutdown_session(session_id)
             .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn restore_revives_live_session_whose_process_died() {
+        // A session whose child process exits while it is still `Live` (e.g. one
+        // adopted across a handover, then exited) must remain restorable. It used
+        // to be rejected with "already live or restoring" and stay stuck.
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+
+        let client_id = ClientId::new("revive-client").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach controller");
+
+        // Tell the shell to exit, then wait for the manager to observe the death.
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                bytes: b"exit\n".to_vec(),
+            })
+            .expect("write exit input");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot dead live session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for live session to exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The session is still `Live` (dead actor) here; restore must revive it
+        // rather than bail.
+        let restored = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+            })
+            .expect("restore revives dead live session");
+        assert!(!restored.exited, "restored session should be live again");
+
+        // It accepts input again through the normal attach + write path.
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("re-attach revived session");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: input_that_prints_marker(),
+            })
+            .expect("write input to revived session");
+        wait_for_manager_marker(&manager, session_id.clone(), "actor-ready");
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown revived session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn restore_does_not_demote_a_non_restorable_dead_live_session() {
+        // A dead `Live` session that was NOT launched as a restorable shell must
+        // be left as `Live` (its actor not reaped) rather than irreversibly
+        // downgraded to `Historical` for a restore that bails anyway.
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        // `-c "exit 0"` exits immediately and is not the triage default shell
+        // wrapper, so is_restorable_shell_launch rejects it.
+        request.args = vec!["-c".to_string(), "exit 0".to_string()];
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot dead live session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for non-restorable session to exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Restore must reject it (not a restorable shell).
+        assert!(
+            manager
+                .restore_session(RestoreSessionRequest {
+                    session_id: session_id.clone(),
+                    size: SessionSize {
+                        rows: 6,
+                        cols: 40,
+                        pixel_width: 800,
+                        pixel_height: 240,
+                        dpi: 96,
+                    },
+                })
+                .is_err(),
+            "restore of a non-restorable session should fail"
+        );
+
+        // It must still be `Live`: attaching as a controller acquires the input
+        // lease (the `Historical` attach branch never grants one), proving the
+        // session was not demoted and its actor not reaped.
+        let response = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("non-restorable-client").expect("client id"),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach still-live session");
+        assert!(
+            response.lease.holder.is_some(),
+            "non-restorable dead session should remain Live with an acquirable lease"
+        );
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
