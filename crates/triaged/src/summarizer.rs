@@ -20,10 +20,20 @@ use triage_core::session::SessionId;
 const SYSTEM_PROMPT: &str = "You label terminal sessions. Reply with a terse description of what \
 the session is doing, at most 8 words, no trailing punctuation, no quotes. Output only the label.";
 
+/// Instruction for the longer-form detail summary shown in the hover popover and
+/// used as the future session-search corpus. Allows a few sentences.
+const DETAIL_SYSTEM_PROMPT: &str = "You summarize terminal sessions. In two or three short \
+sentences, describe what the session is doing: the task, any commands run, and the current state \
+(e.g. building, tests passing/failing, an error, waiting at a prompt). Be concrete and factual. \
+No markdown, no quotes, no preamble — output only the summary.";
+
 /// Hard cap on the sanitized snippet length (characters).
 const MAX_SNIPPET_CHARS: usize = 60;
 /// Hard cap on the sanitized snippet length (words).
 const MAX_SNIPPET_WORDS: usize = 8;
+
+/// Hard cap on the sanitized detail summary length (characters).
+const MAX_DETAIL_CHARS: usize = 280;
 
 /// Runtime parameters for the summarizer worker. Built from the daemon config.
 #[derive(Debug, Clone)]
@@ -32,6 +42,8 @@ pub struct SummarizerConfig {
     pub quant: String,
     pub context_size: u32,
     pub max_tokens: u32,
+    /// Token budget for the longer-form detail summary (a few sentences).
+    pub detail_max_tokens: u32,
     pub cache_dir: PathBuf,
     pub queue_depth: usize,
 }
@@ -47,6 +59,9 @@ pub struct SummarizeJob {
 pub struct SnippetResult {
     pub session_id: SessionId,
     pub text: String,
+    /// Longer-form summary for the hover popover / search. `None` when the model
+    /// produced nothing usable (keeps any prior detail rather than clearing it).
+    pub detail: Option<String>,
     pub generated_at_output_seq: u64,
 }
 
@@ -134,11 +149,28 @@ fn run_worker(
 
         for job in batch {
             match generate_one_line(engine, &config, &job.prompt_text) {
-                Ok(Some(text)) => on_result(SnippetResult {
-                    session_id: job.session_id,
-                    text,
-                    generated_at_output_seq: job.output_seq,
-                }),
+                Ok(Some(text)) => {
+                    // Second, longer-form pass for the hover popover / search.
+                    // Failures here are non-fatal: emit the one-liner with no
+                    // detail rather than dropping the result entirely.
+                    let detail = match generate_detail(engine, &config, &job.prompt_text) {
+                        Ok(detail) => detail,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                session_id = %job.session_id,
+                                "detail summary generation failed"
+                            );
+                            None
+                        }
+                    };
+                    on_result(SnippetResult {
+                        session_id: job.session_id,
+                        text,
+                        detail,
+                        generated_at_output_seq: job.output_seq,
+                    });
+                }
                 Ok(None) => {
                     tracing::debug!(
                         session_id = %job.session_id,
@@ -212,6 +244,82 @@ fn generate_one_line(
     session.generate(&opts, &mut sink)?;
 
     Ok(sanitize_one_line(&sink.text))
+}
+
+/// Runs one inference for the longer-form detail summary and returns it
+/// sanitized, or `None` if the model produced nothing usable.
+fn generate_detail(
+    engine: &cera::CeraEngine,
+    config: &SummarizerConfig,
+    prompt_text: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut session = engine.new_session(cera::SessionConfig::default());
+    let messages = [
+        ChatMessage {
+            role: "system".to_string(),
+            content: DETAIL_SYSTEM_PROMPT.to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: prompt_text.to_string(),
+        },
+    ];
+    let rendered = cera::tokenizer::apply_chat_template(engine.tokenizer(), &messages, true)?;
+    session.append_text(&rendered)?;
+
+    let mut sink = DetailSink::new(engine.tokenizer());
+    let opts = cera::GenerateOpts {
+        max_tokens: config.detail_max_tokens,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    session.generate(&opts, &mut sink)?;
+
+    Ok(sanitize_detail(&sink.text))
+}
+
+/// A [`ModalitySink`] that accumulates all decoded text (multi-line). Used for
+/// the longer detail summary, which may span a few sentences.
+struct DetailSink<'a> {
+    tokenizer: &'a BpeTokenizer,
+    text: String,
+}
+
+impl<'a> DetailSink<'a> {
+    fn new(tokenizer: &'a BpeTokenizer) -> Self {
+        Self {
+            tokenizer,
+            text: String::new(),
+        }
+    }
+}
+
+impl ModalitySink for DetailSink<'_> {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        self.text.push_str(&self.tokenizer.decode(tokens));
+    }
+
+    fn on_done(&mut self, _reason: FinishReason) {}
+}
+
+/// Normalizes the raw detail output: trims, collapses blank-line runs and
+/// internal whitespace, caps at [`MAX_DETAIL_CHARS`]. Returns `None` if empty.
+fn sanitize_detail(raw: &str) -> Option<String> {
+    // Collapse all whitespace (including newlines) to single spaces — the
+    // popover renders it as a wrapped paragraph.
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > MAX_DETAIL_CHARS {
+        let mut capped: String = trimmed.chars().take(MAX_DETAIL_CHARS).collect();
+        capped = capped.trim_end().to_string();
+        capped.push('…');
+        Some(capped)
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// A [`ModalitySink`] that accumulates decoded text up to the first newline.
@@ -323,6 +431,19 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_detail_collapses_whitespace_and_caps() {
+        assert_eq!(
+            sanitize_detail("  Running cargo test.\n\nAll 83 tests passed.  "),
+            Some("Running cargo test. All 83 tests passed.".to_string())
+        );
+        assert_eq!(sanitize_detail("   \n\n  "), None);
+        let long = "word ".repeat(100);
+        let capped = sanitize_detail(&long).expect("non-empty");
+        assert!(capped.chars().count() <= MAX_DETAIL_CHARS + 1, "{capped:?}");
+        assert!(capped.ends_with('…'), "{capped:?}");
+    }
+
+    #[test]
     fn build_prompt_drops_blank_rows_and_keeps_tail() {
         let rows = vec![
             "".to_string(),
@@ -351,6 +472,7 @@ mod tests {
             quant: "Q4_0".to_string(),
             context_size: 1024,
             max_tokens: 24,
+            detail_max_tokens: 96,
             cache_dir: crate::session::default_model_cache_dir(),
             queue_depth: 4,
         };

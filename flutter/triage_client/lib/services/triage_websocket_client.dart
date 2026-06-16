@@ -227,18 +227,23 @@ class TriageWebSocketClient {
     return sessionIds?.map((e) => e.toString()).toList() ?? [];
   }
 
-  /// Returns the current snippet for every session as `{session_id: snippet?}`.
-  /// Sessions without a generated snippet map to `null`. Used to seed the side
-  /// rail on connect; live updates arrive via `session_snippet_updated` events.
-  Future<Map<String, String?>> listSessionSnippets() async {
+  /// Returns the current snippet + detail summary for every session, keyed by
+  /// session id. Sessions without a generated snippet carry `null` fields. Used
+  /// to seed the side rail on connect; live updates arrive via
+  /// `session_snippet_updated` events.
+  Future<Map<String, ({String? snippet, String? detail})>>
+  listSessionSnippets() async {
     final response = await _send('list_session_snippets');
     final entries = response['entries'] as List<dynamic>?;
-    final result = <String, String?>{};
+    final result = <String, ({String? snippet, String? detail})>{};
     for (final entry in entries ?? const []) {
       final map = entry as Map<String, dynamic>;
       final sessionId = map['session_id'] as String?;
       if (sessionId != null) {
-        result[sessionId] = map['snippet'] as String?;
+        result[sessionId] = (
+          snippet: map['snippet'] as String?,
+          detail: map['detail'] as String?,
+        );
       }
     }
     return result;
@@ -440,6 +445,7 @@ class TriageWebSocketClient {
         'type': 'session_snippet_updated',
         'session_id': updated.sessionId,
         'snippet': updated.snippet,
+        'detail': updated.detail,
         'output_seq': updated.outputSeq,
       };
     }
@@ -519,6 +525,7 @@ class TriageWebSocketClient {
                 (entry) => {
                   'session_id': entry.sessionId,
                   'snippet': entry.snippet,
+                  'detail': entry.detail,
                 },
               )
               .toList(),
@@ -560,6 +567,8 @@ class TriageWebSocketClient {
       'raw_output_start': snap.rawOutputStart,
       // Local-LLM one-line description of the session, if generated.
       'snippet': snap.snippet,
+      // Local-LLM longer-form summary for the hover popover / search.
+      'snippet_detail': snap.snippetDetail,
     };
   }
 

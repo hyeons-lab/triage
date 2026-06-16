@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
@@ -102,6 +103,8 @@ class SessionVm {
     required this.statusColor,
     required this.icon,
     required this.rows,
+    this.repoRoot,
+    this.worktreeRoot,
     this.isRemote = false,
     this.isExited = false,
   }) : terminalController = TerminalController() {
@@ -129,11 +132,39 @@ class SessionVm {
 
   final String title;
   final String branch;
+  // Absolute git repository root and worktree root for this session, from the
+  // snapshot context. Null when the session isn't in a git repo (or old host).
+  final String? repoRoot;
+  final String? worktreeRoot;
   String status;
   Color statusColor;
   // Local-LLM one-line description of what the session is doing, shown in the
   // side rail. Null until the daemon generates one (or summarization is off).
   String? snippet;
+  // Local-LLM longer-form summary for the hover popover / future search. Null
+  // until the daemon generates one (or summarization is off).
+  String? snippetDetail;
+
+  /// Last path segment of [repoRoot], for compact display (e.g. "triage").
+  String? get repoName => _leafOf(repoRoot);
+
+  /// Last path segment of [worktreeRoot], for compact display. Null when it is
+  /// the repo root itself (not a separate worktree) so the rail can hide it.
+  String? get worktreeName {
+    final wt = worktreeRoot;
+    if (wt == null || wt.isEmpty || wt == repoRoot) return null;
+    return _leafOf(wt);
+  }
+
+  static String? _leafOf(String? path) {
+    if (path == null || path.isEmpty) return null;
+    final trimmed = path.endsWith('/')
+        ? path.substring(0, path.length - 1)
+        : path;
+    final slash = trimmed.lastIndexOf('/');
+    final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
+    return leaf.isEmpty ? null : leaf;
+  }
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
   // real rendering goes through [store]/[terminal] from raw bytes.
@@ -282,6 +313,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
+  // Per-device side-rail order (remote session ids), loaded once at startup and
+  // read synchronously when sessions load so the load path never awaits prefs.
+  List<String> _savedSessionOrder = const [];
   int _createdSessionCount = 0;
   late NewSessionShell _newSessionShell;
 
@@ -335,6 +369,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Restore the per-device side-rail order in the background; it's read
+    // synchronously from the cache when sessions load.
+    unawaited(_restoreSessionOrder());
     _lastWatchdogTick = DateTime.now();
     _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
       final now = DateTime.now();
@@ -918,7 +955,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected) return;
 
     try {
-      final sessionIds = await _client.listSessions();
+      final rawSessionIds = await _client.listSessions();
+      // Apply the per-device saved order (cached at startup) before building
+      // rows so selection, history-on-load, and rendering all flow from the
+      // displayed order. Read synchronously — never await prefs on this path.
+      final sessionIds = _applySavedOrder(rawSessionIds, _savedSessionOrder);
+      if (_disposed) return;
       final List<String> failedSessionIds = [];
       final targetSelectedIndex = _selectedIndex >= sessionIds.length
           ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
@@ -1035,8 +1077,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       setState(() {
         for (final session in _sessions) {
           final sid = session.remoteSessionId;
-          if (sid != null && snippets.containsKey(sid)) {
-            session.snippet = snippets[sid];
+          final entry = sid == null ? null : snippets[sid];
+          if (entry != null) {
+            session.snippet = entry.snippet;
+            session.snippetDetail = entry.detail;
           }
         }
       });
@@ -1133,6 +1177,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       final contextObj = snapshot?['context'] as Map<String, dynamic>?;
       final branch = contextObj?['branch']?.toString() ?? 'main';
+      final repoRoot = contextObj?['repository_root']?.toString();
+      final worktreeRoot = contextObj?['worktree_root']?.toString();
 
       final plainRows = _plainRowsFromSnapshot(snapshot);
       final exited = snapshot?['exited'] as bool? ?? false;
@@ -1141,6 +1187,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final session = SessionVm(
         title: 'triage / $sid',
         branch: branch,
+        repoRoot: repoRoot,
+        worktreeRoot: worktreeRoot,
         status: exited ? 'exited' : 'attached',
         statusColor: exited ? const Color(0xff7f8b8d) : const Color(0xff7fd1c7),
         icon: Icons.terminal,
@@ -1153,6 +1201,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Snapshot carries the current snippet for the attached session (the list
       // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
+      session.snippetDetail = snapshot?['snippet_detail'] as String?;
       // Replay the raw output-history tail through the single write path. Live
       // chunks already covered by this snapshot are dropped by output_seq.
       session.applyHistory(
@@ -1277,9 +1326,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null) return;
       final snippet = message['snippet'] as String?;
+      final detail = message['detail'] as String?;
       final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
       if (index == -1) return;
-      void apply() => _sessions[index].snippet = snippet;
+      void apply() {
+        _sessions[index].snippet = snippet;
+        // A regeneration always reports the current detail; null means the
+        // detail pass produced nothing this round, so clear the stale one.
+        _sessions[index].snippetDetail = detail;
+      }
+
       if (mounted) {
         setState(apply);
       } else {
@@ -1509,6 +1565,75 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  // Client-local, per-device side-rail ordering. Persisted as an ordered list of
+  // remote session ids; not shared with the TUI or other clients.
+  static const String _sessionOrderKey = 'session_order_v1';
+
+  /// Reorders the side rail in response to a drag, keeping the current
+  /// selection pointed at the same session, and persists the new order.
+  void _reorderSessions(int oldIndex, int newIndex) {
+    if (oldIndex < 0 || oldIndex >= _sessions.length) return;
+    setState(() {
+      // ReorderableListView reports newIndex in the pre-removal coordinate space.
+      if (newIndex > oldIndex) newIndex -= 1;
+      final selected = (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
+          ? _sessions[_selectedIndex]
+          : null;
+      final moved = _sessions.removeAt(oldIndex);
+      _sessions.insert(newIndex.clamp(0, _sessions.length), moved);
+      if (selected != null) {
+        final reselected = _sessions.indexOf(selected);
+        if (reselected != -1) _selectedIndex = reselected;
+      }
+    });
+    unawaited(_persistSessionOrder());
+  }
+
+  Future<void> _restoreSessionOrder() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _savedSessionOrder = prefs.getStringList(_sessionOrderKey) ?? const [];
+    } catch (_) {
+      // Ordering is a best-effort convenience; ignore load failures.
+    }
+  }
+
+  Future<void> _persistSessionOrder() async {
+    final ids = _sessions
+        .map((s) => s.remoteSessionId)
+        .whereType<String>()
+        .toList();
+    _savedSessionOrder = ids;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_sessionOrderKey, ids);
+    } catch (_) {
+      // Ordering is a best-effort convenience; ignore persistence failures.
+    }
+  }
+
+  /// Stable-sorts daemon session ids by the saved per-device order: known ids
+  /// first in saved order, then any new ids in the daemon's original order.
+  List<String> _applySavedOrder(List<String> ids, List<String> savedOrder) {
+    if (savedOrder.isEmpty) return ids;
+    final rank = <String, int>{
+      for (var i = 0; i < savedOrder.length; i++) savedOrder[i]: i,
+    };
+    final daemonRank = <String, int>{
+      for (var i = 0; i < ids.length; i++) ids[i]: i,
+    };
+    final ordered = [...ids];
+    ordered.sort((a, b) {
+      final ra = rank[a];
+      final rb = rank[b];
+      if (ra != null && rb != null) return ra.compareTo(rb);
+      if (ra != null) return -1; // known (saved) ids sort before new ones
+      if (rb != null) return 1;
+      return (daemonRank[a] ?? 0).compareTo(daemonRank[b] ?? 0);
+    });
+    return ordered;
+  }
+
   void _selectSession(int index) {
     if (index < 0 || index >= _sessions.length) return;
     final session = _sessions[index];
@@ -1699,6 +1824,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
           final branch = contextObj?['branch']?.toString() ?? 'main';
+          final repoRoot = contextObj?['repository_root']?.toString();
+          final worktreeRoot = contextObj?['worktree_root']?.toString();
 
           final plainRows = _plainRowsFromSnapshot(snapshot);
           final exited = snapshot?['exited'] as bool? ?? false;
@@ -1707,6 +1834,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           final session = SessionVm(
             title: 'triage / $sessionId',
             branch: branch,
+            repoRoot: repoRoot,
+            worktreeRoot: worktreeRoot,
             status: exited ? 'exited' : 'attached',
             statusColor: exited
                 ? const Color(0xff7f8b8d)
@@ -1718,6 +1847,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             isRemote: true,
             isExited: exited,
           );
+          session.snippet = snapshot?['snippet'] as String?;
+          session.snippetDetail = snapshot?['snippet_detail'] as String?;
           _setupSessionInputListener(session);
           session.applyHistory(
             _rawOutputFromSnapshot(snapshot ?? const {}),
@@ -1863,6 +1994,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               sessions: _sessions,
               selectedIndex: _selectedIndex,
               onSelectSession: _selectSession,
+              onReorderSession: _reorderSessions,
               onCreateSession: _createSession,
               selectedShell: _newSessionShell,
               shellOptions: newSessionShellMenuOrderForPlatform(
@@ -1936,6 +2068,7 @@ class SessionRail extends StatelessWidget {
     required this.sessions,
     required this.selectedIndex,
     required this.onSelectSession,
+    required this.onReorderSession,
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
@@ -1949,6 +2082,7 @@ class SessionRail extends StatelessWidget {
   final List<SessionVm> sessions;
   final int selectedIndex;
   final ValueChanged<int> onSelectSession;
+  final void Function(int oldIndex, int newIndex) onReorderSession;
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
@@ -2140,22 +2274,35 @@ class SessionRail extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         Expanded(
-          child: SingleChildScrollView(
+          child: ReorderableListView.builder(
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-            child: Column(
-              children: [
-                for (final indexed in sessions.indexed)
-                  SessionListTile(
-                    selected: indexed.$1 == selectedIndex,
-                    title: indexed.$2.title,
-                    subtitle: indexed.$2.status,
-                    statusColor: indexed.$2.statusColor,
-                    icon: indexed.$2.icon,
-                    snippet: indexed.$2.snippet,
-                    onTap: () => onSelectSession(indexed.$1),
-                  ),
-              ],
-            ),
+            buildDefaultDragHandles: false,
+            onReorder: onReorderSession,
+            itemCount: sessions.length,
+            itemBuilder: (context, index) {
+              final session = sessions[index];
+              // The whole row is the drag handle (immediate drag on mouse move);
+              // a click still selects since a tap registers no movement.
+              return ReorderableDragStartListener(
+                key: ValueKey<String>(
+                  session.remoteSessionId ?? 'local:${session.title}',
+                ),
+                index: index,
+                child: SessionListTile(
+                  selected: index == selectedIndex,
+                  title: session.title,
+                  subtitle: session.status,
+                  statusColor: session.statusColor,
+                  icon: session.icon,
+                  branch: session.branch,
+                  repoName: session.repoName,
+                  worktreeName: session.worktreeName,
+                  snippet: session.snippet,
+                  snippetDetail: session.snippetDetail,
+                  onTap: () => onSelectSession(index),
+                ),
+              );
+            },
           ),
         ),
       ],
@@ -2235,7 +2382,7 @@ class _NewSessionMenu extends StatelessWidget {
   }
 }
 
-class SessionListTile extends StatelessWidget {
+class SessionListTile extends StatefulWidget {
   const SessionListTile({
     super.key,
     required this.title,
@@ -2243,7 +2390,11 @@ class SessionListTile extends StatelessWidget {
     required this.statusColor,
     required this.icon,
     required this.onTap,
+    this.branch,
+    this.repoName,
+    this.worktreeName,
     this.snippet,
+    this.snippetDetail,
     this.selected = false,
   });
 
@@ -2252,84 +2403,329 @@ class SessionListTile extends StatelessWidget {
   final Color statusColor;
   final IconData icon;
   final VoidCallback onTap;
+  // Git context for the glance row + hover popover; hidden when null.
+  final String? branch;
+  final String? repoName;
+  final String? worktreeName;
   // Local-LLM one-line description of the session; hidden when null/empty.
   final String? snippet;
+  // Local-LLM longer-form summary, shown in the hover popover.
+  final String? snippetDetail;
   final bool selected;
 
   @override
+  State<SessionListTile> createState() => _SessionListTileState();
+}
+
+class _SessionListTileState extends State<SessionListTile> {
+  final OverlayPortalController _popover = OverlayPortalController();
+  final LayerLink _link = LayerLink();
+
+  /// One-line "repo · branch · worktree" summary, omitting absent parts.
+  String? get _metaLine {
+    final parts = <String>[
+      if (widget.repoName != null) widget.repoName!,
+      if (widget.branch != null && widget.branch!.isNotEmpty) widget.branch!,
+      if (widget.worktreeName != null && widget.worktreeName != widget.branch)
+        widget.worktreeName!,
+    ];
+    return parts.isEmpty ? null : parts.join('  ·  ');
+  }
+
+  void _showPopover() {
+    if (!_popover.isShowing) _popover.show();
+  }
+
+  void _hidePopover() {
+    if (_popover.isShowing) _popover.hide();
+  }
+
+  @override
+  void dispose() {
+    _hidePopover();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Semantics(
-      button: true,
-      selected: selected,
-      label: title,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(8),
-        child: Container(
-          margin: const EdgeInsets.only(bottom: 8),
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: selected ? const Color(0xff233033) : Colors.transparent,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(
-              color: selected ? const Color(0xff3b5356) : Colors.transparent,
+    final meta = _metaLine;
+    return CompositedTransformTarget(
+      link: _link,
+      child: MouseRegion(
+        onEnter: (_) => _showPopover(),
+        onExit: (_) => _hidePopover(),
+        child: OverlayPortal(
+          controller: _popover,
+          overlayChildBuilder: (context) => Positioned(
+            width: 320,
+            child: CompositedTransformFollower(
+              link: _link,
+              showWhenUnlinked: false,
+              targetAnchor: Alignment.topRight,
+              followerAnchor: Alignment.topLeft,
+              offset: const Offset(10, 0),
+              child: IgnorePointer(
+                child: _SessionGlanceCard(
+                  title: widget.title,
+                  status: widget.subtitle,
+                  statusColor: widget.statusColor,
+                  repoName: widget.repoName,
+                  branch: widget.branch,
+                  worktreeName: widget.worktreeName,
+                  snippet: widget.snippet,
+                  detail: widget.snippetDetail,
+                ),
+              ),
             ),
           ),
-          child: Row(
-            children: [
-              Icon(icon, size: 20, color: const Color(0xffcdd7d6)),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+          child: Semantics(
+            button: true,
+            selected: widget.selected,
+            label: widget.title,
+            child: InkWell(
+              onTap: widget.onTap,
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: widget.selected
+                      ? const Color(0xff233033)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: widget.selected
+                        ? const Color(0xff3b5356)
+                        : Colors.transparent,
+                  ),
+                ),
+                child: Row(
                   children: [
-                    Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    Icon(
+                      widget.icon,
+                      size: 20,
+                      color: const Color(0xffcdd7d6),
                     ),
-                    const SizedBox(height: 3),
-                    Row(
-                      children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: statusColor,
-                            shape: BoxShape.circle,
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            subtitle,
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.title,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(color: Color(0xff9aa6a8)),
+                            style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
-                        ),
-                      ],
-                    ),
-                    if (snippet != null && snippet!.isNotEmpty) ...[
-                      const SizedBox(height: 3),
-                      Text(
-                        snippet!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xff6f7b7d),
-                          fontSize: 12,
-                          fontStyle: FontStyle.italic,
-                        ),
+                          if (meta != null) ...[
+                            const SizedBox(height: 3),
+                            Row(
+                              children: [
+                                const Icon(
+                                  Icons.account_tree_outlined,
+                                  size: 12,
+                                  color: Color(0xff7f8b8d),
+                                ),
+                                const SizedBox(width: 5),
+                                Expanded(
+                                  child: Text(
+                                    meta,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Color(0xff8b9799),
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                          const SizedBox(height: 3),
+                          Row(
+                            children: [
+                              Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                  color: widget.statusColor,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  widget.subtitle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xff9aa6a8),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (widget.snippet != null &&
+                              widget.snippet!.isNotEmpty) ...[
+                            const SizedBox(height: 3),
+                            Text(
+                              widget.snippet!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Color(0xff6f7b7d),
+                                fontSize: 12,
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
-                    ],
+                    ),
                   ],
                 ),
               ),
-            ],
+            ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Rich hover popover for a session row: full git context + the longer-form
+/// LLM detail summary (falls back to the one-liner, then a placeholder).
+class _SessionGlanceCard extends StatelessWidget {
+  const _SessionGlanceCard({
+    required this.title,
+    required this.status,
+    required this.statusColor,
+    required this.repoName,
+    required this.branch,
+    required this.worktreeName,
+    required this.snippet,
+    required this.detail,
+  });
+
+  final String title;
+  final String status;
+  final Color statusColor;
+  final String? repoName;
+  final String? branch;
+  final String? worktreeName;
+  final String? snippet;
+  final String? detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final summary = (detail != null && detail!.isNotEmpty)
+        ? detail!
+        : (snippet != null && snippet!.isNotEmpty
+              ? snippet!
+              : 'No summary yet.');
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: const Color(0xff1b2327),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xff334044)),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x66000000),
+              blurRadius: 16,
+              offset: Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+                Text(
+                  status,
+                  style: const TextStyle(
+                    color: Color(0xff9aa6a8),
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (repoName != null)
+              _GlanceRow(icon: Icons.folder_outlined, label: repoName!),
+            if (branch != null && branch!.isNotEmpty)
+              _GlanceRow(icon: Icons.account_tree_outlined, label: branch!),
+            if (worktreeName != null && worktreeName != branch)
+              _GlanceRow(icon: Icons.alt_route, label: worktreeName!),
+            if (repoName != null ||
+                (branch != null && branch!.isNotEmpty) ||
+                worktreeName != null)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Divider(height: 1, color: Color(0xff2b363a)),
+              ),
+            Text(
+              summary,
+              style: const TextStyle(
+                color: Color(0xffc4cecd),
+                fontSize: 12,
+                height: 1.35,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GlanceRow extends StatelessWidget {
+  const _GlanceRow({required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          Icon(icon, size: 13, color: const Color(0xff7f8b8d)),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Color(0xffb4bfc0), fontSize: 12),
+            ),
+          ),
+        ],
       ),
     );
   }

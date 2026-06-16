@@ -944,10 +944,11 @@ class SessionSnapshot {
   List<int>? get rawOutput => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 26);
   int get rawOutputStart => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 28, 0);
   String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 30);
+  String? get snippetDetail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 32);
 
   @override
   String toString() {
-    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}}';
+    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}, snippetDetail: ${snippetDetail}}';
   }
 }
 
@@ -965,7 +966,7 @@ class SessionSnapshotBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(14);
+    fbBuilder.startTable(15);
   }
 
   int addOutputSeq(int? outputSeq) {
@@ -1024,6 +1025,10 @@ class SessionSnapshotBuilder {
     fbBuilder.addOffset(13, offset);
     return fbBuilder.offset;
   }
+  int addSnippetDetailOffset(int? offset) {
+    fbBuilder.addOffset(14, offset);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -1045,6 +1050,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
   final List<int>? _rawOutput;
   final int? _rawOutputStart;
   final String? _snippet;
+  final String? _snippetDetail;
 
   SessionSnapshotObjectBuilder({
     int? outputSeq,
@@ -1061,6 +1067,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     List<int>? rawOutput,
     int? rawOutputStart,
     String? snippet,
+    String? snippetDetail,
   })
       : _outputSeq = outputSeq,
         _bytesLogged = bytesLogged,
@@ -1075,7 +1082,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
         _exited = exited,
         _rawOutput = rawOutput,
         _rawOutputStart = rawOutputStart,
-        _snippet = snippet;
+        _snippet = snippet,
+        _snippetDetail = snippetDetail;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -1091,7 +1099,9 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeListUint8(_rawOutput!);
     final int? snippetOffset = _snippet == null ? null
         : fbBuilder.writeString(_snippet!);
-    fbBuilder.startTable(14);
+    final int? snippetDetailOffset = _snippetDetail == null ? null
+        : fbBuilder.writeString(_snippetDetail!);
+    fbBuilder.startTable(15);
     fbBuilder.addUint64(0, _outputSeq);
     fbBuilder.addUint64(1, _bytesLogged);
     if (_size != null) {
@@ -1110,6 +1120,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.addOffset(11, rawOutputOffset);
     fbBuilder.addUint64(12, _rawOutputStart);
     fbBuilder.addOffset(13, snippetOffset);
+    fbBuilder.addOffset(14, snippetDetailOffset);
     return fbBuilder.endTable();
   }
 
@@ -3927,10 +3938,11 @@ class SessionSnippetEntry {
 
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get detail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
   String toString() {
-    return 'SessionSnippetEntry{sessionId: ${sessionId}, snippet: ${snippet}}';
+    return 'SessionSnippetEntry{sessionId: ${sessionId}, snippet: ${snippet}, detail: ${detail}}';
   }
 }
 
@@ -3948,7 +3960,7 @@ class SessionSnippetEntryBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(2);
+    fbBuilder.startTable(3);
   }
 
   int addSessionIdOffset(int? offset) {
@@ -3957,6 +3969,10 @@ class SessionSnippetEntryBuilder {
   }
   int addSnippetOffset(int? offset) {
     fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addDetailOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
     return fbBuilder.offset;
   }
 
@@ -3968,13 +3984,16 @@ class SessionSnippetEntryBuilder {
 class SessionSnippetEntryObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
   final String? _snippet;
+  final String? _detail;
 
   SessionSnippetEntryObjectBuilder({
     String? sessionId,
     String? snippet,
+    String? detail,
   })
       : _sessionId = sessionId,
-        _snippet = snippet;
+        _snippet = snippet,
+        _detail = detail;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -3983,9 +4002,12 @@ class SessionSnippetEntryObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_sessionId!);
     final int? snippetOffset = _snippet == null ? null
         : fbBuilder.writeString(_snippet!);
-    fbBuilder.startTable(2);
+    final int? detailOffset = _detail == null ? null
+        : fbBuilder.writeString(_detail!);
+    fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, snippetOffset);
+    fbBuilder.addOffset(2, detailOffset);
     return fbBuilder.endTable();
   }
 
@@ -4906,10 +4928,11 @@ class SessionSnippetUpdatedPayload {
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
   int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 8, 0);
+  String? get detail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
 
   @override
   String toString() {
-    return 'SessionSnippetUpdatedPayload{sessionId: ${sessionId}, snippet: ${snippet}, outputSeq: ${outputSeq}}';
+    return 'SessionSnippetUpdatedPayload{sessionId: ${sessionId}, snippet: ${snippet}, outputSeq: ${outputSeq}, detail: ${detail}}';
   }
 }
 
@@ -4927,7 +4950,7 @@ class SessionSnippetUpdatedPayloadBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(3);
+    fbBuilder.startTable(4);
   }
 
   int addSessionIdOffset(int? offset) {
@@ -4942,6 +4965,10 @@ class SessionSnippetUpdatedPayloadBuilder {
     fbBuilder.addUint64(2, outputSeq);
     return fbBuilder.offset;
   }
+  int addDetailOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -4952,15 +4979,18 @@ class SessionSnippetUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
   final String? _snippet;
   final int? _outputSeq;
+  final String? _detail;
 
   SessionSnippetUpdatedPayloadObjectBuilder({
     String? sessionId,
     String? snippet,
     int? outputSeq,
+    String? detail,
   })
       : _sessionId = sessionId,
         _snippet = snippet,
-        _outputSeq = outputSeq;
+        _outputSeq = outputSeq,
+        _detail = detail;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -4969,10 +4999,13 @@ class SessionSnippetUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_sessionId!);
     final int? snippetOffset = _snippet == null ? null
         : fbBuilder.writeString(_snippet!);
-    fbBuilder.startTable(3);
+    final int? detailOffset = _detail == null ? null
+        : fbBuilder.writeString(_detail!);
+    fbBuilder.startTable(4);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, snippetOffset);
     fbBuilder.addUint64(2, _outputSeq);
+    fbBuilder.addOffset(3, detailOffset);
     return fbBuilder.endTable();
   }
 

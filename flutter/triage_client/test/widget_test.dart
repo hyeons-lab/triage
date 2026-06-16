@@ -2,9 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, debugDefaultTargetPlatformOverride;
-import 'package:flutter/material.dart' show CheckedPopupMenuItem, TextField;
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
+import 'package:flutter/material.dart'
+    show CheckedPopupMenuItem, Icons, MaterialApp, Scaffold, TextField;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:triage_client/main.dart';
 import 'package:triage_client/services/storage.dart';
@@ -675,7 +678,9 @@ void main() {
 
     await tester.tap(find.text('triage / main'));
     await tester.pumpAndSettle();
-    expect(find.text('main'), findsOneWidget);
+    // The branch 'main' now renders both in the side-rail tile's git-context
+    // row and in the workspace header, so expect at least one match.
+    expect(find.text('main'), findsAtLeastNWidgets(1));
 
     final terminalPane = tester.widget<TerminalPane>(find.byType(TerminalPane));
     terminalPane.controller.sendInput('pwd');
@@ -1239,4 +1244,93 @@ void main() {
     expect(client.helloClientIds.length, 1);
     expect(find.text('Connected to Daemon'), findsOneWidget);
   });
+
+  testWidgets('drag-reordering the rail persists a per-device session order', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Drag the last session ('triage / main') up to the top of the rail.
+    final main = find.text('triage / main');
+    expect(main, findsOneWidget);
+    final gesture = await tester.startGesture(tester.getCenter(main));
+    await tester.pump(const Duration(milliseconds: 200));
+    await gesture.moveBy(const Offset(0, -260));
+    await tester.pump(const Duration(milliseconds: 200));
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    // The new order is persisted, with 'main' no longer last.
+    final prefs = await SharedPreferences.getInstance();
+    final order = prefs.getStringList('session_order_v1');
+    expect(order, isNotNull);
+    expect(order, contains('main'));
+    expect(order!.last, isNot('main'));
+  });
+
+  testWidgets(
+    'session tile shows git context row and reveals detail popover on hover',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.topLeft,
+              child: SizedBox(
+                width: 320,
+                child: SessionListTile(
+                  title: 'triage / abc',
+                  subtitle: 'attached',
+                  statusColor: const Color(0xff7fd1c7),
+                  icon: Icons.terminal,
+                  repoName: 'triage',
+                  branch: 'feat/side-rail-glance',
+                  worktreeName: 'side-rail-glance',
+                  snippet: 'running cargo test',
+                  snippetDetail: 'Running the daemon test suite; all green.',
+                  onTap: () {},
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Glance row combines repo, branch and worktree on one line.
+      expect(
+        find.text('triage  ·  feat/side-rail-glance  ·  side-rail-glance'),
+        findsOneWidget,
+      );
+      // The detail summary is not shown until hover.
+      expect(
+        find.text('Running the daemon test suite; all green.'),
+        findsNothing,
+      );
+
+      final gesture = await tester.createGesture(
+        kind: PointerDeviceKind.mouse,
+      );
+      await gesture.addPointer(location: Offset.zero);
+      addTearDown(gesture.removePointer);
+      await gesture.moveTo(tester.getCenter(find.byType(SessionListTile)));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Running the daemon test suite; all green.'),
+        findsOneWidget,
+      );
+
+      // Moving away dismisses the popover.
+      await gesture.moveTo(const Offset(1000, 1000));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Running the daemon test suite; all green.'),
+        findsNothing,
+      );
+    },
+  );
 }

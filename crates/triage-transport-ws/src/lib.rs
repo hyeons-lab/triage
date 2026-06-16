@@ -370,9 +370,10 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     .api
                     .list_session_snippets()?
                     .into_iter()
-                    .map(|(session_id, snippet)| SessionSnippetEntry {
+                    .map(|(session_id, snippet, detail)| SessionSnippetEntry {
                         session_id,
                         snippet,
+                        detail,
                     })
                     .collect();
                 Ok(ServerResult::SessionSnippets { entries })
@@ -470,6 +471,9 @@ pub struct SessionSnippetEntry {
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// Longer-form summary for the hover popover / search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -498,6 +502,8 @@ pub enum ServerMessage {
     SessionSnippetUpdated {
         session_id: SessionId,
         snippet: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         output_seq: u64,
     },
 }
@@ -922,6 +928,7 @@ mod tests {
             raw_output: Vec::new(),
             raw_output_start: 0,
             snippet: None,
+            snippet_detail: None,
         }
     }
 
@@ -1035,6 +1042,7 @@ mod tests {
         let push = ServerMessage::SessionSnippetUpdated {
             session_id: SessionId::new("session-1").unwrap(),
             snippet: "ran the tests".to_string(),
+            detail: Some("Ran the test suite; all tests passed.".to_string()),
             output_seq: 7,
         };
         tx.send(push.clone()).unwrap();

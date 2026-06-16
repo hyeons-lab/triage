@@ -139,6 +139,10 @@ pub fn build_session_snapshot<'a>(
         .map(|c| build_session_context(builder, c));
     let raw_output = (!snap.raw_output.is_empty()).then(|| builder.create_vector(&snap.raw_output));
     let snippet = snap.snippet.as_ref().map(|s| builder.create_string(s));
+    let snippet_detail = snap
+        .snippet_detail
+        .as_ref()
+        .map(|s| builder.create_string(s));
 
     fb::SessionSnapshot::create(
         builder,
@@ -157,6 +161,7 @@ pub fn build_session_snapshot<'a>(
             raw_output,
             raw_output_start: snap.raw_output_start,
             snippet,
+            snippet_detail,
         },
     )
 }
@@ -302,6 +307,7 @@ mod tests {
             raw_output,
             raw_output_start,
             snippet: None,
+            snippet_detail: None,
         }
     }
 

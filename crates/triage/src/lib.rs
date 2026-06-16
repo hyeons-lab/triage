@@ -847,6 +847,7 @@ mod tests {
             raw_output: Vec::new(),
             raw_output_start: 0,
             snippet: None,
+            snippet_detail: None,
         };
 
         let mut app = LocalSessionApp::start_with_manager(
@@ -1492,6 +1493,7 @@ mod tests {
                 raw_output: Vec::new(),
                 raw_output_start: 0,
                 snippet: None,
+                snippet_detail: None,
             },
             lease: InputLeaseState::default(),
             last_completed: None,
@@ -1583,6 +1585,7 @@ mod tests {
                     raw_output: Vec::new(),
                     raw_output_start: 0,
                     snippet: None,
+                    snippet_detail: None,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
@@ -1763,6 +1766,7 @@ mod tests {
                     raw_output: Vec::new(),
                     raw_output_start: 0,
                     snippet: None,
+                    snippet_detail: None,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
