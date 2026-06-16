@@ -248,7 +248,10 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
 
         // Connection-wide pushes (snippet updates, etc.). A disconnected sender
         // just means the daemon dropped this connection's slot; drop the channel.
-        if let Some(rx) = &self.global_rx {
+        // Snippets derive from session output, so an unauthenticated client must
+        // not receive them when pairing is required — gate draining behind auth.
+        let may_receive_global = !self.authenticator.require_pairing() || self.authenticated;
+        if let (true, Some(rx)) = (may_receive_global, &self.global_rx) {
             let mut disconnected = false;
             for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
                 match rx.try_recv() {
@@ -490,7 +493,8 @@ pub enum ServerMessage {
         subscription_id: SubscriptionId,
     },
     /// Connection-wide push: a session's snippet was (re)generated. Delivered to
-    /// every connected client regardless of subscriptions (see `drain_global`).
+    /// every authenticated client regardless of subscriptions, drained from
+    /// `global_rx` in `drain_events`.
     SessionSnippetUpdated {
         session_id: SessionId,
         snippet: String,
@@ -1013,6 +1017,43 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn unauthenticated_connection_does_not_drain_global_pushes() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut connection =
+            WebSocketSessionConnection::with_authenticator(FakeSessionApi::default(), auth)
+                .with_global_receiver(rx);
+
+        let push = ServerMessage::SessionSnippetUpdated {
+            session_id: SessionId::new("session-1").unwrap(),
+            snippet: "ran the tests".to_string(),
+            output_seq: 7,
+        };
+        tx.send(push.clone()).unwrap();
+
+        // Pairing is required and the connection hasn't authenticated, so the
+        // snippet (derived from session output) must not be delivered.
+        assert!(connection.drain_events().is_empty());
+
+        // Once paired, the buffered push is delivered.
+        let paired = connection.handle_message(ClientMessage {
+            id: Some(json!("pair-req")),
+            request: ClientRequest::Pair {
+                code: "123456".to_string(),
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        });
+        assert!(matches!(paired, ServerMessage::Response { .. }));
+
+        assert_eq!(connection.drain_events(), vec![push]);
     }
 
     #[test]

@@ -202,6 +202,21 @@ Fix (daemon):
 
 Daemon: 85 tests pass, clippy clean. DEPLOYMENT CAVEAT: the currently-running daemon still has the OLD (killing) teardown, so the ONE handover that deploys this fix will still tear down current sessions a final time; every handover AFTER that is seamless. Minor residual: a sub-ms reader race during the handover window (both daemons briefly read the master) — negligible for an idle session, not addressed.
 
+### Copilot review feedback (PR #74) — 2026-06-15T21:36-07:00
+
+- `triage-transport-ws/src/lib.rs` `drain_events` — **security:** connection-wide
+  global pushes were drained even before authentication. When pairing is required,
+  an unauthenticated WS client could passively receive `SessionSnippetUpdated`
+  (derived from session output), leaking metadata without pairing. Gated draining
+  behind `!require_pairing() || authenticated`. The global channel is a bounded
+  (256) `sync_channel` with non-blocking `try_send` that drops on full, so skipping
+  drain pre-auth can't grow unbounded; buffered snippets flush once paired (the
+  now-authenticated client is entitled to them). Added regression test
+  `unauthenticated_connection_does_not_drain_global_pushes`.
+- `ServerMessage::SessionSnippetUpdated` doc comment referenced a nonexistent
+  `drain_global`; corrected to point at `global_rx` draining in `drain_events` and
+  noted delivery is to *authenticated* clients.
+
 ## Commits
 
 - b0662c5 — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
@@ -210,4 +225,6 @@ Daemon: 85 tests pass, clippy clean. DEPLOYMENT CAVEAT: the currently-running da
 - 4b96d10 — fix(client): forward session_snippet_updated push to the rail
 - ff5573d — fix(client): stop blank terminals and first-load refresh races
 - f05f8c6 — fix(triaged): keep sessions alive on restore and across handover
-- HEAD — docs(devlog): record restore-revive, handover-detach, and client render fixes
+- 3990efa — docs(devlog): record restore-revive, handover-detach, and client render fixes
+- 9971a8b — style(triaged): format seed_initial_summaries debug log
+- HEAD — fix(transport): gate global snippet pushes behind auth (PR #74 review)
