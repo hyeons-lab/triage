@@ -1,3 +1,7 @@
+// Hand-rolled CLI arg loop uses explicit if/else over match guards for clarity;
+// the newer (nightly) clippy flags these as collapsible. Stress-test bin only.
+#![allow(clippy::collapsible_match)]
+
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;

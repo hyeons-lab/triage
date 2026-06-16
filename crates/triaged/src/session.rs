@@ -33,7 +33,10 @@ use triage_core::session::{
     StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
     TerminalStyle, WriteInputRequest,
 };
+use triage_transport_ws::ServerMessage;
 use unicode_width::UnicodeWidthStr;
+
+use crate::summarizer::{SnippetResult, SummarizeJob, Summarizer, build_prompt_text};
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const EVENT_REPLAY_BUFFER: usize = 1024;
@@ -213,7 +216,29 @@ pub struct SessionManager {
     pairing_challenges: Mutex<HashMap<String, PendingPairingChallenge>>,
     paired_devices: Mutex<HashMap<ClientId, String>>,
     require_pairing: bool,
+    /// Latest generated snippet per session (in-memory only; not persisted).
+    snippets: Mutex<HashMap<SessionId, SessionSnippet>>,
+    /// The local-LLM summarizer worker. Disabled until `start_summarizer` runs.
+    summarizer: Mutex<crate::summarizer::Summarizer>,
+    /// Sender handed to session actors so they report output activity to the
+    /// debounce loop. `None` until `start_summarizer` runs.
+    dirty_tx: Mutex<Option<DirtySender>>,
+    /// Per-connection push channels for connection-wide broadcasts (snippet
+    /// updates). Senders are pruned when their client disconnects.
+    global_senders: Mutex<Vec<SyncSender<ServerMessage>>>,
 }
+
+/// A session's most recent snippet plus the output sequence it was generated at,
+/// used to drop out-of-order worker results.
+#[derive(Debug, Clone)]
+struct SessionSnippet {
+    text: String,
+    generated_at_output_seq: u64,
+}
+
+/// Bounded capacity for each connection's global-push channel. If a client
+/// can't keep up, snippet updates are dropped (the next regeneration resends).
+const GLOBAL_PUSH_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PairingChallengeInfo {
@@ -344,12 +369,224 @@ impl SessionManager {
             pairing_challenges: Mutex::new(HashMap::new()),
             paired_devices: Mutex::new(paired_devices),
             require_pairing,
+            snippets: Mutex::new(HashMap::new()),
+            summarizer: Mutex::new(Summarizer::disabled()),
+            dirty_tx: Mutex::new(None),
+            global_senders: Mutex::new(Vec::new()),
         }
     }
 
     fn allocate_session_id(&self) -> Result<SessionId> {
         let sequence = self.next_session.fetch_add(1, Ordering::Relaxed);
         SessionId::new(format!("session-{sequence}"))
+    }
+
+    /// Clones the dirty-activity sender handed to new session actors. `None`
+    /// until the summarizer is started (or if it is disabled).
+    fn dirty_tx(&self) -> Option<DirtySender> {
+        self.dirty_tx.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Cheap visible-rows snapshot for the summarizer. Clones the live actor's
+    /// command channel under a brief lock, then does the round-trip OFF-LOCK so
+    /// it never holds the global `sessions` mutex during actor I/O (which would
+    /// starve interactive session operations). Returns `None` for
+    /// non-live/missing sessions.
+    fn summary_rows(&self, session_id: &SessionId) -> Option<(Vec<String>, u64)> {
+        let cmd_tx = {
+            let sessions = self.sessions().ok()?;
+            match sessions.get(session_id) {
+                Some(ManagedSession::Live { actor, .. }) => actor.tx.clone(),
+                _ => return None,
+            }
+        };
+        request_summary_rows(&cmd_tx).ok()
+    }
+
+    /// Current snippet text for a session, if one has been generated.
+    fn snippet_for(&self, session_id: &SessionId) -> Option<String> {
+        self.snippets
+            .lock()
+            .ok()?
+            .get(session_id)
+            .map(|snippet| snippet.text.clone())
+    }
+
+    /// Overlays the cached snippet onto a snapshot before it is returned to a
+    /// client. The actor builds snapshots without snippet (it has no cache).
+    fn overlay_snippet(
+        &self,
+        mut snapshot: SessionSnapshot,
+        session_id: &SessionId,
+    ) -> SessionSnapshot {
+        snapshot.snippet = self.snippet_for(session_id);
+        snapshot
+    }
+
+    /// Registers a connection-wide push channel. The returned receiver is
+    /// drained by the WebSocket connection alongside its subscription events.
+    pub fn register_global_receiver(&self) -> Receiver<ServerMessage> {
+        let (tx, rx) = mpsc::sync_channel(GLOBAL_PUSH_CHANNEL_CAPACITY);
+        if let Ok(mut senders) = self.global_senders.lock() {
+            senders.push(tx);
+        }
+        rx
+    }
+
+    /// Broadcasts a message to every connected client, pruning dead channels.
+    fn broadcast_global(&self, message: ServerMessage) {
+        let Ok(mut senders) = self.global_senders.lock() else {
+            return;
+        };
+        senders.retain(|sender| match sender.try_send(message.clone()) {
+            Ok(()) => true,
+            // Full: client is slow; keep it (a later update will resend).
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+    }
+
+    /// Records a freshly generated snippet (newest `output_seq` wins) and pushes
+    /// the update to all connected clients. Called on the summarizer worker thread.
+    fn apply_snippet(&self, result: SnippetResult) {
+        {
+            let Ok(mut snippets) = self.snippets.lock() else {
+                return;
+            };
+            match snippets.get(&result.session_id) {
+                Some(existing)
+                    if existing.generated_at_output_seq > result.generated_at_output_seq => {}
+                _ => {
+                    snippets.insert(
+                        result.session_id.clone(),
+                        SessionSnippet {
+                            text: result.text.clone(),
+                            generated_at_output_seq: result.generated_at_output_seq,
+                        },
+                    );
+                }
+            }
+        }
+        tracing::debug!(
+            session_id = %result.session_id,
+            output_seq = result.generated_at_output_seq,
+            text = %result.text,
+            "cached + broadcasting session snippet"
+        );
+        self.broadcast_global(ServerMessage::SessionSnippetUpdated {
+            session_id: result.session_id,
+            snippet: result.text,
+            output_seq: result.generated_at_output_seq,
+        });
+    }
+
+    /// Drops a session's cached snippet (on shutdown/removal).
+    fn forget_snippet(&self, session_id: &SessionId) {
+        if let Ok(mut snippets) = self.snippets.lock() {
+            snippets.remove(session_id);
+        }
+    }
+
+    /// Starts the local-LLM summarizer: loads the model lazily on a worker
+    /// thread, wires session activity into a debounce loop, and pushes generated
+    /// snippets to clients. No-op when disabled. Safe to call once at startup.
+    pub fn start_summarizer(self: &Arc<Self>, config: triage_core::config::SummarizerConfig) {
+        if !config.enabled {
+            return;
+        }
+        let cache_dir = config
+            .cache_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(default_model_cache_dir);
+        let worker_config = crate::summarizer::SummarizerConfig {
+            bundle_id: config.bundle_id.clone(),
+            quant: config.quant.clone(),
+            context_size: config.context_size,
+            max_tokens: config.max_tokens,
+            cache_dir,
+            queue_depth: 8,
+        };
+
+        let on_result = {
+            let weak = Arc::downgrade(self);
+            move |result: SnippetResult| {
+                if let Some(manager) = weak.upgrade() {
+                    manager.apply_snippet(result);
+                }
+            }
+        };
+        let summarizer = Summarizer::spawn(worker_config, on_result);
+        if !summarizer.is_enabled() {
+            return;
+        }
+
+        let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyTick>();
+        if let Ok(mut guard) = self.dirty_tx.lock() {
+            *guard = Some(dirty_tx);
+        }
+        if let Ok(mut guard) = self.summarizer.lock() {
+            *guard = summarizer.clone();
+        }
+
+        let weak = Arc::downgrade(self);
+        let settle = Duration::from_millis(config.settle_ms);
+        let min_regen = Duration::from_millis(config.min_regen_ms);
+        let loop_summarizer = summarizer.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("triage-summarizer-debounce".into())
+            .spawn(move || {
+                run_debounce_loop(weak, loop_summarizer, dirty_rx, settle, min_regen);
+            })
+        {
+            tracing::error!(%error, "failed to spawn summarizer debounce thread");
+            return;
+        }
+
+        // Seed any sessions that already exist at this point. On a fresh start
+        // there are none; on handover, adoption runs *after* this, so callers
+        // must also invoke `seed_session_snippets` post-adoption.
+        self.seed_initial_summaries(&summarizer);
+    }
+
+    /// Re-runs the initial seed against the current live sessions. Call this
+    /// after handover adoption so adopted (possibly idle) sessions get a snippet
+    /// without waiting for new output. No-op when the summarizer is disabled.
+    pub fn seed_session_snippets(&self) {
+        let summarizer = match self.summarizer.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        if summarizer.is_enabled() {
+            self.seed_initial_summaries(&summarizer);
+        }
+    }
+
+    /// Enqueues a one-shot summary for every currently-live session.
+    fn seed_initial_summaries(&self, summarizer: &Summarizer) {
+        let session_ids = match self.list_sessions() {
+            Ok(ids) => ids,
+            Err(_) => return,
+        };
+        let total = session_ids.len();
+        let mut enqueued = 0usize;
+        let mut skipped_blank = 0usize;
+        for session_id in session_ids {
+            if let Some((rows, output_seq)) = self.summary_rows(&session_id) {
+                if let Some(prompt_text) = build_prompt_text(&rows) {
+                    if summarizer.try_enqueue(SummarizeJob {
+                        session_id,
+                        prompt_text,
+                        output_seq,
+                    }) {
+                        enqueued += 1;
+                    }
+                } else {
+                    skipped_blank += 1;
+                }
+            }
+        }
+        tracing::debug!(total, enqueued, skipped_blank, "seeded session snippets");
     }
 
     fn log_path(&self, session_id: &SessionId) -> PathBuf {
@@ -408,6 +645,78 @@ impl SessionManager {
             bail!("session {session_id} is not being restored");
         };
         sessions.insert(session_id, ManagedSession::Historical { session, lease });
+        Ok(())
+    }
+
+    /// Converts a `Live` session whose child process has already exited into a
+    /// `Historical` session in place, so it can be restored. Nothing else moves
+    /// a dead `Live` session to `Historical` (that only happens on a daemon
+    /// restart via the manifest), so without this a session that dies while live
+    /// — notably one adopted across a handover — can never be re-spawned.
+    ///
+    /// Returns `Ok(())` when the session is left unchanged (still running, not
+    /// `Live`, or not a restorable shell) or successfully demoted; returns `Err`
+    /// only when the session is a confirmed-exited restorable `Live` whose log
+    /// could not be rebuilt, so the caller can report the real cause instead of
+    /// a misleading "already live".
+    fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
+        // Phase 1 (brief lock): grab the actor command channel + launch of a
+        // `Live` session, without doing the actor round-trip under the lock.
+        let (cmd_tx, launch) = {
+            let sessions = self.sessions()?;
+            let Some(ManagedSession::Live { actor, launch, .. }) = sessions.get(session_id) else {
+                return Ok(());
+            };
+            (actor.tx.clone(), launch.clone())
+        };
+
+        // Off-lock: only a cleanly-exited actor is a demote candidate. A snapshot
+        // *error* means the worker thread is gone, so we cannot confirm the child
+        // died — leave it rather than risk reaping a still-running child and
+        // spawning a duplicate shell.
+        if !matches!(request_snapshot(&cmd_tx), Ok(snapshot) if snapshot.exited) {
+            return Ok(());
+        }
+
+        // Only restorable shells can be re-spawned; don't reap a non-restorable
+        // session's actor and downgrade it for a restore that would bail anyway.
+        let persisted = launch.into_persisted(session_id.clone(), true);
+        if !is_restorable_shell_launch(&persisted) {
+            return Ok(());
+        }
+
+        // Off-lock: rebuild the historical view, which reads and replays the
+        // session log — too slow to do while holding the global sessions lock.
+        let historical = HistoricalSession::restore(persisted)
+            .with_context(|| format!("rebuilding exited session {session_id} for restore"))?;
+
+        // Phase 3 (brief lock): swap only if it is still a `Live` entry — a
+        // concurrent restore may already have replaced it. A confirmed-exited
+        // process cannot revive, so no second round-trip is needed here.
+        let mut sessions = self.sessions()?;
+        if !matches!(sessions.get(session_id), Some(ManagedSession::Live { .. })) {
+            return Ok(());
+        }
+        if let Some(ManagedSession::Live { actor, lease, .. }) = sessions.remove(session_id) {
+            if let Err(error) = actor.shutdown() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?error,
+                    "failed to reap exited actor while demoting to historical"
+                );
+            }
+            sessions.insert(
+                session_id.clone(),
+                ManagedSession::Historical {
+                    session: Box::new(historical),
+                    lease,
+                },
+            );
+            // Keep the on-disk manifest consistent with the in-memory swap, as
+            // every other map-mutating path does.
+            self.persist_manifest(&sessions)
+                .with_context(|| format!("persisting manifest after demoting {session_id}"))?;
+        }
         Ok(())
     }
 
@@ -564,27 +873,19 @@ impl SessionManager {
         Ok((state, fds))
     }
 
+    /// Detaches every live session from this daemon for a process handover:
+    /// removes them from the map and disarms their actors (no shutdown signal, no
+    /// `child.kill()`) so the shared child processes survive into the successor
+    /// daemon, which already holds their master fds. The daemon `process::exit`s
+    /// right after, so the OS reaps the detached worker threads and fds.
     #[cfg(unix)]
-    pub fn clear_all_live_sessions(&self) {
+    pub fn detach_all_live_sessions(&self) {
         if let Ok(mut sessions) = self.sessions() {
-            let keys: Vec<_> = sessions.keys().cloned().collect();
-            for id in keys {
-                if let Some(ManagedSession::Live {
-                    mut actor,
-                    lease: _,
-                    launch: _,
-                }) = sessions.remove(&id)
-                {
-                    let (tx, rx) = mpsc::channel();
-                    if let Err(err) = actor.tx.send(ActorCommand::Shutdown { response: tx }) {
-                        tracing::warn!(session_id = %id, ?err, "Failed to send shutdown command to actor");
-                    } else {
-                        let _ = rx.recv();
-                    }
-                    actor.join_threads();
+            for (_, managed) in sessions.drain() {
+                if let ManagedSession::Live { actor, .. } = managed {
+                    actor.detach();
                 }
             }
-            sessions.clear();
         }
     }
 
@@ -613,6 +914,7 @@ impl SessionManager {
             };
 
             let event_session_id = Some(h_sess.id.clone());
+            let dirty_tx = self.dirty_tx();
 
             let PtyRuntime {
                 master,
@@ -654,6 +956,7 @@ impl SessionManager {
                         current_working_directory: initial_working_directory,
                         context: initial_context,
                         event_session_id,
+                        dirty_tx,
                         subscribers: Vec::new(),
                         event_log: VecDeque::new(),
                         next_event_seq: 1,
@@ -772,7 +1075,7 @@ impl SessionApi for SessionManager {
             log_path,
         };
         let launch = PersistedSessionLaunch::from(&config);
-        let actor = SessionActor::spawn_managed(config, session_id.clone())?;
+        let actor = SessionActor::spawn_managed(config, session_id.clone(), self.dirty_tx())?;
 
         let mut sessions = self.sessions()?;
         sessions.insert(
@@ -815,15 +1118,21 @@ impl SessionApi for SessionManager {
                     })?;
                 }
 
+                let snapshot = actor.snapshot()?;
+                let lease = lease.clone();
                 Ok(AttachSessionResponse {
-                    snapshot: actor.snapshot()?,
-                    lease: lease.clone(),
+                    snapshot: self.overlay_snippet(snapshot, &request.session_id),
+                    lease,
                 })
             }
-            ManagedSession::Historical { session, lease } => Ok(AttachSessionResponse {
-                snapshot: session.snapshot_with_history(),
-                lease: lease.clone(),
-            }),
+            ManagedSession::Historical { session, lease } => {
+                let snapshot = session.snapshot_with_history();
+                let lease = lease.clone();
+                Ok(AttachSessionResponse {
+                    snapshot: self.overlay_snippet(snapshot, &request.session_id),
+                    lease,
+                })
+            }
             ManagedSession::Restoring { .. } => {
                 bail!("session {} is being restored", request.session_id)
             }
@@ -940,19 +1249,27 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
-        match session {
-            ManagedSession::Live { actor, .. } => actor.resize(request.size),
+        let snapshot = match session {
+            ManagedSession::Live { actor, .. } => actor.resize(request.size)?,
             ManagedSession::Historical { .. } => {
                 bail!("restored historical sessions cannot be resized")
             }
             ManagedSession::Restoring { .. } => {
                 bail!("session {} is being restored", request.session_id)
             }
-        }
+        };
+        Ok(self.overlay_snippet(snapshot, &request.session_id))
     }
 
     fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
         request.size.validate()?;
+        // A session whose child process dies while `Live` is never demoted to
+        // `Historical` on its own, so the block below would reject it as "already
+        // live" and it would stay stuck/uninputtable until a daemon restart —
+        // e.g. sessions adopted across a handover whose process later exits.
+        // Demote a dead `Live` session here so the normal restore path re-spawns
+        // it; surfaces a real error if its log can't be rebuilt.
+        self.demote_dead_live_session(&request.session_id)?;
         let (persisted, current_working_directory) = {
             let mut sessions = self.sessions()?;
             let existing = sessions
@@ -993,13 +1310,15 @@ impl SessionApi for SessionManager {
             log_path: persisted.log_path.clone(),
         };
         let launch = PersistedSessionLaunch::from(&config);
-        let actor = match SessionActor::spawn_restored(config, request.session_id.clone()) {
-            Ok(actor) => actor,
-            Err(error) => {
-                self.rollback_restoring_session(request.session_id)?;
-                return Err(error);
-            }
-        };
+        let actor =
+            match SessionActor::spawn_restored(config, request.session_id.clone(), self.dirty_tx())
+            {
+                Ok(actor) => actor,
+                Err(error) => {
+                    self.rollback_restoring_session(request.session_id)?;
+                    return Err(error);
+                }
+            };
         let snapshot = match actor.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1044,8 +1363,9 @@ impl SessionApi for SessionManager {
             }
             return Err(error);
         }
+        drop(sessions);
 
-        Ok(snapshot)
+        Ok(self.overlay_snippet(snapshot, &request.session_id))
     }
 
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
@@ -1053,11 +1373,12 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        match session {
-            ManagedSession::Live { actor, .. } => actor.snapshot(),
-            ManagedSession::Historical { session, .. } => Ok(session.snapshot_with_history()),
+        let snapshot = match session {
+            ManagedSession::Live { actor, .. } => actor.snapshot()?,
+            ManagedSession::Historical { session, .. } => session.snapshot_with_history(),
             ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
-        }
+        };
+        Ok(self.overlay_snippet(snapshot, &session_id))
     }
 
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
@@ -1088,11 +1409,27 @@ impl SessionApi for SessionManager {
             }
             session
         };
+        self.forget_snippet(&session_id);
         match session {
             ManagedSession::Live { actor, .. } => actor.shutdown(),
             ManagedSession::Historical { session, .. } => Ok(session.completed_session()),
             ManagedSession::Restoring { session, .. } => Ok(session.completed_session()),
         }
+    }
+
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+        let session_ids = self.list_sessions()?;
+        let snippets = self
+            .snippets
+            .lock()
+            .map_err(|_| anyhow!("snippet cache lock poisoned"))?;
+        Ok(session_ids
+            .into_iter()
+            .map(|session_id| {
+                let snippet = snippets.get(&session_id).map(|s| s.text.clone());
+                (session_id, snippet)
+            })
+            .collect())
     }
 }
 
@@ -1168,6 +1505,134 @@ fn default_log_dir_from_env(
             home.join(".local/state")
         })
         .join("triage/sessions")
+}
+
+/// Default cache directory for downloaded summarizer model files. Mirrors
+/// [`default_log_dir`] but rooted at the XDG *cache* dir (`~/.cache`), since
+/// models are re-downloadable caches, not persistent application state.
+pub fn default_model_cache_dir() -> PathBuf {
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            home.join(".cache")
+        });
+    cache_root.join("triage/models")
+}
+
+/// State the debounce loop tracks per session between ticks.
+struct PendingDirty {
+    last_output_seq: u64,
+    last_tick_at: Instant,
+}
+
+/// Debounce loop: receives [`DirtyTick`]s from session actors and, once a
+/// session's output has been quiet for `settle`, enqueues a summarization job —
+/// subject to a per-session rate limit and content-change checks. Runs on its
+/// own thread; exits when the manager is dropped or the dirty channel closes.
+fn run_debounce_loop(
+    manager: std::sync::Weak<SessionManager>,
+    summarizer: Summarizer,
+    dirty_rx: Receiver<DirtyTick>,
+    settle: Duration,
+    min_regen: Duration,
+) {
+    let mut pending: HashMap<SessionId, PendingDirty> = HashMap::new();
+    let mut last_enqueue: HashMap<SessionId, Instant> = HashMap::new();
+    let mut last_summarized_seq: HashMap<SessionId, u64> = HashMap::new();
+    let mut last_prompt_hash: HashMap<SessionId, u64> = HashMap::new();
+
+    loop {
+        // Block up to `settle` for the next tick so we re-evaluate readiness
+        // even when no new output arrives.
+        match dirty_rx.recv_timeout(settle) {
+            Ok(tick) => record_tick(&mut pending, tick),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Coalesce any other immediately-available ticks.
+        while let Ok(tick) = dirty_rx.try_recv() {
+            record_tick(&mut pending, tick);
+        }
+
+        let Some(manager) = manager.upgrade() else {
+            break;
+        };
+        let now = Instant::now();
+
+        let ready: Vec<SessionId> = pending
+            .iter()
+            .filter(|(_, pd)| now.duration_since(pd.last_tick_at) >= settle)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+
+        for session_id in ready {
+            let pd = pending
+                .remove(&session_id)
+                .expect("ready ids come from pending");
+
+            // Already summarized this exact output position.
+            if last_summarized_seq.get(&session_id) == Some(&pd.last_output_seq) {
+                continue;
+            }
+            // Per-session rate limit; keep it pending to retry after the window.
+            if let Some(last) = last_enqueue.get(&session_id)
+                && now.duration_since(*last) < min_regen
+            {
+                pending.insert(session_id, pd);
+                continue;
+            }
+
+            // Off-lock cheap snapshot: never holds the global sessions mutex
+            // during the actor round-trip, so it can't starve interactive ops.
+            let Some((rows, _output_seq)) = manager.summary_rows(&session_id) else {
+                // Session likely gone; drop tracking state for it.
+                last_enqueue.remove(&session_id);
+                last_summarized_seq.remove(&session_id);
+                last_prompt_hash.remove(&session_id);
+                continue;
+            };
+            let Some(prompt_text) = build_prompt_text(&rows) else {
+                continue;
+            };
+
+            let hash = hash_prompt(&prompt_text);
+            // Screen text unchanged since last summary (e.g. spinner repaint).
+            if last_prompt_hash.get(&session_id) == Some(&hash) {
+                last_summarized_seq.insert(session_id, pd.last_output_seq);
+                continue;
+            }
+
+            if summarizer.try_enqueue(SummarizeJob {
+                session_id: session_id.clone(),
+                prompt_text,
+                output_seq: pd.last_output_seq,
+            }) {
+                last_enqueue.insert(session_id.clone(), now);
+                last_prompt_hash.insert(session_id.clone(), hash);
+                last_summarized_seq.insert(session_id, pd.last_output_seq);
+            }
+        }
+    }
+}
+
+fn record_tick(pending: &mut HashMap<SessionId, PendingDirty>, tick: DirtyTick) {
+    let entry = pending.entry(tick.session_id).or_insert(PendingDirty {
+        last_output_seq: tick.output_seq,
+        last_tick_at: Instant::now(),
+    });
+    entry.last_output_seq = tick.output_seq;
+    entry.last_tick_at = Instant::now();
+}
+
+fn hash_prompt(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn load_paired_devices(log_dir: &Path) -> HashMap<ClientId, String> {
@@ -1453,20 +1918,39 @@ impl HistoricalSession {
 
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        Self::spawn_with_events(config, None, LogInitialization::Truncate)
+        Self::spawn_with_events(config, None, None, LogInitialization::Truncate)
     }
 
-    fn spawn_managed(config: SessionConfig, session_id: SessionId) -> Result<Self> {
-        Self::spawn_with_events(config, Some(session_id), LogInitialization::Truncate)
+    fn spawn_managed(
+        config: SessionConfig,
+        session_id: SessionId,
+        dirty_tx: Option<DirtySender>,
+    ) -> Result<Self> {
+        Self::spawn_with_events(
+            config,
+            Some(session_id),
+            dirty_tx,
+            LogInitialization::Truncate,
+        )
     }
 
-    fn spawn_restored(config: SessionConfig, session_id: SessionId) -> Result<Self> {
-        Self::spawn_with_events(config, Some(session_id), LogInitialization::ReplayExisting)
+    fn spawn_restored(
+        config: SessionConfig,
+        session_id: SessionId,
+        dirty_tx: Option<DirtySender>,
+    ) -> Result<Self> {
+        Self::spawn_with_events(
+            config,
+            Some(session_id),
+            dirty_tx,
+            LogInitialization::ReplayExisting,
+        )
     }
 
     fn spawn_with_events(
         config: SessionConfig,
         event_session_id: Option<SessionId>,
+        dirty_tx: Option<DirtySender>,
         log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
@@ -1506,6 +1990,7 @@ impl SessionActor {
                     current_working_directory: initial_working_directory,
                     context: initial_context,
                     event_session_id,
+                    dirty_tx,
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
@@ -1610,6 +2095,18 @@ impl SessionActor {
             join_thread_with_timeout(reader, "session actor reader");
         }
     }
+
+    /// Disarms the actor for a process handover: drops the worker/reader join
+    /// handles WITHOUT signalling shutdown, so the worker thread keeps owning the
+    /// live PTY child until this process exits. The successor daemon already owns
+    /// the session through the transferred master fd; killing the child here (as
+    /// [`Self::shutdown`] and [`Drop`] do) is exactly what tears every session
+    /// down across a handover.
+    fn detach(mut self) {
+        self.worker = None;
+        self.reader = None;
+        // `self` drops here; the `Drop` impl is a no-op once `worker` is `None`.
+    }
 }
 
 impl Drop for SessionActor {
@@ -1630,6 +2127,17 @@ impl Drop for SessionActor {
     }
 }
 
+/// Notification that a session produced output, sent from the actor's output
+/// hot path to the summarizer's debounce loop. Deliberately tiny: one
+/// non-blocking `Sender::send` per output chunk, no lock and no I/O.
+#[derive(Debug, Clone)]
+pub(crate) struct DirtyTick {
+    pub session_id: SessionId,
+    pub output_seq: u64,
+}
+
+pub(crate) type DirtySender = std::sync::mpsc::Sender<DirtyTick>;
+
 struct ActorState {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -1643,6 +2151,9 @@ struct ActorState {
     current_working_directory: Option<PathBuf>,
     context: Option<SessionContext>,
     event_session_id: Option<SessionId>,
+    /// When set, the actor reports output activity here so the summarizer can
+    /// (re)generate this session's snippet once its output settles.
+    dirty_tx: Option<DirtySender>,
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
     next_event_seq: u64,
@@ -1689,6 +2200,12 @@ enum ActorCommand {
     },
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
+    },
+    /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
+    /// no raw-output-history disk read, so it never blocks on I/O. Returns the
+    /// plain visible rows plus the current output sequence.
+    SummaryRows {
+        response: Sender<ActorResult<(Vec<String>, u64)>>,
     },
     StyledRows {
         start: usize,
@@ -1813,6 +2330,14 @@ impl ActorState {
                         self.current_working_directory = Some(current_working_directory);
                     }
                     if let Some(session_id) = self.event_session_id.clone() {
+                        // Non-blocking nudge to the summarizer; a full or dropped
+                        // channel is fine — the debounce loop re-checks on settle.
+                        if let Some(dirty_tx) = &self.dirty_tx {
+                            let _ = dirty_tx.send(DirtyTick {
+                                session_id: session_id.clone(),
+                                output_seq: self.output.output_seq,
+                            });
+                        }
                         self.broadcast(SessionEvent::Output {
                             session_id,
                             output_seq: self.output.output_seq,
@@ -1850,6 +2375,11 @@ impl ActorState {
             }
             ActorCommand::Snapshot { response } => {
                 let _ = response.send(Ok(self.snapshot_with_history()));
+                false
+            }
+            ActorCommand::SummaryRows { response } => {
+                let rows = visible_rows(&self.output.terminal);
+                let _ = response.send(Ok((rows, self.output.output_seq)));
                 false
             }
             ActorCommand::StyledRows {
@@ -2492,6 +3022,9 @@ fn snapshot_from_output(
         // paths via `*_with_history`; resize broadcasts carry none.
         raw_output: Vec::new(),
         raw_output_start: 0,
+        // Populated by the manager from its snippet cache when a snapshot is
+        // returned to a caller; the actor has no access to the cache.
+        snippet: None,
     }
 }
 
@@ -2608,6 +3141,26 @@ fn recv_actor_result<T>(rx: Receiver<ActorResult<T>>, context: &'static str) -> 
         .with_context(|| context)
 }
 
+/// Requests a cheap visible-rows snapshot via a cloned actor command channel.
+/// The caller clones `tx` while briefly holding the sessions lock, then calls
+/// this OFF-LOCK so the actor round-trip never blocks other session operations.
+fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<(Vec<String>, u64)> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::SummaryRows { response: resp_tx })
+        .context("sending session summary-rows command")?;
+    recv_actor_result(resp_rx, "reading session summary rows")
+}
+
+/// Requests a full snapshot via a cloned actor command channel. Mirrors
+/// [`request_summary_rows`]: clone `tx` under a brief lock, then call this
+/// OFF-LOCK so the actor round-trip never blocks other session operations.
+fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::Snapshot { response: resp_tx })
+        .context("sending session snapshot command")?;
+    recv_actor_result(resp_rx, "reading session snapshot")
+}
+
 fn reject_command_during_shutdown(command: ActorCommand) {
     let error = anyhow!("session is shutting down");
     match command {
@@ -2618,6 +3171,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SummaryRows { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::StyledRows { response, .. } => {
@@ -4519,6 +5075,176 @@ mod tests {
         manager
             .shutdown_session(session_id)
             .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn restore_revives_live_session_whose_process_died() {
+        // A session whose child process exits while it is still `Live` (e.g. one
+        // adopted across a handover, then exited) must remain restorable. It used
+        // to be rejected with "already live or restoring" and stay stuck.
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+
+        let client_id = ClientId::new("revive-client").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach controller");
+
+        // Tell the shell to exit, then wait for the manager to observe the death.
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                bytes: b"exit\n".to_vec(),
+            })
+            .expect("write exit input");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot dead live session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for live session to exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The session is still `Live` (dead actor) here; restore must revive it
+        // rather than bail.
+        let restored = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+            })
+            .expect("restore revives dead live session");
+        assert!(!restored.exited, "restored session should be live again");
+
+        // It accepts input again through the normal attach + write path.
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("re-attach revived session");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: input_that_prints_marker(),
+            })
+            .expect("write input to revived session");
+        wait_for_manager_marker(&manager, session_id.clone(), "actor-ready");
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown revived session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn restore_does_not_demote_a_non_restorable_dead_live_session() {
+        // A dead `Live` session that was NOT launched as a restorable shell must
+        // be left as `Live` (its actor not reaped) rather than irreversibly
+        // downgraded to `Historical` for a restore that bails anyway.
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        // `-c "exit 0"` exits immediately and is not the triage default shell
+        // wrapper, so is_restorable_shell_launch rejects it.
+        request.args = vec!["-c".to_string(), "exit 0".to_string()];
+        request.size = SessionSize {
+            rows: 6,
+            cols: 40,
+            pixel_width: 800,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let session_id = manager.start_session(request).expect("start session");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot dead live session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for non-restorable session to exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Restore must reject it (not a restorable shell).
+        assert!(
+            manager
+                .restore_session(RestoreSessionRequest {
+                    session_id: session_id.clone(),
+                    size: SessionSize {
+                        rows: 6,
+                        cols: 40,
+                        pixel_width: 800,
+                        pixel_height: 240,
+                        dpi: 96,
+                    },
+                })
+                .is_err(),
+            "restore of a non-restorable session should fail"
+        );
+
+        // It must still be `Live`: attaching as a controller acquires the input
+        // lease (the `Historical` attach branch never grants one), proving the
+        // session was not demoted and its actor not reaped.
+        let response = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("non-restorable-client").expect("client id"),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach still-live session");
+        assert!(
+            response.lease.holder.is_some(),
+            "non-restorable dead session should remain Live with an acquirable lease"
+        );
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 

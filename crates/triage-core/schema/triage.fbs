@@ -83,6 +83,9 @@ table SessionSnapshot {
     // first byte within the session's full output log (bytes_logged is the end).
     raw_output: [ubyte];
     raw_output_start: uint64;
+    // Local-LLM one-line description of what this session is doing, if generated.
+    // Empty/absent when summarization is disabled or not yet produced.
+    snippet: string;
 }
 
 table CompletedSession {
@@ -196,6 +199,8 @@ table ShutdownSessionRequest {
     session_id: string;
 }
 
+table ListSessionSnippetsRequest {}
+
 union ClientRequestPayload {
     HelloRequest,
     PairRequest,
@@ -211,7 +216,8 @@ union ClientRequestPayload {
     SnapshotSessionRequest,
     StyledRowsRequestTable,
     ShutdownSessionRequest,
-    PairingChallengeRequest
+    PairingChallengeRequest,
+    ListSessionSnippetsRequest
 }
 
 table ClientMessage {
@@ -269,6 +275,15 @@ table CompletedSessionResult {
     completed: CompletedSession;
 }
 
+table SessionSnippetEntry {
+    session_id: string;
+    snippet: string;
+}
+
+table SessionSnippetsResult {
+    entries: [SessionSnippetEntry];
+}
+
 union ServerResultPayload {
     UnitResult,
     HelloResult,
@@ -281,7 +296,8 @@ union ServerResultPayload {
     SessionSnapshotResult,
     StyledRowsResult,
     CompletedSessionResult,
-    PairingChallengeResult
+    PairingChallengeResult,
+    SessionSnippetsResult
 }
 
 table ResponsePayload {
@@ -340,11 +356,21 @@ table SubscriptionClosedPayload {
     subscription_id: string;
 }
 
+// Connection-wide push (not tied to a session subscription): a session's
+// snippet was (re)generated. Broadcast to every connected client so the side
+// rail can update sessions the client hasn't attached to.
+table SessionSnippetUpdatedPayload {
+    session_id: string;
+    snippet: string;
+    output_seq: uint64;
+}
+
 union ServerMessagePayload {
     ResponsePayload,
     ErrorPayload,
     EventPayload,
-    SubscriptionClosedPayload
+    SubscriptionClosedPayload,
+    SessionSnippetUpdatedPayload
 }
 
 table ServerMessage {

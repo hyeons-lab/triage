@@ -119,9 +119,19 @@ mod tests {
             "adopted session failed to replay log state correctly"
         );
 
-        // Clean up the running process
+        // Simulate the old daemon's handover teardown. It must DETACH (not kill)
+        // so the shared child survives into the successor; sending the actors a
+        // shutdown here would SIGKILL the child and exit the adopted session —
+        // that was the "handover tears down every session" bug.
+        manager.detach_all_live_sessions();
+        let snap_after = new_manager.snapshot_session(session_id.clone())?;
+        assert!(
+            !snap_after.exited,
+            "adopted session was killed by the old daemon's handover teardown"
+        );
+
+        // Clean up the running process (now solely owned via the adopted fd).
         let _ = new_manager.shutdown_session(session_id);
-        manager.clear_all_live_sessions();
 
         Ok(())
     }

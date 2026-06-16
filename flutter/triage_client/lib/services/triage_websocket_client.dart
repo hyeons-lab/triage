@@ -99,6 +99,10 @@ class TriageWebSocketClient {
         _eventController.add(message);
       } else if (type == 'subscription_closed') {
         _eventController.add(message);
+      } else if (type == 'session_snippet_updated') {
+        // Connection-wide push (not tied to a request or subscription); forward
+        // to the app so it can update the session's rail snippet live.
+        _eventController.add(message);
       }
     } catch (error) {
       debugPrint(
@@ -221,6 +225,23 @@ class TriageWebSocketClient {
     final response = await _send('list_sessions');
     final sessionIds = response['session_ids'] as List<dynamic>?;
     return sessionIds?.map((e) => e.toString()).toList() ?? [];
+  }
+
+  /// Returns the current snippet for every session as `{session_id: snippet?}`.
+  /// Sessions without a generated snippet map to `null`. Used to seed the side
+  /// rail on connect; live updates arrive via `session_snippet_updated` events.
+  Future<Map<String, String?>> listSessionSnippets() async {
+    final response = await _send('list_session_snippets');
+    final entries = response['entries'] as List<dynamic>?;
+    final result = <String, String?>{};
+    for (final entry in entries ?? const []) {
+      final map = entry as Map<String, dynamic>;
+      final sessionId = map['session_id'] as String?;
+      if (sessionId != null) {
+        result[sessionId] = map['snippet'] as String?;
+      }
+    }
+    return result;
   }
 
   Future<Map<String, dynamic>> attachSession({
@@ -412,6 +433,15 @@ class TriageWebSocketClient {
         'type': 'subscription_closed',
         'subscription_id': closed.subscriptionId,
       };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.SessionSnippetUpdatedPayload) {
+      final updated = payload as fbs.SessionSnippetUpdatedPayload;
+      return {
+        'type': 'session_snippet_updated',
+        'session_id': updated.sessionId,
+        'snippet': updated.snippet,
+        'output_seq': updated.outputSeq,
+      };
     }
     return {};
   }
@@ -480,6 +510,19 @@ class TriageWebSocketClient {
           'result': 'completed_session',
           'completed': _parseCompletedSession(completed.completed),
         };
+      case 13: // SessionSnippetsResult
+        final snippets = result as fbs.SessionSnippetsResult;
+        return {
+          'result': 'session_snippets',
+          'entries': (snippets.entries ?? [])
+              .map(
+                (entry) => {
+                  'session_id': entry.sessionId,
+                  'snippet': entry.snippet,
+                },
+              )
+              .toList(),
+        };
       default:
         return {};
     }
@@ -515,6 +558,8 @@ class TriageWebSocketClient {
       // hosts). raw_output_start is its byte offset in the full output log.
       'raw_output': snap.rawOutput,
       'raw_output_start': snap.rawOutputStart,
+      // Local-LLM one-line description of the session, if generated.
+      'snippet': snap.snippet,
     };
   }
 
@@ -821,6 +866,12 @@ class TriageWebSocketClient {
           start: request?['start'] as int?,
           end: request?['end'] as int?,
         );
+        break;
+
+      case 'list_session_snippets':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
+        payload = fbs.ListSessionSnippetsRequestObjectBuilder();
         break;
 
       default:

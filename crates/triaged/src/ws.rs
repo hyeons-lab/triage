@@ -126,9 +126,11 @@ where
     tracing::debug!(?format, "Upgraded WebSocket client connected");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let global_rx = manager.register_global_receiver();
     let mut conn =
         WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager))
-            .with_format(format);
+            .with_format(format)
+            .with_global_receiver(global_rx);
 
     let mut next_msg = ws_receiver.next();
 

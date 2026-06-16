@@ -30,9 +30,10 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Nightly required by the `cera` dep on aarch64 (see rust-toolchain.toml).
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: 1.94.1
+          toolchain: nightly-2026-04-02
 
       - name: Determine workspace version
         id: version

@@ -356,6 +356,7 @@ pub fn parse_client_message(
                 .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
             ClientRequest::ShutdownSession { session_id }
         }
+        fb::ClientRequestPayload::ListSessionSnippetsRequest => ClientRequest::ListSessionSnippets,
         _ => {
             return Err(crate::ProtocolError::new(
                 "unsupported_payload",
@@ -635,6 +636,16 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::ListSessionSnippets => {
+            let req = fb::ListSessionSnippetsRequest::create(
+                builder,
+                &fb::ListSessionSnippetsRequestArgs {},
+            );
+            (
+                fb::ClientRequestPayload::ListSessionSnippetsRequest,
+                req.as_union_value(),
+            )
+        }
     };
 
     fb::ClientMessage::create(
@@ -819,6 +830,31 @@ pub fn build_server_message<'a>(
                         r.as_union_value(),
                     )
                 }
+                ServerResult::SessionSnippets { entries } => {
+                    let mut entry_offsets = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let sid = builder.create_string(entry.session_id.as_str());
+                        let snip = entry.snippet.as_ref().map(|s| builder.create_string(s));
+                        entry_offsets.push(fb::SessionSnippetEntry::create(
+                            builder,
+                            &fb::SessionSnippetEntryArgs {
+                                session_id: Some(sid),
+                                snippet: snip,
+                            },
+                        ));
+                    }
+                    let entries_vec = builder.create_vector(&entry_offsets);
+                    let r = fb::SessionSnippetsResult::create(
+                        builder,
+                        &fb::SessionSnippetsResultArgs {
+                            entries: Some(entries_vec),
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::SessionSnippetsResult,
+                        r.as_union_value(),
+                    )
+                }
             };
 
             let res_payload = fb::ResponsePayload::create(
@@ -977,6 +1013,26 @@ pub fn build_server_message<'a>(
                 sub_closed.as_union_value(),
             )
         }
+        ServerMessage::SessionSnippetUpdated {
+            session_id,
+            snippet,
+            output_seq,
+        } => {
+            let sid = builder.create_string(session_id.as_str());
+            let snip = builder.create_string(snippet);
+            let updated = fb::SessionSnippetUpdatedPayload::create(
+                builder,
+                &fb::SessionSnippetUpdatedPayloadArgs {
+                    session_id: Some(sid),
+                    snippet: Some(snip),
+                    output_seq: *output_seq,
+                },
+            );
+            (
+                fb::ServerMessagePayload::SessionSnippetUpdatedPayload,
+                updated.as_union_value(),
+            )
+        }
     };
 
     fb::ServerMessage::create(
@@ -1059,6 +1115,11 @@ pub enum ServerMessageBorrowed<'a> {
     },
     SubscriptionClosed {
         subscription_id: &'a str,
+    },
+    SessionSnippetUpdated {
+        session_id: &'a str,
+        snippet: &'a str,
+        output_seq: u64,
     },
 }
 
@@ -1226,6 +1287,21 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 })?;
             Ok(ServerMessageBorrowed::SubscriptionClosed {
                 subscription_id: closed.subscription_id().unwrap_or(""),
+            })
+        }
+        fb::ServerMessagePayload::SessionSnippetUpdatedPayload => {
+            let updated = root
+                .payload_as_session_snippet_updated_payload()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "missing session snippet updated payload",
+                    )
+                })?;
+            Ok(ServerMessageBorrowed::SessionSnippetUpdated {
+                session_id: updated.session_id().unwrap_or(""),
+                snippet: updated.snippet().unwrap_or(""),
+                output_seq: updated.output_seq(),
             })
         }
         _ => Err(crate::ProtocolError::new(

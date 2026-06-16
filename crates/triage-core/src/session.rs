@@ -119,6 +119,10 @@ pub struct SessionSnapshot {
     /// session's full output log (`bytes_logged` is the end offset).
     #[serde(default)]
     pub raw_output_start: u64,
+    /// Local-LLM one-line description of what the session is doing, if one has
+    /// been generated. `None` when summarization is disabled or not yet produced.
+    #[serde(default)]
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +425,11 @@ pub trait SessionApi {
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot>;
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse>;
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
+    /// Current snippet for every session (id, snippet). Sessions without a
+    /// snippet yet carry `None`. Default: no snippets (summarization unsupported).
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+        Ok(Vec::new())
+    }
 }
 
 impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
@@ -469,6 +478,9 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     }
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         (**self).shutdown_session(session_id)
+    }
+    fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>)>> {
+        (**self).list_session_snippets()
     }
 }
 
