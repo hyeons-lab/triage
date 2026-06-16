@@ -217,6 +217,15 @@ Daemon: 85 tests pass, clippy clean. DEPLOYMENT CAVEAT: the currently-running da
   `drain_global`; corrected to point at `global_rx` draining in `drain_events` and
   noted delivery is to *authenticated* clients.
 
+## Next Steps (followup — AFTER this branch merges; do NOT do here)
+
+Side-rail enhancements requested 2026-06-15, deferred to a separate branch:
+- **Flutter rail parity + glance info:** show repo, branch, and worktree per session (the TUI rail already does this via `SessionContext.repository_root` / `worktree_root` / `branch` in `crates/triage` — see its `session_context_rows`; the Flutter `SessionListTile` shows none of them, only title/status/snippet). Keep the existing one-line snippet.
+- **Two-tier summaries:** keep the one-liner as-is for the rail; add a *second, more detailed* summary surfaced in a hover popover in the Flutter client. Open design Q: is the detailed summary a second (longer) LLM generation, or assembled from metadata + the one-liner? Affects `summarizer.rs` + a new snapshot/protocol field (e.g. `snippet_detail`).
+- **Search:** the detailed summary should also feed a future session search to locate the right session.
+- **Drag-and-drop reorder:** let the rail be reordered by dragging sessions into position. Open Q: persist order daemon-side (per client/device) or client-local only?
+- TUI also does NOT consume the `snippet` field today — could optionally surface it there too.
+
 ## Commits
 
 - b0662c5 — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
