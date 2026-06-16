@@ -271,6 +271,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Color _connectionStatusColor = const Color(0xff7f8b8d);
   late final String _clientId;
   final Map<String, String> _subscriptionIds = {};
+  // Session ids with an in-flight snapshot refresh. A refresh clears and
+  // re-emulates the terminal from history, so two concurrent refreshes for the
+  // same session race and the second blanks the first (e.g. the select + first
+  // view-fit refreshes that both fire on a session's initial load).
+  final Set<String> _refreshInFlight = {};
   final Map<String, List<Map<String, dynamic>>> _pendingEvents = {};
   final Queue<Map<String, dynamic>> _websocketEventQueue = Queue();
   bool _websocketProcessingEvent = false;
@@ -1116,8 +1121,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      // Fall back to the prepared snapshot only when it carries history: the
+      // restore path's snapshot does, but a resize snapshot never does, and
+      // replaying its empty history would clear the terminal to a blank screen.
       if (replayTargetSize != null &&
           preparedSnapshot != null &&
+          _rawOutputFromSnapshot(preparedSnapshot).isNotEmpty &&
           !_snapshotSizeMatches(snapshot, replayTargetSize)) {
         snapshot = preparedSnapshot;
       }
@@ -1356,12 +1365,24 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<void> _applySnapshotToSession(
     SessionVm session,
     String sessionId,
-    Map<String, dynamic> snapshot,
-  ) async {
-    if (_disposed) return;
+    Map<String, dynamic> snapshot, {
+    (int, int)? renderSize,
+  }) async {
+    // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
+    // _loadDaemonSessions) while the refresh was in flight — applying to a
+    // disposed store is a use-after-dispose, and the live same-id object is
+    // refreshed by its own load path.
+    if (_disposed || !_sessions.contains(session)) return;
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     final cols = sizeObj?['cols'] as int? ?? 80;
     final rowsVal = sizeObj?['rows'] as int? ?? 24;
+    // The grid the content is actually rendered at: the caller's replay target
+    // (the view's fitted size) when known, else the snapshot's own size. Using
+    // the snapshot size when it carries the *host* width — e.g. the resize
+    // branch keeps the host-sized attach snapshot — would poison lastFittedCols
+    // and drive the next refresh to resize the host back and forth.
+    final fittedCols = renderSize?.$2 ?? cols;
+    final fittedRows = renderSize?.$1 ?? rowsVal;
     final rawOutput = _rawOutputFromSnapshot(snapshot);
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
@@ -1381,8 +1402,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.statusColor = exited
           ? const Color(0xff7f8b8d)
           : const Color(0xff7fd1c7);
-      session.lastFittedCols = cols;
-      session.lastFittedRows = rowsVal;
+      session.lastFittedCols = fittedCols;
+      session.lastFittedRows = fittedRows;
       session.inFlightCols = null;
       session.inFlightRows = null;
     });
@@ -1491,7 +1512,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _selectSession(int index) {
     if (index < 0 || index >= _sessions.length) return;
     final session = _sessions[index];
-    final shouldRefresh =
+    // On a session's first load the view-fit handler issues the initial refresh
+    // at the real fitted size; refreshing here too would race it (and use an
+    // estimated size). Only refresh on re-select of an already-fitted session.
+    final canRefresh =
         _client.isConnected &&
         session.isRemote &&
         _sessionIdFor(session) != null;
@@ -1499,8 +1523,24 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.focusCursorOnNextDisplay();
       _selectedIndex = index;
     });
-    if (shouldRefresh) {
+    if (!canRefresh) return;
+    if (session.hasFitted) {
+      // Already fitted: refresh now at the known real size.
       unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+    } else {
+      // Not yet fitted: the first view-fit issues the initial refresh at the
+      // real size; refreshing here too would race it with an estimated size.
+      // Guard against a pane that never reports a fit (zero-size or a reused
+      // pane that skips onViewFit) by refreshing after the frame if it still
+      // hasn't fitted, so the session can't be stranded on stale content.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_disposed &&
+            !session.hasFitted &&
+            identical(_selectedSession, session) &&
+            _client.isConnected) {
+          unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+        }
+      });
     }
   }
 
@@ -1511,6 +1551,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected || !session.isRemote) return;
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
+    // Coalesce concurrent refreshes for the same session: a second one would
+    // clear the terminal and replay history underneath the first, blanking it.
+    if (!_refreshInFlight.add(sessionId)) return;
     try {
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
@@ -1542,6 +1585,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             if (restoredSnapshot != null) {
               finalSnapshot = restoredSnapshot;
             }
+            // restoreSession re-spawns a brand-new daemon actor; our prior
+            // subscription was bound to the old (now shut-down) actor and
+            // receives no further output. Re-subscribe before the fresh attach
+            // so live updates from the revived shell keep flowing.
+            await _resubscribeSessionEvents(sessionId);
             final freshAttachRes = await _client.attachSession(
               sessionId: sessionId,
               clientId: _clientId,
@@ -1564,22 +1612,41 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }
         } else if (replayTargetSize != null &&
             !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+          // Resize the host so its program repaints at our width, but keep the
+          // history-bearing attach snapshot for rendering. The resize response
+          // carries no raw_output (resize snapshots never do), so using it would
+          // make applyHistory clear the terminal and blank it; history replays
+          // at the fitted size client-side anyway.
           try {
-            final resizedSnapshot = _snapshotFromResponse(
-              await _client.resizeSession(
-                sessionId: sessionId,
-                rows: replayTargetSize.$1,
-                cols: replayTargetSize.$2,
-              ),
+            await _client.resizeSession(
+              sessionId: sessionId,
+              rows: replayTargetSize.$1,
+              cols: replayTargetSize.$2,
             );
-            if (resizedSnapshot != null) {
-              finalSnapshot = resizedSnapshot;
-            }
           } catch (_) {}
         }
-        await _applySnapshotToSession(session, sessionId, finalSnapshot);
+        await _applySnapshotToSession(
+          session,
+          sessionId,
+          finalSnapshot,
+          renderSize: replayTargetSize,
+        );
       }
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _refreshInFlight.remove(sessionId);
+    }
+  }
+
+  /// Re-subscribes to a session's events, dropping any stale subscription ids
+  /// for it. Used after a restore, whose new daemon actor leaves the previous
+  /// subscription bound to a shut-down actor that emits nothing further.
+  Future<void> _resubscribeSessionEvents(String sessionId) async {
+    _subscriptionIds.removeWhere((_, sid) => sid == sessionId);
+    final subId = await _client.subscribeSessionEvents(sessionId: sessionId);
+    if (subId.isNotEmpty) {
+      _subscriptionIds[subId] = sessionId;
+    }
   }
 
   String? _sessionIdFor(SessionVm session) {
