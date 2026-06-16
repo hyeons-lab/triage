@@ -131,9 +131,83 @@ After deploying the new app and relaunching it, the daemon log is STILL frozen a
 - **Action: clean restart.** Rebuild release from HEAD (summary_rows e9561a1), install to `~/.cargo/bin/triaged`, `kill` pid 321, start fresh `triaged` (NO --handover) via the Bash tool's `run_in_background: true` (survives; nohup did not). Fresh start loses the wedged live PTYs — unavoidable; the 28 persisted sessions reload as Historical (restorable).
 - **Known nuance (acceptable):** the summary_rows refactor only reads LIVE actors, so on a fresh (non-handover) start, Historical sessions are NOT seeded a snippet until restored→live→produce output. Reasonable (a non-running session isn't "doing" anything). To SEE snippets after restart: start a new session / restore one and run a command → debounce generates a snippet within ~settle.
 
+### BUG + FIX (2026-06-15T16:47-07:00) — dead `Live` sessions are unrestorable after handover
+
+User report: "I can't input into restored sessions anymore" / "side rail says exited with a grey dot" / "I also don't see any snippets" (desktop Flutter client). Investigated against the live daemon (pid 86096, `triaged --handover`, self-updated to this branch's binary at 15:59; log shows a clean handover this time: "Adopting 4 inherited live sessions" + model loaded, no wedge).
+
+Findings:
+- **Root cause of can't-input/grey-exited:** a session whose child process dies while in the `ManagedSession::Live` state is **never** demoted to `Historical` (the only Live→Historical transitions are restore-rollback and the manifest reload on a fresh daemon start). `attach_session` on such a session returns `exited: true` (the actor's `snapshot()` reflects the reaped child), so the client correctly shows grey and gates input on `status == 'attached'` (main.dart:631). The client's recovery path — `restoreSession` — calls `restore_session`, which **requires** `Historical` and bails `"session … is already live or restoring"`; the client swallows that error, so the session is stuck exited/uninputtable until a full daemon restart. Bites exactly the post-handover case: the 4 adopted sessions' shell processes are dead now (none re-parented to launchd; confirmed via `ps`) → dead-`Live` → irrecoverable.
+- **Why no snippets (again):** the running client is pid 88261 = `…/triage/flutter/triage_client/build/macos/Build/Products/Debug/Triage.app` — the **main-checkout Debug build**, no snippet code, never calls `list_session_snippets`. The snippet-capable build was installed to `/Applications/Triage.app` (Release, this branch) but is NOT the one running. Same class of issue as the 2026-06-12 note. Also: snippets only generate for LIVE sessions; with all sessions dead there is nothing to summarize until they are restored→live→produce output.
+
+Fix (daemon, `crates/triaged/src/session.rs`):
+- New `SessionManager::demote_dead_live_session(session_id)` — three-phase (brief lock → off-lock `HistoricalSession::restore` log replay → brief lock swap), mirroring the `summary_rows` off-lock discipline so the multi-MB log replay never runs under the global `sessions` mutex. Converts a dead `Live` session into `Historical` in place; no-op for running/non-Live sessions; leaves the session untouched if the historical rebuild fails.
+- `restore_session` calls it first, so the existing restore path then finds `Historical` and re-spawns normally.
+- Regression test `restore_revives_live_session_whose_process_died`: start a live `/bin/sh`, `exit\n` it, wait for the manager to observe `exited`, assert `restore_session` revives it (was panicking on the "already live" bail before the fix) and accepts input again. Full triaged suite: 85 pass; my code fmt-clean + clippy-clean.
+
+Pre-existing note: `cargo fmt --all --check` flags session.rs:586 (the `seed_initial_summaries` debug log) even with my changes stashed — committed drift, likely a rustfmt-version mismatch from the `rust-toolchain.toml` change on this branch. Not touched here; flag for CI.
+
+NOT YET DONE (pending user confirmation — daemon redeploy is disruptive to the one remaining live session): deploy the rebuilt daemon (`target/release/triaged` + `~/.cargo/bin/triaged`) and move the user onto the snippet-capable client.
+
+### BUG + FIX (2026-06-15T17:04-07:00) — blank terminal on a session's first load (refresh race)
+
+User: "when I tap on a session, the first time I load one, it shows the session, then a blank screen. looks like a race condition." Confirmed root cause: on a session's FIRST load, `_refreshSessionSnapshot` runs twice concurrently — once from `_selectSession` (main.dart) and once from `_onSessionViewFit`'s first-fit branch (gated on `!session.hasFitted`, so it only doubles on first load). Each refresh calls `applyHistory` → `HistoryBytes`, whose reducer does `_sink.clear()` then re-emulates (terminal_store.dart:196). The first refresh renders content; the second clears and replays underneath it — and the second often carries thinner/empty history (e.g. a fresh re-attach vs the restore path's full replay), so the screen goes blank. Only happens once because `hasFitted` is true thereafter.
+
+Fix (client, `flutter/triage_client/lib/main.dart`):
+- `_refreshSessionSnapshot`: per-session in-flight guard (`_refreshInFlight: Set<String>`, add at entry / remove in `finally`) — a second concurrent refresh for the same session returns immediately instead of clobbering the first. Defends against any concurrent trigger (select+fit, double-select, reconnect+select).
+- `_selectSession`: only refresh when `session.hasFitted` — on first load the view-fit handler does the authoritative refresh at the REAL fitted size; refreshing from select too would race it and use an estimated pre-layout size. Re-selecting an already-fitted session still refreshes (its pane is kept alive, so no new fit fires).
+- `flutter analyze lib/main.dart`: clean for the change (2 pre-existing infos at unrelated lines). Rebuilt Release + reinstalled to `/Applications/Triage.app` (pid 4238).
+
+### BUG + FIX #2 (2026-06-15T17:53-07:00) — blank persists: rendering from the history-less resize snapshot
+
+User after fix #1: "it still sometimes shows a blank session. it will show text, then clear it." The in-flight guard removed one race but not the real culprit. Root cause: when the view's fitted size differs from the session's recorded size, `_refreshSessionSnapshot` (and `_loadDaemonSession`) take a resize branch that **replaces the render snapshot with the `resizeSession` response**. The daemon's resize returns the plain `snapshot()` with `raw_output: Vec::new()` (session.rs:2449/3019; attach/Snapshot use `snapshot_with_history()` which DOES carry it — the doc says "Resize broadcasts ... never carry history"). So `_applySnapshotToSession` → `applyHistory([])` → `HistoryBytes([])` → `_sink.clear()` + nothing → the just-rendered content blanks. "Sometimes" = only when fitted size ≠ recorded size. History replays at the fitted size CLIENT-side (`HistoryBytes(cols:_viewCols, rows:_viewRows)`), so the resize snapshot was never needed for sizing — only as a host side-effect.
+
+Fix (client, `main.dart`):
+- `_refreshSessionSnapshot`: resize branch now calls `resizeSession` purely for the host side-effect and KEEPS the history-bearing attach snapshot for rendering (no longer overwrites `finalSnapshot`).
+- `_loadDaemonSession`: the analogous prepared-snapshot swap now only fires when the prepared snapshot actually has `raw_output` — restore path still wins (it has history), resize path no longer blanks.
+- Confirmed the incoming `Snapshot` resize-broadcast EVENT handler already ignores history correctly (tracks size only) — not a blank source.
+- `flutter analyze` clean; rebuilt Release + reinstalled `/Applications/Triage.app` (pid 7267).
+
+### CODE REVIEW (max effort) + FIXES (2026-06-15T20:58-07:00)
+
+Ran `/code-review max` (Workflow: 10 finder angles → dedup → 1-vote verify → sweep → synth; 26 agents, 67 raw → 11 findings). Fixed all 11.
+
+DAEMON (`session.rs`, `demote_dead_live_session`):
+- #3 gate on `is_restorable_shell_launch` BEFORE demoting — a dead non-restorable `Live` session is no longer downgraded/reaped for a restore that bails. New test `restore_does_not_demote_a_non_restorable_dead_live_session` (proves it stays `Live` via an acquirable lease).
+- #7 helper now returns `Result`; `restore_session` propagates with `?` — a confirmed-dead session whose log can't be rebuilt yields a real error instead of the misleading "already live or restoring".
+- #8 only demote on `Ok(snapshot.exited == true)`; a snapshot *error* (actor worker gone, child maybe alive) no longer triggers demote → no orphaned child / duplicate shell.
+- #9 deadness check done OFF-lock via new `request_snapshot(tx)` helper (clone tx under brief lock, round-trip off-lock), mirroring `request_summary_rows`; phase 3 no longer round-trips under the lock.
+- #10 `persist_manifest` after the Live→Historical swap, like every other map mutator.
+- #11 `actor.shutdown()` error now logged instead of `let _ =`.
+
+CLIENT (`main.dart`):
+- #4 `_applySnapshotToSession` gained a `renderSize` param; `_refreshSessionSnapshot` passes `replayTargetSize` so `lastFittedCols/Rows` track the VIEW size, not the host-sized attach snapshot — kills the resize ping-pong (#6 folds in: no more host bounce from polluted `lastFittedCols`).
+- #1 restore branch now calls new `_resubscribeSessionEvents(sessionId)` (drops stale sub ids + re-subscribes) before the fresh attach — live output keeps flowing after a dead session is revived (restore spawns a new actor with an empty subscriber list).
+- #2 `_selectSession` keeps the fitted-size-wins design but adds a post-frame fallback refresh when a selected session never reports a view-fit (zero-size / reused pane), so it can't be stranded on stale content.
+- #5 `_applySnapshotToSession` bails if the `SessionVm` was disposed/replaced mid-await (`!_sessions.contains(session)`) — no use-after-dispose when a reconnect swaps the same-id object.
+
+Daemon: 85 tests pass, clippy clean, fmt clean (mine; pre-existing 586 drift untouched). Client: `flutter analyze` clean (2 pre-existing infos). Rebuilt + reinstalled `/Applications/Triage.app` (pid 26549).
+
+### ROOT-CAUSE FIX (2026-06-15T21:11-07:00) — handover was killing every session
+
+User: "the handover still kills all sessions. any way we can make it seamless?" This is the long-running mystery (sessions die after a self-update handover; confirmed via `ps` that adopted shells were gone even though the daemon held their PTY masters).
+
+Root cause: `ipc.rs` handover Phase-3 teardown called `manager.clear_all_live_sessions()`, which sends each actor `ActorCommand::Shutdown` → `shutdown()` → **`child.kill()`**. The old daemon was SIGKILLing the very shell processes it had just handed over. The PTY *masters* survive (the successor dup'd them via SCM_RIGHTS), so it's not a SIGHUP-on-master-close — the old daemon actively kills the shared child PIDs. Then it `process::exit(0)`s anyway, so the "cleanup" was pure destruction. `process::exit(0)` skips `Drop`, so nothing else needed to run.
+
+Fix (daemon):
+- New `SessionActor::detach(self)` — drops the worker/reader join handles WITHOUT sending shutdown and WITHOUT `child.kill()`, so the worker thread keeps owning the live child until `process::exit` (the OS then reaps threads/fds; the child, reparented to launchd, lives on under the successor's master fd).
+- New `SessionManager::detach_all_live_sessions()` — drains the map and detaches each live actor. Handover-safe counterpart to the old kill path.
+- `ipc.rs` Phase-3 now calls `detach_all_live_sessions()` instead of `clear_all_live_sessions()`.
+- Removed the now-dead `clear_all_live_sessions()` (no remaining callers).
+- Strengthened `handover_tests::test_zero_downtime_session_serialization_and_adoption`: after adopting into the successor, call the old manager's teardown (`detach_all_live_sessions`) and assert the adopted session is still `!exited` — the shared child survived. (With the old kill path this would fail.)
+
+Daemon: 85 tests pass, clippy clean. DEPLOYMENT CAVEAT: the currently-running daemon still has the OLD (killing) teardown, so the ONE handover that deploys this fix will still tear down current sessions a final time; every handover AFTER that is seamless. Minor residual: a sub-ms reader race during the handover window (both daemons briefly read the master) — negligible for an idle session, not addressed.
+
 ## Commits
 
 - b0662c5 — feat: local-LLM session snippets in the side rail via cera (LFM2.5)
 - 94a3374 — fix(triaged): seed snippets for sessions adopted on handover
 - e9561a1 — perf(triaged): off-lock cheap visible-rows snapshot for summarizer
-- HEAD — fix(client): forward session_snippet_updated push to the rail
+- 4b96d10 — fix(client): forward session_snippet_updated push to the rail
+- ff5573d — fix(client): stop blank terminals and first-load refresh races
+- f05f8c6 — fix(triaged): keep sessions alive on restore and across handover
+- HEAD — docs(devlog): record restore-revive, handover-detach, and client render fixes
