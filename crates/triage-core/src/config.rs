@@ -387,7 +387,7 @@ impl Default for SummarizerConfig {
             quant: "Q4_0".to_string(),
             context_size: 1024,
             max_tokens: 24,
-            detail_max_tokens: 110,
+            detail_max_tokens: 180,
             settle_ms: 1500,
             min_regen_ms: 5000,
             cache_dir: None,

@@ -9,31 +9,40 @@
 //! once. The model is downloaded + loaded lazily on the first job, so enabling
 //! the summarizer never blocks daemon startup.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
+use cera::manifest::GenerationDefaults;
 use cera::session::{FinishReason, ModalitySink};
 use cera::tokenizer::{BpeTokenizer, ChatMessage};
-use triage_core::session::SessionId;
+use triage_core::session::{SessionContext, SessionId};
 
 /// Instruction given to the model. Kept terse; the model only needs to label.
 const SYSTEM_PROMPT: &str = "You label terminal sessions. Reply with a terse description of what \
 the session is doing, at most 8 words, no trailing punctuation, no quotes. Output only the label.";
 
 /// Instruction for the longer-form detail summary shown in the hover popover and
-/// used as the future session-search corpus. Allows a few sentences.
-const DETAIL_SYSTEM_PROMPT: &str = "You summarize terminal sessions. In two or three short \
-sentences, describe what the session is doing: the task, any commands run, and the current state \
-(e.g. building, tests passing/failing, an error, waiting at a prompt). Be concrete and factual. \
-No markdown, no quotes, no preamble — output only the summary.";
+/// used as the future session-search corpus. The repo/branch/worktree the
+/// session lives in are prepended deterministically by [`generate_detail`] (the
+/// model can't see them and must not invent them), so this prompt only asks for
+/// the activity. Length is generous — enough sentences to localize the user.
+const DETAIL_SYSTEM_PROMPT: &str = "You summarize terminal sessions so a developer can tell which \
+of many sessions this is and what it needs. Describe what the session is doing: the task, the \
+commands or tools running, the files or components involved, and the current state (building, \
+tests passing/failing, an error and its message, or waiting at a prompt for input). Use as many \
+short sentences as the activity needs — up to about five — but no filler. Be concrete and factual; \
+prefer specifics (command names, file paths, error text) over generalities. Do not guess the git \
+repository, branch, or directory. No markdown, no quotes, no preamble — output only the summary.";
 
 /// Hard cap on the sanitized snippet length (characters).
 const MAX_SNIPPET_CHARS: usize = 60;
 /// Hard cap on the sanitized snippet length (words).
 const MAX_SNIPPET_WORDS: usize = 8;
 
-/// Hard cap on the sanitized detail summary length (characters).
-const MAX_DETAIL_CHARS: usize = 280;
+/// Hard cap on the sanitized detail summary length (characters). Applies only
+/// to the model-written activity portion; the deterministic context header is
+/// prepended afterwards and is never truncated.
+const MAX_DETAIL_CHARS: usize = 480;
 
 /// Runtime parameters for the summarizer worker. Built from the daemon config.
 #[derive(Debug, Clone)]
@@ -53,6 +62,10 @@ pub struct SummarizeJob {
     pub session_id: SessionId,
     pub prompt_text: String,
     pub output_seq: u64,
+    /// Git context (repo/branch/worktree) for this session, used to build the
+    /// deterministic localization header on the detail summary. `None` when the
+    /// session isn't inside a git repo.
+    pub context: Option<SessionContext>,
 }
 
 /// A produced snippet, delivered to the `on_result` callback on the worker thread.
@@ -153,7 +166,12 @@ fn run_worker(
                     // Second, longer-form pass for the hover popover / search.
                     // Failures here are non-fatal: emit the one-liner with no
                     // detail rather than dropping the result entirely.
-                    let detail = match generate_detail(engine, &config, &job.prompt_text) {
+                    let detail = match generate_detail(
+                        engine,
+                        &config,
+                        &job.prompt_text,
+                        job.context.as_ref(),
+                    ) {
                         Ok(detail) => detail,
                         Err(error) => {
                             tracing::warn!(
@@ -236,6 +254,9 @@ fn generate_one_line(
     session.append_text(&rendered)?;
 
     let mut sink = OneLineSink::new(engine.tokenizer());
+    // The one-line label stays greedy (temperature 0) regardless of the model's
+    // manifest sampling params, so the terse rail label is stable across
+    // regenerations. The detail pass honours the manifest params instead.
     let opts = cera::GenerateOpts {
         max_tokens: config.max_tokens,
         temperature: 0.0,
@@ -247,11 +268,14 @@ fn generate_one_line(
 }
 
 /// Runs one inference for the longer-form detail summary and returns it
-/// sanitized, or `None` if the model produced nothing usable.
+/// sanitized, with a deterministic `repo · branch · worktree` header prepended
+/// so the reader can localize the session at a glance. Returns `None` only when
+/// neither the model nor the git context produced anything usable.
 fn generate_detail(
     engine: &cera::CeraEngine,
     config: &SummarizerConfig,
     prompt_text: &str,
+    context: Option<&SessionContext>,
 ) -> anyhow::Result<Option<String>> {
     let mut session = engine.new_session(cera::SessionConfig::default());
     let messages = [
@@ -268,14 +292,90 @@ fn generate_detail(
     session.append_text(&rendered)?;
 
     let mut sink = DetailSink::new(engine.tokenizer());
-    let opts = cera::GenerateOpts {
-        max_tokens: config.detail_max_tokens,
+    let opts = sampling_opts(engine, config.detail_max_tokens);
+    session.generate(&opts, &mut sink)?;
+
+    let header = context.and_then(context_header);
+    let summary = sanitize_detail(&sink.text);
+    Ok(match (header, summary) {
+        (Some(header), Some(summary)) => Some(format!("{header}\n{summary}")),
+        (Some(header), None) => Some(header),
+        (None, summary) => summary,
+    })
+}
+
+/// Builds [`GenerateOpts`] for the detail-summary pass. Starts from cera's
+/// defaults, then — when the loaded model is a text bundle whose LeapBundles
+/// manifest ships advisory `sampling_parameters` — applies the model's own
+/// recommended temperature / top-p / top-k / repetition-penalty. Falls back to
+/// deterministic greedy decoding (temperature 0) when the manifest specifies no
+/// sampling params (e.g. a bare GGUF or a non-text inference type). The one-line
+/// label deliberately does not use this — it stays greedy for a stable rail.
+fn sampling_opts(engine: &cera::CeraEngine, max_tokens: u32) -> cera::GenerateOpts {
+    let mut opts = cera::GenerateOpts {
+        max_tokens,
         temperature: 0.0,
         ..Default::default()
     };
-    session.generate(&opts, &mut sink)?;
+    if let GenerationDefaults::Text {
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        ..
+    } = &engine.manifest().generation_defaults
+    {
+        if let Some(temperature) = temperature {
+            opts.temperature = *temperature;
+        }
+        if let Some(top_p) = top_p {
+            opts.top_p = *top_p;
+        }
+        if let Some(top_k) = top_k {
+            opts.top_k = *top_k;
+        }
+        if let Some(repetition_penalty) = repetition_penalty {
+            opts.repetition_penalty = *repetition_penalty;
+        }
+    }
+    opts
+}
 
-    Ok(sanitize_detail(&sink.text))
+/// Deterministic `repo · branch · worktree` localization header that leads the
+/// detail summary. Mirrors the side-rail meta line: omits absent parts, hides
+/// the worktree leaf when it's the repo root itself or merely echoes the branch.
+/// Returns `None` when no part is known.
+fn context_header(context: &SessionContext) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(repo) = context.repository_root.as_deref().and_then(leaf_name) {
+        parts.push(repo);
+    }
+    let branch = context
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty());
+    if let Some(branch) = branch {
+        parts.push(branch.to_string());
+    }
+    let worktree_leaf = context.worktree_root.as_deref().and_then(|worktree| {
+        if Some(worktree) == context.repository_root.as_deref() {
+            None
+        } else {
+            leaf_name(worktree)
+        }
+    });
+    if let Some(worktree) = worktree_leaf
+        && Some(worktree.as_str()) != branch
+    {
+        parts.push(worktree);
+    }
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
+}
+
+/// Last path component as a display string, or `None` for a rootless path.
+fn leaf_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// A [`ModalitySink`] that accumulates all decoded text (multi-line). Used for
@@ -496,6 +596,11 @@ mod tests {
             session_id: SessionId::new("e2e").unwrap(),
             prompt_text: prompt,
             output_seq: 1,
+            context: Some(SessionContext {
+                repository_root: Some("/home/dev/triage".into()),
+                worktree_root: Some("/home/dev/triage/worktrees/feat-summary".into()),
+                branch: Some("feat/summary".to_string()),
+            }),
         }));
 
         // First call downloads the model, so allow a generous timeout.
@@ -503,11 +608,50 @@ mod tests {
             .recv_timeout(Duration::from_secs(600))
             .expect("a snippet within timeout");
         eprintln!("GENERATED SNIPPET: {:?}", result.text);
+        eprintln!("GENERATED DETAIL: {:?}", result.detail);
         assert!(!result.text.is_empty(), "snippet should be non-empty");
         assert!(
             result.text.split_whitespace().count() <= MAX_SNIPPET_WORDS,
             "snippet should respect the word cap: {:?}",
             result.text
+        );
+        // The detail must lead with the deterministic localization header.
+        let detail = result.detail.expect("detail summary present");
+        assert!(
+            detail.starts_with("triage  ·  feat/summary  ·  feat-summary"),
+            "detail should lead with the repo/branch/worktree header: {detail:?}"
+        );
+    }
+
+    #[test]
+    fn context_header_mirrors_the_side_rail_meta_line() {
+        // Linked worktree: all three parts, worktree leaf distinct from branch.
+        let header = context_header(&SessionContext {
+            repository_root: Some("/home/dev/triage".into()),
+            worktree_root: Some("/home/dev/triage/worktrees/feat-summary".into()),
+            branch: Some("feat/summary".to_string()),
+        });
+        assert_eq!(
+            header.as_deref(),
+            Some("triage  ·  feat/summary  ·  feat-summary")
+        );
+
+        // Working in the repo root itself: worktree leaf is hidden.
+        let header = context_header(&SessionContext {
+            repository_root: Some("/home/dev/triage".into()),
+            worktree_root: Some("/home/dev/triage".into()),
+            branch: Some("main".to_string()),
+        });
+        assert_eq!(header.as_deref(), Some("triage  ·  main"));
+
+        // No git context at all: no header.
+        assert_eq!(
+            context_header(&SessionContext {
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            }),
+            None
         );
     }
 }
