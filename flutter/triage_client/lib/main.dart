@@ -1914,6 +1914,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   Future<void> _closeSession(SessionVm session) async {
+    final confirmed = await _confirmCloseSession(session);
+    if (confirmed != true) return;
+
     final sessionId = session.remoteSessionId;
 
     if (_client.isConnected && sessionId != null) {
@@ -1923,6 +1926,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         debugPrint('Failed to shutdown session: ${e.toString()}');
       }
     }
+
+    // The dialog and shutdown RPC both await; the State may have been disposed
+    // in the meantime, so guard setState to avoid throwing on a dead widget.
+    if (!mounted) return;
 
     setState(() {
       final index = _sessions.indexOf(session);
@@ -1935,6 +1942,63 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       }
     });
+  }
+
+  Future<bool?> _confirmCloseSession(SessionVm session) {
+    return showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.55),
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xff161b1d),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xff2a3437)),
+          ),
+          title: const Text(
+            'Close session?',
+            style: TextStyle(
+              color: Color(0xffcdd7d6),
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          content: Text(
+            session.isRemote
+                ? 'This ends the terminal session "${session.title}" and its '
+                      'running processes. This cannot be undone.'
+                : 'This closes the terminal session "${session.title}". This '
+                      'cannot be undone.',
+            style: const TextStyle(color: Color(0xff9aa6a8), height: 1.4),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xff7f8b8d),
+              ),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xffb3443f),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 12,
+                ),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: const Text('Close session'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
