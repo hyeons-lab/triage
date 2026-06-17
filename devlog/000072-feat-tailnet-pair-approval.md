@@ -133,6 +133,31 @@ accessors recovered from poisoning via `into_inner()` instead of `expect`, so a
 prior panic can't crash pairing. (3) README tailnet config snippet now uses a
 `100.x.y.z` Tailscale-IP bind instead of `0.0.0.0`, matching the caveat below it.
 
+2026-06-17T08:57-0700 Addressed a max-effort multi-agent review (15 findings) of
+the branch. Code (`ws.rs`): negative (`None`) whois results now use a 1s TTL
+(`WHOIS_NEGATIVE_CACHE_TTL`) vs the 10s positive TTL, so a transient failure
+can't lock out a legit user; `cached_login` returns a named `CacheLookup` enum
+instead of `Option<Option<String>>`; `resolve_login` split into a thin wrapper +
+testable `resolve_login_with(lookup)` that owns the cache/semaphore orchestration;
+cache eviction guards updates of existing keys and evicts overflow in one sorted
+pass (was an O(n²) `min_by_key` loop); `whois_addr_arg` reuses `mapped_ipv4`;
+`tailnet_login_is_allowed` hard-rejects the `tagged-devices` pseudo-login;
+startup warns when the allowlist is set but `tailscale` isn't runnable or the
+bind is unspecified; the misleading "at most one subprocess" comment corrected.
+Config (`config.rs`): new `remote.pair_approval_trust_local_peers` (default true)
+to disable loopback/same-host auto-approval behind a reverse proxy, validated to
+require a non-empty allowlist; validation rejects `tagged-devices`. New tests for
+the resolver orchestration, the real `tailscale_whois_login` subprocess path,
+the trust toggle, the tagged-devices guard, negative TTL, and the require_pairing
+fixture coupling. README documents the new option and behaviors.
+
+2026-06-17T08:57-0700 Deferred (not bug-fixes): finding #15 (re-architect
+tailnet authz into a shared `WebSocketAuthenticator`/peer-identity layer rather
+than a `/pair`-only gate) is a design-direction item, intentionally not bundled
+into this review-fix pass to avoid a risky cross-cutting refactor. Finding #1
+(loopback reverse-proxy trust) is now enforceable in code via the new toggle
+rather than README-only.
+
 ## Research & Discoveries
 
 - Gate computed sync at `ws.rs:43` (`is_local_pairing_peer`) before `tokio::spawn`,
@@ -153,7 +178,15 @@ prior panic can't crash pairing. (3) README tailnet config snippet now uses a
 Unix socket bind permissions in macOS tempdir for existing IPC/handover tests.
 Reran the same command outside the sandbox and it passed.
 
+2026-06-17T08:57-0700 Review finding "0.0.0.0 makes a routable peer look
+same-host" was investigated and refuted — `is_unspecified_ip` short-circuits the
+same-host branch for an unspecified listener (test
+`local_pairing_peer_rejects_remote_peer_on_concrete_or_wildcard_listener`), so no
+fix was needed there. The IPv4-mapped-unspecified asymmetry is not reachable by a
+real accepted peer, so it was not changed.
+
 ## Commits
 
 8a41b8c — feat(triaged): tailnet identity pair approval
-HEAD — fix(triaged): enforce whois cache cap and harden pairing per PR review
+9265110 — fix(triaged): enforce whois cache cap and harden pairing per PR review
+HEAD — fix(triaged): address max-effort review (negative-cache TTL, trust-local toggle, tagged-devices guard, single-pass eviction, startup warnings)

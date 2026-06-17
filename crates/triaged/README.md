@@ -146,13 +146,20 @@ that may open `/pair`:
 bind = "100.x.y.z:7777"
 require_pairing = true
 pair_approval_tailnet_users = ["you@example.com"]
+# Optional. Set false when a loopback reverse proxy fronts the daemon, so
+# forwarded requests are NOT auto-trusted as local and must pass the allowlist.
+# pair_approval_trust_local_peers = false
 ```
 
 When a non-local peer requests `/pair`, `triaged` runs
 `tailscale whois --json <peer-ip>:<peer-port>` on the daemon host, reads
 `UserProfile.LoginName`, and compares it with the allowlist. If the `tailscale`
 CLI is missing, the lookup times out, or the login is not allowlisted, `/pair`
-remains unavailable to that peer.
+remains unavailable to that peer. A successful lookup is cached per peer IP for
+a few seconds; a *failed* lookup is cached only briefly, so a transient
+`tailscale` hiccup won't lock out a legitimate user for long. `triaged` logs a
+startup warning if the allowlist is set but `tailscale` isn't runnable, or if it
+is bound to an unspecified address.
 
 > **Security caveats for tailnet approval.** Identity is derived from the
 > peer's TCP connection, so deploy accordingly:
@@ -160,12 +167,17 @@ remains unavailable to that peer.
 > - **Bind to the tailnet interface, not `0.0.0.0`.** With an all-interfaces
 >   bind the daemon trusts the connection's source IP as the identity input;
 >   bind to the host's Tailscale IP (e.g. `bind = "100.x.y.z:7777"`) so only
->   traffic that actually arrives over tailscale can reach `/pair`.
-> - **A loopback reverse proxy bypasses the check.** `triaged` terminates no
->   TLS, so an HTTPS reverse proxy forwards over loopback — every proxied
->   request then looks like a same-host connection and is approved regardless
->   of origin or tailnet identity. Do not expose `/pair` through a reverse
->   proxy unless the proxy enforces the same identity allowlist itself.
+>   traffic that actually arrives over tailscale can reach `/pair`. `triaged`
+>   warns at startup when an allowlist is configured on an unspecified bind.
+> - **A loopback reverse proxy bypasses the local-peer check.** `triaged`
+>   terminates no TLS, so an HTTPS reverse proxy forwards over loopback — every
+>   proxied request then looks like a same-host connection. By default such
+>   peers are auto-approved; set `pair_approval_trust_local_peers = false` so
+>   that even loopback peers must pass the tailnet allowlist (the proxy must
+>   then forward genuine tailnet source IPs, or enforce the allowlist itself).
+> - **Tagged nodes share one identity.** Tailscale reports every tag-owned
+>   (non-user) node with the synthetic login `tagged-devices`, so it is rejected
+>   from the allowlist — list real user logins, not shared/service identities.
 > - **Allowlisted identities can self-approve.** An allowlisted device can both
 >   request *and* approve its own pairing, so list only identities you trust to
 >   authorize new devices — the allowlist replaces, it does not add to, the
