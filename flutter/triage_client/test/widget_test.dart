@@ -1333,4 +1333,107 @@ void main() {
       );
     },
   );
+
+  group('parseDaemonAddress', () {
+    test('bare host or IPv4 -> ws://host:7777/ws', () {
+      expect(
+        parseDaemonAddress('100.64.2.7').toString(),
+        'ws://100.64.2.7:7777/ws',
+      );
+      expect(
+        parseDaemonAddress('  my-mac.tailnet  ').toString(),
+        'ws://my-mac.tailnet:7777/ws',
+      );
+    });
+
+    test('host:port keeps the port', () {
+      expect(
+        parseDaemonAddress('192.168.1.5:7777').toString(),
+        'ws://192.168.1.5:7777/ws',
+      );
+      expect(
+        parseDaemonAddress('host.local:9000').toString(),
+        'ws://host.local:9000/ws',
+      );
+    });
+
+    test('full URLs normalize scheme/port/path', () {
+      expect(parseDaemonAddress('ws://h:7777/ws').toString(), 'ws://h:7777/ws');
+      expect(
+        parseDaemonAddress('wss://my-mac.tailnet:7777').toString(),
+        'wss://my-mac.tailnet:7777/ws',
+      );
+      expect(parseDaemonAddress('http://h').toString(), 'ws://h:7777/ws');
+      expect(
+        parseDaemonAddress('https://h:8443/ws').toString(),
+        'wss://h:8443/ws',
+      );
+    });
+
+    test('full URLs preserve query and fragment', () {
+      expect(
+        parseDaemonAddress('https://host/ws?token=abc123').toString(),
+        'wss://host:7777/ws?token=abc123',
+      );
+      expect(
+        parseDaemonAddress('wss://host:8443/path?a=1&b=2#frag').toString(),
+        'wss://host:8443/path?a=1&b=2#frag',
+      );
+    });
+
+    test('bracketed IPv6 literal', () {
+      expect(parseDaemonAddress('[::1]:7777').toString(), 'ws://[::1]:7777/ws');
+    });
+
+    test('invalid input -> null', () {
+      expect(parseDaemonAddress(''), isNull);
+      expect(parseDaemonAddress('   '), isNull);
+      expect(parseDaemonAddress('host:notaport'), isNull);
+      expect(parseDaemonAddress('host:99999'), isNull);
+      expect(parseDaemonAddress('ftp://host'), isNull);
+    });
+  });
+
+  testWidgets('first run shows the connection screen when no address is set', (
+    WidgetTester tester,
+  ) async {
+    // No injected client and no saved address → the app must prompt for a host
+    // instead of auto-connecting.
+    await tester.pumpWidget(const TriageClientApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('Connect to a Triage daemon'), findsOneWidget);
+    expect(find.text('Daemon address'), findsOneWidget);
+    expect(find.text('Connect'), findsOneWidget);
+  });
+
+  testWidgets('connection form validates input and submits the raw address', (
+    WidgetTester tester,
+  ) async {
+    String? submitted;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConnectionSettingsForm(onSubmit: (raw) => submitted = raw),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'myhost:abc');
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text(
+        'Enter a valid host, host:port, or ws://, wss://, http://, or https:// URL.',
+      ),
+      findsOneWidget,
+    );
+    expect(submitted, isNull);
+
+    await tester.enterText(find.byType(TextField), '192.168.1.5:7777');
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    expect(submitted, '192.168.1.5:7777');
+  });
 }

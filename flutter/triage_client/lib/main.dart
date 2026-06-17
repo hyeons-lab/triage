@@ -3,7 +3,7 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform, visibleForTesting;
+    show TargetPlatform, defaultTargetPlatform, kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,10 +22,95 @@ void main() async {
   // Restore the persisted client id / pairing token from secure storage before
   // the first frame so the app can reconnect without re-pairing on each launch.
   await loadCredentials();
-  runApp(const TriageClientApp());
+  // Restore the saved daemon address so we auto-connect (or, on first run, show
+  // the connection screen).
+  final savedAddress = await loadDaemonAddress();
+  runApp(TriageClientApp(initialDaemonAddress: savedAddress));
 }
 
 const int _defaultDaemonPort = 7777;
+
+/// shared_preferences key holding the raw daemon address the user entered.
+const String _daemonAddressPrefKey = 'daemon_address_v1';
+
+/// Parses a user-entered daemon address into a WebSocket [Uri], or null if it
+/// can't be normalized. Accepts a bare host/IP (`host` → `ws://host:7777/ws`),
+/// `host:port`, a bracketed IPv6 literal (`[::1]:7777`), or a full
+/// `ws://`/`wss://`/`http://`/`https://` URL (http→ws, https→wss; path defaults
+/// to `/ws`, port to 7777).
+@visibleForTesting
+Uri? parseDaemonAddress(String input) {
+  final raw = input.trim();
+  if (raw.isEmpty) return null;
+
+  final hasScheme = RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://').hasMatch(raw);
+  if (hasScheme) {
+    final parsed = Uri.tryParse(raw);
+    if (parsed == null || parsed.host.isEmpty) return null;
+    final scheme = switch (parsed.scheme.toLowerCase()) {
+      'ws' || 'http' => 'ws',
+      'wss' || 'https' => 'wss',
+      _ => null,
+    };
+    if (scheme == null) return null;
+    final port = parsed.hasPort ? parsed.port : _defaultDaemonPort;
+    final path = (parsed.path.isEmpty || parsed.path == '/') ? '/ws' : parsed.path;
+    return Uri(
+      scheme: scheme,
+      host: parsed.host,
+      port: port,
+      path: path,
+      query: parsed.hasQuery ? parsed.query : null,
+      fragment: parsed.hasFragment ? parsed.fragment : null,
+    );
+  }
+
+  String host;
+  var port = _defaultDaemonPort;
+  final bracketedV6 = RegExp(r'^\[([^\]]+)\](?::(\d+))?$').firstMatch(raw);
+  if (bracketedV6 != null) {
+    host = bracketedV6.group(1)!;
+    final portStr = bracketedV6.group(2);
+    if (portStr != null) {
+      final p = int.tryParse(portStr);
+      if (p == null || p < 1 || p > 65535) return null;
+      port = p;
+    }
+  } else {
+    final colons = ':'.allMatches(raw).length;
+    if (colons == 1) {
+      final idx = raw.indexOf(':');
+      host = raw.substring(0, idx);
+      final p = int.tryParse(raw.substring(idx + 1));
+      if (p == null || p < 1 || p > 65535) return null;
+      port = p;
+    } else {
+      // 0 colons → host/IPv4; 2+ colons → bare IPv6 literal (default port).
+      host = raw;
+    }
+  }
+  if (host.isEmpty) return null;
+  return Uri(scheme: 'ws', host: host, port: port, path: '/ws');
+}
+
+/// Loads the saved raw daemon address, or null if none / on error.
+Future<String?> loadDaemonAddress() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString(_daemonAddressPrefKey);
+    return (value != null && value.trim().isNotEmpty) ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Persists the raw daemon address the user entered. Best-effort.
+Future<void> saveDaemonAddress(String address) async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_daemonAddressPrefKey, address);
+  } catch (_) {}
+}
 const double _sessionRailCollapsedWidth = 72;
 const double _sessionRailExpandedWidth = 320;
 const Duration _sessionRailAnimationDuration = Duration(milliseconds: 220);
@@ -47,9 +132,12 @@ Uri defaultWebSocketUriForBase(Uri base) {
 }
 
 class TriageClientApp extends StatelessWidget {
-  const TriageClientApp({super.key, this.client});
+  const TriageClientApp({super.key, this.client, this.initialDaemonAddress});
 
   final TriageWebSocketClient? client;
+  // Raw saved daemon address (host/IP/URL) restored at startup. Null on first
+  // run → the connection screen is shown instead of auto-connecting.
+  final String? initialDaemonAddress;
 
   @override
   Widget build(BuildContext context) {
@@ -64,7 +152,10 @@ class TriageClientApp extends StatelessWidget {
         fontFamily: 'Segoe UI',
         scaffoldBackgroundColor: const Color(0xff101416),
       ),
-      home: TriageHome(client: client),
+      home: TriageHome(
+        client: client,
+        initialDaemonAddress: initialDaemonAddress,
+      ),
     );
   }
 }
@@ -271,9 +362,10 @@ class _PendingHistory {
 }
 
 class TriageHome extends StatefulWidget {
-  const TriageHome({super.key, this.client});
+  const TriageHome({super.key, this.client, this.initialDaemonAddress});
 
   final TriageWebSocketClient? client;
+  final String? initialDaemonAddress;
 
   @override
   State<TriageHome> createState() => _TriageHomeState();
@@ -298,6 +390,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   DateTime? _pairingExpiresAt;
   String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
+  // Resolved daemon WebSocket URI + the raw address the user entered. Null until
+  // a saved/entered address is resolved (then the connection screen is shown).
+  Uri? _daemonUri;
+  String? _daemonAddressRaw;
+  // True when there is no daemon address yet (first run, native) — render the
+  // connection screen instead of auto-connecting.
+  bool _needsConnectionConfig = false;
   String _connectionStatus = 'Offline (Local Mock)';
   Color _connectionStatusColor = const Color(0xff7f8b8d);
   late final String _clientId;
@@ -442,8 +541,56 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (isMockMode) {
       _connectionStatus = 'Offline (Local Mock)';
       _connectionStatusColor = const Color(0xff7f8b8d);
-    } else {
+    } else if (widget.client != null) {
+      // Injected client (tests) connects directly, bypassing address config.
       _connectWebSocket();
+    } else {
+      // Resolve the saved daemon address. With one, auto-connect; on first run
+      // (native) show the connection screen so the user picks a host. Web is
+      // served by the daemon, so derive the URL from the page and connect.
+      final raw = widget.initialDaemonAddress;
+      final uri = raw == null ? null : parseDaemonAddress(raw);
+      if (uri != null) {
+        _daemonUri = uri;
+        _daemonAddressRaw = raw;
+        _connectWebSocket();
+      } else if (kIsWeb) {
+        _connectWebSocket();
+      } else {
+        _needsConnectionConfig = true;
+        _connectionStatus = 'Not connected';
+      }
+    }
+  }
+
+  /// Applies a new daemon address: persists it, then tears down any existing
+  /// connection and reconnects to the new host. Called from the connection
+  /// screen / settings dialog after the input validates.
+  Future<void> _applyDaemonAddress(String raw) async {
+    final uri = parseDaemonAddress(raw);
+    if (uri == null) return;
+    await saveDaemonAddress(raw);
+    if (!mounted) return;
+    setState(() {
+      _daemonUri = uri;
+      _daemonAddressRaw = raw;
+      _needsConnectionConfig = false;
+      _needsPairing = false;
+      _reconnectAttempt = 0;
+    });
+    // _connectWebSocket bumps the generation and disconnects any prior client.
+    _connectWebSocket();
+  }
+
+  /// Opens the connection settings dialog (gear icon / connect-failure action).
+  Future<void> _openConnectionSettings() async {
+    final raw = await showDialog<String>(
+      context: context,
+      builder: (context) =>
+          ConnectionSettingsDialog(initialAddress: _daemonAddressRaw),
+    );
+    if (raw != null && raw.trim().isNotEmpty) {
+      await _applyDaemonAddress(raw.trim());
     }
   }
 
@@ -778,7 +925,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
 
     final client =
-        widget.client ?? TriageWebSocketClient(_defaultWebSocketUri());
+        widget.client ??
+        TriageWebSocketClient(_daemonUri ?? _defaultWebSocketUri());
     _client = client;
     _clientInitialized = true;
 
@@ -2003,6 +2151,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (_needsConnectionConfig) {
+      return Scaffold(
+        body: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConnectionSettingsForm(
+              initialAddress: _daemonAddressRaw,
+              submitLabel: 'Connect',
+              title: 'Connect to a Triage daemon',
+              subtitle:
+                  'Enter the host, IP, or URL of the device running triaged. '
+                  'For example 100.64.2.7, 192.168.1.5:7777, or '
+                  'wss://my-mac.tailnet:7777.',
+              onSubmit: (raw) => _applyDaemonAddress(raw),
+            ),
+          ),
+        ),
+      );
+    }
+
     if (_needsPairing) {
       return Scaffold(
         body: Center(
@@ -2069,6 +2237,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               ),
               connectionStatus: _connectionStatus,
               connectionStatusColor: _connectionStatusColor,
+              onOpenSettings: _openConnectionSettings,
               isCollapsed: _sidebarCollapsed,
               onToggleCollapse: () {
                 setState(() {
@@ -2139,6 +2308,7 @@ class SessionRail extends StatelessWidget {
     required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
+    required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
   });
@@ -2153,6 +2323,7 @@ class SessionRail extends StatelessWidget {
   final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
+  final VoidCallback onOpenSettings;
   final bool isCollapsed;
   final VoidCallback onToggleCollapse;
 
@@ -2228,7 +2399,13 @@ class SessionRail extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 8),
+          IconButton(
+            onPressed: onOpenSettings,
+            tooltip: 'Connection settings',
+            icon: const Icon(Icons.settings, color: Color(0xff7f8b8d), size: 20),
+          ),
+          const SizedBox(height: 12),
           const Divider(height: 1, color: Color(0xff263033)),
           const SizedBox(height: 8),
           Expanded(
@@ -2290,11 +2467,13 @@ class SessionRail extends StatelessWidget {
             children: [
               const Icon(Icons.terminal, size: 24, color: Color(0xff7fd1c7)),
               const SizedBox(width: 10),
-              const Text(
-                'Triage',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+              const Expanded(
+                child: Text(
+                  'Triage',
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+                ),
               ),
-              const SizedBox(width: 6),
               IconButton(
                 onPressed: onToggleCollapse,
                 tooltip: 'Minimize sidebar',
@@ -2306,7 +2485,19 @@ class SessionRail extends StatelessWidget {
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
               ),
-              const Spacer(),
+              const SizedBox(width: 4),
+              IconButton(
+                onPressed: onOpenSettings,
+                tooltip: 'Connection settings',
+                icon: const Icon(
+                  Icons.settings,
+                  color: Color(0xff7f8b8d),
+                  size: 20,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
+              const SizedBox(width: 4),
               _NewSessionMenu(
                 selectedShell: selectedShell,
                 shellOptions: shellOptions,
@@ -2318,9 +2509,15 @@ class SessionRail extends StatelessWidget {
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
-          child: _ConnectionStatus(
-            status: connectionStatus,
-            color: connectionStatusColor,
+          // Tapping the status opens connection settings — the recovery path
+          // when a connect attempt fails.
+          child: InkWell(
+            onTap: onOpenSettings,
+            borderRadius: BorderRadius.circular(8),
+            child: _ConnectionStatus(
+              status: connectionStatus,
+              color: connectionStatusColor,
+            ),
           ),
         ),
         const SizedBox(height: 18),
@@ -2402,6 +2599,170 @@ class _ConnectionStatus extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Modal wrapper around [ConnectionSettingsForm]. Pops with the entered raw
+/// address (or null if cancelled).
+class ConnectionSettingsDialog extends StatelessWidget {
+  const ConnectionSettingsDialog({super.key, this.initialAddress});
+
+  final String? initialAddress;
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: const Color(0xff161b1d),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: ConnectionSettingsForm(
+            initialAddress: initialAddress,
+            submitLabel: 'Connect',
+            title: 'Connection settings',
+            subtitle:
+                'Host, IP, or URL of the device running triaged (e.g. '
+                '100.64.2.7 or 192.168.1.5:7777).',
+            onCancel: () => Navigator.of(context).pop(),
+            onSubmit: (raw) => Navigator.of(context).pop(raw),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Smart single-field form for the daemon address. Validates input with
+/// [parseDaemonAddress] and calls [onSubmit] with the raw (un-normalized) text
+/// so the caller can persist exactly what the user typed.
+class ConnectionSettingsForm extends StatefulWidget {
+  const ConnectionSettingsForm({
+    super.key,
+    required this.onSubmit,
+    this.onCancel,
+    this.initialAddress,
+    this.submitLabel = 'Connect',
+    this.title = 'Connect to a Triage daemon',
+    this.subtitle,
+  });
+
+  final ValueChanged<String> onSubmit;
+  final VoidCallback? onCancel;
+  final String? initialAddress;
+  final String submitLabel;
+  final String title;
+  final String? subtitle;
+
+  @override
+  State<ConnectionSettingsForm> createState() => _ConnectionSettingsFormState();
+}
+
+class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
+  late final TextEditingController _controller;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(
+      text: widget.initialAddress ?? '127.0.0.1',
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final raw = _controller.text.trim();
+    final uri = parseDaemonAddress(raw);
+    if (uri == null) {
+      setState(
+        () => _error =
+            'Enter a valid host, host:port, or ws://, wss://, http://, or https:// URL.',
+      );
+      return;
+    }
+    widget.onSubmit(raw);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = parseDaemonAddress(_controller.text.trim());
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.dns_outlined, color: Color(0xff7fd1c7), size: 22),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                widget.title,
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (widget.subtitle != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            widget.subtitle!,
+            style: const TextStyle(color: Color(0xff9aa6a8), fontSize: 13),
+          ),
+        ],
+        const SizedBox(height: 18),
+        TextField(
+          controller: _controller,
+          autofocus: true,
+          onChanged: (_) {
+            // Single rebuild: clears any stale error and refreshes the preview.
+            setState(() => _error = null);
+          },
+          onSubmitted: (_) => _submit(),
+          decoration: InputDecoration(
+            labelText: 'Daemon address',
+            hintText: '100.64.2.7  ·  192.168.1.5:7777  ·  wss://host:7777',
+            errorText: _error,
+            prefixIcon: const Icon(Icons.lan_outlined, size: 20),
+            border: const OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          preview == null
+              ? 'Will connect to: —'
+              : 'Will connect to: $preview',
+          style: const TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+        ),
+        const SizedBox(height: 20),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            if (widget.onCancel != null) ...[
+              TextButton(
+                onPressed: widget.onCancel,
+                child: const Text('Cancel'),
+              ),
+              const SizedBox(width: 8),
+            ],
+            FilledButton.icon(
+              onPressed: _submit,
+              icon: const Icon(Icons.link, size: 18),
+              label: Text(widget.submitLabel),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

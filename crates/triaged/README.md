@@ -23,24 +23,27 @@ triaged
 ## Web Server & Connecting
 
 `triaged` embeds an HTTP/WebSocket server that, by default, listens on
-`127.0.0.1:7777` (loopback only). A single TCP port serves three things:
+`0.0.0.0:7777` — all interfaces, so the client can connect from another device
+on your LAN/tailnet. Access is gated by device-code + PIN pairing
+(`require_pairing`, default true), and the daemon logs a warning at startup when
+bound to an unspecified address. A single TCP port serves three things:
 
 - **Web client** — a built-in browser UI is served at `/`. Open
-  <http://127.0.0.1:7777> to attach to your sessions from a browser, no separate
-  install required.
+  <http://127.0.0.1:7777> (or `http://<daemon-host>:7777` from another device) to
+  attach to your sessions from a browser, no separate install required.
 - **WebSocket API** — clients (the web UI, the native desktop/mobile clients, or
-  your own integration) attach over `ws://127.0.0.1:7777/ws`.
+  your own integration) attach over `ws://<daemon-host>:7777/ws`.
 - **Pairing approval page** — served at `/pair` (see [Pairing](#pairing) below).
 
 ### Connecting from another device
 
-The default bind is loopback, so the daemon is only reachable from the same
-machine. To attach from another device on your network, set a routable bind
-address in `~/.config/triage/config.toml`:
+The default bind (`0.0.0.0:7777`) is already reachable from other devices on your
+network. To restrict the daemon to loopback instead, set a narrower bind address
+in `~/.config/triage/config.toml`:
 
 ```toml
 [remote]
-bind = "0.0.0.0:7777"
+bind = "127.0.0.1:7777"   # loopback only; or a specific tailnet IP
 require_pairing = true
 ```
 

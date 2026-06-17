@@ -218,7 +218,11 @@ impl RemoteConfig {
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:7777".to_string(),
+            // Bind to all interfaces by default so the client can connect from
+            // another device (LAN/tailnet). Access is gated by pairing
+            // (`require_pairing`, default true); `triaged` logs a warning at
+            // startup when bound to an unspecified address.
+            bind: "0.0.0.0:7777".to_string(),
             require_pairing: true,
             tls_cert: None,
             tls_key: None,
@@ -484,7 +488,7 @@ pause_all = "ctrl+p"
             config.agents.known,
             ["claude", "aider", "codex", "cline", "continue"]
         );
-        assert_eq!(config.remote.bind, "127.0.0.1:7777");
+        assert_eq!(config.remote.bind, "0.0.0.0:7777");
         assert!(config.remote.require_pairing);
         assert_eq!(config.mcp.tcp_bind, "127.0.0.1:7778");
         assert!(!config.grpc.enabled);

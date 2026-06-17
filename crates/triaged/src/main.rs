@@ -63,6 +63,25 @@ fn run() -> anyhow::Result<()> {
 
     let bind_addr = config.remote.bind_addr()?;
 
+    // The default bind is 0.0.0.0 so the client can reach the daemon from another
+    // device on the LAN/tailnet. That exposes the listener to the local network;
+    // access is still gated by device-code + PIN pairing (require_pairing). Warn
+    // so an operator who didn't intend network exposure notices.
+    if bind_addr.ip().is_unspecified() {
+        if config.remote.require_pairing {
+            tracing::warn!(
+                %bind_addr,
+                "daemon is reachable on the local network; access is gated by pairing"
+            );
+        } else {
+            tracing::warn!(
+                %bind_addr,
+                "daemon is reachable on the local network with pairing DISABLED — \
+                 anyone who can reach this address can control sessions"
+            );
+        }
+    }
+
     // Bind TCP listener (either inherited or brand new)
     let tcp_listener = {
         #[cfg(unix)]
