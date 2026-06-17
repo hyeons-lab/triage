@@ -124,6 +124,15 @@ self-approve.
 and `pair_approval_caches_whois_per_peer` (ws). Updated existing serve_http call
 sites to the closure form.
 
+2026-06-17T07:34-0700 Addressed PR #82 review (Copilot). (1) `WHOIS_CACHE_MAX_ENTRIES`
+was not actually enforced — `retain` only drops stale entries, so a flood of
+unique fresh peers grew the map unbounded; `store_login` now evicts the oldest
+entries after pruning until under the cap (new test
+`pair_approval_cache_stays_capped_under_unique_peers`). (2) The cache mutex
+accessors recovered from poisoning via `into_inner()` instead of `expect`, so a
+prior panic can't crash pairing. (3) README tailnet config snippet now uses a
+`100.x.y.z` Tailscale-IP bind instead of `0.0.0.0`, matching the caveat below it.
+
 ## Research & Discoveries
 
 - Gate computed sync at `ws.rs:43` (`is_local_pairing_peer`) before `tokio::spawn`,
@@ -146,4 +155,5 @@ Reran the same command outside the sandbox and it passed.
 
 ## Commits
 
-HEAD — feat(triaged): tailnet identity pair approval
+8a41b8c — feat(triaged): tailnet identity pair approval
+HEAD — fix(triaged): enforce whois cache cap and harden pairing per PR review

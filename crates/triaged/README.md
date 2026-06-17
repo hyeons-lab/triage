@@ -141,7 +141,9 @@ that may open `/pair`:
 
 ```toml
 [remote]
-bind = "0.0.0.0:7777"
+# Bind to this host's Tailscale IP so only tailnet traffic can reach /pair
+# (see the security caveats below); avoid 0.0.0.0 with tailnet approval.
+bind = "100.x.y.z:7777"
 require_pairing = true
 pair_approval_tailnet_users = ["you@example.com"]
 ```

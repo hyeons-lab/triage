@@ -172,7 +172,12 @@ impl PairApproval {
     }
 
     fn cached_login(&self, peer_ip: IpAddr) -> Option<Option<String>> {
-        let cache = self.cache.lock().expect("pairing whois cache poisoned");
+        // Recover from a poisoned lock instead of panicking, so a prior panic
+        // elsewhere never crashes pairing — at worst we lose a cache entry.
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache
             .get(&peer_ip)
             .filter(|entry| entry.resolved_at.elapsed() < WHOIS_CACHE_TTL)
@@ -180,9 +185,24 @@ impl PairApproval {
     }
 
     fn store_login(&self, peer_ip: IpAddr, login: Option<String>) {
-        let mut cache = self.cache.lock().expect("pairing whois cache poisoned");
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if cache.len() >= WHOIS_CACHE_MAX_ENTRIES {
+            // Drop expired entries first; if every entry is still fresh (a flood
+            // of unique peers), evict the oldest so the map stays capped.
             cache.retain(|_, entry| entry.resolved_at.elapsed() < WHOIS_CACHE_TTL);
+            while cache.len() >= WHOIS_CACHE_MAX_ENTRIES {
+                let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.resolved_at)
+                    .map(|(ip, _)| *ip)
+                else {
+                    break;
+                };
+                cache.remove(&oldest);
+            }
         }
         cache.insert(
             peer_ip,
@@ -592,6 +612,19 @@ mod tests {
             approval.cached_login("100.100.100.51:1".parse::<SocketAddr>().unwrap().ip()),
             None
         );
+    }
+
+    #[test]
+    fn pair_approval_cache_stays_capped_under_unique_peers() {
+        let approval = PairApproval::new(vec!["alice@example.com".to_string()]);
+        // More unique, still-fresh peers than the cap; the map must not grow
+        // past WHOIS_CACHE_MAX_ENTRIES.
+        for i in 0..(WHOIS_CACHE_MAX_ENTRIES + 50) {
+            let ip = IpAddr::V4(Ipv4Addr::new(100, 100, (i / 256) as u8, (i % 256) as u8));
+            approval.store_login(ip, None);
+        }
+        let len = approval.cache.lock().unwrap().len();
+        assert!(len <= WHOIS_CACHE_MAX_ENTRIES, "cache grew to {len}");
     }
 
     #[tokio::test]
