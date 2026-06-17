@@ -395,7 +395,7 @@ impl SessionManager {
     /// it never holds the global `sessions` mutex during actor I/O (which would
     /// starve interactive session operations). Returns `None` for
     /// non-live/missing sessions.
-    fn summary_rows(&self, session_id: &SessionId) -> Option<(Vec<String>, u64)> {
+    fn summary_rows(&self, session_id: &SessionId) -> Option<SummaryRowsResponse> {
         let cmd_tx = {
             let sessions = self.sessions().ok()?;
             match sessions.get(session_id) {
@@ -583,12 +583,13 @@ impl SessionManager {
         let mut enqueued = 0usize;
         let mut skipped_blank = 0usize;
         for session_id in session_ids {
-            if let Some((rows, output_seq)) = self.summary_rows(&session_id) {
+            if let Some((rows, output_seq, context)) = self.summary_rows(&session_id) {
                 if let Some(prompt_text) = build_prompt_text(&rows) {
                     if summarizer.try_enqueue(SummarizeJob {
                         session_id,
                         prompt_text,
                         output_seq,
+                        context,
                     }) {
                         enqueued += 1;
                     }
@@ -1603,7 +1604,7 @@ fn run_debounce_loop(
 
             // Off-lock cheap snapshot: never holds the global sessions mutex
             // during the actor round-trip, so it can't starve interactive ops.
-            let Some((rows, _output_seq)) = manager.summary_rows(&session_id) else {
+            let Some((rows, _output_seq, context)) = manager.summary_rows(&session_id) else {
                 // Session likely gone; drop tracking state for it.
                 last_enqueue.remove(&session_id);
                 last_summarized_seq.remove(&session_id);
@@ -1625,6 +1626,7 @@ fn run_debounce_loop(
                 session_id: session_id.clone(),
                 prompt_text,
                 output_seq: pd.last_output_seq,
+                context,
             }) {
                 last_enqueue.insert(session_id.clone(), now);
                 last_prompt_hash.insert(session_id.clone(), hash);
@@ -2199,6 +2201,10 @@ struct OutputState {
     log_cache: Option<Vec<u8>>,
 }
 
+/// Visible rows + output sequence + git context, returned by the actor's
+/// cheap `SummaryRows` snapshot for the summarizer.
+type SummaryRowsResponse = (Vec<String>, u64, Option<SessionContext>);
+
 enum ActorMessage {
     Output(Vec<u8>),
     OutputClosed(Result<()>),
@@ -2217,10 +2223,12 @@ enum ActorCommand {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
     /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
-    /// no raw-output-history disk read, so it never blocks on I/O. Returns the
-    /// plain visible rows plus the current output sequence.
+    /// no raw-output-history disk read, so it never blocks on I/O. Returns a
+    /// `(rows, output_seq, context)` tuple: the plain visible rows, the current
+    /// output sequence, and the optional `SessionContext`
+    /// (repository/worktree root + branch) used to localize the summary.
     SummaryRows {
-        response: Sender<ActorResult<(Vec<String>, u64)>>,
+        response: Sender<ActorResult<SummaryRowsResponse>>,
     },
     StyledRows {
         start: usize,
@@ -2394,7 +2402,7 @@ impl ActorState {
             }
             ActorCommand::SummaryRows { response } => {
                 let rows = visible_rows(&self.output.terminal);
-                let _ = response.send(Ok((rows, self.output.output_seq)));
+                let _ = response.send(Ok((rows, self.output.output_seq, self.context.clone())));
                 false
             }
             ActorCommand::StyledRows {
@@ -3160,7 +3168,7 @@ fn recv_actor_result<T>(rx: Receiver<ActorResult<T>>, context: &'static str) -> 
 /// Requests a cheap visible-rows snapshot via a cloned actor command channel.
 /// The caller clones `tx` while briefly holding the sessions lock, then calls
 /// this OFF-LOCK so the actor round-trip never blocks other session operations.
-fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<(Vec<String>, u64)> {
+fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<SummaryRowsResponse> {
     let (resp_tx, resp_rx) = mpsc::channel();
     tx.send(ActorCommand::SummaryRows { response: resp_tx })
         .context("sending session summary-rows command")?;

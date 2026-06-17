@@ -9,31 +9,40 @@
 //! once. The model is downloaded + loaded lazily on the first job, so enabling
 //! the summarizer never blocks daemon startup.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
+use cera::manifest::GenerationDefaults;
 use cera::session::{FinishReason, ModalitySink};
 use cera::tokenizer::{BpeTokenizer, ChatMessage};
-use triage_core::session::SessionId;
+use triage_core::session::{SessionContext, SessionId};
 
 /// Instruction given to the model. Kept terse; the model only needs to label.
 const SYSTEM_PROMPT: &str = "You label terminal sessions. Reply with a terse description of what \
 the session is doing, at most 8 words, no trailing punctuation, no quotes. Output only the label.";
 
 /// Instruction for the longer-form detail summary shown in the hover popover and
-/// used as the future session-search corpus. Allows a few sentences.
-const DETAIL_SYSTEM_PROMPT: &str = "You summarize terminal sessions. In two or three short \
-sentences, describe what the session is doing: the task, any commands run, and the current state \
-(e.g. building, tests passing/failing, an error, waiting at a prompt). Be concrete and factual. \
-No markdown, no quotes, no preamble — output only the summary.";
+/// used as the future session-search corpus. The repo/branch/worktree the
+/// session lives in are prepended deterministically by [`generate_detail`] (the
+/// model can't see them and must not invent them), so this prompt only asks for
+/// the activity. Length is generous — enough sentences to localize the user.
+const DETAIL_SYSTEM_PROMPT: &str = "You summarize terminal sessions so a developer can tell which \
+of many sessions this is and what it needs. Describe what the session is doing: the task, the \
+commands or tools running, the files or components involved, and the current state (building, \
+tests passing/failing, an error and its message, or waiting at a prompt for input). Use as many \
+short sentences as the activity needs — up to about five — but no filler. Be concrete and factual; \
+prefer specifics (command names, file paths, error text) over generalities. Do not guess the git \
+repository, branch, or directory. No markdown, no quotes, no preamble — output only the summary.";
 
 /// Hard cap on the sanitized snippet length (characters).
 const MAX_SNIPPET_CHARS: usize = 60;
 /// Hard cap on the sanitized snippet length (words).
 const MAX_SNIPPET_WORDS: usize = 8;
 
-/// Hard cap on the sanitized detail summary length (characters).
-const MAX_DETAIL_CHARS: usize = 280;
+/// Hard cap on the sanitized detail summary length (characters). Applies only
+/// to the model-written activity portion; the deterministic context header is
+/// prepended afterwards and is never truncated.
+const MAX_DETAIL_CHARS: usize = 480;
 
 /// Runtime parameters for the summarizer worker. Built from the daemon config.
 #[derive(Debug, Clone)]
@@ -53,14 +62,21 @@ pub struct SummarizeJob {
     pub session_id: SessionId,
     pub prompt_text: String,
     pub output_seq: u64,
+    /// Git context (repo/branch/worktree) for this session, used to build the
+    /// deterministic localization header on the detail summary. `None` when the
+    /// session isn't inside a git repo.
+    pub context: Option<SessionContext>,
 }
 
 /// A produced snippet, delivered to the `on_result` callback on the worker thread.
 pub struct SnippetResult {
     pub session_id: SessionId,
     pub text: String,
-    /// Longer-form summary for the hover popover / search. `None` when the model
-    /// produced nothing usable (keeps any prior detail rather than clearing it).
+    /// Longer-form summary for the hover popover / search: a deterministic
+    /// `repo · branch · worktree` header (when the session has git context)
+    /// followed by the model's activity description. `None` only when neither
+    /// the model nor the git context produced anything usable (keeps any prior
+    /// detail rather than clearing it).
     pub detail: Option<String>,
     pub generated_at_output_seq: u64,
 }
@@ -153,7 +169,12 @@ fn run_worker(
                     // Second, longer-form pass for the hover popover / search.
                     // Failures here are non-fatal: emit the one-liner with no
                     // detail rather than dropping the result entirely.
-                    let detail = match generate_detail(engine, &config, &job.prompt_text) {
+                    let detail = match generate_detail(
+                        engine,
+                        &config,
+                        &job.prompt_text,
+                        job.context.as_ref(),
+                    ) {
                         Ok(detail) => detail,
                         Err(error) => {
                             tracing::warn!(
@@ -236,6 +257,9 @@ fn generate_one_line(
     session.append_text(&rendered)?;
 
     let mut sink = OneLineSink::new(engine.tokenizer());
+    // The one-line label stays greedy (temperature 0) regardless of the model's
+    // manifest sampling params, so the terse rail label is stable across
+    // regenerations. The detail pass honours the manifest params instead.
     let opts = cera::GenerateOpts {
         max_tokens: config.max_tokens,
         temperature: 0.0,
@@ -247,11 +271,14 @@ fn generate_one_line(
 }
 
 /// Runs one inference for the longer-form detail summary and returns it
-/// sanitized, or `None` if the model produced nothing usable.
+/// sanitized, with a deterministic `repo · branch · worktree` header prepended
+/// so the reader can localize the session at a glance. Returns `None` only when
+/// neither the model nor the git context produced anything usable.
 fn generate_detail(
     engine: &cera::CeraEngine,
     config: &SummarizerConfig,
     prompt_text: &str,
+    context: Option<&SessionContext>,
 ) -> anyhow::Result<Option<String>> {
     let mut session = engine.new_session(cera::SessionConfig::default());
     let messages = [
@@ -268,14 +295,129 @@ fn generate_detail(
     session.append_text(&rendered)?;
 
     let mut sink = DetailSink::new(engine.tokenizer());
-    let opts = cera::GenerateOpts {
-        max_tokens: config.detail_max_tokens,
-        temperature: 0.0,
-        ..Default::default()
-    };
+    let opts = sampling_opts(engine, config.detail_max_tokens);
     session.generate(&opts, &mut sink)?;
 
-    Ok(sanitize_detail(&sink.text))
+    let header = context.and_then(context_header);
+    let summary = sanitize_detail(&sink.text);
+    Ok(match (header, summary) {
+        (Some(header), Some(summary)) => Some(format!("{header}\n{summary}")),
+        (Some(header), None) => Some(header),
+        (None, summary) => summary,
+    })
+}
+
+/// Builds [`GenerateOpts`] for the detail-summary pass.
+///
+/// When the loaded model is a text bundle whose LeapBundles manifest ships
+/// advisory `sampling_parameters`, honor them: start from cera's own defaults
+/// and apply every param the manifest carries (temperature / min-p / top-p /
+/// top-k / repetition-penalty), so a param the manifest *omits* keeps cera's
+/// default rather than being forced off. In particular a manifest that sets
+/// top-p/top-k but no temperature still samples (at cera's default temperature)
+/// instead of collapsing to greedy.
+///
+/// A manifest that carries no sampling guidance at all — a `Text` block with
+/// every field unset, a bare GGUF, or a non-text inference type — falls back to
+/// deterministic greedy decoding (temperature 0) so the detail is stable across
+/// regenerations. The one-line label deliberately does not use this — it stays
+/// greedy for a stable rail.
+///
+/// The `GenerationDefaults::Text` destructure is exhaustive (no `..`) on
+/// purpose: if cera grows another manifest sampling param, this stops
+/// compiling so we wire it through rather than silently dropping it.
+fn sampling_opts(engine: &cera::CeraEngine, max_tokens: u32) -> cera::GenerateOpts {
+    sampling_opts_from_defaults(&engine.manifest().generation_defaults, max_tokens)
+}
+
+/// Engine-free core of [`sampling_opts`] — splits the decision out from the
+/// `CeraEngine` so the manifest→opts mapping is unit-testable.
+fn sampling_opts_from_defaults(
+    defaults: &GenerationDefaults,
+    max_tokens: u32,
+) -> cera::GenerateOpts {
+    // Start from cera's real defaults; the greedy fallback below only kicks in
+    // when the manifest provides no guidance at all.
+    let mut opts = cera::GenerateOpts {
+        max_tokens,
+        ..Default::default()
+    };
+    if let GenerationDefaults::Text {
+        temperature,
+        min_p,
+        top_p,
+        top_k,
+        repetition_penalty,
+    } = defaults
+    {
+        // Honor the manifest only when its `Text` block actually carries a
+        // sampling param. An all-`None` block (or a non-`Text` manifest) falls
+        // through to greedy rather than silently inheriting cera's sampling
+        // default temperature.
+        let has_sampling_params = temperature.is_some()
+            || min_p.is_some()
+            || top_p.is_some()
+            || top_k.is_some()
+            || repetition_penalty.is_some();
+        if has_sampling_params {
+            if let Some(temperature) = temperature {
+                opts.temperature = *temperature;
+            }
+            if let Some(min_p) = min_p {
+                opts.min_p = *min_p;
+            }
+            if let Some(top_p) = top_p {
+                opts.top_p = *top_p;
+            }
+            if let Some(top_k) = top_k {
+                opts.top_k = *top_k;
+            }
+            if let Some(repetition_penalty) = repetition_penalty {
+                opts.repetition_penalty = *repetition_penalty;
+            }
+            return opts;
+        }
+    }
+    // No manifest sampling guidance: deterministic greedy decoding.
+    opts.temperature = 0.0;
+    opts
+}
+
+/// Deterministic `repo · branch · worktree` localization header that leads the
+/// detail summary. Mirrors the side-rail meta line: omits absent parts, hides
+/// the worktree leaf when it's the repo root itself or merely echoes the branch.
+/// Returns `None` when no part is known.
+fn context_header(context: &SessionContext) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(repo) = context.repository_root.as_deref().and_then(leaf_name) {
+        parts.push(repo);
+    }
+    let branch = context
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty());
+    if let Some(branch) = branch {
+        parts.push(branch.to_string());
+    }
+    let worktree_leaf = context.worktree_root.as_deref().and_then(|worktree| {
+        if Some(worktree) == context.repository_root.as_deref() {
+            None
+        } else {
+            leaf_name(worktree)
+        }
+    });
+    if let Some(worktree) = worktree_leaf
+        && Some(worktree.as_str()) != branch
+    {
+        parts.push(worktree);
+    }
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
+}
+
+/// Last path component as a display string, or `None` for a rootless path.
+fn leaf_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// A [`ModalitySink`] that accumulates all decoded text (multi-line). Used for
@@ -496,6 +638,11 @@ mod tests {
             session_id: SessionId::new("e2e").unwrap(),
             prompt_text: prompt,
             output_seq: 1,
+            context: Some(SessionContext {
+                repository_root: Some("/home/dev/triage".into()),
+                worktree_root: Some("/home/dev/triage/worktrees/feat-summary".into()),
+                branch: Some("feat/summary".to_string()),
+            }),
         }));
 
         // First call downloads the model, so allow a generous timeout.
@@ -503,11 +650,135 @@ mod tests {
             .recv_timeout(Duration::from_secs(600))
             .expect("a snippet within timeout");
         eprintln!("GENERATED SNIPPET: {:?}", result.text);
+        eprintln!("GENERATED DETAIL: {:?}", result.detail);
         assert!(!result.text.is_empty(), "snippet should be non-empty");
         assert!(
             result.text.split_whitespace().count() <= MAX_SNIPPET_WORDS,
             "snippet should respect the word cap: {:?}",
             result.text
         );
+        // The detail must lead with the deterministic localization header.
+        let detail = result.detail.expect("detail summary present");
+        assert!(
+            detail.starts_with("triage  ·  feat/summary  ·  feat-summary"),
+            "detail should lead with the repo/branch/worktree header: {detail:?}"
+        );
+    }
+
+    #[test]
+    fn context_header_mirrors_the_side_rail_meta_line() {
+        // Linked worktree: all three parts, worktree leaf distinct from branch.
+        let header = context_header(&SessionContext {
+            repository_root: Some("/home/dev/triage".into()),
+            worktree_root: Some("/home/dev/triage/worktrees/feat-summary".into()),
+            branch: Some("feat/summary".to_string()),
+        });
+        assert_eq!(
+            header.as_deref(),
+            Some("triage  ·  feat/summary  ·  feat-summary")
+        );
+
+        // Working in the repo root itself: worktree leaf is hidden.
+        let header = context_header(&SessionContext {
+            repository_root: Some("/home/dev/triage".into()),
+            worktree_root: Some("/home/dev/triage".into()),
+            branch: Some("main".to_string()),
+        });
+        assert_eq!(header.as_deref(), Some("triage  ·  main"));
+
+        // No git context at all: no header.
+        assert_eq!(
+            context_header(&SessionContext {
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn sampling_opts_without_temperature_samples_at_cera_default() {
+        // Manifest recommends top-p/top-k but omits temperature: we must NOT
+        // collapse to greedy, or those params never take effect. Temperature
+        // stays at cera's sampling default so the recommendation is honored.
+        let cera_default = cera::GenerateOpts::default();
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: Some(0.5),
+                top_k: Some(20),
+                repetition_penalty: None,
+            },
+            99,
+        );
+        assert_eq!(opts.max_tokens, 99);
+        assert!(
+            (opts.temperature - cera_default.temperature).abs() < 1e-6,
+            "temperature should fall back to cera's default, not greedy: {}",
+            opts.temperature
+        );
+        assert!(opts.temperature > 0.0, "must stay stochastic, not greedy");
+        assert!((opts.top_p - 0.5).abs() < 1e-6);
+        assert_eq!(opts.top_k, 20);
+    }
+
+    #[test]
+    fn sampling_opts_with_all_params_unset_is_greedy() {
+        // A `Text` block that carries no sampling guidance falls back to
+        // deterministic greedy decoding (temperature 0).
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+            },
+            32,
+        );
+        assert!(
+            opts.temperature.abs() < 1e-6,
+            "all-unset manifest should be greedy: {}",
+            opts.temperature
+        );
+    }
+
+    #[test]
+    fn sampling_opts_non_text_manifest_is_greedy() {
+        // A non-text manifest (here: audio) carries no text sampling params, so
+        // the detail pass stays greedy.
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Audio {
+                number_of_decoding_threads: None,
+            },
+            32,
+        );
+        assert!(
+            opts.temperature.abs() < 1e-6,
+            "non-text manifest should be greedy: {}",
+            opts.temperature
+        );
+    }
+
+    #[test]
+    fn sampling_opts_applies_explicit_manifest_params() {
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Text {
+                temperature: Some(0.3),
+                min_p: Some(0.05),
+                top_p: Some(0.8),
+                top_k: Some(15),
+                repetition_penalty: Some(1.1),
+            },
+            64,
+        );
+        assert_eq!(opts.max_tokens, 64);
+        assert!((opts.temperature - 0.3).abs() < 1e-6);
+        assert!((opts.min_p - 0.05).abs() < 1e-6);
+        assert!((opts.top_p - 0.8).abs() < 1e-6);
+        assert_eq!(opts.top_k, 15);
+        assert!((opts.repetition_penalty - 1.1).abs() < 1e-6);
     }
 }
