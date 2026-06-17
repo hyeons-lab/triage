@@ -72,8 +72,11 @@ pub struct SummarizeJob {
 pub struct SnippetResult {
     pub session_id: SessionId,
     pub text: String,
-    /// Longer-form summary for the hover popover / search. `None` when the model
-    /// produced nothing usable (keeps any prior detail rather than clearing it).
+    /// Longer-form summary for the hover popover / search: a deterministic
+    /// `repo · branch · worktree` header (when the session has git context)
+    /// followed by the model's activity description. `None` only when neither
+    /// the model nor the git context produced anything usable (keeps any prior
+    /// detail rather than clearing it).
     pub detail: Option<String>,
     pub generated_at_output_seq: u64,
 }
@@ -304,23 +307,39 @@ fn generate_detail(
     })
 }
 
-/// Builds [`GenerateOpts`] for the detail-summary pass. Starts from cera's
-/// defaults, then — when the loaded model is a text bundle whose LeapBundles
-/// manifest ships advisory `sampling_parameters` — applies every recommended
-/// param the manifest carries: temperature / min-p / top-p / top-k /
-/// repetition-penalty. Each is applied only when the manifest specifies it, so
-/// a partial block keeps cera's defaults for the rest. Falls back to
-/// deterministic greedy decoding (temperature 0) when the manifest specifies no
-/// sampling params (e.g. a bare GGUF or a non-text inference type). The one-line
-/// label deliberately does not use this — it stays greedy for a stable rail.
+/// Builds [`GenerateOpts`] for the detail-summary pass.
+///
+/// When the loaded model is a text bundle whose LeapBundles manifest ships
+/// advisory `sampling_parameters`, honor them: start from cera's own defaults
+/// and apply every param the manifest carries (temperature / min-p / top-p /
+/// top-k / repetition-penalty), so a param the manifest *omits* keeps cera's
+/// default rather than being forced off. In particular a manifest that sets
+/// top-p/top-k but no temperature still samples (at cera's default temperature)
+/// instead of collapsing to greedy.
+///
+/// A manifest that carries no sampling guidance at all — a `Text` block with
+/// every field unset, a bare GGUF, or a non-text inference type — falls back to
+/// deterministic greedy decoding (temperature 0) so the detail is stable across
+/// regenerations. The one-line label deliberately does not use this — it stays
+/// greedy for a stable rail.
 ///
 /// The `GenerationDefaults::Text` destructure is exhaustive (no `..`) on
 /// purpose: if cera grows another manifest sampling param, this stops
 /// compiling so we wire it through rather than silently dropping it.
 fn sampling_opts(engine: &cera::CeraEngine, max_tokens: u32) -> cera::GenerateOpts {
+    sampling_opts_from_defaults(&engine.manifest().generation_defaults, max_tokens)
+}
+
+/// Engine-free core of [`sampling_opts`] — splits the decision out from the
+/// `CeraEngine` so the manifest→opts mapping is unit-testable.
+fn sampling_opts_from_defaults(
+    defaults: &GenerationDefaults,
+    max_tokens: u32,
+) -> cera::GenerateOpts {
+    // Start from cera's real defaults; the greedy fallback below only kicks in
+    // when the manifest provides no guidance at all.
     let mut opts = cera::GenerateOpts {
         max_tokens,
-        temperature: 0.0,
         ..Default::default()
     };
     if let GenerationDefaults::Text {
@@ -329,24 +348,38 @@ fn sampling_opts(engine: &cera::CeraEngine, max_tokens: u32) -> cera::GenerateOp
         top_p,
         top_k,
         repetition_penalty,
-    } = &engine.manifest().generation_defaults
+    } = defaults
     {
-        if let Some(temperature) = temperature {
-            opts.temperature = *temperature;
-        }
-        if let Some(min_p) = min_p {
-            opts.min_p = *min_p;
-        }
-        if let Some(top_p) = top_p {
-            opts.top_p = *top_p;
-        }
-        if let Some(top_k) = top_k {
-            opts.top_k = *top_k;
-        }
-        if let Some(repetition_penalty) = repetition_penalty {
-            opts.repetition_penalty = *repetition_penalty;
+        // Honor the manifest only when its `Text` block actually carries a
+        // sampling param. An all-`None` block (or a non-`Text` manifest) falls
+        // through to greedy rather than silently inheriting cera's sampling
+        // default temperature.
+        let has_sampling_params = temperature.is_some()
+            || min_p.is_some()
+            || top_p.is_some()
+            || top_k.is_some()
+            || repetition_penalty.is_some();
+        if has_sampling_params {
+            if let Some(temperature) = temperature {
+                opts.temperature = *temperature;
+            }
+            if let Some(min_p) = min_p {
+                opts.min_p = *min_p;
+            }
+            if let Some(top_p) = top_p {
+                opts.top_p = *top_p;
+            }
+            if let Some(top_k) = top_k {
+                opts.top_k = *top_k;
+            }
+            if let Some(repetition_penalty) = repetition_penalty {
+                opts.repetition_penalty = *repetition_penalty;
+            }
+            return opts;
         }
     }
+    // No manifest sampling guidance: deterministic greedy decoding.
+    opts.temperature = 0.0;
     opts
 }
 
@@ -662,5 +695,90 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn sampling_opts_without_temperature_samples_at_cera_default() {
+        // Manifest recommends top-p/top-k but omits temperature: we must NOT
+        // collapse to greedy, or those params never take effect. Temperature
+        // stays at cera's sampling default so the recommendation is honored.
+        let cera_default = cera::GenerateOpts::default();
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: Some(0.5),
+                top_k: Some(20),
+                repetition_penalty: None,
+            },
+            99,
+        );
+        assert_eq!(opts.max_tokens, 99);
+        assert!(
+            (opts.temperature - cera_default.temperature).abs() < 1e-6,
+            "temperature should fall back to cera's default, not greedy: {}",
+            opts.temperature
+        );
+        assert!(opts.temperature > 0.0, "must stay stochastic, not greedy");
+        assert!((opts.top_p - 0.5).abs() < 1e-6);
+        assert_eq!(opts.top_k, 20);
+    }
+
+    #[test]
+    fn sampling_opts_with_all_params_unset_is_greedy() {
+        // A `Text` block that carries no sampling guidance falls back to
+        // deterministic greedy decoding (temperature 0).
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+            },
+            32,
+        );
+        assert!(
+            opts.temperature.abs() < 1e-6,
+            "all-unset manifest should be greedy: {}",
+            opts.temperature
+        );
+    }
+
+    #[test]
+    fn sampling_opts_non_text_manifest_is_greedy() {
+        // A non-text manifest (here: audio) carries no text sampling params, so
+        // the detail pass stays greedy.
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Audio {
+                number_of_decoding_threads: None,
+            },
+            32,
+        );
+        assert!(
+            opts.temperature.abs() < 1e-6,
+            "non-text manifest should be greedy: {}",
+            opts.temperature
+        );
+    }
+
+    #[test]
+    fn sampling_opts_applies_explicit_manifest_params() {
+        let opts = sampling_opts_from_defaults(
+            &GenerationDefaults::Text {
+                temperature: Some(0.3),
+                min_p: Some(0.05),
+                top_p: Some(0.8),
+                top_k: Some(15),
+                repetition_penalty: Some(1.1),
+            },
+            64,
+        );
+        assert_eq!(opts.max_tokens, 64);
+        assert!((opts.temperature - 0.3).abs() < 1e-6);
+        assert!((opts.min_p - 0.05).abs() < 1e-6);
+        assert!((opts.top_p - 0.8).abs() < 1e-6);
+        assert_eq!(opts.top_k, 15);
+        assert!((opts.repetition_penalty - 1.1).abs() < 1e-6);
     }
 }

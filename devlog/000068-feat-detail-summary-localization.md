@@ -68,6 +68,28 @@ pass, while keeping the one-line rail label deterministic (greedy).
   a future cera param fails the build instead of being dropped. Each param is
   still applied only when the manifest sets it, so partial blocks keep cera's
   defaults for the rest.
+- 2026-06-16T22:06-0700 PR #78 review round 2 (Copilot) fixes on `sampling_opts`
+  + a `/code-review` finding:
+  - **Greedy baseline bug**: `sampling_opts` initialized `temperature: 0.0`
+    unconditionally, so a manifest recommending `top_p`/`top_k` *without* a
+    temperature was forced to greedy (the recommended params then did nothing),
+    and the "starts from cera's defaults" doc was false for temperature. Fixed
+    by starting from `GenerateOpts::default()` (cera's real defaults) and
+    applying manifest params only when the `Text` block carries at least one
+    (`has_sampling_params` guard); a `Text` block with every field unset — or a
+    non-`Text` manifest — falls back to explicit greedy (`temperature = 0.0`).
+    So: params present → sample (unset fields keep cera defaults, incl.
+    temperature); no guidance → deterministic greedy. Addresses both inline
+    comments (`:325` greedy-baseline, `:350` missing explicit fallback).
+  - Extracted the engine-free core `sampling_opts_from_defaults(&defaults,
+    max_tokens)` so the mapping is unit-testable, and added four tests:
+    top-p/top-k-without-temperature stays stochastic at cera's default temp;
+    all-`None` `Text` → greedy; non-`Text` (`Audio`) → greedy; explicit params
+    applied verbatim.
+  - `/code-review` finding: `SnippetResult.detail` doc said `None` means "model
+    produced nothing", but a header-only detail is now returned when git context
+    exists with empty model output — corrected the doc to "`None` only when
+    neither the model nor the git context produced anything usable".
 
 ## Commits
 
