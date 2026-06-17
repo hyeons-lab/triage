@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "cera"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ba481e18476a4f5bc525be2f272ac9cbf5281c37e546f679f795ff85393e9f"
+checksum = "a878719f6e3a0ed1e73fe271124d83a78901e1d411bbb37925f968e046e18bb6"
 dependencies = [
  "anyhow",
  "bytemuck",
