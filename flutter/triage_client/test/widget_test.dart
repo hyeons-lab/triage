@@ -1370,6 +1370,17 @@ void main() {
       );
     });
 
+    test('full URLs preserve query and fragment', () {
+      expect(
+        parseDaemonAddress('https://host/ws?token=abc123').toString(),
+        'wss://host:7777/ws?token=abc123',
+      );
+      expect(
+        parseDaemonAddress('wss://host:8443/path?a=1&b=2#frag').toString(),
+        'wss://host:8443/path?a=1&b=2#frag',
+      );
+    });
+
     test('bracketed IPv6 literal', () {
       expect(parseDaemonAddress('[::1]:7777').toString(), 'ws://[::1]:7777/ws');
     });
@@ -1413,7 +1424,9 @@ void main() {
     await tester.tap(find.text('Connect'));
     await tester.pumpAndSettle();
     expect(
-      find.text('Enter a valid host, host:port, or ws:// URL.'),
+      find.text(
+        'Enter a valid host, host:port, or ws://, wss://, http://, or https:// URL.',
+      ),
       findsOneWidget,
     );
     expect(submitted, isNull);

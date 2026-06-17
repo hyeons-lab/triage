@@ -55,7 +55,14 @@ Uri? parseDaemonAddress(String input) {
     if (scheme == null) return null;
     final port = parsed.hasPort ? parsed.port : _defaultDaemonPort;
     final path = (parsed.path.isEmpty || parsed.path == '/') ? '/ws' : parsed.path;
-    return Uri(scheme: scheme, host: parsed.host, port: port, path: path);
+    return Uri(
+      scheme: scheme,
+      host: parsed.host,
+      port: port,
+      path: path,
+      query: parsed.hasQuery ? parsed.query : null,
+      fragment: parsed.hasFragment ? parsed.fragment : null,
+    );
   }
 
   String host;
@@ -2611,7 +2618,10 @@ class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
     final raw = _controller.text.trim();
     final uri = parseDaemonAddress(raw);
     if (uri == null) {
-      setState(() => _error = 'Enter a valid host, host:port, or ws:// URL.');
+      setState(
+        () => _error =
+            'Enter a valid host, host:port, or ws://, wss://, http://, or https:// URL.',
+      );
       return;
     }
     widget.onSubmit(raw);
@@ -2651,8 +2661,8 @@ class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
           controller: _controller,
           autofocus: true,
           onChanged: (_) {
-            if (_error != null) setState(() => _error = null);
-            setState(() {});
+            // Single rebuild: clears any stale error and refreshes the preview.
+            setState(() => _error = null);
           },
           onSubmitted: (_) => _submit(),
           decoration: InputDecoration(
