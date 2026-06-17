@@ -192,6 +192,12 @@ pub struct RemoteConfig {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub web_assets_path: Option<String>,
+    /// Tailnet login names (e.g. `you@example.com`) permitted to approve pairing
+    /// from a remote device. When non-empty, a `/pair` request whose tailnet
+    /// identity (`tailscale whois`) matches an entry is allowed to approve, in
+    /// addition to loopback / same-host. Empty (the default) keeps approval
+    /// loopback-only.
+    pub pair_approval_tailnet_users: Vec<String>,
 }
 
 impl RemoteConfig {
@@ -203,6 +209,16 @@ impl RemoteConfig {
         self.bind_addr()?;
         if let Some(ref path) = self.web_assets_path {
             ensure_non_empty("remote.web_assets_path", path)?;
+        }
+        ensure_non_empty_items(
+            "remote.pair_approval_tailnet_users",
+            &self.pair_approval_tailnet_users,
+        )?;
+        if !self.pair_approval_tailnet_users.is_empty() && !self.require_pairing {
+            bail!(
+                "remote.pair_approval_tailnet_users requires remote.require_pairing = true \
+                 (pairing approval is meaningless when pairing is disabled)"
+            );
         }
         match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => {
@@ -227,6 +243,9 @@ impl Default for RemoteConfig {
             tls_cert: None,
             tls_key: None,
             web_assets_path: None,
+            // Loopback-only pairing approval by default; opt in to remote
+            // (tailnet) approval by listing tailnet login names here.
+            pair_approval_tailnet_users: Vec::new(),
         }
     }
 }
@@ -450,9 +469,10 @@ prompt_patterns = ['\? for shortcuts', '\[y/n\]']
 
 [remote]
 bind = "127.0.0.1:8888"
-require_pairing = false
+require_pairing = true
 tls_cert = "~/.config/triage/certs/dev.crt"
 tls_key = "~/.config/triage/certs/dev.key"
+pair_approval_tailnet_users = ["alice@example.com", "bob@example.com"]
 
 [mcp]
 tcp_bind = "127.0.0.1:8889"
@@ -490,6 +510,7 @@ pause_all = "ctrl+p"
         );
         assert_eq!(config.remote.bind, "0.0.0.0:7777");
         assert!(config.remote.require_pairing);
+        assert!(config.remote.pair_approval_tailnet_users.is_empty());
         assert_eq!(config.mcp.tcp_bind, "127.0.0.1:7778");
         assert!(!config.grpc.enabled);
         assert_eq!(config.keybindings.next_attention, "g w");
@@ -526,6 +547,10 @@ notify_sound = false
         assert_eq!(config.general.default_shell, "/bin/fish");
         assert_eq!(config.ui.group_by, GroupBy::Repo);
         assert_eq!(config.remote.bind_addr().unwrap().port(), 8888);
+        assert_eq!(
+            config.remote.pair_approval_tailnet_users,
+            ["alice@example.com", "bob@example.com"]
+        );
         assert_eq!(config.mcp.tcp_bind_addr().unwrap().port(), 8889);
         assert_eq!(config.grpc.bind_addr().unwrap().unwrap().port(), 50051);
         assert_eq!(config.approval.patterns, ["^rm -rf"]);
@@ -593,6 +618,41 @@ tls_cert = "server.crt"
             error
                 .to_string()
                 .contains("remote.tls_cert and remote.tls_key must be set together")
+        );
+    }
+
+    #[test]
+    fn empty_tailnet_pair_approval_user_fails_validation() {
+        let error = Config::from_toml_str(
+            r#"
+[remote]
+pair_approval_tailnet_users = ["alice@example.com", " "]
+"#,
+        )
+        .expect_err("empty tailnet pair approval user should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote.pair_approval_tailnet_users[1] must not be empty")
+        );
+    }
+
+    #[test]
+    fn tailnet_pair_approval_requires_require_pairing() {
+        let error = Config::from_toml_str(
+            r#"
+[remote]
+require_pairing = false
+pair_approval_tailnet_users = ["alice@example.com"]
+"#,
+        )
+        .expect_err("tailnet pair approval without require_pairing should fail");
+
+        assert!(
+            error.to_string().contains(
+                "remote.pair_approval_tailnet_users requires remote.require_pairing = true"
+            )
         );
     }
 

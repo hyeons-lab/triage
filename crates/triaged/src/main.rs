@@ -146,10 +146,16 @@ fn run() -> anyhow::Result<()> {
     // Spawn Multiplexed HTTP & WebSocket Server in a background thread
     let ws_manager = Arc::clone(&manager);
     let ws_cache = Arc::clone(&web_cache);
+    let pair_approval_tailnet_users = config.remote.pair_approval_tailnet_users.clone();
     std::thread::Builder::new()
         .name("triage-websocket-server".to_string())
         .spawn(move || {
-            if let Err(error) = ws::start_websocket_server(ws_manager, tcp_listener, ws_cache) {
+            if let Err(error) = ws::start_websocket_server(
+                ws_manager,
+                tcp_listener,
+                ws_cache,
+                pair_approval_tailnet_users,
+            ) {
                 tracing::error!(error = ?error, "Multiplexed HTTP + WebSocket server failed");
             }
         })?;
