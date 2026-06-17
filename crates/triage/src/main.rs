@@ -913,8 +913,8 @@ fn context_path_overflows(path: &Path, width: usize) -> bool {
 }
 
 fn context_path_display_name(path: &Path) -> String {
-    // Shared leaf extraction with triage-core; fall back to the full path for a
-    // rootless path (e.g. `/`) so the row is never blank.
+    // Shared leaf extraction with triage-core; fall back to the full path when
+    // there's no final component (e.g. `/`) so the row is never blank.
     path_leaf_name(path).unwrap_or_else(|| path.display().to_string())
 }
 

@@ -58,6 +58,13 @@ drift on the next UI change. Make `triage-core` the single source of truth.
   e2e ignored) + `cargo clippy --all-targets --all-features --locked -D warnings`
   + `cargo fmt --all --check` all clean across triage-core/triaged/triage.
 
+- 2026-06-16T22:23-0700 PR #80 review (Copilot): reworded three comments that
+  called `/` a "rootless path" — `/` is a root path with no final component.
+  Now "no final component (e.g. `/`)", matching `Path::file_name()` semantics
+  (`path_leaf_name` doc + its test in triage-core, and the
+  `context_path_display_name` comment in the TUI).
+
 ## Commits
 
-- HEAD — refactor: hoist SessionContext display logic into triage-core
+- efc7fb4 — refactor: hoist SessionContext display logic into triage-core
+- HEAD — docs: clarify path-with-no-final-component wording (PR #80 review)

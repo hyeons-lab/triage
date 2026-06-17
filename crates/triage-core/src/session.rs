@@ -197,8 +197,8 @@ impl SessionContext {
     }
 }
 
-/// Last path component of `path` as a display string, or `None` for a rootless
-/// path (e.g. `/`). Lossy on non-UTF-8 components.
+/// Last path component of `path` as a display string, or `None` when the path
+/// has no final component (e.g. `/`). Lossy on non-UTF-8 components.
 pub fn path_leaf_name(path: &Path) -> Option<String> {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -635,7 +635,7 @@ mod tests {
             path_leaf_name(Path::new("/home/dev/triage")).as_deref(),
             Some("triage")
         );
-        // A rootless path has no leaf.
+        // A path with no final component has no leaf.
         assert_eq!(path_leaf_name(Path::new("/")), None);
     }
 
