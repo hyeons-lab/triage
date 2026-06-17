@@ -1927,6 +1927,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
     }
 
+    // The dialog and shutdown RPC both await; the State may have been disposed
+    // in the meantime, so guard setState to avoid throwing on a dead widget.
+    if (!mounted) return;
+
     setState(() {
       final index = _sessions.indexOf(session);
       if (index != -1) {
@@ -1960,8 +1964,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             ),
           ),
           content: Text(
-            'This ends the terminal session "${session.title}" and its running '
-            'processes. This cannot be undone.',
+            session.isRemote
+                ? 'This ends the terminal session "${session.title}" and its '
+                      'running processes. This cannot be undone.'
+                : 'This closes the terminal session "${session.title}". This '
+                      'cannot be undone.',
             style: const TextStyle(color: Color(0xff9aa6a8), height: 1.4),
           ),
           actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),

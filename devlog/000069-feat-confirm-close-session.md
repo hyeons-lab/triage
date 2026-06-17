@@ -21,6 +21,16 @@ prompt in front of the destructive action.
   a muted `TextButton` "Cancel" and a destructive-red (`0xffb3443f`) `ElevatedButton`
   "Close session". The body names the session via `session.title` and warns the action
   cannot be undone.
+- 2026-06-16T21:34-0700 PR #77 review (Copilot) fixes:
+  - `_closeSession` — added an `if (!mounted) return;` guard before the teardown
+    `setState`. Both the confirmation dialog and the `shutdownSession` RPC await, so the
+    `State` can be disposed before resumption; calling `setState` on a dead widget throws.
+  - `_confirmCloseSession` — dialog copy is now tailored on `session.isRemote`: the
+    "ends … its running processes" wording only shows for remote sessions; local/scratch
+    sessions get a plain "This closes the terminal session" message so the warning isn't
+    misleading.
+  - Devlog — qualified the two "no `showDialog` under `lib/`" notes as describing the
+    pre-change state (this branch adds the first dialog), so they stay accurate post-merge.
 
 ## Decisions
 
@@ -28,16 +38,17 @@ prompt in front of the destructive action.
   current/future caller of `_closeSession` is protected uniformly, and the teardown path
   stays a single block after the guard.
 - 2026-06-16T16:31-0700 Built a one-off `AlertDialog` instead of adding a shared
-  confirmation widget — `lib/` had zero existing `showDialog` usages, so there was no
-  pattern to extend and only one destructive action needs guarding today. Used a red primary
+  confirmation widget — before this change `lib/` had zero existing `showDialog` usages, so
+  there was no pattern to extend and only one destructive action needs guarding today. Used a red primary
   button (`0xffb3443f`) to signal destructiveness, distinct from the teal (`0xff2b6f6f`) used
   for benign primary actions in `_PairingView`.
 
 ## Research & Discoveries
 
-- 2026-06-16T16:31-0700 The Flutter client has no dialog infrastructure at all — no
-  `showDialog`/`AlertDialog`/`Dialog` anywhere under `lib/`. Confirmation patterns must be
-  introduced from Flutter's built-ins and themed by hand against the app palette.
+- 2026-06-16T16:31-0700 Before this change the Flutter client had no dialog infrastructure
+  at all — no `showDialog`/`AlertDialog`/`Dialog` anywhere under `lib/` (this branch adds the
+  first one). Confirmation patterns had to be introduced from Flutter's built-ins and themed
+  by hand against the app palette.
 
 ## Issues
 
