@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use anyhow::{Result, ensure};
@@ -134,6 +134,74 @@ pub struct SessionContext {
     pub repository_root: Option<PathBuf>,
     pub worktree_root: Option<PathBuf>,
     pub branch: Option<String>,
+}
+
+/// Separator between the parts of [`SessionContext::localization_label`].
+const LABEL_SEPARATOR: &str = "  ·  ";
+
+impl SessionContext {
+    /// The repository root's directory name (its last path component), if known.
+    pub fn repository_name(&self) -> Option<String> {
+        self.repository_root.as_deref().and_then(path_leaf_name)
+    }
+
+    /// The worktree root, but only when it is a *distinct* linked worktree —
+    /// set and not equal to the repository root. Returns `None` when the
+    /// worktree is unset or merely echoes the repository root (the common
+    /// "working in the main checkout" case), so callers never render the same
+    /// directory as both repo and worktree.
+    pub fn distinct_worktree_root(&self) -> Option<&Path> {
+        let worktree = self.worktree_root.as_deref()?;
+        if Some(worktree) == self.repository_root.as_deref() {
+            None
+        } else {
+            Some(worktree)
+        }
+    }
+
+    /// The distinct worktree's directory name, if any. See
+    /// [`Self::distinct_worktree_root`].
+    pub fn worktree_name(&self) -> Option<String> {
+        self.distinct_worktree_root().and_then(path_leaf_name)
+    }
+
+    /// The branch name, treating an empty string as absent.
+    pub fn branch_name(&self) -> Option<&str> {
+        self.branch.as_deref().filter(|branch| !branch.is_empty())
+    }
+
+    /// A compact one-line `repo · branch · worktree` localization label for the
+    /// session. Omits absent parts, and hides the worktree leaf when it merely
+    /// echoes the repository root (handled by [`Self::distinct_worktree_root`])
+    /// or the branch name, so the label never repeats itself. Returns `None`
+    /// when no part is known.
+    ///
+    /// This is the single source of truth for how a session's git location is
+    /// rendered as one line — the daemon's detail-summary header and any other
+    /// consumer share it so the format can't drift.
+    pub fn localization_label(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(repo) = self.repository_name() {
+            parts.push(repo);
+        }
+        let branch = self.branch_name();
+        if let Some(branch) = branch {
+            parts.push(branch.to_string());
+        }
+        if let Some(worktree) = self.worktree_name()
+            && Some(worktree.as_str()) != branch
+        {
+            parts.push(worktree);
+        }
+        (!parts.is_empty()).then(|| parts.join(LABEL_SEPARATOR))
+    }
+}
+
+/// Last path component of `path` as a display string, or `None` for a rootless
+/// path (e.g. `/`). Lossy on non-UTF-8 components.
+pub fn path_leaf_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,5 +619,96 @@ mod tests {
 
         let request = StartSessionRequest::new(" ");
         assert!(request.validate().is_err());
+    }
+
+    fn ctx(repo: Option<&str>, worktree: Option<&str>, branch: Option<&str>) -> SessionContext {
+        SessionContext {
+            repository_root: repo.map(PathBuf::from),
+            worktree_root: worktree.map(PathBuf::from),
+            branch: branch.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn path_leaf_name_takes_the_last_component() {
+        assert_eq!(
+            path_leaf_name(Path::new("/home/dev/triage")).as_deref(),
+            Some("triage")
+        );
+        // A rootless path has no leaf.
+        assert_eq!(path_leaf_name(Path::new("/")), None);
+    }
+
+    #[test]
+    fn distinct_worktree_root_hides_the_repo_root() {
+        // Worktree equal to the repo root is not distinct.
+        assert_eq!(
+            ctx(Some("/home/dev/triage"), Some("/home/dev/triage"), None).distinct_worktree_root(),
+            None
+        );
+        // A linked worktree under the repo is distinct.
+        assert_eq!(
+            ctx(
+                Some("/home/dev/triage"),
+                Some("/home/dev/triage/worktrees/feat-summary"),
+                None,
+            )
+            .distinct_worktree_root(),
+            Some(Path::new("/home/dev/triage/worktrees/feat-summary"))
+        );
+        // Worktree set without a repo root is still distinct.
+        assert_eq!(
+            ctx(None, Some("/tmp/scratch"), None).distinct_worktree_root(),
+            Some(Path::new("/tmp/scratch"))
+        );
+    }
+
+    #[test]
+    fn branch_name_treats_empty_as_absent() {
+        assert_eq!(ctx(None, None, Some("main")).branch_name(), Some("main"));
+        assert_eq!(ctx(None, None, Some("")).branch_name(), None);
+        assert_eq!(ctx(None, None, None).branch_name(), None);
+    }
+
+    #[test]
+    fn localization_label_joins_repo_branch_worktree() {
+        // Linked worktree: all three parts, worktree leaf distinct from branch.
+        assert_eq!(
+            ctx(
+                Some("/home/dev/triage"),
+                Some("/home/dev/triage/worktrees/feat-summary"),
+                Some("feat/summary"),
+            )
+            .localization_label()
+            .as_deref(),
+            Some("triage  ·  feat/summary  ·  feat-summary")
+        );
+
+        // Working in the repo root itself: worktree leaf is hidden.
+        assert_eq!(
+            ctx(
+                Some("/home/dev/triage"),
+                Some("/home/dev/triage"),
+                Some("main"),
+            )
+            .localization_label()
+            .as_deref(),
+            Some("triage  ·  main")
+        );
+
+        // Worktree leaf that merely echoes the branch is suppressed.
+        assert_eq!(
+            ctx(
+                Some("/home/dev/triage"),
+                Some("/home/dev/triage/worktrees/feature"),
+                Some("feature"),
+            )
+            .localization_label()
+            .as_deref(),
+            Some("triage  ·  feature")
+        );
+
+        // No git context at all: no label.
+        assert_eq!(ctx(None, None, None).localization_label(), None);
     }
 }

@@ -25,6 +25,7 @@ use triage::{
 };
 use triage_core::session::{
     InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
+    path_leaf_name,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -743,11 +744,7 @@ fn session_context_rows(
             rows.push(Line::from(""));
         }
 
-        if let Some(worktree_root) = context
-            .worktree_root
-            .as_ref()
-            .filter(|worktree_root| context.repository_root.as_ref() != Some(*worktree_root))
-        {
+        if let Some(worktree_root) = context.distinct_worktree_root() {
             rows.push(context_path_row(
                 "w",
                 worktree_root,
@@ -895,9 +892,7 @@ fn session_context_overflows(view: &SessionView, width: usize) -> bool {
             .or(context.worktree_root.as_ref())
             .is_some_and(|root| context_path_overflows(root, width));
         let worktree_overflows = context
-            .worktree_root
-            .as_ref()
-            .filter(|worktree_root| context.repository_root.as_ref() != Some(*worktree_root))
+            .distinct_worktree_root()
             .is_some_and(|worktree_root| context_path_overflows(worktree_root, width));
         repo_overflows || worktree_overflows
     } else {
@@ -918,9 +913,9 @@ fn context_path_overflows(path: &Path, width: usize) -> bool {
 }
 
 fn context_path_display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+    // Shared leaf extraction with triage-core; fall back to the full path for a
+    // rootless path (e.g. `/`) so the row is never blank.
+    path_leaf_name(path).unwrap_or_else(|| path.display().to_string())
 }
 
 fn draw_terminal(
