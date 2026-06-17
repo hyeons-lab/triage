@@ -2223,8 +2223,10 @@ enum ActorCommand {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
     /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
-    /// no raw-output-history disk read, so it never blocks on I/O. Returns the
-    /// plain visible rows plus the current output sequence.
+    /// no raw-output-history disk read, so it never blocks on I/O. Returns a
+    /// `(rows, output_seq, context)` tuple: the plain visible rows, the current
+    /// output sequence, and the optional `SessionContext`
+    /// (repository/worktree root + branch) used to localize the summary.
     SummaryRows {
         response: Sender<ActorResult<SummaryRowsResponse>>,
     },
