@@ -174,14 +174,16 @@ fn sha2_hash(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub async fn serve_http<B>(
+pub async fn serve_http<B, F, Fut>(
     req: Request<B>,
     cache: Arc<WebAssetCache>,
     manager: Arc<crate::session::SessionManager>,
-    allow_pairing_approval: bool,
+    authorize_pairing: F,
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     B: hyper::body::Body + Send + 'static,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
 {
     let method = req.method();
     let path = req.uri().path();
@@ -202,8 +204,11 @@ where
         return Ok(handle_ws_upgrade(req, manager));
     }
 
+    // `/pair` is the single source of truth for the pairing route. The
+    // authorizer (which may run `tailscale whois`) is invoked lazily here —
+    // only after the method check above — so non-GET requests never trigger it.
     if path == "/pair" || path == "/pair/" {
-        if !allow_pairing_approval {
+        if !authorize_pairing().await {
             let mut res = Response::new(Full::new(Bytes::from("Not Found")));
             *res.status_mut() = StatusCode::NOT_FOUND;
             return Ok(res);

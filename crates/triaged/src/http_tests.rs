@@ -125,9 +125,11 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
-            .await
-            .unwrap();
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            true
+        })
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), hyper::StatusCode::OK);
         assert_eq!(
@@ -163,9 +165,11 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
-            .await
-            .unwrap();
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            true
+        })
+        .await
+        .unwrap();
 
         // Should return 200 OK because of the SPA fallback (returns fallback index.html)
         assert_eq!(response.status(), hyper::StatusCode::OK);
@@ -200,9 +204,11 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
-            .await
-            .unwrap();
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            true
+        })
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), hyper::StatusCode::OK);
         assert_eq!(
@@ -250,9 +256,11 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
-            .await
-            .unwrap();
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            true
+        })
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), hyper::StatusCode::OK);
         assert_eq!(
@@ -275,9 +283,14 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response_raw = serve_http(req_raw, Arc::clone(&cache), Arc::clone(&manager), true)
-            .await
-            .unwrap();
+        let response_raw = serve_http(
+            req_raw,
+            Arc::clone(&cache),
+            Arc::clone(&manager),
+            || async { true },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response_raw.status(), hyper::StatusCode::OK);
         assert!(
@@ -310,9 +323,11 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), true)
-            .await
-            .unwrap();
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            true
+        })
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), hyper::StatusCode::OK);
 
@@ -351,10 +366,49 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), false)
-            .await
-            .unwrap();
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            false
+        })
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_pair_page_non_get_does_not_invoke_authorizer() {
+        // A non-GET request to /pair must be rejected by the method check
+        // before the pairing authorizer (which may spawn `tailscale whois`)
+        // is ever consulted — otherwise an unauthenticated peer could amplify
+        // requests into subprocess spawns.
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(WebAssetCache::new(Some(temp_dir.path.clone())));
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            temp_dir.path.clone(),
+        )));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/pair?device_code=anything")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let authorizer_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&authorizer_called);
+        let response = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), move || {
+            let flag = Arc::clone(&flag);
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), hyper::StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            !authorizer_called.load(std::sync::atomic::Ordering::SeqCst),
+            "pairing authorizer must not run for a non-GET request"
+        );
     }
 }

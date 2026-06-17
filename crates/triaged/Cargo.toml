@@ -35,7 +35,7 @@ tracing.workspace = true
 unicode-width.workspace = true
 tattoy-wezterm-term.workspace = true
 tattoy-wezterm-surface.workspace = true
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 triage-transport-ws.workspace = true
