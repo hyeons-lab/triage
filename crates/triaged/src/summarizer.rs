@@ -306,11 +306,17 @@ fn generate_detail(
 
 /// Builds [`GenerateOpts`] for the detail-summary pass. Starts from cera's
 /// defaults, then — when the loaded model is a text bundle whose LeapBundles
-/// manifest ships advisory `sampling_parameters` — applies the model's own
-/// recommended temperature / top-p / top-k / repetition-penalty. Falls back to
+/// manifest ships advisory `sampling_parameters` — applies every recommended
+/// param the manifest carries: temperature / min-p / top-p / top-k /
+/// repetition-penalty. Each is applied only when the manifest specifies it, so
+/// a partial block keeps cera's defaults for the rest. Falls back to
 /// deterministic greedy decoding (temperature 0) when the manifest specifies no
 /// sampling params (e.g. a bare GGUF or a non-text inference type). The one-line
 /// label deliberately does not use this — it stays greedy for a stable rail.
+///
+/// The `GenerationDefaults::Text` destructure is exhaustive (no `..`) on
+/// purpose: if cera grows another manifest sampling param, this stops
+/// compiling so we wire it through rather than silently dropping it.
 fn sampling_opts(engine: &cera::CeraEngine, max_tokens: u32) -> cera::GenerateOpts {
     let mut opts = cera::GenerateOpts {
         max_tokens,
@@ -319,14 +325,17 @@ fn sampling_opts(engine: &cera::CeraEngine, max_tokens: u32) -> cera::GenerateOp
     };
     if let GenerationDefaults::Text {
         temperature,
+        min_p,
         top_p,
         top_k,
         repetition_penalty,
-        ..
     } = &engine.manifest().generation_defaults
     {
         if let Some(temperature) = temperature {
             opts.temperature = *temperature;
+        }
+        if let Some(min_p) = min_p {
+            opts.min_p = *min_p;
         }
         if let Some(top_p) = top_p {
             opts.top_p = *top_p;

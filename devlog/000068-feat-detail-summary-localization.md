@@ -59,6 +59,15 @@ pass, while keeping the one-line rail label deterministic (greedy).
   `(rows, output_seq, context)` return shape (the optional `SessionContext` is
   repo/worktree root + branch, used to localize the summary); normalized this
   file's timestamps from `-07:00` to the repo-standard `-0700` offset form.
+- 2026-06-16T21:48-0700 `crates/triaged/src/summarizer.rs` — `sampling_opts`
+  now maps the full manifest sampling set. cera 0.1.1 added a `min_p` field to
+  both `GenerateOpts` and `GenerationDefaults::Text`; the old destructure used
+  `..` and silently dropped it, so a model recommending min-p wasn't honored.
+  Now we map all five (`temperature`/`min_p`/`top_p`/`top_k`/
+  `repetition_penalty`) and made the `Text` destructure exhaustive (no `..`) so
+  a future cera param fails the build instead of being dropped. Each param is
+  still applied only when the manifest sets it, so partial blocks keep cera's
+  defaults for the rest.
 
 ## Commits
 
