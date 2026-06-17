@@ -9,7 +9,7 @@
 //! once. The model is downloaded + loaded lazily on the first job, so enabling
 //! the summarizer never blocks daemon startup.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
 use cera::manifest::GenerationDefaults;
@@ -298,7 +298,7 @@ fn generate_detail(
     let opts = sampling_opts(engine, config.detail_max_tokens);
     session.generate(&opts, &mut sink)?;
 
-    let header = context.and_then(context_header);
+    let header = context.and_then(SessionContext::localization_label);
     let summary = sanitize_detail(&sink.text);
     Ok(match (header, summary) {
         (Some(header), Some(summary)) => Some(format!("{header}\n{summary}")),
@@ -381,43 +381,6 @@ fn sampling_opts_from_defaults(
     // No manifest sampling guidance: deterministic greedy decoding.
     opts.temperature = 0.0;
     opts
-}
-
-/// Deterministic `repo · branch · worktree` localization header that leads the
-/// detail summary. Mirrors the side-rail meta line: omits absent parts, hides
-/// the worktree leaf when it's the repo root itself or merely echoes the branch.
-/// Returns `None` when no part is known.
-fn context_header(context: &SessionContext) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(repo) = context.repository_root.as_deref().and_then(leaf_name) {
-        parts.push(repo);
-    }
-    let branch = context
-        .branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty());
-    if let Some(branch) = branch {
-        parts.push(branch.to_string());
-    }
-    let worktree_leaf = context.worktree_root.as_deref().and_then(|worktree| {
-        if Some(worktree) == context.repository_root.as_deref() {
-            None
-        } else {
-            leaf_name(worktree)
-        }
-    });
-    if let Some(worktree) = worktree_leaf
-        && Some(worktree.as_str()) != branch
-    {
-        parts.push(worktree);
-    }
-    (!parts.is_empty()).then(|| parts.join("  ·  "))
-}
-
-/// Last path component as a display string, or `None` for a rootless path.
-fn leaf_name(path: &Path) -> Option<String> {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// A [`ModalitySink`] that accumulates all decoded text (multi-line). Used for
@@ -662,38 +625,6 @@ mod tests {
         assert!(
             detail.starts_with("triage  ·  feat/summary  ·  feat-summary"),
             "detail should lead with the repo/branch/worktree header: {detail:?}"
-        );
-    }
-
-    #[test]
-    fn context_header_mirrors_the_side_rail_meta_line() {
-        // Linked worktree: all three parts, worktree leaf distinct from branch.
-        let header = context_header(&SessionContext {
-            repository_root: Some("/home/dev/triage".into()),
-            worktree_root: Some("/home/dev/triage/worktrees/feat-summary".into()),
-            branch: Some("feat/summary".to_string()),
-        });
-        assert_eq!(
-            header.as_deref(),
-            Some("triage  ·  feat/summary  ·  feat-summary")
-        );
-
-        // Working in the repo root itself: worktree leaf is hidden.
-        let header = context_header(&SessionContext {
-            repository_root: Some("/home/dev/triage".into()),
-            worktree_root: Some("/home/dev/triage".into()),
-            branch: Some("main".to_string()),
-        });
-        assert_eq!(header.as_deref(), Some("triage  ·  main"));
-
-        // No git context at all: no header.
-        assert_eq!(
-            context_header(&SessionContext {
-                repository_root: None,
-                worktree_root: None,
-                branch: None,
-            }),
-            None
         );
     }
 
