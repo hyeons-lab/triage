@@ -151,6 +151,13 @@ the resolver orchestration, the real `tailscale_whois_login` subprocess path,
 the trust toggle, the tagged-devices guard, negative TTL, and the require_pairing
 fixture coupling. README documents the new option and behaviors.
 
+2026-06-17T09:24-0700 PR #82 review (Copilot, round 2): clarified the Pairing
+flow README step so it notes that `pair_approval_trust_local_peers = false` drops
+the loopback/same-host shortcut — even `127.0.0.1` then needs the allowlist or
+`/pair` 404s (prevents "why does localhost /pair 404?" confusion). The round's
+other comments (cache cap, mutex poisoning, README `0.0.0.0` snippet) were on a
+superseded commit and already fixed in 9265110 / this branch.
+
 2026-06-17T08:57-0700 Deferred (not bug-fixes): finding #15 (re-architect
 tailnet authz into a shared `WebSocketAuthenticator`/peer-identity layer rather
 than a `/pair`-only gate) is a design-direction item, intentionally not bundled

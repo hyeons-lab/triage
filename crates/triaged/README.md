@@ -119,11 +119,15 @@ can also opt in to approval from allowlisted Tailscale identities.
    challenge*. The daemon returns a short-lived `device_code`.
 2. **Approve.** The client surfaces the device code. By default, open the
    approval URL **on the machine running the daemon** —
-   `http://127.0.0.1:7777/pair?device_code=<device_code>`. The `/pair` page is
-   served to **loopback / same-host connections** (`is_local_pairing_peer`). If
-   `pair_approval_tailnet_users` is configured, it is also served to remote peers
-   whose authenticated Tailscale login is on that allowlist. The page validates
-   the device code and displays a one-time, **device-bound PIN** with an expiry.
+   `http://127.0.0.1:7777/pair?device_code=<device_code>`. By default the `/pair`
+   page is served to **loopback / same-host connections** (`is_local_pairing_peer`).
+   If `pair_approval_tailnet_users` is configured, it is also served to remote
+   peers whose authenticated Tailscale login is on that allowlist. (Setting
+   `pair_approval_trust_local_peers = false` — for a loopback reverse-proxy
+   deployment — drops the loopback/same-host shortcut entirely, so even
+   `127.0.0.1` requests must be on the tailnet allowlist or `/pair` returns 404.)
+   The page validates the device code and displays a one-time, **device-bound
+   PIN** with an expiry.
 3. **Enter the PIN.** That PIN is typed back into the waiting client. The client
    exchanges it (`pair(pin, client_id)`) and the daemon — after verifying the PIN
    is bound to that exact client/device — issues a **bearer token**.
