@@ -95,3 +95,38 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+
+  flutter:
+    name: Flutter (analyze + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: flutter/triage_client
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Set up Flutter
+        # subosito/flutter-action@v2 (matches publish.yml)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.0"
+          channel: "stable"
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # The client carries a large pre-existing analyzer backlog (mostly the
+      # generated FlatBuffers bindings), so gate on error-severity only: genuine
+      # breakage fails the build without drowning in the existing info/warning
+      # noise. Tightening this (excluding generated files, clearing the backlog,
+      # then making warnings fatal) is a worthwhile follow-up.
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run tests
+        run: flutter test
