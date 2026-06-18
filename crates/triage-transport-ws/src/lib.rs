@@ -506,6 +506,23 @@ pub enum ServerMessage {
         detail: Option<String>,
         output_seq: u64,
     },
+    /// Connection-wide push: a session's git context (or working directory)
+    /// changed — e.g. the shell `cd`-ed into another repo or out of one.
+    /// Delivered to every authenticated client so the side rail stays fresh
+    /// without re-attaching. `current_working_directory` is set whenever known
+    /// (even outside a repo); the git fields are `None` when the cwd is not
+    /// inside a repository, so the rail can fall back to showing the cwd.
+    SessionContextUpdated {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1322,5 +1339,49 @@ mod tests {
         let err = root.payload_as_error_payload().unwrap();
         assert_eq!(err.code().unwrap(), "invalid_flatbuffer");
         assert!(!err.message().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flatbuffers_session_context_updated_roundtrip() {
+        // In a repo: every git field is carried alongside the cwd.
+        let in_repo = ServerMessage::SessionContextUpdated {
+            session_id: SessionId::new("session-1").unwrap(),
+            current_working_directory: Some("/home/me/dev/triage".to_string()),
+            repository_root: Some("/home/me/dev/triage".to_string()),
+            worktree_root: Some("/home/me/dev/triage/worktrees/x".to_string()),
+            branch: Some("feat/x".to_string()),
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&in_repo);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::SessionContextUpdated {
+                session_id: "session-1",
+                current_working_directory: Some("/home/me/dev/triage"),
+                repository_root: Some("/home/me/dev/triage"),
+                worktree_root: Some("/home/me/dev/triage/worktrees/x"),
+                branch: Some("feat/x"),
+            }
+        );
+
+        // Outside a repo: the cwd is still sent, with the git fields absent so
+        // the client can fall back to showing the working directory.
+        let no_repo = ServerMessage::SessionContextUpdated {
+            session_id: SessionId::new("session-2").unwrap(),
+            current_working_directory: Some("/tmp/scratch".to_string()),
+            repository_root: None,
+            worktree_root: None,
+            branch: None,
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&no_repo);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::SessionContextUpdated {
+                session_id: "session-2",
+                current_working_directory: Some("/tmp/scratch"),
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            }
+        );
     }
 }

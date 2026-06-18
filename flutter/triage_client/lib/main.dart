@@ -16,6 +16,10 @@ import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
+// Process-env access (home dir, marquee gating) behind a conditional import so
+// the web client — which has no `dart:io` — compiles against web stubs.
+import 'package:triage_client/platform_env_io.dart'
+    if (dart.library.js_util) 'package:triage_client/platform_env_web.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -54,7 +58,9 @@ Uri? parseDaemonAddress(String input) {
     };
     if (scheme == null) return null;
     final port = parsed.hasPort ? parsed.port : _defaultDaemonPort;
-    final path = (parsed.path.isEmpty || parsed.path == '/') ? '/ws' : parsed.path;
+    final path = (parsed.path.isEmpty || parsed.path == '/')
+        ? '/ws'
+        : parsed.path;
     return Uri(
       scheme: scheme,
       host: parsed.host,
@@ -111,6 +117,7 @@ Future<void> saveDaemonAddress(String address) async {
     await prefs.setString(_daemonAddressPrefKey, address);
   } catch (_) {}
 }
+
 const double _sessionRailCollapsedWidth = 72;
 const double _sessionRailExpandedWidth = 320;
 const Duration _sessionRailAnimationDuration = Duration(milliseconds: 220);
@@ -189,13 +196,14 @@ bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
 class SessionVm {
   SessionVm({
     required this.title,
-    required this.branch,
     required this.status,
     required this.statusColor,
     required this.icon,
     required this.rows,
+    this.branch,
     this.repoRoot,
     this.worktreeRoot,
+    this.cwd,
     this.isRemote = false,
     this.isExited = false,
   }) : terminalController = TerminalController() {
@@ -222,11 +230,17 @@ class SessionVm {
   }
 
   final String title;
-  final String branch;
-  // Absolute git repository root and worktree root for this session, from the
-  // snapshot context. Null when the session isn't in a git repo (or old host).
-  final String? repoRoot;
-  final String? worktreeRoot;
+  // Git context for this session, from the snapshot context and refreshed live
+  // via `session_context_updated` pushes. All null when the session isn't in a
+  // git repo (or the host is too old to report context).
+  String? branch;
+  // Absolute git repository root and worktree root for this session.
+  String? repoRoot;
+  String? worktreeRoot;
+  // Absolute current working directory, shown in the rail in place of the git
+  // line when the session isn't inside a repo. Mutable so live context pushes
+  // can update it without recreating the view-model.
+  String? cwd;
   String status;
   Color statusColor;
   // Local-LLM one-line description of what the session is doing, shown in the
@@ -256,6 +270,7 @@ class SessionVm {
     final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
     return leaf.isEmpty ? null : leaf;
   }
+
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
   // real rendering goes through [store]/[terminal] from raw bytes.
@@ -658,7 +673,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           rows: rows - 1,
         );
         if (_disposed) return;
-        await _client.resizeSession(sessionId: sessionId, cols: cols, rows: rows);
+        await _client.resizeSession(
+          sessionId: sessionId,
+          cols: cols,
+          rows: rows,
+        );
       } catch (_) {}
     }());
   }
@@ -1240,7 +1259,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   SessionVm _loadingDaemonSession(String sessionId) {
     return SessionVm(
       title: 'triage / $sessionId',
-      branch: 'main',
       status: 'loading',
       statusColor: const Color(0xffffc857),
       icon: Icons.terminal,
@@ -1324,9 +1342,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
 
       final contextObj = snapshot?['context'] as Map<String, dynamic>?;
-      final branch = contextObj?['branch']?.toString() ?? 'main';
+      final branch = contextObj?['branch']?.toString();
       final repoRoot = contextObj?['repository_root']?.toString();
       final worktreeRoot = contextObj?['worktree_root']?.toString();
+      final cwd = snapshot?['current_working_directory']?.toString();
 
       final plainRows = _plainRowsFromSnapshot(snapshot);
       final exited = snapshot?['exited'] as bool? ?? false;
@@ -1337,6 +1356,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         branch: branch,
         repoRoot: repoRoot,
         worktreeRoot: worktreeRoot,
+        cwd: cwd,
         status: exited ? 'exited' : 'attached',
         statusColor: exited ? const Color(0xff7f8b8d) : const Color(0xff7fd1c7),
         icon: Icons.terminal,
@@ -1482,6 +1502,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // A regeneration always reports the current detail; null means the
         // detail pass produced nothing this round, so clear the stale one.
         _sessions[index].snippetDetail = detail;
+      }
+
+      if (mounted) {
+        setState(apply);
+      } else {
+        apply();
+      }
+      return;
+    }
+
+    if (type == 'session_context_updated') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null) return;
+      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (index == -1) return;
+      // Each push carries the full current context, so a null field genuinely
+      // means "absent" (e.g. cd'd out of a repo) — assign directly, don't merge.
+      void apply() {
+        final session = _sessions[index];
+        session.cwd = message['current_working_directory']?.toString();
+        session.repoRoot = message['repository_root']?.toString();
+        session.worktreeRoot = message['worktree_root']?.toString();
+        session.branch = message['branch']?.toString();
       }
 
       if (mounted) {
@@ -1724,7 +1767,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       // ReorderableListView reports newIndex in the pre-removal coordinate space.
       if (newIndex > oldIndex) newIndex -= 1;
-      final selected = (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
+      final selected =
+          (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
           ? _sessions[_selectedIndex]
           : null;
       final moved = _sessions.removeAt(oldIndex);
@@ -1971,9 +2015,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           final responseObj = attachRes['response'] as Map<String, dynamic>?;
           final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
           final contextObj = snapshot?['context'] as Map<String, dynamic>?;
-          final branch = contextObj?['branch']?.toString() ?? 'main';
+          final branch = contextObj?['branch']?.toString();
           final repoRoot = contextObj?['repository_root']?.toString();
           final worktreeRoot = contextObj?['worktree_root']?.toString();
+          final cwd = snapshot?['current_working_directory']?.toString();
 
           final plainRows = _plainRowsFromSnapshot(snapshot);
           final exited = snapshot?['exited'] as bool? ?? false;
@@ -1984,6 +2029,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             branch: branch,
             repoRoot: repoRoot,
             worktreeRoot: worktreeRoot,
+            cwd: cwd,
             status: exited ? 'exited' : 'attached',
             statusColor: exited
                 ? const Color(0xff7f8b8d)
@@ -2403,7 +2449,11 @@ class SessionRail extends StatelessWidget {
           IconButton(
             onPressed: onOpenSettings,
             tooltip: 'Connection settings',
-            icon: const Icon(Icons.settings, color: Color(0xff7f8b8d), size: 20),
+            icon: const Icon(
+              Icons.settings,
+              color: Color(0xff7f8b8d),
+              size: 20,
+            ),
           ),
           const SizedBox(height: 12),
           const Divider(height: 1, color: Color(0xff263033)),
@@ -2558,6 +2608,7 @@ class SessionRail extends StatelessWidget {
                   branch: session.branch,
                   repoName: session.repoName,
                   worktreeName: session.worktreeName,
+                  cwd: session.cwd,
                   snippet: session.snippet,
                   snippetDetail: session.snippetDetail,
                   onTap: () => onSelectSession(index),
@@ -2739,9 +2790,7 @@ class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
         ),
         const SizedBox(height: 8),
         Text(
-          preview == null
-              ? 'Will connect to: —'
-              : 'Will connect to: $preview',
+          preview == null ? 'Will connect to: —' : 'Will connect to: $preview',
           style: const TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
         ),
         const SizedBox(height: 20),
@@ -2818,6 +2867,7 @@ class SessionListTile extends StatefulWidget {
     this.branch,
     this.repoName,
     this.worktreeName,
+    this.cwd,
     this.snippet,
     this.snippetDetail,
     this.selected = false,
@@ -2832,6 +2882,9 @@ class SessionListTile extends StatefulWidget {
   final String? branch;
   final String? repoName;
   final String? worktreeName;
+  // Absolute current working directory, shown in place of the git line when the
+  // session isn't inside a repo.
+  final String? cwd;
   // Local-LLM one-line description of the session; hidden when null/empty.
   final String? snippet;
   // Local-LLM longer-form summary, shown in the hover popover.
@@ -2846,8 +2899,9 @@ class _SessionListTileState extends State<SessionListTile> {
   final OverlayPortalController _popover = OverlayPortalController();
   final LayerLink _link = LayerLink();
 
-  /// One-line "repo · branch · worktree" summary, omitting absent parts.
-  String? get _metaLine {
+  /// One-line "repo · branch · worktree" summary, omitting absent parts. Null
+  /// when the session has no git context — the rail then falls back to the cwd.
+  String? get _gitMeta {
     final parts = <String>[
       if (widget.repoName != null) widget.repoName!,
       if (widget.branch != null && widget.branch!.isNotEmpty) widget.branch!,
@@ -2873,7 +2927,14 @@ class _SessionListTileState extends State<SessionListTile> {
 
   @override
   Widget build(BuildContext context) {
-    final meta = _metaLine;
+    // The rail meta line is the git "repo · branch · worktree" summary when the
+    // session is in a repo; otherwise it falls back to the working directory.
+    final gitMeta = _gitMeta;
+    final cwd = widget.cwd;
+    final hasCwdFallback = gitMeta == null && cwd != null && cwd.isNotEmpty;
+    final metaIcon = gitMeta != null
+        ? Icons.account_tree_outlined
+        : Icons.folder_outlined;
     return CompositedTransformTarget(
       link: _link,
       child: MouseRegion(
@@ -2897,6 +2958,7 @@ class _SessionListTileState extends State<SessionListTile> {
                   repoName: widget.repoName,
                   branch: widget.branch,
                   worktreeName: widget.worktreeName,
+                  cwd: widget.cwd,
                   snippet: widget.snippet,
                   detail: widget.snippetDetail,
                 ),
@@ -2926,11 +2988,7 @@ class _SessionListTileState extends State<SessionListTile> {
                 ),
                 child: Row(
                   children: [
-                    Icon(
-                      widget.icon,
-                      size: 20,
-                      color: const Color(0xffcdd7d6),
-                    ),
+                    Icon(widget.icon, size: 20, color: const Color(0xffcdd7d6)),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Column(
@@ -2942,21 +3000,28 @@ class _SessionListTileState extends State<SessionListTile> {
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
-                          if (meta != null) ...[
+                          if (gitMeta != null || hasCwdFallback) ...[
                             const SizedBox(height: 3),
                             Row(
                               children: [
-                                const Icon(
-                                  Icons.account_tree_outlined,
+                                Icon(
+                                  metaIcon,
                                   size: 12,
-                                  color: Color(0xff7f8b8d),
+                                  color: const Color(0xff7f8b8d),
                                 ),
                                 const SizedBox(width: 5),
                                 Expanded(
-                                  child: Text(
-                                    meta,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
+                                  child: _MetaLineText(
+                                    // Git meta is already compact (leaf names);
+                                    // the cwd fallback shows the absolute path,
+                                    // collapsing to ~/… or scrolling when long.
+                                    full: gitMeta ?? cwd!,
+                                    abbreviated: gitMeta == null
+                                        ? _homeAbbreviatedPath(cwd!)
+                                        : null,
+                                    // Marquee only the selected row, to keep the
+                                    // rail quiet (per design).
+                                    animate: widget.selected,
                                     style: const TextStyle(
                                       color: Color(0xff8b9799),
                                       fontSize: 11,
@@ -3028,6 +3093,7 @@ class _SessionGlanceCard extends StatelessWidget {
     required this.repoName,
     required this.branch,
     required this.worktreeName,
+    required this.cwd,
     required this.snippet,
     required this.detail,
   });
@@ -3038,6 +3104,7 @@ class _SessionGlanceCard extends StatelessWidget {
   final String? repoName;
   final String? branch;
   final String? worktreeName;
+  final String? cwd;
   final String? snippet;
   final String? detail;
 
@@ -3106,9 +3173,18 @@ class _SessionGlanceCard extends StatelessWidget {
               _GlanceRow(icon: Icons.account_tree_outlined, label: branch!),
             if (worktreeName != null && worktreeName != branch)
               _GlanceRow(icon: Icons.alt_route, label: worktreeName!),
+            // The full working directory, wrapping across lines so the whole
+            // path is readable here even when the rail line had to truncate it.
+            if (cwd != null && cwd!.isNotEmpty)
+              _GlanceRow(
+                icon: Icons.subdirectory_arrow_right,
+                label: cwd!,
+                wrap: true,
+              ),
             if (repoName != null ||
                 (branch != null && branch!.isNotEmpty) ||
-                worktreeName != null)
+                worktreeName != null ||
+                (cwd != null && cwd!.isNotEmpty))
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 8),
                 child: Divider(height: 1, color: Color(0xff2b363a)),
@@ -3129,28 +3205,201 @@ class _SessionGlanceCard extends StatelessWidget {
 }
 
 class _GlanceRow extends StatelessWidget {
-  const _GlanceRow({required this.icon, required this.label});
+  const _GlanceRow({
+    required this.icon,
+    required this.label,
+    this.wrap = false,
+  });
 
   final IconData icon;
   final String label;
+  // When true the label wraps across lines instead of truncating — used for the
+  // full working-directory path so it stays fully readable in the popover.
+  final bool wrap;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: Row(
+        crossAxisAlignment: wrap
+            ? CrossAxisAlignment.start
+            : CrossAxisAlignment.center,
         children: [
           Icon(icon, size: 13, color: const Color(0xff7f8b8d)),
           const SizedBox(width: 7),
           Expanded(
             child: Text(
               label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+              maxLines: wrap ? null : 1,
+              overflow: wrap ? TextOverflow.clip : TextOverflow.ellipsis,
               style: const TextStyle(color: Color(0xffb4bfc0), fontSize: 12),
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Collapses a leading local-home prefix to `~` — e.g. `/Users/me/dev` →
+/// `~/dev`. Returns null when [path] is not under the local home (e.g. a path
+/// from a remote daemon), so callers fall back to showing it in full.
+String? _homeAbbreviatedPath(String path) {
+  final home = localHomeDir();
+  if (home == null || home.isEmpty) return null;
+  final normalized = home.endsWith('/')
+      ? home.substring(0, home.length - 1)
+      : home;
+  if (path == normalized) return '~';
+  if (path.startsWith('$normalized/')) {
+    return '~${path.substring(normalized.length)}';
+  }
+  return null;
+}
+
+/// Renders a single-line meta string that adapts to the available width: shows
+/// [full] when it fits; else [abbreviated] (e.g. a `~/…` path) when that fits;
+/// else scrolls it as a marquee when [animate] is set, or truncates with an
+/// ellipsis. The marquee is reserved for the selected row so the rail stays
+/// quiet.
+class _MetaLineText extends StatelessWidget {
+  const _MetaLineText({
+    required this.full,
+    required this.abbreviated,
+    required this.animate,
+    required this.style,
+  });
+
+  final String full;
+  final String? abbreviated;
+  final bool animate;
+  final TextStyle style;
+
+  bool _fits(String text, double maxWidth) {
+    final painter = TextPainter(
+      text: TextSpan(text: text, style: style),
+      maxLines: 1,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    return painter.width <= maxWidth;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxWidth = constraints.maxWidth;
+        if (maxWidth.isFinite && _fits(full, maxWidth)) {
+          return Text(full, style: style, maxLines: 1, softWrap: false);
+        }
+        final abbr = abbreviated;
+        if (abbr != null && maxWidth.isFinite && _fits(abbr, maxWidth)) {
+          return Text(abbr, style: style, maxLines: 1, softWrap: false);
+        }
+        if (animate && marqueeAnimationsEnabled()) {
+          return _MarqueeText(text: full, style: style);
+        }
+        // Static fallback: prefer the abbreviated form so the most meaningful
+        // tail still shows before the ellipsis.
+        return Text(
+          abbr ?? full,
+          style: style,
+          maxLines: 1,
+          softWrap: false,
+          overflow: TextOverflow.ellipsis,
+        );
+      },
+    );
+  }
+}
+
+/// Horizontally scrolls [text] back and forth so an over-long single line stays
+/// fully readable. One there-and-back cycle takes [cyclePeriod] with a brief
+/// pause at each end. Renders as static text when the content already fits.
+class _MarqueeText extends StatefulWidget {
+  const _MarqueeText({required this.text, required this.style});
+
+  final String text;
+  final TextStyle style;
+
+  /// One full there-and-back scroll cycle takes roughly this long.
+  static const Duration cyclePeriod = Duration(seconds: 15);
+
+  @override
+  State<_MarqueeText> createState() => _MarqueeTextState();
+}
+
+class _MarqueeTextState extends State<_MarqueeText>
+    with SingleTickerProviderStateMixin {
+  final ScrollController _scroll = ScrollController();
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    // Half a cycle per direction; repeat(reverse:) gives the full there-and-back.
+    duration: _MarqueeText.cyclePeriod ~/ 2,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onTick);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _start());
+  }
+
+  @override
+  void didUpdateWidget(_MarqueeText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _start());
+    }
+  }
+
+  void _start() {
+    if (!mounted || !_scroll.hasClients) return;
+    if (_scroll.position.maxScrollExtent <= 0) {
+      _controller
+        ..stop()
+        ..value = 0;
+      return;
+    }
+    if (!_controller.isAnimating) {
+      _controller.repeat(reverse: true);
+    }
+  }
+
+  void _onTick() {
+    if (!_scroll.hasClients) return;
+    final max = _scroll.position.maxScrollExtent;
+    if (max <= 0) return;
+    _scroll.jumpTo(max * _holdEased(_controller.value));
+  }
+
+  /// Eases 0→1 with a hold at each end so the scroll pauses before reversing.
+  double _holdEased(double v) {
+    const hold = 0.12;
+    if (v <= hold) return 0;
+    if (v >= 1 - hold) return 1;
+    return Curves.easeInOut.transform((v - hold) / (1 - 2 * hold));
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      controller: _scroll,
+      scrollDirection: Axis.horizontal,
+      physics: const NeverScrollableScrollPhysics(),
+      child: Text(
+        widget.text,
+        style: widget.style,
+        maxLines: 1,
+        softWrap: false,
       ),
     );
   }
@@ -3202,6 +3451,17 @@ class WorkspaceHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Header subtitle: the branch when in a repo, else the working directory
+    // (home-abbreviated), so a non-repo session still shows where it is.
+    final cwd = session.cwd;
+    final branch = session.branch;
+    // Treat an empty/whitespace branch as absent (the daemon may send "") so the
+    // subtitle falls back to the cwd instead of going blank.
+    final headerMeta = (branch != null && branch.trim().isNotEmpty)
+        ? branch
+        : (cwd != null && cwd.isNotEmpty
+              ? (_homeAbbreviatedPath(cwd) ?? cwd)
+              : '');
     return Container(
       height: 68,
       padding: const EdgeInsets.symmetric(horizontal: 22),
@@ -3229,7 +3489,7 @@ class WorkspaceHeader extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  session.branch,
+                  headerMeta,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Color(0xff9aa6a8)),

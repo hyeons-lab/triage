@@ -284,7 +284,8 @@ enum ServerMessagePayloadTypeId {
   ErrorPayload(2),
   EventPayload(3),
   SubscriptionClosedPayload(4),
-  SessionSnippetUpdatedPayload(5);
+  SessionSnippetUpdatedPayload(5),
+  SessionContextUpdatedPayload(6);
 
   final int value;
   const ServerMessagePayloadTypeId(this.value);
@@ -297,6 +298,7 @@ enum ServerMessagePayloadTypeId {
       case 3: return ServerMessagePayloadTypeId.EventPayload;
       case 4: return ServerMessagePayloadTypeId.SubscriptionClosedPayload;
       case 5: return ServerMessagePayloadTypeId.SessionSnippetUpdatedPayload;
+      case 6: return ServerMessagePayloadTypeId.SessionContextUpdatedPayload;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -305,7 +307,7 @@ enum ServerMessagePayloadTypeId {
       value == null ? null : ServerMessagePayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 5;
+  static const int maxValue = 6;
   static const fb.Reader<ServerMessagePayloadTypeId> reader = _ServerMessagePayloadTypeIdReader();
 }
 
@@ -5017,6 +5019,123 @@ class SessionSnippetUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionContextUpdatedPayload {
+  SessionContextUpdatedPayload._(this._bc, this._bcOffset);
+  factory SessionContextUpdatedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionContextUpdatedPayload> reader = _SessionContextUpdatedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get currentWorkingDirectory => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get repositoryRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
+  String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+
+  @override
+  String toString() {
+    return 'SessionContextUpdatedPayload{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
+  }
+}
+
+class _SessionContextUpdatedPayloadReader extends fb.TableReader<SessionContextUpdatedPayload> {
+  const _SessionContextUpdatedPayloadReader();
+
+  @override
+  SessionContextUpdatedPayload createObject(fb.BufferContext bc, int offset) => 
+    SessionContextUpdatedPayload._(bc, offset);
+}
+
+class SessionContextUpdatedPayloadBuilder {
+  SessionContextUpdatedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(5);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addCurrentWorkingDirectoryOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addRepositoryRootOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addWorktreeRootOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+  int addBranchOffset(int? offset) {
+    fbBuilder.addOffset(4, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionContextUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _currentWorkingDirectory;
+  final String? _repositoryRoot;
+  final String? _worktreeRoot;
+  final String? _branch;
+
+  SessionContextUpdatedPayloadObjectBuilder({
+    String? sessionId,
+    String? currentWorkingDirectory,
+    String? repositoryRoot,
+    String? worktreeRoot,
+    String? branch,
+  })
+      : _sessionId = sessionId,
+        _currentWorkingDirectory = currentWorkingDirectory,
+        _repositoryRoot = repositoryRoot,
+        _worktreeRoot = worktreeRoot,
+        _branch = branch;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? currentWorkingDirectoryOffset = _currentWorkingDirectory == null ? null
+        : fbBuilder.writeString(_currentWorkingDirectory!);
+    final int? repositoryRootOffset = _repositoryRoot == null ? null
+        : fbBuilder.writeString(_repositoryRoot!);
+    final int? worktreeRootOffset = _worktreeRoot == null ? null
+        : fbBuilder.writeString(_worktreeRoot!);
+    final int? branchOffset = _branch == null ? null
+        : fbBuilder.writeString(_branch!);
+    fbBuilder.startTable(5);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, currentWorkingDirectoryOffset);
+    fbBuilder.addOffset(2, repositoryRootOffset);
+    fbBuilder.addOffset(3, worktreeRootOffset);
+    fbBuilder.addOffset(4, branchOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ServerMessage {
   ServerMessage._(this._bc, this._bcOffset);
   factory ServerMessage(List<int> bytes) {
@@ -5037,6 +5156,7 @@ class ServerMessage {
       case 3: return EventPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 4: return SubscriptionClosedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 5: return SessionSnippetUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 6: return SessionContextUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       default: return null;
     }
   }
