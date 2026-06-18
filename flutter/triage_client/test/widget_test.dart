@@ -861,8 +861,9 @@ void main() {
     // changes (see TerminalPane.didUpdateWidget); the real FocusNode lives on
     // the xterm view, which is stubbed out under FLUTTER_TEST, so we assert on
     // that revision — the contract the fix relies on — rather than raw focus.
-    int revision() =>
-        tester.widget<TerminalPane>(find.byType(TerminalPane)).focusCursorRevision;
+    int revision() => tester
+        .widget<TerminalPane>(find.byType(TerminalPane))
+        .focusCursorRevision;
     final baseline = revision();
 
     // A bare inactive→resumed cycle (desktop focus change, no occlusion) must
@@ -1053,8 +1054,13 @@ void main() {
     // Verify initial active session is triage / flutter-spike
     expect(find.text('triage / flutter-spike'), findsWidgets);
 
-    // Tap on close button
+    // Tap the close button, then confirm in the dialog (closing a session
+    // requires confirmation).
     await tester.tap(find.byTooltip('Close session'));
+    await tester.pumpAndSettle();
+    // The confirm dialog's button is the only 'Close session' Text (the icon
+    // button uses a tooltip; the dialog title is 'Close session?').
+    await tester.tap(find.text('Close session'));
     await tester.pumpAndSettle();
 
     // Verify shutdown session was called with 'flutter-spike'
@@ -1311,9 +1317,7 @@ void main() {
         findsNothing,
       );
 
-      final gesture = await tester.createGesture(
-        kind: PointerDeviceKind.mouse,
-      );
+      final gesture = await tester.createGesture(kind: PointerDeviceKind.mouse);
       await gesture.addPointer(location: Offset.zero);
       addTearDown(gesture.removePointer);
       await gesture.moveTo(tester.getCenter(find.byType(SessionListTile)));

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:io' show Platform;
 import 'dart:math';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb, visibleForTesting;
@@ -17,6 +16,10 @@ import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
+// Process-env access (home dir, marquee gating) behind a conditional import so
+// the web client — which has no `dart:io` — compiles against web stubs.
+import 'package:triage_client/platform_env_io.dart'
+    if (dart.library.js_util) 'package:triage_client/platform_env_web.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -3239,33 +3242,11 @@ class _GlanceRow extends StatelessWidget {
   }
 }
 
-/// False under `flutter test`, where a perpetual marquee animation would
-/// fast-forward fake-async time and hang `pumpAndSettle`. In that case the rail
-/// falls back to static (ellipsized) text. Guarded because reading
-/// [Platform.environment] can throw on some platforms.
-bool _marqueeAnimationsEnabled() {
-  try {
-    return !Platform.environment.containsKey('FLUTTER_TEST');
-  } catch (_) {
-    return true;
-  }
-}
-
-/// The user's local home directory (`$HOME`), or null when unknown. Reading
-/// [Platform.environment] can throw on some platforms, so it is guarded.
-String? _localHomeDir() {
-  try {
-    return Platform.environment['HOME'];
-  } catch (_) {
-    return null;
-  }
-}
-
 /// Collapses a leading local-home prefix to `~` — e.g. `/Users/me/dev` →
 /// `~/dev`. Returns null when [path] is not under the local home (e.g. a path
 /// from a remote daemon), so callers fall back to showing it in full.
 String? _homeAbbreviatedPath(String path) {
-  final home = _localHomeDir();
+  final home = localHomeDir();
   if (home == null || home.isEmpty) return null;
   final normalized = home.endsWith('/')
       ? home.substring(0, home.length - 1)
@@ -3316,7 +3297,7 @@ class _MetaLineText extends StatelessWidget {
         if (abbr != null && maxWidth.isFinite && _fits(abbr, maxWidth)) {
           return Text(abbr, style: style, maxLines: 1, softWrap: false);
         }
-        if (animate && _marqueeAnimationsEnabled()) {
+        if (animate && marqueeAnimationsEnabled()) {
           return _MarqueeText(text: full, style: style);
         }
         // Static fallback: prefer the abbreviated form so the most meaningful
@@ -3473,11 +3454,14 @@ class WorkspaceHeader extends StatelessWidget {
     // Header subtitle: the branch when in a repo, else the working directory
     // (home-abbreviated), so a non-repo session still shows where it is.
     final cwd = session.cwd;
-    final headerMeta =
-        session.branch ??
-        (cwd != null && cwd.isNotEmpty
-            ? (_homeAbbreviatedPath(cwd) ?? cwd)
-            : '');
+    final branch = session.branch;
+    // Treat an empty/whitespace branch as absent (the daemon may send "") so the
+    // subtitle falls back to the cwd instead of going blank.
+    final headerMeta = (branch != null && branch.trim().isNotEmpty)
+        ? branch
+        : (cwd != null && cwd.isNotEmpty
+              ? (_homeAbbreviatedPath(cwd) ?? cwd)
+              : '');
     return Container(
       height: 68,
       padding: const EdgeInsets.symmetric(horizontal: 22),

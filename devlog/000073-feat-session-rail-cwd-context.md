@@ -70,6 +70,32 @@ the daemon so the rail stays fresh as the user `cd`s.
 - 2026-06-17T20:47-0700 The widget test "closes a session over WebSocket and
   removes it from the list" fails — confirmed PRE-EXISTING on origin/main (same
   `+95 -1` with this branch's changes stashed), unrelated to this work.
+  RESOLVED 2026-06-17T21:40-0700 (see PR #83 review below): #77 added the
+  confirm-close dialog but never updated this test (its commit touched only
+  `main.dart`); the test now taps the dialog's confirm button. The whole Flutter
+  suite is green again (96 passed).
+
+## PR #83 Review (Copilot)
+
+2026-06-17T21:40-0700 Addressed three review comments:
+
+- `main.dart` imported `dart:io show Platform`, which fails the **web** build.
+  Moved the two env helpers (`localHomeDir`, `marqueeAnimationsEnabled`) behind a
+  conditional import — new `platform_env_io.dart` (native, uses `dart:io`) and
+  `platform_env_web.dart` (stubs: `null` home, marquee always on). Verified with
+  `flutter build web` (now compiles; previously would not).
+- `headerMeta` used `session.branch ?? cwd-fallback`, so an empty-string branch
+  blanked the subtitle and skipped the cwd fallback. Now treats empty/whitespace
+  branch as absent (`branch.trim().isNotEmpty`), matching `_gitMeta`.
+- `session.rs` dropped `SessionContextUpdated` on a full client channel with no
+  resend (context is only broadcast on change). `broadcast_to_global_senders`
+  now returns whether delivery was complete; the actor sets a
+  `context_resend_pending` flag and re-broadcasts the current context on the next
+  output event until it lands. Snippet broadcasts still ignore the result.
+
+Verification: `cargo clippy -p triaged -D warnings` clean; 65 session tests pass;
+`flutter analyze` (only pre-existing warnings); 96 Flutter tests pass; web build
+succeeds.
 
 ## Lessons Learned
 - Flutter sets the `FLUTTER_TEST` env var during `flutter test`; reading it via
@@ -80,4 +106,5 @@ the daemon so the rail stays fresh as the user `cd`s.
   regenerate automatically via `crates/triage-core/build.rs` on `cargo build`.
 
 ## Commits
-- HEAD — feat(rail): show cwd when outside a repo + live git-context updates
+- HEAD — fix(rail): address PR #83 review (web-safe Platform, empty-branch fallback, context resend)
+- 1314719 — feat(rail): show cwd when outside a repo + live git-context updates

@@ -239,16 +239,29 @@ type GlobalSenders = Arc<Mutex<Vec<SyncSender<ServerMessage>>>>;
 /// Broadcasts a message to every connected client, pruning dead channels. Shared
 /// by [`SessionManager::broadcast_global`] and the live session actors (which
 /// hold a clone of the same [`GlobalSenders`]).
-fn broadcast_to_global_senders(senders: &GlobalSenders, message: ServerMessage) {
+///
+/// Returns `true` if the message reached every live client, or `false` if at
+/// least one client's channel was full and the message was dropped for it. For
+/// snippet updates a dropped message is harmless (the next regeneration
+/// resends), but context updates are only emitted on change, so the caller uses
+/// this to schedule a resend (see [`ActorState::broadcast_context_update`]).
+fn broadcast_to_global_senders(senders: &GlobalSenders, message: ServerMessage) -> bool {
     let Ok(mut senders) = senders.lock() else {
-        return;
+        // Can't reach any sender; nothing a resend could fix, so don't loop on it.
+        return true;
     };
+    let mut delivered_to_all = true;
     senders.retain(|sender| match sender.try_send(message.clone()) {
         Ok(()) => true,
-        // Full: client is slow; keep it (a later update will resend).
-        Err(TrySendError::Full(_)) => true,
+        // Full: client is slow; keep it, but report the drop so the caller can
+        // resend (context updates won't otherwise be re-emitted).
+        Err(TrySendError::Full(_)) => {
+            delivered_to_all = false;
+            true
+        }
         Err(TrySendError::Disconnected(_)) => false,
     });
+    delivered_to_all
 }
 
 /// A session's most recent snippet plus the output sequence it was generated at,
@@ -466,7 +479,9 @@ impl SessionManager {
 
     /// Broadcasts a message to every connected client, pruning dead channels.
     fn broadcast_global(&self, message: ServerMessage) {
-        broadcast_to_global_senders(&self.global_senders, message);
+        // Snippet broadcasts tolerate a dropped send (the next regeneration
+        // resends), so the delivery result is intentionally ignored here.
+        let _ = broadcast_to_global_senders(&self.global_senders, message);
     }
 
     /// Clones the shared global-sender list handed to live session actors so they
@@ -992,6 +1007,7 @@ impl SessionManager {
                         event_session_id,
                         dirty_tx,
                         global_senders,
+                        context_resend_pending: false,
                         subscribers: Vec::new(),
                         event_log: VecDeque::new(),
                         next_event_seq: 1,
@@ -2045,6 +2061,7 @@ impl SessionActor {
                     event_session_id,
                     dirty_tx,
                     global_senders,
+                    context_resend_pending: false,
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
@@ -2213,6 +2230,11 @@ struct ActorState {
     /// directory / git context changes, keeping every client's side rail fresh
     /// without re-attaching. `None` for unmanaged/test actors.
     global_senders: Option<GlobalSenders>,
+    /// Set when the last [`ServerMessage::SessionContextUpdated`] broadcast was
+    /// dropped for at least one full client channel. Because context updates are
+    /// only emitted on change, the actor re-attempts the broadcast (with the
+    /// current context) on the next output event until it is delivered.
+    context_resend_pending: bool,
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
     next_event_seq: u64,
@@ -2392,9 +2414,9 @@ impl ActorState {
     /// assigned. `current_working_directory` is sent whenever known — even
     /// outside a repo — with the git fields left `None`, so the rail can fall
     /// back to showing the cwd.
-    fn broadcast_context_update(&self) {
+    fn broadcast_context_update(&mut self) {
         let (Some(session_id), Some(global_senders)) =
-            (self.event_session_id.clone(), self.global_senders.as_ref())
+            (self.event_session_id.clone(), self.global_senders.clone())
         else {
             return;
         };
@@ -2408,8 +2430,8 @@ impl ActorState {
             ),
             None => (None, None, None),
         };
-        broadcast_to_global_senders(
-            global_senders,
+        let delivered = broadcast_to_global_senders(
+            &global_senders,
             ServerMessage::SessionContextUpdated {
                 session_id,
                 current_working_directory,
@@ -2418,6 +2440,10 @@ impl ActorState {
                 branch,
             },
         );
+        // If a client's channel was full the update was dropped for it; since
+        // context updates are only emitted on change, remember to resend the
+        // current context on the next output event until it lands.
+        self.context_resend_pending = !delivered;
     }
 
     fn handle_output(&mut self, message: ActorMessage) {
@@ -2436,7 +2462,10 @@ impl ActorState {
                                 != Some(current_working_directory.as_path());
                         self.context = new_context;
                         self.current_working_directory = Some(current_working_directory);
-                        if changed {
+                        // Resend when the context changed, or when a prior
+                        // broadcast was dropped for a then-full client channel
+                        // and still needs to land.
+                        if changed || self.context_resend_pending {
                             self.broadcast_context_update();
                         }
                     }
