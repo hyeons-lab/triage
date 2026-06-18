@@ -370,12 +370,27 @@ table SessionSnippetUpdatedPayload {
     detail: string;
 }
 
+// Connection-wide push (not tied to a session subscription): a session's git
+// context (or current working directory) changed. Broadcast to every connected
+// client so the side rail stays fresh as the session's shell `cd`s, without
+// re-attaching. `current_working_directory` is set whenever known, even when the
+// session is not inside a git repo; the repo/worktree/branch fields are unset in
+// that case so the rail can fall back to showing the cwd.
+table SessionContextUpdatedPayload {
+    session_id: string;
+    current_working_directory: string;
+    repository_root: string;
+    worktree_root: string;
+    branch: string;
+}
+
 union ServerMessagePayload {
     ResponsePayload,
     ErrorPayload,
     EventPayload,
     SubscriptionClosedPayload,
-    SessionSnippetUpdatedPayload
+    SessionSnippetUpdatedPayload,
+    SessionContextUpdatedPayload
 }
 
 table ServerMessage {

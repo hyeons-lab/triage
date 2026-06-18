@@ -103,6 +103,11 @@ class TriageWebSocketClient {
         // Connection-wide push (not tied to a request or subscription); forward
         // to the app so it can update the session's rail snippet live.
         _eventController.add(message);
+      } else if (type == 'session_context_updated') {
+        // Connection-wide push: a session's working directory / git context
+        // changed. Forward so the rail's repo·branch·worktree (or cwd) line
+        // stays fresh without re-attaching.
+        _eventController.add(message);
       }
     } catch (error) {
       debugPrint(
@@ -447,6 +452,17 @@ class TriageWebSocketClient {
         'snippet': updated.snippet,
         'detail': updated.detail,
         'output_seq': updated.outputSeq,
+      };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.SessionContextUpdatedPayload) {
+      final updated = payload as fbs.SessionContextUpdatedPayload;
+      return {
+        'type': 'session_context_updated',
+        'session_id': updated.sessionId,
+        'current_working_directory': updated.currentWorkingDirectory,
+        'repository_root': updated.repositoryRoot,
+        'worktree_root': updated.worktreeRoot,
+        'branch': updated.branch,
       };
     }
     return {};
@@ -878,8 +894,7 @@ class TriageWebSocketClient {
         break;
 
       case 'list_session_snippets':
-        payloadType =
-            fbs.ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
+        payloadType = fbs.ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
         payload = fbs.ListSessionSnippetsRequestObjectBuilder();
         break;
 

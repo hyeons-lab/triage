@@ -1038,6 +1038,35 @@ pub fn build_server_message<'a>(
                 updated.as_union_value(),
             )
         }
+        ServerMessage::SessionContextUpdated {
+            session_id,
+            current_working_directory,
+            repository_root,
+            worktree_root,
+            branch,
+        } => {
+            let sid = builder.create_string(session_id.as_str());
+            let cwd = current_working_directory
+                .as_ref()
+                .map(|s| builder.create_string(s));
+            let repo = repository_root.as_ref().map(|s| builder.create_string(s));
+            let worktree = worktree_root.as_ref().map(|s| builder.create_string(s));
+            let branch = branch.as_ref().map(|s| builder.create_string(s));
+            let updated = fb::SessionContextUpdatedPayload::create(
+                builder,
+                &fb::SessionContextUpdatedPayloadArgs {
+                    session_id: Some(sid),
+                    current_working_directory: cwd,
+                    repository_root: repo,
+                    worktree_root: worktree,
+                    branch,
+                },
+            );
+            (
+                fb::ServerMessagePayload::SessionContextUpdatedPayload,
+                updated.as_union_value(),
+            )
+        }
     };
 
     fb::ServerMessage::create(
@@ -1126,6 +1155,13 @@ pub enum ServerMessageBorrowed<'a> {
         snippet: &'a str,
         detail: Option<&'a str>,
         output_seq: u64,
+    },
+    SessionContextUpdated {
+        session_id: &'a str,
+        current_working_directory: Option<&'a str>,
+        repository_root: Option<&'a str>,
+        worktree_root: Option<&'a str>,
+        branch: Option<&'a str>,
     },
 }
 
@@ -1309,6 +1345,23 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 snippet: updated.snippet().unwrap_or(""),
                 detail: updated.detail(),
                 output_seq: updated.output_seq(),
+            })
+        }
+        fb::ServerMessagePayload::SessionContextUpdatedPayload => {
+            let updated = root
+                .payload_as_session_context_updated_payload()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "missing session context updated payload",
+                    )
+                })?;
+            Ok(ServerMessageBorrowed::SessionContextUpdated {
+                session_id: updated.session_id().unwrap_or(""),
+                current_working_directory: updated.current_working_directory(),
+                repository_root: updated.repository_root(),
+                worktree_root: updated.worktree_root(),
+                branch: updated.branch(),
             })
         }
         _ => Err(crate::ProtocolError::new(
