@@ -1,4 +1,4 @@
-package com.example.triage_client
+package com.hyeonslab.triage_client
 
 import io.flutter.embedding.android.FlutterActivity
 
