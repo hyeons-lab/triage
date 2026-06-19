@@ -184,6 +184,9 @@ fn run() -> anyhow::Result<()> {
 
     #[cfg(windows)]
     {
+        // Record our PID so `triaged service stop` can target this exact daemon
+        // rather than every triaged.exe the user owns.
+        triaged::service::record_running_pid();
         let pipe_name = default_socket_path();
         let endpoint = triaged::ipc::display_endpoint(&pipe_name);
         tracing::info!(pipe = %endpoint, "triaged starting named pipe server");
