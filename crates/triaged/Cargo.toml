@@ -56,3 +56,8 @@ workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Cross-platform local IPC: maps the daemon's control socket to a Windows named
+# pipe (\\.\pipe\triage-<user>). Unix keeps using std::os::unix::net.
+interprocess = "2.4"

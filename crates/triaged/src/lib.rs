@@ -2,7 +2,7 @@
 
 pub mod handover;
 pub mod http;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod ipc;
 pub mod session;
 pub mod summarizer;

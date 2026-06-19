@@ -210,4 +210,13 @@ triaged --handover
 
 ### Windows Graceful Fallback
 
-Because low-level file descriptor passing and raw Unix domain sockets are native to POSIX platforms, native Windows installations will fall back gracefully to Triage's robust **Session Restore** flow, which saves session metadata and restores shell/workspace layout structures on restart.
+The daemon runs natively on Windows: its local control plane uses a named pipe
+(`\\.\pipe\triage-<user>`) in place of the Unix domain socket, and terminal
+sessions run on ConPTY via `portable-pty`. Clients (TUI, MCP, GUI) connect the
+same way they do on macOS and Linux.
+
+The one capability that does not cross over is **zero-downtime handover** — it
+relies on low-level file-descriptor passing (`SCM_RIGHTS`) that is native to
+POSIX platforms. On Windows, upgrading or restarting the daemon falls back
+gracefully to Triage's robust **Session Restore** flow, which saves session
+metadata and restores shell/workspace layout structures on restart.
