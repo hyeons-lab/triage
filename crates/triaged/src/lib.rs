@@ -4,6 +4,7 @@ pub mod handover;
 pub mod http;
 #[cfg(any(unix, windows))]
 pub mod ipc;
+pub mod service;
 pub mod session;
 pub mod summarizer;
 pub mod ws;

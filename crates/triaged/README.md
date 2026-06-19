@@ -4,6 +4,12 @@ Persistent daemon process that manages terminal session state, PTY multiplexing,
 
 The daemon runs persistently in the background, keeping terminal scrollbacks, layout grids, and active PTY handles alive even when no clients are attached.
 
+It runs on **macOS, Linux, and Windows**. The local control plane uses a Unix
+domain socket on macOS/Linux and a named pipe on Windows, and `triaged` can
+register itself to start at login on each platform (see
+[Running as a background service](#running-as-a-background-service)). Terminal
+sessions run on ConPTY on Windows and on a standard PTY elsewhere.
+
 ## Installation
 
 ```bash
@@ -17,6 +23,37 @@ Start the persistent supervisor process:
 ```bash
 triaged
 ```
+
+### Running as a background service
+
+Instead of launching `triaged` by hand, register it to start automatically at
+login and run in the background:
+
+```bash
+triaged service install     # register + start now
+triaged service status      # is it installed / running?
+triaged service stop        # stop it
+triaged service start       # start it again
+triaged service uninstall   # stop + remove the registration
+```
+
+This installs a **per-user** service that runs inside your login session — so it
+can own your interactive terminals and the per-user control socket/pipe — using
+each platform's native mechanism:
+
+| Platform | Mechanism | Location |
+| -------- | --------- | -------- |
+| macOS   | LaunchAgent (`launchctl`)        | `~/Library/LaunchAgents/com.hyeons-lab.triaged.plist` |
+| Linux   | systemd user unit (`systemctl --user`) | `~/.config/systemd/user/triaged.service` |
+| Windows | Scheduled Task at logon (`schtasks`)   | task `triaged` |
+
+`install` embeds the path of the `triaged` binary you ran, so install from the
+binary you want the service to launch (e.g. the one `cargo install triaged`
+placed on your `PATH`).
+
+> **Linux: surviving logout.** A systemd `--user` service stops when your last
+> session ends. To keep `triaged` running after you log out, enable lingering:
+> `loginctl enable-linger $USER` (the `install` step prints this reminder).
 
 ---
 

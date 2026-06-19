@@ -21,8 +21,24 @@ cargo install triage triaged
 
 ## Usage
 
-Launch the client interface:
+First make sure the daemon is running. Start it in the foreground:
+
+```bash
+triaged
+```
+
+…or register it to start automatically at login (macOS, Linux, and Windows):
+
+```bash
+triaged service install
+```
+
+Then launch the client interface:
 
 ```bash
 triage
 ```
+
+The client connects to the daemon over a local Unix domain socket (macOS/Linux)
+or named pipe (Windows). See [`triaged`](https://crates.io/crates/triaged) for
+daemon and service details.

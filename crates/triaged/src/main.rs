@@ -5,7 +5,7 @@ use triaged::session::SessionManager;
 use triaged::ws;
 
 #[cfg(any(unix, windows))]
-use triaged::ipc::{UnixSocketConfig, UnixSocketServer, default_socket_path};
+use triaged::ipc::{IpcConfig, IpcServer, default_socket_path};
 
 fn main() -> anyhow::Result<()> {
     // Keep this binding alive for the lifetime of the process: dropping the
@@ -16,6 +16,15 @@ fn main() -> anyhow::Result<()> {
 
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // `triaged service <action>` manages the per-user login service (LaunchAgent
+    // / systemd user unit / Windows logon task) and exits, rather than running
+    // the daemon in this process.
+    if args.get(1).map(String::as_str) == Some("service") {
+        let action = args.get(2).map(String::as_str).unwrap_or("");
+        return triaged::service::run_cli(action);
+    }
+
     let is_handover = args.contains(&"--handover".to_string()) || args.contains(&"-U".to_string());
 
     #[cfg(unix)]
@@ -169,7 +178,7 @@ fn run() -> anyhow::Result<()> {
     {
         let socket_path = default_socket_path();
         tracing::info!(socket_path = %socket_path.display(), "triaged starting Unix socket server");
-        UnixSocketServer::new(manager, web_cache, UnixSocketConfig::new(socket_path)).serve()?;
+        IpcServer::new(manager, web_cache, IpcConfig::new(socket_path)).serve()?;
         Ok(())
     }
 
@@ -178,7 +187,7 @@ fn run() -> anyhow::Result<()> {
         let pipe_name = default_socket_path();
         let endpoint = triaged::ipc::display_endpoint(&pipe_name);
         tracing::info!(pipe = %endpoint, "triaged starting named pipe server");
-        UnixSocketServer::new(manager, web_cache, UnixSocketConfig::new(pipe_name)).serve()?;
+        IpcServer::new(manager, web_cache, IpcConfig::new(pipe_name)).serve()?;
         Ok(())
     }
 

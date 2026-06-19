@@ -10,7 +10,7 @@ use triage_core::session::{
     WriteInputRequest,
 };
 #[cfg(any(unix, windows))]
-use triaged::ipc::UnixSocketClient;
+use triaged::ipc::IpcClient;
 use triaged::session::{SessionManager, SessionManagerConfig};
 
 const MAX_EVENTS_PER_SESSION_TICK: usize = 256;
@@ -53,7 +53,7 @@ impl LocalSessionApp {
 
     #[cfg(any(unix, windows))]
     pub fn connect(socket_path: impl Into<PathBuf>, size: SessionSize) -> Result<Self> {
-        let manager = UnixSocketClient::new(socket_path);
+        let manager = IpcClient::new(socket_path);
         Self::start_with_manager(Box::new(manager), size, false)
     }
 

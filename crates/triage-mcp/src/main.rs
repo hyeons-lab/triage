@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use triage_core::session::{SessionApi, SessionId, StyledRowsRequest};
 #[cfg(any(unix, windows))]
-use triaged::ipc::{UnixSocketClient, default_socket_path};
+use triaged::ipc::{IpcClient, default_socket_path};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "triage-mcp";
@@ -25,7 +25,7 @@ fn main() -> Result<()> {
 fn run_stdio(config: ServerConfig) -> Result<()> {
     #[cfg(any(unix, windows))]
     {
-        let client = UnixSocketClient::new(config.socket_path.unwrap_or_else(default_socket_path));
+        let client = IpcClient::new(config.socket_path.unwrap_or_else(default_socket_path));
         run_stdio_with_client(client, io::stdin().lock(), io::stdout().lock())
     }
 

@@ -134,11 +134,30 @@ fn compress_gzip(bytes: &[u8]) -> std::io::Result<Bytes> {
     Ok(Bytes::from(compressed))
 }
 
+/// Directory where upgraded web client assets are cached, overriding the
+/// embedded bundle. The daemon reads from here and the client's upgrade flow
+/// writes here, so both call this one function to stay in agreement.
+///
+/// On Windows this is `%LOCALAPPDATA%\triage\web` (the idiomatic per-user cache
+/// location); on Unix it stays `~/.local/share/triage/web`.
 pub fn default_override_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    Some(PathBuf::from(home).join(".local/share/triage/web"))
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+            })?;
+        Some(base.join("triage").join("web"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()?;
+        Some(PathBuf::from(home).join(".local/share/triage/web"))
+    }
 }
 
 pub(crate) fn mime_type_for_path(path: &str) -> &'static str {

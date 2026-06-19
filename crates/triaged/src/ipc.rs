@@ -37,34 +37,60 @@ const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 mod transport {
     use super::*;
 
-    /// A connected local IPC stream (client or accepted server side).
-    #[cfg(unix)]
-    pub type LocalStream = UnixStream;
+    /// A server-side accepted local IPC stream (yielded by the listener). On
+    /// Unix the accept loop uses `UnixStream` directly; this alias names the
+    /// Windows `local_socket::Stream` that `handle_connection` consumes.
     #[cfg(windows)]
     pub type LocalStream = interprocess::local_socket::Stream;
 
+    /// A client-side connected local IPC stream. On Unix this is the same
+    /// `UnixStream`; on Windows we use the raw named-pipe stream rather than the
+    /// `local_socket::Stream` wrapper so the connect can take a wait timeout
+    /// (the cross-platform `local_socket` connect hardcodes an unbounded wait).
+    #[cfg(unix)]
+    pub type ClientStream = UnixStream;
+    #[cfg(windows)]
+    pub type ClientStream = interprocess::os::windows::named_pipe::DuplexPipeStream<
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+    >;
+
+    /// Upper bound on how long a client waits for a daemon instance to become
+    /// available. The accept loop re-arms in microseconds, so this only matters
+    /// when every pipe instance is momentarily busy; without it a busy pipe
+    /// (`ERROR_PIPE_BUSY`) could block the client indefinitely.
+    #[cfg(windows)]
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Connect a client to the daemon's local IPC endpoint.
     #[cfg(unix)]
-    pub fn connect(path: &Path) -> std::io::Result<LocalStream> {
+    pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
         UnixStream::connect(path)
     }
 
     #[cfg(windows)]
-    pub fn connect(path: &Path) -> std::io::Result<LocalStream> {
-        use interprocess::local_socket::traits::Stream as _;
-        LocalStream::connect(windows_pipe_name(path)?)
+    pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
+        use interprocess::ConnectWaitMode;
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
+        // `connect_by_path` does not prepend the `\\.\pipe\` prefix, so pass the
+        // fully-qualified endpoint. A missing daemon fails fast (the pipe does
+        // not exist); only an all-instances-busy pipe consumes the timeout.
+        let endpoint = super::display_endpoint(path);
+        DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
+            endpoint.as_str(),
+            ConnectWaitMode::Timeout(CONNECT_TIMEOUT),
+        )
     }
 
     /// Signal end-of-request to the server. On Unix we half-close the write side
     /// as a courtesy; on Windows the newline already frames the request, so this
     /// is a no-op (named pipes have no half-close).
     #[cfg(unix)]
-    pub fn finish_write(stream: &LocalStream) -> std::io::Result<()> {
+    pub fn finish_write(stream: &ClientStream) -> std::io::Result<()> {
         stream.shutdown(std::net::Shutdown::Write)
     }
 
     #[cfg(windows)]
-    pub fn finish_write(_stream: &LocalStream) -> std::io::Result<()> {
+    pub fn finish_write(_stream: &ClientStream) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -93,13 +119,50 @@ mod transport {
             .strip_prefix(r"\\.\pipe\")
             .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
             .unwrap_or(raw);
-        Ok(bare
+        let collapsed: String = bare
             .chars()
             .map(|c| match c {
                 '\\' | '/' | ':' => '_',
                 other => other,
             })
-            .collect())
+            .collect();
+
+        // The full pipe path `\\.\pipe\<token>` is capped by NPFS at 256 UTF-16
+        // code units (the Win32 string unit), not chars — a non-BMP char is one
+        // `char` but two units. A deep override/test path could exceed that;
+        // collapse an over-long token to a readable prefix plus a stable hash so
+        // it stays legal and still unique per distinct path.
+        if collapsed.encode_utf16().count() <= MAX_PIPE_TOKEN_LEN {
+            return Ok(collapsed);
+        }
+        use sha2::{Digest, Sha256};
+        // 16 hex chars (ASCII → 16 units) + one `_` separator = 17 units.
+        let hash = hex::encode(&Sha256::digest(collapsed.as_bytes())[..8]);
+        let prefix = truncate_utf16_units(&collapsed, MAX_PIPE_TOKEN_LEN - 17);
+        Ok(format!("{prefix}_{hash}"))
+    }
+
+    /// Maximum length, in UTF-16 code units, for a named-pipe token. NPFS caps
+    /// the full `\\.\pipe\<token>` path at 256 units; this leaves margin for the
+    /// 9-unit `\\.\pipe\` prefix.
+    #[cfg(windows)]
+    pub const MAX_PIPE_TOKEN_LEN: usize = 210;
+
+    /// Truncate `s` to at most `max_units` UTF-16 code units, stopping on a
+    /// `char` boundary so a surrogate pair is never split.
+    #[cfg(windows)]
+    fn truncate_utf16_units(s: &str, max_units: usize) -> String {
+        let mut out = String::new();
+        let mut units = 0usize;
+        for c in s.chars() {
+            let w = c.len_utf16();
+            if units + w > max_units {
+                break;
+            }
+            out.push(c);
+            units += w;
+        }
+        out
     }
 
     #[cfg(windows)]
@@ -126,11 +189,11 @@ pub fn display_endpoint(path: &Path) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnixSocketConfig {
+pub struct IpcConfig {
     pub socket_path: PathBuf,
 }
 
-impl UnixSocketConfig {
+impl IpcConfig {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -138,17 +201,17 @@ impl UnixSocketConfig {
     }
 }
 
-pub struct UnixSocketServer {
+pub struct IpcServer {
     manager: Arc<SessionManager>,
     web_cache: Arc<crate::http::WebAssetCache>,
-    config: UnixSocketConfig,
+    config: IpcConfig,
 }
 
-impl UnixSocketServer {
+impl IpcServer {
     pub fn new(
         manager: Arc<SessionManager>,
         web_cache: Arc<crate::http::WebAssetCache>,
-        config: UnixSocketConfig,
+        config: IpcConfig,
     ) -> Self {
         Self {
             manager,
@@ -166,18 +229,7 @@ impl UnixSocketServer {
                 Ok((stream, _addr)) => {
                     let manager = Arc::clone(&self.manager);
                     let web_cache = Arc::clone(&self.web_cache);
-                    if let Err(error) = thread::Builder::new()
-                        .name("triage-ipc-client".to_string())
-                        .spawn(move || {
-                            if let Err(error) = handle_connection(manager, web_cache, stream)
-                                && !is_closed_socket_error(&error)
-                            {
-                                tracing::warn!(error = ?error, "Unix socket client failed");
-                            }
-                        })
-                    {
-                        tracing::warn!(error = ?error, "failed to spawn Unix socket client handler");
-                    }
+                    spawn_client_handler(move || handle_connection(manager, web_cache, stream));
                 }
                 Err(error) => {
                     tracing::warn!(error = ?error, "failed to accept Unix socket connection");
@@ -189,42 +241,26 @@ impl UnixSocketServer {
     #[cfg(windows)]
     pub fn serve(self) -> Result<()> {
         use interprocess::local_socket::ListenerOptions;
-        use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+        use interprocess::local_socket::traits::ListenerExt as _;
 
         let pipe_name = display_endpoint(&self.config.socket_path);
 
-        // Refuse to start a second daemon on the same pipe. Named pipes leave no
-        // stale filesystem entry, so if a connect succeeds another server is live.
-        if interprocess::local_socket::Stream::connect(transport::windows_pipe_name(
-            &self.config.socket_path,
-        )?)
-        .is_ok()
-        {
-            bail!("named pipe {pipe_name} is already in use");
-        }
-
+        // `create_sync` sets FILE_FLAG_FIRST_PIPE_INSTANCE, so a second daemon's
+        // create fails atomically — no need for a self-connect preflight (which
+        // could itself block and left a phantom connection in the accept loop).
         let listener = ListenerOptions::new()
             .name(transport::windows_pipe_name(&self.config.socket_path)?)
             .create_sync()
-            .with_context(|| format!("creating named pipe {pipe_name}"))?;
+            .with_context(|| {
+                format!("creating named pipe {pipe_name} (is another triaged already running?)")
+            })?;
 
         for incoming in listener.incoming() {
             match incoming {
                 Ok(stream) => {
                     let manager = Arc::clone(&self.manager);
                     let web_cache = Arc::clone(&self.web_cache);
-                    if let Err(error) = thread::Builder::new()
-                        .name("triage-ipc-client".to_string())
-                        .spawn(move || {
-                            if let Err(error) = handle_connection(manager, web_cache, stream)
-                                && !is_closed_socket_error(&error)
-                            {
-                                tracing::warn!(error = ?error, "named pipe client failed");
-                            }
-                        })
-                    {
-                        tracing::warn!(error = ?error, "failed to spawn named pipe client handler");
-                    }
+                    spawn_client_handler(move || handle_connection(manager, web_cache, stream));
                 }
                 Err(error) => {
                     tracing::warn!(error = ?error, "failed to accept named pipe connection");
@@ -235,12 +271,34 @@ impl UnixSocketServer {
     }
 }
 
+/// Spawn a detached worker thread to service one accepted IPC connection. Shared
+/// by the Unix and Windows accept loops, which differ only in how they obtain
+/// the stream. A clean client disconnect (`is_closed_socket_error`) is not worth
+/// logging; anything else is surfaced as a warning.
+fn spawn_client_handler<F>(handler: F)
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    if let Err(error) = thread::Builder::new()
+        .name("triage-ipc-client".to_string())
+        .spawn(move || {
+            if let Err(error) = handler()
+                && !is_closed_socket_error(&error)
+            {
+                tracing::warn!(error = ?error, "IPC client handler failed");
+            }
+        })
+    {
+        tracing::warn!(error = ?error, "failed to spawn IPC client handler");
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnixSocketClient {
+pub struct IpcClient {
     socket_path: PathBuf,
 }
 
-impl UnixSocketClient {
+impl IpcClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -285,7 +343,7 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("triage-{}", fallback_user_component()))
 }
 
-impl SessionApi for UnixSocketClient {
+impl SessionApi for IpcClient {
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
         match self.round_trip(WireRequest::ListSessions)? {
             WireSuccess::SessionIds(session_ids) => Ok(session_ids),
@@ -590,24 +648,14 @@ fn handle_connection(
     let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
         return Ok(());
     };
-    let mut writer = BufWriter::new(stream);
-
+    // Handover needs the raw stream for SCM_RIGHTS FD passing, so it branches
+    // before the shared dispatch (which only deals with the JSON wire protocol).
     if let WireRequest::Handover = request {
         return handle_handover_server(&manager, reader.into_inner());
     }
 
-    if let WireRequest::SubscribeSessionEvents {
-        session_id,
-        after_event_seq,
-    } = request
-    {
-        return handle_subscription(&manager, session_id, after_event_seq, &mut writer);
-    }
-
-    let response = WireResponse::from_result(handle_request(&manager, &web_cache, request));
-    write_json_line(&mut writer, &response).context("writing response")?;
-    writer.flush().context("flushing response")?;
-    Ok(())
+    let mut writer = BufWriter::new(stream);
+    dispatch_request(&manager, &web_cache, request, &mut writer)
 }
 
 // Windows named-pipe connection handler. The wire protocol is identical to Unix;
@@ -627,21 +675,34 @@ fn handle_connection(
     let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
         return Ok(());
     };
-    let mut writer = BufWriter::new(reader.into_inner());
-
-    match request {
-        WireRequest::Handover => bail!("Handover request not supported on Windows"),
-        WireRequest::SubscribeSessionEvents {
-            session_id,
-            after_event_seq,
-        } => handle_subscription(&manager, session_id, after_event_seq, &mut writer),
-        other => {
-            let response = WireResponse::from_result(handle_request(&manager, &web_cache, other));
-            write_json_line(&mut writer, &response).context("writing response")?;
-            writer.flush().context("flushing response")?;
-            Ok(())
-        }
+    if let WireRequest::Handover = request {
+        bail!("Handover request not supported on Windows");
     }
+
+    let mut writer = BufWriter::new(reader.into_inner());
+    dispatch_request(&manager, &web_cache, request, &mut writer)
+}
+
+/// Service a single non-handover request: stream a subscription, or run the
+/// request and write its one-shot response. Shared by both platform handlers.
+fn dispatch_request(
+    manager: &SessionManager,
+    web_cache: &crate::http::WebAssetCache,
+    request: WireRequest,
+    writer: &mut impl Write,
+) -> Result<()> {
+    if let WireRequest::SubscribeSessionEvents {
+        session_id,
+        after_event_seq,
+    } = request
+    {
+        return handle_subscription(manager, session_id, after_event_seq, writer);
+    }
+
+    let response = WireResponse::from_result(handle_request(manager, web_cache, request));
+    write_json_line(writer, &response).context("writing response")?;
+    writer.flush().context("flushing response")?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -877,14 +938,14 @@ mod tests {
             log_dir.clone(),
         )));
         let cache = Arc::new(crate::http::WebAssetCache::new(None));
-        let server = UnixSocketServer::new(
+        let server = IpcServer::new(
             Arc::clone(&manager),
             cache,
-            UnixSocketConfig::new(socket_path.clone()),
+            IpcConfig::new(socket_path.clone()),
         );
         spawn_server(server);
 
-        let client = UnixSocketClient::new(socket_path.clone());
+        let client = IpcClient::new(socket_path.clone());
         let missing = SessionId::new("missing").expect("session id");
         let error = client
             .snapshot_session(missing)
@@ -926,14 +987,14 @@ mod tests {
             log_dir.clone(),
         )));
         let cache = Arc::new(crate::http::WebAssetCache::new(None));
-        let server = UnixSocketServer::new(
+        let server = IpcServer::new(
             Arc::clone(&manager),
             cache,
-            UnixSocketConfig::new(socket_path.clone()),
+            IpcConfig::new(socket_path.clone()),
         );
         spawn_server(server);
 
-        let client = UnixSocketClient::new(socket_path.clone());
+        let client = IpcClient::new(socket_path.clone());
         let client_id = ClientId::new("test-client").expect("client id");
         let mut request = StartSessionRequest::new("/bin/sh");
         request.args = vec!["-lc".to_string(), "cat".to_string()];
@@ -1030,13 +1091,13 @@ mod tests {
             log_dir.clone(),
         )));
         let cache = Arc::new(crate::http::WebAssetCache::new(None));
-        let server = UnixSocketServer::new(
+        let server = IpcServer::new(
             Arc::clone(&manager),
             cache,
-            UnixSocketConfig::new(socket_path.clone()),
+            IpcConfig::new(socket_path.clone()),
         );
         spawn_server(server);
-        let client = UnixSocketClient::new(socket_path.clone());
+        let client = IpcClient::new(socket_path.clone());
 
         let snapshot = client
             .restore_session(RestoreSessionRequest {
@@ -1067,7 +1128,7 @@ mod tests {
         let _ = fs::remove_dir_all(log_dir);
     }
 
-    fn spawn_server(server: UnixSocketServer) {
+    fn spawn_server(server: IpcServer) {
         let socket_path = server.config.socket_path.clone();
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
@@ -1114,6 +1175,27 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_token_caps_overlong_names() {
+        let long = format!(r"\\.\pipe\{}", "a".repeat(400));
+        let token = transport::windows_pipe_token(Path::new(&long)).expect("token");
+        assert!(token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
+        // Stable across calls...
+        let again = transport::windows_pipe_token(Path::new(&long)).expect("token");
+        assert_eq!(token, again);
+        // ...and distinct inputs yield distinct tokens.
+        let other = format!(r"\\.\pipe\{}", "b".repeat(400));
+        let other_token = transport::windows_pipe_token(Path::new(&other)).expect("token");
+        assert_ne!(token, other_token);
+
+        // Non-BMP chars are one `char` but two UTF-16 units, so a char-based cap
+        // would undercount and overflow. The bound must hold in UTF-16 units.
+        let astral = format!(r"\\.\pipe\{}", "🦀".repeat(400));
+        let astral_token = transport::windows_pipe_token(Path::new(&astral)).expect("token");
+        assert!(astral_token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
     }
 
     #[cfg(windows)]
