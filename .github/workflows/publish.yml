@@ -77,6 +77,17 @@ jobs:
           mkdir -p crates/triaged/dist
           cp -r flutter/triage_client/build/web/* crates/triaged/dist/
 
+      # Share the built web assets with the build-cli jobs so the released
+      # `triaged` binary embeds the same web UI without rebuilding Flutter on
+      # each runner.
+      - name: Upload Web Assets artifact
+        # actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: web-assets
+          path: crates/triaged/dist
+          if-no-files-found: error
+
       # Step 3: Run Crate Dry-runs / Checks
       - name: Verify Workspace Compiles with Staged Assets
         run: cargo check --workspace --locked
@@ -309,9 +320,92 @@ jobs:
           path: Triage-linux-v${{ needs.publish.outputs.version }}.tar.gz
           if-no-files-found: error
 
+  # Build the prebuilt CLI binaries (triaged daemon, triage TUI, triage-mcp) on
+  # each native runner so users can self-update / install without compiling.
+  # Same gating as the client builds: only after a successful publish, skipped on
+  # dry runs. The build itself mirrors what ci.yml already runs on all three OSes.
+  build-cli:
+    name: Build CLI binaries (${{ matrix.label }})
+    needs: publish
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macos
+            ext: tar.gz
+          - os: windows-latest
+            label: windows
+            ext: zip
+          - os: ubuntu-latest
+            label: linux
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        # actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain@v1 (SHA-pinned to match ci.yml). Nightly is
+        # required by the `cera` dep on aarch64 (see rust-toolchain.toml).
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: nightly-2026-04-02
+
+      - name: Cache Rust build artifacts
+        # Swatinem/rust-cache@v2 (SHA-pinned to match ci.yml).
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          cache-bin: false
+
+      - name: Install flatc
+        uses: ./.github/actions/setup-flatc
+        with:
+          version: "25.2.10"
+
+      # Embed the same web UI the published daemon serves, built once by the
+      # publish job, so we don't rebuild Flutter on three runners.
+      - name: Download Web Assets
+        # actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: web-assets
+          path: crates/triaged/dist
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p triaged -p triage -p triage-mcp
+
+      - name: Package binaries (tar.gz)
+        if: ${{ matrix.ext == 'tar.gz' }}
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          tar -czf "Triage-cli-${{ matrix.label }}-v${VERSION}.tar.gz" \
+            -C target/release triaged triage triage-mcp
+
+      - name: Package binaries (zip)
+        if: ${{ matrix.ext == 'zip' }}
+        shell: pwsh
+        run: |
+          $version = "${{ needs.publish.outputs.version }}"
+          Compress-Archive `
+            -Path target/release/triaged.exe, target/release/triage.exe, target/release/triage-mcp.exe `
+            -DestinationPath "Triage-cli-windows-v$version.zip"
+
+      - name: Upload CLI artifact
+        # actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: cli-${{ matrix.label }}
+          path: Triage-cli-${{ matrix.label }}-v${{ needs.publish.outputs.version }}.${{ matrix.ext }}
+          if-no-files-found: error
+
   release:
-    name: Tag & GitHub Release (all clients)
-    needs: [publish, build-macos, build-windows, build-linux]
+    name: Tag & GitHub Release (clients + CLI binaries)
+    needs: [publish, build-macos, build-windows, build-linux, build-cli]
     if: ${{ github.event.inputs.dry_run == 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -319,10 +413,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download client artifacts
+      - name: Download client + CLI artifacts
         # actions/download-artifact@v8
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
+          # Only the release archives: client-* and cli-* (both start "cl").
+          # Skips the web-assets bundle the build-cli jobs already consumed.
+          pattern: cl*
           path: release-assets
 
       - name: Create tag and GitHub release with all clients
