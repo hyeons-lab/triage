@@ -456,21 +456,38 @@ mod platform {
         // The logon task launches the daemon detached, so there's no task
         // instance to end — kill the process directly. Prefer the PID the daemon
         // recorded at startup so we stop exactly the service-managed daemon and
-        // not a triaged the user started by hand; fall back to image name.
-        match recorded_pid() {
-            Some(pid) => {
-                let _ = Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/F"])
-                    .status();
-            }
-            None => {
-                let _ = Command::new("taskkill")
-                    .args(["/IM", "triaged.exe", "/F"])
-                    .status();
-            }
+        // not a triaged the user started by hand. The PID file can be stale (the
+        // daemon was force-killed last time, or its PID was reused), so only the
+        // image-name-filtered kill counts as success; otherwise fall back to
+        // killing by image name.
+        let killed_by_pid = recorded_pid().is_some_and(taskkill_pid);
+        if !killed_by_pid {
+            let _ = Command::new("taskkill")
+                .args(["/IM", "triaged.exe", "/F"])
+                .status();
+        }
+        // Always drop the PID file so a stale PID is never read again.
+        if let Some(path) = pid_file_path() {
+            let _ = std::fs::remove_file(path);
         }
         println!("Stopped triaged.");
         Ok(())
+    }
+
+    /// Force-kill `pid`, but only if it is actually a `triaged.exe` (the recorded
+    /// PID may be stale and reused by an unrelated process). Returns whether a
+    /// matching process was killed.
+    fn taskkill_pid(pid: u32) -> bool {
+        Command::new("taskkill")
+            .args([
+                "/FI",
+                &format!("PID eq {pid}"),
+                "/FI",
+                "IMAGENAME eq triaged.exe",
+                "/F",
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     /// The PID the running daemon recorded at startup, if the file is present

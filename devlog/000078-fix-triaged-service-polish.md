@@ -18,36 +18,36 @@ follow-ups):
 
 ## Decisions
 
-- 2026-06-18T23:35-07:00 macOS smoke test runs against a throwaway dummy
+- 2026-06-18T23:35-0700 macOS smoke test runs against a throwaway dummy
   LaunchAgent (a `sleep`-based program under a `…smoketest` label), NOT a live
   `triaged service install`: a production `triaged` is already bound to
   `:7777`, so installing the real agent would spawn a second daemon that
   crash-loops under `KeepAlive` fighting for the port. The dummy exercises the
   exact `launchctl` verb sequence `service.rs` uses, non-disruptively.
-- 2026-06-18T23:35-07:00 Windows PID file at `%LOCALAPPDATA%\triage\triaged.pid`
+- 2026-06-18T23:35-0700 Windows PID file at `%LOCALAPPDATA%\triage\triaged.pid`
   (handover is Unix-only, so on Windows there's exactly one daemon process to
   track). Best-effort write at startup; `stop` reads it, `uninstall` removes it.
 
 ## What Changed
 
-- 2026-06-18T23:40-07:00 `crates/triaged/src/service.rs` — Windows `stop` now
+- 2026-06-18T23:40-0700 `crates/triaged/src/service.rs` — Windows `stop` now
   prefers a PID-targeted `taskkill /PID <pid> /F` (reading the PID the daemon
   recorded at startup) over the blanket `/IM triaged.exe`, so stopping the
   service no longer also kills a `triaged` the user launched by hand. Added
   `pid_file_path()` (`%LOCALAPPDATA%\triage\triaged.pid`, USERPROFILE fallback),
   `record_running_pid()` (pub, best-effort startup write), and `recorded_pid()`
   (parse helper in the Windows platform mod). `uninstall` removes the PID file.
-- 2026-06-18T23:40-07:00 `crates/triaged/src/main.rs` — call
+- 2026-06-18T23:40-0700 `crates/triaged/src/main.rs` — call
   `triaged::service::record_running_pid()` in the Windows serve block before
   `serve()`.
-- 2026-06-18T23:40-07:00 `crates/triaged/src/ipc.rs` — added Windows test
+- 2026-06-18T23:40-0700 `crates/triaged/src/ipc.rs` — added Windows test
   `windows_connect_to_missing_daemon_fails_fast`: a bounded connect to a
   nonexistent pipe must error in < 2s (proving the missing-daemon path fast-fails
   rather than waiting out the 5s busy-pipe timeout).
 
 ## Issues
 
-- 2026-06-18T23:36-07:00 macOS `launchctl` smoke test (dummy `sleep` agent under
+- 2026-06-18T23:36-0700 macOS `launchctl` smoke test (dummy `sleep` agent under
   `com.hyeons-lab.triaged.smoketest`, since a production daemon holds `:7777`).
   The exact verb sequence `service.rs` uses passed end-to-end:
   `load -w` → started the program; `start` → re-triggered; `list` → showed Label
@@ -56,10 +56,24 @@ follow-ups):
   processes. Confirms the launchctl integration on real macOS; the plist body
   itself is covered by the `plist_contents` unit tests.
 
+### PR review comments (Copilot, #89)
+
+- 2026-06-19T08:30-0700 `crates/triaged/src/service.rs` — Copilot: Windows `stop`
+  ignored `taskkill`'s exit status, so a stale PID file (daemon crashed, or a
+  failed restart overwrote it) would make `/PID` fail yet still print "Stopped
+  triaged." with the daemon still running. Fixed: the PID kill now uses a
+  filtered `taskkill /FI "PID eq <pid>" /FI "IMAGENAME eq triaged.exe" /F` (so a
+  reused PID can't kill an unrelated process), and only its *success* skips the
+  `/IM` fallback — a stale/missing PID falls through to image-name kill. `stop`
+  now also removes the PID file unconditionally so a stale PID is never re-read.
+- 2026-06-19T08:30-0700 devlog — switched timestamp UTC offsets to the AGENTS.md
+  `±HHMM` (no-colon) convention.
+
 ## Next Steps
 
 - Self-update epic Phase 0 (prebuilt release binaries) tracked separately.
 
 ## Commits
 
-- HEAD — fix(triaged): target the recorded PID on Windows service stop; add tests
+- 59e9039 — fix(triaged): target the recorded PID on Windows service stop; add tests
+- HEAD — fix(triaged): verify taskkill success and clear the PID file on stop
