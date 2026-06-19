@@ -685,13 +685,21 @@ pub fn build_server_message<'a>(
                 ServerResult::Hello {
                     protocol_version,
                     authenticated,
+                    server_version,
+                    update_available,
+                    latest_version,
                 } => {
                     let pv = builder.create_string(protocol_version);
+                    let sv = builder.create_string(server_version);
+                    let lv = latest_version.as_ref().map(|s| builder.create_string(s));
                     let r = fb::HelloResult::create(
                         builder,
                         &fb::HelloResultArgs {
                             protocol_version: Some(pv),
                             authenticated: *authenticated,
+                            server_version: Some(sv),
+                            update_available: *update_available,
+                            latest_version: lv,
                         },
                     );
                     (fb::ServerResultPayload::HelloResult, r.as_union_value())
@@ -1067,6 +1075,24 @@ pub fn build_server_message<'a>(
                 updated.as_union_value(),
             )
         }
+        ServerMessage::UpdateAvailable {
+            current_version,
+            latest_version,
+        } => {
+            let current = builder.create_string(current_version);
+            let latest = builder.create_string(latest_version);
+            let payload = fb::UpdateAvailablePayload::create(
+                builder,
+                &fb::UpdateAvailablePayloadArgs {
+                    current_version: Some(current),
+                    latest_version: Some(latest),
+                },
+            );
+            (
+                fb::ServerMessagePayload::UpdateAvailablePayload,
+                payload.as_union_value(),
+            )
+        }
     };
 
     fb::ServerMessage::create(
@@ -1090,6 +1116,11 @@ pub enum ServerResultBorrowed<'a> {
     Hello {
         protocol_version: &'a str,
         authenticated: bool,
+        server_version: &'a str,
+        update_available: bool,
+        // `None` until the first successful poll; the FlatBuffers field is
+        // omitted, not an empty string, so preserve that distinction.
+        latest_version: Option<&'a str>,
     },
     Paired {
         token: &'a str,
@@ -1163,6 +1194,10 @@ pub enum ServerMessageBorrowed<'a> {
         worktree_root: Option<&'a str>,
         branch: Option<&'a str>,
     },
+    UpdateAvailable {
+        current_version: &'a str,
+        latest_version: &'a str,
+    },
 }
 
 pub fn parse_fb_server_message_borrowed<'a>(
@@ -1185,6 +1220,9 @@ pub fn parse_fb_server_message_borrowed<'a>(
                     ServerResultBorrowed::Hello {
                         protocol_version: hello.protocol_version().unwrap_or(""),
                         authenticated: hello.authenticated(),
+                        server_version: hello.server_version().unwrap_or(""),
+                        update_available: hello.update_available(),
+                        latest_version: hello.latest_version(),
                     }
                 }
                 fb::ServerResultPayload::PairingChallengeResult => {
@@ -1362,6 +1400,15 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 repository_root: updated.repository_root(),
                 worktree_root: updated.worktree_root(),
                 branch: updated.branch(),
+            })
+        }
+        fb::ServerMessagePayload::UpdateAvailablePayload => {
+            let payload = root.payload_as_update_available_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing update available payload")
+            })?;
+            Ok(ServerMessageBorrowed::UpdateAvailable {
+                current_version: payload.current_version().unwrap_or(""),
+                latest_version: payload.latest_version().unwrap_or(""),
             })
         }
         _ => Err(crate::ProtocolError::new(

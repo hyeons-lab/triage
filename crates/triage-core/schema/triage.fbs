@@ -235,6 +235,13 @@ table UnitResult {}
 table HelloResult {
     protocol_version: string;
     authenticated: bool;
+    // Self-update fields (appended for forward/backward compatibility): the
+    // running daemon version, whether a newer stable release exists, and the
+    // newest tag seen (normalized, no leading `v`). `latest_version` is absent
+    // (null), not an empty string, until the first successful check.
+    server_version: string;
+    update_available: bool;
+    latest_version: string;
 }
 
 table PairedResult {
@@ -384,13 +391,23 @@ table SessionContextUpdatedPayload {
     branch: string;
 }
 
+// Connection-wide push (not tied to a session subscription): the daemon's
+// background update check observed a newer stable release. Broadcast once on the
+// transition; the same information also rides every HelloResult, so a missed
+// push is recovered on the next handshake.
+table UpdateAvailablePayload {
+    current_version: string;
+    latest_version: string;
+}
+
 union ServerMessagePayload {
     ResponsePayload,
     ErrorPayload,
     EventPayload,
     SubscriptionClosedPayload,
     SessionSnippetUpdatedPayload,
-    SessionContextUpdatedPayload
+    SessionContextUpdatedPayload,
+    UpdateAvailablePayload
 }
 
 table ServerMessage {

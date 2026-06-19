@@ -186,6 +186,7 @@ async fn main() -> Result<()> {
                 ServerResult::Hello {
                     protocol_version,
                     authenticated,
+                    ..
                 },
             ..
         }) => {
@@ -199,6 +200,7 @@ async fn main() -> Result<()> {
                 ServerResultBorrowed::Hello {
                     protocol_version,
                     authenticated,
+                    ..
                 },
             ..
         }) => {

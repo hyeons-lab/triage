@@ -285,7 +285,8 @@ enum ServerMessagePayloadTypeId {
   EventPayload(3),
   SubscriptionClosedPayload(4),
   SessionSnippetUpdatedPayload(5),
-  SessionContextUpdatedPayload(6);
+  SessionContextUpdatedPayload(6),
+  UpdateAvailablePayload(7);
 
   final int value;
   const ServerMessagePayloadTypeId(this.value);
@@ -299,6 +300,7 @@ enum ServerMessagePayloadTypeId {
       case 4: return ServerMessagePayloadTypeId.SubscriptionClosedPayload;
       case 5: return ServerMessagePayloadTypeId.SessionSnippetUpdatedPayload;
       case 6: return ServerMessagePayloadTypeId.SessionContextUpdatedPayload;
+      case 7: return ServerMessagePayloadTypeId.UpdateAvailablePayload;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -307,7 +309,7 @@ enum ServerMessagePayloadTypeId {
       value == null ? null : ServerMessagePayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 6;
+  static const int maxValue = 7;
   static const fb.Reader<ServerMessagePayloadTypeId> reader = _ServerMessagePayloadTypeIdReader();
 }
 
@@ -3124,10 +3126,13 @@ class HelloResult {
 
   String? get protocolVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   bool get authenticated => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+  String? get serverVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  bool get updateAvailable => const fb.BoolReader().vTableGet(_bc, _bcOffset, 10, false);
+  String? get latestVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
 
   @override
   String toString() {
-    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}}';
+    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}}';
   }
 }
 
@@ -3145,7 +3150,7 @@ class HelloResultBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(2);
+    fbBuilder.startTable(5);
   }
 
   int addProtocolVersionOffset(int? offset) {
@@ -3154,6 +3159,18 @@ class HelloResultBuilder {
   }
   int addAuthenticated(bool? authenticated) {
     fbBuilder.addBool(1, authenticated);
+    return fbBuilder.offset;
+  }
+  int addServerVersionOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addUpdateAvailable(bool? updateAvailable) {
+    fbBuilder.addBool(3, updateAvailable);
+    return fbBuilder.offset;
+  }
+  int addLatestVersionOffset(int? offset) {
+    fbBuilder.addOffset(4, offset);
     return fbBuilder.offset;
   }
 
@@ -3165,22 +3182,38 @@ class HelloResultBuilder {
 class HelloResultObjectBuilder extends fb.ObjectBuilder {
   final String? _protocolVersion;
   final bool? _authenticated;
+  final String? _serverVersion;
+  final bool? _updateAvailable;
+  final String? _latestVersion;
 
   HelloResultObjectBuilder({
     String? protocolVersion,
     bool? authenticated,
+    String? serverVersion,
+    bool? updateAvailable,
+    String? latestVersion,
   })
       : _protocolVersion = protocolVersion,
-        _authenticated = authenticated;
+        _authenticated = authenticated,
+        _serverVersion = serverVersion,
+        _updateAvailable = updateAvailable,
+        _latestVersion = latestVersion;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
     final int? protocolVersionOffset = _protocolVersion == null ? null
         : fbBuilder.writeString(_protocolVersion!);
-    fbBuilder.startTable(2);
+    final int? serverVersionOffset = _serverVersion == null ? null
+        : fbBuilder.writeString(_serverVersion!);
+    final int? latestVersionOffset = _latestVersion == null ? null
+        : fbBuilder.writeString(_latestVersion!);
+    fbBuilder.startTable(5);
     fbBuilder.addOffset(0, protocolVersionOffset);
     fbBuilder.addBool(1, _authenticated);
+    fbBuilder.addOffset(2, serverVersionOffset);
+    fbBuilder.addBool(3, _updateAvailable);
+    fbBuilder.addOffset(4, latestVersionOffset);
     return fbBuilder.endTable();
   }
 
@@ -5136,6 +5169,90 @@ class SessionContextUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class UpdateAvailablePayload {
+  UpdateAvailablePayload._(this._bc, this._bcOffset);
+  factory UpdateAvailablePayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<UpdateAvailablePayload> reader = _UpdateAvailablePayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get currentVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get latestVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+
+  @override
+  String toString() {
+    return 'UpdateAvailablePayload{currentVersion: ${currentVersion}, latestVersion: ${latestVersion}}';
+  }
+}
+
+class _UpdateAvailablePayloadReader extends fb.TableReader<UpdateAvailablePayload> {
+  const _UpdateAvailablePayloadReader();
+
+  @override
+  UpdateAvailablePayload createObject(fb.BufferContext bc, int offset) => 
+    UpdateAvailablePayload._(bc, offset);
+}
+
+class UpdateAvailablePayloadBuilder {
+  UpdateAvailablePayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addCurrentVersionOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addLatestVersionOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class UpdateAvailablePayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _currentVersion;
+  final String? _latestVersion;
+
+  UpdateAvailablePayloadObjectBuilder({
+    String? currentVersion,
+    String? latestVersion,
+  })
+      : _currentVersion = currentVersion,
+        _latestVersion = latestVersion;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? currentVersionOffset = _currentVersion == null ? null
+        : fbBuilder.writeString(_currentVersion!);
+    final int? latestVersionOffset = _latestVersion == null ? null
+        : fbBuilder.writeString(_latestVersion!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, currentVersionOffset);
+    fbBuilder.addOffset(1, latestVersionOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ServerMessage {
   ServerMessage._(this._bc, this._bcOffset);
   factory ServerMessage(List<int> bytes) {
@@ -5157,6 +5274,7 @@ class ServerMessage {
       case 4: return SubscriptionClosedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 5: return SessionSnippetUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 6: return SessionContextUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 7: return UpdateAvailablePayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       default: return null;
     }
   }

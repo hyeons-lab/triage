@@ -19,6 +19,7 @@ pub struct Config {
     pub approval: ApprovalConfig,
     pub keybindings: KeybindingsConfig,
     pub summarizer: SummarizerConfig,
+    pub update: UpdateConfig,
 }
 
 impl Config {
@@ -53,7 +54,51 @@ impl Config {
         self.approval.validate()?;
         self.keybindings.validate()?;
         self.summarizer.validate()?;
+        self.update.validate()?;
         Ok(())
+    }
+}
+
+/// Settings for the background update check (Phase 1 of self-update). The daemon
+/// periodically asks the release host for the latest published tag and surfaces
+/// an "update available" banner; nothing is ever downloaded or installed
+/// automatically. Set `check = false` to disable the check entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Whether the daemon polls for newer releases at all.
+    pub check: bool,
+    /// How often to poll, in hours. Must be greater than zero.
+    pub interval_hours: u64,
+    /// Release channel to track. Only `stable` is recognized today.
+    pub channel: String,
+}
+
+impl UpdateConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.interval_hours > 0,
+            "update.interval_hours must be greater than zero"
+        );
+        ensure_non_empty("update.channel", &self.channel)?;
+        // Only `stable` is wired up today; reject anything else loudly rather
+        // than silently accepting a channel that has no effect. Relax this to an
+        // enum once more channels exist.
+        ensure!(
+            self.channel == "stable",
+            "update.channel must be \"stable\" (the only channel supported today)"
+        );
+        Ok(())
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            interval_hours: 6,
+            channel: "stable".to_string(),
+        }
     }
 }
 
@@ -807,5 +852,52 @@ default_shell = "/bin/bash"
         std::fs::remove_file(&path).expect("test config file should be removed");
 
         assert_eq!(config.general.default_shell, "/bin/bash");
+    }
+
+    #[test]
+    fn update_defaults_are_valid() {
+        let config = Config::default();
+        assert!(config.update.check);
+        assert_eq!(config.update.interval_hours, 6);
+        assert_eq!(config.update.channel, "stable");
+        config
+            .validate()
+            .expect("default update config should validate");
+    }
+
+    #[test]
+    fn unknown_update_channel_is_rejected() {
+        let error = Config::from_toml_str(
+            r#"
+[update]
+channel = "beta"
+"#,
+        )
+        .expect_err("an unrecognized update channel should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("update.channel must be \"stable\""),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_update_interval_is_rejected() {
+        let error = Config::from_toml_str(
+            r#"
+[update]
+interval_hours = 0
+"#,
+        )
+        .expect_err("a zero update interval should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("update.interval_hours must be greater than zero"),
+            "unexpected error: {error}"
+        );
     }
 }

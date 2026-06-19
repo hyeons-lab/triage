@@ -469,6 +469,19 @@ pub struct SubscribeSessionEventsRequest {
 
 pub type SessionEventReceiver = Receiver<SessionEventEnvelope>;
 
+/// The server's self-reported version and update status, surfaced to clients on
+/// the `Hello` handshake (Phase 1–2 of self-update). `latest_version` is `None`
+/// until the daemon's background check has seen a published release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerUpdateInfo {
+    /// The running daemon's version (its compiled `CARGO_PKG_VERSION`).
+    pub server_version: String,
+    /// Whether a strictly newer stable release has been observed.
+    pub update_available: bool,
+    /// The newest release tag seen, normalized without a leading `v`.
+    pub latest_version: Option<String>,
+}
+
 pub trait SessionApi {
     fn list_sessions(&self) -> Result<Vec<SessionId>>;
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
@@ -503,6 +516,16 @@ pub trait SessionApi {
     #[allow(clippy::type_complexity)]
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         Ok(Vec::new())
+    }
+    /// Update status to embed in the `Hello` handshake. Defaults to "this build,
+    /// nothing newer known" so non-daemon implementors (test mocks, the MCP
+    /// recorder) need not care; the daemon's `SessionManager` overrides it.
+    fn server_update_info(&self) -> ServerUpdateInfo {
+        ServerUpdateInfo {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            update_available: false,
+            latest_version: None,
+        }
     }
 }
 
@@ -556,6 +579,9 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     #[allow(clippy::type_complexity)]
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         (**self).list_session_snippets()
+    }
+    fn server_update_info(&self) -> ServerUpdateInfo {
+        (**self).server_update_info()
     }
 }
 
