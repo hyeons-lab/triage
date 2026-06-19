@@ -9,7 +9,7 @@ use triage_core::session::{
     SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
     WriteInputRequest,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use triaged::ipc::UnixSocketClient;
 use triaged::session::{SessionManager, SessionManagerConfig};
 
@@ -51,7 +51,7 @@ impl LocalSessionApp {
         Self::start_with_log_dir(size, default_tui_log_dir())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn connect(socket_path: impl Into<PathBuf>, size: SessionSize) -> Result<Self> {
         let manager = UnixSocketClient::new(socket_path);
         Self::start_with_manager(Box::new(manager), size, false)

@@ -48,14 +48,14 @@ fn main() -> Result<()> {
         socket_path: _socket_path,
     } = &startup_mode
     {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let path = _socket_path
                 .clone()
                 .unwrap_or_else(triaged::ipc::default_socket_path);
-            if !path.exists() {
+            if !daemon_endpoint_present(&path) {
                 bail!(
-                    "Daemon Unix socket not found at {}. Is the Triage daemon running?",
+                    "Daemon socket not found at {}. Is the Triage daemon running?",
                     path.display()
                 );
             }
@@ -67,9 +67,9 @@ fn main() -> Result<()> {
             println!("Successfully reloaded web assets cache.");
             return Ok(());
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            bail!("Client asset reloading is only supported on Unix systems.");
+            bail!("Client asset reloading is not supported on this platform.");
         }
     }
 
@@ -97,12 +97,12 @@ fn main() -> Result<()> {
         copy_dir_all(src, &dest).context("failed to copy client assets")?;
         println!("Assets successfully copied.");
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let path = _socket_path
                 .clone()
                 .unwrap_or_else(triaged::ipc::default_socket_path);
-            if path.exists() {
+            if daemon_endpoint_present(&path) {
                 let client = triaged::ipc::UnixSocketClient::new(path);
                 println!("Notifying triaged daemon to reload web cache...");
                 if let Err(e) = client.reload_client_assets() {
@@ -190,7 +190,7 @@ fn pairing_url_for_bind(bind_addr: std::net::SocketAddr) -> String {
     format!("http://{}:{}/pair", ip, bind_addr.port())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessionApp> {
     match startup_mode {
         StartupMode::Daemon { socket_path } => LocalSessionApp::connect(&socket_path, size)
@@ -212,12 +212,12 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessionApp> {
     match startup_mode {
         StartupMode::Daemon { .. } => {
             bail!(
-                "daemon socket mode is only available on Unix; pass --embedded for development mode"
+                "daemon socket mode requires the local IPC transport, which is unavailable on this platform; pass --embedded for development mode"
             )
         }
         StartupMode::Embedded => LocalSessionApp::start(size),
@@ -227,6 +227,21 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
             unreachable!("client subcommands exit before starting app")
         }
     }
+}
+
+/// Whether the daemon's control endpoint appears reachable, used to give a
+/// friendly "is the daemon running?" message before connecting. On Unix the
+/// endpoint is a filesystem socket we can stat; on Windows it is a named-pipe
+/// token (never a filesystem entry), so we optimistically return `true` and let
+/// the connect attempt surface a real failure.
+#[cfg(unix)]
+fn daemon_endpoint_present(path: &Path) -> bool {
+    path.exists()
+}
+
+#[cfg(windows)]
+fn daemon_endpoint_present(_path: &Path) -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,13 +270,14 @@ Options:
   client reload     Reload in-memory web asset cache inside running daemon
   client upgrade    Upgrade web client assets from a source directory
   --src <dir>       Source directory for web client upgrade (required for client upgrade)
-  --socket <path>   Connect to a daemon Unix socket at <path>
+  --socket <path>   Connect to a daemon control socket at <path>
+                    (Unix domain socket on Unix, named pipe on Windows)
   --embedded        Run an isolated in-process session manager
   -h, --help        Print this help text
 
-By default triage connects to the daemon Unix socket on Unix and uses
-embedded development mode on non-Unix platforms. Use --embedded on Unix only
-for isolated development.";
+By default triage connects to the running daemon (Unix domain socket on Unix,
+named pipe on Windows). Use --embedded for an isolated in-process session
+manager when no daemon is running.";
 
     fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut mode = None;
@@ -373,14 +389,14 @@ for isolated development.";
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn default_startup_mode() -> StartupMode {
     StartupMode::Daemon {
         socket_path: triaged::ipc::default_socket_path(),
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn default_startup_mode() -> StartupMode {
     StartupMode::Embedded
 }
@@ -2498,9 +2514,11 @@ mod tests {
     fn startup_mode_defaults_to_daemon_socket() {
         let startup_mode = StartupMode::from_args(Vec::<OsString>::new()).expect("startup mode");
 
-        #[cfg(unix)]
+        // Wherever the daemon's local IPC transport exists (Unix + Windows), a
+        // bare `triage` defaults to attaching to the running daemon.
+        #[cfg(any(unix, windows))]
         assert!(matches!(startup_mode, StartupMode::Daemon { .. }));
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert_eq!(startup_mode, StartupMode::Embedded);
     }
 
