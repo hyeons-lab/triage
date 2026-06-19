@@ -223,7 +223,10 @@ mod platform {
         let _ = launchctl(&["unload", &plist.display().to_string()]);
         let status = launchctl(&["load", "-w", &plist.display().to_string()])?;
         if !status.success() {
-            bail!("launchctl load failed; the LaunchAgent was written to {} but not loaded", plist.display());
+            bail!(
+                "launchctl load failed; the LaunchAgent was written to {} but not loaded",
+                plist.display()
+            );
         }
         println!(
             "Installed and started triaged LaunchAgent ({SERVICE_LABEL}).\n  plist: {}\n  logs:  {}",
@@ -280,9 +283,7 @@ mod platform {
     }
 
     fn unit_path() -> Result<PathBuf> {
-        Ok(home_dir()?
-            .join(".config/systemd/user")
-            .join(unit_name()))
+        Ok(home_dir()?.join(".config/systemd/user").join(unit_name()))
     }
 
     fn systemctl(args: &[&str]) -> Result<std::process::ExitStatus> {
@@ -324,8 +325,7 @@ mod platform {
         let unit = unit_path()?;
         if unit.exists() {
             let _ = systemctl(&["disable", "--now", &unit_name()]);
-            std::fs::remove_file(&unit)
-                .with_context(|| format!("removing {}", unit.display()))?;
+            std::fs::remove_file(&unit).with_context(|| format!("removing {}", unit.display()))?;
             systemctl(&["daemon-reload"])?;
             println!("Removed triaged systemd unit ({}).", unit_name());
         } else {
@@ -337,7 +337,9 @@ mod platform {
     pub(super) fn start(_ctx: &ServiceContext) -> Result<()> {
         let status = systemctl(&["start", &unit_name()])?;
         if !status.success() {
-            bail!("systemctl --user start failed; is the service installed? (triaged service install)");
+            bail!(
+                "systemctl --user start failed; is the service installed? (triaged service install)"
+            );
         }
         println!("Started triaged.");
         Ok(())
@@ -515,6 +517,9 @@ mod tests {
         assert!(joined.contains("/TN triaged"));
         assert!(joined.contains("/SC ONLOGON"));
         // The run command detaches from a console so no window flashes at logon.
-        assert!(args.iter().any(|a| a.contains(r#"start "" /b "C:\Users\me\triaged.exe""#)));
+        assert!(
+            args.iter()
+                .any(|a| a.contains(r#"start "" /b "C:\Users\me\triaged.exe""#))
+        );
     }
 }

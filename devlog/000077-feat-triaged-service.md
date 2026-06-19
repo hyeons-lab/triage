@@ -117,8 +117,18 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
 
 ## Next Steps
 
-- Implement `service` subcommand + per-platform registration + tests.
-- Fold in the four Windows follow-ups, each as its own commit.
+Service feature and all four Windows follow-ups are done. Remaining validation /
+polish, deliberately out of scope here:
+
+- **Manual end-to-end service test per OS.** Template generation is unit-tested,
+  but the actual `launchctl` / `systemctl --user` / `schtasks` install→start→
+  status→uninstall round trip needs a manual smoke test on each platform.
+- **Bounded-connect runtime check.** Compiles on the Windows target and is
+  exercised by `windows-latest` CI, but the `ERROR_PIPE_BUSY` timeout path
+  itself isn't directly asserted — worth a Windows lifecycle test someday.
+- **Windows service stop granularity.** `service stop` does a best-effort
+  `taskkill /IM triaged.exe`; with multiple users' daemons this is coarse.
+  Consider matching the per-user task/pid instead.
 
 ## Commits
 
@@ -127,4 +137,5 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
 - ddf3e5d — fix(triaged): bound the Windows named-pipe client connect with a timeout
 - f309af3 — fix(triaged): store upgraded web assets under %LOCALAPPDATA% on Windows
 - 2187e0a — refactor(triaged): rename UnixSocket* to Ipc*, de-dup serve/handle_connection
-- HEAD — docs: document the triaged background service and cross-platform support
+- 30323cc — docs: document the triaged background service and cross-platform support
+- HEAD — style(triaged): rustfmt service test assertion
