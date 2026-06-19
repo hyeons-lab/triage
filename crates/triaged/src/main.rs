@@ -16,6 +16,15 @@ fn main() -> anyhow::Result<()> {
 
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // `triaged service <action>` manages the per-user login service (LaunchAgent
+    // / systemd user unit / Windows logon task) and exits, rather than running
+    // the daemon in this process.
+    if args.get(1).map(String::as_str) == Some("service") {
+        let action = args.get(2).map(String::as_str).unwrap_or("");
+        return triaged::service::run_cli(action);
+    }
+
     let is_handover = args.contains(&"--handover".to_string()) || args.contains(&"-U".to_string());
 
     #[cfg(unix)]
