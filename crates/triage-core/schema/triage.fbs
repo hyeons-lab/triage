@@ -237,7 +237,8 @@ table HelloResult {
     authenticated: bool;
     // Self-update fields (appended for forward/backward compatibility): the
     // running daemon version, whether a newer stable release exists, and the
-    // newest tag seen (normalized, no leading `v`; empty until the first check).
+    // newest tag seen (normalized, no leading `v`). `latest_version` is absent
+    // (null), not an empty string, until the first successful check.
     server_version: string;
     update_available: bool;
     latest_version: string;

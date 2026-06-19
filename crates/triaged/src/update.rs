@@ -22,8 +22,8 @@ use triage_core::config::UpdateConfig;
 
 /// Public repository whose release tags define "the latest version". The git
 /// protocol endpoint needs no auth and is not subject to the REST API rate
-/// limit.
-const RELEASE_REPO_URL: &str = "https://github.com/hyeons-lab/triage";
+/// limit. The canonical `.git` URL avoids relying on a GitHub redirect.
+const RELEASE_REPO_URL: &str = "https://github.com/hyeons-lab/triage.git";
 
 /// This daemon's own compiled version (the workspace `version`, e.g. `0.1.6`).
 pub fn current_version() -> &'static str {

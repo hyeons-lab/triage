@@ -129,8 +129,29 @@ See `devlog/plans/000066-01-self-update.md`.
   (now requires confirmation); macOS in-app install fights Gatekeeper under
   ad-hoc signing (now browser-download default). Full findings F1–F9 in the plan.
 
+### PR review comments (Copilot, #91)
+
+- 2026-06-19T07:27-0700 `crates/triage-core/src/config.rs` — Copilot: `update.channel`
+  was documented as "only `stable`" but validation only checked non-empty, so an
+  unknown channel was silently accepted with no effect. Now `validate` rejects
+  anything but `stable` (relax to an enum when more channels exist). Added tests:
+  default config validates, unknown channel rejected, zero interval rejected.
+- 2026-06-19T07:27-0700 `crates/triaged/src/update.rs` — Copilot: use the
+  canonical `.git` remote URL for `git ls-remote` to avoid relying on a GitHub
+  redirect. Changed `RELEASE_REPO_URL` to `…/triage.git`.
+- 2026-06-19T07:27-0700 `crates/triage-transport-ws/src/flatbuffers_proto.rs` —
+  Copilot: the borrowed `Hello.latest_version` was `&str` with `unwrap_or("")`,
+  collapsing the FlatBuffers "field absent" case into an empty string while the
+  owned side is `Option<String>`. Changed the borrowed field to `Option<&str>`
+  and the parser to pass `hello.latest_version()` through unchanged.
+- 2026-06-19T07:27-0700 `crates/triage-core/schema/triage.fbs` — Copilot: comment
+  said `latest_version` is "empty until the first check"; reworded to "absent
+  (null)" to match how FlatBuffers omits an unset field. Comment-only; bindings
+  unchanged.
+
 ## Commits
 
 - 8f8ebfe — docs(devlog): plan self-update & update notifications
 - 95ac71b — docs(devlog): revise self-update plan after critical review
-- HEAD — feat(triaged): background update check + surface over session API
+- 2d5d32d — feat(triaged): background update check + surface over session API
+- HEAD — fix(triaged): enforce stable channel, canonical ls-remote URL, optional borrowed latest_version

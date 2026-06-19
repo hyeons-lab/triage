@@ -1118,7 +1118,9 @@ pub enum ServerResultBorrowed<'a> {
         authenticated: bool,
         server_version: &'a str,
         update_available: bool,
-        latest_version: &'a str,
+        // `None` until the first successful poll; the FlatBuffers field is
+        // omitted, not an empty string, so preserve that distinction.
+        latest_version: Option<&'a str>,
     },
     Paired {
         token: &'a str,
@@ -1220,7 +1222,7 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         authenticated: hello.authenticated(),
                         server_version: hello.server_version().unwrap_or(""),
                         update_available: hello.update_available(),
-                        latest_version: hello.latest_version().unwrap_or(""),
+                        latest_version: hello.latest_version(),
                     }
                 }
                 fb::ServerResultPayload::PairingChallengeResult => {
