@@ -85,7 +85,15 @@ mod transport {
                 "named pipe name is not valid UTF-8",
             )
         })?;
-        Ok(raw
+        // Accept either a bare token (`triage-<user>`, the default) or a full pipe
+        // path (`\\.\pipe\triage-<user>` / `\\?\pipe\...`); strip the well-known
+        // prefix so a user-typed full path maps to the same token, then collapse
+        // any remaining separators into the single legal token.
+        let bare = raw
+            .strip_prefix(r"\\.\pipe\")
+            .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
+            .unwrap_or(raw);
+        Ok(bare
             .chars()
             .map(|c| match c {
                 '\\' | '/' | ':' => '_',
@@ -183,7 +191,7 @@ impl UnixSocketServer {
         use interprocess::local_socket::ListenerOptions;
         use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
 
-        let pipe_name = self.config.socket_path.display().to_string();
+        let pipe_name = display_endpoint(&self.config.socket_path);
 
         // Refuse to start a second daemon on the same pipe. Named pipes leave no
         // stale filesystem entry, so if a connect succeeds another server is live.
@@ -576,7 +584,12 @@ fn handle_connection(
     stream: UnixStream,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning Unix socket stream")?);
-    let request: WireRequest = read_json_line(&mut reader)?.context("reading request")?;
+    // A client that connects then closes without sending a request line (e.g. a
+    // liveness probe, or the Windows "already in use" preflight) yields EOF here;
+    // that's a normal disconnect, not an error worth logging.
+    let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
+        return Ok(());
+    };
     let mut writer = BufWriter::new(stream);
 
     if let WireRequest::Handover = request {
@@ -608,7 +621,12 @@ fn handle_connection(
     stream: transport::LocalStream,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
-    let request: WireRequest = read_json_line(&mut reader)?.context("reading request")?;
+    // A client that connects then closes without sending a request line (e.g. a
+    // liveness probe, or the Windows "already in use" preflight) yields EOF here;
+    // that's a normal disconnect, not an error worth logging.
+    let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
+        return Ok(());
+    };
     let mut writer = BufWriter::new(reader.into_inner());
 
     match request {

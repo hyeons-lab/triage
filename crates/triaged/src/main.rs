@@ -176,7 +176,8 @@ fn run() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let pipe_name = default_socket_path();
-        tracing::info!(pipe = %pipe_name.display(), "triaged starting named pipe server");
+        let endpoint = triaged::ipc::display_endpoint(&pipe_name);
+        tracing::info!(pipe = %endpoint, "triaged starting named pipe server");
         UnixSocketServer::new(manager, web_cache, UnixSocketConfig::new(pipe_name)).serve()?;
         Ok(())
     }

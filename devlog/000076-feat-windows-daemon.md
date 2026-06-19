@@ -153,6 +153,24 @@ See `devlog/plans/000076-01-windows-daemon.md`.
     near-identical notify blocks and restores the friendly hint on Windows. The
     TUI `start_app` daemon error also uses `display_endpoint`.
 
+## PR review comments (Copilot)
+
+- 2026-06-18T21:26-0700 Addressed the PR review:
+  - `crates/triaged/src/ipc.rs` — both `handle_connection`s now treat
+    EOF-before-request (`read_json_line` → `Ok(None)`) as a normal disconnect and
+    return `Ok(())`, instead of an error that wasn't classified as a closed socket
+    and logged a spurious warning. This also quiets the Windows liveness/preflight
+    probes. `windows_pipe_token` now strips a `\\.\pipe\` / `\\?\pipe\` prefix
+    before sanitizing, so a user-supplied full pipe path maps to the same token as
+    the bare default (previously it was mangled and wouldn't connect). `serve()`
+    diagnostics use `display_endpoint(&socket_path)` instead of the bare
+    `display()` token.
+  - `crates/triaged/src/main.rs` — the Windows "starting named pipe server" log
+    uses `display_endpoint` for a consistent `\\.\pipe\…` endpoint.
+  - `crates/triaged/README.md` — renamed the section heading from "Windows
+    Graceful Fallback" to "Windows Support (no zero-downtime handover)" to match
+    the content (full native support + the handover caveat).
+
 ## Next Steps
 
 Remaining follow-ups, deliberately out of this PR (most daemon-side):
@@ -192,4 +210,5 @@ DACL is owner+SYSTEM+Admins only).
 
 - e7ca86d — feat(triaged): run the daemon on Windows via named-pipe IPC
 - 52a2ec3 — feat(triage,triage-mcp): connect to the Windows daemon over the named pipe
-- HEAD — fix(triage): friendlier Windows IPC errors, unified daemon-reload notify
+- e473980 — fix(triage): friendlier Windows IPC errors, unified daemon-reload notify
+- HEAD — fix(triaged): address PR review — quiet benign disconnects, accept full pipe paths

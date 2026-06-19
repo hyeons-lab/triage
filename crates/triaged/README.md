@@ -208,7 +208,7 @@ To upgrade or restart the daemon with zero downtime, run the new binary with the
 triaged --handover
 ```
 
-### Windows Graceful Fallback
+### Windows Support (no zero-downtime handover)
 
 The daemon runs natively on Windows: its local control plane uses a named pipe
 (`\\.\pipe\triage-<user>`) in place of the Unix domain socket, and terminal
