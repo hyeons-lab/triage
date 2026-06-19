@@ -4,7 +4,7 @@ use std::sync::Arc;
 use triaged::session::SessionManager;
 use triaged::ws;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use triaged::ipc::{UnixSocketConfig, UnixSocketServer, default_socket_path};
 
 fn main() -> anyhow::Result<()> {
@@ -162,7 +162,9 @@ fn run() -> anyhow::Result<()> {
             }
         })?;
 
-    // Run Unix Socket Server on Unix
+    // Run the local IPC control server. This is a Unix domain socket on Unix and
+    // a named pipe on Windows; both speak the same protocol. The call blocks the
+    // main thread for the daemon's lifetime.
     #[cfg(unix)]
     {
         let socket_path = default_socket_path();
@@ -171,10 +173,20 @@ fn run() -> anyhow::Result<()> {
         Ok(())
     }
 
-    // On non-Unix, block the main thread by parking to keep the daemon alive
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        tracing::info!("triaged starting (no Unix socket server available)");
+        let pipe_name = default_socket_path();
+        let endpoint = triaged::ipc::display_endpoint(&pipe_name);
+        tracing::info!(pipe = %endpoint, "triaged starting named pipe server");
+        UnixSocketServer::new(manager, web_cache, UnixSocketConfig::new(pipe_name)).serve()?;
+        Ok(())
+    }
+
+    // No local IPC transport on other platforms: keep the daemon (and its
+    // WS/HTTP server thread) alive by parking the main thread.
+    #[cfg(not(any(unix, windows)))]
+    {
+        tracing::info!("triaged starting (no local IPC server available on this platform)");
         loop {
             std::thread::park();
         }

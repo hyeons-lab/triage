@@ -48,28 +48,15 @@ fn main() -> Result<()> {
         socket_path: _socket_path,
     } = &startup_mode
     {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            let path = _socket_path
-                .clone()
-                .unwrap_or_else(triaged::ipc::default_socket_path);
-            if !path.exists() {
-                bail!(
-                    "Daemon Unix socket not found at {}. Is the Triage daemon running?",
-                    path.display()
-                );
-            }
-            let client = triaged::ipc::UnixSocketClient::new(path);
             println!("Sending ReloadClientAssets command to triaged daemon...");
-            client
-                .reload_client_assets()
-                .context("failed to reload web assets cache")?;
-            println!("Successfully reloaded web assets cache.");
+            notify_daemon_reload(_socket_path.clone(), true)?;
             return Ok(());
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            bail!("Client asset reloading is only supported on Unix systems.");
+            bail!("Client asset reloading is not supported on this platform.");
         }
     }
 
@@ -97,22 +84,10 @@ fn main() -> Result<()> {
         copy_dir_all(src, &dest).context("failed to copy client assets")?;
         println!("Assets successfully copied.");
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            let path = _socket_path
-                .clone()
-                .unwrap_or_else(triaged::ipc::default_socket_path);
-            if path.exists() {
-                let client = triaged::ipc::UnixSocketClient::new(path);
-                println!("Notifying triaged daemon to reload web cache...");
-                if let Err(e) = client.reload_client_assets() {
-                    tracing::warn!(
-                        "Failed to notify daemon: {e}. The daemon will use new assets upon next restart."
-                    );
-                } else {
-                    println!("Successfully notified daemon. New assets are live.");
-                }
-            }
+            println!("Notifying triaged daemon to reload web cache...");
+            notify_daemon_reload(_socket_path.clone(), false)?;
         }
         return Ok(());
     }
@@ -190,14 +165,14 @@ fn pairing_url_for_bind(bind_addr: std::net::SocketAddr) -> String {
     format!("http://{}:{}/pair", ip, bind_addr.port())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessionApp> {
     match startup_mode {
         StartupMode::Daemon { socket_path } => LocalSessionApp::connect(&socket_path, size)
             .with_context(|| {
                 format!(
-                    "connecting to Triage daemon socket at {}; start triaged or pass --embedded for development mode",
-                    socket_path.display()
+                    "connecting to the Triage daemon at {}; start triaged or pass --embedded for development mode",
+                    triaged::ipc::display_endpoint(&socket_path)
                 )
             }),
         StartupMode::Embedded => {
@@ -212,12 +187,12 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessionApp> {
     match startup_mode {
         StartupMode::Daemon { .. } => {
             bail!(
-                "daemon socket mode is only available on Unix; pass --embedded for development mode"
+                "daemon socket mode requires the local IPC transport, which is unavailable on this platform; pass --embedded for development mode"
             )
         }
         StartupMode::Embedded => LocalSessionApp::start(size),
@@ -225,6 +200,37 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
         StartupMode::Help => unreachable!("help mode exits before startup"),
         StartupMode::ClientReload { .. } | StartupMode::ClientUpgrade { .. } => {
             unreachable!("client subcommands exit before starting app")
+        }
+    }
+}
+
+/// Tell a running daemon to reload its in-memory web-asset cache.
+///
+/// `required` controls failure handling and matches the two call sites: `client
+/// reload` is an explicit request, so a failure is a hard error with an "is the
+/// daemon running?" hint; `client upgrade` notifies best-effort after copying
+/// assets, so a failure is a benign note (the daemon picks up the new assets when
+/// it next starts). This attempts the connect on both platforms rather than
+/// pre-checking the path, because on Windows the endpoint is a named pipe with no
+/// filesystem entry to stat — the connect itself is the only honest liveness test.
+#[cfg(any(unix, windows))]
+fn notify_daemon_reload(socket_path: Option<PathBuf>, required: bool) -> Result<()> {
+    let path = socket_path.unwrap_or_else(triaged::ipc::default_socket_path);
+    let endpoint = triaged::ipc::display_endpoint(&path);
+    let client = triaged::ipc::UnixSocketClient::new(path);
+    match client.reload_client_assets() {
+        Ok(()) => {
+            println!("Successfully reloaded the daemon web-asset cache at {endpoint}.");
+            Ok(())
+        }
+        Err(error) if required => Err(error.context(format!(
+            "failed to reach the Triage daemon at {endpoint}. Is the daemon running?"
+        ))),
+        Err(error) => {
+            println!(
+                "Daemon at {endpoint} not reachable ({error}); new assets will load when it next starts."
+            );
+            Ok(())
         }
     }
 }
@@ -255,13 +261,14 @@ Options:
   client reload     Reload in-memory web asset cache inside running daemon
   client upgrade    Upgrade web client assets from a source directory
   --src <dir>       Source directory for web client upgrade (required for client upgrade)
-  --socket <path>   Connect to a daemon Unix socket at <path>
+  --socket <path>   Connect to a daemon control socket at <path>
+                    (Unix domain socket on Unix, named pipe on Windows)
   --embedded        Run an isolated in-process session manager
   -h, --help        Print this help text
 
-By default triage connects to the daemon Unix socket on Unix and uses
-embedded development mode on non-Unix platforms. Use --embedded on Unix only
-for isolated development.";
+By default triage connects to the running daemon (Unix domain socket on Unix,
+named pipe on Windows). Use --embedded for an isolated in-process session
+manager when no daemon is running.";
 
     fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut mode = None;
@@ -373,14 +380,14 @@ for isolated development.";
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn default_startup_mode() -> StartupMode {
     StartupMode::Daemon {
         socket_path: triaged::ipc::default_socket_path(),
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn default_startup_mode() -> StartupMode {
     StartupMode::Embedded
 }
@@ -2498,9 +2505,11 @@ mod tests {
     fn startup_mode_defaults_to_daemon_socket() {
         let startup_mode = StartupMode::from_args(Vec::<OsString>::new()).expect("startup mode");
 
-        #[cfg(unix)]
+        // Wherever the daemon's local IPC transport exists (Unix + Windows), a
+        // bare `triage` defaults to attaching to the running daemon.
+        #[cfg(any(unix, windows))]
         assert!(matches!(startup_mode, StartupMode::Daemon { .. }));
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert_eq!(startup_mode, StartupMode::Embedded);
     }
 

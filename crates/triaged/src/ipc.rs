@@ -1,6 +1,11 @@
+// Filesystem ops are only used by the Unix socket path and by tests; on Windows
+// the named-pipe transport touches no filesystem entries.
+#[cfg(any(unix, test))]
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +25,105 @@ use triage_core::session::{
 use crate::session::SessionManager;
 
 const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Local IPC transport seam.
+///
+/// The daemon's control plane speaks a newline-delimited JSON protocol over a
+/// local, single-machine socket. On Unix that socket is a filesystem AF_UNIX
+/// socket (hardened to `0o600`); on Windows it is a named pipe
+/// (`\\.\pipe\triage-<user>`). Only the connect/listen primitives differ — the
+/// wire protocol, request handlers, and client are shared. Handover (FD passing
+/// via `SCM_RIGHTS`) is Unix-only and keeps its own `UnixStream` path.
+mod transport {
+    use super::*;
+
+    /// A connected local IPC stream (client or accepted server side).
+    #[cfg(unix)]
+    pub type LocalStream = UnixStream;
+    #[cfg(windows)]
+    pub type LocalStream = interprocess::local_socket::Stream;
+
+    /// Connect a client to the daemon's local IPC endpoint.
+    #[cfg(unix)]
+    pub fn connect(path: &Path) -> std::io::Result<LocalStream> {
+        UnixStream::connect(path)
+    }
+
+    #[cfg(windows)]
+    pub fn connect(path: &Path) -> std::io::Result<LocalStream> {
+        use interprocess::local_socket::traits::Stream as _;
+        LocalStream::connect(windows_pipe_name(path)?)
+    }
+
+    /// Signal end-of-request to the server. On Unix we half-close the write side
+    /// as a courtesy; on Windows the newline already frames the request, so this
+    /// is a no-op (named pipes have no half-close).
+    #[cfg(unix)]
+    pub fn finish_write(stream: &LocalStream) -> std::io::Result<()> {
+        stream.shutdown(std::net::Shutdown::Write)
+    }
+
+    #[cfg(windows)]
+    pub fn finish_write(_stream: &LocalStream) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Build the `interprocess` namespaced name for a Windows named pipe from the
+    /// configured socket path (which on Windows carries the bare pipe name).
+    /// The single legal named-pipe token for `path`. A pipe lives at
+    /// `\\.\pipe\<token>`, where `<token>` must not contain a path separator. The
+    /// default socket path is already a clean `triage-<user>`, but a
+    /// caller-supplied or test path may be filesystem-like (`…\triage.sock`);
+    /// collapse separators into a legal token that is still unique per distinct
+    /// path (so parallel tests with different temp dirs don't collide). Shared by
+    /// the connect/listen name builder and by user-facing endpoint display.
+    #[cfg(windows)]
+    pub fn windows_pipe_token(path: &Path) -> std::io::Result<String> {
+        let raw = path.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "named pipe name is not valid UTF-8",
+            )
+        })?;
+        // Accept either a bare token (`triage-<user>`, the default) or a full pipe
+        // path (`\\.\pipe\triage-<user>` / `\\?\pipe\...`); strip the well-known
+        // prefix so a user-typed full path maps to the same token, then collapse
+        // any remaining separators into the single legal token.
+        let bare = raw
+            .strip_prefix(r"\\.\pipe\")
+            .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
+            .unwrap_or(raw);
+        Ok(bare
+            .chars()
+            .map(|c| match c {
+                '\\' | '/' | ':' => '_',
+                other => other,
+            })
+            .collect())
+    }
+
+    #[cfg(windows)]
+    pub fn windows_pipe_name(
+        path: &Path,
+    ) -> std::io::Result<interprocess::local_socket::Name<'static>> {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        windows_pipe_token(path)?.to_ns_name::<GenericNamespaced>()
+    }
+}
+
+/// Human-facing description of the daemon's control endpoint, for log and error
+/// messages. On Unix this is the socket file path; on Windows it is the full
+/// named-pipe path (`\\.\pipe\<token>`), since the stored path holds only the
+/// bare pipe token (a bare token reads like a typo in an error message).
+pub fn display_endpoint(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(token) = transport::windows_pipe_token(path) {
+            return format!(r"\\.\pipe\{token}");
+        }
+    }
+    path.display().to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnixSocketConfig {
@@ -53,6 +157,7 @@ impl UnixSocketServer {
         }
     }
 
+    #[cfg(unix)]
     pub fn serve(self) -> Result<()> {
         let listener = bind_owner_socket(&self.config.socket_path)?;
 
@@ -80,6 +185,54 @@ impl UnixSocketServer {
             }
         }
     }
+
+    #[cfg(windows)]
+    pub fn serve(self) -> Result<()> {
+        use interprocess::local_socket::ListenerOptions;
+        use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+
+        let pipe_name = display_endpoint(&self.config.socket_path);
+
+        // Refuse to start a second daemon on the same pipe. Named pipes leave no
+        // stale filesystem entry, so if a connect succeeds another server is live.
+        if interprocess::local_socket::Stream::connect(transport::windows_pipe_name(
+            &self.config.socket_path,
+        )?)
+        .is_ok()
+        {
+            bail!("named pipe {pipe_name} is already in use");
+        }
+
+        let listener = ListenerOptions::new()
+            .name(transport::windows_pipe_name(&self.config.socket_path)?)
+            .create_sync()
+            .with_context(|| format!("creating named pipe {pipe_name}"))?;
+
+        for incoming in listener.incoming() {
+            match incoming {
+                Ok(stream) => {
+                    let manager = Arc::clone(&self.manager);
+                    let web_cache = Arc::clone(&self.web_cache);
+                    if let Err(error) = thread::Builder::new()
+                        .name("triage-ipc-client".to_string())
+                        .spawn(move || {
+                            if let Err(error) = handle_connection(manager, web_cache, stream)
+                                && !is_closed_socket_error(&error)
+                            {
+                                tracing::warn!(error = ?error, "named pipe client failed");
+                            }
+                        })
+                    {
+                        tracing::warn!(error = ?error, "failed to spawn named pipe client handler");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "failed to accept named pipe connection");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,12 +255,10 @@ impl UnixSocketClient {
     }
 
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .with_context(|| format!("connecting to {}", self.socket_path.display()))?;
-        write_json_line(&mut stream, &request).context("writing Unix socket request")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("finishing Unix socket request")?;
+        let mut stream = transport::connect(&self.socket_path)
+            .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
+        write_json_line(&mut stream, &request).context("writing IPC request")?;
+        transport::finish_write(&stream).context("finishing IPC request")?;
 
         let mut reader = BufReader::new(stream);
         let response: WireResponse = read_json_line(&mut reader)?.context("reading response")?;
@@ -115,6 +266,7 @@ impl UnixSocketClient {
     }
 }
 
+#[cfg(unix)]
 pub fn default_socket_path() -> PathBuf {
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join("triage/triage.sock");
@@ -123,6 +275,14 @@ pub fn default_socket_path() -> PathBuf {
     std::env::temp_dir()
         .join(format!("triage-{}", fallback_user_component()))
         .join("triage.sock")
+}
+
+/// On Windows the "socket path" is the bare name of a named pipe; the transport
+/// layer expands it to `\\.\pipe\triage-<user>`. Per-user in the name keeps
+/// concurrent users on a shared machine from colliding.
+#[cfg(windows)]
+pub fn default_socket_path() -> PathBuf {
+    PathBuf::from(format!("triage-{}", fallback_user_component()))
 }
 
 impl SessionApi for UnixSocketClient {
@@ -158,8 +318,8 @@ impl SessionApi for UnixSocketClient {
         &self,
         request: SubscribeSessionEventsRequest,
     ) -> Result<SessionEventReceiver> {
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .with_context(|| format!("connecting to {}", self.socket_path.display()))?;
+        let mut stream = transport::connect(&self.socket_path)
+            .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
         write_json_line(
             &mut stream,
             &WireRequest::SubscribeSessionEvents {
@@ -167,12 +327,11 @@ impl SessionApi for UnixSocketClient {
                 after_event_seq: request.after_event_seq,
             },
         )
-        .context("writing Unix socket subscribe request")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .context("finishing Unix socket subscribe request")?;
+        .context("writing IPC subscribe request")?;
+        transport::finish_write(&stream).context("finishing IPC subscribe request")?;
 
-        let mut reader = BufReader::new(stream.try_clone().context("cloning subscription stream")?);
+        // The client only reads from here on, so a single handle suffices.
+        let mut reader = BufReader::new(stream);
         let response: WireResponse =
             read_json_line(&mut reader)?.context("reading subscribe response")?;
         match response.into_result()? {
@@ -340,6 +499,14 @@ enum WireSuccess {
 }
 
 fn fallback_user_component() -> String {
+    user_identifier()
+        .filter(|value| !value.trim().is_empty())
+        .map(sanitize_path_component)
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+}
+
+#[cfg(unix)]
+fn user_identifier() -> Option<String> {
     std::env::var("UID")
         .or_else(|_| {
             current_user_uid()
@@ -348,14 +515,17 @@ fn fallback_user_component() -> String {
         })
         .or_else(|_| std::env::var("USER"))
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(sanitize_path_component)
-        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
 }
 
+#[cfg(unix)]
 fn current_user_uid() -> Option<u32> {
     let home = std::env::var_os("HOME")?;
     fs::metadata(home).map(|metadata| metadata.uid()).ok()
+}
+
+#[cfg(windows)]
+fn user_identifier() -> Option<String> {
+    std::env::var("USERNAME").ok()
 }
 
 fn sanitize_path_component(value: String) -> String {
@@ -371,6 +541,7 @@ fn sanitize_path_component(value: String) -> String {
         .collect()
 }
 
+#[cfg(unix)]
 fn bind_owner_socket(socket_path: &Path) -> Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
@@ -406,24 +577,23 @@ fn bind_owner_socket(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+#[cfg(unix)]
 fn handle_connection(
     manager: Arc<SessionManager>,
     web_cache: Arc<crate::http::WebAssetCache>,
     stream: UnixStream,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning Unix socket stream")?);
-    let request: WireRequest = read_json_line(&mut reader)?.context("reading request")?;
+    // A client that connects then closes without sending a request line (e.g. a
+    // liveness probe, or the Windows "already in use" preflight) yields EOF here;
+    // that's a normal disconnect, not an error worth logging.
+    let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
+        return Ok(());
+    };
     let mut writer = BufWriter::new(stream);
 
     if let WireRequest::Handover = request {
-        #[cfg(unix)]
-        {
-            return handle_handover_server(&manager, reader.into_inner());
-        }
-        #[cfg(not(unix))]
-        {
-            bail!("Handover request not supported on non-unix systems");
-        }
+        return handle_handover_server(&manager, reader.into_inner());
     }
 
     if let WireRequest::SubscribeSessionEvents {
@@ -438,6 +608,40 @@ fn handle_connection(
     write_json_line(&mut writer, &response).context("writing response")?;
     writer.flush().context("flushing response")?;
     Ok(())
+}
+
+// Windows named-pipe connection handler. The wire protocol is identical to Unix;
+// the only differences are that there is no FD-passing handover, and the request
+// is read then the same stream is reused for writing (the client sends exactly one
+// request line before reading, so no second read handle is needed).
+#[cfg(windows)]
+fn handle_connection(
+    manager: Arc<SessionManager>,
+    web_cache: Arc<crate::http::WebAssetCache>,
+    stream: transport::LocalStream,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    // A client that connects then closes without sending a request line (e.g. a
+    // liveness probe, or the Windows "already in use" preflight) yields EOF here;
+    // that's a normal disconnect, not an error worth logging.
+    let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
+        return Ok(());
+    };
+    let mut writer = BufWriter::new(reader.into_inner());
+
+    match request {
+        WireRequest::Handover => bail!("Handover request not supported on Windows"),
+        WireRequest::SubscribeSessionEvents {
+            session_id,
+            after_event_seq,
+        } => handle_subscription(&manager, session_id, after_event_seq, &mut writer),
+        other => {
+            let response = WireResponse::from_result(handle_request(&manager, &web_cache, other));
+            write_json_line(&mut writer, &response).context("writing response")?;
+            writer.flush().context("flushing response")?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -530,7 +734,7 @@ fn handle_subscription(
     manager: &SessionManager,
     session_id: SessionId,
     after_event_seq: Option<u64>,
-    writer: &mut BufWriter<UnixStream>,
+    writer: &mut impl Write,
 ) -> Result<()> {
     match manager.subscribe_session_events_from(SubscribeSessionEventsRequest {
         session_id,
@@ -875,16 +1079,29 @@ mod tests {
             .expect("spawn server");
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !socket_path.exists() {
+        while server_not_ready(&socket_path) {
             if let Ok(result) = rx.try_recv() {
                 result.expect("test server failed");
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for test socket"
+                "timed out waiting for test server endpoint"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    // Readiness probe for the test server. On Unix the listener is ready once the
+    // socket file appears; on Windows the endpoint is a named pipe (no filesystem
+    // entry), so probe by attempting to connect.
+    #[cfg(unix)]
+    fn server_not_ready(socket_path: &Path) -> bool {
+        !socket_path.exists()
+    }
+
+    #[cfg(windows)]
+    fn server_not_ready(socket_path: &Path) -> bool {
+        transport::connect(socket_path).is_err()
     }
 
     fn unique_socket_path(name: &str) -> PathBuf {

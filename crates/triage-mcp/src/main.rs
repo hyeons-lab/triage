@@ -1,4 +1,3 @@
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -7,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use triage_core::session::{SessionApi, SessionId, StyledRowsRequest};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use triaged::ipc::{UnixSocketClient, default_socket_path};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -24,16 +23,16 @@ fn main() -> Result<()> {
 }
 
 fn run_stdio(config: ServerConfig) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let client = UnixSocketClient::new(config.socket_path.unwrap_or_else(default_socket_path));
         run_stdio_with_client(client, io::stdin().lock(), io::stdout().lock())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = config;
-        bail!("triage-mcp requires the Unix socket API, which is only available on Unix platforms")
+        bail!("triage-mcp requires the local IPC transport, which is unavailable on this platform")
     }
 }
 
@@ -76,10 +75,11 @@ impl ServerConfig {
 usage: triage-mcp [--socket <path>]
 
 Options:
-  --socket <path>  Connect to a Triage daemon Unix socket at <path>
+  --socket <path>  Connect to a Triage daemon control socket at <path>
+                   (Unix domain socket on Unix, named pipe on Windows)
   -h, --help       Print this help text
 
-By default triage-mcp connects to the same Unix socket path as triaged.";
+By default triage-mcp connects to the same control socket as triaged.";
 
     fn from_args(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut socket_path = None;
