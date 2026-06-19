@@ -70,32 +70,51 @@ mod transport {
 
     /// Build the `interprocess` namespaced name for a Windows named pipe from the
     /// configured socket path (which on Windows carries the bare pipe name).
+    /// The single legal named-pipe token for `path`. A pipe lives at
+    /// `\\.\pipe\<token>`, where `<token>` must not contain a path separator. The
+    /// default socket path is already a clean `triage-<user>`, but a
+    /// caller-supplied or test path may be filesystem-like (`…\triage.sock`);
+    /// collapse separators into a legal token that is still unique per distinct
+    /// path (so parallel tests with different temp dirs don't collide). Shared by
+    /// the connect/listen name builder and by user-facing endpoint display.
     #[cfg(windows)]
-    pub fn windows_pipe_name(
-        path: &Path,
-    ) -> std::io::Result<interprocess::local_socket::Name<'static>> {
-        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+    pub fn windows_pipe_token(path: &Path) -> std::io::Result<String> {
         let raw = path.to_str().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "named pipe name is not valid UTF-8",
             )
         })?;
-        // A named pipe lives at `\\.\pipe\<name>`, where `<name>` is a single
-        // token and must not contain a path separator. The default socket path is
-        // already a clean `triage-<user>`, but a caller-supplied or test path may
-        // be filesystem-like (`…\triage.sock`); collapse separators into a legal
-        // token that is still unique per distinct path (so parallel tests with
-        // different temp dirs don't collide).
-        let token: String = raw
+        Ok(raw
             .chars()
             .map(|c| match c {
                 '\\' | '/' | ':' => '_',
                 other => other,
             })
-            .collect();
-        token.to_ns_name::<GenericNamespaced>()
+            .collect())
     }
+
+    #[cfg(windows)]
+    pub fn windows_pipe_name(
+        path: &Path,
+    ) -> std::io::Result<interprocess::local_socket::Name<'static>> {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        windows_pipe_token(path)?.to_ns_name::<GenericNamespaced>()
+    }
+}
+
+/// Human-facing description of the daemon's control endpoint, for log and error
+/// messages. On Unix this is the socket file path; on Windows it is the full
+/// named-pipe path (`\\.\pipe\<token>`), since the stored path holds only the
+/// bare pipe token (a bare token reads like a typo in an error message).
+pub fn display_endpoint(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(token) = transport::windows_pipe_token(path) {
+            return format!(r"\\.\pipe\{token}");
+        }
+    }
+    path.display().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +248,7 @@ impl UnixSocketClient {
 
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
         let mut stream = transport::connect(&self.socket_path)
-            .with_context(|| format!("connecting to {}", self.socket_path.display()))?;
+            .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
         write_json_line(&mut stream, &request).context("writing IPC request")?;
         transport::finish_write(&stream).context("finishing IPC request")?;
 
@@ -292,7 +311,7 @@ impl SessionApi for UnixSocketClient {
         request: SubscribeSessionEventsRequest,
     ) -> Result<SessionEventReceiver> {
         let mut stream = transport::connect(&self.socket_path)
-            .with_context(|| format!("connecting to {}", self.socket_path.display()))?;
+            .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
         write_json_line(
             &mut stream,
             &WireRequest::SubscribeSessionEvents {

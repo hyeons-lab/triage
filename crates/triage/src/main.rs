@@ -50,21 +50,8 @@ fn main() -> Result<()> {
     {
         #[cfg(any(unix, windows))]
         {
-            let path = _socket_path
-                .clone()
-                .unwrap_or_else(triaged::ipc::default_socket_path);
-            if !daemon_endpoint_present(&path) {
-                bail!(
-                    "Daemon socket not found at {}. Is the Triage daemon running?",
-                    path.display()
-                );
-            }
-            let client = triaged::ipc::UnixSocketClient::new(path);
             println!("Sending ReloadClientAssets command to triaged daemon...");
-            client
-                .reload_client_assets()
-                .context("failed to reload web assets cache")?;
-            println!("Successfully reloaded web assets cache.");
+            notify_daemon_reload(_socket_path.clone(), true)?;
             return Ok(());
         }
         #[cfg(not(any(unix, windows)))]
@@ -99,20 +86,8 @@ fn main() -> Result<()> {
 
         #[cfg(any(unix, windows))]
         {
-            let path = _socket_path
-                .clone()
-                .unwrap_or_else(triaged::ipc::default_socket_path);
-            if daemon_endpoint_present(&path) {
-                let client = triaged::ipc::UnixSocketClient::new(path);
-                println!("Notifying triaged daemon to reload web cache...");
-                if let Err(e) = client.reload_client_assets() {
-                    tracing::warn!(
-                        "Failed to notify daemon: {e}. The daemon will use new assets upon next restart."
-                    );
-                } else {
-                    println!("Successfully notified daemon. New assets are live.");
-                }
-            }
+            println!("Notifying triaged daemon to reload web cache...");
+            notify_daemon_reload(_socket_path.clone(), false)?;
         }
         return Ok(());
     }
@@ -196,8 +171,8 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
         StartupMode::Daemon { socket_path } => LocalSessionApp::connect(&socket_path, size)
             .with_context(|| {
                 format!(
-                    "connecting to Triage daemon socket at {}; start triaged or pass --embedded for development mode",
-                    socket_path.display()
+                    "connecting to the Triage daemon at {}; start triaged or pass --embedded for development mode",
+                    triaged::ipc::display_endpoint(&socket_path)
                 )
             }),
         StartupMode::Embedded => {
@@ -229,19 +204,35 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
     }
 }
 
-/// Whether the daemon's control endpoint appears reachable, used to give a
-/// friendly "is the daemon running?" message before connecting. On Unix the
-/// endpoint is a filesystem socket we can stat; on Windows it is a named-pipe
-/// token (never a filesystem entry), so we optimistically return `true` and let
-/// the connect attempt surface a real failure.
-#[cfg(unix)]
-fn daemon_endpoint_present(path: &Path) -> bool {
-    path.exists()
-}
-
-#[cfg(windows)]
-fn daemon_endpoint_present(_path: &Path) -> bool {
-    true
+/// Tell a running daemon to reload its in-memory web-asset cache.
+///
+/// `required` controls failure handling and matches the two call sites: `client
+/// reload` is an explicit request, so a failure is a hard error with an "is the
+/// daemon running?" hint; `client upgrade` notifies best-effort after copying
+/// assets, so a failure is a benign note (the daemon picks up the new assets when
+/// it next starts). This attempts the connect on both platforms rather than
+/// pre-checking the path, because on Windows the endpoint is a named pipe with no
+/// filesystem entry to stat — the connect itself is the only honest liveness test.
+#[cfg(any(unix, windows))]
+fn notify_daemon_reload(socket_path: Option<PathBuf>, required: bool) -> Result<()> {
+    let path = socket_path.unwrap_or_else(triaged::ipc::default_socket_path);
+    let endpoint = triaged::ipc::display_endpoint(&path);
+    let client = triaged::ipc::UnixSocketClient::new(path);
+    match client.reload_client_assets() {
+        Ok(()) => {
+            println!("Successfully reloaded the daemon web-asset cache at {endpoint}.");
+            Ok(())
+        }
+        Err(error) if required => Err(error.context(format!(
+            "failed to reach the Triage daemon at {endpoint}. Is the daemon running?"
+        ))),
+        Err(error) => {
+            println!(
+                "Daemon at {endpoint} not reachable ({error}); new assets will load when it next starts."
+            );
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -135,29 +135,54 @@ See `devlog/plans/000076-01-windows-daemon.md`.
 - `cargo clippy -p triaged --all-targets -- -D warnings` (host) — clean.
 - Runtime on real Windows: deferred to `windows-latest` CI.
 
+## Code review fixes (second `/code-review max` pass)
+
+- 2026-06-18T20:58-0700 A second review of the client-side commit found no
+  correctness bugs but several Windows UX/parity gaps. Fixed:
+  - `crates/triaged/src/ipc.rs` — added `display_endpoint(&Path)` (Unix: the
+    socket path; Windows: the full `\\.\pipe\<token>`) and use it in the client
+    connect error context, so messages no longer show a bare pipe token that
+    reads like a typo. Factored the pipe-token sanitizer into
+    `transport::windows_pipe_token` (shared by the name builder and display).
+  - `crates/triage/src/main.rs` — replaced the Windows-always-`true`
+    `daemon_endpoint_present` pre-check with a `notify_daemon_reload(socket_path,
+    required)` helper that attempts the connect and reports failure uniformly on
+    both platforms: a hard "is the daemon running?" error for `client reload`, a
+    benign "will load on next start" note for `client upgrade` (no more scary
+    Windows-only warning on an offline upgrade). This dedups the two
+    near-identical notify blocks and restores the friendly hint on Windows. The
+    TUI `start_app` daemon error also uses `display_endpoint`.
+
 ## Next Steps
 
-A `/code-review max` pass (10 finder angles + a code-grounded `interprocess`
-verifier + gap sweep) confirmed the client-side gap (now fixed) and surfaced
-daemon-side robustness follow-ups, deliberately deferred out of this PR:
+Remaining follow-ups, deliberately out of this PR (most daemon-side):
 
-- **Bounded connect.** `interprocess` `Stream::connect` waits unbounded with no
-  timeout; the listener exposes one un-accepted pipe instance at a time, so
-  concurrent IPC clients racing between `accept()` calls can block on
-  `ERROR_PIPE_BUSY`. Consider the Windows `ConnectWaitMode::Timeout` path.
+- **Bounded connect (the one substantive item).** `interprocess`'s cross-platform
+  `local_socket` API has *no* connect-timeout knob — verified in source:
+  `from_options` ignores the wait mode and hardcodes `ConnectWaitMode::Unbounded`.
+  So under `ERROR_PIPE_BUSY` (all instances busy) a client connect can block
+  indefinitely. A correct fix needs the Windows-specific
+  `named_pipe::…::connect_by_path_with_wait_mode(ConnectWaitMode::Timeout(..))`,
+  which changes the transport's stream type and must be validated on a real
+  Windows runtime — not a safe blind change to the just-green transport.
+  Low-probability in practice (the accept loop re-arms in microseconds; the
+  missing-daemon case fails fast), so deferred to a dedicated, Windows-tested PR.
 - **Redundant startup probe.** The Windows `serve()` self-connect "already in
   use" check is redundant — `create_sync()` sets `FILE_FLAG_FIRST_PIPE_INSTANCE`,
-  so a second daemon's create fails atomically. Removing the probe also removes a
+  so a second daemon's create fails atomically. Removing it also removes a
   potential indefinite block and the phantom-connection warning.
-- **Pipe-name length cap.** `windows_pipe_name` has no 256-char guard; a deep
+- **Pipe-name length cap.** `windows_pipe_token` has no 256-char guard; a deep
   override/test path could exceed the NPFS limit. Hash or truncate long names.
 - **Test readiness flakiness.** The Windows test readiness probe leaves a
   dead-on-arrival connection that races the real client (latent; CI green so far).
-- **Hardening / cleanup.** Explicit owner-only pipe SD (the default DACL already
-  restricts to creator+SYSTEM+Admins, comparable to `0o600`, so this is
-  defense-in-depth not a regression); de-dup the per-platform `serve`/
-  `handle_connection`; rename the `UnixSocket*` types now that they're
-  cross-platform.
+- **`%LOCALAPPDATA%` for web assets.** `triaged::http::default_override_dir` puts
+  upgraded web assets under a Unix-style `.local/share` on Windows (pre-existing,
+  not in this PR's diff; client and daemon agree so it works). Switch to a
+  Windows-idiomatic dir as a separate Windows-paths cleanup.
+- **Cleanup.** De-dup the per-platform `serve`/`handle_connection`; rename the
+  `UnixSocket*` types now that they're cross-platform. (The `cfg(any(unix,
+  windows))` repetition was judged idiomatic — not worth `cfg_aliases` build.rs
+  machinery in two crates.)
 
 REFUTED by the verifier (not issues): handover-restart TOCTOU split-brain
 (`FILE_FLAG_FIRST_PIPE_INSTANCE` prevents it); "any local user can RCE" (default
@@ -166,4 +191,5 @@ DACL is owner+SYSTEM+Admins only).
 ## Commits
 
 - e7ca86d — feat(triaged): run the daemon on Windows via named-pipe IPC
-- HEAD — feat(triage,triage-mcp): connect to the Windows daemon over the named pipe
+- 52a2ec3 — feat(triage,triage-mcp): connect to the Windows daemon over the named pipe
+- HEAD — fix(triage): friendlier Windows IPC errors, unified daemon-reload notify
