@@ -30,6 +30,25 @@ Implementation order:
 
 Early development. Not yet usable.
 
+## Running
+
+The daemon (`triaged`) owns session state; clients (the `triage` TUI, the MCP
+server, the Flutter client) attach to it. Start the daemon in the foreground
+with `triaged`, or register it to start automatically at login:
+
+```bash
+triaged service install     # start now + run at every login
+triaged service status
+triaged service uninstall
+```
+
+`triaged` runs on **macOS, Linux, and Windows** — the local control plane uses a
+Unix domain socket on macOS/Linux and a named pipe on Windows, and the service
+command installs the matching per-user mechanism (LaunchAgent, systemd `--user`
+unit, or a logon Scheduled Task). Zero-downtime upgrade handover is Unix-only;
+Windows falls back to Session Restore. See
+[`crates/triaged/README.md`](crates/triaged/README.md) for details.
+
 ## Testing
 
 The workspace includes `triage-test-support`, a non-published crate for reusable acceptance-test helpers. It provides renderer snapshot normalization and VT byte-stream fixtures so terminal engine, daemon session, and TUI behavior can be tested with deterministic golden outputs.

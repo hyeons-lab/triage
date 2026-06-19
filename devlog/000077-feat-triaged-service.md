@@ -93,6 +93,17 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   platform handler keeps only its genuinely-divergent part (Unix stream-clone +
   SCM_RIGHTS handover; Windows single-stream + handover bail).
 
+### Documentation
+
+- 2026-06-18T22:04-07:00 READMEs — user-facing docs for the service + Windows
+  support across crates and GitHub. Root `README.md`: new "Running" section
+  (foreground vs `triaged service install`, cross-platform transport note,
+  handover caveat). `crates/triaged/README.md`: "Running as a background service"
+  command/mechanism tables (added earlier with the feature). `crates/triage/
+  README.md`: daemon-start prerequisite with the service option. `crates/
+  triage-mcp/README.md`: "Prerequisite: a running daemon" note. Each links to the
+  `triaged` crate docs for detail.
+
 ## Issues
 
 - 2026-06-18T21:45-07:00 Dead-code under `-D warnings` differs per target: the
@@ -115,4 +126,5 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
 - 83461d6 — refactor(triaged): drop redundant pipe probe, cap pipe-name length
 - ddf3e5d — fix(triaged): bound the Windows named-pipe client connect with a timeout
 - f309af3 — fix(triaged): store upgraded web assets under %LOCALAPPDATA% on Windows
-- HEAD — refactor(triaged): rename UnixSocket* to Ipc*, de-dup serve/handle_connection
+- 2187e0a — refactor(triaged): rename UnixSocket* to Ipc*, de-dup serve/handle_connection
+- HEAD — docs: document the triaged background service and cross-platform support
