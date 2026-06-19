@@ -107,6 +107,15 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   paragraph to the intro (macOS/Linux/Windows, the per-platform control-plane
   transport, login-service registration, ConPTY vs PTY) so the description states
   the cross-platform story up front instead of only in the Windows section.
+- 2026-06-18T22:55-07:00 `flutter/triage_client/README.md` — fleshed out the
+  Flutter client README, which had a description but no instructions. Added:
+  supported platforms (Web/iOS/Android/macOS/Windows/Linux); "Getting the client"
+  (prebuilt release builds linking the `triaged` unsigned-binary steps, plus
+  build-from-source with Flutter 3.44 stable — `flutter pub get` / `run` /
+  `build`); "Connecting to a daemon" (address formats, `ws://127.0.0.1:7777/ws`
+  default, device-code + PIN pairing linking the `triaged` Pairing section, the
+  no-TLS/reverse-proxy caveat); and a Development (`analyze`/`test`) note.
+  Corrected "secure WebSocket" → plain WS (the daemon terminates no TLS itself).
 
 ### PR review comments (Copilot, #88)
 
