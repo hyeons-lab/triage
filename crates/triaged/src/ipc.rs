@@ -1198,6 +1198,26 @@ mod tests {
         assert!(astral_token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
     }
 
+    // The bounded Windows connect (`ConnectWaitMode::Timeout`) must fail *fast*
+    // when no daemon is listening — the pipe doesn't exist, so the connect should
+    // error immediately rather than wait out the multi-second busy-pipe timeout.
+    #[cfg(windows)]
+    #[test]
+    fn windows_connect_to_missing_daemon_fails_fast() {
+        let missing = unique_socket_path("no-daemon");
+        let started = Instant::now();
+        let result = transport::connect(&missing);
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_err(),
+            "connecting to a nonexistent pipe must error"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "missing-daemon connect should fail fast, took {elapsed:?}"
+        );
+    }
+
     #[cfg(windows)]
     fn long_running_shell_command() -> &'static str {
         "cmd.exe"

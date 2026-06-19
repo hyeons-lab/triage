@@ -92,6 +92,35 @@ fn default_log_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Logs/triage"))
 }
 
+/// Path of the file the Windows daemon writes its PID to, so `service stop` can
+/// target exactly this process instead of every `triaged.exe` the user owns.
+/// `launchctl` / `systemctl --user` already track the process on Unix, so this
+/// is Windows-only.
+#[cfg(target_os = "windows")]
+fn pid_file_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+        })?;
+    Some(base.join("triage").join("triaged.pid"))
+}
+
+/// Record the running daemon's PID for `service stop`. Best-effort: a failure
+/// here just means `stop` falls back to killing by image name. Called once at
+/// daemon startup. Handover is Unix-only, so on Windows there is exactly one
+/// daemon process and the file never goes stale mid-run.
+#[cfg(windows)]
+pub fn record_running_pid() {
+    if let Some(path) = pid_file_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, std::process::id().to_string());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure template builders (unit-tested on every platform)
 // ---------------------------------------------------------------------------
@@ -393,6 +422,9 @@ mod platform {
 
     pub(super) fn uninstall(_ctx: &ServiceContext) -> Result<()> {
         let _ = stop(_ctx);
+        if let Some(path) = pid_file_path() {
+            let _ = std::fs::remove_file(path);
+        }
         let status = schtasks(&[
             "/Delete".to_string(),
             "/TN".to_string(),
@@ -421,13 +453,35 @@ mod platform {
     }
 
     pub(super) fn stop(_ctx: &ServiceContext) -> Result<()> {
-        // Best-effort: kill any running daemon process. The task itself only
-        // runs at logon, so there is no long-lived task instance to end.
-        let _ = Command::new("taskkill")
-            .args(["/IM", "triaged.exe", "/F"])
-            .status();
+        // The logon task launches the daemon detached, so there's no task
+        // instance to end — kill the process directly. Prefer the PID the daemon
+        // recorded at startup so we stop exactly the service-managed daemon and
+        // not a triaged the user started by hand; fall back to image name.
+        match recorded_pid() {
+            Some(pid) => {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .status();
+            }
+            None => {
+                let _ = Command::new("taskkill")
+                    .args(["/IM", "triaged.exe", "/F"])
+                    .status();
+            }
+        }
         println!("Stopped triaged.");
         Ok(())
+    }
+
+    /// The PID the running daemon recorded at startup, if the file is present
+    /// and parseable.
+    fn recorded_pid() -> Option<u32> {
+        let path = pid_file_path()?;
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
     }
 
     pub(super) fn status(_ctx: &ServiceContext) -> Result<()> {
