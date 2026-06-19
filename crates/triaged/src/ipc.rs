@@ -93,14 +93,31 @@ mod transport {
             .strip_prefix(r"\\.\pipe\")
             .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
             .unwrap_or(raw);
-        Ok(bare
+        let collapsed: String = bare
             .chars()
             .map(|c| match c {
                 '\\' | '/' | ':' => '_',
                 other => other,
             })
-            .collect())
+            .collect();
+
+        // The full pipe path `\\.\pipe\<token>` is capped at 256 chars by NPFS.
+        // A deep override/test path could exceed that; collapse an over-long
+        // token to a readable prefix plus a stable hash so it stays legal and
+        // still unique per distinct path.
+        if collapsed.chars().count() <= MAX_PIPE_TOKEN_LEN {
+            return Ok(collapsed);
+        }
+        use sha2::{Digest, Sha256};
+        let hash = hex::encode(&Sha256::digest(collapsed.as_bytes())[..8]);
+        let prefix: String = collapsed.chars().take(MAX_PIPE_TOKEN_LEN - 17).collect();
+        Ok(format!("{prefix}_{hash}"))
     }
+
+    /// Maximum length (in characters) for a named-pipe token. NPFS caps the full
+    /// `\\.\pipe\<token>` path at 256; this leaves margin for the 9-char prefix.
+    #[cfg(windows)]
+    pub const MAX_PIPE_TOKEN_LEN: usize = 210;
 
     #[cfg(windows)]
     pub fn windows_pipe_name(
@@ -189,24 +206,19 @@ impl UnixSocketServer {
     #[cfg(windows)]
     pub fn serve(self) -> Result<()> {
         use interprocess::local_socket::ListenerOptions;
-        use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+        use interprocess::local_socket::traits::ListenerExt as _;
 
         let pipe_name = display_endpoint(&self.config.socket_path);
 
-        // Refuse to start a second daemon on the same pipe. Named pipes leave no
-        // stale filesystem entry, so if a connect succeeds another server is live.
-        if interprocess::local_socket::Stream::connect(transport::windows_pipe_name(
-            &self.config.socket_path,
-        )?)
-        .is_ok()
-        {
-            bail!("named pipe {pipe_name} is already in use");
-        }
-
+        // `create_sync` sets FILE_FLAG_FIRST_PIPE_INSTANCE, so a second daemon's
+        // create fails atomically — no need for a self-connect preflight (which
+        // could itself block and left a phantom connection in the accept loop).
         let listener = ListenerOptions::new()
             .name(transport::windows_pipe_name(&self.config.socket_path)?)
             .create_sync()
-            .with_context(|| format!("creating named pipe {pipe_name}"))?;
+            .with_context(|| {
+                format!("creating named pipe {pipe_name} (is another triaged already running?)")
+            })?;
 
         for incoming in listener.incoming() {
             match incoming {
@@ -1114,6 +1126,21 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_token_caps_overlong_names() {
+        let long = format!(r"\\.\pipe\{}", "a".repeat(400));
+        let token = transport::windows_pipe_token(Path::new(&long)).expect("token");
+        assert!(token.chars().count() <= transport::MAX_PIPE_TOKEN_LEN);
+        // Stable across calls...
+        let again = transport::windows_pipe_token(Path::new(&long)).expect("token");
+        assert_eq!(token, again);
+        // ...and distinct inputs yield distinct tokens.
+        let other = format!(r"\\.\pipe\{}", "b".repeat(400));
+        let other_token = transport::windows_pipe_token(Path::new(&other)).expect("token");
+        assert_ne!(token, other_token);
     }
 
     #[cfg(windows)]

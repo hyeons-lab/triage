@@ -51,6 +51,18 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   service" section: command table, per-platform mechanism/location table, and a
   `loginctl enable-linger` note for surviving logout on Linux.
 
+### Windows daemon follow-ups (from #87)
+
+- 2026-06-18T21:55-07:00 `crates/triaged/src/ipc.rs` — **Safe cleanups.**
+  Removed the Windows `serve()` self-connect "already in use" preflight;
+  `create_sync()` sets `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a second daemon's
+  create fails atomically (the probe could itself block and left a phantom
+  connection in the accept loop). The create error context now hints "is another
+  triaged already running?". Added a 210-char length cap to `windows_pipe_token`:
+  an over-long token collapses to a readable prefix + sha256 hash so it stays
+  under the 256-char NPFS limit and unique per path. Windows-only test
+  `windows_pipe_token_caps_overlong_names` covers it.
+
 ## Issues
 
 - 2026-06-18T21:45-07:00 Dead-code under `-D warnings` differs per target: the
@@ -69,4 +81,5 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
 
 ## Commits
 
-- HEAD — feat(triaged): manage triaged as a per-user login service
+- aaa7551 — feat(triaged): manage triaged as a per-user login service
+- HEAD — refactor(triaged): drop redundant pipe probe, cap pipe-name length
