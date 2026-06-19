@@ -59,6 +59,13 @@ but ships no prebuilt Rust binaries.
   tags; left as-is — out of this change's scope.)
 - 2026-06-19T08:35-0700 devlog — switched timestamp UTC offsets to the AGENTS.md
   `±HHMM` (no-colon) convention.
+- 2026-06-19T06:31-0700 Round 2. `crates/triaged/README.md` — Copilot: the
+  prebuilt-binary note didn't mention architecture; `macos-latest` is Apple
+  Silicon (arm64), so an Intel-Mac user would hit "exec format error". Added an
+  Architecture note (macOS = arm64, Linux/Windows = x86-64; use `cargo install`
+  elsewhere). `.github/workflows/publish.yml` — Copilot: the release job's
+  blanket artifact download also pulled the `web-assets` bundle; added
+  `pattern: cl*` so it fetches only `client-*` / `cli-*`.
 
 ## Next Steps
 
@@ -70,4 +77,5 @@ but ships no prebuilt Rust binaries.
 ## Commits
 
 - 740c142 — ci(release): attach prebuilt triaged/triage/triage-mcp binaries to releases
-- HEAD — ci(release): SHA-pin build-cli actions to match ci.yml
+- f788341 — ci(release): SHA-pin build-cli actions to match ci.yml
+- HEAD — ci(release): note binary arch in README, scope release download to cl*

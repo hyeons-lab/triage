@@ -23,6 +23,11 @@ Windows) containing the `triaged`, `triage`, and `triage-mcp` binaries — unpac
 it and put them on your `PATH`. The bundled `triaged` already embeds the web
 client.
 
+> **Architecture.** Each archive is built on its GitHub-hosted runner: the macOS
+> binaries are **Apple Silicon (arm64)** (`macos-latest`), Linux and Windows are
+> **x86-64**. On a different architecture (e.g. an Intel Mac), install via
+> `cargo install` instead.
+
 ## Running the Daemon
 
 Start the persistent supervisor process:

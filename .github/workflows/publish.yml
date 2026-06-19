@@ -413,10 +413,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download client artifacts
+      - name: Download client + CLI artifacts
         # actions/download-artifact@v8
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
+          # Only the release archives: client-* and cli-* (both start "cl").
+          # Skips the web-assets bundle the build-cli jobs already consumed.
+          pattern: cl*
           path: release-assets
 
       - name: Create tag and GitHub release with all clients
