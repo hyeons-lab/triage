@@ -16,6 +16,13 @@ sessions run on ConPTY on Windows and on a standard PTY elsewhere.
 cargo install triaged
 ```
 
+Or grab a prebuilt binary instead of compiling: every
+[GitHub release](https://github.com/hyeons-lab/triage/releases) attaches a
+`Triage-cli-<os>-v<version>` archive (`.tar.gz` for macOS/Linux, `.zip` for
+Windows) containing the `triaged`, `triage`, and `triage-mcp` binaries — unpack
+it and put them on your `PATH`. The bundled `triaged` already embeds the web
+client.
+
 ## Running the Daemon
 
 Start the persistent supervisor process:
