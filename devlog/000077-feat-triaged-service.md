@@ -104,6 +104,17 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   triage-mcp/README.md`: "Prerequisite: a running daemon" note. Each links to the
   `triaged` crate docs for detail.
 
+### PR review comments (Copilot, #88)
+
+- 2026-06-18T22:35-07:00 `crates/triaged/src/ipc.rs` — Copilot flagged that the
+  pipe-name cap measured `chars().count()`, but NPFS's 256-limit is in **UTF-16
+  code units**; a non-BMP char is one `char` but two units, so a capped token
+  could still overflow. Fixed: `MAX_PIPE_TOKEN_LEN` is now a UTF-16-unit budget,
+  measured with `encode_utf16().count()`, and the over-long prefix is built by
+  `truncate_utf16_units` (accumulates `char::len_utf16`, stops on a char boundary
+  so a surrogate pair is never split). Extended the test with a `🦀`-repeat
+  (astral) input that would overflow under the old char-based cap.
+
 ## Issues
 
 - 2026-06-18T21:45-07:00 Dead-code under `-D warnings` differs per target: the
@@ -138,4 +149,5 @@ polish, deliberately out of scope here:
 - f309af3 — fix(triaged): store upgraded web assets under %LOCALAPPDATA% on Windows
 - 2187e0a — refactor(triaged): rename UnixSocket* to Ipc*, de-dup serve/handle_connection
 - 30323cc — docs: document the triaged background service and cross-platform support
-- HEAD — style(triaged): rustfmt service test assertion
+- ae43f10 — style(triaged): rustfmt service test assertion
+- HEAD — fix(triaged): measure the pipe-name cap in UTF-16 code units

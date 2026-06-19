@@ -127,23 +127,43 @@ mod transport {
             })
             .collect();
 
-        // The full pipe path `\\.\pipe\<token>` is capped at 256 chars by NPFS.
-        // A deep override/test path could exceed that; collapse an over-long
-        // token to a readable prefix plus a stable hash so it stays legal and
-        // still unique per distinct path.
-        if collapsed.chars().count() <= MAX_PIPE_TOKEN_LEN {
+        // The full pipe path `\\.\pipe\<token>` is capped by NPFS at 256 UTF-16
+        // code units (the Win32 string unit), not chars — a non-BMP char is one
+        // `char` but two units. A deep override/test path could exceed that;
+        // collapse an over-long token to a readable prefix plus a stable hash so
+        // it stays legal and still unique per distinct path.
+        if collapsed.encode_utf16().count() <= MAX_PIPE_TOKEN_LEN {
             return Ok(collapsed);
         }
         use sha2::{Digest, Sha256};
+        // 16 hex chars (ASCII → 16 units) + one `_` separator = 17 units.
         let hash = hex::encode(&Sha256::digest(collapsed.as_bytes())[..8]);
-        let prefix: String = collapsed.chars().take(MAX_PIPE_TOKEN_LEN - 17).collect();
+        let prefix = truncate_utf16_units(&collapsed, MAX_PIPE_TOKEN_LEN - 17);
         Ok(format!("{prefix}_{hash}"))
     }
 
-    /// Maximum length (in characters) for a named-pipe token. NPFS caps the full
-    /// `\\.\pipe\<token>` path at 256; this leaves margin for the 9-char prefix.
+    /// Maximum length, in UTF-16 code units, for a named-pipe token. NPFS caps
+    /// the full `\\.\pipe\<token>` path at 256 units; this leaves margin for the
+    /// 9-unit `\\.\pipe\` prefix.
     #[cfg(windows)]
     pub const MAX_PIPE_TOKEN_LEN: usize = 210;
+
+    /// Truncate `s` to at most `max_units` UTF-16 code units, stopping on a
+    /// `char` boundary so a surrogate pair is never split.
+    #[cfg(windows)]
+    fn truncate_utf16_units(s: &str, max_units: usize) -> String {
+        let mut out = String::new();
+        let mut units = 0usize;
+        for c in s.chars() {
+            let w = c.len_utf16();
+            if units + w > max_units {
+                break;
+            }
+            out.push(c);
+            units += w;
+        }
+        out
+    }
 
     #[cfg(windows)]
     pub fn windows_pipe_name(
@@ -1162,7 +1182,7 @@ mod tests {
     fn windows_pipe_token_caps_overlong_names() {
         let long = format!(r"\\.\pipe\{}", "a".repeat(400));
         let token = transport::windows_pipe_token(Path::new(&long)).expect("token");
-        assert!(token.chars().count() <= transport::MAX_PIPE_TOKEN_LEN);
+        assert!(token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
         // Stable across calls...
         let again = transport::windows_pipe_token(Path::new(&long)).expect("token");
         assert_eq!(token, again);
@@ -1170,6 +1190,12 @@ mod tests {
         let other = format!(r"\\.\pipe\{}", "b".repeat(400));
         let other_token = transport::windows_pipe_token(Path::new(&other)).expect("token");
         assert_ne!(token, other_token);
+
+        // Non-BMP chars are one `char` but two UTF-16 units, so a char-based cap
+        // would undercount and overflow. The bound must hold in UTF-16 units.
+        let astral = format!(r"\\.\pipe\{}", "🦀".repeat(400));
+        let astral_token = transport::windows_pipe_token(Path::new(&astral)).expect("token");
+        assert!(astral_token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
     }
 
     #[cfg(windows)]
