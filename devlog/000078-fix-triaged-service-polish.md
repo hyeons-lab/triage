@@ -68,6 +68,11 @@ follow-ups):
   now also removes the PID file unconditionally so a stale PID is never re-read.
 - 2026-06-19T08:30-0700 devlog — switched timestamp UTC offsets to the AGENTS.md
   `±HHMM` (no-colon) convention.
+- 2026-06-19T06:31-0700 `crates/triaged/src/service.rs` — Copilot (round 2): the
+  `/IM triaged.exe` fallback would also kill the running `triaged service stop` /
+  `uninstall` CLI (itself a triaged.exe), so `uninstall` could self-terminate
+  before reaching `schtasks /Delete`. Fixed: the fallback now excludes our own
+  PID — `taskkill /FI "IMAGENAME eq triaged.exe" /FI "PID ne <self>" /F`.
 
 ## Next Steps
 
@@ -76,4 +81,5 @@ follow-ups):
 ## Commits
 
 - 59e9039 — fix(triaged): target the recorded PID on Windows service stop; add tests
-- HEAD — fix(triaged): verify taskkill success and clear the PID file on stop
+- b2ff70c — fix(triaged): verify taskkill success and clear the PID file on stop
+- HEAD — fix(triaged): exclude the CLI's own PID from the taskkill fallback

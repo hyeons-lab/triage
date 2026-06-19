@@ -462,8 +462,18 @@ mod platform {
         // killing by image name.
         let killed_by_pid = recorded_pid().is_some_and(taskkill_pid);
         if !killed_by_pid {
+            // Fall back to killing by image name — but exclude our own PID: this
+            // CLI (`triaged service stop` / `uninstall`) is itself a triaged.exe,
+            // so a blanket `/IM` would terminate the command mid-run (e.g.
+            // `uninstall` would never reach `schtasks /Delete`).
             let _ = Command::new("taskkill")
-                .args(["/IM", "triaged.exe", "/F"])
+                .args([
+                    "/FI",
+                    "IMAGENAME eq triaged.exe",
+                    "/FI",
+                    &format!("PID ne {}", std::process::id()),
+                    "/F",
+                ])
                 .status();
         }
         // Always drop the PID file so a stale PID is never read again.
