@@ -76,6 +76,12 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   the single pipe instance now bounds the real client's wait at 5s (re-arm is
   microseconds) instead of risking an unbounded block. Confirmed the API against
   interprocess 2.4.2 source; validated only by the `windows-latest` CI runner.
+- 2026-06-18T22:12-07:00 `crates/triaged/src/http.rs` — **`%LOCALAPPDATA%` web
+  assets.** `default_override_dir` now returns `%LOCALAPPDATA%\triage\web` on
+  Windows (falling back to `%USERPROFILE%\AppData\Local`), instead of the
+  Unix-style `~/.local/share`. The Unix branch is unchanged byte-for-byte to
+  avoid shifting the path for existing installs. Both the daemon (reads) and the
+  client upgrade flow (writes) call this one function, so they stay in agreement.
 
 ## Issues
 
@@ -97,4 +103,5 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
 
 - aaa7551 — feat(triaged): manage triaged as a per-user login service
 - 83461d6 — refactor(triaged): drop redundant pipe probe, cap pipe-name length
-- HEAD — fix(triaged): bound the Windows named-pipe client connect with a timeout
+- ddf3e5d — fix(triaged): bound the Windows named-pipe client connect with a timeout
+- HEAD — fix(triaged): store upgraded web assets under %LOCALAPPDATA% on Windows
