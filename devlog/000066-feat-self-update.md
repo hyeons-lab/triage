@@ -40,6 +40,58 @@ latest GitHub release tag, and let the user update in place:
   secrets) and is a prerequisite for download-install. Flutter in-app install
   demoted to a later sub-phase gated on notarization; browser-download is the
   default. Revisions captured in the plan's "Revisions" section.
+- 2026-06-19T07:04-0700 PR 2 (Phases 1–2) implementation choices. Version check
+  via `git ls-remote --tags --refs` (per F5 — no outbound TLS client added);
+  `--refs` drops the peeled `^{}` lines but parsing tolerates them anyway.
+  Semver parsing is a hand-rolled strict `X.Y.Z` parse rather than a new `semver`
+  dependency — release tags are trivial, and a non-`X.Y.Z` tag (prerelease,
+  `nightly`) naturally fails the parse, which *is* the stable-channel policy.
+  The poller is a plain `std::thread` + `thread::sleep` (no async runtime in the
+  daemon's main thread; `git ls-remote` is a blocking subprocess anyway). Update
+  status is surfaced two ways: it rides every `HelloResult` (new
+  `server_version` / `update_available` / `latest_version` fields, appended for
+  FB compatibility) and is pushed once on the transition via a new
+  connection-level `UpdateAvailablePayload` (per F4 — a `ServerMessagePayload`
+  variant, not a `SessionEventPayload`), reusing the existing
+  `broadcast_global` / `global_senders` fan-out the snippet/context pushes use.
+  A missed push is self-healing because the same data is on the next handshake.
+  Surfaced to the transport layer through a defaulted `SessionApi::server_update_info`
+  so non-daemon implementors (mocks, MCP recorder) are unaffected; the `Arc<T>`
+  blanket impl forwards it so the daemon's real status reaches `Hello`.
+
+## What Changed
+
+- 2026-06-19T07:04-0700 `crates/triage-core/src/config.rs` — new `[update]`
+  config section (`UpdateConfig`: `check` = true, `interval_hours` = 6,
+  `channel` = "stable") with `Default` + `validate`, wired into `Config`.
+- 2026-06-19T07:04-0700 `crates/triaged/src/update.rs` (new) — Phase 1 update
+  check: `UpdateStatus`, `current_version()`, `fetch_latest_tag()` via
+  `git ls-remote`, pure `latest_tag_from_ls_remote` / `parse_semver` /
+  `compute_status` helpers, and a best-effort background poll thread
+  (`spawn_poller`) that stores the status and fires a callback on the transition
+  into "update available". 7 unit tests (tag parsing, prerelease/peeled
+  rejection, version compare, transition-only signalling).
+- 2026-06-19T07:04-0700 `crates/triaged/src/session.rs` — `SessionManager` gains
+  an `Arc<RwLock<UpdateStatus>>`, an `update_status()` accessor,
+  `start_update_poller()` (spawns the poller with a weak-ref broadcast callback,
+  mirroring `start_summarizer`), `broadcast_update_available()`, and an override
+  of `SessionApi::server_update_info`. `crates/triaged/src/main.rs` starts the
+  poller at daemon startup alongside the summarizer. `lib.rs` registers the
+  module.
+- 2026-06-19T07:04-0700 `crates/triage-core/src/session.rs` — `SessionApi` gains
+  a defaulted `server_update_info() -> ServerUpdateInfo`; `Arc<T>` blanket impl
+  forwards it; new `ServerUpdateInfo` type.
+- 2026-06-19T07:04-0700 `crates/triage-core/schema/triage.fbs` — appended
+  `server_version` / `update_available` / `latest_version` to `HelloResult` and
+  a new `UpdateAvailablePayload` table + `ServerMessagePayload` union member.
+  Rust bindings auto-regen via `build.rs`; Dart bindings regenerated with
+  `flatc --dart` (committed).
+- 2026-06-19T07:04-0700 `crates/triage-transport-ws/src/lib.rs` +
+  `flatbuffers_proto.rs` — extended `ServerResult::Hello` (owned + borrowed),
+  added `ServerMessage::UpdateAvailable` (owned + borrowed) with FB
+  serialize/parse, and populated `Hello` from `api.server_update_info()`. New
+  `flatbuffers_update_available_roundtrip` test; `hello` tests assert the new
+  fields. `stress_client.rs` Hello patterns gained `..` for the new fields.
 
 ## Research & Discoveries
 
@@ -79,5 +131,6 @@ See `devlog/plans/000066-01-self-update.md`.
 
 ## Commits
 
-- 63b9117 — docs(devlog): plan self-update & update notifications
-- HEAD — docs(devlog): revise self-update plan after critical review
+- 8f8ebfe — docs(devlog): plan self-update & update notifications
+- 95ac71b — docs(devlog): revise self-update plan after critical review
+- HEAD — feat(triaged): background update check + surface over session API

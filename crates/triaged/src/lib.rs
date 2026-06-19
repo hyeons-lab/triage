@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod service;
 pub mod session;
 pub mod summarizer;
+pub mod update;
 pub mod ws;
 
 #[cfg(all(unix, test))]

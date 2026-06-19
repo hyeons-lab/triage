@@ -70,6 +70,11 @@ fn run() -> anyhow::Result<()> {
     // on first activity, so this never blocks startup). No-op when disabled.
     manager.start_summarizer(config.summarizer.clone());
 
+    // Start the background update check (on by default). Polls the release host
+    // for a newer tag via `git ls-remote`; failures are silent and never block
+    // startup. No-op when `[update] check` is false.
+    manager.start_update_poller(config.update.clone());
+
     let bind_addr = config.remote.bind_addr()?;
 
     // The default bind is 0.0.0.0 so the client can reach the daemon from another

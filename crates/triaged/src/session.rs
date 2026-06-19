@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{
     self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
@@ -229,6 +230,11 @@ pub struct SessionManager {
     /// directly (see [`GlobalSenders`] and `ActorState::global_senders`) without
     /// routing through the manager.
     global_senders: GlobalSenders,
+    /// Latest result of the background update check (Phase 1 of self-update).
+    /// Read into every `Hello` handshake; a poll that flips it to
+    /// `update_available` also pushes a connection-wide notice. Starts as the
+    /// running version with no `latest` until the first poll completes.
+    update_status: Arc<RwLock<crate::update::UpdateStatus>>,
 }
 
 /// Shared list of per-connection global push channels. Cloned (cheaply, by
@@ -412,6 +418,7 @@ impl SessionManager {
             summarizer: Mutex::new(Summarizer::disabled()),
             dirty_tx: Mutex::new(None),
             global_senders: Arc::new(Mutex::new(Vec::new())),
+            update_status: Arc::new(RwLock::new(crate::update::UpdateStatus::current())),
         }
     }
 
@@ -482,6 +489,43 @@ impl SessionManager {
         // Snippet broadcasts tolerate a dropped send (the next regeneration
         // resends), so the delivery result is intentionally ignored here.
         let _ = broadcast_to_global_senders(&self.global_senders, message);
+    }
+
+    /// Snapshot of the latest update check, embedded into the `Hello` handshake
+    /// so every client learns the server version and whether a newer release
+    /// exists. Falls back to the running version if the lock is poisoned.
+    pub fn update_status(&self) -> crate::update::UpdateStatus {
+        self.update_status
+            .read()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| crate::update::UpdateStatus::current())
+    }
+
+    /// Starts the background update poller (Phase 1 of self-update). No-op when
+    /// `[update] check` is false. When a poll first observes a newer release,
+    /// the result is stored (for future handshakes) and pushed to every
+    /// connected client as a connection-wide notice. Safe to call once at
+    /// startup.
+    pub fn start_update_poller(self: &Arc<Self>, config: triage_core::config::UpdateConfig) {
+        let status = Arc::clone(&self.update_status);
+        let weak = Arc::downgrade(self);
+        crate::update::spawn_poller(config, status, move |new_status| {
+            if let Some(manager) = weak.upgrade() {
+                manager.broadcast_update_available(new_status);
+            }
+        });
+    }
+
+    /// Pushes an "update available" notice to every connected client. Only
+    /// called on the transition into the available state, so a single dropped
+    /// send is acceptable — the value also rides the next `Hello` handshake.
+    fn broadcast_update_available(&self, status: &crate::update::UpdateStatus) {
+        if let Some(latest) = &status.latest {
+            self.broadcast_global(ServerMessage::UpdateAvailable {
+                current_version: status.current.clone(),
+                latest_version: latest.clone(),
+            });
+        }
     }
 
     /// Clones the shared global-sender list handed to live session actors so they
@@ -1493,6 +1537,15 @@ impl SessionApi for SessionManager {
                 (session_id, snippet, detail)
             })
             .collect())
+    }
+
+    fn server_update_info(&self) -> triage_core::session::ServerUpdateInfo {
+        let status = self.update_status();
+        triage_core::session::ServerUpdateInfo {
+            server_version: status.current,
+            update_available: status.update_available,
+            latest_version: status.latest,
+        }
     }
 }
 

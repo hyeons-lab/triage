@@ -297,9 +297,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     true
                 };
 
+                let update = self.api.server_update_info();
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
+                    server_version: update.server_version,
+                    update_available: update.update_available,
+                    latest_version: update.latest_version,
                 })
             }
             ClientRequest::PairingChallenge { client_id } => {
@@ -523,6 +527,14 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branch: Option<String>,
     },
+    /// Connection-wide push: the daemon's background update check found a newer
+    /// stable release. Emitted once on the transition into the available state;
+    /// the same information also rides every `Hello`, so a missed push is
+    /// recovered on the next handshake.
+    UpdateAvailable {
+        current_version: String,
+        latest_version: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +544,13 @@ pub enum ServerResult {
     Hello {
         protocol_version: String,
         authenticated: bool,
+        /// The running daemon's version (Phase 1–2 of self-update).
+        server_version: String,
+        /// Whether the daemon has seen a strictly newer stable release.
+        update_available: bool,
+        /// The newest release tag seen, normalized without a leading `v`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest_version: Option<String>,
     },
     Paired {
         token: String,
@@ -631,6 +650,11 @@ mod tests {
                 result: ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated: true,
+                    // FakeSessionApi uses the default `server_update_info`: its
+                    // own crate version and no newer release known.
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    update_available: false,
+                    latest_version: None,
                 },
             }
         );
@@ -1183,6 +1207,9 @@ mod tests {
                     ServerResult::Hello {
                         protocol_version: PROTOCOL_VERSION.to_string(),
                         authenticated: true,
+                        server_version: env!("CARGO_PKG_VERSION").to_string(),
+                        update_available: false,
+                        latest_version: None,
                     }
                 );
             }
@@ -1225,6 +1252,9 @@ mod tests {
                     ServerResult::Hello {
                         protocol_version: PROTOCOL_VERSION.to_string(),
                         authenticated: false,
+                        server_version: env!("CARGO_PKG_VERSION").to_string(),
+                        update_available: false,
+                        latest_version: None,
                     }
                 );
             }
@@ -1271,6 +1301,27 @@ mod tests {
         let hello = resp.result_as_hello_result().unwrap();
         assert_eq!(hello.protocol_version().unwrap(), PROTOCOL_VERSION);
         assert!(hello.authenticated());
+        // Self-update fields ride the handshake: the default `server_update_info`
+        // reports this build with nothing newer known.
+        assert_eq!(hello.server_version().unwrap(), env!("CARGO_PKG_VERSION"));
+        assert!(!hello.update_available());
+        assert!(hello.latest_version().is_none());
+    }
+
+    #[test]
+    fn flatbuffers_update_available_roundtrip() {
+        let msg = ServerMessage::UpdateAvailable {
+            current_version: "0.1.6".to_string(),
+            latest_version: "0.1.7".to_string(),
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::UpdateAvailable {
+                current_version: "0.1.6",
+                latest_version: "0.1.7",
+            }
+        );
     }
 
     #[test]

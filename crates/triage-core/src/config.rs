@@ -19,6 +19,7 @@ pub struct Config {
     pub approval: ApprovalConfig,
     pub keybindings: KeybindingsConfig,
     pub summarizer: SummarizerConfig,
+    pub update: UpdateConfig,
 }
 
 impl Config {
@@ -53,7 +54,43 @@ impl Config {
         self.approval.validate()?;
         self.keybindings.validate()?;
         self.summarizer.validate()?;
+        self.update.validate()?;
         Ok(())
+    }
+}
+
+/// Settings for the background update check (Phase 1 of self-update). The daemon
+/// periodically asks the release host for the latest published tag and surfaces
+/// an "update available" banner; nothing is ever downloaded or installed
+/// automatically. Set `check = false` to disable the check entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Whether the daemon polls for newer releases at all.
+    pub check: bool,
+    /// How often to poll, in hours. Must be greater than zero.
+    pub interval_hours: u64,
+    /// Release channel to track. Only `stable` is recognized today.
+    pub channel: String,
+}
+
+impl UpdateConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.interval_hours > 0,
+            "update.interval_hours must be greater than zero"
+        );
+        ensure_non_empty("update.channel", &self.channel)
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            interval_hours: 6,
+            channel: "stable".to_string(),
+        }
     }
 }
 
