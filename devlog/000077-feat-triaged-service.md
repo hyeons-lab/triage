@@ -62,6 +62,20 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   an over-long token collapses to a readable prefix + sha256 hash so it stays
   under the 256-char NPFS limit and unique per path. Windows-only test
   `windows_pipe_token_caps_overlong_names` covers it.
+- 2026-06-18T22:05-07:00 `crates/triaged/src/ipc.rs` — **Bounded connect.** The
+  Windows client now connects via the raw named-pipe stream
+  (`DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode`) with a 5s
+  `ConnectWaitMode::Timeout`, instead of the cross-platform `local_socket`
+  connect that hardcodes an unbounded wait. A missing daemon still fails fast
+  (the pipe doesn't exist); only an all-instances-busy pipe (`ERROR_PIPE_BUSY`)
+  consumes the timeout, so a busy pipe can no longer block the client forever.
+  Introduced a `transport::ClientStream` alias (Unix `UnixStream`; Windows the
+  named-pipe stream) distinct from the server-accepted `LocalStream`; `connect`
+  and `finish_write` now take `ClientStream`. This also mitigates the test
+  readiness-probe race — a throwaway probe connection that momentarily consumes
+  the single pipe instance now bounds the real client's wait at 5s (re-arm is
+  microseconds) instead of risking an unbounded block. Confirmed the API against
+  interprocess 2.4.2 source; validated only by the `windows-latest` CI runner.
 
 ## Issues
 
@@ -82,4 +96,5 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
 ## Commits
 
 - aaa7551 — feat(triaged): manage triaged as a per-user login service
-- HEAD — refactor(triaged): drop redundant pipe probe, cap pipe-name length
+- 83461d6 — refactor(triaged): drop redundant pipe probe, cap pipe-name length
+- HEAD — fix(triaged): bound the Windows named-pipe client connect with a timeout

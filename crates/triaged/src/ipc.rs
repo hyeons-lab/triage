@@ -37,34 +37,60 @@ const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 mod transport {
     use super::*;
 
-    /// A connected local IPC stream (client or accepted server side).
-    #[cfg(unix)]
-    pub type LocalStream = UnixStream;
+    /// A server-side accepted local IPC stream (yielded by the listener). On
+    /// Unix the accept loop uses `UnixStream` directly; this alias names the
+    /// Windows `local_socket::Stream` that `handle_connection` consumes.
     #[cfg(windows)]
     pub type LocalStream = interprocess::local_socket::Stream;
 
+    /// A client-side connected local IPC stream. On Unix this is the same
+    /// `UnixStream`; on Windows we use the raw named-pipe stream rather than the
+    /// `local_socket::Stream` wrapper so the connect can take a wait timeout
+    /// (the cross-platform `local_socket` connect hardcodes an unbounded wait).
+    #[cfg(unix)]
+    pub type ClientStream = UnixStream;
+    #[cfg(windows)]
+    pub type ClientStream = interprocess::os::windows::named_pipe::DuplexPipeStream<
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+    >;
+
+    /// Upper bound on how long a client waits for a daemon instance to become
+    /// available. The accept loop re-arms in microseconds, so this only matters
+    /// when every pipe instance is momentarily busy; without it a busy pipe
+    /// (`ERROR_PIPE_BUSY`) could block the client indefinitely.
+    #[cfg(windows)]
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Connect a client to the daemon's local IPC endpoint.
     #[cfg(unix)]
-    pub fn connect(path: &Path) -> std::io::Result<LocalStream> {
+    pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
         UnixStream::connect(path)
     }
 
     #[cfg(windows)]
-    pub fn connect(path: &Path) -> std::io::Result<LocalStream> {
-        use interprocess::local_socket::traits::Stream as _;
-        LocalStream::connect(windows_pipe_name(path)?)
+    pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
+        use interprocess::ConnectWaitMode;
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
+        // `connect_by_path` does not prepend the `\\.\pipe\` prefix, so pass the
+        // fully-qualified endpoint. A missing daemon fails fast (the pipe does
+        // not exist); only an all-instances-busy pipe consumes the timeout.
+        let endpoint = super::display_endpoint(path);
+        DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
+            endpoint.as_str(),
+            ConnectWaitMode::Timeout(CONNECT_TIMEOUT),
+        )
     }
 
     /// Signal end-of-request to the server. On Unix we half-close the write side
     /// as a courtesy; on Windows the newline already frames the request, so this
     /// is a no-op (named pipes have no half-close).
     #[cfg(unix)]
-    pub fn finish_write(stream: &LocalStream) -> std::io::Result<()> {
+    pub fn finish_write(stream: &ClientStream) -> std::io::Result<()> {
         stream.shutdown(std::net::Shutdown::Write)
     }
 
     #[cfg(windows)]
-    pub fn finish_write(_stream: &LocalStream) -> std::io::Result<()> {
+    pub fn finish_write(_stream: &ClientStream) -> std::io::Result<()> {
         Ok(())
     }
 
