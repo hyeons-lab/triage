@@ -217,7 +217,7 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
 fn notify_daemon_reload(socket_path: Option<PathBuf>, required: bool) -> Result<()> {
     let path = socket_path.unwrap_or_else(triaged::ipc::default_socket_path);
     let endpoint = triaged::ipc::display_endpoint(&path);
-    let client = triaged::ipc::UnixSocketClient::new(path);
+    let client = triaged::ipc::IpcClient::new(path);
     match client.reload_client_assets() {
         Ok(()) => {
             println!("Successfully reloaded the daemon web-asset cache at {endpoint}.");

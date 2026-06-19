@@ -5,7 +5,7 @@ use triaged::session::SessionManager;
 use triaged::ws;
 
 #[cfg(any(unix, windows))]
-use triaged::ipc::{UnixSocketConfig, UnixSocketServer, default_socket_path};
+use triaged::ipc::{IpcConfig, IpcServer, default_socket_path};
 
 fn main() -> anyhow::Result<()> {
     // Keep this binding alive for the lifetime of the process: dropping the
@@ -178,7 +178,7 @@ fn run() -> anyhow::Result<()> {
     {
         let socket_path = default_socket_path();
         tracing::info!(socket_path = %socket_path.display(), "triaged starting Unix socket server");
-        UnixSocketServer::new(manager, web_cache, UnixSocketConfig::new(socket_path)).serve()?;
+        IpcServer::new(manager, web_cache, IpcConfig::new(socket_path)).serve()?;
         Ok(())
     }
 
@@ -187,7 +187,7 @@ fn run() -> anyhow::Result<()> {
         let pipe_name = default_socket_path();
         let endpoint = triaged::ipc::display_endpoint(&pipe_name);
         tracing::info!(pipe = %endpoint, "triaged starting named pipe server");
-        UnixSocketServer::new(manager, web_cache, UnixSocketConfig::new(pipe_name)).serve()?;
+        IpcServer::new(manager, web_cache, IpcConfig::new(pipe_name)).serve()?;
         Ok(())
     }
 

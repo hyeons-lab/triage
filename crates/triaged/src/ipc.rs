@@ -169,11 +169,11 @@ pub fn display_endpoint(path: &Path) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnixSocketConfig {
+pub struct IpcConfig {
     pub socket_path: PathBuf,
 }
 
-impl UnixSocketConfig {
+impl IpcConfig {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -181,17 +181,17 @@ impl UnixSocketConfig {
     }
 }
 
-pub struct UnixSocketServer {
+pub struct IpcServer {
     manager: Arc<SessionManager>,
     web_cache: Arc<crate::http::WebAssetCache>,
-    config: UnixSocketConfig,
+    config: IpcConfig,
 }
 
-impl UnixSocketServer {
+impl IpcServer {
     pub fn new(
         manager: Arc<SessionManager>,
         web_cache: Arc<crate::http::WebAssetCache>,
-        config: UnixSocketConfig,
+        config: IpcConfig,
     ) -> Self {
         Self {
             manager,
@@ -209,18 +209,7 @@ impl UnixSocketServer {
                 Ok((stream, _addr)) => {
                     let manager = Arc::clone(&self.manager);
                     let web_cache = Arc::clone(&self.web_cache);
-                    if let Err(error) = thread::Builder::new()
-                        .name("triage-ipc-client".to_string())
-                        .spawn(move || {
-                            if let Err(error) = handle_connection(manager, web_cache, stream)
-                                && !is_closed_socket_error(&error)
-                            {
-                                tracing::warn!(error = ?error, "Unix socket client failed");
-                            }
-                        })
-                    {
-                        tracing::warn!(error = ?error, "failed to spawn Unix socket client handler");
-                    }
+                    spawn_client_handler(move || handle_connection(manager, web_cache, stream));
                 }
                 Err(error) => {
                     tracing::warn!(error = ?error, "failed to accept Unix socket connection");
@@ -251,18 +240,7 @@ impl UnixSocketServer {
                 Ok(stream) => {
                     let manager = Arc::clone(&self.manager);
                     let web_cache = Arc::clone(&self.web_cache);
-                    if let Err(error) = thread::Builder::new()
-                        .name("triage-ipc-client".to_string())
-                        .spawn(move || {
-                            if let Err(error) = handle_connection(manager, web_cache, stream)
-                                && !is_closed_socket_error(&error)
-                            {
-                                tracing::warn!(error = ?error, "named pipe client failed");
-                            }
-                        })
-                    {
-                        tracing::warn!(error = ?error, "failed to spawn named pipe client handler");
-                    }
+                    spawn_client_handler(move || handle_connection(manager, web_cache, stream));
                 }
                 Err(error) => {
                     tracing::warn!(error = ?error, "failed to accept named pipe connection");
@@ -273,12 +251,34 @@ impl UnixSocketServer {
     }
 }
 
+/// Spawn a detached worker thread to service one accepted IPC connection. Shared
+/// by the Unix and Windows accept loops, which differ only in how they obtain
+/// the stream. A clean client disconnect (`is_closed_socket_error`) is not worth
+/// logging; anything else is surfaced as a warning.
+fn spawn_client_handler<F>(handler: F)
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    if let Err(error) = thread::Builder::new()
+        .name("triage-ipc-client".to_string())
+        .spawn(move || {
+            if let Err(error) = handler()
+                && !is_closed_socket_error(&error)
+            {
+                tracing::warn!(error = ?error, "IPC client handler failed");
+            }
+        })
+    {
+        tracing::warn!(error = ?error, "failed to spawn IPC client handler");
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnixSocketClient {
+pub struct IpcClient {
     socket_path: PathBuf,
 }
 
-impl UnixSocketClient {
+impl IpcClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -323,7 +323,7 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("triage-{}", fallback_user_component()))
 }
 
-impl SessionApi for UnixSocketClient {
+impl SessionApi for IpcClient {
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
         match self.round_trip(WireRequest::ListSessions)? {
             WireSuccess::SessionIds(session_ids) => Ok(session_ids),
@@ -628,24 +628,14 @@ fn handle_connection(
     let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
         return Ok(());
     };
-    let mut writer = BufWriter::new(stream);
-
+    // Handover needs the raw stream for SCM_RIGHTS FD passing, so it branches
+    // before the shared dispatch (which only deals with the JSON wire protocol).
     if let WireRequest::Handover = request {
         return handle_handover_server(&manager, reader.into_inner());
     }
 
-    if let WireRequest::SubscribeSessionEvents {
-        session_id,
-        after_event_seq,
-    } = request
-    {
-        return handle_subscription(&manager, session_id, after_event_seq, &mut writer);
-    }
-
-    let response = WireResponse::from_result(handle_request(&manager, &web_cache, request));
-    write_json_line(&mut writer, &response).context("writing response")?;
-    writer.flush().context("flushing response")?;
-    Ok(())
+    let mut writer = BufWriter::new(stream);
+    dispatch_request(&manager, &web_cache, request, &mut writer)
 }
 
 // Windows named-pipe connection handler. The wire protocol is identical to Unix;
@@ -665,21 +655,34 @@ fn handle_connection(
     let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
         return Ok(());
     };
-    let mut writer = BufWriter::new(reader.into_inner());
-
-    match request {
-        WireRequest::Handover => bail!("Handover request not supported on Windows"),
-        WireRequest::SubscribeSessionEvents {
-            session_id,
-            after_event_seq,
-        } => handle_subscription(&manager, session_id, after_event_seq, &mut writer),
-        other => {
-            let response = WireResponse::from_result(handle_request(&manager, &web_cache, other));
-            write_json_line(&mut writer, &response).context("writing response")?;
-            writer.flush().context("flushing response")?;
-            Ok(())
-        }
+    if let WireRequest::Handover = request {
+        bail!("Handover request not supported on Windows");
     }
+
+    let mut writer = BufWriter::new(reader.into_inner());
+    dispatch_request(&manager, &web_cache, request, &mut writer)
+}
+
+/// Service a single non-handover request: stream a subscription, or run the
+/// request and write its one-shot response. Shared by both platform handlers.
+fn dispatch_request(
+    manager: &SessionManager,
+    web_cache: &crate::http::WebAssetCache,
+    request: WireRequest,
+    writer: &mut impl Write,
+) -> Result<()> {
+    if let WireRequest::SubscribeSessionEvents {
+        session_id,
+        after_event_seq,
+    } = request
+    {
+        return handle_subscription(manager, session_id, after_event_seq, writer);
+    }
+
+    let response = WireResponse::from_result(handle_request(manager, web_cache, request));
+    write_json_line(writer, &response).context("writing response")?;
+    writer.flush().context("flushing response")?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -915,14 +918,14 @@ mod tests {
             log_dir.clone(),
         )));
         let cache = Arc::new(crate::http::WebAssetCache::new(None));
-        let server = UnixSocketServer::new(
+        let server = IpcServer::new(
             Arc::clone(&manager),
             cache,
-            UnixSocketConfig::new(socket_path.clone()),
+            IpcConfig::new(socket_path.clone()),
         );
         spawn_server(server);
 
-        let client = UnixSocketClient::new(socket_path.clone());
+        let client = IpcClient::new(socket_path.clone());
         let missing = SessionId::new("missing").expect("session id");
         let error = client
             .snapshot_session(missing)
@@ -964,14 +967,14 @@ mod tests {
             log_dir.clone(),
         )));
         let cache = Arc::new(crate::http::WebAssetCache::new(None));
-        let server = UnixSocketServer::new(
+        let server = IpcServer::new(
             Arc::clone(&manager),
             cache,
-            UnixSocketConfig::new(socket_path.clone()),
+            IpcConfig::new(socket_path.clone()),
         );
         spawn_server(server);
 
-        let client = UnixSocketClient::new(socket_path.clone());
+        let client = IpcClient::new(socket_path.clone());
         let client_id = ClientId::new("test-client").expect("client id");
         let mut request = StartSessionRequest::new("/bin/sh");
         request.args = vec!["-lc".to_string(), "cat".to_string()];
@@ -1068,13 +1071,13 @@ mod tests {
             log_dir.clone(),
         )));
         let cache = Arc::new(crate::http::WebAssetCache::new(None));
-        let server = UnixSocketServer::new(
+        let server = IpcServer::new(
             Arc::clone(&manager),
             cache,
-            UnixSocketConfig::new(socket_path.clone()),
+            IpcConfig::new(socket_path.clone()),
         );
         spawn_server(server);
-        let client = UnixSocketClient::new(socket_path.clone());
+        let client = IpcClient::new(socket_path.clone());
 
         let snapshot = client
             .restore_session(RestoreSessionRequest {
@@ -1105,7 +1108,7 @@ mod tests {
         let _ = fs::remove_dir_all(log_dir);
     }
 
-    fn spawn_server(server: UnixSocketServer) {
+    fn spawn_server(server: IpcServer) {
         let socket_path = server.config.socket_path.clone();
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
