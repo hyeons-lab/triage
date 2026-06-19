@@ -103,6 +103,10 @@ Also folds in the four deferred Windows daemon follow-ups from #87:
   README.md`: daemon-start prerequisite with the service option. `crates/
   triage-mcp/README.md`: "Prerequisite: a running daemon" note. Each links to the
   `triaged` crate docs for detail.
+- 2026-06-18T22:45-07:00 `crates/triaged/README.md` — added a platform-support
+  paragraph to the intro (macOS/Linux/Windows, the per-platform control-plane
+  transport, login-service registration, ConPTY vs PTY) so the description states
+  the cross-platform story up front instead of only in the Windows section.
 
 ### PR review comments (Copilot, #88)
 

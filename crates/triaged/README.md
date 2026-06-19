@@ -4,6 +4,12 @@ Persistent daemon process that manages terminal session state, PTY multiplexing,
 
 The daemon runs persistently in the background, keeping terminal scrollbacks, layout grids, and active PTY handles alive even when no clients are attached.
 
+It runs on **macOS, Linux, and Windows**. The local control plane uses a Unix
+domain socket on macOS/Linux and a named pipe on Windows, and `triaged` can
+register itself to start at login on each platform (see
+[Running as a background service](#running-as-a-background-service)). Terminal
+sessions run on ConPTY on Windows and on a standard PTY elsewhere.
+
 ## Installation
 
 ```bash
