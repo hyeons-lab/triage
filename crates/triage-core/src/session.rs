@@ -470,9 +470,10 @@ pub struct SubscribeSessionEventsRequest {
 pub type SessionEventReceiver = Receiver<SessionEventEnvelope>;
 
 /// The server's self-reported version and update status, surfaced to clients on
-/// the `Hello` handshake (Phase 1–2 of self-update). `latest_version` is `None`
-/// until the daemon's background check has seen a published release.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the `Hello` handshake (Phase 1–2 of self-update) and over the local IPC
+/// control protocol (Phase 4, the TUI banner). `latest_version` is `None` until
+/// the daemon's background check has seen a published release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerUpdateInfo {
     /// The running daemon's version (its compiled `CARGO_PKG_VERSION`).
     pub server_version: String,

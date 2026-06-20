@@ -5,9 +5,9 @@ use std::sync::mpsc::TryRecvError;
 use anyhow::Result;
 use triage_core::session::{
     AttachMode, AttachSessionRequest, ClientId, CompletedSession, InputLeaseState,
-    ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEvent, SessionEventReceiver,
-    SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
-    WriteInputRequest,
+    ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi, SessionEvent,
+    SessionEventReceiver, SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow,
+    StyledRowsRequest, WriteInputRequest,
 };
 #[cfg(any(unix, windows))]
 use triaged::ipc::IpcClient;
@@ -32,6 +32,11 @@ pub struct LocalSessionApp {
     selected: usize,
     current_size: SessionSize,
     last_error: Option<String>,
+    /// Latest update status from the daemon (Phase 4 banner). Fetched at startup
+    /// and refreshed on a slow timer; drives the read-only "update available"
+    /// banner. In embedded mode the daemon never polls, so this stays
+    /// not-available and no banner shows.
+    update: ServerUpdateInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +88,7 @@ impl LocalSessionApp {
             )?);
         }
 
+        let update = manager.server_update_info();
         let mut app = Self {
             manager,
             client_id,
@@ -91,9 +97,37 @@ impl LocalSessionApp {
             selected: 0,
             current_size: size,
             last_error: None,
+            update,
         };
         app.activate_selected_session();
         Ok(app)
+    }
+
+    /// Re-query the daemon's update status. Returns `true` when it changed (so
+    /// the caller can trigger a redraw). Cheap best-effort IPC round-trip; the
+    /// `IpcClient` impl swallows transport errors into the not-available default.
+    pub fn refresh_update_status(&mut self) -> bool {
+        let latest = self.manager.server_update_info();
+        if latest == self.update {
+            return false;
+        }
+        self.update = latest;
+        true
+    }
+
+    /// Whether the daemon has seen a strictly newer stable release.
+    pub fn update_available(&self) -> bool {
+        self.update.update_available
+    }
+
+    /// The newest release version available, if any (normalized, no leading `v`).
+    pub fn latest_version(&self) -> Option<&str> {
+        self.update.latest_version.as_deref()
+    }
+
+    /// The running daemon's version.
+    pub fn server_version(&self) -> &str {
+        &self.update.server_version
     }
 
     pub fn create_session(&mut self, size: SessionSize) {
@@ -1055,6 +1089,11 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
         };
 
         assert!(app.ensure_selected_styled_rows(2));
@@ -1096,6 +1135,11 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
         };
 
         assert!(app.ensure_selected_styled_rows(2));
@@ -1137,6 +1181,11 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
         };
 
         assert!(!app.ensure_selected_styled_rows(2));
@@ -1390,6 +1439,11 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
         };
 
         assert_eq!(app.close_selected_session(), CloseSessionOutcome::NotClosed);
@@ -1428,6 +1482,11 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: Some("stale resize error".to_string()),
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
         };
 
         app.resize(new_size.clone());

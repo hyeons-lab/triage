@@ -501,6 +501,14 @@ impl SessionManager {
             .unwrap_or_else(|_| crate::update::UpdateStatus::current())
     }
 
+    /// Overwrite the stored update status. Test-only: the poller is the sole
+    /// production writer, but tests need to seed a known "update available"
+    /// state without a network round-trip.
+    #[cfg(test)]
+    pub(crate) fn set_update_status_for_test(&self, status: crate::update::UpdateStatus) {
+        *self.update_status.write().expect("update status lock") = status;
+    }
+
     /// Starts the background update poller (Phase 1 of self-update). No-op when
     /// `[update] check` is false. When a poll first observes a newer release,
     /// the result is stored (for future handshakes) and pushed to every

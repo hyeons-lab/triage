@@ -17,9 +17,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEventEnvelope,
-    SessionEventReceiver, SessionId, SessionSnapshot, StartSessionRequest, StyledRowsRequest,
-    StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
+    LeaseChange, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSnapshot, StartSessionRequest,
+    StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
 };
 
 use crate::session::SessionManager;
@@ -486,6 +486,21 @@ impl SessionApi for IpcClient {
             other => bail!("unexpected shutdown_session response: {other:?}"),
         }
     }
+
+    /// Ask the daemon for its update status (Phase 4, the TUI banner). This is a
+    /// best-effort, read-only query: any IPC failure (daemon mid-restart,
+    /// unexpected reply) falls back to "this build, nothing newer" so the banner
+    /// simply stays hidden rather than surfacing an error.
+    fn server_update_info(&self) -> ServerUpdateInfo {
+        match self.round_trip(WireRequest::ServerUpdateInfo) {
+            Ok(WireSuccess::ServerUpdateInfo(info)) => info,
+            _ => ServerUpdateInfo {
+                server_version: env!("CARGO_PKG_VERSION").to_string(),
+                update_available: false,
+                latest_version: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +529,7 @@ enum WireRequest {
     },
     Handover,
     ReloadClientAssets,
+    ServerUpdateInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,6 +570,7 @@ enum WireSuccess {
     SessionEvent(SessionEventEnvelope),
     Heartbeat,
     HandoverState(crate::handover::HandoverState),
+    ServerUpdateInfo(ServerUpdateInfo),
 }
 
 fn fallback_user_component() -> String {
@@ -892,6 +909,9 @@ fn handle_request(
             web_cache.reload();
             Ok(WireSuccess::Unit)
         }
+        WireRequest::ServerUpdateInfo => {
+            Ok(WireSuccess::ServerUpdateInfo(manager.server_update_info()))
+        }
     }
 }
 
@@ -952,6 +972,38 @@ mod tests {
             .expect_err("missing snapshot should fail");
 
         assert!(error.to_string().contains("not found"));
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    fn client_fetches_server_update_info_over_socket() {
+        let socket_path = unique_socket_path("upd");
+        let log_dir = unique_dir("upd-logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        // Seed a "newer release available" status so the value we read back
+        // proves it crossed the wire (the client's fallback is never-available).
+        manager.set_update_status_for_test(crate::update::UpdateStatus {
+            current: "0.1.6".to_string(),
+            latest: Some("0.1.7".to_string()),
+            update_available: true,
+        });
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
+        let server = IpcServer::new(
+            Arc::clone(&manager),
+            cache,
+            IpcConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+
+        let client = IpcClient::new(socket_path.clone());
+        let info = client.server_update_info();
+
+        assert!(info.update_available);
+        assert_eq!(info.server_version, "0.1.6");
+        assert_eq!(info.latest_version.as_deref(), Some("0.1.7"));
         let _ = fs::remove_file(socket_path);
         let _ = fs::remove_dir_all(log_dir);
     }
