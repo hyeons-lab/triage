@@ -14,6 +14,16 @@ fn main() -> anyhow::Result<()> {
     run()
 }
 
+/// Probe whether a *live* daemon already owns the IPC socket. A successful
+/// connect means another daemon is accepting connections (the server treats a
+/// bare connect-then-close as a liveness probe). A missing socket or a refused
+/// connection means no live daemon — any leftover socket file is stale and
+/// `bind_owner_socket` clears it on bind.
+#[cfg(unix)]
+fn is_live_daemon_socket(socket_path: &std::path::Path) -> bool {
+    socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -30,23 +40,37 @@ fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut has_inherited_sessions = false;
 
-    if is_handover {
-        #[cfg(unix)]
-        {
-            let socket_path = default_socket_path();
-            if socket_path.exists() {
-                tracing::info!(socket_path = %socket_path.display(), "initiating zero-downtime process handover");
-                triaged::handover::perform_handover_client(&socket_path)?;
-                has_inherited_sessions = true;
-            } else {
-                anyhow::bail!(
-                    "No running daemon socket found at {}. Start the daemon normally first.",
-                    socket_path.display()
-                );
-            }
+    // Decide whether to adopt a running daemon. Handover is the right move
+    // whenever a *live* daemon already owns the socket — regardless of whether
+    // `--handover` was passed. Keying off "is one actually running?" rather than
+    // the flag is what makes the daemon safe to run under a KeepAlive supervisor
+    // (the launchd LaunchAgent / systemd unit):
+    //   - Cold start, nothing running: start fresh. `--handover` no longer bails
+    //     ("No running daemon socket found"), so a KeepAlive respawn after the
+    //     last daemon exits can't crash-loop.
+    //   - A live daemon already owns the socket: hand over (zero session loss)
+    //     instead of bailing "already in use", so a supervised respawn doesn't
+    //     fight an in-flight manual deploy.
+    #[cfg(unix)]
+    {
+        let socket_path = default_socket_path();
+        if is_live_daemon_socket(&socket_path) {
+            tracing::info!(
+                socket_path = %socket_path.display(),
+                "existing daemon detected; initiating zero-downtime process handover"
+            );
+            triaged::handover::perform_handover_client(&socket_path)?;
+            has_inherited_sessions = true;
+        } else if is_handover {
+            tracing::warn!(
+                socket_path = %socket_path.display(),
+                "--handover requested but no running daemon found; starting fresh"
+            );
         }
-        #[cfg(not(unix))]
-        {
+    }
+    #[cfg(not(unix))]
+    {
+        if is_handover {
             anyhow::bail!(
                 "Zero-downtime process handover is only supported on Unix-like operating systems (including Linux and WSL). Please use Session Restore on Windows."
             );
