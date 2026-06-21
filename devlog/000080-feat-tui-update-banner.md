@@ -41,6 +41,21 @@ versions and where to get it. No update *action* yet — that's PR 4.
 - 2026-06-19T17:36-0700 Naturally gated by config: when `[update] check = false`
   the daemon never polls, so `update_available` stays false and the banner never
   shows — no extra TUI-side config plumbing.
+- 2026-06-21T08:47-0300 **PR #92 review (Copilot): moved the refresh off the UI
+  thread.** The original design re-queried `manager.server_update_info()` directly
+  from the main loop, but that's a blocking IPC round-trip — on Windows the
+  pipe-busy connect can wait up to 5s with no read timeout, freezing the UI even
+  when idle. Now a dedicated `triage-update-poller` thread owns its own stateless
+  `IpcClient` (each round-trip reconnects, so a second client is safe) and pushes
+  status over an `mpsc` channel; `refresh_update_status` drains it with `try_recv`
+  and never blocks. The thread exits when the receiver drops. Supersedes the
+  "cheap periodic IPC round-trip on the main loop" decision above. Poller cadence
+  stays 30s (`UPDATE_POLL_INTERVAL`); the UI drains every loop iteration since it's
+  now free.
+- 2026-06-21T08:47-0300 **PR #92 review (Copilot): no per-frame `Vec` in `draw()`.**
+  The banner/no-banner layout used `constraints(if … { vec![…] } else { vec![…] })`,
+  allocating a `Vec` every redraw. Split into two branches each passing a
+  fixed-size constraint array, so the hot path no longer heap-allocates.
 
 ## Plan
 
@@ -55,4 +70,5 @@ See `devlog/plans/000080-01-tui-update-banner.md`.
 
 ## Commits
 
-- HEAD — feat(triage): read-only update-available banner in the TUI
+- 3ddf6f0 — feat(triage): read-only update-available banner in the TUI
+- HEAD — fix(triage): poll update status off the UI thread; drop per-frame layout alloc

@@ -31,11 +31,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SIDEBAR_COLS: u16 = 28;
 const UI_EVENT_POLL: Duration = Duration::from_millis(8);
-/// How often the TUI re-queries the daemon's update status for the banner. Slow
-/// on purpose — the daemon only re-checks every few hours; this just lets the
-/// banner appear without a TUI restart once the daemon's first poll lands.
-const UPDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-
 fn main() -> Result<()> {
     let startup_mode = StartupMode::from_args(std::env::args_os().skip(1))?;
     if startup_mode == StartupMode::Help {
@@ -408,13 +403,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut needs_draw = true;
     let mut sidebar_scroll_offset = 0usize;
     let mut last_sidebar_scroll_tick = Instant::now();
-    let mut last_update_refresh = Instant::now();
 
     loop {
-        if last_update_refresh.elapsed() >= UPDATE_REFRESH_INTERVAL {
-            last_update_refresh = Instant::now();
-            needs_draw |= app.refresh_update_status();
-        }
+        // Cheap non-blocking drain of the background poller's channel; the
+        // blocking IPC round-trip happens on the poller thread.
+        needs_draw |= app.refresh_update_status();
 
         if sidebar_visible
             && selected_sidebar_context_overflows(app, usize::from(SIDEBAR_COLS.saturating_sub(1)))
@@ -585,24 +578,25 @@ fn draw(
 ) -> Rect {
     // An optional one-row update banner sits above the content; the status line
     // stays pinned to the bottom.
+    // Two fixed-size constraint arrays avoid a per-frame `Vec` allocation in
+    // this hot redraw path.
     let show_banner = app.update_available();
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if show_banner {
-            vec![
+    let (content_area, status_area) = if show_banner {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
                 Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(1),
-            ]
-        } else {
-            vec![Constraint::Min(1), Constraint::Length(1)]
-        })
-        .split(frame.area());
-
-    let (content_area, status_area) = if show_banner {
+            ])
+            .split(frame.area());
         draw_update_banner(frame, root[0], app);
         (root[1], root[2])
     } else {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(frame.area());
         (root[0], root[1])
     };
 
