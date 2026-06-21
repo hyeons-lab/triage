@@ -422,6 +422,47 @@ jobs:
           pattern: cl*
           path: release-assets
 
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      # Sign and checksum every release archive so clients can verify downloads
+      # before installing them (self-update, in-app install). minisign uses the
+      # ed25519 key whose public half is committed at .github/minisign.pub; the
+      # private half lives only in the MINISIGN_SECRET_KEY secret. Fails closed:
+      # if the secret is missing, no release is cut rather than shipping unsigned
+      # binaries.
+      - name: Sign and checksum release assets
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set; refusing to publish unsigned binaries" >&2
+            exit 1
+          fi
+
+          # Materialize the passwordless secret key for this job only.
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keyfile"
+
+          # Sign + checksum each archive, skipping any already-generated sidecars.
+          find release-assets -type f -name 'Triage-*' \
+            ! -name '*.minisig' ! -name '*.sha256' -print0 |
+          while IFS= read -r -d '' asset; do
+            echo "Signing $asset"
+            dir="$(dirname "$asset")"
+            base="$(basename "$asset")"
+            # `.sha256` holds "<hash>  <basename>" so `sha256sum -c` works in-place.
+            ( cd "$dir" && sha256sum "$base" > "$base.sha256" )
+            minisign -S -s "$keyfile" -m "$asset" \
+              -t "triage release v$VERSION" -c "triage release v$VERSION" < /dev/null
+          done
+
+          echo "=== generated signatures + checksums ==="
+          find release-assets -type f \( -name '*.minisig' -o -name '*.sha256' \) -print | sort
+
       - name: Create tag and GitHub release with all clients
         # softprops/action-gh-release@v3
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
@@ -430,4 +471,6 @@ jobs:
           name: v${{ needs.publish.outputs.version }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # The `.minisig`/`.sha256` sidecars also start with "Triage-", so the
+          # same glob attaches them alongside each archive.
           files: release-assets/**/Triage-*
