@@ -3066,6 +3066,34 @@ enum LogInitialization {
     ReplayExisting,
 }
 
+/// Session-identity markers that agent CLIs inject into their own environment
+/// (here: Claude Code). If `triaged` was itself launched from inside such a
+/// session, these leak into the daemon's environment and — because
+/// `CommandBuilder::new` seeds the child env from the daemon's — get inherited
+/// by every agent it spawns. The spawned agent then sees them and treats itself
+/// as a nested *child* session: Claude Code, for one, skips writing a resumable
+/// transcript, so the session never appears in `/resume`. Strip them so each
+/// spawned agent starts as a fresh top-level session regardless of how
+/// `triaged` was started. (User preferences such as `CLAUDE_EFFORT` are
+/// deliberately left intact.)
+const INHERITED_AGENT_SESSION_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "AI_AGENT",
+];
+
+/// Remove inherited agent session-identity markers from `command` so the
+/// spawned agent does not mistake itself for a nested child session. See
+/// [`INHERITED_AGENT_SESSION_ENV`].
+fn scrub_inherited_agent_session_env(command: &mut CommandBuilder) {
+    for key in INHERITED_AGENT_SESSION_ENV {
+        command.env_remove(key);
+    }
+}
+
 fn spawn_pty_runtime(
     config: SessionConfig,
     log_initialization: LogInitialization,
@@ -3084,6 +3112,7 @@ fn spawn_pty_runtime(
     if let Some(cwd) = &config.cwd {
         command.cwd(cwd);
     }
+    scrub_inherited_agent_session_env(&mut command);
 
     let child = pair
         .slave
@@ -3952,6 +3981,31 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn scrub_removes_inherited_agent_session_markers() {
+        let mut command = CommandBuilder::new("claude");
+        // Simulate a daemon environment polluted by a parent Claude Code
+        // session (e.g. triaged launched from inside `claude`).
+        command.env("CLAUDECODE", "1");
+        command.env("CLAUDE_CODE_CHILD_SESSION", "1");
+        command.env("CLAUDE_CODE_SESSION_ID", "stale-session-id");
+        command.env("CLAUDE_EFFORT", "high");
+
+        scrub_inherited_agent_session_env(&mut command);
+
+        for key in INHERITED_AGENT_SESSION_ENV {
+            assert!(
+                command.get_env(key).is_none(),
+                "{key} should be scrubbed before spawning the agent"
+            );
+        }
+        // User preferences must survive the scrub.
+        assert_eq!(
+            command.get_env("CLAUDE_EFFORT"),
+            Some(std::ffi::OsStr::new("high"))
+        );
+    }
 
     #[test]
     fn output_state_extracts_osc7_working_directory() {
