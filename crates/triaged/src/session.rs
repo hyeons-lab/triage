@@ -1060,6 +1060,8 @@ impl SessionManager {
                         dirty_tx,
                         global_senders,
                         context_resend_pending: false,
+                        shell_reports_cwd: false,
+                        last_cwd_poll: None,
                         subscribers: Vec::new(),
                         event_log: VecDeque::new(),
                         next_event_seq: 1,
@@ -2123,6 +2125,8 @@ impl SessionActor {
                     dirty_tx,
                     global_senders,
                     context_resend_pending: false,
+                    shell_reports_cwd: false,
+                    last_cwd_poll: None,
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
@@ -2296,6 +2300,15 @@ struct ActorState {
     /// only emitted on change, the actor re-attempts the broadcast (with the
     /// current context) on the next output event until it is delivered.
     context_resend_pending: bool,
+    /// Set once the session has reported its cwd via OSC 7 at least once, i.e.
+    /// its shell honors the injected `PROMPT_COMMAND` hook (bash). When true, we
+    /// trust OSC 7 and skip the OS-level cwd polling entirely; when it stays
+    /// false (zsh, fish, ...), the fallback poll keeps the cwd fresh.
+    shell_reports_cwd: bool,
+    /// Timestamp of the last OS-level working-directory poll, used to throttle
+    /// the fallback so git context is not re-resolved on every output chunk for
+    /// shells that never emit OSC 7.
+    last_cwd_poll: Option<Instant>,
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
     next_event_seq: u64,
@@ -2507,28 +2520,63 @@ impl ActorState {
         self.context_resend_pending = !delivered;
     }
 
+    /// Update the tracked working directory and git context, broadcasting the
+    /// change to clients. Re-resolves git context on every call so a branch
+    /// switch within the same directory is still caught; only broadcasts when
+    /// the cwd or resolved context actually changed (or a prior broadcast was
+    /// dropped for a then-full client channel and still needs to land).
+    fn apply_cwd(&mut self, cwd: PathBuf) {
+        let new_context = resolve_session_context(Some(&cwd));
+        let changed = self.context != new_context
+            || self.current_working_directory.as_deref() != Some(cwd.as_path());
+        self.context = new_context;
+        self.current_working_directory = Some(cwd);
+        if changed || self.context_resend_pending {
+            self.broadcast_context_update();
+        }
+    }
+
+    /// Read the PTY child's working directory from the OS, used for shells that
+    /// do not emit OSC 7. Throttled to [`CWD_POLL_INTERVAL`] so the underlying
+    /// `git` invocations in [`Self::apply_cwd`] are not run on every output
+    /// chunk while an agent repaints its TUI.
+    fn poll_child_cwd(&mut self) -> Option<PathBuf> {
+        let now = Instant::now();
+        if let Some(last) = self.last_cwd_poll
+            && now.duration_since(last) < CWD_POLL_INTERVAL
+        {
+            return None;
+        }
+        self.last_cwd_poll = Some(now);
+        let pid = self.child.process_id()?;
+        child_cwd(pid)
+    }
+
     fn handle_output(&mut self, message: ActorMessage) {
         match message {
             ActorMessage::Output(bytes) => match self.output.ingest(&bytes) {
                 Ok(current_working_directory) => {
-                    if let Some(current_working_directory) = current_working_directory {
-                        // Re-resolve git context every time the shell reports a
-                        // cwd (it does so each prompt), so a branch switch within
-                        // the same directory is still caught. Only broadcast when
-                        // the cwd or resolved context actually changed, to avoid
-                        // spamming clients with identical per-prompt updates.
-                        let new_context = resolve_session_context(Some(&current_working_directory));
-                        let changed = self.context != new_context
-                            || self.current_working_directory.as_deref()
-                                != Some(current_working_directory.as_path());
-                        self.context = new_context;
-                        self.current_working_directory = Some(current_working_directory);
-                        // Resend when the context changed, or when a prior
-                        // broadcast was dropped for a then-full client channel
-                        // and still needs to land.
-                        if changed || self.context_resend_pending {
-                            self.broadcast_context_update();
+                    match current_working_directory {
+                        // bash reports its cwd via OSC 7 (the injected
+                        // PROMPT_COMMAND hook), so apply it directly. Mark the
+                        // shell as OSC 7-capable so we stop OS-polling for it.
+                        Some(reported) => {
+                            self.shell_reports_cwd = true;
+                            self.apply_cwd(reported);
                         }
+                        // zsh, fish, and other shells ignore PROMPT_COMMAND and
+                        // never emit OSC 7, so the cwd would otherwise stay stuck
+                        // at the daemon's startup directory. Until a session has
+                        // proven it emits OSC 7, fall back to reading the PTY
+                        // child's cwd from the kernel (throttled). Once OSC 7 has
+                        // been seen we trust it and skip polling, so OSC 7-capable
+                        // shells don't re-resolve git context during long output.
+                        None if !self.shell_reports_cwd => {
+                            if let Some(cwd) = self.poll_child_cwd() {
+                                self.apply_cwd(cwd);
+                            }
+                        }
+                        None => {}
                     }
                     if let Some(session_id) = self.event_session_id.clone() {
                         // Non-blocking nudge to the summarizer; a full or dropped
@@ -3580,6 +3628,65 @@ impl Write for ReplayGateWriter {
     }
 }
 
+/// Minimum interval between OS-level working-directory polls. Bounds how often
+/// [`ActorState::apply_cwd`] (which shells out to `git`) runs for sessions whose
+/// shell does not emit OSC 7.
+const CWD_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
+/// Reads the working directory of `pid` directly from the kernel.
+///
+/// Triage tracks each session's cwd from the OSC 7 sequence emitted by the
+/// injected `PROMPT_COMMAND` hook, but `PROMPT_COMMAND` is a bash feature —
+/// zsh, fish, and others ignore it and never report their cwd, leaving the side
+/// rail stuck on the daemon's startup directory. Reading the PTY child's cwd
+/// from the OS works regardless of the user's shell (the same approach terminal
+/// multiplexers use).
+#[cfg(target_os = "linux")]
+fn child_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn child_cwd(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    // SAFETY: `proc_vnodepathinfo` is a plain-old-data struct; zeroing it is a
+    // valid initial state and `proc_pidinfo` fully populates it on success.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: `info` is a correctly sized, writable buffer matching the
+    // `PROC_PIDVNODEPATHINFO` flavor.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // `vip_path` is a NUL-terminated C string stored as a flattened byte buffer.
+    let path = &info.pvi_cdir.vip_path;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(path.as_ptr().cast::<u8>(), std::mem::size_of_val(path))
+    };
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(
+        bytes[..len].to_vec(),
+    )))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn child_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
     let cwd = cwd?;
     let worktree_root = git_path_output(cwd, &["rev-parse", "--show-toplevel"]);
@@ -3981,6 +4088,20 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn child_cwd_reads_a_live_process_working_directory() {
+        // The test process is a live process, so reading its own pid must yield
+        // its current working directory — the same shell-agnostic mechanism used
+        // to track session cwd when no OSC 7 is emitted.
+        let expected = std::env::current_dir().expect("current dir");
+        let got = child_cwd(std::process::id()).expect("child_cwd resolves a live pid");
+        assert_eq!(
+            std::fs::canonicalize(&got).expect("canonicalize got"),
+            std::fs::canonicalize(&expected).expect("canonicalize expected"),
+        );
+    }
 
     #[test]
     fn scrub_removes_inherited_agent_session_markers() {
