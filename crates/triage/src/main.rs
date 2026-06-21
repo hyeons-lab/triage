@@ -31,7 +31,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SIDEBAR_COLS: u16 = 28;
 const UI_EVENT_POLL: Duration = Duration::from_millis(8);
-
 fn main() -> Result<()> {
     let startup_mode = StartupMode::from_args(std::env::args_os().skip(1))?;
     if startup_mode == StartupMode::Help {
@@ -406,6 +405,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut last_sidebar_scroll_tick = Instant::now();
 
     loop {
+        // Cheap non-blocking drain of the background poller's channel; the
+        // blocking IPC round-trip happens on the poller thread.
+        needs_draw |= app.refresh_update_status();
+
         if sidebar_visible
             && selected_sidebar_context_overflows(app, usize::from(SIDEBAR_COLS.saturating_sub(1)))
             && last_sidebar_scroll_tick.elapsed() >= Duration::from_millis(250)
@@ -573,32 +576,69 @@ fn draw(
     selection: Option<TerminalSelection>,
     sidebar_scroll_offset: usize,
 ) -> Rect {
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(frame.area());
+    // An optional one-row update banner sits above the content; the status line
+    // stays pinned to the bottom.
+    // Two fixed-size constraint arrays avoid a per-frame `Vec` allocation in
+    // this hot redraw path.
+    let show_banner = app.update_available();
+    let (content_area, status_area) = if show_banner {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        draw_update_banner(frame, root[0], app);
+        (root[1], root[2])
+    } else {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(frame.area());
+        (root[0], root[1])
+    };
 
     let terminal_area = if sidebar_visible {
         let body = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(SIDEBAR_COLS), Constraint::Min(20)])
-            .split(root[0]);
+            .split(content_area);
         draw_sidebar(frame, body[0], app, sidebar_scroll_offset);
         draw_terminal(frame, body[1], app.view(), selection);
         body[1]
     } else {
-        draw_terminal(frame, root[0], app.view(), selection);
-        root[0]
+        draw_terminal(frame, content_area, app.view(), selection);
+        content_area
     };
 
     draw_status(
         frame,
-        root[1],
+        status_area,
         app.view(),
         app.last_error(),
         pending_confirmation,
     );
     terminal_area
+}
+
+/// A single-row "update available" banner. Read-only for now: it names the
+/// newer version and where to get it. The in-app update action arrives in a
+/// later phase.
+fn draw_update_banner(frame: &mut ratatui::Frame<'_>, area: Rect, app: &LocalSessionApp) {
+    let text = format!(
+        "⬆ Update available: Triage {latest} (you have {current}) — github.com/hyeons-lab/triage/releases",
+        latest = app.latest_version().unwrap_or("a newer version"),
+        current = app.server_version(),
+    );
+    let banner = Paragraph::new(text).style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(banner, area);
 }
 
 fn draw_sidebar(

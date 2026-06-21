@@ -1,19 +1,24 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Duration;
 
 use anyhow::Result;
 use triage_core::session::{
     AttachMode, AttachSessionRequest, ClientId, CompletedSession, InputLeaseState,
-    ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEvent, SessionEventReceiver,
-    SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
-    WriteInputRequest,
+    ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi, SessionEvent,
+    SessionEventReceiver, SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow,
+    StyledRowsRequest, WriteInputRequest,
 };
 #[cfg(any(unix, windows))]
 use triaged::ipc::IpcClient;
 use triaged::session::{SessionManager, SessionManagerConfig};
 
 const MAX_EVENTS_PER_SESSION_TICK: usize = 256;
+
+/// How often the background poller re-queries the daemon for update status.
+/// The query is a blocking IPC round-trip, so it runs off the UI thread.
+const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionView {
@@ -32,6 +37,16 @@ pub struct LocalSessionApp {
     selected: usize,
     current_size: SessionSize,
     last_error: Option<String>,
+    /// Latest update status from the daemon (Phase 4 banner). Fetched once at
+    /// startup, then refreshed from `update_rx`; drives the read-only "update
+    /// available" banner. In embedded mode the daemon never polls, so this stays
+    /// not-available and no banner shows.
+    update: ServerUpdateInfo,
+    /// Fresh update status pushed by the background poller (IPC mode only). The
+    /// poll is a blocking round-trip, so it runs off the UI thread and the loop
+    /// drains this channel without ever blocking. `None` in embedded mode, where
+    /// status never changes.
+    update_rx: Option<Receiver<ServerUpdateInfo>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +69,12 @@ impl LocalSessionApp {
     #[cfg(any(unix, windows))]
     pub fn connect(socket_path: impl Into<PathBuf>, size: SessionSize) -> Result<Self> {
         let manager = IpcClient::new(socket_path);
-        Self::start_with_manager(Box::new(manager), size, false)
+        // The poller owns its own stateless client (each round-trip reconnects),
+        // so it can block on IPC without touching the UI thread's manager.
+        let update_rx = spawn_update_poller(manager.clone());
+        let mut app = Self::start_with_manager(Box::new(manager), size, false)?;
+        app.update_rx = Some(update_rx);
+        Ok(app)
     }
 
     fn start_with_log_dir(size: SessionSize, log_dir: PathBuf) -> Result<Self> {
@@ -83,6 +103,7 @@ impl LocalSessionApp {
             )?);
         }
 
+        let update = manager.server_update_info();
         let mut app = Self {
             manager,
             client_id,
@@ -91,9 +112,48 @@ impl LocalSessionApp {
             selected: 0,
             current_size: size,
             last_error: None,
+            update,
+            update_rx: None,
         };
         app.activate_selected_session();
         Ok(app)
+    }
+
+    /// Drain any update status pushed by the background poller. Returns `true`
+    /// when it changed (so the caller can trigger a redraw). Never blocks: the
+    /// blocking IPC round-trip happens on the poller thread, not here.
+    pub fn refresh_update_status(&mut self) -> bool {
+        let Some(rx) = self.update_rx.as_ref() else {
+            return false;
+        };
+        // Coalesce to the newest status; the poller only sends on change, but a
+        // burst could queue more than one.
+        let mut latest = None;
+        while let Ok(status) = rx.try_recv() {
+            latest = Some(status);
+        }
+        match latest {
+            Some(status) if status != self.update => {
+                self.update = status;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the daemon has seen a strictly newer stable release.
+    pub fn update_available(&self) -> bool {
+        self.update.update_available
+    }
+
+    /// The newest release version available, if any (normalized, no leading `v`).
+    pub fn latest_version(&self) -> Option<&str> {
+        self.update.latest_version.as_deref()
+    }
+
+    /// The running daemon's version.
+    pub fn server_version(&self) -> &str {
+        &self.update.server_version
     }
 
     pub fn create_session(&mut self, size: SessionSize) {
@@ -452,6 +512,39 @@ impl LocalSessionApp {
             self.last_error = None;
         }
     }
+}
+
+/// Poll the daemon's update status off the UI thread. The IPC round-trip can
+/// block (notably the Windows pipe-busy connect wait, which has no timeout), so
+/// a dedicated thread owns its own stateless `IpcClient` and pushes fresh status
+/// over the returned channel. The UI loop drains it via `try_recv`, so a stalled
+/// or unreachable daemon just leaves the banner unchanged instead of freezing
+/// the UI. The thread exits on its own when the receiver is dropped.
+#[cfg(any(unix, windows))]
+fn spawn_update_poller(client: IpcClient) -> Receiver<ServerUpdateInfo> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("triage-update-poller".to_string())
+        .spawn(move || {
+            let mut last: Option<ServerUpdateInfo> = None;
+            loop {
+                std::thread::sleep(UPDATE_POLL_INTERVAL);
+                let status = client.server_update_info();
+                if last.as_ref() == Some(&status) {
+                    continue;
+                }
+                if tx.send(status.clone()).is_err() {
+                    break; // UI gone; stop polling.
+                }
+                last = Some(status);
+            }
+        });
+    if let Err(error) = spawned {
+        // A missing poller just means no live refreshes; the startup fetch still
+        // populated the initial status. Not worth failing the whole TUI.
+        eprintln!("triage: could not start update poller: {error}");
+    }
+    rx
 }
 
 fn attach_existing_sessions(
@@ -1055,6 +1148,12 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
+            update_rx: None,
         };
 
         assert!(app.ensure_selected_styled_rows(2));
@@ -1096,6 +1195,12 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
+            update_rx: None,
         };
 
         assert!(app.ensure_selected_styled_rows(2));
@@ -1137,6 +1242,12 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
+            update_rx: None,
         };
 
         assert!(!app.ensure_selected_styled_rows(2));
@@ -1390,6 +1501,12 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
+            update_rx: None,
         };
 
         assert_eq!(app.close_selected_session(), CloseSessionOutcome::NotClosed);
@@ -1428,6 +1545,12 @@ mod tests {
             selected: 0,
             current_size: SessionSize::default(),
             last_error: Some("stale resize error".to_string()),
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
+            update_rx: None,
         };
 
         app.resize(new_size.clone());
