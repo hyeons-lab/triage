@@ -45,6 +45,13 @@ branch resolved from that cwd is wrong for all adopted sessions.
   `tempfile` is not a triaged dependency (only my new line referenced it).
   Switched to the existing `std::env::temp_dir().join(<unique>)` convention used
   elsewhere in the test module, with explicit `remove_dir_all` cleanup.
+- 2026-06-22T00:50-0300 PR #98 review (Copilot): the fallback assertion reused
+  the just-reaped child's pid, which a fast system could recycle into an
+  unrelated live process — flaky. Switched the fallback call to `u32::MAX` (a pid
+  that cannot exist on Linux/macOS), since the helper treats "exited" and
+  "unknown pid" identically. Also corrected the plan's lint command to the
+  documented `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  (it was missing `--` and `--all-features`); re-ran that exact command — clean.
 
 ## Plan
 
@@ -52,4 +59,5 @@ See `devlog/plans/000084-01-handover-live-cwd.md`.
 
 ## Commits
 
-- HEAD — fix(triaged): restore the live cwd of sessions adopted across a handover
+- 92be05f — fix(triaged): restore the live cwd of sessions adopted across a handover
+- HEAD — test(triaged): use a non-existent pid for the adopted-cwd fallback case

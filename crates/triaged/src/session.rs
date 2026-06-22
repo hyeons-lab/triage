@@ -4176,17 +4176,29 @@ mod tests {
             "the live process cwd must win over replayed/launch cwds",
         );
 
-        // Once the process exits, the live read fails and we fall back to the
-        // replayed cwd (OSC 7 log), then the launch cwd.
         child.kill().expect("kill live process");
         child.wait().expect("reap live process");
-        let fallback =
-            adopted_session_cwd(child.id(), Some(replayed_dir.clone()), Some(launch_dir.clone()))
-                .expect("a fallback cwd is resolved");
+
+        // When the live read fails we fall back to the replayed cwd (OSC 7 log),
+        // then the launch cwd. The helper treats "process exited" and "unknown
+        // pid" identically (`child_cwd(pid) == None`), so use a pid that cannot
+        // exist rather than the just-reaped one — a recycled pid could belong to
+        // an unrelated live process and make this flaky.
+        let dead_pid = u32::MAX;
+        assert!(
+            child_cwd(dead_pid).is_none(),
+            "u32::MAX must not map to a live process",
+        );
+        let fallback = adopted_session_cwd(
+            dead_pid,
+            Some(replayed_dir.clone()),
+            Some(launch_dir.clone()),
+        )
+        .expect("a fallback cwd is resolved");
         assert_eq!(
             std::fs::canonicalize(&fallback).expect("canonicalize fallback"),
             std::fs::canonicalize(&replayed_dir).expect("canonicalize replayed"),
-            "with the process gone, the replayed cwd is the next-best source",
+            "with no live process, the replayed cwd is the next-best source",
         );
 
         let _ = std::fs::remove_dir_all(&base);

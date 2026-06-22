@@ -48,8 +48,8 @@ process has since exited.
 3. Regression test with a real live process: a `sleep` in `live/` must win over
    distinct `replayed/` and `launch/` dirs; after the process is killed, the
    resolver falls back to `replayed/`.
-4. Validate: `cargo clippy --workspace --all-targets -D warnings` + `triaged`
-   test suite.
+4. Validate: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   (the documented lint command) + `triaged` test suite.
 
 Out of scope: the normal (non-handover) start path already spawns the shell at
 `config.cwd`, so its initial cwd is correct and the on-output poll keeps it
