@@ -18,7 +18,7 @@ For each release archive `Triage-…`, the `release` job in
 
 | Sidecar | Produced by | Verify with |
 | --- | --- | --- |
-| `<asset>.minisig` | `minisign -S` | `minisign -Vm <asset> -p minisign.pub` |
+| `<asset>.minisig` | `minisign -S` | `minisign -Vm <asset> -P <pinned public key>` |
 | `<asset>.sha256` | `sha256sum` | `sha256sum -c <asset>.sha256` |
 
 ## Public key

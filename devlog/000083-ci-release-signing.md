@@ -27,6 +27,10 @@ the loose private-key files sitting in the repo root.
 - 2026-06-21T14:56-0300 Removed the untracked `prism_release_signing`,
   `prism_release_signing.pub`, and `private-key.asc` from the main checkout's
   working tree (never committed; housekeeping, not part of the diff).
+- 2026-06-21T21:09-0300 `docs/release-signing.md` — PR #96 review (Copilot):
+  the scheme-table verify command used `-p minisign.pub`, inconsistent with the
+  worked example's `-P <base64 key>` form. Changed the table cell to
+  `-P <pinned public key>` so the doc uses one verification form throughout.
 
 ## Decisions
 
@@ -71,4 +75,5 @@ See `devlog/plans/000083-01-release-signing.md`.
 
 ## Commits
 
-- HEAD — ci(release): sign and checksum release assets with minisign
+- 089b045 — ci(release): sign and checksum release assets with minisign
+- HEAD — docs(release-signing): use one minisign verify form throughout
