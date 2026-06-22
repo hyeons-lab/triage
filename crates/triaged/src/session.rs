@@ -3161,6 +3161,18 @@ fn spawn_pty_runtime(
         command.cwd(cwd);
     }
     scrub_inherited_agent_session_env(&mut command);
+    // Pin TERM/COLORTERM to a standard, widely-supported terminal rather than
+    // leaking whatever the daemon launched with. portable_pty doesn't default
+    // TERM, so a headless daemon (login service, or one re-exec'd via handover)
+    // would otherwise spawn shells with an empty TERM. With no TERM, zsh's ZLE
+    // can't load terminfo, can't emit cursor-left to redraw, and renders a
+    // backspace as a literal space ("backspace adds a space"). xterm-256color is
+    // understood both by the server-side emulator (tattoy_wezterm_term) that
+    // ingests this output and by the clients that render the session, so it's the
+    // right value regardless of the daemon's own environment. Set after the scrub
+    // so these are authoritative.
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
 
     let child = pair
         .slave
@@ -4459,6 +4471,27 @@ mod tests {
         assert_eq!(response.output_seq, snapshot.output_seq);
         assert_eq!(response.start, 0);
         assert_eq!(response.rows.len(), end);
+        actor.shutdown().expect("shutdown session actor");
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    // Regression: a spawned shell must see TERM=xterm-256color regardless of the
+    // daemon's own environment. A headless daemon has an empty TERM, which left
+    // zsh unable to redraw on backspace (it rendered a backspace as a space). We
+    // pin TERM on the spawned command, so the shell reports it back here.
+    #[cfg(not(windows))]
+    #[test]
+    fn spawned_session_pins_term_for_the_client_emulator() {
+        let log_path = unique_log_path();
+        let mut config = SessionConfig::new("/bin/sh", log_path.clone());
+        // Print TERM with a delimiter so the assertion can't match a substring of
+        // some other value; run via the shell so $TERM is expanded by the child.
+        config.args = vec![
+            "-c".to_string(),
+            "printf 'TERM=<%s>\\r\\n' \"$TERM\"".to_string(),
+        ];
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+        wait_for_visible_marker(&actor, "TERM=<xterm-256color>");
         actor.shutdown().expect("shutdown session actor");
         let _ = std::fs::remove_file(log_path);
     }
