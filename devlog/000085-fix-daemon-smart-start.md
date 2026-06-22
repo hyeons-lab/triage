@@ -10,7 +10,7 @@ and fix.
 
 ## Research & Discoveries
 
-- 2026-06-21T20:10-03:00 — The daemon runs as a macOS LaunchAgent
+- 2026-06-21T20:10-0300 — The daemon runs as a macOS LaunchAgent
   (`~/Library/LaunchAgents/com.hyeons-lab.triaged.plist`) with `KeepAlive: true`,
   so launchd respawns it on every exit. The handover timestamps in the daemon
   log come in pairs ~12–14s apart (e.g. 18:28:16 then 18:28:30), one per manual
@@ -33,7 +33,7 @@ and fix.
 
 ## Decisions
 
-- 2026-06-21T20:30-03:00 — Make startup "smart": decide handover vs fresh by
+- 2026-06-21T20:30-0300 — Make startup "smart": decide handover vs fresh by
   probing whether a *live* daemon already owns the socket, not by the
   `--handover` flag. Live socket → hand over (adopt, zero session loss). No live
   socket → start fresh (so `--handover` no longer bails, killing the crash-loop;
@@ -42,11 +42,22 @@ and fix.
 
 ## What Changed
 
-- 2026-06-21T20:30-03:00 `crates/triaged/src/main.rs` — replaced the rigid
+- 2026-06-21T20:30-0300 `crates/triaged/src/main.rs` — replaced the rigid
   `if is_handover { handover-or-bail }` block with a liveness-probe-driven
-  decision; added `is_live_daemon_socket()` (connect probe). `--handover` is now
-  a no-op hint (a warning when requested with no daemon to adopt). Windows still
-  rejects `--handover` explicitly.
+  decision. `--handover` is now a no-op hint (a warning when requested with no
+  daemon to adopt). Windows still rejects `--handover` explicitly.
+- 2026-06-22T00:50-0300 `crates/triaged/src/main.rs` — (PR #97 review) replaced
+  the boolean `is_live_daemon_socket` with `probe_daemon_socket` →
+  `DaemonSocketState { Live, Absent, Unverifiable }`, mirroring
+  `bind_owner_socket`'s error-kind handling: `ConnectionRefused`/`NotFound` is
+  `Absent` (stale), an unexpected connect error is `Unverifiable` (warn, treated
+  as live so we don't proceed under an unvalidated assumption). Handover failure
+  now falls back to a fresh start instead of aborting launch.
+- 2026-06-22T00:50-0300 `crates/triaged/src/handover.rs` — (PR #97 review) set a
+  10s read timeout on the handover client stream before `recv_fds`, so a hung
+  daemon or a non-triaged process squatting on the socket can't block startup
+  forever; the caller falls back to a fresh start on timeout. Verified with an
+  isolated socket squatter (exits in ~10s instead of hanging).
 
 ## Issues
 

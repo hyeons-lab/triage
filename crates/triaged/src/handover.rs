@@ -192,6 +192,15 @@ mod unix_impl {
     pub fn perform_handover_client(socket_path: &Path) -> Result<()> {
         let stream =
             UnixStream::connect(socket_path).context("connecting to running daemon Unix socket")?;
+        // Bound the wait on the old daemon's response. The smart-start launch
+        // path adopts any *live* socket, so a hung daemon — or a non-triaged
+        // process squatting on the socket path — must not block startup forever
+        // (recv_fds would otherwise wait on recvmsg/read_exact with no deadline).
+        // On timeout recv_fds returns an error and the caller falls back to a
+        // fresh start. complete_handover_adoption sets its own timeout later.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .context("setting handover client read timeout")?;
 
         let request_str = "{\"Handover\":null}\n";
         {
