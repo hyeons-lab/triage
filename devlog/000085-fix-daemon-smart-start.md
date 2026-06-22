@@ -1,4 +1,4 @@
-# 000084 — fix/daemon-smart-start
+# 000085 — fix/daemon-smart-start
 
 **Agent:** Claude (claude-opus-4-8) @ triage branch fix/daemon-smart-start
 
