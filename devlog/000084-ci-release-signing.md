@@ -1,4 +1,4 @@
-# 000083 — Release signing (Phase 0b)
+# 000084 — Release signing (Phase 0b)
 
 **Agent:** Claude (claude-opus-4-8) @ triage branch ci/release-signing
 
@@ -63,7 +63,7 @@ the loose private-key files sitting in the repo root.
 
 ## Plan
 
-See `devlog/plans/000083-01-release-signing.md`.
+See `devlog/plans/000084-01-release-signing.md`.
 
 ## Next Steps
 

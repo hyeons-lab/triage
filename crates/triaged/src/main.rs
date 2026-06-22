@@ -14,6 +14,53 @@ fn main() -> anyhow::Result<()> {
     run()
 }
 
+/// Whether a daemon already owns the IPC socket, used to decide adopt-vs-fresh
+/// at launch.
+#[cfg(unix)]
+enum DaemonSocketState {
+    /// A process is accepting connections on the socket — adopt it via handover.
+    Live,
+    /// No socket, or a stale one (connection refused / not found) that
+    /// `bind_owner_socket` will clear — start fresh.
+    Absent,
+    /// The socket exists but couldn't be probed (e.g. a permission/IO error).
+    /// We can't prove nothing is there, so treat it like `Live` rather than risk
+    /// clobbering a running daemon; the handover path falls back to a fresh start
+    /// if nothing actually answers.
+    Unverifiable,
+}
+
+/// Probe the IPC socket without committing to a handover. Mirrors
+/// `bind_owner_socket`'s error-kind handling: a refused/missing socket is stale
+/// (not live), while an unexpected connect error is reported as `Unverifiable`
+/// rather than silently treated as "no daemon".
+#[cfg(unix)]
+fn probe_daemon_socket(socket_path: &std::path::Path) -> DaemonSocketState {
+    use std::io::ErrorKind;
+    if !socket_path.exists() {
+        return DaemonSocketState::Absent;
+    }
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => DaemonSocketState::Live,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            DaemonSocketState::Absent
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                socket_path = %socket_path.display(),
+                "could not probe daemon socket; assuming a daemon is present"
+            );
+            DaemonSocketState::Unverifiable
+        }
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -30,23 +77,52 @@ fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut has_inherited_sessions = false;
 
-    if is_handover {
-        #[cfg(unix)]
-        {
-            let socket_path = default_socket_path();
-            if socket_path.exists() {
-                tracing::info!(socket_path = %socket_path.display(), "initiating zero-downtime process handover");
-                triaged::handover::perform_handover_client(&socket_path)?;
-                has_inherited_sessions = true;
-            } else {
-                anyhow::bail!(
-                    "No running daemon socket found at {}. Start the daemon normally first.",
-                    socket_path.display()
+    // Decide whether to adopt a running daemon. Handover is the right move
+    // whenever a *live* daemon already owns the socket — regardless of whether
+    // `--handover` was passed. Keying off "is one actually running?" rather than
+    // the flag is what makes the daemon safe to run under a KeepAlive supervisor
+    // (the launchd LaunchAgent / systemd unit):
+    //   - Cold start, nothing running: start fresh. `--handover` no longer bails
+    //     ("No running daemon socket found"), so a KeepAlive respawn after the
+    //     last daemon exits can't crash-loop.
+    //   - A live daemon already owns the socket: hand over (zero session loss)
+    //     instead of bailing "already in use", so a supervised respawn doesn't
+    //     fight an in-flight manual deploy.
+    #[cfg(unix)]
+    {
+        let socket_path = default_socket_path();
+        match probe_daemon_socket(&socket_path) {
+            DaemonSocketState::Live | DaemonSocketState::Unverifiable => {
+                tracing::info!(
+                    socket_path = %socket_path.display(),
+                    "existing daemon detected; initiating zero-downtime process handover"
                 );
+                // The handover client bounds its own wait; if the peer never
+                // completes the protocol (a hung daemon, or a non-triaged process
+                // on the socket), fall back to a fresh start rather than aborting
+                // launch. A fresh start that then finds the socket genuinely held
+                // will fail to bind with a clear error.
+                match triaged::handover::perform_handover_client(&socket_path) {
+                    Ok(()) => has_inherited_sessions = true,
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "handover to existing daemon failed; starting fresh"
+                    ),
+                }
+            }
+            DaemonSocketState::Absent => {
+                if is_handover {
+                    tracing::warn!(
+                        socket_path = %socket_path.display(),
+                        "--handover requested but no running daemon found; starting fresh"
+                    );
+                }
             }
         }
-        #[cfg(not(unix))]
-        {
+    }
+    #[cfg(not(unix))]
+    {
+        if is_handover {
             anyhow::bail!(
                 "Zero-downtime process handover is only supported on Unix-like operating systems (including Linux and WSL). Please use Session Restore on Windows."
             );
