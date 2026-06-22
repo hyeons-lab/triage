@@ -16,3 +16,16 @@ worktrees/
 
 # Triage daemon pre-built web client assets
 /crates/triaged/dist/
+
+# Signing key material — never commit private keys. The release-signing private
+# key lives only in the MINISIGN_SECRET_KEY GitHub Actions secret; the public
+# key is committed at .github/minisign.pub (allowlisted below).
+*.key
+*.asc
+*.pem
+*_signing
+*_signing.pub
+minisign.key
+*.minisign.key
+# Keep the committed release-signing public key (it is meant to be public).
+!.github/minisign.pub
