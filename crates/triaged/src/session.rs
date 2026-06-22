@@ -1128,7 +1128,8 @@ fn spawn_adopted_pty_runtime(
     } else {
         output.replay(&replay)?
     };
-    let current_working_directory = restorable_cwd(replayed_working_directory, h_sess.cwd.clone());
+    let current_working_directory =
+        adopted_session_cwd(h_sess.pid, replayed_working_directory, h_sess.cwd.clone());
 
     Ok(PtyRuntime {
         master,
@@ -1891,6 +1892,26 @@ fn restorable_cwd(
         .into_iter()
         .flatten()
         .find(|path| path.is_dir())
+}
+
+/// Resolve the working directory for a session adopted across a handover.
+///
+/// The adopted process is still alive under `pid`, so its real cwd is read
+/// straight from the kernel and preferred above everything else. This is the
+/// only source that reflects a `cd` made in a shell that never emits OSC 7 (zsh,
+/// fish, …): `replayed_working_directory` comes from replaying OSC 7 reports in
+/// the session log, and `launch_cwd` is the *original* launch directory. Without
+/// the live read, a handover-restored non-OSC-7 session comes back pinned to its
+/// launch directory — so the side rail shows the launch branch (typically the
+/// repo's default branch) for every adopted session until it next emits output.
+/// Falls back to the replayed cwd, then the launch cwd, if the process has since
+/// exited or its cwd is unreadable.
+fn adopted_session_cwd(
+    pid: u32,
+    replayed_working_directory: Option<PathBuf>,
+    launch_cwd: Option<PathBuf>,
+) -> Option<PathBuf> {
+    restorable_cwd(child_cwd(pid).or(replayed_working_directory), launch_cwd)
 }
 
 fn replace_manifest(temp_path: &Path, manifest_path: &Path) -> Result<()> {
@@ -4113,6 +4134,62 @@ mod tests {
             std::fs::canonicalize(&got).expect("canonicalize got"),
             std::fs::canonicalize(&expected).expect("canonicalize expected"),
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn adopted_session_cwd_prefers_the_live_process_over_replay_and_launch() {
+        // Regression: a session adopted across a handover whose shell never
+        // emits OSC 7 must come back at its *current* cwd, not the launch dir.
+        // Model the three candidate sources with three distinct directories and
+        // a real live process sitting in the "current" one.
+        let base = std::env::temp_dir().join(format!(
+            "triage-adopted-cwd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let live_dir = base.join("live");
+        let replayed_dir = base.join("replayed");
+        let launch_dir = base.join("launch");
+        for dir in [&live_dir, &replayed_dir, &launch_dir] {
+            std::fs::create_dir_all(dir).expect("create candidate dir");
+        }
+
+        // A long-lived child whose working directory is `live_dir`.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&live_dir)
+            .spawn()
+            .expect("spawn live process");
+        // Give the kernel a moment to settle the new process's cwd.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let resolved = adopted_session_cwd(
+            child.id(),
+            Some(replayed_dir.clone()),
+            Some(launch_dir.clone()),
+        )
+        .expect("a cwd is resolved");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).expect("canonicalize resolved"),
+            std::fs::canonicalize(&live_dir).expect("canonicalize live"),
+            "the live process cwd must win over replayed/launch cwds",
+        );
+
+        // Once the process exits, the live read fails and we fall back to the
+        // replayed cwd (OSC 7 log), then the launch cwd.
+        child.kill().expect("kill live process");
+        child.wait().expect("reap live process");
+        let fallback =
+            adopted_session_cwd(child.id(), Some(replayed_dir.clone()), Some(launch_dir.clone()))
+                .expect("a fallback cwd is resolved");
+        assert_eq!(
+            std::fs::canonicalize(&fallback).expect("canonicalize fallback"),
+            std::fs::canonicalize(&replayed_dir).expect("canonicalize replayed"),
+            "with the process gone, the replayed cwd is the next-best source",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
