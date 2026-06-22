@@ -3161,15 +3161,16 @@ fn spawn_pty_runtime(
         command.cwd(cwd);
     }
     scrub_inherited_agent_session_env(&mut command);
-    // Pin TERM/COLORTERM to the client's emulator rather than leaking whatever
-    // the daemon launched with. portable_pty doesn't default TERM, so a headless
-    // daemon (login service, or one re-exec'd via handover) would otherwise spawn
-    // shells with an empty TERM. With no TERM, zsh's ZLE can't load terminfo,
-    // can't emit cursor-left to redraw, and renders a backspace as a literal
-    // space ("backspace adds a space"). The client always renders through
-    // xterm.dart, which is xterm-256color/truecolor class, so that is the correct
-    // terminal regardless of the daemon's own environment. Set after the scrub so
-    // these are authoritative.
+    // Pin TERM/COLORTERM to a standard, widely-supported terminal rather than
+    // leaking whatever the daemon launched with. portable_pty doesn't default
+    // TERM, so a headless daemon (login service, or one re-exec'd via handover)
+    // would otherwise spawn shells with an empty TERM. With no TERM, zsh's ZLE
+    // can't load terminfo, can't emit cursor-left to redraw, and renders a
+    // backspace as a literal space ("backspace adds a space"). xterm-256color is
+    // understood both by the server-side emulator (tattoy_wezterm_term) that
+    // ingests this output and by the clients that render the session, so it's the
+    // right value regardless of the daemon's own environment. Set after the scrub
+    // so these are authoritative.
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
