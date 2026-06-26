@@ -146,6 +146,11 @@ fn run() -> anyhow::Result<()> {
     // on first activity, so this never blocks startup). No-op when disabled.
     manager.start_summarizer(config.summarizer.clone());
 
+    // Start recording each live session's working directory into the manifest as
+    // it changes, so a daemon kill restores sessions where they left off rather
+    // than at their launch dir. Always on, independent of the summarizer.
+    manager.start_cwd_persistence();
+
     // Start the background update check (on by default). Polls the release host
     // for a newer tag via `git ls-remote`; failures are silent and never block
     // startup. No-op when `[update] check` is false.

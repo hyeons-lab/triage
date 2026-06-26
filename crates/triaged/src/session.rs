@@ -235,7 +235,18 @@ pub struct SessionManager {
     /// `update_available` also pushes a connection-wide notice. Starts as the
     /// running version with no `latest` until the first poll completes.
     update_status: Arc<RwLock<crate::update::UpdateStatus>>,
+    /// Sender handed to session actors so they report working-directory changes
+    /// to the cwd-persistence thread, which records the live cwd into the
+    /// on-disk manifest. Unlike [`Self::dirty_tx`] this is wired up
+    /// unconditionally (`start_cwd_persistence`), independent of the summarizer,
+    /// so a daemon kill can restore a session into the directory it was last in.
+    /// `None` until `start_cwd_persistence` runs (e.g. in tests).
+    cwd_update_tx: Mutex<Option<CwdUpdateSender>>,
 }
+
+/// Channel an actor uses to report a working-directory change to the manager's
+/// cwd-persistence thread: `(session_id, new_cwd)`.
+type CwdUpdateSender = std::sync::mpsc::Sender<(SessionId, PathBuf)>;
 
 /// Shared list of per-connection global push channels. Cloned (cheaply, by
 /// `Arc`) into managed session actors so they can broadcast context updates as a
@@ -312,11 +323,22 @@ struct PendingPairingPin {
     expires_at: Instant,
 }
 
+// The `Live` variant intentionally carries the live actor plus its launch
+// metadata and last-known cwd for the session's whole lifetime; only a handful
+// of these are ever held (one per session) and they coexist with `Historical`,
+// so boxing fields to shrink the variant difference would add indirection for no
+// real memory win.
+#[allow(clippy::large_enum_variant)]
 enum ManagedSession {
     Live {
         actor: SessionActor,
         lease: InputLeaseState,
         launch: PersistedSessionLaunch,
+        /// The session's most recently observed working directory, kept fresh by
+        /// the actor (via the cwd-update channel). Persisted into the manifest so
+        /// a daemon kill restores the session here rather than at its launch dir.
+        /// Seeded from the launch/restored cwd; `None` until first known.
+        last_known_cwd: Option<PathBuf>,
     },
     Historical {
         session: Box<HistoricalSession>,
@@ -351,6 +373,13 @@ struct PersistedSession {
     size: SessionSize,
     log_path: PathBuf,
     exited: bool,
+    /// The session's last observed live working directory, tracked while it ran
+    /// and recorded here so a daemon kill restores it into that directory rather
+    /// than its launch dir. `cwd` above is the *launch* directory and never
+    /// changes; this follows the shell. Defaults to `None` for manifests written
+    /// before this field existed.
+    #[serde(default)]
+    last_known_cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +413,7 @@ impl PersistedSessionLaunch {
             size: self.size,
             log_path: self.log_path,
             exited,
+            last_known_cwd: None,
         }
     }
 }
@@ -419,6 +449,7 @@ impl SessionManager {
             dirty_tx: Mutex::new(None),
             global_senders: Arc::new(Mutex::new(Vec::new())),
             update_status: Arc::new(RwLock::new(crate::update::UpdateStatus::current())),
+            cwd_update_tx: Mutex::new(None),
         }
     }
 
@@ -431,6 +462,81 @@ impl SessionManager {
     /// until the summarizer is started (or if it is disabled).
     fn dirty_tx(&self) -> Option<DirtySender> {
         self.dirty_tx.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Clones the cwd-update sender handed to new session actors. `None` until
+    /// `start_cwd_persistence` runs (e.g. in tests that never start it).
+    fn cwd_update_tx(&self) -> Option<CwdUpdateSender> {
+        self.cwd_update_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Spawns the cwd-persistence thread: it records each live session's
+    /// working directory into the on-disk manifest as it changes, so a daemon
+    /// kill (which also kills the child shells) can restore a session into the
+    /// directory it was last in rather than the launch dir / `~`. Wired up
+    /// unconditionally at startup, independent of the summarizer.
+    ///
+    /// Updates are coalesced over `CWD_PERSIST_SETTLE` so a burst of `cd`s
+    /// collapses into a single manifest rewrite rather than one per directory —
+    /// mirroring the summarizer's `run_debounce_loop`. Idempotent: a second call
+    /// is a no-op (it does not spawn a second thread or swap the sender), so live
+    /// actors that captured the original sender keep reporting to the one loop.
+    pub fn start_cwd_persistence(self: &Arc<Self>) {
+        let rx = {
+            let Ok(mut guard) = self.cwd_update_tx.lock() else {
+                return;
+            };
+            if guard.is_some() {
+                return; // already started
+            }
+            let (tx, rx) = mpsc::channel::<(SessionId, PathBuf)>();
+            *guard = Some(tx);
+            rx
+        };
+        let weak = Arc::downgrade(self);
+        if let Err(error) = thread::Builder::new()
+            .name("triage-cwd-persistence".into())
+            .spawn(move || run_cwd_persistence_loop(weak, rx))
+        {
+            tracing::error!(%error, "failed to spawn cwd-persistence thread");
+            // Roll back so a retry can spawn the thread rather than seeing a
+            // sender with no loop draining it.
+            if let Ok(mut guard) = self.cwd_update_tx.lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    /// Applies a coalesced batch of working-directory updates and persists the
+    /// manifest at most once. No-op unless at least one live session's cwd
+    /// actually changed. Holds the global `sessions` lock across the manifest
+    /// write (like the lifecycle persisters); the debounce keeps this to roughly
+    /// one write per [`CWD_PERSIST_SETTLE`] even under a `cd` storm.
+    fn flush_cwd_updates(&self, updates: HashMap<SessionId, PathBuf>) {
+        if updates.is_empty() {
+            return;
+        }
+        let Ok(mut sessions) = self.sessions() else {
+            return;
+        };
+        let mut changed = false;
+        for (session_id, cwd) in updates {
+            if let Some(ManagedSession::Live { last_known_cwd, .. }) = sessions.get_mut(&session_id)
+                && last_known_cwd.as_deref() != Some(cwd.as_path())
+            {
+                *last_known_cwd = Some(cwd);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        if let Err(error) = self.persist_manifest(&sessions) {
+            tracing::warn!(error = ?error, "failed to persist live cwd updates");
+        }
     }
 
     /// Cheap visible-rows snapshot for the summarizer. Clones the live actor's
@@ -762,12 +868,18 @@ impl SessionManager {
     fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
         // Phase 1 (brief lock): grab the actor command channel + launch of a
         // `Live` session, without doing the actor round-trip under the lock.
-        let (cmd_tx, launch) = {
+        let (cmd_tx, launch, last_known_cwd) = {
             let sessions = self.sessions()?;
-            let Some(ManagedSession::Live { actor, launch, .. }) = sessions.get(session_id) else {
+            let Some(ManagedSession::Live {
+                actor,
+                launch,
+                last_known_cwd,
+                ..
+            }) = sessions.get(session_id)
+            else {
                 return Ok(());
             };
-            (actor.tx.clone(), launch.clone())
+            (actor.tx.clone(), launch.clone(), last_known_cwd.clone())
         };
 
         // Off-lock: only a cleanly-exited actor is a demote candidate. A snapshot
@@ -780,7 +892,11 @@ impl SessionManager {
 
         // Only restorable shells can be re-spawned; don't reap a non-restorable
         // session's actor and downgrade it for a restore that would bail anyway.
-        let persisted = launch.into_persisted(session_id.clone(), true);
+        let mut persisted = launch.into_persisted(session_id.clone(), true);
+        // Preserve the live-tracked cwd across the demotion: `into_persisted`
+        // only carries the launch dir, so without this an exit-then-restore would
+        // overwrite the persisted cwd with `None` and re-spawn at the launch dir.
+        persisted.last_known_cwd = last_known_cwd;
         if !is_restorable_shell_launch(&persisted) {
             return Ok(());
         }
@@ -930,6 +1046,10 @@ impl SessionManager {
                 actor,
                 lease: _,
                 launch,
+                // The adopted process stays alive across a handover, so the new
+                // daemon reads its live cwd directly (see `adopted_session_cwd`);
+                // no need to carry `last_known_cwd` through the handover state.
+                last_known_cwd: _,
             } = managed
             {
                 let (tx, rx) = mpsc::channel();
@@ -1015,6 +1135,7 @@ impl SessionManager {
 
             let event_session_id = Some(h_sess.id.clone());
             let dirty_tx = self.dirty_tx();
+            let cwd_update_tx = self.cwd_update_tx();
             let global_senders = Some(self.global_senders());
 
             let PtyRuntime {
@@ -1032,6 +1153,7 @@ impl SessionManager {
                 .or_else(|| h_sess.cwd.clone())
                 .or_else(|| std::env::current_dir().ok());
             let initial_context = resolve_session_context(initial_working_directory.as_ref());
+            let last_known_cwd = initial_working_directory.clone();
 
             let (command_tx, command_rx) = mpsc::channel();
             let (output_tx, output_rx) = mpsc::sync_channel(64);
@@ -1058,10 +1180,15 @@ impl SessionManager {
                         context: initial_context,
                         event_session_id,
                         dirty_tx,
+                        cwd_update_tx,
                         global_senders,
                         context_resend_pending: false,
                         shell_reports_cwd: false,
-                        last_cwd_poll: None,
+                        // Throttle the cwd poll from spawn so the idle refresh
+                        // doesn't fire before the session has settled (and races
+                        // the initial snapshot); the first poll runs one interval
+                        // in. Output-driven polling is gated by the same field.
+                        last_cwd_poll: Some(Instant::now()),
                         subscribers: Vec::new(),
                         event_log: VecDeque::new(),
                         next_event_seq: 1,
@@ -1082,6 +1209,7 @@ impl SessionManager {
                     actor,
                     lease: InputLeaseState::default(),
                     launch,
+                    last_known_cwd,
                 },
             );
         }
@@ -1128,8 +1256,12 @@ fn spawn_adopted_pty_runtime(
     } else {
         output.replay(&replay)?
     };
-    let current_working_directory =
-        adopted_session_cwd(h_sess.pid, replayed_working_directory, h_sess.cwd.clone());
+    let current_working_directory = adopted_session_cwd(
+        h_sess.pid,
+        pty_foreground_pgid(fd),
+        replayed_working_directory,
+        h_sess.cwd.clone(),
+    );
 
     Ok(PtyRuntime {
         master,
@@ -1146,7 +1278,15 @@ fn spawn_adopted_pty_runtime(
 impl ManagedSession {
     fn persisted(&self, session_id: SessionId) -> PersistedSession {
         match self {
-            Self::Live { launch, .. } => launch.clone().into_persisted(session_id, false),
+            Self::Live {
+                launch,
+                last_known_cwd,
+                ..
+            } => {
+                let mut persisted = launch.clone().into_persisted(session_id, false);
+                persisted.last_known_cwd = last_known_cwd.clone();
+                persisted
+            }
             Self::Historical { session, .. } => session.persisted.clone(),
             Self::Restoring { session, .. } => session.persisted.clone(),
         }
@@ -1181,10 +1321,12 @@ impl SessionApi for SessionManager {
             log_path,
         };
         let launch = PersistedSessionLaunch::from(&config);
+        let last_known_cwd = launch.cwd.clone();
         let actor = SessionActor::spawn_managed(
             config,
             session_id.clone(),
             self.dirty_tx(),
+            self.cwd_update_tx(),
             Some(self.global_senders()),
         )?;
 
@@ -1195,6 +1337,7 @@ impl SessionApi for SessionManager {
                 actor,
                 lease: InputLeaseState::default(),
                 launch,
+                last_known_cwd,
             },
         );
         if let Err(error) = self.persist_manifest(&sessions) {
@@ -1421,10 +1564,12 @@ impl SessionApi for SessionManager {
             log_path: persisted.log_path.clone(),
         };
         let launch = PersistedSessionLaunch::from(&config);
+        let last_known_cwd = launch.cwd.clone();
         let actor = match SessionActor::spawn_restored(
             config,
             request.session_id.clone(),
             self.dirty_tx(),
+            self.cwd_update_tx(),
             Some(self.global_senders()),
         ) {
             Ok(actor) => actor,
@@ -1458,6 +1603,7 @@ impl SessionApi for SessionManager {
                 actor,
                 lease: InputLeaseState::default(),
                 launch,
+                last_known_cwd,
             },
         );
         if let Err(error) = self.persist_manifest(&sessions) {
@@ -1654,6 +1800,59 @@ pub fn default_model_cache_dir() -> PathBuf {
 struct PendingDirty {
     last_output_seq: u64,
     last_tick_at: Instant,
+}
+
+/// Coalescing window for [`SessionManager::flush_cwd_updates`]: working-directory
+/// changes that land within this window of the first pending change are written
+/// to the manifest in a single rewrite, bounding both disk churn and how long
+/// the `sessions` lock is held for cwd persistence under a `cd` storm.
+const CWD_PERSIST_SETTLE: Duration = Duration::from_millis(500);
+
+/// Drains the cwd-update channel, coalescing a burst of changes within one
+/// [`CWD_PERSIST_SETTLE`] window into a single [`SessionManager::flush_cwd_updates`]
+/// call. Runs on its own thread; exits when the manager is dropped or every
+/// sender (the manager's plus all live actors' clones) has been dropped.
+fn run_cwd_persistence_loop(
+    manager: std::sync::Weak<SessionManager>,
+    rx: Receiver<(SessionId, PathBuf)>,
+) {
+    loop {
+        // Block for the first change of a batch.
+        let mut pending: HashMap<SessionId, PathBuf> = HashMap::new();
+        match rx.recv() {
+            Ok((session_id, cwd)) => {
+                pending.insert(session_id, cwd);
+            }
+            Err(_) => return, // all senders dropped
+        }
+        // Coalesce everything that arrives within one settle window of the first
+        // change, then flush once. The window is measured from the first change
+        // (not reset per message), so a sustained storm still flushes every
+        // `CWD_PERSIST_SETTLE` rather than starving.
+        let deadline = Instant::now() + CWD_PERSIST_SETTLE;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok((session_id, cwd)) => {
+                    pending.insert(session_id, cwd);
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(manager) = manager.upgrade() {
+                        manager.flush_cwd_updates(pending);
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(manager) = manager.upgrade() else {
+            return;
+        };
+        manager.flush_cwd_updates(pending);
+    }
 }
 
 /// Debounce loop: receives [`DirtyTick`]s from session actors and, once a
@@ -1894,24 +2093,42 @@ fn restorable_cwd(
         .find(|path| path.is_dir())
 }
 
+/// Read the foreground process group id of a PTY from its master fd. Returns
+/// the pgid (which equals the group leader's pid) when the terminal reports a
+/// foreground group, else `None`. Shared by the live actor
+/// ([`ActorState::foreground_pgid`]) and handover adoption.
+#[cfg(unix)]
+fn pty_foreground_pgid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+    // SAFETY: the caller passes a live PTY master fd.
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
 /// Resolve the working directory for a session adopted across a handover.
 ///
-/// The adopted process is still alive under `pid`, so its real cwd is read
-/// straight from the kernel and preferred above everything else. This is the
-/// only source that reflects a `cd` made in a shell that never emits OSC 7 (zsh,
-/// fish, …): `replayed_working_directory` comes from replaying OSC 7 reports in
-/// the session log, and `launch_cwd` is the *original* launch directory. Without
-/// the live read, a handover-restored non-OSC-7 session comes back pinned to its
-/// launch directory — so the side rail shows the launch branch (typically the
-/// repo's default branch) for every adopted session until it next emits output.
-/// Falls back to the replayed cwd, then the launch cwd, if the process has since
-/// exited or its cwd is unreadable.
+/// The adopted process is still alive, so its real cwd is read straight from the
+/// kernel and preferred above everything else. `foreground_pgid` is the PTY's
+/// foreground process group leader — the same source the live actor polls — so a
+/// `cd` made in a nested shell or agent is recovered immediately; it falls back
+/// to `pid` (the direct PTY child) when the foreground group is unreadable. This
+/// kernel read is the only source that reflects a `cd` in a shell that never
+/// emits OSC 7 (zsh, fish, …): `replayed_working_directory` comes from replaying
+/// OSC 7 reports in the session log, and `launch_cwd` is the *original* launch
+/// directory. Without it, a handover-restored non-OSC-7 session comes back
+/// pinned to its launch directory — so the side rail shows the launch branch
+/// (typically the repo's default branch) until it next emits output. Falls back
+/// to the replayed cwd, then the launch cwd, if the process has since exited or
+/// its cwd is unreadable.
 fn adopted_session_cwd(
     pid: u32,
+    foreground_pgid: Option<u32>,
     replayed_working_directory: Option<PathBuf>,
     launch_cwd: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    restorable_cwd(child_cwd(pid).or(replayed_working_directory), launch_cwd)
+    let live = foreground_pgid
+        .and_then(child_cwd)
+        .or_else(|| child_cwd(pid));
+    restorable_cwd(live.or(replayed_working_directory), launch_cwd)
 }
 
 fn replace_manifest(temp_path: &Path, manifest_path: &Path) -> Result<()> {
@@ -2002,14 +2219,37 @@ impl HistoricalSession {
     fn restore(persisted: PersistedSession) -> Result<Self> {
         let size = persisted.size.clone();
         let mut output = output_state_for_log(&persisted.log_path, persisted.size.clone())?;
-        let mut current_working_directory = persisted.cwd.clone();
         let log = fs::read(&persisted.log_path)
             .with_context(|| format!("reading session log {}", persisted.log_path.display()))?;
-        if !log.is_empty()
-            && let Some(cwd) = output.replay(&log)?
-        {
-            current_working_directory = Some(cwd);
-        }
+        // Always replay to rebuild the terminal screen; its OSC 7 cwd result is a
+        // by-product used as one cwd candidate below.
+        let replayed_cwd = if log.is_empty() {
+            None
+        } else {
+            output.replay(&log)?
+        };
+        // Choose the cwd by precedence, validating each so a removed worktree
+        // falls through to the next candidate (rather than surfacing a dead path
+        // / losing git context in the side rail for a never-restored session):
+        //   1. last_known_cwd — the foreground-process-group cwd tracked while
+        //      live. The most authoritative source: it reflects a `cd` made in a
+        //      nested shell or agent, and is the only one for shells that never
+        //      emit OSC 7 (zsh, fish), where the replay recovers nothing.
+        //   2. replayed OSC 7 cwd — the *login shell's* last reported dir (bash).
+        //      A fallback for older manifests with no last_known_cwd. It is NOT
+        //      preferred over last_known_cwd: being the login shell's, it can lag
+        //      behind work done in a nested subshell (the exact bug this fixes).
+        //   3. launch dir — last resort.
+        // The live-restore path applies the same `is_dir` filter via
+        // `restorable_cwd`.
+        let current_working_directory = [
+            persisted.last_known_cwd.clone(),
+            replayed_cwd,
+            persisted.cwd.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_dir());
         let context = resolve_session_context(current_working_directory.as_ref());
         Ok(Self {
             persisted,
@@ -2066,19 +2306,21 @@ impl HistoricalSession {
 
 impl SessionActor {
     pub fn spawn(config: SessionConfig) -> Result<Self> {
-        Self::spawn_with_events(config, None, None, None, LogInitialization::Truncate)
+        Self::spawn_with_events(config, None, None, None, None, LogInitialization::Truncate)
     }
 
     fn spawn_managed(
         config: SessionConfig,
         session_id: SessionId,
         dirty_tx: Option<DirtySender>,
+        cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
             Some(session_id),
             dirty_tx,
+            cwd_update_tx,
             global_senders,
             LogInitialization::Truncate,
         )
@@ -2088,12 +2330,14 @@ impl SessionActor {
         config: SessionConfig,
         session_id: SessionId,
         dirty_tx: Option<DirtySender>,
+        cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
             Some(session_id),
             dirty_tx,
+            cwd_update_tx,
             global_senders,
             LogInitialization::ReplayExisting,
         )
@@ -2103,6 +2347,7 @@ impl SessionActor {
         config: SessionConfig,
         event_session_id: Option<SessionId>,
         dirty_tx: Option<DirtySender>,
+        cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
         log_initialization: LogInitialization,
     ) -> Result<Self> {
@@ -2144,10 +2389,14 @@ impl SessionActor {
                     context: initial_context,
                     event_session_id,
                     dirty_tx,
+                    cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
                     shell_reports_cwd: false,
-                    last_cwd_poll: None,
+                    // Throttle the cwd poll from spawn so the idle refresh doesn't
+                    // fire before the session has settled (and races the initial
+                    // snapshot); the first poll runs one interval in.
+                    last_cwd_poll: Some(Instant::now()),
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
@@ -2311,6 +2560,11 @@ struct ActorState {
     /// When set, the actor reports output activity here so the summarizer can
     /// (re)generate this session's snippet once its output settles.
     dirty_tx: Option<DirtySender>,
+    /// When set (managed sessions), the actor reports working-directory changes
+    /// here so the manager records the live cwd into the on-disk manifest,
+    /// letting a daemon kill restore the session where it left off. `None` for
+    /// unmanaged/test actors. Sent only on an actual change.
+    cwd_update_tx: Option<CwdUpdateSender>,
     /// When set (managed sessions), the actor broadcasts a
     /// [`ServerMessage::SessionContextUpdated`] here whenever its working
     /// directory / git context changes, keeping every client's side rail fresh
@@ -2463,7 +2717,10 @@ fn run_actor(
 
         match output_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(message) => state.handle_output(message),
-            Err(RecvTimeoutError::Timeout) => state.flush_subscribers(),
+            Err(RecvTimeoutError::Timeout) => {
+                state.refresh_idle_cwd();
+                state.flush_subscribers();
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 state.output_closed = true;
                 state.mark_exited();
@@ -2548,19 +2805,41 @@ impl ActorState {
     /// dropped for a then-full client channel and still needs to land).
     fn apply_cwd(&mut self, cwd: PathBuf) {
         let new_context = resolve_session_context(Some(&cwd));
-        let changed = self.context != new_context
-            || self.current_working_directory.as_deref() != Some(cwd.as_path());
+        let context_changed = self.context != new_context;
+        let cwd_changed = self.current_working_directory.as_deref() != Some(cwd.as_path());
         self.context = new_context;
         self.current_working_directory = Some(cwd);
-        if changed || self.context_resend_pending {
+        if context_changed || cwd_changed || self.context_resend_pending {
             self.broadcast_context_update();
+        }
+        // Persist only on an actual directory change — the manifest tracks the
+        // path, not the git branch, so a same-dir branch switch needn't re-write.
+        if cwd_changed {
+            self.report_cwd_change();
         }
     }
 
-    /// Read the PTY child's working directory from the OS, used for shells that
-    /// do not emit OSC 7. Throttled to [`CWD_POLL_INTERVAL`] so the underlying
-    /// `git` invocations in [`Self::apply_cwd`] are not run on every output
-    /// chunk while an agent repaints its TUI.
+    /// Notify the manager that this session's working directory changed so it
+    /// records the new cwd into the on-disk manifest. No-op for unmanaged actors
+    /// or before a session id is assigned. A full/closed channel is tolerable —
+    /// the next change retries, and a daemon-kill restore copes with a slightly
+    /// stale cwd by falling back to the launch dir.
+    fn report_cwd_change(&self) {
+        let (Some(session_id), Some(cwd_update_tx), Some(cwd)) = (
+            self.event_session_id.clone(),
+            self.cwd_update_tx.as_ref(),
+            self.current_working_directory.clone(),
+        ) else {
+            return;
+        };
+        let _ = cwd_update_tx.send((session_id, cwd));
+    }
+
+    /// Read the working directory of the process actually using the terminal
+    /// from the OS, used for shells that do not emit OSC 7. Throttled to
+    /// [`CWD_POLL_INTERVAL`] so the underlying `git` invocations in
+    /// [`Self::apply_cwd`] are not run on every output chunk while an agent
+    /// repaints its TUI.
     fn poll_child_cwd(&mut self) -> Option<PathBuf> {
         let now = Instant::now();
         if let Some(last) = self.last_cwd_poll
@@ -2569,8 +2848,61 @@ impl ActorState {
             return None;
         }
         self.last_cwd_poll = Some(now);
-        let pid = self.child.process_id()?;
-        child_cwd(pid)
+        // Prefer the foreground process group leader's cwd (what the user is
+        // interacting with). If that pid is unreadable — e.g. a pipeline whose
+        // group leader has exited while later stages run on, so the pgid no
+        // longer names a live process — fall back to the direct PTY child so the
+        // tracked cwd doesn't silently freeze.
+        if let Some(pgid) = self.foreground_pgid()
+            && let Some(cwd) = child_cwd(pgid)
+        {
+            return Some(cwd);
+        }
+        child_cwd(self.child.process_id()?)
+    }
+
+    /// While idle (no output to drive [`Self::handle_output`]), keep the tracked
+    /// cwd fresh for shells that never emit OSC 7, so the side rail follows a
+    /// `cd` made in a nested shell or agent even when the session is quiet.
+    /// Throttled by [`Self::poll_child_cwd`]; skipped once the shell has proven
+    /// it emits OSC 7 (we then trust OSC 7) or after the child has exited.
+    fn refresh_idle_cwd(&mut self) {
+        if self.shell_reports_cwd || self.exited {
+            return;
+        }
+        if let Some(cwd) = self.poll_child_cwd() {
+            self.apply_polled_cwd(cwd);
+        }
+    }
+
+    /// Apply a cwd discovered by the *idle* poll, but skip the work in
+    /// [`Self::apply_cwd`] — notably the three `git` invocations in
+    /// [`resolve_session_context`] — when the directory is unchanged. A
+    /// stationary idle non-OSC-7 session would otherwise re-resolve git context
+    /// every [`CWD_POLL_INTERVAL`] forever for no result. Same-directory branch
+    /// switches are instead caught on the output-driven path (which calls
+    /// [`Self::apply_cwd`] directly, since a `git switch`/`checkout` produces
+    /// output) and on the next actual cwd change.
+    fn apply_polled_cwd(&mut self, cwd: PathBuf) {
+        if self.current_working_directory.as_deref() != Some(cwd.as_path()) {
+            self.apply_cwd(cwd);
+        }
+    }
+
+    /// The PTY's foreground process group id (which equals the group leader's
+    /// pid) — the shell or program the user is actively interacting with, so a
+    /// `cd` made in a nested shell or agent is tracked, not just the login shell
+    /// that triage spawned (which sits in the launch dir). `None` when the fd is
+    /// unavailable or the terminal reports no foreground group; callers fall back
+    /// to the direct PTY child. Note the returned id is only resolvable while the
+    /// group leader is alive — [`Self::poll_child_cwd`] handles the dead-leader
+    /// case.
+    fn foreground_pgid(&self) -> Option<u32> {
+        #[cfg(unix)]
+        if let Some(fd) = self.master.as_raw_fd() {
+            return pty_foreground_pgid(fd);
+        }
+        None
     }
 
     fn handle_output(&mut self, message: ActorMessage) {
@@ -2593,6 +2925,13 @@ impl ActorState {
                         // been seen we trust it and skip polling, so OSC 7-capable
                         // shells don't re-resolve git context during long output.
                         None if !self.shell_reports_cwd => {
+                            // Output-driven: re-resolve unconditionally (throttled
+                            // by poll_child_cwd) so a same-directory branch switch
+                            // — `git switch`/`checkout`, which produces output but
+                            // no cwd change — still refreshes the side rail. The
+                            // unconditional-resolve cost is bounded here because it
+                            // only fires while the shell is actually producing
+                            // output; the idle path is the one that dedups.
                             if let Some(cwd) = self.poll_child_cwd() {
                                 self.apply_cwd(cwd);
                             }
@@ -4166,6 +4505,7 @@ mod tests {
 
         let resolved = adopted_session_cwd(
             child.id(),
+            None,
             Some(replayed_dir.clone()),
             Some(launch_dir.clone()),
         )
@@ -4174,6 +4514,21 @@ mod tests {
             std::fs::canonicalize(&resolved).expect("canonicalize resolved"),
             std::fs::canonicalize(&live_dir).expect("canonicalize live"),
             "the live process cwd must win over replayed/launch cwds",
+        );
+
+        // The foreground process group is preferred over the direct child pid:
+        // even with a dead `pid` arg, a live `foreground_pgid` resolves the cwd.
+        let via_pgid = adopted_session_cwd(
+            u32::MAX,
+            Some(child.id()),
+            Some(replayed_dir.clone()),
+            Some(launch_dir.clone()),
+        )
+        .expect("a cwd is resolved via the foreground pgid");
+        assert_eq!(
+            std::fs::canonicalize(&via_pgid).expect("canonicalize pgid-resolved"),
+            std::fs::canonicalize(&live_dir).expect("canonicalize live"),
+            "the foreground process group cwd must be preferred over the pid",
         );
 
         child.kill().expect("kill live process");
@@ -4191,6 +4546,7 @@ mod tests {
         );
         let fallback = adopted_session_cwd(
             dead_pid,
+            None,
             Some(replayed_dir.clone()),
             Some(launch_dir.clone()),
         )
@@ -5441,6 +5797,7 @@ mod tests {
                 },
                 log_path,
                 exited: false,
+                last_known_cwd: None,
             }],
         };
         std::fs::write(
@@ -5525,6 +5882,7 @@ mod tests {
                 },
                 log_path: log_path.clone(),
                 exited: false,
+                last_known_cwd: None,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -5671,6 +6029,90 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn demoting_dead_live_session_preserves_last_known_cwd() {
+        // A live session that moved away from its launch dir (tracked in
+        // last_known_cwd) and then exited must, when restored via the demote
+        // path, come back at the tracked dir — demote_dead_live_session must not
+        // drop last_known_cwd (into_persisted hardcodes None) and reset it to the
+        // launch dir.
+        let log_dir = unique_log_dir();
+        let launch_cwd = log_dir.join("launch");
+        let live_cwd = log_dir.join("live");
+        std::fs::create_dir_all(&launch_cwd).expect("create launch cwd");
+        std::fs::create_dir_all(&live_cwd).expect("create live cwd");
+        // Canonicalize: the restored shell reports its cwd symlink-resolved.
+        let live_cwd = std::fs::canonicalize(&live_cwd).expect("canonicalize live cwd");
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut request = StartSessionRequest::new(long_running_shell_command());
+        request.cwd = Some(launch_cwd.clone());
+        request.size = SessionSize::default();
+        let session_id = manager.start_session(request).expect("start session");
+
+        // Simulate the live cwd tracking having recorded a `cd` into live_cwd.
+        // (start_cwd_persistence is not running in tests, so nothing overwrites
+        // this field while the shell sits in the launch dir.)
+        {
+            let mut sessions = manager.sessions().expect("lock sessions");
+            let Some(ManagedSession::Live { last_known_cwd, .. }) = sessions.get_mut(&session_id)
+            else {
+                panic!("expected live session");
+            };
+            *last_known_cwd = Some(live_cwd.clone());
+        }
+
+        let client_id = ClientId::new("demote-cwd-client").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach controller");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: b"exit\n".to_vec(),
+            })
+            .expect("write exit input");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot dead live session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for live session to exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Restore goes through demote_dead_live_session; the tracked cwd must
+        // survive rather than being reset to the launch dir.
+        let restored = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore revives dead live session");
+        assert_eq!(
+            restored.current_working_directory,
+            Some(live_cwd.clone()),
+            "demote -> restore must preserve the live-tracked cwd, not reset to launch"
+        );
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
     #[cfg_attr(
         windows,
         ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
@@ -5775,6 +6217,7 @@ mod tests {
                 },
                 log_path: log_path.clone(),
                 exited: false,
+                last_known_cwd: None,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -5847,6 +6290,7 @@ mod tests {
                 size: SessionSize::default(),
                 log_path,
                 exited: false,
+                last_known_cwd: None,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -5906,6 +6350,7 @@ mod tests {
                 size: SessionSize::default(),
                 log_path,
                 exited: false,
+                last_known_cwd: None,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -5946,6 +6391,117 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn session_manager_restores_persisted_last_known_cwd_without_osc7() {
+        // A zsh-style session that never emits OSC 7: the only durable record of
+        // where it ended up is `last_known_cwd`, tracked live and persisted. A
+        // daemon kill must restore it there, not at the launch dir.
+        let log_dir = unique_log_dir();
+        let live_cwd = log_dir.join("live-cwd");
+        let launch_cwd = log_dir.join("launch-cwd");
+        std::fs::create_dir_all(&live_cwd).expect("create live cwd");
+        std::fs::create_dir_all(&launch_cwd).expect("create launch cwd");
+        // Canonicalize: the live cwd poll resolves symlinks (macOS /var ->
+        // /private/var), so the restored shell reports the canonical path.
+        let live_cwd = std::fs::canonicalize(&live_cwd).expect("canonicalize live cwd");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"shell output with no osc 7 reports\r\n")
+            .expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: Some(launch_cwd.clone()),
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: Some(live_cwd.clone()),
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore shell session");
+
+        assert_eq!(
+            snapshot.current_working_directory,
+            Some(live_cwd.clone()),
+            "restore should prefer the persisted live cwd over the launch dir"
+        );
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn session_manager_restore_ignores_unusable_last_known_cwd() {
+        // The live cwd recorded at kill time no longer exists (worktree removed);
+        // restore must fall back to the launch dir rather than a dead path.
+        let log_dir = unique_log_dir();
+        let launch_cwd = log_dir.join("launch-cwd");
+        let gone_cwd = log_dir.join("removed-worktree");
+        std::fs::create_dir_all(&launch_cwd).expect("create launch cwd");
+        // Canonicalize: the live cwd poll resolves symlinks, so the restored
+        // shell reports the canonical launch path after falling back.
+        let launch_cwd = std::fs::canonicalize(&launch_cwd).expect("canonicalize launch cwd");
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"shell output\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: long_running_shell_command().to_string(),
+                args: Vec::new(),
+                cwd: Some(launch_cwd.clone()),
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: Some(gone_cwd),
+            },
+        );
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore shell session");
+
+        assert_eq!(
+            snapshot.current_working_directory,
+            Some(launch_cwd.clone()),
+            "restore should fall back to the launch dir when the live cwd is gone"
+        );
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown restored session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn persisted_session_deserializes_legacy_manifest_without_last_known_cwd() {
+        // Manifests written before `last_known_cwd` existed must still load.
+        let size_json = serde_json::to_string(&SessionSize::default()).expect("encode size");
+        let json = format!(
+            r#"{{"id":"session-1","command":"/bin/zsh","args":[],"cwd":null,"size":{size_json},"log_path":"/tmp/session-1.log","exited":false}}"#
+        );
+        let persisted: PersistedSession =
+            serde_json::from_str(&json).expect("deserialize legacy manifest entry");
+        assert_eq!(persisted.last_known_cwd, None);
+    }
+
+    #[test]
     fn session_manager_rejects_restore_already_in_progress() {
         let log_dir = unique_log_dir();
         std::fs::create_dir_all(&log_dir).expect("create log dir");
@@ -5962,6 +6518,7 @@ mod tests {
                 size: SessionSize::default(),
                 log_path,
                 exited: false,
+                last_known_cwd: None,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -6008,6 +6565,7 @@ mod tests {
                 size: SessionSize::default(),
                 log_path,
                 exited: false,
+                last_known_cwd: None,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
