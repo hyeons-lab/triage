@@ -41,6 +41,18 @@ rather than the original aspirational plan.
   with an inline note, rather than left unchecked — the doc tracks capability, and
   the note preserves the spec delta.
 
+## PR #100 review responses (Copilot)
+
+- 2026-07-12T08:03-0700 `devlog/triage-design-doc.md` — corrected two inaccurate
+  code citations flagged in review:
+  - Phase 3 IPC adapter: `UnixSocketServer`/`UnixSocketClient` → `IpcServer`/
+    `IpcClient` (the actual types in `crates/triaged/src/ipc.rs`).
+  - Phase 6 pairing flow: split the citations to their real homes —
+    `pairing_url_for_bind` in `crates/triage/src/main.rs`, `pairing_page_response`
+    in `crates/triaged/src/http.rs`, `pair()` in `crates/triaged/src/session.rs`
+    (previously all attributed to `session.rs`).
+
 ## Commits
 
-- HEAD — docs(design): reconcile roadmap checkboxes with the codebase
+- HEAD — docs(design): fix code citations from PR #100 review
+- <hash> — docs(design): reconcile roadmap checkboxes with the codebase

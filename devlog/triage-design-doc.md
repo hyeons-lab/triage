@@ -275,7 +275,7 @@ Daemon-first. Local navigation first. Remote access once the local product is wo
 
 ### Phase 3: Local API + IPC — ✅ complete
 - [x] Define the daemon's session API (Rust trait + types) — the source of truth all transports bind to. (`SessionApi` trait in `crates/triage-core/src/session.rs`)
-- [x] Local Unix socket adapter exposing the API. (`UnixSocketServer`/`UnixSocketClient` in `crates/triaged/src/ipc.rs`)
+- [x] Local Unix socket adapter exposing the API. (`IpcServer`/`IpcClient` in `crates/triaged/src/ipc.rs`)
 - [x] In-process channel for the embedded TUI (zero-IPC path, same trait). (`triage --embedded` constructs `SessionManager` directly; `SessionManager` impls `SessionApi`)
 - [x] Multi-client semantics: many attaches per session, all see output, one active input lease per session. (per-session subscriber fan-out + single-holder lease enforcement on `write_input`)
 
@@ -308,7 +308,7 @@ Two spikes gated the rest of Phase 6 — both effectively proven by the shipping
 
 Once spikes pass:
 - [x] WebSocket server on the daemon. (`crates/triaged/src/ws.rs`, multiplexed with HTTP) — **auth via device-code + PIN pairing issuing per-device tokens, not bearer; TLS not yet implemented** (assumes Tailscale / loopback for now).
-- [x] Pairing flow: `triage pair` surfaces a pairing URL; the daemon's web pairing page approves a device code + PIN and issues a device token. (`pairing_url_for_bind`, `pairing_page_response`, `pair()` in `crates/triaged/src/session.rs`) — **delivers a URL, not a scannable QR code yet.**
+- [x] Pairing flow: `triage pair` surfaces a pairing URL; the daemon's web pairing page approves a device code + PIN and issues a device token. (`pairing_url_for_bind` in `crates/triage/src/main.rs`; `pairing_page_response` in `crates/triaged/src/http.rs`; `pair()` in `crates/triaged/src/session.rs`) — **delivers a URL, not a scannable QR code yet.**
 - [x] Define the Flutter `TerminalPane` widget API — shared interface for byte attach/detach, write, status, lifecycle. **Platform-branched** at focus handling, selection / copy, theming surface, accessibility tree, layout hit-testing via conditional imports. (`terminal_pane.dart` → `terminal_pane_web.dart` / `terminal_pane_stub.dart`)
 - [x] Flutter web app scaffold: sidebar + session navigation. (`SessionRail` in `lib/main.dart`) — **repo/worktree grouping and attention-prioritization UX not yet implemented.**
 - [ ] Tailscale setup doc. *(not written)*
