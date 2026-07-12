@@ -167,6 +167,30 @@ input (see Lessons).
     chunk (paste / suggestion commit) can't leave Ctrl armed to fold into a
     later keystroke.
 
+## Reconnection: lazy-load sessions
+
+- 2026-07-12T08:40-0700 On connect/reconnect the client fired a
+  `subscribe_session_events` for every session at once (`Future.wait` over all
+  sessions), each with a 10s timeout; over a network link they saturated the
+  single WebSocket and all timed out — the reported "reconnect fails / load
+  failed until I keep switching sessions" symptom. Fix (`main.dart`): **lazy-load**
+  — subscribe/attach only the initially-selected session on connect; the rest
+  stay as lightweight rail rows (title + snippet + git context from the list
+  calls) and attach on demand via `_selectSession` → new `_loadDaemonSessionInto`
+  (guarded by `_loadingSessionIds` against double-open; `SessionVm.loaded` tracks
+  state). Only one session is ever shown at a time, so nothing is lost.
+  - Side effect (documented in the widget tests): a historical/exited session now
+    fits the **current** viewport when opened, rather than the size it was
+    persisted at — the desired behavior for the multi-device case.
+
+## Branding
+
+- 2026-07-12T08:40-0700 App display name set to **Triage** (was `triage_client`
+  / "Triage Client"): `android/app/src/main/AndroidManifest.xml` `android:label`,
+  `ios/Runner/Info.plist` `CFBundleDisplayName`. The launcher icon still uses the
+  legacy `ic_launcher.png` — modern/adaptive icons from `triage_icon.svg` are a
+  follow-up (needs SVG rasterization + `flutter_launcher_icons`).
+
 ## Commits
 
 The mobile work is split so the client (verified on-device) can ship ahead of

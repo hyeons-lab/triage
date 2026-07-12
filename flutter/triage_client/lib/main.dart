@@ -300,6 +300,9 @@ class SessionVm {
   final TerminalController terminalController;
   final bool isRemote;
   bool isExited;
+  // True once this remote session has been subscribed/attached (lazy-loaded).
+  // Non-selected sessions stay unloaded until the user opens them.
+  bool loaded = false;
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
@@ -410,6 +413,9 @@ class TriageHome extends StatefulWidget {
 
 class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   late TriageWebSocketClient _client;
+  // Remote session ids currently being attached (lazy-load), so a repeated
+  // select can't open a second subscription for the same session.
+  final Set<String> _loadingSessionIds = {};
   bool _clientInitialized = false;
   bool _isConnecting = false;
   bool _disposed = false;
@@ -1170,8 +1176,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }
         }
         _sessions.clear();
-        for (final sid in sessionIds) {
-          final session = _loadingDaemonSession(sid);
+        for (var i = 0; i < sessionIds.length; i++) {
+          // Only the selected session loads now; the rest rest as rail rows
+          // until selected (see the lazy-load note below).
+          final session = _loadingDaemonSession(
+            sessionIds[i],
+            loading: i == targetSelectedIndex,
+          );
           _setupSessionInputListener(session);
           _sessions.add(session);
         }
@@ -1189,50 +1200,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       });
 
-      final loadTasks = <Future<void>>[];
-      for (var idx = 0; idx < sessionIds.length; idx++) {
-        final sid = sessionIds[idx];
-        final includeHistory = idx == targetSelectedIndex;
-        loadTasks.add(() async {
-          try {
-            final session = await _loadDaemonSession(
-              sid,
-              includeHistory: includeHistory,
-            );
-            if (_disposed) return;
-            setState(() {
-              final existingIndex = _sessions.indexWhere(
-                (s) => s.remoteSessionId == sid,
-              );
-              if (existingIndex == -1) return;
-              final oldSession = _sessions[existingIndex];
-              oldSession.dispose();
-              if (oldSession.title != session.title) {
-                TerminalPane.destroySession(oldSession.title);
-              }
-              _sessions[existingIndex] = session;
-            });
-            _drainPendingEvents(sid);
-          } catch (e) {
-            failedSessionIds.add(sid);
-            if (_disposed) return;
-            setState(() {
-              final existingIndex = _sessions.indexWhere(
-                (s) => s.remoteSessionId == sid,
-              );
-              if (existingIndex == -1) return;
-              _sessions[existingIndex].status = 'load failed';
-              _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
-              _sessions[existingIndex].rows
-                ..clear()
-                ..add(_plainRow('Failed to load session $sid'));
-            });
-            debugPrint('Failed to load session $sid: ${e.toString()}');
-          }
-        }());
+      // Lazy-load: subscribe/attach ONLY the selected session on connect. The
+      // rest stay as lightweight rail rows (title + snippet + git context from
+      // the list calls) and load on demand when selected. Subscribing to every
+      // session at once saturates the single WebSocket and the requests time out
+      // over a network link — the "reconnect fails / load failed until I keep
+      // switching sessions" storm — and only one session is ever shown at a time.
+      if (sessionIds.isNotEmpty) {
+        await _loadDaemonSessionInto(
+          sessionIds[targetSelectedIndex],
+          includeHistory: true,
+          failedSessionIds: failedSessionIds,
+        );
       }
-
-      await Future.wait(loadTasks);
 
       if (!_disposed) {
         setState(() {
@@ -1311,15 +1291,80 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  SessionVm _loadingDaemonSession(String sessionId) {
+  // Placeholder rail row for a daemon session. [loading] true means it is being
+  // attached now (the selected session); false is the lazy resting state for
+  // sessions not yet opened — a muted row that carries only rail metadata until
+  // the user selects it, at which point `_loadDaemonSessionInto` attaches it.
+  SessionVm _loadingDaemonSession(String sessionId, {bool loading = true}) {
     return SessionVm(
       title: 'triage / $sessionId',
-      status: 'loading',
-      statusColor: const Color(0xffffc857),
+      status: loading ? 'loading' : 'idle',
+      statusColor: loading
+          ? const Color(0xffffc857)
+          : const Color(0xff7f8b8d),
       icon: Icons.terminal,
-      rows: [_plainRow('Loading session $sessionId...')],
+      rows: loading ? [_plainRow('Loading session $sessionId...')] : const [],
       isRemote: true,
     );
+  }
+
+  // Attaches one daemon session (subscribe + attach + snapshot) and swaps it into
+  // the rail in place, or marks it failed. Guarded against concurrent re-entry so
+  // a double-select can't open two subscriptions. Extracted so both the connect
+  // path and on-demand selection load a session the same way.
+  Future<void> _loadDaemonSessionInto(
+    String sid, {
+    required bool includeHistory,
+    required List<String> failedSessionIds,
+  }) async {
+    if (_loadingSessionIds.contains(sid)) return;
+    _loadingSessionIds.add(sid);
+    // Show the row as loading (covers the on-demand-select case, where the row
+    // was resting).
+    if (!_disposed) {
+      setState(() {
+        final i = _sessions.indexWhere((s) => s.remoteSessionId == sid);
+        if (i != -1 && !_sessions[i].loaded) {
+          _sessions[i].status = 'loading';
+          _sessions[i].statusColor = const Color(0xffffc857);
+        }
+      });
+    }
+    try {
+      final session = await _loadDaemonSession(sid, includeHistory: includeHistory);
+      session.loaded = true;
+      if (_disposed) return;
+      setState(() {
+        final existingIndex = _sessions.indexWhere(
+          (s) => s.remoteSessionId == sid,
+        );
+        if (existingIndex == -1) return;
+        final oldSession = _sessions[existingIndex];
+        oldSession.dispose();
+        if (oldSession.title != session.title) {
+          TerminalPane.destroySession(oldSession.title);
+        }
+        _sessions[existingIndex] = session;
+      });
+      _drainPendingEvents(sid);
+    } catch (e) {
+      failedSessionIds.add(sid);
+      if (_disposed) return;
+      setState(() {
+        final existingIndex = _sessions.indexWhere(
+          (s) => s.remoteSessionId == sid,
+        );
+        if (existingIndex == -1) return;
+        _sessions[existingIndex].status = 'load failed';
+        _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
+        _sessions[existingIndex].rows
+          ..clear()
+          ..add(_plainRow('Failed to load session $sid'));
+      });
+      debugPrint('Failed to load session $sid: ${e.toString()}');
+    } finally {
+      _loadingSessionIds.remove(sid);
+    }
   }
 
   Future<SessionVm> _loadDaemonSession(
@@ -1896,6 +1941,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _selectedIndex = index;
     });
     if (!canRefresh) return;
+    // Lazy-load: an unopened session has no live subscription yet (the connect
+    // path only attached the initially-selected one), so attach it now instead
+    // of refreshing a snapshot it never subscribed to.
+    if (!session.loaded) {
+      final sid = _sessionIdFor(session);
+      if (sid != null) {
+        unawaited(
+          _loadDaemonSessionInto(
+            sid,
+            includeHistory: true,
+            failedSessionIds: <String>[],
+          ),
+        );
+      }
+      return;
+    }
     if (session.hasFitted) {
       // Already fitted: refresh now at the known real size.
       unawaited(_refreshSessionSnapshot(session, includeHistory: true));

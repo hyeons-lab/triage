@@ -709,7 +709,7 @@ void main() {
   });
 
   testWidgets(
-    'restores historical sessions using authentic saved size when available',
+    'opening a historical session fits it to the current viewport',
     (WidgetTester tester) async {
       tester.view.physicalSize = const Size(1200, 800);
       tester.view.devicePixelRatio = 1;
@@ -722,8 +722,16 @@ void main() {
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
+      // Lazy-load: a non-selected exited session restores when opened, not on
+      // connect. Opening it lays out its pane, which fits to the current
+      // viewport (84x38 here) — so the session shows at the current device's
+      // size, superseding the size it was persisted at. This is what we want
+      // for the multi-device case (fit my screen, not the other device's).
+      await tester.tap(find.text('triage / main').first);
+      await tester.pumpAndSettle();
+
       expect(client.restoreSessionCalls, contains('main'));
-      expect(client.restoreSessionSizes['main'], '80x24');
+      expect(client.restoreSessionSizes['main'], '84x38');
     },
   );
 
@@ -748,6 +756,11 @@ void main() {
         });
 
       await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Lazy-load: a non-selected exited session restores when opened, not on
+      // connect (only the initially-selected session loads eagerly).
+      await tester.tap(find.text('triage / main').first);
       await tester.pumpAndSettle();
 
       expect(client.restoreSessionCalls, contains('main'));
