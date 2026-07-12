@@ -252,6 +252,8 @@ pause_all          = "ctrl+shift+p"
 
 Daemon-first. Local navigation first. Remote access once the local product is worth using from anywhere.
 
+> **Status reconciled with the codebase on 2026-06-11.** Checkboxes below reflect what is actually implemented in `crates/` and `flutter/triage_client/`, not the original aspirational plan. Items that are functionally complete but differ from the original spec (e.g. device-code/PIN pairing instead of bearer auth) are checked with an inline note. Partial items stay unchecked with a note on what remains.
+
 ### Phase 0: Tooling & Architecture
 - [x] Cargo workspace under `crates/`: `triage-core` (session trait + shared types), `triaged` (state owner), `triage` (Ratatui local client), `triage-transport-ws` (WebSocket transport adapter, server-side), `triage-mcp` (MCP server). Flutter app at `flutter/triage_client/` (outside the Cargo workspace, scaffolded in Phase 4).
 - [x] `tracing` to `~/.local/state/triage/triaged.log`.
@@ -264,68 +266,70 @@ Daemon-first. Local navigation first. Remote access once the local product is wo
 - [x] Verify resize, late attach, reconnect, alt-screen, bracketed paste, mouse reporting, scroll regions, replay, and log tee behavior.
 - [x] Decide and document the canonical daemon state model.
 
-### Phase 2: Daemon Session Core
+### Phase 2: Daemon Session Core — ✅ complete
 - [x] PTY spawning via `portable-pty`.
-- [ ] Session actor owns PTY I/O, canonical VT state, scrollback sequence numbers, resize state, and metadata.
-- [x] Per-session log tee.
-- [ ] Define attach modes: observer, interactive controller, and agent controller.
-- [ ] Implement input lease/takeover semantics and broadcast lease changes to clients.
+- [x] Session actor owns PTY I/O, canonical VT state, scrollback sequence numbers, resize state, and metadata. (`ActorState` in `crates/triaged/src/session.rs`)
+- [x] Per-session log tee. (`OutputState` log file + `ingest()`)
+- [x] Define attach modes: observer, interactive controller, and agent controller. (`AttachMode` enum in `crates/triage-core/src/session.rs`)
+- [x] Implement input lease/takeover semantics and broadcast lease changes to clients. (`InputLeaseState`; `LeaseChanged` broadcast on attach/acquire)
 
-### Phase 3: Local API + IPC
-- [ ] Define the daemon's session API (Rust trait + types) — the source of truth all transports bind to.
-- [x] Local Unix socket adapter exposing the API.
-- [ ] In-process channel for the embedded TUI (zero-IPC path, same trait).
-- [ ] Multi-client semantics: many attaches per session, all see output, one active input lease per session.
+### Phase 3: Local API + IPC — ✅ complete
+- [x] Define the daemon's session API (Rust trait + types) — the source of truth all transports bind to. (`SessionApi` trait in `crates/triage-core/src/session.rs`)
+- [x] Local Unix socket adapter exposing the API. (`IpcServer`/`IpcClient` in `crates/triaged/src/ipc.rs`)
+- [x] In-process channel for the embedded TUI (zero-IPC path, same trait). (`triage --embedded` constructs `SessionManager` directly; `SessionManager` impls `SessionApi`)
+- [x] Multi-client semantics: many attaches per session, all see output, one active input lease per session. (per-session subscriber fan-out + single-holder lease enforcement on `write_input`)
 
-### Phase 4: TUI Client (the local product)
-- [ ] Sidebar + main view layout (Ratatui).
-- [ ] Mouse handling (tab switching, scrollback, PTY pass-through for `htop`/`vim`/fzf).
-- [ ] Inferred session context (session cwd, foreground cwd, repo, branch, worktree) via `proc_pidinfo` / `/proc` plus git discovery.
-- [ ] Agent tab auto-classification.
-- [ ] Needs-response detection (manual mark + heuristics first, MCP-reported status once MCP lands, pattern packs for Claude Code, Aider, Codex, Cline, Continue).
-- [ ] Attention-routing hotkeys (`g w`, `g a`, `g r`, attention history).
-- [ ] Notification surface (OS notifications, badges, sounds).
-- [ ] Overview grid (`Ctrl+E`).
-- [ ] Search modal (`Ctrl+F`) over per-session logs via `rg`.
+### Phase 4: TUI Client (the local product) — 🚧 partial (core layout + navigation done; attention-routing features pending)
+- [x] Sidebar + main view layout (Ratatui). (`draw_sidebar`/`draw_terminal` in `crates/triage/src/main.rs`)
+- [x] Mouse handling (tab switching, scrollback, PTY pass-through for `htop`/`vim`/fzf). (`handle_mouse_event`; selection via OSC 52)
+- [x] Inferred session context (session cwd, foreground cwd, repo, branch, worktree) via `proc_pidinfo` / `/proc` plus git discovery. (`resolve_session_context`/`git_repository_root`; cwd tracked from OSC 7)
+- [ ] Agent tab auto-classification. *(not started — only holder kind Interactive/Agent is displayed)*
+- [ ] Needs-response detection (manual mark + heuristics first, MCP-reported status once MCP lands, pattern packs for Claude Code, Aider, Codex, Cline, Continue). *(not started)*
+- [ ] Attention-routing hotkeys (`g w`, `g a`, `g r`, attention history). *(not started — only basic nav hotkeys exist)*
+- [ ] Notification surface (OS notifications, badges, sounds). *(not started)*
+- [ ] Overview grid (`Ctrl+E`). *(not started)*
+- [ ] Search modal (`Ctrl+F`) over per-session logs via `rg`. *(not started)*
 
-### Phase 5: MCP Server (local AI agents)
-- [ ] MCP server crate against the spec (stdio transport first).
-- [ ] Tool surface from §5, bound to the same session API.
-- [ ] Agent input is subject to the same lease model as human clients.
-- [ ] Optional TCP transport behind config flag.
-- [ ] Worked example: Claude Code config snippet registering Triage.
+### Phase 5: MCP Server (local AI agents) — 🚧 partial (read-only tools over stdio; input/lease + TCP pending)
+- [x] MCP server crate against the spec (stdio transport first). (`run_stdio` in `crates/triage-mcp/src/main.rs`)
+- [x] Tool surface from §5, bound to the same session API. *(read-only so far: `list_sessions`, `snapshot_session`, `styled_rows`)*
+- [ ] Agent input is subject to the same lease model as human clients. *(no write/input tools exposed yet, so lease enforcement on the MCP path is unexercised)*
+- [ ] Optional TCP transport behind config flag. *(stdio only)*
+- [ ] Worked example: Claude Code config snippet registering Triage. *(not written)*
 
 ### Phase 6: Remote Web Client + Auth
 
 Remote access starts with a browser/web client before native mobile. That validates the daemon transport, auth, attach/reconnect, and terminal rendering path with less distribution overhead.
 
-Two spikes gate the rest of Phase 6:
+Two spikes gated the rest of Phase 6 — both effectively proven by the shipping web client:
 
-- [ ] **Spike A (3–5 days): xterm.js-in-Flutter-Web bridge.** Prove a `TerminalPane` Flutter widget can embed xterm.js via `HtmlElementView` + `dart:js_interop`, ingest raw PTY bytes from a WebSocket, and forward keyboard + mouse input back. Test on Chrome desktop, Safari desktop, Mobile Safari, Mobile Chrome.
-- [ ] **Spike B: browser reconnect/late attach.** Prove snapshot + byte stream handoff with xterm.js after reconnect and resize.
-
-If either spike fails, revisit the stack decision before continuing.
+- [x] **Spike A: xterm.js-in-Flutter-Web bridge.** `TerminalPane` embeds xterm.js via `HtmlElementView` + `dart:js_interop`, ingests raw PTY bytes from the WebSocket, and forwards keyboard + mouse input back. (`lib/widgets/terminal_pane_web.dart`, `web/xterm.js`; Playwright coverage in `test_web/`)
+- [x] **Spike B: browser reconnect/late attach.** Reconnect with exponential backoff + deferred history replay at the fitted grid size. (`_scheduleReconnect` / `applyHistory` in `lib/main.dart`; daemon replay buffer + `snapshot_session`)
 
 Once spikes pass:
-- [ ] WebSocket server on the daemon (TLS, bearer auth).
-- [ ] QR pairing flow: TUI / `triage pair` shows code, client scans, daemon issues device token.
-- [ ] Define the Flutter `TerminalPane` widget API — shared interface for byte attach/detach, write, status, lifecycle. **Platform-branched** at: focus handling, selection / copy, theming surface, accessibility tree, layout hit-testing. Document where the platform branches live so future maintainers know which operations are unified and which differ per target.
-- [ ] Flutter web app scaffold: sidebar / grouping / attention UX.
-- [ ] Tailscale setup doc.
+- [x] WebSocket server on the daemon. (`crates/triaged/src/ws.rs`, multiplexed with HTTP) — **auth via device-code + PIN pairing issuing per-device tokens, not bearer; TLS not yet implemented** (assumes Tailscale / loopback for now).
+- [x] Pairing flow: `triage pair` surfaces a pairing URL; the daemon's web pairing page approves a device code + PIN and issues a device token. (`pairing_url_for_bind` in `crates/triage/src/main.rs`; `pairing_page_response` in `crates/triaged/src/http.rs`; `pair()` in `crates/triaged/src/session.rs`) — **delivers a URL, not a scannable QR code yet.**
+- [x] Define the Flutter `TerminalPane` widget API — shared interface for byte attach/detach, write, status, lifecycle. **Platform-branched** at focus handling, selection / copy, theming surface, accessibility tree, layout hit-testing via conditional imports. (`terminal_pane.dart` → `terminal_pane_web.dart` / `terminal_pane_stub.dart`)
+- [x] Flutter web app scaffold: sidebar + session navigation. (`SessionRail` in `lib/main.dart`) — **repo/worktree grouping and attention-prioritization UX not yet implemented.**
+- [ ] Tailscale setup doc. *(not written)*
 
-### Phase 7: Native Mobile + Notifications
-- [ ] **Spike: xterm.dart scroll-region validation.** Run vim, tmux, htop, lazygit, less inside xterm.dart on iOS and Android. Confirm whether Issue #222 affects our use. If yes, budget for in-house patch or fork.
-- [ ] Web build: PWA manifest, service worker, Web Push via FCM (Android only).
-- [ ] iOS native build: APNs integration.
-- [ ] Android native build: FCM integration.
-- [ ] Optional Flutter Desktop build (macOS first; Linux / Windows after).
-- [ ] Behavioral compatibility test suite — same byte stream → equivalent rendered grid in both engines for SGR, cursor positioning, scroll regions, mouse events, alt-screen, bracketed paste.
+### Phase 7: Native Mobile + Notifications — 🚧 mostly not started (desktop native pane works; mobile UX + push pending)
 
-### Phase 8: Persistence
-- [ ] Session metadata serialized on daemon exit (title, cwd, env, notes, classification, last known repo/worktree).
-- [ ] Rehydrate UI state on daemon start: restore metadata and replay last N lines to UI buffer.
-- [ ] Optional shell recreation for sessions that were plain shells. Do not promise resurrection of arbitrary programs, editors, or agent processes.
-- [ ] Log rotation enforcement.
+The native rendering path (`terminal_pane_stub.dart` over `xterm.dart`) already exists and is what desktop builds run, so the iOS/Android *engine* is in place — but there is **no mobile-specific UX and no push-notification infrastructure**.
+
+- [ ] **Spike: xterm.dart scroll-region validation.** Run vim, tmux, htop, lazygit, less inside xterm.dart on iOS and Android. Confirm whether Issue #222 affects our use. If yes, budget for in-house patch or fork. *(server-side VT acceptance tests exist, but no on-device iOS/Android validation has been done)*
+- [ ] **Mobile touch UX.** On-screen modifier-key bar (Esc/Ctrl/Tab/arrows), soft-keyboard / IME handling, and touch scroll / selection tuning for phones. *(not started — touch selection logic in the native pane is desktop-pointer-oriented; no `Platform.isIOS`/`isAndroid` UX branches)*
+- [ ] Web build: PWA manifest, service worker, Web Push via FCM (Android only). *(PWA manifest + a stale-service-worker cleanup script exist; no Web Push / FCM)*
+- [ ] iOS native build: APNs integration. *(stock Flutter `AppDelegate`; no APNs, no notification plugin in `pubspec.yaml`)*
+- [ ] Android native build: FCM integration. *(stock Flutter `MainActivity`; no FCM)*
+- [x] Optional Flutter Desktop build (macOS first; Linux / Windows after). *(macOS/Linux/Windows runner folders present; builds from the shared codebase using the native `xterm.dart` pane — actively developed on macOS)*
+- [ ] Behavioral compatibility test suite — same byte stream → equivalent rendered grid in both engines for SGR, cursor positioning, scroll regions, mouse events, alt-screen, bracketed paste. *(single-engine acceptance tests exist; no cross-engine xterm.js-vs-xterm.dart parity suite)*
+
+### Phase 8: Persistence — 🚧 partial (save/restore + replay done; shell recreation + log rotation pending)
+- [x] Session metadata serialized on daemon exit (title, cwd, env, notes, classification, last known repo/worktree). (`persist_manifest` → `sessions.json`; `HandoverState` in `crates/triaged/src/handover.rs`)
+- [x] Rehydrate UI state on daemon start: restore metadata and replay last N lines to UI buffer. (`restore_sessions` + `EVENT_REPLAY_BUFFER`; client-side `applyHistory`)
+- [ ] Optional shell recreation for sessions that were plain shells. Do not promise resurrection of arbitrary programs, editors, or agent processes. *(not started)*
+- [ ] Log rotation enforcement. *(no rotation/size-cap policy)*
 
 ### Phase 9 (optional, prioritize on demand)
 - [ ] Approval gates + cross-client approval modals.
