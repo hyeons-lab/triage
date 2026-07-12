@@ -759,6 +759,10 @@ class _TerminalPaneState extends State<TerminalPane> {
             _accessoryKey('esc', () => _sendAccessory('\x1b')),
             _accessoryKey('ctrl', _toggleCtrl, active: _ctrlArmed),
             _accessoryKey('tab', () => _sendAccessory('\t')),
+            // Enter/Return: the soft keyboard's return key maps to an IME action
+            // that never reaches the terminal, so a terminal needs an explicit
+            // one. `\r` (carriage return) is what a terminal expects on Enter.
+            _accessoryKey('enter', () => _sendAccessory('\r')),
             _accessoryKey('▲', () => _sendAccessory('\x1b[A')),
             _accessoryKey('▼', () => _sendAccessory('\x1b[B')),
             _accessoryKey('◀', () => _sendAccessory('\x1b[D')),

@@ -6,3 +6,5 @@
 String? localHomeDir() => null;
 
 bool marqueeAnimationsEnabled() => true;
+
+bool runningUnderFlutterTest() => false;

@@ -254,6 +254,32 @@ class TriageWebSocketClient {
     return result;
   }
 
+  /// Returns each session's git context (repository/worktree/branch), keyed by
+  /// session id, so the side rail can show a meaningful title for every session
+  /// on connect without subscribing to its event stream. The bulk response
+  /// carries only the git fields (no live cwd — that arrives via
+  /// `session_context_updated`). Best-effort: an older daemon that predates this
+  /// request will error, which the caller swallows.
+  Future<Map<String, ({String? repositoryRoot, String? worktreeRoot, String? branch})>>
+  listSessionContexts() async {
+    final response = await _send('list_session_contexts');
+    final entries = response['entries'] as List<dynamic>?;
+    final result =
+        <String, ({String? repositoryRoot, String? worktreeRoot, String? branch})>{};
+    for (final entry in entries ?? const []) {
+      final map = entry as Map<String, dynamic>;
+      final sessionId = map['session_id'] as String?;
+      if (sessionId != null) {
+        result[sessionId] = (
+          repositoryRoot: map['repository_root'] as String?,
+          worktreeRoot: map['worktree_root'] as String?,
+          branch: map['branch'] as String?,
+        );
+      }
+    }
+    return result;
+  }
+
   Future<Map<String, dynamic>> attachSession({
     required String sessionId,
     required String clientId,

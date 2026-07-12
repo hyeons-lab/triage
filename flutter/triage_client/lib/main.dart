@@ -271,6 +271,28 @@ class SessionVm {
     return leaf.isEmpty ? null : leaf;
   }
 
+  /// Human-facing name for the rail/header, so sessions are identifiable at a
+  /// glance instead of all reading "triage / session-NN". Prefers
+  /// "repo · worktree", falls back to "repo · branch" when there is no distinct
+  /// worktree, then the working-directory leaf, then the raw session id.
+  /// Distinct from [title], which stays a stable identity key.
+  String get displayTitle {
+    final repo = repoName;
+    if (repo != null) {
+      final wt = worktreeName;
+      if (wt != null) return '$repo · $wt';
+      final b = branch;
+      if (b != null && b.trim().isNotEmpty) return '$repo · ${b.trim()}';
+      return repo;
+    }
+    final cwdLeaf = _leafOf(cwd);
+    if (cwdLeaf != null) return cwdLeaf;
+    // No git context and no cwd: fall back to the stable title ("triage /
+    // <id>") rather than a bare id, so a context-less session still reads
+    // sensibly.
+    return title;
+  }
+
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
   // real rendering goes through [store]/[terminal] from raw bytes.
@@ -492,7 +514,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final gap = now.difference(_lastWatchdogTick);
       _lastWatchdogTick = now;
       if (gap > _wakeWatchdogGap) {
-        _redrawActiveSessionOnResume();
+        _refitActiveSession();
         _refocusActiveSessionOnResume();
       }
     });
@@ -629,7 +651,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // The lifecycle event handles this wake; reset the watchdog baseline so
           // its next tick doesn't also see the sleep gap and heal a second time.
           _lastWatchdogTick = DateTime.now();
-          _redrawActiveSessionOnResume();
+          _refitActiveSession();
           _refocusActiveSessionOnResume();
         }
         break;
@@ -639,15 +661,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  // Heal the active session's layout on resume by mimicking a manual resize:
-  // jiggle the host PTY size (one row shorter, then back to our real size) so the
-  // program receives SIGWINCH and repaints over the live stream at our current
-  // width. We deliberately do NOT replay history — re-emulating the raw-output
-  // tail re-introduces the width-mismatched/truncated frame, which is what makes
-  // it render correctly and then switch to incorrect. A same-size resize sends no
+  // Re-assert this device's terminal size on the shared PTY and force a repaint.
+  // Called on resume-from-occlusion and from the header "refit" button, so a user
+  // switching between devices (each with its own width) can reclaim the PTY for
+  // the device they are now on. Mimics a manual resize: jiggle the host PTY size
+  // (one row shorter, then back to our real size) so the program receives
+  // SIGWINCH and repaints over the live stream at our current width. We
+  // deliberately do NOT replay history — re-emulating the raw-output tail
+  // re-introduces the width-mismatched/truncated frame, which is what makes it
+  // render correctly and then switch to incorrect. A same-size resize sends no
   // SIGWINCH, so the jiggle guarantees a repaint even when the host already
   // believes it is at our size.
-  void _redrawActiveSessionOnResume() {
+  void _refitActiveSession() {
     // `_client` is `late` and only assigned by _connectWebSocket; in mock mode it
     // is never set, so guard on _clientInitialized before touching it.
     if (_disposed || !_clientInitialized || _sessions.isEmpty) return;
@@ -1225,9 +1250,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         });
       }
 
-      // Seed side-rail snippets for all sessions (best-effort; no-op if the
-      // daemon's summarizer is disabled). Live updates arrive via push events.
+      // Seed side-rail snippets and git context for all sessions (best-effort).
+      // Context gives every session a "repo · worktree" title immediately;
+      // snippets add the one-line summary. Live updates arrive via push events.
       await _seedSessionSnippets();
+      await _seedSessionContexts();
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
@@ -1253,6 +1280,33 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       });
     } catch (_) {
       // Snippets are best-effort metadata; ignore failures.
+    }
+  }
+
+  // Seed each session's git context on connect so the rail title reads
+  // "repo · worktree" for every session immediately, instead of waiting for a
+  // per-session load (which may never happen / may time out). Only sets the git
+  // fields — the bulk response carries no cwd; live cwd arrives via
+  // `session_context_updated`. Best-effort: an older daemon errors on the
+  // unknown request, which is swallowed here.
+  Future<void> _seedSessionContexts() async {
+    try {
+      final contexts = await _client.listSessionContexts();
+      if (_disposed || contexts.isEmpty) return;
+      setState(() {
+        for (final session in _sessions) {
+          final sid = session.remoteSessionId;
+          final entry = sid == null ? null : contexts[sid];
+          if (entry != null) {
+            session.repoRoot = entry.repositoryRoot;
+            session.worktreeRoot = entry.worktreeRoot;
+            session.branch = entry.branch;
+          }
+        }
+      });
+    } catch (_) {
+      // Context is best-effort rail metadata; a daemon without the request
+      // (pre-upgrade) just leaves titles on their session-id fallback.
     }
   }
 
@@ -2264,76 +2318,163 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
     }
 
+    // On a phone the rail can't sit beside the workspace — it would squeeze the
+    // terminal to a sliver. Mobile shows a full-screen workspace with the rail
+    // as a scrim-backed overlay that dismisses on select; desktop keeps the
+    // side-by-side layout.
+    // The widget tests assert the desktop side-by-side layout, so keep it in the
+    // test harness even though the default test platform is android.
+    final isMobile =
+        !runningUnderFlutterTest() &&
+        (defaultTargetPlatform == TargetPlatform.iOS ||
+            defaultTargetPlatform == TargetPlatform.android);
+
+    void collapseRail() {
+      if (!_sidebarCollapsed) setState(() => _sidebarCollapsed = true);
+    }
+
+    void openRail() {
+      if (_sidebarCollapsed) setState(() => _sidebarCollapsed = false);
+    }
+
+    final rail = SessionRail(
+      sessions: _sessions,
+      selectedIndex: _selectedIndex,
+      // On mobile, selecting or creating a session dismisses the overlay so the
+      // terminal takes the full screen.
+      onSelectSession: (index) {
+        _selectSession(index);
+        if (isMobile) collapseRail();
+      },
+      onReorderSession: _reorderSessions,
+      onCreateSession: (shell) {
+        _createSession(shell);
+        if (isMobile) collapseRail();
+      },
+      selectedShell: _newSessionShell,
+      shellOptions: newSessionShellMenuOrderForPlatform(defaultTargetPlatform),
+      showShellMenu: showNewSessionShellMenuForPlatform(defaultTargetPlatform),
+      connectionStatus: _connectionStatus,
+      connectionStatusColor: _connectionStatusColor,
+      onOpenSettings: _openConnectionSettings,
+      // Mobile: the rail always shows full content (the overlay slide handles
+      // show/hide) and its collapse button closes the overlay. Desktop: the
+      // button shrinks the rail to its icon strip in place.
+      isCollapsed: isMobile ? false : _sidebarCollapsed,
+      onToggleCollapse: isMobile
+          ? collapseRail
+          : () {
+              setState(() {
+                _sidebarCollapsed = !_sidebarCollapsed;
+              });
+            },
+    );
+
+    const emptyWorkspace = Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.terminal, size: 64, color: Color(0xff263033)),
+          SizedBox(height: 16),
+          Text(
+            'No active sessions',
+            style: TextStyle(
+              fontSize: 18,
+              color: Color(0xff7f8b8d),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          SizedBox(height: 8),
+          Text(
+            'Create a new session by clicking the "+" button on the sidebar.',
+            style: TextStyle(fontSize: 14, color: Color(0xff7f8b8d)),
+          ),
+        ],
+      ),
+    );
+
+    final workspace = _sessions.isEmpty
+        ? emptyWorkspace
+        : SessionWorkspace(
+            session: _selectedSession,
+            onCloseSession: () => _closeSession(_selectedSession),
+            onViewFit: (cols, rows) =>
+                _onSessionViewFit(_selectedSession, cols, rows),
+            // The header's menu button reopens the overlay on mobile only.
+            onOpenRail: isMobile ? openRail : null,
+          );
+
+    if (isMobile) {
+      final screenWidth = MediaQuery.of(context).size.width;
+      final overlayWidth = screenWidth < _sessionRailExpandedWidth
+          ? screenWidth
+          : _sessionRailExpandedWidth;
+      return Scaffold(
+        body: SafeArea(
+          // The rail and scrim stay mounted and animate on the collapsed flag
+          // (slide + fade) rather than popping in/out, so open/close is smooth.
+          child: Stack(
+            children: [
+              Positioned.fill(child: workspace),
+              // A menu affordance when the rail is dismissed and there is no
+              // workspace header to host one (no sessions yet).
+              if (_sidebarCollapsed && _sessions.isEmpty)
+                Positioned(
+                  top: 4,
+                  left: 4,
+                  child: IconButton(
+                    icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
+                    tooltip: 'Sessions',
+                    onPressed: openRail,
+                  ),
+                ),
+              // Scrim: fades in with the rail; ignores taps while collapsed so
+              // input passes through to the terminal.
+              Positioned.fill(
+                child: IgnorePointer(
+                  ignoring: _sidebarCollapsed,
+                  child: AnimatedOpacity(
+                    opacity: _sidebarCollapsed ? 0.0 : 1.0,
+                    duration: _sessionRailAnimationDuration,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: collapseRail,
+                      child: const ColoredBox(color: Color(0x99000000)),
+                    ),
+                  ),
+                ),
+              ),
+              // Rail: slides in from the left edge.
+              AnimatedPositioned(
+                duration: _sessionRailAnimationDuration,
+                curve: Curves.easeOutCubic,
+                top: 0,
+                bottom: 0,
+                left: _sidebarCollapsed ? -overlayWidth : 0,
+                width: overlayWidth,
+                child: Material(
+                  elevation: 16,
+                  color: const Color(0xff0d1113),
+                  child: rail,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       body: SafeArea(
         child: Row(
           children: [
-            SessionRail(
-              sessions: _sessions,
-              selectedIndex: _selectedIndex,
-              onSelectSession: _selectSession,
-              onReorderSession: _reorderSessions,
-              onCreateSession: _createSession,
-              selectedShell: _newSessionShell,
-              shellOptions: newSessionShellMenuOrderForPlatform(
-                defaultTargetPlatform,
-              ),
-              showShellMenu: showNewSessionShellMenuForPlatform(
-                defaultTargetPlatform,
-              ),
-              connectionStatus: _connectionStatus,
-              connectionStatusColor: _connectionStatusColor,
-              onOpenSettings: _openConnectionSettings,
-              isCollapsed: _sidebarCollapsed,
-              onToggleCollapse: () {
-                setState(() {
-                  _sidebarCollapsed = !_sidebarCollapsed;
-                });
-              },
-            ),
+            rail,
             const VerticalDivider(
               width: 1,
               thickness: 1,
               color: Color(0xff263033),
             ),
-            Expanded(
-              child: _sessions.isEmpty
-                  ? const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            Icons.terminal,
-                            size: 64,
-                            color: Color(0xff263033),
-                          ),
-                          SizedBox(height: 16),
-                          Text(
-                            'No active sessions',
-                            style: TextStyle(
-                              fontSize: 18,
-                              color: Color(0xff7f8b8d),
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          SizedBox(height: 8),
-                          Text(
-                            'Create a new session by clicking the "+" button on the sidebar.',
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Color(0xff7f8b8d),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  : SessionWorkspace(
-                      session: _selectedSession,
-                      onCloseSession: () => _closeSession(_selectedSession),
-                      onViewFit: (cols, rows) =>
-                          _onSessionViewFit(_selectedSession, cols, rows),
-                    ),
-            ),
+            Expanded(child: workspace),
           ],
         ),
       ),
@@ -2592,28 +2733,42 @@ class SessionRail extends StatelessWidget {
             itemCount: sessions.length,
             itemBuilder: (context, index) {
               final session = sessions[index];
-              // The whole row is the drag handle (immediate drag on mouse move);
-              // a click still selects since a tap registers no movement.
-              return ReorderableDragStartListener(
-                key: ValueKey<String>(
-                  session.remoteSessionId ?? 'local:${session.title}',
-                ),
-                index: index,
-                child: SessionListTile(
-                  selected: index == selectedIndex,
-                  title: session.title,
-                  subtitle: session.status,
-                  statusColor: session.statusColor,
-                  icon: session.icon,
-                  branch: session.branch,
-                  repoName: session.repoName,
-                  worktreeName: session.worktreeName,
-                  cwd: session.cwd,
-                  snippet: session.snippet,
-                  snippetDetail: session.snippetDetail,
-                  onTap: () => onSelectSession(index),
-                ),
+              final key = ValueKey<String>(
+                session.remoteSessionId ?? 'local:${session.title}',
               );
+              final tile = SessionListTile(
+                selected: index == selectedIndex,
+                title: session.displayTitle,
+                subtitle: session.status,
+                statusColor: session.statusColor,
+                icon: session.icon,
+                branch: session.branch,
+                repoName: session.repoName,
+                worktreeName: session.worktreeName,
+                cwd: session.cwd,
+                snippet: session.snippet,
+                snippetDetail: session.snippetDetail,
+                onTap: () => onSelectSession(index),
+              );
+              // Touch: a plain drag must scroll the list, so reordering waits for
+              // a long-press (ReorderableDelayedDragStartListener). Mouse: the
+              // whole row is an immediate drag handle; a click still selects
+              // since a tap registers no movement.
+              final isTouch =
+                  !runningUnderFlutterTest() &&
+                  (defaultTargetPlatform == TargetPlatform.iOS ||
+                      defaultTargetPlatform == TargetPlatform.android);
+              return isTouch
+                  ? ReorderableDelayedDragStartListener(
+                      key: key,
+                      index: index,
+                      child: tile,
+                    )
+                  : ReorderableDragStartListener(
+                      key: key,
+                      index: index,
+                      child: tile,
+                    );
             },
           ),
         ),
@@ -3411,17 +3566,24 @@ class SessionWorkspace extends StatelessWidget {
     required this.session,
     this.onCloseSession,
     this.onViewFit,
+    this.onOpenRail,
   });
 
   final SessionVm session;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
+  // Mobile only: opens the session rail overlay from the workspace header.
+  final VoidCallback? onOpenRail;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        WorkspaceHeader(session: session, onClose: onCloseSession),
+        WorkspaceHeader(
+          session: session,
+          onClose: onCloseSession,
+          onOpenRail: onOpenRail,
+        ),
         Expanded(
           child: TerminalPane(
             key: ValueKey(session.title),
@@ -3444,10 +3606,18 @@ class SessionWorkspace extends StatelessWidget {
 }
 
 class WorkspaceHeader extends StatelessWidget {
-  const WorkspaceHeader({super.key, required this.session, this.onClose});
+  const WorkspaceHeader({
+    super.key,
+    required this.session,
+    this.onClose,
+    this.onOpenRail,
+  });
 
   final SessionVm session;
   final VoidCallback? onClose;
+  // Mobile only: opens the session rail overlay. Null on desktop, where the
+  // rail is always visible beside the workspace.
+  final VoidCallback? onOpenRail;
 
   @override
   Widget build(BuildContext context) {
@@ -3471,6 +3641,14 @@ class WorkspaceHeader extends StatelessWidget {
       ),
       child: Row(
         children: [
+          if (onOpenRail != null) ...[
+            IconButton(
+              icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
+              tooltip: 'Sessions',
+              onPressed: onOpenRail,
+            ),
+            const SizedBox(width: 4),
+          ],
           Icon(session.icon, color: const Color(0xff7fd1c7)),
           const SizedBox(width: 12),
           Expanded(
@@ -3479,7 +3657,7 @@ class WorkspaceHeader extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  session.title,
+                  session.displayTitle,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(

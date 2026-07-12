@@ -75,12 +75,96 @@ See `devlog/plans/000088-01-mobile-touch-input.md`.
   sticky Ctrl reset on session swap; arrow-glyph `fontFamilyFallback`. Skipped
   (by-design): Ctrl staying armed across multi-char IME input.
 
+## On-device session — 2026-07-12 (Pixel 10 Pro Fold, Android)
+
+Ran the app on a real device over Tailscale. The soft-keyboard fix works (typing
+confirmed on-device). On-device testing surfaced several mobile issues, fixed
+this session; the last remaining input complaints are inherent to raw terminal
+input (see Lessons).
+
+### What Changed (this session)
+
+- 2026-07-12T07:01-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`
+  — added an **Enter** key (`\r`) to the accessory bar; the Android soft
+  keyboard's return maps to an IME action that never reaches the terminal.
+- 2026-07-12T07:01-0700 `flutter/triage_client/lib/main.dart`:
+  - **Rail as full-screen overlay on mobile** — `build()` branches: mobile shows
+    a full-screen workspace with the rail as a scrim-backed, slide/fade-animated
+    overlay (`AnimatedPositioned` + `AnimatedOpacity`, `_sessionRailAnimationDuration`)
+    that dismisses on select; desktop keeps the side-by-side `Row`. A ☰ menu
+    button (`WorkspaceHeader.onOpenRail`) reopens it. Fixes the RenderFlex
+    overflow / squished terminal.
+  - **Rail scroll vs reorder** — `ReorderableDelayedDragStartListener` on touch
+    (long-press reorders, drag scrolls); mouse keeps the immediate handle.
+  - **Refit on device switch** — generalized `_redrawActiveSessionOnResume` →
+    `_refitActiveSession` (re-asserts this device's terminal size on the shared
+    PTY), still called on resume; a manual header button is a follow-up.
+  - **`displayTitle`** — `repo · worktree` → `repo · branch` → cwd leaf →
+    session id, so sessions are identifiable; the stable `title` key is untouched.
+    Rail tile + header use it. Seeded from `_seedSessionContexts()` on connect.
+- 2026-07-12T07:01-0700 `flutter/triage_client/lib/services/triage_websocket_client.dart`
+  — `listSessionContexts()` (best-effort; a pre-upgrade daemon errors, swallowed).
+- 2026-07-12T07:01-0700 **Daemon: `list_session_contexts`** (session identity in
+  the list). `crates/triage-core/src/session.rs` (SessionApi trait method +
+  blanket impl), `crates/triaged/src/session.rs` (`SessionManager` impl reading
+  cached context off-lock via a new `ActorCommand::Context`), `crates/triage-transport-ws/src/lib.rs`
+  (`ClientRequest::ListSessionContexts` / `ServerResult::SessionContexts` /
+  `SessionContextEntry` / handler / test), `crates/triage-core/schema/triage.fbs`
+  + `crates/triage-transport-ws/src/flatbuffers_proto.rs` (FB parity). Response
+  carries git fields per session (no cwd; cwd rides `session_context_updated`).
+
+### Issues
+
+- 2026-07-12 **Live handover to deploy the daemon change failed.** The live
+  daemon (pid 13793) had run 13 days (June 28 build); the handover protocol
+  changed since (#97/#98), so the new binary never completed adoption (old daemon
+  never logged "Received handover request"; the client stalled ~30s then was
+  killed). Compounded by an intermittent Bash sandbox. Reverted
+  `~/.cargo/bin/triaged` to the June-28 backup — live daemon + 32 sessions
+  unharmed. The daemon change is built + tested but NOT deployed; deploy via a
+  planned cold restart (`launchctl kickstart -k`, cold-restores sessions) when
+  agent sessions are idle, or investigate the handover incompatibility.
+
+### Lessons Learned
+
+- Raw terminal input on mobile cannot offer predictive suggestions, swipe
+  auto-space, or tap-to-position-cursor: the client streams each keystroke to the
+  PTY and the remote shell owns line editing — there is no local text buffer.
+  The fix for all three is an optional line-input bar (compose-then-send), not a
+  keyboard config. Cursor movement is via arrow keys / readline chords.
+- The handover IPC socket path derives from `TMPDIR`; a manual handover must run
+  with the daemon's `TMPDIR` (here they matched, so this was not the failure).
+
+## Validation
+
+- 2026-07-11T22:50-0700 `flutter analyze lib/widgets/terminal_pane_stub.dart` —
+  no issues in the changed file. `flutter analyze --no-fatal-infos
+  --no-fatal-warnings` (CI's command) passes (pre-existing backlog only, none in
+  this file). `flutter test` — 100 passed. Matches the CI "Flutter (analyze +
+  test)" job; CI does not build iOS/Android.
+- 2026-07-11T22:50-0700 `/review-fix-loop max` — 2 rounds, stopped clean. Fixed:
+  sticky Ctrl reset on session swap; arrow-glyph `fontFamilyFallback`. Skipped
+  (by-design): Ctrl staying armed across multi-char IME input.
+
 ## Next Steps
 
-- On-device build + validation (iOS + Android) over Tailscale — needs the user's
-  device/signing; the xterm.dart scroll-region spike lands here.
-- PR 2 (touch polish): long-press selection, paste, rotate/resize, safe-area.
+- Deploy the daemon `list_session_contexts` change (planned cold restart or
+  handover-compat investigation), then verify `repo · worktree` titles on-device.
+- Optional line-input bar (compose-then-send) for suggestions / cursor editing.
+- Follow-ups: manual "refit" header button; selected-session-to-top on rail
+  reopen; lazy-load sessions (the 50-concurrent-subscribe timeout).
 
 ## Commits
 
-- HEAD — feat(triage_client): mobile soft keyboard + key accessory bar
+The mobile work is split so the client (verified on-device) can ship ahead of
+the daemon protocol change (built + unit-tested, but its on-device end-to-end
+handover failed, so it is held back — see Issues).
+
+- HEAD — feat(triage_client): mobile usability + repo·worktree titles (rail
+  overlay, accessory Enter, touch scroll, refit, `displayTitle` + client-side
+  `list_session_contexts` seeding; widget tests gated to the desktop layout).
+  PUSHED.
+- (local, unpushed) — feat(session): `list_session_contexts` — daemon side of
+  the titles (triage-core / triaged / triage-transport-ws + FB parity). Held
+  local until verified end-to-end on-device.
+- 0359d88 — feat(triaged): mobile soft keyboard + key accessory bar
