@@ -90,6 +90,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   // TapGestureRecognizer only routes to the unforwarded onSingleTapUp), so we
   // drive shift-click from the Listener below instead of that dead callback.
   final GlobalKey<xt.TerminalViewState> _terminalViewKey = GlobalKey();
+
+  // Sticky Ctrl for the on-screen accessory bar (mobile only): when armed, the
+  // next single character typed from the soft keyboard is converted to its
+  // control code in _onTerminalOutput, then disarmed. Mirrors how a physical
+  // Ctrl key would combine with the following keystroke.
+  bool _ctrlArmed = false;
+
   xt.CellOffset? _selectionAnchor;
   // The screen buffer (main vs alternate) the anchor was recorded against.
   // Extending across a buffer switch would land on the wrong screen, so we bail.
@@ -214,6 +221,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       // The scroll anchor pointed at the old terminal's buffer line; drop it so
       // the new session starts following the bottom.
       _scrollAnchor.clear();
+      // Drop any latched sticky Ctrl so it can't fold into the new session's
+      // first keystroke (a Ctrl armed for session A must not reach session B).
+      _ctrlArmed = false;
       _endDrag();
       _scrollToCursor(requestFocus: true);
     }
@@ -491,7 +501,51 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalOutput(String data) {
+    // Sticky Ctrl (accessory bar): fold the armed Ctrl into the next single
+    // character before it reaches the session, so e.g. arming Ctrl then typing
+    // "c" on the soft keyboard sends 0x03 (SIGINT) instead of a literal "c".
+    if (_ctrlArmed && data.length == 1) {
+      final ctrl = controlByteForChar(data);
+      _disarmCtrl();
+      if (ctrl != null) {
+        widget.controller.sendInput(ctrl);
+        return;
+      }
+    }
     widget.controller.sendInput(data);
+  }
+
+  void _armCtrl() {
+    if (_ctrlArmed) return;
+    setState(() => _ctrlArmed = true);
+  }
+
+  void _disarmCtrl() {
+    if (!_ctrlArmed) return;
+    if (mounted) {
+      setState(() => _ctrlArmed = false);
+    } else {
+      _ctrlArmed = false;
+    }
+  }
+
+  // Send a raw byte sequence from an accessory-bar key. Ctrl+<letter> keys pass
+  // the already-encoded control byte; a bare Ctrl toggle arms _ctrlArmed instead
+  // of sending anything. Re-focus the terminal so tapping a key never dismisses
+  // the soft keyboard.
+  void _sendAccessory(String bytes) {
+    widget.controller.sendInput(bytes);
+    _disarmCtrl();
+    _focusTerminal();
+  }
+
+  void _toggleCtrl() {
+    if (_ctrlArmed) {
+      _disarmCtrl();
+    } else {
+      _armCtrl();
+    }
+    _focusTerminal();
   }
 
   void _focusTerminal() {
@@ -684,6 +738,76 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  // Touch platforms (no physical keyboard by default), which get the soft
+  // keyboard (IME) input path and the on-screen key accessory bar. Desktop
+  // (macOS/Linux/Windows) keeps the hardware-keyboard path and its IME fix.
+  bool get _isMobile =>
+      defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.android;
+
+  // On-screen row of keys a soft keyboard lacks (Esc, Ctrl, Tab, arrows, common
+  // shell symbols). Sits directly above the keyboard via the Scaffold's
+  // resize-to-inset. Horizontally scrollable so it fits narrow phones.
+  Widget _buildAccessoryBar() {
+    return Container(
+      color: const Color(0xff141a1c),
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            _accessoryKey('esc', () => _sendAccessory('\x1b')),
+            _accessoryKey('ctrl', _toggleCtrl, active: _ctrlArmed),
+            _accessoryKey('tab', () => _sendAccessory('\t')),
+            _accessoryKey('▲', () => _sendAccessory('\x1b[A')),
+            _accessoryKey('▼', () => _sendAccessory('\x1b[B')),
+            _accessoryKey('◀', () => _sendAccessory('\x1b[D')),
+            _accessoryKey('▶', () => _sendAccessory('\x1b[C')),
+            _accessoryKey('^C', () => _sendAccessory('\x03')),
+            _accessoryKey('/', () => _sendAccessory('/')),
+            _accessoryKey('|', () => _sendAccessory('|')),
+            _accessoryKey('-', () => _sendAccessory('-')),
+            _accessoryKey('~', () => _sendAccessory('~')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // A single accessory key. Uses a raw GestureDetector (no focus node) so a tap
+  // never steals focus from the terminal and dismisses the keyboard. [active]
+  // highlights a latched modifier (sticky Ctrl).
+  Widget _accessoryKey(String label, VoidCallback onTap, {bool active = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: Container(
+          constraints: const BoxConstraints(minWidth: 40, minHeight: 34),
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          decoration: BoxDecoration(
+            color: active ? const Color(0xff2b6a63) : const Color(0xff232c2f),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Color(0xffd9e5e3),
+              fontSize: 13,
+              fontFamily: 'JetBrains Mono',
+              // Fall back for glyphs the bundled JetBrains Mono subset may lack
+              // (the arrow triangles ▲▼◀▶), so the arrow keys never render as
+              // tofu on a device whose default only covers them elsewhere.
+              fontFamilyFallback: ['Menlo', 'Noto Sans Symbols', 'monospace'],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // Detect if we are running inside a widget test environment to preserve
@@ -736,38 +860,68 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
     }
 
+    // Tighter padding on mobile — screen space is scarce and the accessory bar
+    // already separates the terminal from the keyboard.
+    final padding = _isMobile
+        ? const EdgeInsets.all(8)
+        : const EdgeInsets.all(22);
+
     return Container(
       color: const Color(0xff0d1113),
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: _focusTerminal,
-        child: Padding(
-          padding: const EdgeInsets.all(22),
-          child: Listener(
-            onPointerDown: _handlePointerDown,
-            onPointerMove: _handlePointerMove,
-            onPointerUp: _handlePointerUp,
-            onPointerCancel: _handlePointerCancel,
-            child: xt.TerminalView(
-              _terminal,
-              key: _terminalViewKey,
-              controller: _xtermController,
-              theme: _theme,
-              focusNode: _focusNode,
-              autofocus: true,
-              scrollController: _scrollController,
-              onKeyEvent: _handleTerminalKeyEvent,
-              textStyle: _textStyle,
-              // Use the hardware-keyboard path instead of xterm's hidden IME
-              // TextInput connection. On macOS desktop the IME path desyncs
-              // Flutter's HardwareKeyboard state ("physical key already
-              // pressed") and swallows keystrokes; this is the standard desktop
-              // terminal fix.
-              hardwareKeyboardOnly: true,
+      child: Column(
+        children: [
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _focusTerminal,
+              child: Padding(
+                padding: padding,
+                child: Listener(
+                  onPointerDown: _handlePointerDown,
+                  onPointerMove: _handlePointerMove,
+                  onPointerUp: _handlePointerUp,
+                  onPointerCancel: _handlePointerCancel,
+                  child: xt.TerminalView(
+                    _terminal,
+                    key: _terminalViewKey,
+                    controller: _xtermController,
+                    theme: _theme,
+                    focusNode: _focusNode,
+                    autofocus: true,
+                    scrollController: _scrollController,
+                    onKeyEvent: _handleTerminalKeyEvent,
+                    textStyle: _textStyle,
+                    // Desktop uses the hardware-keyboard path instead of xterm's
+                    // hidden IME TextInput connection: on macOS the IME path
+                    // desyncs Flutter's HardwareKeyboard state ("physical key
+                    // already pressed") and swallows keystrokes. Mobile must use
+                    // the IME path, though — it is what raises the soft keyboard,
+                    // so disabling it leaves a phone unable to type.
+                    hardwareKeyboardOnly: !_isMobile,
+                  ),
+                ),
+              ),
             ),
           ),
-        ),
+          if (_isMobile) _buildAccessoryBar(),
+        ],
       ),
     );
   }
+}
+
+/// The control code a character produces when combined with Ctrl, or null if it
+/// has none. Letters and the `@ [ \ ] ^ _` range map via `& 0x1f` — so Ctrl+C
+/// and Ctrl+c both yield `0x03` (SIGINT) and Ctrl+[ yields ESC — matching a
+/// terminal's standard control encoding. Digits, spaces, and other punctuation
+/// have no control form and return null (the character is sent as typed).
+String? controlByteForChar(String char) {
+  if (char.length != 1) return null;
+  final code = char.codeUnitAt(0);
+  // Uppercase the letter range so Ctrl+c and Ctrl+C both yield 0x03.
+  final upper = (code >= 0x61 && code <= 0x7a) ? code - 0x20 : code;
+  if (upper >= 0x40 && upper <= 0x5f) {
+    return String.fromCharCode(upper & 0x1f);
+  }
+  return null;
 }
