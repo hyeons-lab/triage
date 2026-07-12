@@ -504,8 +504,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Sticky Ctrl (accessory bar): fold the armed Ctrl into the next single
     // character before it reaches the session, so e.g. arming Ctrl then typing
     // "c" on the soft keyboard sends 0x03 (SIGINT) instead of a literal "c".
-    if (_ctrlArmed && data.length == 1) {
-      final ctrl = controlByteForChar(data);
+    if (_ctrlArmed) {
+      // Disarm on the very next chunk regardless of its length; only fold Ctrl
+      // into a lone character. A multi-character IME chunk (paste, suggestion
+      // commit) still consumes the armed Ctrl — untransformed — so a latched
+      // Ctrl can never linger into a later keystroke.
+      final ctrl = data.length == 1 ? controlByteForChar(data) : null;
       _disarmCtrl();
       if (ctrl != null) {
         widget.controller.sendInput(ctrl);

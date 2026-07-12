@@ -154,6 +154,19 @@ input (see Lessons).
 - Follow-ups: manual "refit" header button; selected-session-to-top on rail
   reopen; lazy-load sessions (the 50-concurrent-subscribe timeout).
 
+## PR #101 review responses (Copilot)
+
+- 2026-07-12T08:15-0700 Client fixes from the mobile PR review:
+  - `main.dart` — `displayTitle` doc corrected (final fallback is the stable
+    `title`, not the raw id).
+  - `main.dart` — `_seedSessionSnippets` + `_seedSessionContexts` now run
+    concurrently (`Future.wait`) instead of sequentially, saving a connect
+    round-trip on high-latency mobile links.
+  - `terminal_pane_stub.dart` — sticky Ctrl now disarms on the next IME chunk
+    regardless of length (only a lone char is transformed), so a multi-char
+    chunk (paste / suggestion commit) can't leave Ctrl armed to fold into a
+    later keystroke.
+
 ## Commits
 
 The mobile work is split so the client (verified on-device) can ship ahead of

@@ -274,8 +274,8 @@ class SessionVm {
   /// Human-facing name for the rail/header, so sessions are identifiable at a
   /// glance instead of all reading "triage / session-NN". Prefers
   /// "repo · worktree", falls back to "repo · branch" when there is no distinct
-  /// worktree, then the working-directory leaf, then the raw session id.
-  /// Distinct from [title], which stays a stable identity key.
+  /// worktree, then the working-directory leaf, then the stable [title]
+  /// ("triage / <id>"). Distinct from [title], which stays an identity key.
   String get displayTitle {
     final repo = repoName;
     if (repo != null) {
@@ -1253,8 +1253,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Seed side-rail snippets and git context for all sessions (best-effort).
       // Context gives every session a "repo · worktree" title immediately;
       // snippets add the one-line summary. Live updates arrive via push events.
-      await _seedSessionSnippets();
-      await _seedSessionContexts();
+      // Independent best-effort requests — run concurrently to save a connect
+      // round-trip (matters on high-latency mobile links).
+      await Future.wait([_seedSessionSnippets(), _seedSessionContexts()]);
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
