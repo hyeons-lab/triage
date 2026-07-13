@@ -518,6 +518,14 @@ pub trait SessionApi {
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         Ok(Vec::new())
     }
+    /// Every session's most recently resolved git context (repository/worktree
+    /// root + branch), so a client can fetch all sessions' locations in one
+    /// request without subscribing to each session's event stream. Sessions
+    /// without a resolved context carry `None`. Default: no contexts.
+    #[allow(clippy::type_complexity)]
+    fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+        Ok(Vec::new())
+    }
     /// Update status to embed in the `Hello` handshake. Defaults to "this build,
     /// nothing newer known" so non-daemon implementors (test mocks, the MCP
     /// recorder) need not care; the daemon's `SessionManager` overrides it.
@@ -580,6 +588,10 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     #[allow(clippy::type_complexity)]
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         (**self).list_session_snippets()
+    }
+    #[allow(clippy::type_complexity)]
+    fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+        (**self).list_session_contexts()
     }
     fn server_update_info(&self) -> ServerUpdateInfo {
         (**self).server_update_info()
