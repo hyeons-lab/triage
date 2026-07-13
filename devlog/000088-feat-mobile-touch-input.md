@@ -217,6 +217,79 @@ Not yet verified on-device: the phone left the LAN before the verification run
 - This is the cheap fix for the motivation behind the background-keepalive
   request; a foreground service may no longer be needed.
 
+## Stuck on "Reconnecting…" — a wedged connect, not a stale token
+
+- 2026-07-13T06:50-0700 Reported after a reinstall: the app sat on
+  "Reconnecting…" indefinitely and only asked for a PIN after being killed and
+  relaunched. The daemon log showed the client id had changed
+  (`triage-flutter-client-d074207c…` → `…e3ceaa87…`): a reinstall wipes the
+  keystore-backed storage, so the app minted a fresh id and the stored token no
+  longer matched it. Re-pairing was the correct outcome — but the app never got
+  there, which is the real bug.
+- Root cause (`main.dart`): `_connectWebSocket` returned immediately when
+  `_isConnecting` was set, **dropping that attempt entirely**, while
+  `TriageWebSocketClient.connect` awaited `WebSocketChannel.ready` with **no
+  deadline**. A half-open socket — routine when a phone's network changes while
+  the app is backgrounded — leaves `ready` pending for as long as the OS keeps
+  retransmitting. `_isConnecting` then stayed `true` forever: every reconnect
+  timer fired, no-opped, and scheduled nothing in its place. Terminal state, and
+  `_reconnectNowOnResume` bails on `_isConnecting`, so resuming could not rescue
+  it either. Killing the app was the only exit — hence the PIN prompt appearing
+  only on relaunch.
+- Fixes — **every await that can hold `_isConnecting` is now bounded**, which is
+  the invariant the whole wedge came down to:
+  - `triage_websocket_client.dart` — `connect` bounds the handshake with
+    `connectTimeout` (10s) and retires the channel it abandons (cancel the
+    listener, close the socket). `disconnect` bounds the close handshake with
+    `closeTimeout` (2s): a dead socket must never hold up the connection
+    replacing it. `_send`'s existing per-request deadline is now the named
+    `requestTimeout`, next to the other two.
+  - `main.dart` — a connect requested *while one is in flight* is recorded and
+    replayed when that attempt settles, instead of being dropped. Only callers
+    that need a **different** connection (new address, rotated token) get there;
+    the retry timer just returns, since the in-flight attempt already serves it.
+    `_reconnectRequested` is cleared at the point the attempt commits to an
+    address and token — so "requested" structurally means "not yet served", and
+    no after-the-fact comparison of what changed is needed. (Changing the daemon
+    address mid-connect used to be dropped silently, leaving the app on the old
+    host with nothing pending.)
+  - `triage_websocket_client.dart` — pairing failures surface as a typed
+    `TriageAuthException`, classified once from the daemon's `unauthorized`
+    error code, instead of being sniffed out of the message text with
+    `errStr.contains('unauthorized')`.
+  - `main.dart` — that exception is now *reachable*: `_loadDaemonSessions` and
+    `_loadDaemonSessionInto` used to swallow it in a blanket `catch`, which left
+    a rejected token showing "Connected to Daemon" with zero sessions and no way
+    back. Both now route to pairing (the latter also covers selecting a session
+    on demand, which runs outside the connect path entirely).
+- Ownership: a channel may only be torn down by the client that currently owns
+  it (`identical(_channel, …)`, the guard `writeInput` already used). Bounding
+  the handshake is what created abandoned channels in the first place — one dying
+  later would otherwise disown the healthy channel that replaced it, failing its
+  in-flight requests and reporting a live connection closed. A channel that dies
+  *during* the handshake now fails the connect rather than being stored as a
+  corpse we would report as connected.
+- Tests: handshake timeout, close-during-handshake, a superseded channel dying,
+  auth vs non-auth classification, a mid-connect address change not being
+  dropped, and a token rejected mid-load routing to pairing. Each was checked to
+  actually fail with its fix reverted — the first drafts of two of them passed
+  against the unfixed code, which is exactly how a regression test lies.
+- Also: `disconnect` now cancels the channel's listener. A half-open socket never
+  ends its own stream, so the subscription — and the channel and socket behind it
+  — used to outlive every reconnect, leaking one per attempt on a flaky link.
+- Not fixed (follow-up): `isConnected` is `_channel != null`, so a *half-open*
+  socket (network changed while backgrounded, no FIN) still reads as connected —
+  there is no heartbeat, so nothing detects it until a request times out. That is
+  the real case for the keep-alive work in task #14.
+- Review: three `/review-fix-loop max` rounds, and each one found a real defect in
+  the *previous* round's fix — the reconnect-timer guard I added first
+  reintroduced the same permanent wedge through a different door (`isConnected`
+  is true after a request timeout, so the retry cancelled itself), bounding the
+  handshake created abandoned channels that could disown their healthy successor,
+  and `disconnect`'s own unbounded `sink.close()` was the wedge relocated. Two of
+  my first regression tests passed against the unfixed code; every test here was
+  re-checked by reverting its fix and confirming it fails.
+
 ## Rail: selected session to the top on reopen
 
 - 2026-07-12T16:35-0700 `main.dart` — reopening the rail scrolls the selected
@@ -246,11 +319,18 @@ The mobile work is split so the client (verified on-device) can ship ahead of
 the daemon protocol change (built + unit-tested, but its on-device end-to-end
 handover failed, so it is held back — see Issues).
 
-- HEAD — feat(triage_client): mobile usability + repo·worktree titles (rail
+- HEAD — fix(triage_client): route a rejected token to pairing, and stop the
+  reconnect loop from wedging (bounded connect/close, replayed in-flight
+  requests, channel-ownership guards).
+- 9f24473 — feat(session): `list_session_contexts` — daemon side of the titles
+  (triage-core / triaged / triage-transport-ws + FB parity). Committed, but
+  **not deployed**: its on-device end-to-end handover failed (see Issues), so
+  the running daemon predates it.
+- 17052de — fix(triage_client): reconnect immediately on resume, not after the
+  backoff
+- acea0af — feat(triage_client): launcher icon + selected session to top of rail
+- 94b5c0d — feat(triage_client): mobile usability + repo·worktree titles (rail
   overlay, accessory Enter, touch scroll, refit, `displayTitle` + client-side
-  `list_session_contexts` seeding; widget tests gated to the desktop layout).
-  PUSHED.
-- (local, unpushed) — feat(session): `list_session_contexts` — daemon side of
-  the titles (triage-core / triaged / triage-transport-ws + FB parity). Held
-  local until verified end-to-end on-device.
+  `list_session_contexts` seeding; widget tests gated to the desktop layout)
+- 6f44dca — feat(triage_client): Shift+Tab key, swipe-to-scroll, manual refit
 - 0359d88 — feat(triaged): mobile soft keyboard + key accessory bar

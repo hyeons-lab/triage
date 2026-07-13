@@ -29,6 +29,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   final bool shouldFailConnection;
   int failConnectAttempts;
+  Completer<void>? hangConnect;
+  bool listSessionsUnauthorized = false;
   bool authenticated;
   final bool disconnectAfterHello;
   final Set<String> exitedSessionIds;
@@ -65,6 +67,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<void> connect() async {
+    final hang = hangConnect;
+    if (hang != null && !hang.isCompleted) {
+      // Simulates a half-open socket: the handshake sits pending until the
+      // client's connect timeout fires (the test completes it with an error).
+      await hang.future;
+    }
     if (shouldFailConnection || failConnectAttempts > 0) {
       if (failConnectAttempts > 0) {
         failConnectAttempts -= 1;
@@ -111,6 +119,9 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<List<String>> listSessions() async {
+    if (listSessionsUnauthorized) {
+      throw TriageAuthException('unauthorized');
+    }
     return ['flutter-spike', 'websocket-session-api', 'main'];
   }
 
@@ -1262,6 +1273,52 @@ void main() {
 
     expect(client.helloClientIds.length, 1);
     expect(find.text('Connected to Daemon'), findsOneWidget);
+  });
+
+  testWidgets('a token rejected while loading sessions routes to pairing', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient()..listSessionsUnauthorized = true;
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // `hello` succeeded, so the app believed it was connected — then the daemon
+    // refused `list_sessions` because the token is no longer valid for this
+    // client id. Swallowing that (as the blanket `catch (_)` did) left the app
+    // sitting on "Connected to Daemon" with no sessions and no way to re-pair.
+    expect(find.text('Pair Remote Device'), findsOneWidget);
+  });
+
+  testWidgets('a connect requested during an in-flight connect is not dropped', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final client = FakeTriageWebSocketClient()..hangConnect = Completer<void>();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pump();
+    expect(
+      client.helloClientIds,
+      isEmpty,
+      reason: 'first connect is in flight',
+    );
+
+    // The user repoints the app at a different daemon while that connect is
+    // still pending. The in-flight attempt is talking to the *old* address, so
+    // it cannot satisfy this request.
+    await tester.tap(find.byTooltip('Connection settings'));
+    await tester.pump();
+    await tester.enterText(find.byType(TextField).last, 'otherhost:7777');
+    await tester.tap(find.text('Connect'));
+    await tester.pump();
+
+    // The in-flight connect now succeeds — so no failure, and no backoff timer,
+    // will come along to retry on the request's behalf. It has to be replayed
+    // when the attempt settles, or the app silently stays on the old daemon.
+    client.hangConnect!.complete();
+    await tester.pump();
+    await tester.pump();
+
+    expect(client.helloClientIds.length, 2);
   });
 
   testWidgets('drag-reordering the rail persists a per-device session order', (

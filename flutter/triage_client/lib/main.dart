@@ -425,6 +425,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   int _connectGeneration = 0;
   int _reconnectAttempt = 0;
   Timer? _reconnectTimer;
+  // A connect was asked for while one was already in flight; replayed as soon
+  // as that attempt settles. See `_connectWebSocket`.
+  bool _reconnectRequested = false;
   Timer? _credentialStorageTimer;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
@@ -949,18 +952,30 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// made re-attaching take seconds even on a fast network. A user-initiated
   /// resume is a fresh start, not a failed retry, so the attempt counter resets.
   void _reconnectNowOnResume() {
-    if (_disposed || !_clientInitialized) return;
-    // A connect already in flight will finish on its own; don't race it.
-    if (_isConnecting || _client.isConnected) return;
+    if (_disposed || !_clientInitialized || _client.isConnected) return;
+    if (_isConnecting) {
+      // A connect is already racing; let it finish rather than tearing it down.
+      // Still clear the accrued backoff, so that if it fails we retry at once
+      // instead of waiting out a delay that piled up while the app was away —
+      // dropping the resume outright is what left it stalling for seconds.
+      _reconnectAttempt = 0;
+      return;
+    }
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempt = 0;
     unawaited(_connectWebSocket(isReconnect: true));
   }
 
-  void _scheduleReconnect() {
+  /// [afterFailedAttempt] when the caller has just *seen* a connect fail. The
+  /// pairing guard below assumes `_needsPairing` implies a working socket the
+  /// user is pairing over — true only while `hello` is succeeding. If `hello`
+  /// itself failed, the socket is open but useless, and honouring that guard
+  /// would leave the app with no connection, no pending timer, and nothing to
+  /// retry: a dead end on the pairing screen.
+  void _scheduleReconnect({bool afterFailedAttempt = false}) {
     if (_disposed ||
-        (_needsPairing && _client.isConnected) ||
+        (!afterFailedAttempt && _needsPairing && _client.isConnected) ||
         _reconnectTimer?.isActive == true) {
       return;
     }
@@ -973,12 +988,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
     _reconnectTimer = Timer(delay, () {
       _reconnectTimer = null;
+      if (_disposed) return;
+      // A retry only wants *a* connection, and an attempt already in flight is
+      // one — so let it finish instead of queueing a replay that would tear it
+      // back down on success. Dropping this is safe because that attempt is
+      // bounded (connect/request/close all have deadlines) and its own failure
+      // path schedules the next retry.
+      if (_isConnecting) return;
       _connectWebSocket(isReconnect: true);
     });
   }
 
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
-    if (_disposed || _isConnecting) return;
+    if (_disposed) return;
+    if (_isConnecting) {
+      // A connect is already in flight, and it cannot serve this caller: the
+      // ones that reach here want a *different* connection (a new daemon
+      // address, a token that just rotated), not merely any connection — the
+      // retry timer, which does want merely any, returns before calling us.
+      // So record the request and replay it once the attempt settles, rather
+      // than dropping it and silently staying on the old daemon.
+      _reconnectRequested = true;
+      return;
+    }
     _isConnecting = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
@@ -995,10 +1027,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } catch (_) {}
     }
 
+    // Disposed, or superseded by a newer generation — which then owns
+    // `_isConnecting` (and the replay hook in its own `finally`). Clearing the
+    // flag here would let a third connect start alongside the live one.
     if (_disposed || generation != _connectGeneration) {
-      _isConnecting = false;
       return;
     }
+
+    // The attempt commits to an address and a token here. Anything requested
+    // before this point is already served by it — it re-read both — so only a
+    // request arriving from now on needs a connection of its own. Clearing the
+    // flag exactly here is what makes "requested" mean "not yet served", with no
+    // need to compare what changed afterwards.
+    _reconnectRequested = false;
 
     final client =
         widget.client ??
@@ -1015,8 +1056,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       await _client.connect();
 
       if (_disposed || generation != _connectGeneration) {
-        await _client.disconnect();
-        _isConnecting = false;
+        // Disconnect the client *this* generation opened, not `_client` — a
+        // newer generation may already have replaced the field, and tearing
+        // down its fresh connection would kill the live one.
+        await client.disconnect();
         return;
       }
 
@@ -1033,13 +1076,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final authenticated = helloRes['authenticated'] as bool? ?? false;
 
       if (_disposed || generation != _connectGeneration) {
-        _isConnecting = false;
         return;
       }
 
       if (!authenticated) {
         await _showPairingChallenge(generation);
-        _isConnecting = false;
         return;
       }
 
@@ -1055,12 +1096,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _reconnectAttempt = 0;
     } catch (e) {
       if (_disposed || generation != _connectGeneration) {
-        _isConnecting = false;
         return;
       }
-      final errStr = e.toString();
-      if (errStr.contains('unauthorized') ||
-          errStr.contains('unauthenticated')) {
+      // A rejected token never recovers by retrying, so re-pair instead of
+      // falling into the reconnect backoff.
+      if (e is TriageAuthException) {
         await _showPairingChallenge(generation);
       } else {
         setState(() {
@@ -1070,11 +1110,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _connectionStatusColor = const Color(0xff7f8b8d);
           _markAttachedSessionsDisconnected();
         });
-        _scheduleReconnect();
+        // A queued request is replayed immediately by the `finally`, so don't
+        // also burn a backoff step on a delay that would just be cancelled.
+        if (!_reconnectRequested) _scheduleReconnect(afterFailedAttempt: true);
       }
     } finally {
       if (generation == _connectGeneration) {
         _isConnecting = false;
+        if (_reconnectRequested && !_disposed) {
+          _reconnectRequested = false;
+          unawaited(_connectWebSocket(isReconnect: true));
+        }
       }
     }
   }
@@ -1266,6 +1312,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
       // the terminal view has not laid out yet.
+    } on TriageAuthException {
+      // The token was rejected while loading (revoked, or bound to a client id
+      // this install no longer has). Let it reach `_connectWebSocket`, which
+      // routes to pairing. Swallowing it here would strand the app on
+      // "Connected to Daemon" with no sessions and no way to re-pair.
+      rethrow;
     } catch (_) {
       // Fallback
     }
@@ -1325,9 +1377,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     return SessionVm(
       title: 'triage / $sessionId',
       status: loading ? 'loading' : 'idle',
-      statusColor: loading
-          ? const Color(0xffffc857)
-          : const Color(0xff7f8b8d),
+      statusColor: loading ? const Color(0xffffc857) : const Color(0xff7f8b8d),
       icon: Icons.terminal,
       rows: loading ? [_plainRow('Loading session $sessionId...')] : const [],
       isRemote: true,
@@ -1357,7 +1407,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       });
     }
     try {
-      final session = await _loadDaemonSession(sid, includeHistory: includeHistory);
+      final session = await _loadDaemonSession(
+        sid,
+        includeHistory: includeHistory,
+      );
       session.loaded = true;
       if (_disposed) return;
       setState(() {
@@ -1373,6 +1426,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _sessions[existingIndex] = session;
       });
       _drainPendingEvents(sid);
+    } on TriageAuthException {
+      // The daemon refused the attach: this client is no longer paired. Painting
+      // the row "load failed" would be a dead end — the same token fails for
+      // every session, and the user has no way back. Propagate so the caller
+      // re-pairs. It must not be handled here: swallowing it would let the
+      // caller finish and report a healthy "Connected to Daemon" over the top of
+      // the pairing prompt.
+      rethrow;
     } catch (e) {
       failedSessionIds.add(sid);
       if (_disposed) return;
@@ -1973,12 +2034,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!session.loaded) {
       final sid = _sessionIdFor(session);
       if (sid != null) {
+        // Selecting a session runs outside the connect path, so a rejected token
+        // has to be routed to pairing here — nothing upstream will see it.
         unawaited(
           _loadDaemonSessionInto(
             sid,
             includeHistory: true,
             failedSessionIds: <String>[],
-          ),
+          ).catchError((Object e) {
+            if (e is! TriageAuthException || _disposed || _needsPairing) return;
+            unawaited(_showPairingChallenge(_connectGeneration));
+          }),
         );
       }
       return;

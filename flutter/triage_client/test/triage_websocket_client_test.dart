@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/generated/triage_triage.generated_generated.dart'
     as fbs;
@@ -10,6 +12,16 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 class FakeWebSocketChannel implements WebSocketChannel {
   FakeWebSocketChannel({required this.sink, this.protocol, Future<void>? ready})
     : _ready = ready ?? Future.value();
+
+  /// Kill the underlying socket, as a real one does when it finally gives up:
+  /// an optional error, then done.
+  void die([Object? error]) {
+    if (_streamController.isClosed) return;
+    if (error != null) {
+      _streamController.addError(error);
+    }
+    _streamController.close();
+  }
 
   @override
   final WebSocketSink sink;
@@ -44,6 +56,7 @@ class FakeWebSocketChannel implements WebSocketChannel {
 
 class RecordingWebSocketSink implements WebSocketSink {
   final sent = <Object?>[];
+  int closeCalls = 0;
 
   @override
   Future<void> get done => Future.value();
@@ -64,7 +77,9 @@ class RecordingWebSocketSink implements WebSocketSink {
   }
 
   @override
-  Future<void> close([int? closeCode, String? closeReason]) async {}
+  Future<void> close([int? closeCode, String? closeReason]) async {
+    closeCalls += 1;
+  }
 }
 
 class ThrowingWebSocketSink extends RecordingWebSocketSink {
@@ -102,6 +117,205 @@ void main() {
       expect(client.isFlatBuffersNegotiated, isTrue);
     },
   );
+
+  test('connect gives up when the handshake never completes', () {
+    fakeAsync((async) {
+      final sink = RecordingWebSocketSink();
+      // A `ready` that never settles — a half-open socket, which is what a
+      // phone gets when its network changes while the app is backgrounded.
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) =>
+            FakeWebSocketChannel(sink: sink, ready: Completer<void>().future),
+      );
+
+      Object? error;
+      client.connect().catchError((Object e) {
+        error = e;
+      });
+      async.elapse(
+        TriageWebSocketClient.connectTimeout + const Duration(seconds: 1),
+      );
+
+      // The attempt must terminate: callers treat an in-flight connect as
+      // "don't start another one", so a connect that hangs forever would wedge
+      // reconnection permanently.
+      expect(error, isA<TimeoutException>());
+      expect(client.isConnected, isFalse);
+    });
+  });
+
+  test('a timed-out connect retires the channel it abandoned', () {
+    fakeAsync((async) {
+      final sink = RecordingWebSocketSink();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) =>
+            FakeWebSocketChannel(sink: sink, ready: Completer<void>().future),
+      );
+
+      client.connect().catchError((Object _) {});
+      async.elapse(
+        TriageWebSocketClient.connectTimeout + const Duration(seconds: 1),
+      );
+
+      // The handshake it gave up on is still running, so the socket has to be
+      // closed and unsubscribed — otherwise it keeps delivering into a client
+      // that has moved on.
+      expect(sink.closeCalls, 1);
+    });
+  });
+
+  test('a superseded channel dying cannot disown the live one', () {
+    fakeAsync((async) {
+      final channels = <FakeWebSocketChannel>[];
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) {
+          final channel = FakeWebSocketChannel(sink: RecordingWebSocketSink());
+          channels.add(channel);
+          return channel;
+        },
+      );
+
+      // Connect, drop, reconnect — the ordinary reconnect cycle. `disconnect`
+      // does not cancel the old channel's listener, so channel #1 is still wired
+      // to the client when it finally dies.
+      client.connect();
+      async.flushMicrotasks();
+      client.disconnect();
+      async.elapse(TriageWebSocketClient.closeTimeout);
+      client.connect();
+      async.flushMicrotasks();
+      expect(client.isConnected, isTrue);
+      expect(channels.length, 2);
+
+      final events = <Map<String, dynamic>>[];
+      client.events.listen(events.add);
+
+      // Channel #1's socket finally gives up, well after #2 took over. It must
+      // not null out `_channel`, fail #2's in-flight requests, or report the
+      // live connection closed.
+      channels.first.die(StateError('socket reset'));
+      async.flushMicrotasks();
+
+      expect(client.isConnected, isTrue);
+      expect(events, isEmpty);
+    });
+  });
+
+  test('connect fails when the socket closes during the handshake', () {
+    fakeAsync((async) {
+      late FakeWebSocketChannel channel;
+      final ready = Completer<void>();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) {
+          channel = FakeWebSocketChannel(
+            sink: RecordingWebSocketSink(),
+            ready: ready.future,
+          );
+          return channel;
+        },
+      );
+
+      Object? error;
+      client.connect().catchError((Object e) {
+        error = e;
+      });
+      async.flushMicrotasks();
+
+      // The server accepts the upgrade and closes immediately (a daemon shutting
+      // down mid-handshake). `done` lands in the gap before we take ownership.
+      channel.die();
+      ready.complete();
+      async.flushMicrotasks();
+
+      // Storing that channel would leave us "connected" to a corpse: writes
+      // vanish and no close is ever reported.
+      expect(error, isNotNull);
+      expect(client.isConnected, isFalse);
+    });
+  });
+
+  test('an unauthorized error response surfaces as TriageAuthException', () {
+    fakeAsync((async) {
+      final sink = RecordingWebSocketSink();
+      late FakeWebSocketChannel channel;
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) {
+          channel = FakeWebSocketChannel(sink: sink);
+          return channel;
+        },
+      );
+
+      client.connect();
+      async.flushMicrotasks();
+
+      Object? error;
+      client.hello(clientId: 'c1', token: 'stale-token').catchError((Object e) {
+        error = e;
+        return <String, dynamic>{};
+      });
+      async.flushMicrotasks();
+
+      final id =
+          (jsonDecode(sink.sent.single as String)
+              as Map<String, dynamic>)['id'];
+      channel.addIncoming(
+        jsonEncode({
+          'type': 'error',
+          'id': id,
+          'error': {'code': 'unauthorized', 'message': 'unauthorized'},
+        }),
+      );
+      async.flushMicrotasks();
+
+      // Typed, not message-sniffed: a rejected token must route to pairing
+      // rather than an endless reconnect backoff.
+      expect(error, isA<TriageAuthException>());
+    });
+  });
+
+  test('a non-auth error response stays a plain Exception', () {
+    fakeAsync((async) {
+      final sink = RecordingWebSocketSink();
+      late FakeWebSocketChannel channel;
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) {
+          channel = FakeWebSocketChannel(sink: sink);
+          return channel;
+        },
+      );
+
+      client.connect();
+      async.flushMicrotasks();
+
+      Object? error;
+      client.listSessions().catchError((Object e) {
+        error = e;
+        return <String>[];
+      });
+      async.flushMicrotasks();
+
+      final id =
+          (jsonDecode(sink.sent.single as String)
+              as Map<String, dynamic>)['id'];
+      channel.addIncoming(
+        jsonEncode({
+          'type': 'error',
+          'id': id,
+          'error': {'code': 'internal', 'message': 'boom'},
+        }),
+      );
+      async.flushMicrotasks();
+
+      expect(error, isA<Exception>());
+      expect(error, isNot(isA<TriageAuthException>()));
+    });
+  });
 
   test('writeInput fails when the WebSocket is not connected', () async {
     final client = TriageWebSocketClient(Uri.parse('ws://localhost/ws'));

@@ -8,6 +8,32 @@ import 'package:triage_client/generated/triage_triage.generated_generated.dart'
 
 typedef WebSocketChannelFactory = WebSocketChannel Function(Uri uri);
 
+/// Thrown when the daemon refuses a request because this client is not paired:
+/// the bearer token was revoked or expired, or it belongs to a different client
+/// id (a reinstall wipes the keystore-backed client id, so the stored token no
+/// longer matches the id we send). Retrying is futile — the same token fails
+/// identically forever — so callers must re-pair rather than reconnect.
+///
+/// A distinct type rather than a message substring, so that routing to the
+/// pairing screen does not depend on how the daemon words the error.
+class TriageAuthException implements Exception {
+  TriageAuthException(this.message);
+
+  final String message;
+
+  // Callers display this straight to the user (stripping only an `Exception: `
+  // prefix), so a `TriageAuthException: ` prefix here would leak into the UI.
+  @override
+  String toString() => message;
+}
+
+/// The daemon's error code for a request refused because the connection has not
+/// paired (`TransportError::Unauthorized`, whose message is the same string).
+const _unauthorizedCode = 'unauthorized';
+
+bool _isUnauthorized(String value) =>
+    value.trim().toLowerCase() == _unauthorizedCode;
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
@@ -17,6 +43,11 @@ class TriageWebSocketClient {
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
   WebSocketChannel? _channel;
+  // The current channel's listener, kept so it can be cancelled when the channel
+  // is retired. A half-open socket never ends its own stream, so without this
+  // the subscription — and the channel and socket it holds — would outlive every
+  // reconnect.
+  StreamSubscription<dynamic>? _subscription;
 
   final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
   final Map<String, String> _pendingRequestTypes = {};
@@ -33,34 +64,94 @@ class TriageWebSocketClient {
   bool get isFlatBuffersNegotiated =>
       _channel?.protocol == 'triage-flatbuffers';
 
+  /// How long [connect] waits for the WebSocket handshake before failing.
+  ///
+  /// `WebSocketChannel.ready` has no deadline of its own, so a half-open socket
+  /// — routine on a phone whose network changed while the app was backgrounded
+  /// — leaves it pending for as long as the OS keeps retransmitting. Callers
+  /// treat a connect that is still in flight as "one is already running, don't
+  /// start another", so a `ready` that never settles wedges reconnection
+  /// entirely. Bounding it guarantees every attempt terminates and can retry.
+  static const Duration connectTimeout = Duration(seconds: 10);
+
+  /// How long a request waits for its response before failing. Note this does
+  /// not close the socket: a request can time out on a connection that stays
+  /// open, so callers must not treat "still connected" as "still working".
+  static const Duration requestTimeout = Duration(seconds: 10);
+
+  /// How long [disconnect] waits for the close handshake before abandoning the
+  /// socket.
+  static const Duration closeTimeout = Duration(seconds: 2);
+
   Future<void> connect() async {
     if (_channel != null) return;
 
+    WebSocketChannel? channel;
+    StreamSubscription<dynamic>? subscription;
+    // Set when the channel dies before this call takes ownership of it — the
+    // handlers below can't report that through `_channel`, because it isn't
+    // ours yet.
+    var diedBeforeOwned = false;
     try {
-      final channel = _channelFactory(uri);
-      channel.stream.listen(
+      final pending = _channelFactory(uri);
+      channel = pending;
+      subscription = pending.stream.listen(
         (message) {
           _handleIncomingMessage(message);
         },
+        // Only the channel this client currently owns may tear it down. A
+        // channel abandoned by a timed-out connect dies later, on its own
+        // schedule — by then it may not be the current one, and disowning a
+        // healthy successor here would drop a live connection. Same guard as
+        // `writeInput`'s error path.
         onError: (error) {
+          if (!identical(_channel, pending)) {
+            diedBeforeOwned = true;
+            return;
+          }
           _cleanupPendingRequests();
           _channel = null;
+          _subscription = null;
           _eventController.add({
             'type': 'connection_closed',
             'error': error.toString(),
           });
         },
         onDone: () {
+          if (!identical(_channel, pending)) {
+            diedBeforeOwned = true;
+            return;
+          }
           _cleanupPendingRequests();
           _channel = null;
+          _subscription = null;
           _eventController.add({'type': 'connection_closed'});
         },
       );
-      await channel.ready;
-      _channel = channel;
+      await pending.ready.timeout(connectTimeout);
+      // A server that accepts the upgrade and closes immediately delivers
+      // `onDone` in the gap between `ready` completing and the line below. Left
+      // unchecked we would store a corpse and report it as connected — every
+      // later write would vanish into it — so fail the connect instead.
+      if (diedBeforeOwned) {
+        throw StateError('WebSocket closed during the handshake');
+      }
+      _channel = pending;
+      _subscription = subscription;
     } catch (error) {
-      _cleanupPendingRequests();
-      _channel = null;
+      // This attempt never took ownership (`_channel` is assigned only on
+      // success), so the same rule as the handlers above applies: if another
+      // connect has since installed a live channel, leave it and its in-flight
+      // requests alone. Only clean up when nothing has taken over.
+      if (_channel == null) {
+        _cleanupPendingRequests();
+      }
+      // A timeout does not cancel the handshake it gave up on, so retire this
+      // channel for good: stop listening to it and close the socket. Left
+      // subscribed, it would still be delivering frames — and running the
+      // handlers above — long after this attempt was abandoned.
+      unawaited(subscription?.cancel().catchError((_) {}));
+      unawaited(channel?.sink.close().catchError((_) {}));
       rethrow;
     }
   }
@@ -90,10 +181,17 @@ class TriageWebSocketClient {
         if (id != null && _pendingRequests.containsKey(id)) {
           _requestTimers.remove(id)?.cancel();
           _pendingRequestTypes.remove(id);
-          final errorMessage = error != null
-              ? (error['message'] ?? error['code'] ?? 'Unknown error')
-              : 'Unknown error';
-          _pendingRequests.remove(id)!.completeError(Exception(errorMessage));
+          final code = error?['code']?.toString();
+          final errorMessage =
+              error?['message']?.toString() ?? code ?? 'Unknown error';
+          // Classify pairing failures here, at the one place that sees the
+          // daemon's error code, so callers route to pairing on a type rather
+          // than sniffing message text. Fall back to the message only when
+          // there is no code at all.
+          final failure = _isUnauthorized(code ?? errorMessage)
+              ? TriageAuthException(errorMessage)
+              : Exception(errorMessage);
+          _pendingRequests.remove(id)!.completeError(failure);
         }
       } else if (type == 'event') {
         _eventController.add(message);
@@ -152,7 +250,7 @@ class TriageWebSocketClient {
     final completer = Completer<Map<String, dynamic>>();
     _pendingRequests[id] = completer;
     _pendingRequestTypes[id] = type;
-    _requestTimers[id] = Timer(const Duration(seconds: 10), () {
+    _requestTimers[id] = Timer(requestTimeout, () {
       if (_pendingRequests.remove(id) == completer && !completer.isCompleted) {
         final requestType = _pendingRequestTypes.remove(id) ?? type;
         completer.completeError(
@@ -260,12 +358,20 @@ class TriageWebSocketClient {
   /// carries only the git fields (no live cwd — that arrives via
   /// `session_context_updated`). Best-effort: an older daemon that predates this
   /// request will error, which the caller swallows.
-  Future<Map<String, ({String? repositoryRoot, String? worktreeRoot, String? branch})>>
+  Future<
+    Map<
+      String,
+      ({String? repositoryRoot, String? worktreeRoot, String? branch})
+    >
+  >
   listSessionContexts() async {
     final response = await _send('list_session_contexts');
     final entries = response['entries'] as List<dynamic>?;
     final result =
-        <String, ({String? repositoryRoot, String? worktreeRoot, String? branch})>{};
+        <
+          String,
+          ({String? repositoryRoot, String? worktreeRoot, String? branch})
+        >{};
     for (final entry in entries ?? const []) {
       final map = entry as Map<String, dynamic>;
       final sessionId = map['session_id'] as String?;
@@ -342,6 +448,8 @@ class TriageWebSocketClient {
       _cleanupPendingRequests();
       if (identical(_channel, channel)) {
         _channel = null;
+        unawaited(_subscription?.cancel().catchError((_) {}));
+        _subscription = null;
       }
       _eventController.add({
         'type': 'connection_closed',
@@ -425,9 +533,20 @@ class TriageWebSocketClient {
 
   Future<void> disconnect() async {
     final channel = _channel;
+    final subscription = _subscription;
     _channel = null;
+    _subscription = null;
+    // Stop listening first: on a half-open socket the close below never
+    // completes, so the stream would never end on its own and the subscription
+    // would keep this channel — and its socket — alive past every reconnect.
+    unawaited(subscription?.cancel().catchError((_) {}));
     if (channel != null) {
-      await channel.sink.close();
+      // Closing is a handshake, and a half-open socket never answers it. Bound
+      // the wait: callers disconnect in order to reconnect, so a dead socket
+      // must never be able to hold up the connection replacing it.
+      try {
+        await channel.sink.close().timeout(closeTimeout);
+      } catch (_) {}
     }
     _cleanupPendingRequests();
   }
