@@ -200,13 +200,28 @@ input (see Lessons).
 Not yet verified on-device: the phone left the LAN before the verification run
 (analyze clean, 100 tests pass).
 
+## Rail: selected session to the top on reopen
+
+- 2026-07-12T16:35-0700 `main.dart` — reopening the rail scrolls the selected
+  session to the top (`_selectedTileKey` on the selected tile + a post-frame
+  `Scrollable.ensureVisible(alignment: 0)` from `openRail`). Scrolls rather than
+  reorders, so it never fights the user's persisted drag order.
+
 ## Branding
 
 - 2026-07-12T08:40-0700 App display name set to **Triage** (was `triage_client`
   / "Triage Client"): `android/app/src/main/AndroidManifest.xml` `android:label`,
-  `ios/Runner/Info.plist` `CFBundleDisplayName`. The launcher icon still uses the
-  legacy `ic_launcher.png` — modern/adaptive icons from `triage_icon.svg` are a
-  follow-up (needs SVG rasterization + `flutter_launcher_icons`).
+  `ios/Runner/Info.plist` `CFBundleDisplayName`.
+- 2026-07-12T16:35-0700 **Launcher icon** replaced the legacy `ic_launcher.png`
+  with generated icons via `flutter_launcher_icons`. SVG sources are now
+  versioned in `assets/icon/`; `pubspec.yaml` documents the regeneration.
+  - iOS: full-bleed **opaque** square (`icon_square.png`) — iOS applies its own
+    squircle mask, so a pre-rounded/transparent icon would double-round.
+  - Android: real **adaptive icon** (`mipmap-anydpi-v26/ic_launcher.xml`) —
+    transparent logo foreground over a `#1A2233` background (`colors.xml`).
+    Foreground is sized to ~88% of the layer because the generated XML insets a
+    further 16%, landing the mark at ~60% of the icon (verified by compositing
+    the exact mask/inset Android applies).
 
 ## Commits
 

@@ -46,6 +46,28 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_launcher_icons: ^0.14.1
+
+# Launcher icons. Sources of truth are the SVGs in assets/icon/; the two PNGs
+# below are derived. To regenerate after editing an SVG:
+#
+#   cd assets/icon
+#   inkscape triage_icon.svg -w 1024 -h 1024 -o /tmp/icon.png
+#   inkscape triage_logo_transparent.svg -w 1024 -h 1024 -o /tmp/logo.png
+#   # iOS wants a full-bleed OPAQUE square (it applies its own squircle mask):
+#   magick /tmp/icon.png -background "#1A2233" -alpha remove -alpha off icon_square.png
+#   # Android adaptive foreground: logo at ~88% of the layer — the generated
+#   # adaptive XML insets it by a further 16%, landing the mark at ~60%.
+#   magick /tmp/logo.png -trim +repage -resize 900x900 -background none \
+#       -gravity center -extent 1024x1024 adaptive_fg.png
+#   cd ../.. && dart run flutter_launcher_icons
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/icon_square.png"
+  adaptive_icon_background: "#1A2233"
+  adaptive_icon_foreground: "assets/icon/adaptive_fg.png"
+  remove_alpha_ios: true
 
   # Deterministic virtual clock for unit-testing the store's time-bounded
   # history-input suppression window without real delays.

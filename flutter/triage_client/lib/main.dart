@@ -416,6 +416,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Remote session ids currently being attached (lazy-load), so a repeated
   // select can't open a second subscription for the same session.
   final Set<String> _loadingSessionIds = {};
+  // Marks the selected session's rail tile so reopening the rail can scroll it
+  // to the top — the session you're in should be the first thing you see.
+  final GlobalKey _selectedTileKey = GlobalKey();
   bool _clientInitialized = false;
   bool _isConnecting = false;
   bool _disposed = false;
@@ -2396,12 +2399,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
 
     void openRail() {
-      if (_sidebarCollapsed) setState(() => _sidebarCollapsed = false);
+      if (!_sidebarCollapsed) return;
+      setState(() => _sidebarCollapsed = false);
+      // Bring the session you're in to the top of the freshly-opened rail.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final tileContext = _selectedTileKey.currentContext;
+        if (tileContext == null) return;
+        Scrollable.ensureVisible(
+          tileContext,
+          alignment: 0, // 0 = align to the top of the viewport
+          duration: _sessionRailAnimationDuration,
+          curve: Curves.easeOutCubic,
+        );
+      });
     }
 
     final rail = SessionRail(
       sessions: _sessions,
       selectedIndex: _selectedIndex,
+      selectedTileKey: _selectedTileKey,
       // On mobile, selecting or creating a session dismisses the overlay so the
       // terminal takes the full screen.
       onSelectSession: (index) {
@@ -2563,10 +2579,14 @@ class SessionRail extends StatelessWidget {
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
+    this.selectedTileKey,
   });
 
   final List<SessionVm> sessions;
   final int selectedIndex;
+  // Attached to the selected session's tile so the host can scroll it to the
+  // top when the rail (re)opens.
+  final Key? selectedTileKey;
   final ValueChanged<int> onSelectSession;
   final void Function(int oldIndex, int newIndex) onReorderSession;
   final ValueChanged<NewSessionShell> onCreateSession;
@@ -2802,6 +2822,7 @@ class SessionRail extends StatelessWidget {
                 session.remoteSessionId ?? 'local:${session.title}',
               );
               final tile = SessionListTile(
+                key: index == selectedIndex ? selectedTileKey : null,
                 selected: index == selectedIndex,
                 title: session.displayTitle,
                 subtitle: session.status,

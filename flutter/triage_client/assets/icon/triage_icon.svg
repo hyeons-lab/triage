@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Clip path to keep all background elements perfectly inside the squircle -->
+    <clipPath id="squircleClip">
+      <rect x="4" y="4" width="504" height="504" rx="112" ry="112" />
+    </clipPath>
+
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="40%" r="60%" fx="50%" fy="30%">
+      <stop offset="0%" stop-color="#161e2e"/>
+      <stop offset="100%" stop-color="#0b0f19"/>
+    </radialGradient>
+    
+    <!-- Sharp Bezel Gradient for Outer Border -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe" stroke-opacity="0.6"/>
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.1"/>
+      <stop offset="70%" stop-color="#ffffff" stop-opacity="0.02"/>
+      <stop offset="100%" stop-color="#ff0844" stop-opacity="0.4"/>
+    </linearGradient>
+
+    <!-- Neon Path Gradients -->
+    <linearGradient id="cyanNeon" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#00f2fe" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#4facfe"/>
+    </linearGradient>
+    
+    <linearGradient id="pinkNeon" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff0844" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#ffb199"/>
+    </linearGradient>
+    
+    <linearGradient id="indigoNeon" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#7000ff" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#b000ff"/>
+    </linearGradient>
+
+    <linearGradient id="purpleNeon" x1="100%" y1="0%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#a18cd1" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#fbc2eb"/>
+    </linearGradient>
+
+    <!-- Glow Filters (Self-contained, don't bleed out of squircle bounds) -->
+    <filter id="glowSoft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    
+    <filter id="glowHeavy" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feColorMatrix type="matrix" values="
+        1 0 0 0 0
+        0 1 0 0 0
+        0 0 1 0 0
+        0 0 0 1.8 0
+      " result="boost"/>
+      <feMerge>
+        <feMergeNode in="boost"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Crisp Squircle Background -->
+  <rect x="4" y="4" width="504" height="504" rx="112" ry="112" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="4" />
+
+  <!-- Background blueprint details (Clipped to prevent leaking outside the squircle boundary) -->
+  <g clip-path="url(#squircleClip)">
+    <line x1="50" y1="50" x2="462" y2="462" stroke="#1f293d" stroke-width="1.5" stroke-dasharray="6,12"/>
+    <line x1="462" y1="50" x2="50" y2="462" stroke="#1f293d" stroke-width="1.5" stroke-dasharray="6,12"/>
+    <circle cx="256" cy="256" r="160" fill="none" stroke="#24314c" stroke-width="1.5" stroke-dasharray="5,8"/>
+    <circle cx="256" cy="256" r="200" fill="none" stroke="#1a2335" stroke-width="1.2"/>
+    <line x1="256" y1="10" x2="256" y2="502" stroke="#1f293d" stroke-width="1.2" opacity="0.6"/>
+    <line x1="10" y1="256" x2="502" y2="256" stroke="#1f293d" stroke-width="1.2" opacity="0.6"/>
+    
+    <!-- Subtle Inner Rim Gloss -->
+    <rect x="8" y="8" width="496" height="496" rx="108" ry="108" fill="none" stroke="#ffffff" stroke-width="1" stroke-opacity="0.06"/>
+  </g>
+
+  <!-- Central Graphic Components (Perfectly contained) -->
+  <g clip-path="url(#squircleClip)">
+    <!-- ==================== GLOW UNDERLAY (BLURRED) ==================== -->
+    <g opacity="0.85" filter="url(#glowHeavy)">
+      <!-- Top Lines Glow (Cyan) -->
+      <path d="M 230 195 L 230 165 L 210 140 L 210 110" fill="none" stroke="#00f2fe" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 256 195 L 256 100" fill="none" stroke="#00f2fe" stroke-width="10" stroke-linecap="round"/>
+      <path d="M 282 195 L 282 165 L 302 140 L 302 110" fill="none" stroke="#00f2fe" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="210" cy="110" r="8" fill="#00f2fe"/>
+      <circle cx="256" cy="100" r="8" fill="#00f2fe"/>
+      <circle cx="302" cy="110" r="8" fill="#00f2fe"/>
+
+      <!-- Bottom Lines Glow (Indigo/Violet) -->
+      <path d="M 230 317 L 230 347 L 210 372 L 210 402" fill="none" stroke="#9d4edd" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 256 317 L 256 412" fill="none" stroke="#9d4edd" stroke-width="10" stroke-linecap="round"/>
+      <path d="M 282 317 L 282 347 L 302 372 L 302 402" fill="none" stroke="#9d4edd" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="210" cy="402" r="8" fill="#9d4edd"/>
+      <circle cx="256" cy="412" r="8" fill="#9d4edd"/>
+      <circle cx="302" cy="402" r="8" fill="#9d4edd"/>
+
+      <!-- Left Lines Glow (Purple/Violet) -->
+      <path d="M 195 230 L 165 230 L 140 210 L 110 210" fill="none" stroke="#7209b7" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 195 256 L 100 256" fill="none" stroke="#7209b7" stroke-width="10" stroke-linecap="round"/>
+      <path d="M 195 282 L 165 282 L 140 302 L 110 302" fill="none" stroke="#7209b7" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="110" cy="210" r="8" fill="#7209b7"/>
+      <circle cx="100" cy="256" r="8" fill="#7209b7"/>
+      <circle cx="110" cy="302" r="8" fill="#7209b7"/>
+
+      <!-- Right Lines Glow (Pink/Magenta) -->
+      <path d="M 317 230 L 347 230 L 372 210 L 402 210" fill="none" stroke="#ff007f" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 317 256 L 412 256" fill="none" stroke="#ff007f" stroke-width="10" stroke-linecap="round"/>
+      <path d="M 317 282 L 347 282 L 372 302 L 402 302" fill="none" stroke="#ff007f" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="402" cy="210" r="8" fill="#ff007f"/>
+      <circle cx="412" cy="256" r="8" fill="#ff007f"/>
+      <circle cx="402" cy="302" r="8" fill="#ff007f"/>
+
+      <!-- Center Terminal Prompt Glow (Cyan) -->
+      <path d="M 215 220 L 245 256 L 215 292" fill="none" stroke="#00f2fe" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+      <line x1="260" y1="292" x2="295" y2="292" stroke="#00f2fe" stroke-width="14" stroke-linecap="round"/>
+    </g>
+
+    <!-- ==================== CRISP TOP LAYER ==================== -->
+    <!-- Top Lines (Cyan) -->
+    <g stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 230 195 L 230 165 L 210 140 L 210 110" fill="none" stroke="url(#cyanNeon)" stroke-width="6"/>
+      <path d="M 256 195 L 256 100" fill="none" stroke="url(#cyanNeon)" stroke-width="6"/>
+      <path d="M 282 195 L 282 165 L 302 140 L 302 110" fill="none" stroke="url(#cyanNeon)" stroke-width="6"/>
+      <circle cx="210" cy="110" r="5" fill="#e0fbfc" stroke="#00f2fe" stroke-width="2"/>
+      <circle cx="256" cy="100" r="5" fill="#e0fbfc" stroke="#00f2fe" stroke-width="2"/>
+      <circle cx="302" cy="110" r="5" fill="#e0fbfc" stroke="#00f2fe" stroke-width="2"/>
+    </g>
+
+    <!-- Bottom Lines (Indigo/Violet) -->
+    <g stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 230 317 L 230 347 L 210 372 L 210 402" fill="none" stroke="url(#indigoNeon)" stroke-width="6"/>
+      <path d="M 256 317 L 256 412" fill="none" stroke="url(#indigoNeon)" stroke-width="6"/>
+      <path d="M 282 317 L 282 347 L 302 372 L 302 402" fill="none" stroke="url(#indigoNeon)" stroke-width="6"/>
+      <circle cx="210" cy="402" r="5" fill="#f3e8ff" stroke="#9d4edd" stroke-width="2"/>
+      <circle cx="256" cy="412" r="5" fill="#f3e8ff" stroke="#9d4edd" stroke-width="2"/>
+      <circle cx="302" cy="402" r="5" fill="#f3e8ff" stroke="#9d4edd" stroke-width="2"/>
+    </g>
+
+    <!-- Left Lines (Purple/Violet) -->
+    <g stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 195 230 L 165 230 L 140 210 L 110 210" fill="none" stroke="url(#purpleNeon)" stroke-width="6"/>
+      <path d="M 195 256 L 100 256" fill="none" stroke="url(#purpleNeon)" stroke-width="6"/>
+      <path d="M 195 282 L 165 282 L 140 302 L 110 302" fill="none" stroke="url(#purpleNeon)" stroke-width="6"/>
+      <circle cx="110" cy="210" r="5" fill="#fae8ff" stroke="#a18cd1" stroke-width="2"/>
+      <circle cx="100" cy="256" r="5" fill="#fae8ff" stroke="#a18cd1" stroke-width="2"/>
+      <circle cx="110" cy="302" r="5" fill="#fae8ff" stroke="#a18cd1" stroke-width="2"/>
+    </g>
+
+    <!-- Right Lines (Pink/Magenta) -->
+    <g stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 317 230 L 347 230 L 372 210 L 402 210" fill="none" stroke="url(#pinkNeon)" stroke-width="6"/>
+      <path d="M 317 256 L 412 256" fill="none" stroke="url(#pinkNeon)" stroke-width="6"/>
+      <path d="M 317 282 L 347 282 L 372 302 L 402 302" fill="none" stroke="url(#pinkNeon)" stroke-width="6"/>
+      <circle cx="402" cy="210" r="5" fill="#ffe4e6" stroke="#ff0844" stroke-width="2"/>
+      <circle cx="412" cy="256" r="5" fill="#ffe4e6" stroke="#ff0844" stroke-width="2"/>
+      <circle cx="402" cy="302" r="5" fill="#ffe4e6" stroke="#ff0844" stroke-width="2"/>
+    </g>
+
+    <!-- Center Terminal Prompt -->
+    <g filter="url(#glowSoft)" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 215 220 L 245 256 L 215 292" fill="none" stroke="#ffffff" stroke-width="8"/>
+      <path d="M 215 220 L 245 256 L 215 292" fill="none" stroke="#00f2fe" stroke-width="4"/>
+      <line x1="260" y1="292" x2="295" y2="292" stroke="#ffffff" stroke-width="8"/>
+      <line x1="260" y1="292" x2="295" y2="292" stroke="#00f2fe" stroke-width="4"/>
+    </g>
+  </g>
+</svg>
