@@ -200,6 +200,23 @@ input (see Lessons).
 Not yet verified on-device: the phone left the LAN before the verification run
 (analyze clean, 100 tests pass).
 
+## Resume: reconnect immediately instead of waiting out the backoff
+
+- 2026-07-12T16:55-0700 Reported: switching away from the app and back took
+  *seconds* to re-attach, even on a fast network. Cause was not the network:
+  backgrounding drops the socket, `_scheduleReconnect` then sits on an
+  exponential backoff (`1 << attempt` → 1, 2, 4, 8, 16s), and the `resumed`
+  lifecycle handler never cancelled it — so returning to the app waited out
+  whatever delay had accrued while away.
+- Fix (`main.dart`): new `_reconnectNowOnResume()` — on `AppLifecycleState.resumed`
+  (and on the wake-watchdog path, for sleeps that deliver no lifecycle event),
+  cancel the pending backoff timer, reset `_reconnectAttempt` (a user-initiated
+  resume is a fresh start, not a failed retry) and reconnect at once. Guarded
+  against racing an in-flight connect. With lazy-load (one session attaches),
+  resume is now a single connect rather than a timer wait.
+- This is the cheap fix for the motivation behind the background-keepalive
+  request; a foreground service may no longer be needed.
+
 ## Rail: selected session to the top on reopen
 
 - 2026-07-12T16:35-0700 `main.dart` — reopening the rail scrolls the selected

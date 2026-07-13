@@ -523,6 +523,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final gap = now.difference(_lastWatchdogTick);
       _lastWatchdogTick = now;
       if (gap > _wakeWatchdogGap) {
+        // Same as the resume path: don't wait out the accrued backoff after a
+        // sleep/wake that never delivered a lifecycle event.
+        _reconnectNowOnResume();
         _refitActiveSession();
         _refocusActiveSessionOnResume();
       }
@@ -660,6 +663,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // The lifecycle event handles this wake; reset the watchdog baseline so
           // its next tick doesn't also see the sleep gap and heal a second time.
           _lastWatchdogTick = DateTime.now();
+          // Reattach at once instead of waiting out the reconnect backoff that
+          // accrued while we were backgrounded.
+          _reconnectNowOnResume();
           _refitActiveSession();
           _refocusActiveSessionOnResume();
         }
@@ -933,6 +939,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final seconds = 1 << _reconnectAttempt.clamp(0, 4);
     _reconnectAttempt += 1;
     return Duration(seconds: seconds);
+  }
+
+  /// Reconnect immediately when the app comes back to the foreground.
+  ///
+  /// Backgrounding drops the socket, and `_scheduleReconnect` then sits on an
+  /// exponential backoff (1, 2, 4, 8, 16s). Without this, returning to the app
+  /// waits out whatever delay had accrued while we were away — which is what
+  /// made re-attaching take seconds even on a fast network. A user-initiated
+  /// resume is a fresh start, not a failed retry, so the attempt counter resets.
+  void _reconnectNowOnResume() {
+    if (_disposed || !_clientInitialized) return;
+    // A connect already in flight will finish on its own; don't race it.
+    if (_isConnecting || _client.isConnected) return;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
+    unawaited(_connectWebSocket(isReconnect: true));
   }
 
   void _scheduleReconnect() {
