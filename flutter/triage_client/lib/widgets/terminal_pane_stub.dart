@@ -337,6 +337,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _handlePointerDown(PointerDownEvent event) {
     _focusTerminal();
     if ((event.buttons & kPrimaryButton) == 0) return;
+    // Touch: let the terminal's own gestures handle scrolling (a swipe) and
+    // selection (long-press). The pointer-driven drag-select below is for a
+    // mouse — on touch it would hijack a swipe-to-scroll into a text selection.
+    if (_isMobile) return;
     if (HardwareKeyboard.instance.isShiftPressed) {
       // Shift+primary: a click extends the existing selection on pointer-up.
       _shiftClickPointer = event.pointer;
@@ -763,6 +767,9 @@ class _TerminalPaneState extends State<TerminalPane> {
             _accessoryKey('esc', () => _sendAccessory('\x1b')),
             _accessoryKey('ctrl', _toggleCtrl, active: _ctrlArmed),
             _accessoryKey('tab', () => _sendAccessory('\t')),
+            // Shift+Tab (back-tab, `ESC [ Z`) — e.g. to cycle Claude Code's
+            // auto / accept-edits / plan modes from a phone.
+            _accessoryKey('⇧tab', () => _sendAccessory('\x1b[Z')),
             // Enter/Return: the soft keyboard's return key maps to an IME action
             // that never reaches the terminal, so a terminal needs an explicit
             // one. `\r` (carriage return) is what a terminal expects on Enter.

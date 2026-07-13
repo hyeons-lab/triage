@@ -183,6 +183,23 @@ input (see Lessons).
     fits the **current** viewport when opened, rather than the size it was
     persisted at — the desired behavior for the multi-device case.
 
+## Touch polish (Shift+Tab, swipe-scroll, refit)
+
+- 2026-07-12T16:10-0700 `terminal_pane_stub.dart`:
+  - **Shift+Tab** key (`⇧tab` → `ESC [ Z`, back-tab) in the accessory bar, so
+    Claude Code's auto / accept-edits / plan modes can be cycled from a phone.
+  - **Swipe scrolls, long-press selects** — `_handlePointerDown` now returns
+    early on touch, so the pointer-driven drag-select (a *mouse* affordance) no
+    longer hijacks a swipe into a text selection; the terminal's own gestures
+    handle scroll + long-press selection.
+- 2026-07-12T16:10-0700 `main.dart` — manual **refit** button in
+  `WorkspaceHeader` (`onRefit` → `_refitActiveSession`), the escape hatch for
+  reclaiming the shared PTY size when switching back to a device (auto-refit
+  only fires on resume-from-occlusion).
+
+Not yet verified on-device: the phone left the LAN before the verification run
+(analyze clean, 100 tests pass).
+
 ## Branding
 
 - 2026-07-12T08:40-0700 App display name set to **Triage** (was `triage_client`

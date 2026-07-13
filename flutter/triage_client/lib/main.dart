@@ -2464,6 +2464,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 _onSessionViewFit(_selectedSession, cols, rows),
             // The header's menu button reopens the overlay on mobile only.
             onOpenRail: isMobile ? openRail : null,
+            // Manual escape hatch for reclaiming the shared PTY size when
+            // switching back to this device (auto-refit only fires on resume).
+            onRefit: _refitActiveSession,
           );
 
     if (isMobile) {
@@ -3629,6 +3632,7 @@ class SessionWorkspace extends StatelessWidget {
     this.onCloseSession,
     this.onViewFit,
     this.onOpenRail,
+    this.onRefit,
   });
 
   final SessionVm session;
@@ -3636,6 +3640,8 @@ class SessionWorkspace extends StatelessWidget {
   final void Function(int cols, int rows)? onViewFit;
   // Mobile only: opens the session rail overlay from the workspace header.
   final VoidCallback? onOpenRail;
+  // Re-asserts this device's terminal size on the shared PTY.
+  final VoidCallback? onRefit;
 
   @override
   Widget build(BuildContext context) {
@@ -3645,6 +3651,7 @@ class SessionWorkspace extends StatelessWidget {
           session: session,
           onClose: onCloseSession,
           onOpenRail: onOpenRail,
+          onRefit: onRefit,
         ),
         Expanded(
           child: TerminalPane(
@@ -3673,6 +3680,7 @@ class WorkspaceHeader extends StatelessWidget {
     required this.session,
     this.onClose,
     this.onOpenRail,
+    this.onRefit,
   });
 
   final SessionVm session;
@@ -3680,6 +3688,9 @@ class WorkspaceHeader extends StatelessWidget {
   // Mobile only: opens the session rail overlay. Null on desktop, where the
   // rail is always visible beside the workspace.
   final VoidCallback? onOpenRail;
+  // Re-asserts this device's terminal size on the shared PTY, so switching back
+  // to this device reclaims the size from whichever device resized it last.
+  final VoidCallback? onRefit;
 
   @override
   Widget build(BuildContext context) {
@@ -3743,7 +3754,14 @@ class WorkspaceHeader extends StatelessWidget {
             session.status,
             style: const TextStyle(color: Color(0xffcdd7d6)),
           ),
-          const SizedBox(width: 16),
+          const SizedBox(width: 8),
+          if (onRefit != null)
+            IconButton(
+              icon: const Icon(Icons.fit_screen, color: Color(0xffcdd7d6)),
+              tooltip: 'Refit terminal to this device',
+              onPressed: onRefit,
+            ),
+          const SizedBox(width: 8),
           if (onClose != null)
             IconButton(
               icon: const Icon(Icons.close, color: Color(0xffcdd7d6)),
