@@ -1696,6 +1696,53 @@ impl SessionApi for SessionManager {
             .collect())
     }
 
+    /// Every session's most recently resolved git context, for the
+    /// `list_session_contexts` control request. Reads the already-resolved
+    /// per-session context — it never re-runs git (`resolve_session_context`):
+    /// live sessions return the actor's cached `SessionContext` via a brief
+    /// off-lock round-trip (mirroring `summary_rows`), and historical /
+    /// restoring sessions read their stored context directly. Sessions with no
+    /// resolved context (e.g. a cwd outside any repository) carry `None`.
+    #[allow(clippy::type_complexity)]
+    fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+        // Capture each session's context source under a brief lock: a cloned
+        // actor channel for live sessions (read OFF-LOCK so the round-trip never
+        // holds the global `sessions` mutex during actor I/O) or the
+        // already-stored context for historical / restoring ones.
+        enum ContextSource {
+            Ready(Option<SessionContext>),
+            Live(Sender<ActorCommand>),
+        }
+        let sources: Vec<(SessionId, ContextSource)> = {
+            let sessions = self.sessions()?;
+            sessions
+                .iter()
+                .map(|(session_id, managed)| {
+                    let source = match managed {
+                        ManagedSession::Live { actor, .. } => ContextSource::Live(actor.tx.clone()),
+                        ManagedSession::Historical { session, .. }
+                        | ManagedSession::Restoring { session, .. } => {
+                            ContextSource::Ready(session.context.clone())
+                        }
+                    };
+                    (session_id.clone(), source)
+                })
+                .collect()
+        };
+        Ok(sources
+            .into_iter()
+            .map(|(session_id, source)| {
+                let context = match source {
+                    ContextSource::Ready(context) => context,
+                    // A live actor mid-shutdown simply yields no context rather
+                    // than failing the whole batch.
+                    ContextSource::Live(tx) => request_session_context(&tx).ok().flatten(),
+                };
+                (session_id, context)
+            })
+            .collect())
+    }
+
     fn server_update_info(&self) -> triage_core::session::ServerUpdateInfo {
         let status = self.update_status();
         triage_core::session::ServerUpdateInfo {
@@ -2643,6 +2690,13 @@ enum ActorCommand {
     SummaryRows {
         response: Sender<ActorResult<SummaryRowsResponse>>,
     },
+    /// Cheap read of the session's already-resolved git context
+    /// (repository/worktree root + branch): the actor just clones its cached
+    /// `SessionContext`, so this never renders rows or re-runs git. Backs the
+    /// `list_session_contexts` control request.
+    Context {
+        response: Sender<ActorResult<Option<SessionContext>>>,
+    },
     StyledRows {
         start: usize,
         end: usize,
@@ -2989,6 +3043,10 @@ impl ActorState {
             ActorCommand::SummaryRows { response } => {
                 let rows = visible_rows(&self.output.terminal);
                 let _ = response.send(Ok((rows, self.output.output_seq, self.context.clone())));
+                false
+            }
+            ActorCommand::Context { response } => {
+                let _ = response.send(Ok(self.context.clone()));
                 false
             }
             ActorCommand::StyledRows {
@@ -3802,6 +3860,18 @@ fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<SummaryRowsResponse
     recv_actor_result(resp_rx, "reading session summary rows")
 }
 
+/// Requests the session's already-resolved git context via a cloned actor
+/// command channel. Mirrors [`request_summary_rows`]: clone `tx` under a brief
+/// lock, then call this OFF-LOCK so the round-trip never blocks other session
+/// operations. Cheap — the actor just clones its cached `SessionContext`; it
+/// never re-runs git.
+fn request_session_context(tx: &Sender<ActorCommand>) -> Result<Option<SessionContext>> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::Context { response: resp_tx })
+        .context("sending session context command")?;
+    recv_actor_result(resp_rx, "reading session context")
+}
+
 /// Requests a full snapshot via a cloned actor command channel. Mirrors
 /// [`request_summary_rows`]: clone `tx` under a brief lock, then call this
 /// OFF-LOCK so the actor round-trip never blocks other session operations.
@@ -3825,6 +3895,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::SummaryRows { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::Context { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::StyledRows { response, .. } => {

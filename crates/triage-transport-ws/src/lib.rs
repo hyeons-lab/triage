@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use anyhow::{Result, bail};
@@ -382,6 +383,36 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     .collect();
                 Ok(ServerResult::SessionSnippets { entries })
             }
+            ClientRequest::ListSessionContexts => {
+                let entries = self
+                    .api
+                    .list_session_contexts()?
+                    .into_iter()
+                    .map(|(session_id, context)| {
+                        let to_string = |path: &Path| path.to_string_lossy().into_owned();
+                        // Convert the cached `SessionContext` paths to strings the
+                        // same way the `SessionContextUpdated` push does; the bulk
+                        // fetch carries no live cwd (the cached context holds only
+                        // the git fields), so `current_working_directory` is None.
+                        let (repository_root, worktree_root, branch) = match &context {
+                            Some(context) => (
+                                context.repository_root.as_deref().map(to_string),
+                                context.worktree_root.as_deref().map(to_string),
+                                context.branch_name().map(str::to_string),
+                            ),
+                            None => (None, None, None),
+                        };
+                        SessionContextEntry {
+                            session_id,
+                            current_working_directory: None,
+                            repository_root,
+                            worktree_root,
+                            branch,
+                        }
+                    })
+                    .collect();
+                Ok(ServerResult::SessionContexts { entries })
+            }
         }
     }
 
@@ -467,6 +498,7 @@ pub enum ClientRequest {
         session_id: SessionId,
     },
     ListSessionSnippets,
+    ListSessionContexts,
 }
 
 /// One session's current snippet, as carried in [`ServerResult::SessionSnippets`].
@@ -478,6 +510,26 @@ pub struct SessionSnippetEntry {
     /// Longer-form summary for the hover popover / search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// One session's current git context, as carried in
+/// [`ServerResult::SessionContexts`]. Mirrors the fields of the
+/// [`ServerMessage::SessionContextUpdated`] push so a bulk fetch and the
+/// incremental updates reconcile against the same shape.
+/// `current_working_directory` is always `None` in the bulk fetch — the cached
+/// `SessionContext` holds only the git fields; clients that need the live cwd
+/// read it from the push.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextEntry {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -586,6 +638,9 @@ pub enum ServerResult {
     SessionSnippets {
         entries: Vec<SessionSnippetEntry>,
     },
+    SessionContexts {
+        entries: Vec<SessionContextEntry>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +674,7 @@ fn serialize_fallback_error(message: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
@@ -626,7 +682,8 @@ mod tests {
     use serde_json::json;
     use triage_core::generated::triage::generated as fb;
     use triage_core::session::{
-        AttachMode, InputLeaseState, SessionEvent, SessionSize, StyledRow, TerminalCursor,
+        AttachMode, InputLeaseState, SessionContext, SessionEvent, SessionSize, StyledRow,
+        TerminalCursor,
     };
 
     use super::*;
@@ -678,6 +735,36 @@ mod tests {
                 id: Some(json!("req-1")),
                 result: ServerResult::SessionIds {
                     session_ids: vec![SessionId::new("session-1").unwrap()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn list_session_contexts_routes_to_session_api() {
+        let api = FakeSessionApi::default();
+        api.sessions
+            .lock()
+            .unwrap()
+            .push(SessionId::new("session-1").unwrap());
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        let response =
+            connection.handle_text_message(r#"{"id":"req-1","type":"list_session_contexts"}"#);
+
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            decoded,
+            ServerMessage::Response {
+                id: Some(json!("req-1")),
+                result: ServerResult::SessionContexts {
+                    entries: vec![SessionContextEntry {
+                        session_id: SessionId::new("session-1").unwrap(),
+                        current_working_directory: None,
+                        repository_root: Some("/repo".to_string()),
+                        worktree_root: Some("/repo/worktree".to_string()),
+                        branch: Some("main".to_string()),
+                    }],
                 },
             }
         );
@@ -860,6 +947,26 @@ mod tests {
     impl SessionApi for FakeSessionApi {
         fn list_sessions(&self) -> Result<Vec<SessionId>> {
             Ok(self.sessions.lock().unwrap().clone())
+        }
+
+        fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+            Ok(self
+                .sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|session_id| {
+                    (
+                        session_id,
+                        Some(SessionContext {
+                            repository_root: Some(PathBuf::from("/repo")),
+                            worktree_root: Some(PathBuf::from("/repo/worktree")),
+                            branch: Some("main".to_string()),
+                        }),
+                    )
+                })
+                .collect())
         }
 
         fn start_session(&self, _request: StartSessionRequest) -> Result<SessionId> {

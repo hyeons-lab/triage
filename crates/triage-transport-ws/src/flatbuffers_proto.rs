@@ -357,6 +357,7 @@ pub fn parse_client_message(
             ClientRequest::ShutdownSession { session_id }
         }
         fb::ClientRequestPayload::ListSessionSnippetsRequest => ClientRequest::ListSessionSnippets,
+        fb::ClientRequestPayload::ListSessionContextsRequest => ClientRequest::ListSessionContexts,
         _ => {
             return Err(crate::ProtocolError::new(
                 "unsupported_payload",
@@ -646,6 +647,16 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::ListSessionContexts => {
+            let req = fb::ListSessionContextsRequest::create(
+                builder,
+                &fb::ListSessionContextsRequestArgs {},
+            );
+            (
+                fb::ClientRequestPayload::ListSessionContextsRequest,
+                req.as_union_value(),
+            )
+        }
     };
 
     fb::ClientMessage::create(
@@ -862,6 +873,46 @@ pub fn build_server_message<'a>(
                     );
                     (
                         fb::ServerResultPayload::SessionSnippetsResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::SessionContexts { entries } => {
+                    let mut entry_offsets = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let sid = builder.create_string(entry.session_id.as_str());
+                        let cwd = entry
+                            .current_working_directory
+                            .as_ref()
+                            .map(|s| builder.create_string(s));
+                        let repo = entry
+                            .repository_root
+                            .as_ref()
+                            .map(|s| builder.create_string(s));
+                        let wt = entry
+                            .worktree_root
+                            .as_ref()
+                            .map(|s| builder.create_string(s));
+                        let branch = entry.branch.as_ref().map(|s| builder.create_string(s));
+                        entry_offsets.push(fb::SessionContextEntry::create(
+                            builder,
+                            &fb::SessionContextEntryArgs {
+                                session_id: Some(sid),
+                                current_working_directory: cwd,
+                                repository_root: repo,
+                                worktree_root: wt,
+                                branch,
+                            },
+                        ));
+                    }
+                    let entries_vec = builder.create_vector(&entry_offsets);
+                    let r = fb::SessionContextsResult::create(
+                        builder,
+                        &fb::SessionContextsResultArgs {
+                            entries: Some(entries_vec),
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::SessionContextsResult,
                         r.as_union_value(),
                     )
                 }

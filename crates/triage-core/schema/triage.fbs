@@ -204,6 +204,8 @@ table ShutdownSessionRequest {
 
 table ListSessionSnippetsRequest {}
 
+table ListSessionContextsRequest {}
+
 union ClientRequestPayload {
     HelloRequest,
     PairRequest,
@@ -220,7 +222,8 @@ union ClientRequestPayload {
     StyledRowsRequestTable,
     ShutdownSessionRequest,
     PairingChallengeRequest,
-    ListSessionSnippetsRequest
+    ListSessionSnippetsRequest,
+    ListSessionContextsRequest
 }
 
 table ClientMessage {
@@ -295,6 +298,18 @@ table SessionSnippetsResult {
     entries: [SessionSnippetEntry];
 }
 
+table SessionContextEntry {
+    session_id: string;
+    current_working_directory: string;
+    repository_root: string;
+    worktree_root: string;
+    branch: string;
+}
+
+table SessionContextsResult {
+    entries: [SessionContextEntry];
+}
+
 union ServerResultPayload {
     UnitResult,
     HelloResult,
@@ -308,7 +323,8 @@ union ServerResultPayload {
     StyledRowsResult,
     CompletedSessionResult,
     PairingChallengeResult,
-    SessionSnippetsResult
+    SessionSnippetsResult,
+    SessionContextsResult
 }
 
 table ResponsePayload {

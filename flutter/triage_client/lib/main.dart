@@ -271,6 +271,28 @@ class SessionVm {
     return leaf.isEmpty ? null : leaf;
   }
 
+  /// Human-facing name for the rail/header, so sessions are identifiable at a
+  /// glance instead of all reading "triage / session-NN". Prefers
+  /// "repo · worktree", falls back to "repo · branch" when there is no distinct
+  /// worktree, then the working-directory leaf, then the stable [title]
+  /// ("triage / <id>"). Distinct from [title], which stays an identity key.
+  String get displayTitle {
+    final repo = repoName;
+    if (repo != null) {
+      final wt = worktreeName;
+      if (wt != null) return '$repo · $wt';
+      final b = branch;
+      if (b != null && b.trim().isNotEmpty) return '$repo · ${b.trim()}';
+      return repo;
+    }
+    final cwdLeaf = _leafOf(cwd);
+    if (cwdLeaf != null) return cwdLeaf;
+    // No git context and no cwd: fall back to the stable title ("triage /
+    // <id>") rather than a bare id, so a context-less session still reads
+    // sensibly.
+    return title;
+  }
+
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
   // real rendering goes through [store]/[terminal] from raw bytes.
@@ -278,6 +300,9 @@ class SessionVm {
   final TerminalController terminalController;
   final bool isRemote;
   bool isExited;
+  // True once this remote session has been subscribed/attached (lazy-loaded).
+  // Non-selected sessions stay unloaded until the user opens them.
+  bool loaded = false;
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
@@ -388,12 +413,21 @@ class TriageHome extends StatefulWidget {
 
 class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   late TriageWebSocketClient _client;
+  // Remote session ids currently being attached (lazy-load), so a repeated
+  // select can't open a second subscription for the same session.
+  final Set<String> _loadingSessionIds = {};
+  // Marks the selected session's rail tile so reopening the rail can scroll it
+  // to the top — the session you're in should be the first thing you see.
+  final GlobalKey _selectedTileKey = GlobalKey();
   bool _clientInitialized = false;
   bool _isConnecting = false;
   bool _disposed = false;
   int _connectGeneration = 0;
   int _reconnectAttempt = 0;
   Timer? _reconnectTimer;
+  // A connect was asked for while one was already in flight; replayed as soon
+  // as that attempt settles. See `_connectWebSocket`.
+  bool _reconnectRequested = false;
   Timer? _credentialStorageTimer;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
@@ -492,7 +526,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final gap = now.difference(_lastWatchdogTick);
       _lastWatchdogTick = now;
       if (gap > _wakeWatchdogGap) {
-        _redrawActiveSessionOnResume();
+        // Same as the resume path: don't wait out the accrued backoff after a
+        // sleep/wake that never delivered a lifecycle event.
+        _reconnectNowOnResume();
+        _refitActiveSession();
         _refocusActiveSessionOnResume();
       }
     });
@@ -629,7 +666,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // The lifecycle event handles this wake; reset the watchdog baseline so
           // its next tick doesn't also see the sleep gap and heal a second time.
           _lastWatchdogTick = DateTime.now();
-          _redrawActiveSessionOnResume();
+          // Reattach at once instead of waiting out the reconnect backoff that
+          // accrued while we were backgrounded.
+          _reconnectNowOnResume();
+          _refitActiveSession();
           _refocusActiveSessionOnResume();
         }
         break;
@@ -639,15 +679,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  // Heal the active session's layout on resume by mimicking a manual resize:
-  // jiggle the host PTY size (one row shorter, then back to our real size) so the
-  // program receives SIGWINCH and repaints over the live stream at our current
-  // width. We deliberately do NOT replay history — re-emulating the raw-output
-  // tail re-introduces the width-mismatched/truncated frame, which is what makes
-  // it render correctly and then switch to incorrect. A same-size resize sends no
+  // Re-assert this device's terminal size on the shared PTY and force a repaint.
+  // Called on resume-from-occlusion and from the header "refit" button, so a user
+  // switching between devices (each with its own width) can reclaim the PTY for
+  // the device they are now on. Mimics a manual resize: jiggle the host PTY size
+  // (one row shorter, then back to our real size) so the program receives
+  // SIGWINCH and repaints over the live stream at our current width. We
+  // deliberately do NOT replay history — re-emulating the raw-output tail
+  // re-introduces the width-mismatched/truncated frame, which is what makes it
+  // render correctly and then switch to incorrect. A same-size resize sends no
   // SIGWINCH, so the jiggle guarantees a repaint even when the host already
   // believes it is at our size.
-  void _redrawActiveSessionOnResume() {
+  void _refitActiveSession() {
     // `_client` is `late` and only assigned by _connectWebSocket; in mock mode it
     // is never set, so guard on _clientInitialized before touching it.
     if (_disposed || !_clientInitialized || _sessions.isEmpty) return;
@@ -901,9 +944,38 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     return Duration(seconds: seconds);
   }
 
-  void _scheduleReconnect() {
+  /// Reconnect immediately when the app comes back to the foreground.
+  ///
+  /// Backgrounding drops the socket, and `_scheduleReconnect` then sits on an
+  /// exponential backoff (1, 2, 4, 8, 16s). Without this, returning to the app
+  /// waits out whatever delay had accrued while we were away — which is what
+  /// made re-attaching take seconds even on a fast network. A user-initiated
+  /// resume is a fresh start, not a failed retry, so the attempt counter resets.
+  void _reconnectNowOnResume() {
+    if (_disposed || !_clientInitialized || _client.isConnected) return;
+    if (_isConnecting) {
+      // A connect is already racing; let it finish rather than tearing it down.
+      // Still clear the accrued backoff, so that if it fails we retry at once
+      // instead of waiting out a delay that piled up while the app was away —
+      // dropping the resume outright is what left it stalling for seconds.
+      _reconnectAttempt = 0;
+      return;
+    }
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
+    unawaited(_connectWebSocket(isReconnect: true));
+  }
+
+  /// [afterFailedAttempt] when the caller has just *seen* a connect fail. The
+  /// pairing guard below assumes `_needsPairing` implies a working socket the
+  /// user is pairing over — true only while `hello` is succeeding. If `hello`
+  /// itself failed, the socket is open but useless, and honouring that guard
+  /// would leave the app with no connection, no pending timer, and nothing to
+  /// retry: a dead end on the pairing screen.
+  void _scheduleReconnect({bool afterFailedAttempt = false}) {
     if (_disposed ||
-        (_needsPairing && _client.isConnected) ||
+        (!afterFailedAttempt && _needsPairing && _client.isConnected) ||
         _reconnectTimer?.isActive == true) {
       return;
     }
@@ -916,12 +988,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
     _reconnectTimer = Timer(delay, () {
       _reconnectTimer = null;
+      if (_disposed) return;
+      // A retry only wants *a* connection, and an attempt already in flight is
+      // one — so let it finish instead of queueing a replay that would tear it
+      // back down on success. Dropping this is safe because that attempt is
+      // bounded (connect/request/close all have deadlines) and its own failure
+      // path schedules the next retry.
+      if (_isConnecting) return;
       _connectWebSocket(isReconnect: true);
     });
   }
 
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
-    if (_disposed || _isConnecting) return;
+    if (_disposed) return;
+    if (_isConnecting) {
+      // A connect is already in flight, and it cannot serve this caller: the
+      // ones that reach here want a *different* connection (a new daemon
+      // address, a token that just rotated), not merely any connection — the
+      // retry timer, which does want merely any, returns before calling us.
+      // So record the request and replay it once the attempt settles, rather
+      // than dropping it and silently staying on the old daemon.
+      _reconnectRequested = true;
+      return;
+    }
     _isConnecting = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
@@ -938,10 +1027,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } catch (_) {}
     }
 
+    // Disposed, or superseded by a newer generation — which then owns
+    // `_isConnecting` (and the replay hook in its own `finally`). Clearing the
+    // flag here would let a third connect start alongside the live one.
     if (_disposed || generation != _connectGeneration) {
-      _isConnecting = false;
       return;
     }
+
+    // The attempt commits to an address and a token here. Anything requested
+    // before this point is already served by it — it re-read both — so only a
+    // request arriving from now on needs a connection of its own. Clearing the
+    // flag exactly here is what makes "requested" mean "not yet served", with no
+    // need to compare what changed afterwards.
+    _reconnectRequested = false;
 
     final client =
         widget.client ??
@@ -958,8 +1056,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       await _client.connect();
 
       if (_disposed || generation != _connectGeneration) {
-        await _client.disconnect();
-        _isConnecting = false;
+        // Disconnect the client *this* generation opened, not `_client` — a
+        // newer generation may already have replaced the field, and tearing
+        // down its fresh connection would kill the live one.
+        await client.disconnect();
         return;
       }
 
@@ -976,13 +1076,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final authenticated = helloRes['authenticated'] as bool? ?? false;
 
       if (_disposed || generation != _connectGeneration) {
-        _isConnecting = false;
         return;
       }
 
       if (!authenticated) {
         await _showPairingChallenge(generation);
-        _isConnecting = false;
         return;
       }
 
@@ -998,12 +1096,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _reconnectAttempt = 0;
     } catch (e) {
       if (_disposed || generation != _connectGeneration) {
-        _isConnecting = false;
         return;
       }
-      final errStr = e.toString();
-      if (errStr.contains('unauthorized') ||
-          errStr.contains('unauthenticated')) {
+      // A rejected token never recovers by retrying, so re-pair instead of
+      // falling into the reconnect backoff.
+      if (e is TriageAuthException) {
         await _showPairingChallenge(generation);
       } else {
         setState(() {
@@ -1013,11 +1110,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _connectionStatusColor = const Color(0xff7f8b8d);
           _markAttachedSessionsDisconnected();
         });
-        _scheduleReconnect();
+        // A queued request is replayed immediately by the `finally`, so don't
+        // also burn a backoff step on a delay that would just be cancelled.
+        if (!_reconnectRequested) _scheduleReconnect(afterFailedAttempt: true);
       }
     } finally {
       if (generation == _connectGeneration) {
         _isConnecting = false;
+        if (_reconnectRequested && !_disposed) {
+          _reconnectRequested = false;
+          unawaited(_connectWebSocket(isReconnect: true));
+        }
       }
     }
   }
@@ -1145,8 +1248,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }
         }
         _sessions.clear();
-        for (final sid in sessionIds) {
-          final session = _loadingDaemonSession(sid);
+        for (var i = 0; i < sessionIds.length; i++) {
+          // Only the selected session loads now; the rest rest as rail rows
+          // until selected (see the lazy-load note below).
+          final session = _loadingDaemonSession(
+            sessionIds[i],
+            loading: i == targetSelectedIndex,
+          );
           _setupSessionInputListener(session);
           _sessions.add(session);
         }
@@ -1164,50 +1272,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       });
 
-      final loadTasks = <Future<void>>[];
-      for (var idx = 0; idx < sessionIds.length; idx++) {
-        final sid = sessionIds[idx];
-        final includeHistory = idx == targetSelectedIndex;
-        loadTasks.add(() async {
-          try {
-            final session = await _loadDaemonSession(
-              sid,
-              includeHistory: includeHistory,
-            );
-            if (_disposed) return;
-            setState(() {
-              final existingIndex = _sessions.indexWhere(
-                (s) => s.remoteSessionId == sid,
-              );
-              if (existingIndex == -1) return;
-              final oldSession = _sessions[existingIndex];
-              oldSession.dispose();
-              if (oldSession.title != session.title) {
-                TerminalPane.destroySession(oldSession.title);
-              }
-              _sessions[existingIndex] = session;
-            });
-            _drainPendingEvents(sid);
-          } catch (e) {
-            failedSessionIds.add(sid);
-            if (_disposed) return;
-            setState(() {
-              final existingIndex = _sessions.indexWhere(
-                (s) => s.remoteSessionId == sid,
-              );
-              if (existingIndex == -1) return;
-              _sessions[existingIndex].status = 'load failed';
-              _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
-              _sessions[existingIndex].rows
-                ..clear()
-                ..add(_plainRow('Failed to load session $sid'));
-            });
-            debugPrint('Failed to load session $sid: ${e.toString()}');
-          }
-        }());
+      // Lazy-load: subscribe/attach ONLY the selected session on connect. The
+      // rest stay as lightweight rail rows (title + snippet + git context from
+      // the list calls) and load on demand when selected. Subscribing to every
+      // session at once saturates the single WebSocket and the requests time out
+      // over a network link — the "reconnect fails / load failed until I keep
+      // switching sessions" storm — and only one session is ever shown at a time.
+      if (sessionIds.isNotEmpty) {
+        await _loadDaemonSessionInto(
+          sessionIds[targetSelectedIndex],
+          includeHistory: true,
+          failedSessionIds: failedSessionIds,
+        );
       }
-
-      await Future.wait(loadTasks);
 
       if (!_disposed) {
         setState(() {
@@ -1225,13 +1302,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         });
       }
 
-      // Seed side-rail snippets for all sessions (best-effort; no-op if the
-      // daemon's summarizer is disabled). Live updates arrive via push events.
-      await _seedSessionSnippets();
+      // Seed side-rail snippets and git context for all sessions (best-effort).
+      // Context gives every session a "repo · worktree" title immediately;
+      // snippets add the one-line summary. Live updates arrive via push events.
+      // Independent best-effort requests — run concurrently to save a connect
+      // round-trip (matters on high-latency mobile links).
+      await Future.wait([_seedSessionSnippets(), _seedSessionContexts()]);
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
       // the terminal view has not laid out yet.
+    } on TriageAuthException {
+      // The token was rejected while loading (revoked, or bound to a client id
+      // this install no longer has). Let it reach `_connectWebSocket`, which
+      // routes to pairing. Swallowing it here would strand the app on
+      // "Connected to Daemon" with no sessions and no way to re-pair.
+      rethrow;
     } catch (_) {
       // Fallback
     }
@@ -1256,15 +1342,116 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  SessionVm _loadingDaemonSession(String sessionId) {
+  // Seed each session's git context on connect so the rail title reads
+  // "repo · worktree" for every session immediately, instead of waiting for a
+  // per-session load (which may never happen / may time out). Only sets the git
+  // fields — the bulk response carries no cwd; live cwd arrives via
+  // `session_context_updated`. Best-effort: an older daemon errors on the
+  // unknown request, which is swallowed here.
+  Future<void> _seedSessionContexts() async {
+    try {
+      final contexts = await _client.listSessionContexts();
+      if (_disposed || contexts.isEmpty) return;
+      setState(() {
+        for (final session in _sessions) {
+          final sid = session.remoteSessionId;
+          final entry = sid == null ? null : contexts[sid];
+          if (entry != null) {
+            session.repoRoot = entry.repositoryRoot;
+            session.worktreeRoot = entry.worktreeRoot;
+            session.branch = entry.branch;
+          }
+        }
+      });
+    } catch (_) {
+      // Context is best-effort rail metadata; a daemon without the request
+      // (pre-upgrade) just leaves titles on their session-id fallback.
+    }
+  }
+
+  // Placeholder rail row for a daemon session. [loading] true means it is being
+  // attached now (the selected session); false is the lazy resting state for
+  // sessions not yet opened — a muted row that carries only rail metadata until
+  // the user selects it, at which point `_loadDaemonSessionInto` attaches it.
+  SessionVm _loadingDaemonSession(String sessionId, {bool loading = true}) {
     return SessionVm(
       title: 'triage / $sessionId',
-      status: 'loading',
-      statusColor: const Color(0xffffc857),
+      status: loading ? 'loading' : 'idle',
+      statusColor: loading ? const Color(0xffffc857) : const Color(0xff7f8b8d),
       icon: Icons.terminal,
-      rows: [_plainRow('Loading session $sessionId...')],
+      rows: loading ? [_plainRow('Loading session $sessionId...')] : const [],
       isRemote: true,
     );
+  }
+
+  // Attaches one daemon session (subscribe + attach + snapshot) and swaps it into
+  // the rail in place, or marks it failed. Guarded against concurrent re-entry so
+  // a double-select can't open two subscriptions. Extracted so both the connect
+  // path and on-demand selection load a session the same way.
+  Future<void> _loadDaemonSessionInto(
+    String sid, {
+    required bool includeHistory,
+    required List<String> failedSessionIds,
+  }) async {
+    if (_loadingSessionIds.contains(sid)) return;
+    _loadingSessionIds.add(sid);
+    // Show the row as loading (covers the on-demand-select case, where the row
+    // was resting).
+    if (!_disposed) {
+      setState(() {
+        final i = _sessions.indexWhere((s) => s.remoteSessionId == sid);
+        if (i != -1 && !_sessions[i].loaded) {
+          _sessions[i].status = 'loading';
+          _sessions[i].statusColor = const Color(0xffffc857);
+        }
+      });
+    }
+    try {
+      final session = await _loadDaemonSession(
+        sid,
+        includeHistory: includeHistory,
+      );
+      session.loaded = true;
+      if (_disposed) return;
+      setState(() {
+        final existingIndex = _sessions.indexWhere(
+          (s) => s.remoteSessionId == sid,
+        );
+        if (existingIndex == -1) return;
+        final oldSession = _sessions[existingIndex];
+        oldSession.dispose();
+        if (oldSession.title != session.title) {
+          TerminalPane.destroySession(oldSession.title);
+        }
+        _sessions[existingIndex] = session;
+      });
+      _drainPendingEvents(sid);
+    } on TriageAuthException {
+      // The daemon refused the attach: this client is no longer paired. Painting
+      // the row "load failed" would be a dead end — the same token fails for
+      // every session, and the user has no way back. Propagate so the caller
+      // re-pairs. It must not be handled here: swallowing it would let the
+      // caller finish and report a healthy "Connected to Daemon" over the top of
+      // the pairing prompt.
+      rethrow;
+    } catch (e) {
+      failedSessionIds.add(sid);
+      if (_disposed) return;
+      setState(() {
+        final existingIndex = _sessions.indexWhere(
+          (s) => s.remoteSessionId == sid,
+        );
+        if (existingIndex == -1) return;
+        _sessions[existingIndex].status = 'load failed';
+        _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
+        _sessions[existingIndex].rows
+          ..clear()
+          ..add(_plainRow('Failed to load session $sid'));
+      });
+      debugPrint('Failed to load session $sid: ${e.toString()}');
+    } finally {
+      _loadingSessionIds.remove(sid);
+    }
   }
 
   Future<SessionVm> _loadDaemonSession(
@@ -1841,6 +2028,27 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _selectedIndex = index;
     });
     if (!canRefresh) return;
+    // Lazy-load: an unopened session has no live subscription yet (the connect
+    // path only attached the initially-selected one), so attach it now instead
+    // of refreshing a snapshot it never subscribed to.
+    if (!session.loaded) {
+      final sid = _sessionIdFor(session);
+      if (sid != null) {
+        // Selecting a session runs outside the connect path, so a rejected token
+        // has to be routed to pairing here — nothing upstream will see it.
+        unawaited(
+          _loadDaemonSessionInto(
+            sid,
+            includeHistory: true,
+            failedSessionIds: <String>[],
+          ).catchError((Object e) {
+            if (e is! TriageAuthException || _disposed || _needsPairing) return;
+            unawaited(_showPairingChallenge(_connectGeneration));
+          }),
+        );
+      }
+      return;
+    }
     if (session.hasFitted) {
       // Already fitted: refresh now at the known real size.
       unawaited(_refreshSessionSnapshot(session, includeHistory: true));
@@ -2264,76 +2472,179 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
     }
 
+    // On a phone the rail can't sit beside the workspace — it would squeeze the
+    // terminal to a sliver. Mobile shows a full-screen workspace with the rail
+    // as a scrim-backed overlay that dismisses on select; desktop keeps the
+    // side-by-side layout.
+    // The widget tests assert the desktop side-by-side layout, so keep it in the
+    // test harness even though the default test platform is android.
+    final isMobile =
+        !runningUnderFlutterTest() &&
+        (defaultTargetPlatform == TargetPlatform.iOS ||
+            defaultTargetPlatform == TargetPlatform.android);
+
+    void collapseRail() {
+      if (!_sidebarCollapsed) setState(() => _sidebarCollapsed = true);
+    }
+
+    void openRail() {
+      if (!_sidebarCollapsed) return;
+      setState(() => _sidebarCollapsed = false);
+      // Bring the session you're in to the top of the freshly-opened rail.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final tileContext = _selectedTileKey.currentContext;
+        if (tileContext == null) return;
+        Scrollable.ensureVisible(
+          tileContext,
+          alignment: 0, // 0 = align to the top of the viewport
+          duration: _sessionRailAnimationDuration,
+          curve: Curves.easeOutCubic,
+        );
+      });
+    }
+
+    final rail = SessionRail(
+      sessions: _sessions,
+      selectedIndex: _selectedIndex,
+      selectedTileKey: _selectedTileKey,
+      // On mobile, selecting or creating a session dismisses the overlay so the
+      // terminal takes the full screen.
+      onSelectSession: (index) {
+        _selectSession(index);
+        if (isMobile) collapseRail();
+      },
+      onReorderSession: _reorderSessions,
+      onCreateSession: (shell) {
+        _createSession(shell);
+        if (isMobile) collapseRail();
+      },
+      selectedShell: _newSessionShell,
+      shellOptions: newSessionShellMenuOrderForPlatform(defaultTargetPlatform),
+      showShellMenu: showNewSessionShellMenuForPlatform(defaultTargetPlatform),
+      connectionStatus: _connectionStatus,
+      connectionStatusColor: _connectionStatusColor,
+      onOpenSettings: _openConnectionSettings,
+      // Mobile: the rail always shows full content (the overlay slide handles
+      // show/hide) and its collapse button closes the overlay. Desktop: the
+      // button shrinks the rail to its icon strip in place.
+      isCollapsed: isMobile ? false : _sidebarCollapsed,
+      onToggleCollapse: isMobile
+          ? collapseRail
+          : () {
+              setState(() {
+                _sidebarCollapsed = !_sidebarCollapsed;
+              });
+            },
+    );
+
+    const emptyWorkspace = Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.terminal, size: 64, color: Color(0xff263033)),
+          SizedBox(height: 16),
+          Text(
+            'No active sessions',
+            style: TextStyle(
+              fontSize: 18,
+              color: Color(0xff7f8b8d),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          SizedBox(height: 8),
+          Text(
+            'Create a new session by clicking the "+" button on the sidebar.',
+            style: TextStyle(fontSize: 14, color: Color(0xff7f8b8d)),
+          ),
+        ],
+      ),
+    );
+
+    final workspace = _sessions.isEmpty
+        ? emptyWorkspace
+        : SessionWorkspace(
+            session: _selectedSession,
+            onCloseSession: () => _closeSession(_selectedSession),
+            onViewFit: (cols, rows) =>
+                _onSessionViewFit(_selectedSession, cols, rows),
+            // The header's menu button reopens the overlay on mobile only.
+            onOpenRail: isMobile ? openRail : null,
+            // Manual escape hatch for reclaiming the shared PTY size when
+            // switching back to this device (auto-refit only fires on resume).
+            onRefit: _refitActiveSession,
+          );
+
+    if (isMobile) {
+      final screenWidth = MediaQuery.of(context).size.width;
+      final overlayWidth = screenWidth < _sessionRailExpandedWidth
+          ? screenWidth
+          : _sessionRailExpandedWidth;
+      return Scaffold(
+        body: SafeArea(
+          // The rail and scrim stay mounted and animate on the collapsed flag
+          // (slide + fade) rather than popping in/out, so open/close is smooth.
+          child: Stack(
+            children: [
+              Positioned.fill(child: workspace),
+              // A menu affordance when the rail is dismissed and there is no
+              // workspace header to host one (no sessions yet).
+              if (_sidebarCollapsed && _sessions.isEmpty)
+                Positioned(
+                  top: 4,
+                  left: 4,
+                  child: IconButton(
+                    icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
+                    tooltip: 'Sessions',
+                    onPressed: openRail,
+                  ),
+                ),
+              // Scrim: fades in with the rail; ignores taps while collapsed so
+              // input passes through to the terminal.
+              Positioned.fill(
+                child: IgnorePointer(
+                  ignoring: _sidebarCollapsed,
+                  child: AnimatedOpacity(
+                    opacity: _sidebarCollapsed ? 0.0 : 1.0,
+                    duration: _sessionRailAnimationDuration,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: collapseRail,
+                      child: const ColoredBox(color: Color(0x99000000)),
+                    ),
+                  ),
+                ),
+              ),
+              // Rail: slides in from the left edge.
+              AnimatedPositioned(
+                duration: _sessionRailAnimationDuration,
+                curve: Curves.easeOutCubic,
+                top: 0,
+                bottom: 0,
+                left: _sidebarCollapsed ? -overlayWidth : 0,
+                width: overlayWidth,
+                child: Material(
+                  elevation: 16,
+                  color: const Color(0xff0d1113),
+                  child: rail,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       body: SafeArea(
         child: Row(
           children: [
-            SessionRail(
-              sessions: _sessions,
-              selectedIndex: _selectedIndex,
-              onSelectSession: _selectSession,
-              onReorderSession: _reorderSessions,
-              onCreateSession: _createSession,
-              selectedShell: _newSessionShell,
-              shellOptions: newSessionShellMenuOrderForPlatform(
-                defaultTargetPlatform,
-              ),
-              showShellMenu: showNewSessionShellMenuForPlatform(
-                defaultTargetPlatform,
-              ),
-              connectionStatus: _connectionStatus,
-              connectionStatusColor: _connectionStatusColor,
-              onOpenSettings: _openConnectionSettings,
-              isCollapsed: _sidebarCollapsed,
-              onToggleCollapse: () {
-                setState(() {
-                  _sidebarCollapsed = !_sidebarCollapsed;
-                });
-              },
-            ),
+            rail,
             const VerticalDivider(
               width: 1,
               thickness: 1,
               color: Color(0xff263033),
             ),
-            Expanded(
-              child: _sessions.isEmpty
-                  ? const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            Icons.terminal,
-                            size: 64,
-                            color: Color(0xff263033),
-                          ),
-                          SizedBox(height: 16),
-                          Text(
-                            'No active sessions',
-                            style: TextStyle(
-                              fontSize: 18,
-                              color: Color(0xff7f8b8d),
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          SizedBox(height: 8),
-                          Text(
-                            'Create a new session by clicking the "+" button on the sidebar.',
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Color(0xff7f8b8d),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  : SessionWorkspace(
-                      session: _selectedSession,
-                      onCloseSession: () => _closeSession(_selectedSession),
-                      onViewFit: (cols, rows) =>
-                          _onSessionViewFit(_selectedSession, cols, rows),
-                    ),
-            ),
+            Expanded(child: workspace),
           ],
         ),
       ),
@@ -2357,10 +2668,14 @@ class SessionRail extends StatelessWidget {
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
+    this.selectedTileKey,
   });
 
   final List<SessionVm> sessions;
   final int selectedIndex;
+  // Attached to the selected session's tile so the host can scroll it to the
+  // top when the rail (re)opens.
+  final Key? selectedTileKey;
   final ValueChanged<int> onSelectSession;
   final void Function(int oldIndex, int newIndex) onReorderSession;
   final ValueChanged<NewSessionShell> onCreateSession;
@@ -2592,28 +2907,43 @@ class SessionRail extends StatelessWidget {
             itemCount: sessions.length,
             itemBuilder: (context, index) {
               final session = sessions[index];
-              // The whole row is the drag handle (immediate drag on mouse move);
-              // a click still selects since a tap registers no movement.
-              return ReorderableDragStartListener(
-                key: ValueKey<String>(
-                  session.remoteSessionId ?? 'local:${session.title}',
-                ),
-                index: index,
-                child: SessionListTile(
-                  selected: index == selectedIndex,
-                  title: session.title,
-                  subtitle: session.status,
-                  statusColor: session.statusColor,
-                  icon: session.icon,
-                  branch: session.branch,
-                  repoName: session.repoName,
-                  worktreeName: session.worktreeName,
-                  cwd: session.cwd,
-                  snippet: session.snippet,
-                  snippetDetail: session.snippetDetail,
-                  onTap: () => onSelectSession(index),
-                ),
+              final key = ValueKey<String>(
+                session.remoteSessionId ?? 'local:${session.title}',
               );
+              final tile = SessionListTile(
+                key: index == selectedIndex ? selectedTileKey : null,
+                selected: index == selectedIndex,
+                title: session.displayTitle,
+                subtitle: session.status,
+                statusColor: session.statusColor,
+                icon: session.icon,
+                branch: session.branch,
+                repoName: session.repoName,
+                worktreeName: session.worktreeName,
+                cwd: session.cwd,
+                snippet: session.snippet,
+                snippetDetail: session.snippetDetail,
+                onTap: () => onSelectSession(index),
+              );
+              // Touch: a plain drag must scroll the list, so reordering waits for
+              // a long-press (ReorderableDelayedDragStartListener). Mouse: the
+              // whole row is an immediate drag handle; a click still selects
+              // since a tap registers no movement.
+              final isTouch =
+                  !runningUnderFlutterTest() &&
+                  (defaultTargetPlatform == TargetPlatform.iOS ||
+                      defaultTargetPlatform == TargetPlatform.android);
+              return isTouch
+                  ? ReorderableDelayedDragStartListener(
+                      key: key,
+                      index: index,
+                      child: tile,
+                    )
+                  : ReorderableDragStartListener(
+                      key: key,
+                      index: index,
+                      child: tile,
+                    );
             },
           ),
         ),
@@ -3411,17 +3741,28 @@ class SessionWorkspace extends StatelessWidget {
     required this.session,
     this.onCloseSession,
     this.onViewFit,
+    this.onOpenRail,
+    this.onRefit,
   });
 
   final SessionVm session;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
+  // Mobile only: opens the session rail overlay from the workspace header.
+  final VoidCallback? onOpenRail;
+  // Re-asserts this device's terminal size on the shared PTY.
+  final VoidCallback? onRefit;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        WorkspaceHeader(session: session, onClose: onCloseSession),
+        WorkspaceHeader(
+          session: session,
+          onClose: onCloseSession,
+          onOpenRail: onOpenRail,
+          onRefit: onRefit,
+        ),
         Expanded(
           child: TerminalPane(
             key: ValueKey(session.title),
@@ -3444,10 +3785,22 @@ class SessionWorkspace extends StatelessWidget {
 }
 
 class WorkspaceHeader extends StatelessWidget {
-  const WorkspaceHeader({super.key, required this.session, this.onClose});
+  const WorkspaceHeader({
+    super.key,
+    required this.session,
+    this.onClose,
+    this.onOpenRail,
+    this.onRefit,
+  });
 
   final SessionVm session;
   final VoidCallback? onClose;
+  // Mobile only: opens the session rail overlay. Null on desktop, where the
+  // rail is always visible beside the workspace.
+  final VoidCallback? onOpenRail;
+  // Re-asserts this device's terminal size on the shared PTY, so switching back
+  // to this device reclaims the size from whichever device resized it last.
+  final VoidCallback? onRefit;
 
   @override
   Widget build(BuildContext context) {
@@ -3471,6 +3824,14 @@ class WorkspaceHeader extends StatelessWidget {
       ),
       child: Row(
         children: [
+          if (onOpenRail != null) ...[
+            IconButton(
+              icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
+              tooltip: 'Sessions',
+              onPressed: onOpenRail,
+            ),
+            const SizedBox(width: 4),
+          ],
           Icon(session.icon, color: const Color(0xff7fd1c7)),
           const SizedBox(width: 12),
           Expanded(
@@ -3479,7 +3840,7 @@ class WorkspaceHeader extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  session.title,
+                  session.displayTitle,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
@@ -3503,7 +3864,14 @@ class WorkspaceHeader extends StatelessWidget {
             session.status,
             style: const TextStyle(color: Color(0xffcdd7d6)),
           ),
-          const SizedBox(width: 16),
+          const SizedBox(width: 8),
+          if (onRefit != null)
+            IconButton(
+              icon: const Icon(Icons.fit_screen, color: Color(0xffcdd7d6)),
+              tooltip: 'Refit terminal to this device',
+              onPressed: onRefit,
+            ),
+          const SizedBox(width: 8),
           if (onClose != null)
             IconButton(
               icon: const Icon(Icons.close, color: Color(0xffcdd7d6)),
