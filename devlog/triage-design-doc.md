@@ -295,7 +295,7 @@ Daemon-first. Local navigation first. Remote access once the local product is wo
 - [x] Tool surface from §5, bound to the same session API. *(read-only so far: `list_sessions`, `snapshot_session`, `styled_rows`)*
 - [ ] Agent input is subject to the same lease model as human clients. *(no write/input tools exposed yet, so lease enforcement on the MCP path is unexercised)*
 - [ ] Optional TCP transport behind config flag. *(stdio only)*
-- [ ] Worked example: Claude Code config snippet registering Triage. *(not written)*
+- [x] Worked example: Claude Code config snippet registering Triage. (`crates/triage-mcp/README.md` — `claude mcp add triage -- triage-mcp`, plus a Claude Desktop `mcpServers` block)
 
 ### Phase 6: Remote Web Client + Auth
 
@@ -313,12 +313,13 @@ Once spikes pass:
 - [x] Flutter web app scaffold: sidebar + session navigation. (`SessionRail` in `lib/main.dart`) — **repo/worktree grouping and attention-prioritization UX not yet implemented.**
 - [ ] Tailscale setup doc. *(not written)*
 
-### Phase 7: Native Mobile + Notifications — 🚧 mostly not started (desktop native pane works; mobile UX + push pending)
+### Phase 7: Native Mobile + Notifications — 🚧 partial (Android UX shipped; iOS validation + push pending)
 
-The native rendering path (`terminal_pane_stub.dart` over `xterm.dart`) already exists and is what desktop builds run, so the iOS/Android *engine* is in place — but there is **no mobile-specific UX and no push-notification infrastructure**.
+The native rendering path (`terminal_pane_stub.dart` over `xterm.dart`) is what desktop *and* mobile builds run. The Android client is in daily use; what remains is iOS validation and **push-notification infrastructure, of which none exists**.
 
-- [ ] **Spike: xterm.dart scroll-region validation.** Run vim, tmux, htop, lazygit, less inside xterm.dart on iOS and Android. Confirm whether Issue #222 affects our use. If yes, budget for in-house patch or fork. *(server-side VT acceptance tests exist, but no on-device iOS/Android validation has been done)*
-- [ ] **Mobile touch UX.** On-screen modifier-key bar (Esc/Ctrl/Tab/arrows), soft-keyboard / IME handling, and touch scroll / selection tuning for phones. *(not started — touch selection logic in the native pane is desktop-pointer-oriented; no `Platform.isIOS`/`isAndroid` UX branches)*
+- [ ] **Spike: xterm.dart scroll-region validation.** Run vim, tmux, htop, lazygit, less inside xterm.dart on iOS and Android. Confirm whether Issue #222 affects our use. If yes, budget for in-house patch or fork. *(exercised on Android via the shipping client; no iOS on-device validation, and no deliberate pass over the scroll-region app matrix)*
+- [x] **Mobile touch UX.** On-screen modifier-key bar (Esc/Ctrl/Tab/arrows/Shift+Tab), soft-keyboard handling (verified on-device), touch scroll + long-press selection, and a full-screen session rail with drag-to-reorder. (`Platform.isIOS`/`isAndroid` branches in `lib/main.dart` + `lib/widgets/`)
+- [x] **Multi-daemon switching.** The client remembers labeled daemons and switches between them, keeping a per-daemon pairing token and rail order. (`lib/services/server_store.dart`, `ServerManagerDialog` in `lib/main.dart`)
 - [ ] Web build: PWA manifest, service worker, Web Push via FCM (Android only). *(PWA manifest + a stale-service-worker cleanup script exist; no Web Push / FCM)*
 - [ ] iOS native build: APNs integration. *(stock Flutter `AppDelegate`; no APNs, no notification plugin in `pubspec.yaml`)*
 - [ ] Android native build: FCM integration. *(stock Flutter `MainActivity`; no FCM)*

@@ -58,6 +58,27 @@ stores the resulting bearer token for future launches. See
 [Pairing](../../crates/triaged/README.md#pairing) in the `triaged` docs for the
 full flow and the remote/Tailscale approval options.
 
+### Multiple daemons
+
+The client remembers a list of daemons — a machine at home and one at work, say
+— and switches between them. The status pill at the top of the session rail
+names the daemon you are attached to; tap it to open the daemon manager, where
+you can add, rename, re-point, and forget daemons, or switch to another one.
+
+Switching is not lossy. Each daemon gets **its own pairing token and its own
+rail order**, so moving between two daemons costs no re-pairing and does not
+disturb either one's session layout. Renaming a daemon, or editing its address
+when the same machine moves (a new DHCP lease, LAN → Tailscale), keeps its
+token — re-pairing is only needed when the address points at a genuinely
+different daemon, which rejects the old token and routes to pairing on its own.
+
+Upgrading from a single-daemon build migrates automatically: the address, token,
+and rail order you already had become your first daemon entry, so an
+already-paired client stays paired.
+
+> On the **web** client this section does not appear. The web UI is served *by*
+> its daemon, so that daemon is implied rather than chosen.
+
 > Triage serves plain HTTP/WebSocket and terminates no TLS itself. For `wss://`
 > from another device, front the daemon with a reverse proxy (e.g. Caddy or
 > nginx), as described in the `triaged` docs.

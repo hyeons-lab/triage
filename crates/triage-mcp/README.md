@@ -1,6 +1,8 @@
 # triage-mcp
 
-Model Context Protocol (MCP) server for **Triage**, exposing terminal session context and supervisor controls to local AI agents (such as Claude Desktop, Cursor, etc.).
+Model Context Protocol (MCP) server for **Triage**, exposing terminal session context to local AI agents (such as Claude Code, Claude Desktop, or Cursor).
+
+It lets an agent *read* what is happening in your terminals — which sessions exist, what is on screen, and how it is styled — so it can reason about a build, a test run, or a stuck prompt without you pasting output by hand.
 
 ## Installation
 
@@ -16,9 +18,19 @@ Windows). Make sure the daemon is running first, either in the foreground
 (`triaged`) or as a per-user login service (`triaged service install`). See the
 [`triaged`](https://crates.io/crates/triaged) docs for details.
 
-## Setup Configuration
+## Setup
 
-Add the following configuration block to your local Claude Desktop config (e.g. `~/AppData/Roaming/Claude/claude_desktop_config.json` on Windows):
+`triage-mcp` speaks MCP over stdio, so it needs no arguments — point your client
+at the binary.
+
+Claude Code:
+
+```bash
+claude mcp add triage -- triage-mcp
+```
+
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`
+on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -32,7 +44,12 @@ Add the following configuration block to your local Claude Desktop config (e.g. 
 
 ## Available Tools
 
-*   `list_sessions`: List active Triage terminal sessions.
-*   `create_session`: Spawn a new PTY session.
-*   `write_session_input`: Inject keyboard inputs.
-*   `get_session_scrollback`: Retrieve formatted terminal content.
+The server is **read-only**: every tool observes session state, and none of them
+spawn sessions, write input, or otherwise mutate the daemon. An agent can watch
+your terminals; it cannot drive them.
+
+| Tool | Arguments | Returns |
+| ---- | --------- | ------- |
+| `list_sessions` | — | Every daemon-owned session, each with its current snapshot. |
+| `snapshot_session` | `session_id` | The current daemon snapshot for one session. |
+| `styled_rows` | `session_id`, `start`, `end` | Styled cells for a visible row range (`start` inclusive, `end` exclusive). |

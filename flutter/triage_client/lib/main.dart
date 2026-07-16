@@ -11,7 +11,9 @@ import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
+import 'package:triage_client/models/daemon_server.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
+import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
@@ -23,19 +25,18 @@ import 'package:triage_client/platform_env_io.dart'
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Restore the persisted client id / pairing token from secure storage before
-  // the first frame so the app can reconnect without re-pairing on each launch.
+  // Restore the persisted client id / per-server pairing tokens from secure
+  // storage before the first frame so the app can reconnect without re-pairing
+  // on each launch. Must precede loadServers, whose migration reads the legacy
+  // token from the same cache.
   await loadCredentials();
-  // Restore the saved daemon address so we auto-connect (or, on first run, show
-  // the connection screen).
-  final savedAddress = await loadDaemonAddress();
-  runApp(TriageClientApp(initialDaemonAddress: savedAddress));
+  // Restore the known daemons so we auto-connect to the selected one (or, on
+  // first run, show the connection screen).
+  final servers = await loadServers();
+  runApp(TriageClientApp(initialServers: servers));
 }
 
 const int _defaultDaemonPort = 7777;
-
-/// shared_preferences key holding the raw daemon address the user entered.
-const String _daemonAddressPrefKey = 'daemon_address_v1';
 
 /// Parses a user-entered daemon address into a WebSocket [Uri], or null if it
 /// can't be normalized. Accepts a bare host/IP (`host` → `ws://host:7777/ws`),
@@ -99,23 +100,27 @@ Uri? parseDaemonAddress(String input) {
   return Uri(scheme: 'ws', host: host, port: port, path: '/ws');
 }
 
-/// Loads the saved raw daemon address, or null if none / on error.
-Future<String?> loadDaemonAddress() async {
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    final value = prefs.getString(_daemonAddressPrefKey);
-    return (value != null && value.trim().isNotEmpty) ? value : null;
-  } catch (_) {
-    return null;
-  }
-}
+/// The per-server storage key used when no server is configured. Only the
+/// injected-client test path, which never goes through server configuration,
+/// reaches it.
+@visibleForTesting
+const String unconfiguredServerId = 'default';
 
-/// Persists the raw daemon address the user entered. Best-effort.
-Future<void> saveDaemonAddress(String address) async {
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_daemonAddressPrefKey, address);
-  } catch (_) {}
+/// The web client is served *by* a daemon, so its daemon is implied by the page
+/// origin rather than configured. Synthesizing a server entry for it keeps the
+/// invariant that a live connection always has an active server, so token
+/// keying, session order, and the switcher need no web special case.
+///
+/// The id is derived from the origin — unlike a user-added server, whose address
+/// is editable and whose id must therefore stay stable across an edit. Here the
+/// origin *is* the identity, and deriving it keeps two daemons that both serve a
+/// web client from colliding on one token.
+DaemonServer webOriginServer(Uri wsUri) {
+  return DaemonServer(
+    id: 'web-${wsUri.host}-${wsUri.port}',
+    label: DaemonServer.defaultLabelFor(wsUri.toString()),
+    address: wsUri.toString(),
+  );
 }
 
 const double _sessionRailCollapsedWidth = 72;
@@ -139,12 +144,17 @@ Uri defaultWebSocketUriForBase(Uri base) {
 }
 
 class TriageClientApp extends StatelessWidget {
-  const TriageClientApp({super.key, this.client, this.initialDaemonAddress});
+  const TriageClientApp({
+    super.key,
+    this.client,
+    this.initialServers = ServerConfig.empty,
+  });
 
   final TriageWebSocketClient? client;
-  // Raw saved daemon address (host/IP/URL) restored at startup. Null on first
-  // run → the connection screen is shown instead of auto-connecting.
-  final String? initialDaemonAddress;
+  // The daemons this device knows about, restored at startup, and which one to
+  // connect to. Empty on first run → the connection screen is shown instead of
+  // auto-connecting.
+  final ServerConfig initialServers;
 
   @override
   Widget build(BuildContext context) {
@@ -159,10 +169,7 @@ class TriageClientApp extends StatelessWidget {
         fontFamily: 'Segoe UI',
         scaffoldBackgroundColor: const Color(0xff101416),
       ),
-      home: TriageHome(
-        client: client,
-        initialDaemonAddress: initialDaemonAddress,
-      ),
+      home: TriageHome(client: client, initialServers: initialServers),
     );
   }
 }
@@ -402,10 +409,14 @@ class _PendingHistory {
 }
 
 class TriageHome extends StatefulWidget {
-  const TriageHome({super.key, this.client, this.initialDaemonAddress});
+  const TriageHome({
+    super.key,
+    this.client,
+    this.initialServers = ServerConfig.empty,
+  });
 
   final TriageWebSocketClient? client;
-  final String? initialDaemonAddress;
+  final ServerConfig initialServers;
 
   @override
   State<TriageHome> createState() => _TriageHomeState();
@@ -439,11 +450,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   DateTime? _pairingExpiresAt;
   String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
-  // Resolved daemon WebSocket URI + the raw address the user entered. Null until
-  // a saved/entered address is resolved (then the connection screen is shown).
-  Uri? _daemonUri;
-  String? _daemonAddressRaw;
-  // True when there is no daemon address yet (first run, native) — render the
+  // The daemons this device knows about, and which one we are connected to.
+  // Empty until a saved/entered server resolves (then the connection screen is
+  // shown).
+  List<DaemonServer> _servers = const [];
+  String? _selectedServerId;
+  // True when there is no daemon configured yet (first run, native) — render the
   // connection screen instead of auto-connecting.
   bool _needsConnectionConfig = false;
   String _connectionStatus = 'Offline (Local Mock)';
@@ -461,13 +473,44 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
-  // Per-device side-rail order (remote session ids), loaded once at startup and
-  // read synchronously when sessions load so the load path never awaits prefs.
+  // Per-server side-rail order (remote session ids), loaded when the active
+  // server resolves and read synchronously when sessions load so the load path
+  // never awaits prefs.
   List<String> _savedSessionOrder = const [];
+  // The daemon the sessions currently in the rail came from. Null while none are
+  // loaded, or while a switch is in flight and the tiles still belong to the
+  // daemon we are leaving — their ids mean nothing to the one we are joining.
+  String? _sessionsServerId;
   int _createdSessionCount = 0;
   late NewSessionShell _newSessionShell;
 
   SessionVm get _selectedSession => _sessions[_selectedIndex];
+
+  /// The daemon we are pointed at, or null when none is configured (first run)
+  /// or when a test injects a client and bypasses server configuration.
+  DaemonServer? get _activeServer {
+    for (final server in _servers) {
+      if (server.id == _selectedServerId) return server;
+    }
+    return null;
+  }
+
+  /// The id the active daemon's per-server state — its pairing token and its
+  /// rail order — is stored under. Both are issued/owned per daemon, so every
+  /// read/write of them goes through this rather than a single global key.
+  String get _activeServerId => _activeServer?.id ?? unconfiguredServerId;
+
+  /// The daemon to connect to. Falls back to the page origin, which is right for
+  /// the injected-client test path and for a web client whose origin server has
+  /// not been synthesized yet.
+  Uri get _activeDaemonUri {
+    final address = _activeServer?.address;
+    if (address != null) {
+      final uri = parseDaemonAddress(address);
+      if (uri != null) return uri;
+    }
+    return _defaultWebSocketUri();
+  }
 
   StyledRow _plainRow(String text) {
     return StyledRow(
@@ -517,7 +560,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // Restore the per-device side-rail order in the background; it's read
+    // Resolve the active server before anything that keys off it — the rail
+    // order below is stored per server.
+    _servers = List.of(widget.initialServers.servers);
+    _selectedServerId = widget.initialServers.selectedId;
+    // Restore this server's side-rail order in the background; it's read
     // synchronously from the cache when sessions load.
     unawaited(_restoreSessionOrder());
     _lastWatchdogTick = DateTime.now();
@@ -596,54 +643,241 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     } else if (widget.client != null) {
       // Injected client (tests) connects directly, bypassing address config.
       _connectWebSocket();
+    } else if (_activeServer != null) {
+      _connectWebSocket();
+    } else if (kIsWeb) {
+      // The web client is served by a daemon, so adopt the page origin as a
+      // server rather than asking which host to connect to.
+      final origin = webOriginServer(_defaultWebSocketUri());
+      // A web user upgrading from the single-server build is already paired with
+      // this very daemon, but never had a daemon address stored — the page
+      // origin was it — so loadServers' migration, which keys off that address,
+      // never sees them. Adopt their credential here instead, or every existing
+      // web user is silently un-paired by this change. Synchronous, so the
+      // connect below already sees the token.
+      adoptLegacyToken(origin.id);
+      _servers = [..._servers, origin];
+      _selectedServerId = origin.id;
+      unawaited(saveServers(_servers, selectedId: _selectedServerId));
+      unawaited(
+        adoptLegacySessionOrder(origin.id).then((_) => _restoreSessionOrder()),
+      );
+      _connectWebSocket();
     } else {
-      // Resolve the saved daemon address. With one, auto-connect; on first run
-      // (native) show the connection screen so the user picks a host. Web is
-      // served by the daemon, so derive the URL from the page and connect.
-      final raw = widget.initialDaemonAddress;
-      final uri = raw == null ? null : parseDaemonAddress(raw);
-      if (uri != null) {
-        _daemonUri = uri;
-        _daemonAddressRaw = raw;
-        _connectWebSocket();
-      } else if (kIsWeb) {
-        _connectWebSocket();
-      } else {
-        _needsConnectionConfig = true;
-        _connectionStatus = 'Not connected';
-      }
+      // First run on native: no daemon yet, so ask for one instead of dialing a
+      // host we're only guessing at.
+      _needsConnectionConfig = true;
+      _connectionStatus = 'Not connected';
     }
   }
 
-  /// Applies a new daemon address: persists it, then tears down any existing
-  /// connection and reconnects to the new host. Called from the connection
-  /// screen / settings dialog after the input validates.
-  Future<void> _applyDaemonAddress(String raw) async {
-    final uri = parseDaemonAddress(raw);
-    if (uri == null) return;
-    await saveDaemonAddress(raw);
+  /// Adds a daemon and connects to it. Called from the first-run connection
+  /// screen and from "Add server".
+  Future<void> _addServer(String rawAddress, {String? label}) async {
+    final trimmed = rawAddress.trim();
+    if (parseDaemonAddress(trimmed) == null) return;
+    final named = label?.trim();
+    final server = DaemonServer(
+      id: newServerId(),
+      label: (named == null || named.isEmpty)
+          ? DaemonServer.defaultLabelFor(trimmed)
+          : named,
+      address: trimmed,
+    );
+    // Apply to state before any await. Computing the new list, awaiting, and
+    // only then assigning would let a removal land in the gap and be silently
+    // undone by this stale snapshot.
+    setState(() => _servers = [..._servers, server]);
+    await _selectServer(server.id);
+  }
+
+  /// Switches to another daemon.
+  ///
+  /// This is the same teardown-and-reconnect an address change already did, so
+  /// it routes through [_connectWebSocket] rather than growing a parallel path:
+  /// that bumps the connect generation, disconnects the old client, and — via
+  /// the replay flag — handles a switch requested while a connect is in flight.
+  Future<void> _selectServer(String serverId) async {
+    if (_disposed) return;
+    if (!_servers.any((server) => server.id == serverId)) return;
+
+    await saveServers(_servers, selectedId: serverId);
     if (!mounted) return;
+
+    // Drop the outgoing daemon's socket *before* touching any of its state. While
+    // it is still subscribed it keeps delivering events, and those would
+    // re-populate the very buffers the purge below exists to clear. Tearing down
+    // also bumps the connect generation, which retires any in-flight attempt and
+    // any in-flight session load belonging to that daemon.
+    await _teardownConnection();
+    if (_disposed) return;
+
     setState(() {
-      _daemonUri = uri;
-      _daemonAddressRaw = raw;
+      _selectedServerId = serverId;
       _needsConnectionConfig = false;
       _needsPairing = false;
       _reconnectAttempt = 0;
     });
-    // _connectWebSocket bumps the generation and disconnects any prior client.
-    _connectWebSocket();
+
+    _purgeDaemonLocalState();
+    await _restoreSessionOrder();
+    if (_disposed) return;
+    unawaited(_connectWebSocket());
   }
 
-  /// Opens the connection settings dialog (gear icon / connect-failure action).
-  Future<void> _openConnectionSettings() async {
-    final raw = await showDialog<String>(
-      context: context,
-      builder: (context) =>
-          ConnectionSettingsDialog(initialAddress: _daemonAddressRaw),
-    );
-    if (raw != null && raw.trim().isNotEmpty) {
-      await _applyDaemonAddress(raw.trim());
+  /// Drops everything keyed by a daemon-local identifier.
+  ///
+  /// Session ids — and the titles built from them — are only unique *within* one
+  /// daemon: two of them routinely both have a session called `main`. So every
+  /// cache keyed by one is meaningless, and actively dangerous, once we point at
+  /// a different daemon. Carrying the pending-event buffers across would replay
+  /// one machine's output into the other's terminal; carrying the cached panes
+  /// would show the outgoing daemon's scrollback under the incoming daemon's
+  /// session of the same name.
+  void _purgeDaemonLocalState() {
+    setState(() {
+      // Retire the outgoing daemon's tiles outright rather than leaving them on
+      // screen until the new list lands. They are still marked `attached` and
+      // still wired to `_client`, which is about to point at a different daemon —
+      // so a keystroke or a resize in that window would be delivered to the *new*
+      // daemon under an *old* daemon's session id. The ids collide by
+      // construction (both machines have a `main`), so it would land on a real,
+      // unrelated session. None of this is salvageable; the new list rebuilds it.
+      for (final session in _sessions) {
+        session.terminalController.dispose();
+        TerminalPane.destroySession(session.title);
+      }
+      _sessions.clear();
+      _selectedIndex = 0;
+    });
+    _pendingEvents.clear();
+    _websocketEventQueue.clear();
+    _subscriptionIds.clear();
+    _refreshInFlight.clear();
+    _loadingSessionIds.clear();
+    _sessionsServerId = null;
+    _savedSessionOrder = const [];
+  }
+
+  /// Renames a daemon or re-points it at a new address.
+  ///
+  /// The token is deliberately kept: it is stored under the server's id, not its
+  /// address, so a host that merely moved (a new DHCP lease, LAN → Tailscale)
+  /// reconnects without a re-pair. Re-pointing the entry at a genuinely
+  /// different daemon instead yields a rejected token, which already routes to
+  /// pairing on its own.
+  Future<void> _updateServer(DaemonServer updated) async {
+    final index = _servers.indexWhere((server) => server.id == updated.id);
+    if (index == -1) return;
+    final previous = _servers[index];
+    final servers = [..._servers]..[index] = updated;
+    // Apply to state before the await, for the same reason as _addServer: a
+    // removal landing during the save would otherwise be undone by this stale
+    // snapshot, resurrecting a daemon whose token has already been cleared.
+    setState(() => _servers = servers);
+    await saveServers(servers, selectedId: _selectedServerId);
+    if (!mounted) return;
+
+    final isActive = updated.id == _selectedServerId;
+    if (isActive && updated.address != previous.address) {
+      // A new address may well be a different machine. The id is unchanged, so
+      // nothing downstream would notice on its own — `_sessionsServerId` still
+      // matches and the old daemon's panes, buffers and rail order would all be
+      // reused for the new host. Tear down and purge exactly as a switch does.
+      await _teardownConnection();
+      if (_disposed) return;
+      setState(() {
+        _reconnectAttempt = 0;
+        // A pairing challenge belongs to the daemon that issued it, and we are
+        // now dialing a different address. Drop it rather than leave a dead PIN
+        // prompt in front of the reconnect.
+        _needsPairing = false;
+      });
+      _purgeDaemonLocalState();
+      unawaited(_connectWebSocket());
     }
+  }
+
+  /// Forgets a daemon, including its pairing token and rail order — the entry is
+  /// the only thing that names them, so leaving them behind would strand a live
+  /// bearer token in the keychain under an id nothing can reach.
+  Future<void> _removeServer(String serverId) async {
+    if (!_servers.any((server) => server.id == serverId)) return;
+    final servers = _servers.where((server) => server.id != serverId).toList();
+    final wasActive = serverId == _selectedServerId;
+    final nextId = wasActive
+        ? (servers.isEmpty ? null : servers.first.id)
+        : _selectedServerId;
+
+    // Apply to state before the awaits, as _addServer and _updateServer do: an
+    // add landing during the save would otherwise be dropped by this stale
+    // snapshot when it is assigned afterwards.
+    setState(() => _servers = servers);
+    clearTokenFor(serverId);
+    await _clearSessionOrderFor(serverId);
+    await saveServers(servers, selectedId: nextId);
+    if (!mounted) return;
+
+    if (!wasActive) return;
+    if (nextId != null) {
+      await _selectServer(nextId);
+      return;
+    }
+    // Nothing left to connect to — fall back to the first-run screen rather than
+    // leaving the user on a rail attached to a daemon they just forgot.
+    await _teardownConnection();
+    if (!mounted) return;
+    setState(() {
+      _selectedServerId = null;
+      _needsPairing = false;
+      _needsConnectionConfig = true;
+      _connectionStatus = 'Not connected';
+      _connectionStatusColor = const Color(0xff7f8b8d);
+    });
+  }
+
+  /// Drops the live connection without scheduling a reconnect. Bumping the
+  /// generation is what stops one: an in-flight attempt sees it and bails.
+  Future<void> _teardownConnection() async {
+    _connectGeneration++;
+    _isConnecting = false;
+    _reconnectRequested = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    final subscription = _websocketSubscription;
+    _websocketSubscription = null;
+    try {
+      // Bounded, like the connect path's cancel: a cancel that never completes
+      // would strand this teardown, and everything waiting on it — including the
+      // fall back to the connection screen — never runs.
+      await subscription?.cancel().timeout(const Duration(milliseconds: 250));
+    } catch (_) {}
+    if (_clientInitialized) {
+      try {
+        await _client.disconnect();
+      } catch (_) {}
+    }
+    // Retire the client too. The resume and wake paths reconnect on the strength
+    // of `_clientInitialized` alone, so leaving it set after forgetting the last
+    // daemon would have them dial the page-origin fallback — a localhost daemon
+    // the user never configured — from behind the connection screen.
+    _clientInitialized = false;
+    _bearerToken = null;
+  }
+
+  /// Opens the server manager (gear icon / connect-failure action).
+  Future<void> _openConnectionSettings() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => ServerManagerDialog(
+        servers: _servers,
+        selectedId: _selectedServerId,
+        onSelect: _selectServer,
+        onAdd: (address, label) => _addServer(address, label: label),
+        onUpdate: _updateServer,
+        onRemove: _removeServer,
+      ),
+    );
   }
 
   // After waking from sleep / un-hiding, the active terminal's buffer is wrapped
@@ -760,7 +994,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _refreshBearerTokenFromStorage() {
     final storedClientId = retrieveClientId();
-    final storedToken = retrieveToken();
+    final storedToken = retrieveTokenFor(_activeServerId);
     if (!_storageBackedClientId) {
       if (storedClientId == _clientId) {
         _storageBackedClientId = true;
@@ -800,7 +1034,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
 
-    if (retrieveClientId() == _clientId && retrieveToken() == _bearerToken) {
+    if (retrieveClientId() == _clientId &&
+        retrieveTokenFor(_activeServerId) == _bearerToken) {
       return;
     }
 
@@ -915,7 +1150,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
 
     session.terminalController.addResizeOutListener((cols, rows) {
-      if (_client.isConnected && session.status == 'attached') {
+      // `_client` is `late`: on the first-run and mock paths nothing has
+      // connected yet, and xterm fires this on its very first layout.
+      if (_clientInitialized &&
+          _client.isConnected &&
+          session.status == 'attached') {
         final parts = session.title.split(' / ');
         final sessionId = parts.length > 1 ? parts[1] : null;
         if (sessionId != null) {
@@ -1001,6 +1240,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
     if (_disposed) return;
+    // Nothing to dial. Without this, a connect raised while the connection
+    // screen is up — the resume/wake path, a retry timer — would fall back to
+    // the page-origin URI and pair against a localhost daemon the user never
+    // added. Web has no such screen: its daemon is the page origin.
+    if (widget.client == null && !kIsWeb && _activeServer == null) return;
     if (_isConnecting) {
       // A connect is already in flight, and it cannot serve this caller: the
       // ones that reach here want a *different* connection (a new daemon
@@ -1015,7 +1259,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     final generation = ++_connectGeneration;
-    _refreshBearerTokenFromStorage();
     if (_clientInitialized) {
       final subscription = _websocketSubscription;
       _websocketSubscription = null;
@@ -1035,15 +1278,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
 
     // The attempt commits to an address and a token here. Anything requested
-    // before this point is already served by it — it re-read both — so only a
+    // before this point is already served by it — it re-reads both — so only a
     // request arriving from now on needs a connection of its own. Clearing the
     // flag exactly here is what makes "requested" mean "not yet served", with no
     // need to compare what changed afterwards.
     _reconnectRequested = false;
 
-    final client =
-        widget.client ??
-        TriageWebSocketClient(_daemonUri ?? _defaultWebSocketUri());
+    // Read the server, its token, and its address together, with no await in
+    // between, so an attempt can never pair one daemon's token with another's
+    // address. Reading the token earlier — before the disconnect above — let a
+    // switch land in the gap and leave the attempt with a mixed identity.
+    final serverId = _activeServerId;
+    _refreshBearerTokenFromStorage();
+    final client = widget.client ?? TriageWebSocketClient(_activeDaemonUri);
     _client = client;
     _clientInitialized = true;
 
@@ -1055,7 +1302,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     try {
       await _client.connect();
 
-      if (_disposed || generation != _connectGeneration) {
+      // A switch that landed mid-attempt retires it: this socket is open to the
+      // daemon we just left. Bailing is safe — the switch set
+      // `_reconnectRequested`, so the `finally` replays against the new server.
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId) {
         // Disconnect the client *this* generation opened, not `_client` — a
         // newer generation may already have replaced the field, and tearing
         // down its fresh connection would kill the live one.
@@ -1075,12 +1327,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
       final authenticated = helloRes['authenticated'] as bool? ?? false;
 
-      if (_disposed || generation != _connectGeneration) {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId) {
         return;
       }
 
       if (!authenticated) {
-        await _showPairingChallenge(generation);
+        await _showPairingChallenge(generation, serverId);
         return;
       }
 
@@ -1095,13 +1349,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       await _loadDaemonSessions();
       _reconnectAttempt = 0;
     } catch (e) {
-      if (_disposed || generation != _connectGeneration) {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId) {
         return;
       }
       // A rejected token never recovers by retrying, so re-pair instead of
       // falling into the reconnect backoff.
       if (e is TriageAuthException) {
-        await _showPairingChallenge(generation);
+        await _showPairingChallenge(generation, serverId);
       } else {
         setState(() {
           _connectionStatus = isReconnect
@@ -1125,10 +1381,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _showPairingChallenge(int generation) async {
+  /// Drops the token [serverId] rejected and asks that daemon for a fresh
+  /// pairing challenge.
+  ///
+  /// The token cleared is the one the *attempt* used, not whichever server is
+  /// active by the time this runs — clearing by "current" would let an attempt
+  /// against the daemon we just left un-pair the one we just switched to.
+  Future<void> _showPairingChallenge(int generation, String serverId) async {
     _bearerToken = null;
-    clearToken();
-    if (_disposed || generation != _connectGeneration) {
+    clearTokenFor(serverId);
+    if (_disposed ||
+        generation != _connectGeneration ||
+        serverId != _activeServerId) {
       return;
     }
 
@@ -1198,6 +1462,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   Future<void> _onPairRequested(String pin) async {
+    // The daemon being paired with, captured before the round trip: the token it
+    // returns is *its* token, and storing it under whatever server is active by
+    // the time the PIN clears would file it against the wrong daemon.
+    final serverId = _activeServerId;
     final String token;
     try {
       token = await _client.pair(code: pin, clientId: _clientId);
@@ -1205,20 +1473,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       await _requestPairingChallenge();
       rethrow;
     }
-    if (token.isNotEmpty) {
-      setState(() {
-        _bearerToken = token;
-        persistClientId(_clientId);
-        persistToken(token);
-        _storageBackedClientId = retrieveClientId() == _clientId;
-        _pairingChallengeError = null;
-      });
-      _reconnectAttempt = 0;
-      _isConnecting = false;
-      await _connectWebSocket();
-    } else {
+    if (token.isEmpty) {
       throw Exception('Server returned empty pairing token');
     }
+    if (_disposed || serverId != _activeServerId) return;
+
+    setState(() {
+      _bearerToken = token;
+      persistClientId(_clientId);
+      // Keyed by server: this token is what *this* daemon issued, and pairing
+      // with a second one must not overwrite the first one's.
+      persistTokenFor(serverId, token);
+      _storageBackedClientId = retrieveClientId() == _clientId;
+      _pairingChallengeError = null;
+    });
+    _reconnectAttempt = 0;
+    _isConnecting = false;
+    await _connectWebSocket();
   }
 
   Future<void> _loadDaemonSessions() async {
@@ -1237,9 +1508,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           : _selectedIndex;
 
       if (_disposed) return;
-      final loadingSessionTitles = {
-        for (final sid in sessionIds) 'triage / $sid',
-      };
+      // Keep a pane only when it is the *same* daemon's session of that name. A
+      // title is `triage / <session id>`, and session ids are daemon-local, so
+      // after a switch an identical title is a different machine's session — and
+      // reusing its cached terminal would show the old daemon's scrollback.
+      final sameServer = _sessionsServerId == _activeServerId;
+      final loadingSessionTitles = sameServer
+          ? {for (final sid in sessionIds) 'triage / $sid'}
+          : const <String>{};
       setState(() {
         for (final s in _sessions) {
           s.terminalController.dispose();
@@ -1247,6 +1523,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             TerminalPane.destroySession(s.title);
           }
         }
+        _sessionsServerId = _activeServerId;
         _sessions.clear();
         for (var i = 0; i < sessionIds.length; i++) {
           // Only the selected session loads now; the rest rest as rail rows
@@ -1395,6 +1672,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }) async {
     if (_loadingSessionIds.contains(sid)) return;
     _loadingSessionIds.add(sid);
+    // The daemon this load belongs to. `_client` is a mutable field re-read
+    // across every await below, and session ids are daemon-local and collide, so
+    // a load still in flight when the user switches would otherwise subscribe and
+    // attach against the *new* daemon using the *old* daemon's id — and then
+    // stamp its result onto the new daemon's identically-named tile.
+    final generation = _connectGeneration;
     // Show the row as loading (covers the on-demand-select case, where the row
     // was resting).
     if (!_disposed) {
@@ -1412,7 +1695,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         includeHistory: includeHistory,
       );
       session.loaded = true;
-      if (_disposed) return;
+      // The daemon changed under us: this session belongs to the one we left, and
+      // the rail is now a different machine's. Discard it rather than stamp it
+      // onto whatever tile happens to share the id.
+      if (_disposed || generation != _connectGeneration) {
+        session.dispose();
+        return;
+      }
       setState(() {
         final existingIndex = _sessions.indexWhere(
           (s) => s.remoteSessionId == sid,
@@ -1435,8 +1724,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // the pairing prompt.
       rethrow;
     } catch (e) {
+      // A load that failed because we tore its daemon down is not a failure of
+      // the session now sitting under that id on the new daemon — painting that
+      // one "load failed" would be a lie about a healthy session.
+      if (_disposed || generation != _connectGeneration) return;
       failedSessionIds.add(sid);
-      if (_disposed) return;
       setState(() {
         final existingIndex = _sessions.indexWhere(
           (s) => s.remoteSessionId == sid,
@@ -1943,10 +2235,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  // Client-local, per-device side-rail ordering. Persisted as an ordered list of
-  // remote session ids; not shared with the TUI or other clients.
-  static const String _sessionOrderKey = 'session_order_v1';
-
   /// Reorders the side rail in response to a drag, keeping the current
   /// selection pointed at the same session, and persists the new order.
   void _reorderSessions(int oldIndex, int newIndex) {
@@ -1969,15 +2257,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   Future<void> _restoreSessionOrder() async {
+    // The server can change while the prefs read is in flight; capture the one
+    // being read for so a slow read can't apply a stale order to a new daemon.
+    final serverId = _activeServerId;
     try {
       final prefs = await SharedPreferences.getInstance();
-      _savedSessionOrder = prefs.getStringList(_sessionOrderKey) ?? const [];
+      final order = prefs.getStringList(sessionOrderPrefKeyFor(serverId));
+      if (_disposed || serverId != _activeServerId) return;
+      _savedSessionOrder = order ?? const [];
     } catch (_) {
       // Ordering is a best-effort convenience; ignore load failures.
     }
   }
 
   Future<void> _persistSessionOrder() async {
+    final serverId = _activeServerId;
+    // The rail keeps rendering — and accepting drags on — the outgoing daemon's
+    // tiles until the new session list lands. Their ids belong to that daemon,
+    // so writing them under this one's key would destroy its real order and then
+    // be applied to its sessions.
+    if (_sessionsServerId != serverId) return;
     final ids = _sessions
         .map((s) => s.remoteSessionId)
         .whereType<String>()
@@ -1985,9 +2284,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _savedSessionOrder = ids;
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setStringList(_sessionOrderKey, ids);
+      await prefs.setStringList(sessionOrderPrefKeyFor(serverId), ids);
     } catch (_) {
       // Ordering is a best-effort convenience; ignore persistence failures.
+    }
+  }
+
+  Future<void> _clearSessionOrderFor(String serverId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(sessionOrderPrefKeyFor(serverId));
+    } catch (_) {
+      // Ordering is a best-effort convenience; ignore removal failures.
     }
   }
 
@@ -2043,7 +2351,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             failedSessionIds: <String>[],
           ).catchError((Object e) {
             if (e is! TriageAuthException || _disposed || _needsPairing) return;
-            unawaited(_showPairingChallenge(_connectGeneration));
+            // Outside the connect path, so the daemon that rejected the token is
+            // the one we are attached to right now.
+            unawaited(
+              _showPairingChallenge(_connectGeneration, _activeServerId),
+            );
           }),
         );
       }
@@ -2411,14 +2723,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(24),
             child: ConnectionSettingsForm(
-              initialAddress: _daemonAddressRaw,
               submitLabel: 'Connect',
               title: 'Connect to a Triage daemon',
               subtitle:
                   'Enter the host, IP, or URL of the device running triaged. '
                   'For example 100.64.2.7, 192.168.1.5:7777, or '
                   'wss://my-mac.tailnet:7777.',
-              onSubmit: (raw) => _applyDaemonAddress(raw),
+              onSubmit: (raw, label) => _addServer(raw, label: label),
             ),
           ),
         ),
@@ -2523,6 +2834,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       showShellMenu: showNewSessionShellMenuForPlatform(defaultTargetPlatform),
       connectionStatus: _connectionStatus,
       connectionStatusColor: _connectionStatusColor,
+      serverLabel: _activeServer?.label,
       onOpenSettings: _openConnectionSettings,
       // Mobile: the rail always shows full content (the overlay slide handles
       // show/hide) and its collapse button closes the overlay. Desktop: the
@@ -2668,6 +2980,7 @@ class SessionRail extends StatelessWidget {
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
+    this.serverLabel,
     this.selectedTileKey,
   });
 
@@ -2684,6 +2997,9 @@ class SessionRail extends StatelessWidget {
   final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
+  // Name of the daemon these sessions belong to. Null when none is configured
+  // (the injected-client test path).
+  final String? serverLabel;
   final VoidCallback onOpenSettings;
   final bool isCollapsed;
   final VoidCallback onToggleCollapse;
@@ -2750,7 +3066,9 @@ class SessionRail extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           Tooltip(
-            message: connectionStatus,
+            message: serverLabel == null
+                ? connectionStatus
+                : '$serverLabel — $connectionStatus',
             child: Container(
               width: 10,
               height: 10,
@@ -2763,7 +3081,7 @@ class SessionRail extends StatelessWidget {
           const SizedBox(height: 8),
           IconButton(
             onPressed: onOpenSettings,
-            tooltip: 'Connection settings',
+            tooltip: 'Daemons',
             icon: const Icon(
               Icons.settings,
               color: Color(0xff7f8b8d),
@@ -2853,7 +3171,7 @@ class SessionRail extends StatelessWidget {
               const SizedBox(width: 4),
               IconButton(
                 onPressed: onOpenSettings,
-                tooltip: 'Connection settings',
+                tooltip: 'Daemons',
                 icon: const Icon(
                   Icons.settings,
                   color: Color(0xff7f8b8d),
@@ -2882,6 +3200,7 @@ class SessionRail extends StatelessWidget {
             child: _ConnectionStatus(
               status: connectionStatus,
               color: connectionStatusColor,
+              serverLabel: serverLabel,
             ),
           ),
         ),
@@ -2952,14 +3271,24 @@ class SessionRail extends StatelessWidget {
   }
 }
 
+/// The connection pill: which daemon we are on, and how that connection is
+/// doing. Doubles as the switcher's entry point, so it names the daemon even
+/// when only one is configured — otherwise there is nothing to tell you *which*
+/// machine the sessions below belong to.
 class _ConnectionStatus extends StatelessWidget {
-  const _ConnectionStatus({required this.status, required this.color});
+  const _ConnectionStatus({
+    required this.status,
+    required this.color,
+    this.serverLabel,
+  });
 
   final String status;
   final Color color;
+  final String? serverLabel;
 
   @override
   Widget build(BuildContext context) {
+    final label = serverLabel;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -2972,27 +3301,152 @@ class _ConnectionStatus extends StatelessWidget {
           Icon(Icons.radio_button_checked, size: 16, color: color),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(
-              status,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontWeight: FontWeight.w600),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (label != null)
+                  Text(
+                    label,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                Text(
+                  status,
+                  overflow: TextOverflow.ellipsis,
+                  style: label == null
+                      ? const TextStyle(fontWeight: FontWeight.w600)
+                      : const TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+                ),
+              ],
             ),
           ),
+          if (label != null)
+            const Icon(Icons.unfold_more, size: 16, color: Color(0xff7f8b8d)),
         ],
       ),
     );
   }
 }
 
-/// Modal wrapper around [ConnectionSettingsForm]. Pops with the entered raw
-/// address (or null if cancelled).
-class ConnectionSettingsDialog extends StatelessWidget {
-  const ConnectionSettingsDialog({super.key, this.initialAddress});
+/// Add, rename, re-point, remove, and switch between daemons.
+///
+/// Keeps its own copy of the list: a dialog sits on its own route and does not
+/// rebuild when the host's state changes, so it applies each edit locally as
+/// well as handing it to the host to persist.
+class ServerManagerDialog extends StatefulWidget {
+  const ServerManagerDialog({
+    super.key,
+    required this.servers,
+    required this.selectedId,
+    required this.onSelect,
+    required this.onAdd,
+    required this.onUpdate,
+    required this.onRemove,
+  });
 
-  final String? initialAddress;
+  final List<DaemonServer> servers;
+  final String? selectedId;
+  final ValueChanged<String> onSelect;
+  final void Function(String address, String? label) onAdd;
+  final ValueChanged<DaemonServer> onUpdate;
+  final ValueChanged<String> onRemove;
+
+  @override
+  State<ServerManagerDialog> createState() => _ServerManagerDialogState();
+}
+
+class _ServerManagerDialogState extends State<ServerManagerDialog> {
+  late final List<DaemonServer> _servers = List.of(widget.servers);
+  late String? _selectedId = widget.selectedId;
+
+  // The server being edited. Null with [_adding] false shows the list.
+  DaemonServer? _editing;
+  // With nothing to list, open straight to the form — an empty list with an
+  // "add" button is a dead end you have to click through.
+  late bool _adding = _servers.isEmpty;
+
+  void _startAdd() => setState(() {
+    _adding = true;
+    _editing = null;
+  });
+
+  void _startEdit(DaemonServer server) => setState(() {
+    _adding = false;
+    _editing = server;
+  });
+
+  void _backToList() => setState(() {
+    _adding = false;
+    _editing = null;
+  });
+
+  void _submitForm(String address, String? label) {
+    final editing = _editing;
+    if (editing == null) {
+      // Adding: the host mints the id, so close rather than render a row we
+      // have no key for. Adding also selects and connects — which is what you
+      // want the moment you finish typing a new daemon's address.
+      widget.onAdd(address, label);
+      Navigator.of(context).pop();
+      return;
+    }
+    final updated = editing.copyWith(
+      address: address,
+      label: label ?? DaemonServer.defaultLabelFor(address),
+    );
+    setState(() {
+      final index = _servers.indexWhere((s) => s.id == updated.id);
+      if (index != -1) _servers[index] = updated;
+    });
+    widget.onUpdate(updated);
+    _backToList();
+  }
+
+  Future<void> _confirmRemove(DaemonServer server) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xff161b1d),
+        title: Text('Forget ${server.label}?'),
+        content: const Text(
+          'This device will be un-paired from that daemon. Reconnecting to it '
+          'later needs the PIN again.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xffff6b6b),
+            ),
+            child: const Text('Forget'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _servers.removeWhere((s) => s.id == server.id);
+      if (_selectedId == server.id) {
+        _selectedId = _servers.isEmpty ? null : _servers.first.id;
+      }
+    });
+    widget.onRemove(server.id);
+    // Forgetting the last daemon drops the app back to the connection screen,
+    // so there is no list left to stand on.
+    if (_servers.isEmpty && mounted) Navigator.of(context).pop();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final editing = _editing;
+    final showForm = _adding || editing != null;
+
     return Dialog(
       backgroundColor: const Color(0xff161b1d),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -3000,39 +3454,153 @@ class ConnectionSettingsDialog extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 480),
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: ConnectionSettingsForm(
-            initialAddress: initialAddress,
-            submitLabel: 'Connect',
-            title: 'Connection settings',
-            subtitle:
-                'Host, IP, or URL of the device running triaged (e.g. '
-                '100.64.2.7 or 192.168.1.5:7777).',
-            onCancel: () => Navigator.of(context).pop(),
-            onSubmit: (raw) => Navigator.of(context).pop(raw),
-          ),
+          child: showForm
+              ? ConnectionSettingsForm(
+                  // The form seeds its fields in initState, so switching which
+                  // server is being edited has to rebuild it, not update it.
+                  key: ValueKey<String>(editing?.id ?? '@add'),
+                  initialAddress: editing?.address,
+                  initialLabel: editing?.label,
+                  submitLabel: editing == null ? 'Add' : 'Save',
+                  title: editing == null ? 'Add a daemon' : 'Edit daemon',
+                  subtitle:
+                      'Host, IP, or URL of the device running triaged '
+                      '(e.g. my-mac.tailnet:7777).',
+                  // With no servers there is no list to go back to.
+                  onCancel: _servers.isEmpty
+                      ? () => Navigator.of(context).pop()
+                      : _backToList,
+                  onSubmit: _submitForm,
+                )
+              : _buildList(),
         ),
       ),
     );
   }
+
+  Widget _buildList() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.dns_outlined, color: Color(0xff7fd1c7), size: 22),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Daemons',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+            ),
+            IconButton(
+              onPressed: _startAdd,
+              tooltip: 'Add a daemon',
+              icon: const Icon(Icons.add, color: Color(0xff7fd1c7), size: 22),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Flexible(
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: _servers.length,
+            itemBuilder: (context, index) {
+              final server = _servers[index];
+              final isSelected = server.id == _selectedId;
+              return ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(
+                  isSelected
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                  color: isSelected
+                      ? const Color(0xff7fd1c7)
+                      : const Color(0xff7f8b8d),
+                  size: 20,
+                ),
+                title: Text(
+                  server.label,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w400,
+                  ),
+                ),
+                subtitle: Text(
+                  server.address,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Color(0xff7f8b8d),
+                    fontSize: 12,
+                  ),
+                ),
+                onTap: () {
+                  if (!isSelected) widget.onSelect(server.id);
+                  Navigator.of(context).pop();
+                },
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      onPressed: () => _startEdit(server),
+                      tooltip: 'Edit',
+                      icon: const Icon(
+                        Icons.edit_outlined,
+                        size: 18,
+                        color: Color(0xff7f8b8d),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: () => _confirmRemove(server),
+                      tooltip: 'Forget',
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        size: 18,
+                        color: Color(0xff7f8b8d),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
-/// Smart single-field form for the daemon address. Validates input with
-/// [parseDaemonAddress] and calls [onSubmit] with the raw (un-normalized) text
-/// so the caller can persist exactly what the user typed.
+/// Form for one daemon: its address, and the name to show it under. Validates
+/// the address with [parseDaemonAddress] and calls [onSubmit] with the raw
+/// (un-normalized) text, so the caller persists exactly what the user typed.
+///
+/// The label is optional — left blank it falls back to the host, which is what
+/// an unnamed server would have been called anyway.
 class ConnectionSettingsForm extends StatefulWidget {
   const ConnectionSettingsForm({
     super.key,
     required this.onSubmit,
     this.onCancel,
     this.initialAddress,
+    this.initialLabel,
     this.submitLabel = 'Connect',
     this.title = 'Connect to a Triage daemon',
     this.subtitle,
   });
 
-  final ValueChanged<String> onSubmit;
+  /// Called with the raw address and the label — null when left blank.
+  final void Function(String address, String? label) onSubmit;
   final VoidCallback? onCancel;
   final String? initialAddress;
+  final String? initialLabel;
   final String submitLabel;
   final String title;
   final String? subtitle;
@@ -3043,6 +3611,7 @@ class ConnectionSettingsForm extends StatefulWidget {
 
 class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
   late final TextEditingController _controller;
+  late final TextEditingController _labelController;
   String? _error;
 
   @override
@@ -3051,11 +3620,13 @@ class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
     _controller = TextEditingController(
       text: widget.initialAddress ?? '127.0.0.1',
     );
+    _labelController = TextEditingController(text: widget.initialLabel ?? '');
   }
 
   @override
   void dispose() {
     _controller.dispose();
+    _labelController.dispose();
     super.dispose();
   }
 
@@ -3069,7 +3640,8 @@ class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
       );
       return;
     }
-    widget.onSubmit(raw);
+    final label = _labelController.text.trim();
+    widget.onSubmit(raw, label.isEmpty ? null : label);
   }
 
   @override
@@ -3122,6 +3694,17 @@ class _ConnectionSettingsFormState extends State<ConnectionSettingsForm> {
         Text(
           preview == null ? 'Will connect to: —' : 'Will connect to: $preview',
           style: const TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _labelController,
+          onSubmitted: (_) => _submit(),
+          decoration: InputDecoration(
+            labelText: 'Name (optional)',
+            hintText: DaemonServer.defaultLabelFor(_controller.text.trim()),
+            prefixIcon: const Icon(Icons.label_outline, size: 20),
+            border: const OutlineInputBorder(),
+          ),
         ),
         const SizedBox(height: 20),
         Row(

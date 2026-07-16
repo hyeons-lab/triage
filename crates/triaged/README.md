@@ -238,6 +238,29 @@ is bound to an unspecified address.
 
 ---
 
+## Update checks
+
+`triaged` periodically asks the release host for the latest published version and
+surfaces an "update available" notice — the `triage` TUI shows a one-row banner
+naming the newer version. **Nothing is ever downloaded or installed
+automatically**; the check is a notification, and upgrading stays your call
+(`cargo install triaged`, or a new release archive, followed by
+[a handover](#zero-downtime-upgrades-process-handover)).
+
+Defaults, in `~/.config/triage/config.toml`:
+
+```toml
+[update]
+check = true          # set false to disable the check entirely
+interval_hours = 6    # how often to poll; must be > 0
+channel = "stable"    # the only channel supported today
+```
+
+> The config parser rejects unknown keys, so a typo here is a startup error
+> rather than a silently ignored setting.
+
+---
+
 ## Zero-Downtime Upgrades (Process Handover)
 
 On Unix-like operating systems (including Linux, WSL, and macOS), `triaged` supports **zero-downtime updates**. This allows you to upgrade the daemon binary or restart the service without dropping active terminal sessions or interrupting running foreground shells.
