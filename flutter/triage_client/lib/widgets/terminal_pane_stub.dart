@@ -570,6 +570,20 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelHeight,
   ) {
     if (width > 0 && height > 0) {
+      // Reflow (reflowEnabled is on) runs only on a column change, moving content
+      // between rows and staling the cached shift-click anchor — a buffer
+      // coordinate the identity guard in _extendSelectionTo can't detect as stale,
+      // since reflow mutates lines within the same Buffer object. Drop it on a
+      // width change so a later shift-click won't extend from a pre-reflow row
+      // (with no anchor the extend is a no-op until the next fresh select). A
+      // height-only resize doesn't reflow, so the anchor stays valid and is left
+      // alone. `viewWidth` is still the old width here — onResize fires before the
+      // terminal stores the new one. The live highlight is unaffected; only the
+      // extend-from point is invalidated.
+      if (width != _terminal.viewWidth) {
+        _selectionAnchor = null;
+        _selectionAnchorBuffer = null;
+      }
       // This fires from inside RenderTerminal.performLayout (the view auto-fits
       // by calling terminal.resize). Replaying history writes to the terminal,
       // which would mark the render object dirty during its own layout — illegal.
