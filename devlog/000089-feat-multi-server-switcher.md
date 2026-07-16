@@ -196,10 +196,24 @@ lossy.
   unkeyed token and carried it onto the migrated server entry, which is the whole
   point of the migration, verified against a real Keychain rather than a mock.
 
+## Review
+
+- 2026-07-16T00:20-0700 PR #102 Copilot review flagged the legacy-token
+  migration clearing the unkeyed token *before* the new server list is durably
+  saved. On the native path the id is random, so a failed `saveServers` would
+  orphan the copy under an id nothing references and leave no legacy token to
+  retry from — an on-upgrade re-pair. Fixed by splitting `adoptLegacyToken` into
+  copy-only `copyLegacyTokenTo` (returns whether it copied) and deferring
+  `clearLegacyToken()` to the caller, run only after the save succeeds (and only
+  when a token was actually copied, preserving the "never delete a token we
+  failed to read" property). Applied to both the native migration and the web
+  origin-server path.
+
 ## Next Steps
 
 - Switch between two live daemons on-device (only one is currently running).
 
 ## Commits
 
-- HEAD — feat(triage_client): remember and switch between multiple daemons
+- 62e2eb8 — feat(triage_client): remember and switch between multiple daemons
+- HEAD — fix(triage_client): defer legacy-token clear until the server list is saved

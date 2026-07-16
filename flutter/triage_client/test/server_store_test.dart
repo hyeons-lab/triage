@@ -172,24 +172,28 @@ void main() {
     });
   });
 
-  group('adoptLegacyToken', () {
-    test('moves the unkeyed token onto the given server', () async {
+  group('copyLegacyTokenTo', () {
+    test('copies the unkeyed token but leaves the legacy key intact', () async {
       // The web client is served by its daemon and never stored a daemon
       // address, so loadServers' migration — which keys off that address — never
-      // sees it. Its origin server adopts the credential through this instead;
+      // sees it. Its origin server copies the credential through this instead;
       // without it every existing web user is silently un-paired on upgrade.
       await hydrateCredentials({'triage_bearer_token': 'web-token'});
 
-      adoptLegacyToken('web-my-mac-7777');
+      expect(copyLegacyTokenTo('web-my-mac-7777'), isTrue);
 
       expect(retrieveTokenFor('web-my-mac-7777'), 'web-token');
-      expect(retrieveLegacyToken(), isNull);
+      // The legacy token is deliberately NOT cleared here: the caller retires it
+      // only after the server entry is durably saved, so a failed save can be
+      // retried from the legacy key instead of orphaning the copy.
+      expect(retrieveLegacyToken(), 'web-token');
     });
 
-    test('is a no-op when there is no legacy token', () async {
+    test('returns false and copies nothing when there is no legacy token',
+        () async {
       await hydrateCredentials({});
 
-      adoptLegacyToken('web-my-mac-7777');
+      expect(copyLegacyTokenTo('web-my-mac-7777'), isFalse);
 
       expect(retrieveTokenFor('web-my-mac-7777'), isNull);
     });

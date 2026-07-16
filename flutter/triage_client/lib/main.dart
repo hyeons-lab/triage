@@ -652,13 +652,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // A web user upgrading from the single-server build is already paired with
       // this very daemon, but never had a daemon address stored — the page
       // origin was it — so loadServers' migration, which keys off that address,
-      // never sees them. Adopt their credential here instead, or every existing
+      // never sees them. Copy their credential here instead, or every existing
       // web user is silently un-paired by this change. Synchronous, so the
       // connect below already sees the token.
-      adoptLegacyToken(origin.id);
+      final copiedToken = copyLegacyTokenTo(origin.id);
       _servers = [..._servers, origin];
       _selectedServerId = origin.id;
-      unawaited(saveServers(_servers, selectedId: _selectedServerId));
+      unawaited(
+        saveServers(_servers, selectedId: _selectedServerId).then((saved) {
+          // Retire the legacy token only once the origin entry is persisted; a
+          // failed save leaves it so the next load re-adopts it. The copy already
+          // lives under the stable origin id, so connect isn't blocked meanwhile.
+          if (saved && copiedToken) clearLegacyToken();
+        }),
+      );
       unawaited(
         adoptLegacySessionOrder(origin.id).then((_) => _restoreSessionOrder()),
       );

@@ -107,15 +107,19 @@ Future<ServerConfig> _migrateLegacyServer(SharedPreferences prefs) async {
     address: legacyAddress,
   );
 
-  adoptLegacyToken(server.id);
+  // Copy the token onto the new (random) id now so this session can connect,
+  // but keep the legacy copy until the id is durably bound below.
+  final copiedToken = copyLegacyTokenTo(server.id);
 
   final saved = await saveServers([server], selectedId: server.id);
   await adoptLegacySessionOrder(server.id);
-  // Retire the legacy address only once the server that replaces it is safely
-  // stored. Dropping it after a failed save would leave nothing on either side —
-  // no server list and no legacy address — and the user's only daemon would be
-  // forgotten outright on the next launch.
+  // Retire the legacy keys only once the server that binds this id is safely
+  // stored. Dropping them after a failed save would leave nothing recoverable —
+  // no server list, an orphaned token under a random id nothing references, and
+  // no legacy address or token to retry from — forgetting the user's only
+  // daemon and forcing a re-pair on the next launch.
   if (saved) {
+    if (copiedToken) clearLegacyToken();
     try {
       await prefs.remove(legacyDaemonAddressPrefKey);
     } catch (_) {}
@@ -124,25 +128,29 @@ Future<ServerConfig> _migrateLegacyServer(SharedPreferences prefs) async {
   return ServerConfig(servers: [server], selectedId: server.id);
 }
 
-/// Moves the pre-multi-server unkeyed token onto [serverId].
+/// Copies the pre-multi-server unkeyed token onto [serverId] if one exists,
+/// returning whether it copied anything.
 ///
 /// This is what makes the upgrade a migration rather than a reset: carrying the
 /// token over is what keeps an already-paired user from having to pair again.
 ///
-/// Synchronous, because the credential cache is in memory — a caller can adopt
+/// Synchronous, because the credential cache is in memory — a caller can copy
 /// the token and connect within the same frame.
 ///
-/// The token is deleted only once it is safely copied. [loadCredentials]
-/// swallows a failed Keychain read (locked before first unlock, plugin missing)
-/// and leaves the cache empty, which is indistinguishable here from "never
-/// paired" — so an unconditional delete would destroy a live credential we
-/// merely failed to read. Leaving it costs a re-pair at worst; deleting it
-/// guarantees one.
-void adoptLegacyToken(String serverId) {
+/// It deliberately does NOT delete the legacy token. The caller must call
+/// [clearLegacyToken] only once [serverId] is durably bound (its server entry
+/// persisted): clearing earlier would, on a failed persist, orphan the copy
+/// under an id nothing references — a random migration id that never reached
+/// disk — and strand the user unpaired with no legacy token to retry from. And
+/// because a false return also covers a *failed* read ([loadCredentials]
+/// swallows a locked-Keychain read and leaves the cache empty, indistinguishable
+/// here from "never paired"), a caller that only clears when this returned true
+/// can never destroy a live credential it merely failed to read.
+bool copyLegacyTokenTo(String serverId) {
   final legacyToken = retrieveLegacyToken()?.trim();
-  if (legacyToken == null || legacyToken.isEmpty) return;
+  if (legacyToken == null || legacyToken.isEmpty) return false;
   persistTokenFor(serverId, legacyToken);
-  clearLegacyToken();
+  return true;
 }
 
 /// Moves the pre-multi-server unkeyed rail order onto [serverId]. Best-effort:
