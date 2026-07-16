@@ -109,6 +109,15 @@ full-screen TUI (Claude Code) redraws garbled after a resize. Both are one bug.
   confirmed sound (first-match + exact-equality can't pass for the wrong reason;
   `getText()` skips blank cells so trailing-cell fragility is a non-issue).
 
+- 2026-07-16T00:35-0700 PR #103 Copilot review claimed the width gate
+  (`width != _terminal.viewWidth`) can never be true because `onResize` fires
+  after xterm stores the new width. This is a false positive: xterm calls
+  `onResize` at `terminal.dart:362`, before `_viewWidth = newWidth` at `:368`, so
+  `viewWidth` inside the callback is still the old width. Verified empirically and
+  captured the ordering as a regression test (`onResize fires before the terminal
+  stores the new width`) so an xterm bump that reordered it would fail loudly
+  rather than silently disabling the gate. No code change.
+
 ## Next Steps
 
 - On-device verification: rebuild `Triage.app` with the reviewed fixes, install
@@ -118,4 +127,5 @@ full-screen TUI (Claude Code) redraws garbled after a resize. Both are one bug.
 
 ## Commits
 
-- HEAD — fix(triage_client): reflow terminal scrollback on resize
+- 639a133 — fix(triage_client): reflow terminal scrollback on resize
+- HEAD — test(triage_client): guard onResize-before-viewWidth timing

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/main.dart';
+import 'package:xterm/xterm.dart' as xt;
 
 /// A session with no seeded rows — enough to reach its live `terminal`, which is
 /// the object the reflow flag is set on.
@@ -81,6 +82,27 @@ void main() {
       expect(_rowContaining(session, 'ABCDE'), 'ABCDE');
       expect(_rowContaining(session, 'FGHIJ'), 'FGHIJ');
       expect(_rowContaining(session, 'ABCDEFGHIJ'), isNull);
+    });
+
+    // The selection-anchor drop in `_onTerminalResize` gates on
+    // `width != _terminal.viewWidth` to fire only on a real column change. That
+    // is correct *only because* xterm invokes `onResize` before it stores the
+    // new width, so `viewWidth` inside the callback is still the OLD width. Guard
+    // that ordering — an xterm bump that moved the store ahead of the callback
+    // would silently make the gate always-false and the anchor never clear.
+    test('onResize fires before the terminal stores the new width', () {
+      final viewWidthsSeen = <int>[];
+      late final xt.Terminal terminal;
+      terminal = xt.Terminal(
+        maxLines: 100,
+        onResize: (w, h, pw, ph) => viewWidthsSeen.add(terminal.viewWidth),
+      );
+
+      terminal.resize(40, 10); // callback sees the default width, 80
+      terminal.resize(80, 10); // callback must still see the previous width, 40
+
+      expect(viewWidthsSeen, [80, 40]);
+      expect(terminal.viewWidth, 80);
     });
   });
 }
