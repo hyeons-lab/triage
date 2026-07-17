@@ -112,13 +112,16 @@ Future<ServerConfig> _migrateLegacyServer(SharedPreferences prefs) async {
   final copiedToken = copyLegacyTokenTo(server.id);
 
   final saved = await saveServers([server], selectedId: server.id);
-  await adoptLegacySessionOrder(server.id);
   // Retire the legacy keys only once the server that binds this id is safely
   // stored. Dropping them after a failed save would leave nothing recoverable —
   // no server list, an orphaned token under a random id nothing references, and
   // no legacy address or token to retry from — forgetting the user's only
-  // daemon and forcing a re-pair on the next launch.
+  // daemon and forcing a re-pair on the next launch. Adopting the rail order
+  // (which deletes the legacy order key) belongs inside this guard for the same
+  // reason: a failed save would otherwise strand the order under an id that
+  // never reached disk, with the legacy key already gone.
   if (saved) {
+    await adoptLegacySessionOrder(server.id);
     if (copiedToken) clearLegacyToken();
     try {
       await prefs.remove(legacyDaemonAddressPrefKey);

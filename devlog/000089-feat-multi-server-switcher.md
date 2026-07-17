@@ -209,6 +209,34 @@ lossy.
   failed to read" property). Applied to both the native migration and the web
   origin-server path.
 
+- 2026-07-16T19:08-0700 A second `/review-fix-loop max` (Round 1 full-PR
+  fan-out, Round 2 adversarial re-review of the fixes) found five more
+  switch-time defects, all now fixed:
+  - `_loadDaemonSessions` and its `_seedSessionSnippets`/`_seedSessionContexts`
+    helpers only checked `_disposed`, not the connect generation. A switch
+    landing mid-load could stamp the outgoing daemon's snippet/git-context onto
+    the incoming daemon's identically-named `main` — the same cross-daemon class
+    the earlier rounds fixed for `_loadDaemonSessionInto`, but the outer loader
+    and the seeds were left unpinned. Pinned all three to the connection
+    generation captured at entry.
+  - `_updateServer` purged the in-memory rail order but never called
+    `_restoreSessionOrder` on an active address edit (unlike `_selectServer`),
+    so re-pointing a daemon at a new address for the *same* machine reverted the
+    rail to default order and a later drag overwrote the good on-disk order.
+  - `_onPairRequested` discarded a freshly issued token if the user switched
+    daemons during PIN entry; the token is keyed by the captured server id, so it
+    now persists before the switched-away guard rather than after it.
+  - `_removeServer`'s last-daemon branch tore down the connection without
+    `_purgeDaemonLocalState`, leaking terminal controllers and stale
+    `_sessionsServerId` behind the connection screen.
+  - `_migrateLegacyServer` deleted the legacy `session_order_v1` key before the
+    save landed (via `adoptLegacySessionOrder` running ahead of the `if (saved)`
+    guard), inconsistent with the deferred token/address; moved it inside the
+    guard. The web-origin path's unconditional adoption was verified *not* a bug
+    — its id is deterministic (`web-${host}-${port}`), so a failed save
+    self-heals on the next launch. Round 2 confirmed all five fixes clean; 128
+    tests pass, analyze clean.
+
 ## Next Steps
 
 - Switch between two live daemons on-device (only one is currently running).
@@ -216,4 +244,5 @@ lossy.
 ## Commits
 
 - 62e2eb8 — feat(triage_client): remember and switch between multiple daemons
-- HEAD — fix(triage_client): defer legacy-token clear until the server list is saved
+- b2079d3 — fix(triage_client): defer legacy-token clear until the server list is saved
+- HEAD — fix(triage_client): close mid-switch state leaks found by review

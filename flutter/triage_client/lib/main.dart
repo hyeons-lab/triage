@@ -801,6 +801,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _needsPairing = false;
       });
       _purgeDaemonLocalState();
+      // The purge cleared the in-memory order; reload this server's saved order
+      // (its id is unchanged) before connecting, exactly as _selectServer does —
+      // otherwise the rail reverts to the daemon's default order on an address
+      // edit, and a later drag then overwrites the good on-disk order.
+      await _restoreSessionOrder();
+      if (_disposed) return;
       unawaited(_connectWebSocket());
     }
   }
@@ -834,6 +840,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // leaving the user on a rail attached to a daemon they just forgot.
     await _teardownConnection();
     if (!mounted) return;
+    // Drop the forgotten daemon's tiles, buffers, and _sessionsServerId, as
+    // every other teardown path does. Skipping it here leaks the undisposed
+    // terminal controllers and leaves stale daemon-local state behind the
+    // connection screen until the next switch happens to purge it.
+    _purgeDaemonLocalState();
     setState(() {
       _selectedServerId = null;
       _needsPairing = false;
@@ -1483,14 +1494,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (token.isEmpty) {
       throw Exception('Server returned empty pairing token');
     }
+    // Store the token before the switched-away guard. It is keyed by the
+    // captured serverId, so it belongs to *that* daemon no matter which one is
+    // active now — and pairing with a second daemon must not overwrite the
+    // first one's. Discarding it because the user switched away mid-PIN would
+    // throw away a valid credential and force a needless re-pair on return, the
+    // exact loss this feature removes. persistClientId is device-global.
+    persistClientId(_clientId);
+    persistTokenFor(serverId, token);
     if (_disposed || serverId != _activeServerId) return;
 
     setState(() {
       _bearerToken = token;
-      persistClientId(_clientId);
-      // Keyed by server: this token is what *this* daemon issued, and pairing
-      // with a second one must not overwrite the first one's.
-      persistTokenFor(serverId, token);
       _storageBackedClientId = retrieveClientId() == _clientId;
       _pairingChallengeError = null;
     });
@@ -1502,19 +1517,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<void> _loadDaemonSessions() async {
     if (!_client.isConnected) return;
 
+    // Pin the connection this load belongs to. A switch landing mid-load bumps
+    // the generation; every state mutation below re-checks it so a load started
+    // against the outgoing daemon can't rebuild the rail or seed metadata onto
+    // the incoming one — session ids are daemon-local and collide (both have a
+    // `main`), so a stale continuation would file A's data under B's session.
+    final generation = _connectGeneration;
     try {
       final rawSessionIds = await _client.listSessions();
       // Apply the per-device saved order (cached at startup) before building
       // rows so selection, history-on-load, and rendering all flow from the
       // displayed order. Read synchronously — never await prefs on this path.
       final sessionIds = _applySavedOrder(rawSessionIds, _savedSessionOrder);
-      if (_disposed) return;
+      if (_disposed || generation != _connectGeneration) return;
       final List<String> failedSessionIds = [];
       final targetSelectedIndex = _selectedIndex >= sessionIds.length
           ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
           : _selectedIndex;
 
-      if (_disposed) return;
+      if (_disposed || generation != _connectGeneration) return;
       // Keep a pane only when it is the *same* daemon's session of that name. A
       // title is `triage / <session id>`, and session ids are daemon-local, so
       // after a switch an identical title is a different machine's session — and
@@ -1570,7 +1591,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         );
       }
 
-      if (!_disposed) {
+      if (!_disposed && generation == _connectGeneration) {
         setState(() {
           final loadedCount = _sessions
               .where((s) => s.isRemote && s.status == 'attached')
@@ -1591,7 +1612,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // snippets add the one-line summary. Live updates arrive via push events.
       // Independent best-effort requests — run concurrently to save a connect
       // round-trip (matters on high-latency mobile links).
-      await Future.wait([_seedSessionSnippets(), _seedSessionContexts()]);
+      await Future.wait([
+        _seedSessionSnippets(generation),
+        _seedSessionContexts(generation),
+      ]);
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
@@ -1607,10 +1631,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _seedSessionSnippets() async {
+  Future<void> _seedSessionSnippets(int generation) async {
     try {
       final snippets = await _client.listSessionSnippets();
-      if (_disposed || snippets.isEmpty) return;
+      if (_disposed || generation != _connectGeneration || snippets.isEmpty) {
+        return;
+      }
       setState(() {
         for (final session in _sessions) {
           final sid = session.remoteSessionId;
@@ -1632,10 +1658,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // fields — the bulk response carries no cwd; live cwd arrives via
   // `session_context_updated`. Best-effort: an older daemon errors on the
   // unknown request, which is swallowed here.
-  Future<void> _seedSessionContexts() async {
+  Future<void> _seedSessionContexts(int generation) async {
     try {
       final contexts = await _client.listSessionContexts();
-      if (_disposed || contexts.isEmpty) return;
+      if (_disposed || generation != _connectGeneration || contexts.isEmpty) {
+        return;
+      }
       setState(() {
         for (final session in _sessions) {
           final sid = session.remoteSessionId;
