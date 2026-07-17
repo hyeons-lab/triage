@@ -10,6 +10,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:triage_client/main.dart';
+import 'package:triage_client/models/daemon_server.dart';
+import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
@@ -32,6 +34,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   Completer<void>? hangConnect;
   bool listSessionsUnauthorized = false;
   bool authenticated;
+  // When set, `hello` authenticates only these tokens — which is how a test
+  // gives two daemons genuinely different credentials, rather than one global
+  // yes/no.
+  Set<String>? acceptTokens;
   final bool disconnectAfterHello;
   final Set<String> exitedSessionIds;
   final Set<String> failedStartSessionCommands;
@@ -65,8 +71,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final Map<String, Completer<Map<String, dynamic>>> attachCompleters = {};
   final Map<String, List<dynamic>> snapshotStyledRowsMap = {};
 
+  int connectCalls = 0;
+
   @override
   Future<void> connect() async {
+    connectCalls += 1;
     final hang = hangConnect;
     if (hang != null && !hang.isCompleted) {
       // Simulates a half-open socket: the handshake sits pending until the
@@ -91,7 +100,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (disconnectAfterHello) {
       _connected = false;
     }
-    return {'protocol_version': '2026-05-20', 'authenticated': authenticated};
+    final accepted = acceptTokens;
+    final isAuthenticated = accepted == null
+        ? authenticated
+        : token != null && accepted.contains(token);
+    return {'protocol_version': '2026-05-20', 'authenticated': isAuthenticated};
   }
 
   @override
@@ -719,32 +732,31 @@ void main() {
     expect(client.writeInputCalls.contains('flutter-spike'), isTrue);
   });
 
-  testWidgets(
-    'opening a historical session fits it to the current viewport',
-    (WidgetTester tester) async {
-      tester.view.physicalSize = const Size(1200, 800);
-      tester.view.devicePixelRatio = 1;
-      addTearDown(() {
-        tester.view.resetPhysicalSize();
-        tester.view.resetDevicePixelRatio();
-      });
+  testWidgets('opening a historical session fits it to the current viewport', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
 
-      final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
-      await tester.pumpWidget(TriageClientApp(client: client));
-      await tester.pumpAndSettle();
+    final client = FakeTriageWebSocketClient(exitedSessionIds: {'main'});
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
 
-      // Lazy-load: a non-selected exited session restores when opened, not on
-      // connect. Opening it lays out its pane, which fits to the current
-      // viewport (84x38 here) — so the session shows at the current device's
-      // size, superseding the size it was persisted at. This is what we want
-      // for the multi-device case (fit my screen, not the other device's).
-      await tester.tap(find.text('triage / main').first);
-      await tester.pumpAndSettle();
+    // Lazy-load: a non-selected exited session restores when opened, not on
+    // connect. Opening it lays out its pane, which fits to the current
+    // viewport (84x38 here) — so the session shows at the current device's
+    // size, superseding the size it was persisted at. This is what we want
+    // for the multi-device case (fit my screen, not the other device's).
+    await tester.tap(find.text('triage / main').first);
+    await tester.pumpAndSettle();
 
-      expect(client.restoreSessionCalls, contains('main'));
-      expect(client.restoreSessionSizes['main'], '84x38');
-    },
-  );
+    expect(client.restoreSessionCalls, contains('main'));
+    expect(client.restoreSessionSizes['main'], '84x38');
+  });
 
   testWidgets(
     'restores historical sessions using estimated viewport size when saved size is absent',
@@ -1117,15 +1129,15 @@ void main() {
   testWidgets('drops in-memory token when site data is cleared while running', (
     WidgetTester tester,
   ) async {
-    clearToken();
+    clearTokenFor(unconfiguredServerId);
     clearClientId();
     addTearDown(() {
-      clearToken();
+      clearTokenFor(unconfiguredServerId);
       clearClientId();
     });
 
     persistClientId('triage-flutter-client-stored');
-    persistToken('stored-token');
+    persistTokenFor(unconfiguredServerId, 'stored-token');
     final client = FakeTriageWebSocketClient();
     await tester.pumpWidget(TriageClientApp(client: client));
     await tester.pumpAndSettle();
@@ -1134,7 +1146,7 @@ void main() {
     expect(client.helloTokens.single, 'stored-token');
     expect(find.text('Connected to Daemon'), findsOneWidget);
 
-    clearToken();
+    clearTokenFor(unconfiguredServerId);
     clearClientId();
     client.authenticated = false;
     await tester.pump(const Duration(seconds: 2));
@@ -1302,13 +1314,13 @@ void main() {
       reason: 'first connect is in flight',
     );
 
-    // The user repoints the app at a different daemon while that connect is
-    // still pending. The in-flight attempt is talking to the *old* address, so
-    // it cannot satisfy this request.
-    await tester.tap(find.byTooltip('Connection settings'));
+    // The user points the app at a different daemon while that connect is still
+    // pending. The in-flight attempt is talking to the *old* address, so it
+    // cannot satisfy this request.
+    await tester.tap(find.byTooltip('Daemons'));
     await tester.pump();
-    await tester.enterText(find.byType(TextField).last, 'otherhost:7777');
-    await tester.tap(find.text('Connect'));
+    await tester.enterText(find.byType(TextField).first, 'otherhost:7777');
+    await tester.tap(find.text('Add'));
     await tester.pump();
 
     // The in-flight connect now succeeds — so no failure, and no backoff timer,
@@ -1318,7 +1330,11 @@ void main() {
     await tester.pump();
     await tester.pump();
 
-    expect(client.helloClientIds.length, 2);
+    // Two connects: the one that was in flight, and the replay for the daemon
+    // the user actually asked for. A dropped request would leave this at one.
+    // (The first attempt is retired before its `hello` — it belongs to the
+    // daemon we left — so the hello count is not what proves the replay ran.)
+    expect(client.connectCalls, 2);
   });
 
   testWidgets('drag-reordering the rail persists a per-device session order', (
@@ -1339,9 +1355,13 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
 
-    // The new order is persisted, with 'main' no longer last.
+    // The new order is persisted — under this server's key, since session ids
+    // are daemon-local and one global list would let another daemon's order
+    // overwrite this one's.
     final prefs = await SharedPreferences.getInstance();
-    final order = prefs.getStringList('session_order_v1');
+    final order = prefs.getStringList(
+      sessionOrderPrefKeyFor(unconfiguredServerId),
+    );
     expect(order, isNotNull);
     expect(order, contains('main'));
     expect(order!.last, isNot('main'));
@@ -1488,13 +1508,16 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: ConnectionSettingsForm(onSubmit: (raw) => submitted = raw),
+          body: ConnectionSettingsForm(
+            onSubmit: (raw, label) => submitted = raw,
+          ),
         ),
       ),
     );
     await tester.pumpAndSettle();
 
-    await tester.enterText(find.byType(TextField), 'myhost:abc');
+    final addressField = find.byType(TextField).first;
+    await tester.enterText(addressField, 'myhost:abc');
     await tester.tap(find.text('Connect'));
     await tester.pumpAndSettle();
     expect(
@@ -1505,9 +1528,274 @@ void main() {
     );
     expect(submitted, isNull);
 
-    await tester.enterText(find.byType(TextField), '192.168.1.5:7777');
+    await tester.enterText(addressField, '192.168.1.5:7777');
     await tester.tap(find.text('Connect'));
     await tester.pumpAndSettle();
     expect(submitted, '192.168.1.5:7777');
+  });
+
+  group('multi-daemon switcher', () {
+    const workLaptop = DaemonServer(
+      id: 'server-work',
+      label: 'Work laptop',
+      address: 'work.tailnet:7777',
+    );
+    const homeMac = DaemonServer(
+      id: 'server-home',
+      label: 'Home mac',
+      address: 'home.tailnet:7777',
+    );
+
+    setUp(() {
+      SharedPreferences.setMockInitialValues({});
+      clearTokenFor(workLaptop.id);
+      clearTokenFor(homeMac.id);
+      clearClientId();
+    });
+
+    tearDown(() {
+      clearTokenFor(workLaptop.id);
+      clearTokenFor(homeMac.id);
+      clearClientId();
+    });
+
+    Future<FakeTriageWebSocketClient> pumpWithServers(
+      WidgetTester tester, {
+      required String selectedId,
+    }) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(
+        TriageClientApp(
+          client: client,
+          initialServers: ServerConfig(
+            servers: const [workLaptop, homeMac],
+            selectedId: selectedId,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      return client;
+    }
+
+    testWidgets('the rail names the daemon the sessions belong to', (
+      WidgetTester tester,
+    ) async {
+      await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      // With more than one daemon configured, "Connected to Daemon" alone does
+      // not say *which* machine these sessions are on.
+      expect(find.text('Work laptop'), findsOneWidget);
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+    });
+
+    testWidgets('each daemon is paired with its own token', (
+      WidgetTester tester,
+    ) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      persistTokenFor(homeMac.id, 'home-token');
+
+      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+      expect(client.helloTokens.single, 'work-token');
+
+      // Switch to the other daemon.
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Home mac'));
+      await tester.pumpAndSettle();
+
+      // The whole point of keying tokens by server: the second daemon is
+      // greeted with the token *it* issued, not the first one's, so switching
+      // costs no re-pair in either direction.
+      expect(client.helloTokens.last, 'home-token');
+      expect(find.text('Home mac'), findsOneWidget);
+
+      // And the daemon we left is still paired.
+      expect(retrieveTokenFor(workLaptop.id), 'work-token');
+    });
+
+    testWidgets('pairing with a daemon does not overwrite the other token', (
+      WidgetTester tester,
+    ) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      // The home mac has never been paired with, so it challenges for a PIN.
+      final client = FakeTriageWebSocketClient()..authenticated = false;
+      await tester.pumpWidget(
+        TriageClientApp(
+          client: client,
+          initialServers: const ServerConfig(
+            servers: [workLaptop, homeMac],
+            selectedId: 'server-home',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Pair Remote Device'), findsOneWidget);
+      await tester.enterText(find.byType(TextField), 'WXYZ9876');
+      await tester.tap(find.text('Pair Device'));
+      await tester.pumpAndSettle();
+
+      expect(retrieveTokenFor(homeMac.id), 'paired-token');
+      // Pairing a second daemon must not un-pair the first.
+      expect(retrieveTokenFor(workLaptop.id), 'work-token');
+    });
+
+    testWidgets('switching mid-connect does not un-pair the incoming daemon', (
+      WidgetTester tester,
+    ) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      persistTokenFor(homeMac.id, 'home-token');
+
+      // The work laptop has revoked our token; the home mac has not.
+      final client = FakeTriageWebSocketClient()
+        ..acceptTokens = {'home-token'}
+        ..hangConnect = Completer<void>();
+      await tester.pumpWidget(
+        TriageClientApp(
+          client: client,
+          initialServers: const ServerConfig(
+            servers: [workLaptop, homeMac],
+            selectedId: 'server-work',
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // Switch to the home mac while the work laptop's connect is still pending.
+      // Settle so the switch has fully landed (it persists the selection before
+      // applying it) — otherwise the stale attempt resolves before the active
+      // server has actually changed, and the race under test never happens.
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Home mac'));
+      await tester.pumpAndSettle();
+
+      // The work laptop's attempt now lands, and its token is rejected. That
+      // attempt belongs to the daemon we just left: if it clears "the active
+      // server's" token rather than its own, it wipes the home mac's perfectly
+      // good credential and drops us onto a PIN screen for a daemon that never
+      // rejected anything.
+      client.hangConnect!.complete();
+      await tester.pumpAndSettle();
+
+      expect(retrieveTokenFor(homeMac.id), 'home-token');
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+      expect(find.text('Pair Remote Device'), findsNothing);
+    });
+
+    testWidgets('switching daemons does not carry session state across', (
+      WidgetTester tester,
+    ) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      persistTokenFor(homeMac.id, 'home-token');
+      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      // The rail order recorded against the work laptop.
+      await tester.drag(find.text('triage / main'), const Offset(0, -260));
+      await tester.pumpAndSettle();
+      final prefs = await SharedPreferences.getInstance();
+      final workOrder = prefs.getStringList(
+        sessionOrderPrefKeyFor(workLaptop.id),
+      );
+      expect(workOrder, isNotNull);
+
+      // Switch to the home mac, holding its connect open so we can inspect the
+      // window between daemons.
+      client.hangConnect = Completer<void>();
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Home mac'));
+      await tester.pumpAndSettle();
+
+      // The work laptop's tiles are gone. Leaving them on screen is what made
+      // the whole class of cross-daemon bugs possible: they stay marked
+      // `attached` and wired to the client, which now points at the home mac, so
+      // a keystroke, a resize, or a drag would be delivered to the home mac
+      // under a work-laptop session id — and the ids collide, since both
+      // machines have a `main`.
+      expect(find.text('triage / main'), findsNothing);
+
+      // So nothing can have been filed under the home mac, and the work laptop's
+      // own order is untouched.
+      expect(prefs.getStringList(sessionOrderPrefKeyFor(homeMac.id)), isNull);
+      expect(
+        prefs.getStringList(sessionOrderPrefKeyFor(workLaptop.id)),
+        workOrder,
+      );
+
+      client.hangConnect!.complete();
+      await tester.pumpAndSettle();
+      expect(client.helloTokens.last, 'home-token');
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+    });
+
+    testWidgets('forgetting the last daemon does not dial a phantom one', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(
+        TriageClientApp(
+          client: client,
+          initialServers: const ServerConfig(
+            servers: [workLaptop],
+            selectedId: 'server-work',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final hellosWhileConnected = client.helloClientIds.length;
+
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Forget'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Forget'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Connect to a Triage daemon'), findsOneWidget);
+
+      // With no daemon left, the resume/wake path must not reconnect. It used to
+      // fire on `_clientInitialized` alone and fall back to the page-origin URI —
+      // pairing against a localhost daemon the user never added, invisibly,
+      // behind the connection screen.
+      for (final state in const [
+        AppLifecycleState.inactive,
+        AppLifecycleState.hidden,
+        AppLifecycleState.paused,
+        AppLifecycleState.hidden,
+        AppLifecycleState.inactive,
+        AppLifecycleState.resumed,
+      ]) {
+        tester.binding.handleAppLifecycleStateChanged(state);
+      }
+      await tester.pumpAndSettle();
+
+      expect(client.helloClientIds.length, hellosWhileConnected);
+    });
+
+    testWidgets('forgetting a daemon clears only its token', (
+      WidgetTester tester,
+    ) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      persistTokenFor(homeMac.id, 'home-token');
+      await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      // Forget the daemon we are *not* on, so the rail stays put.
+      await tester.tap(find.byTooltip('Forget').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Forget'));
+      await tester.pumpAndSettle();
+
+      // A forgotten daemon's bearer token would otherwise sit in the keychain
+      // under an id nothing can reach again.
+      expect(retrieveTokenFor(homeMac.id), isNull);
+      expect(retrieveTokenFor(workLaptop.id), 'work-token');
+
+      final prefs = await SharedPreferences.getInstance();
+      final saved = DaemonServer.decodeList(prefs.getString(serversPrefKey));
+      expect(saved.map((s) => s.id), [workLaptop.id]);
+    });
   });
 }
