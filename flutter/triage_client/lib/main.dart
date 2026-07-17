@@ -216,7 +216,12 @@ class SessionVm {
   }) : terminalController = TerminalController() {
     terminal = xt.Terminal(
       maxLines: 10000,
-      reflowEnabled: false,
+      // Re-wrap the whole buffer on resize, like a real terminal — otherwise
+      // scrollback keeps its old wrap points and a full-screen TUI's in-place
+      // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
+      // tolerates reflow replacing line objects: it drops a detached anchor
+      // line (`BufferLine.attached`) and falls back to following the bottom.
+      reflowEnabled: true,
       onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
     );
     terminalController.addWriteListener((data) {
