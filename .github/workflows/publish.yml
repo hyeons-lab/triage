@@ -184,22 +184,202 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # Ad-hoc signed (the project uses CODE_SIGN_IDENTITY = "-"), so no signing
-      # secrets are required.
+      # Flutter itself signs with CODE_SIGN_IDENTITY = "-" (ad-hoc); the Developer ID
+      # signature is applied afterwards when signing secrets are configured (below).
       - name: Build Triage.app
         run: |
           cd flutter/triage_client
           flutter pub get
           flutter build macos --release
 
-      # The runner has no Developer ID, so `flutter build macos --release` falls
-      # back to ad-hoc signing and Xcode injects `com.apple.security.get-task-allow`
-      # (a debug entitlement) into the app. macOS will not persist an "Always Allow"
-      # Keychain decision for a debuggable app, so flutter_secure_storage re-prompts
-      # the user on every launch. Re-sign with the Release entitlements (which omit
-      # get-task-allow) to stop the repeated Keychain prompts. The app stays ad-hoc
-      # signed (users clear quarantine on first launch) but is no longer debuggable.
-      - name: Strip get-task-allow (fix repeated Keychain prompts)
+      # Developer ID signing + notarization runs only when the signing secrets are
+      # configured. Without them the job falls back to the prior ad-hoc re-sign so
+      # forks / unconfigured repos still produce a release (just not a notarized one).
+      - name: Check for signing secrets
+        id: signing
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          # The signed/notarized path needs ALL six secrets. Gating on the full
+          # set (not just the identity) means a partially configured repo falls
+          # back to ad-hoc cleanly instead of entering the signed path and failing
+          # mid-job when a cert or notary key turns up missing.
+          missing=""
+          for var in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_SIGN_IDENTITY \
+                     MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              missing="$missing $var"
+            fi
+          done
+          if [ -z "$missing" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Developer ID signing secrets not fully set (missing:$missing); the macOS client will be ad-hoc signed and not notarized."
+          fi
+
+      # Import the Developer ID Application cert into an ephemeral, per-job keychain
+      # (auto-discarded when the runner is torn down) so codesign/notarytool can find
+      # the identity without touching the runner's login keychain.
+      - name: Import Developer ID certificate
+        if: ${{ steps.signing.outputs.enabled == 'true' }}
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/developer_id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          # Remove the decoded private key on any exit path, so a mid-step failure
+          # can't leave the .p12 on the runner.
+          trap 'rm -f "$CERT_PATH"' EXIT
+          # -D (not --decode) is the decode flag the macOS/BSD base64 accepts on
+          # every runner image; GNU-style long options are not guaranteed there.
+          echo "$MACOS_CERT_P12_BASE64" | base64 -D > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          # Allow codesign to use the private key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          # Prepend our signing keychain to the search list, preserving the runner's
+          # existing keychains so the Apple intermediate certificates needed to build
+          # the signing chain stay resolvable. Word-splitting the existing list into
+          # separate arguments is intentional (runner keychain paths have no spaces).
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+
+      # Sign nested Flutter frameworks/dylibs inside-out, then the app bundle, all
+      # with the hardened runtime + secure timestamp Apple requires for notarization.
+      # Signing with a real Developer ID identity means Xcode does not inject the
+      # debug get-task-allow entitlement, so the notarized app is not debuggable and
+      # macOS persists "Always Allow" Keychain decisions (fixing the repeated prompts
+      # the old ad-hoc build had). Uses the sandbox Release entitlements.
+      - name: Sign with Developer ID (hardened runtime)
+        if: ${{ steps.signing.outputs.enabled == 'true' }}
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          cd flutter/triage_client
+          APP=build/macos/Build/Products/Release/Triage.app
+          sign() {
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_SIGN_IDENTITY" "$1"
+          }
+          contains_macho() {
+            while IFS= read -r -d '' m; do
+              if file -b "$m" | grep -q 'Mach-O'; then return 0; fi
+            done < <(find "$1" -type f -print0)
+            return 1
+          }
+          # Notarization requires the hardened runtime + secure timestamp on *every*
+          # Mach-O in the bundle, which `codesign --deep` does not reliably apply to
+          # nested code. Sign inside-out, discovering code by content (`file`) rather
+          # than by extension/location so a future plugin that ships a helper tool, an
+          # .xpc/.bundle, a nested framework, or an extension-less binary anywhere in
+          # the bundle is still covered instead of failing notarization.
+          #
+          # Pass 1 — every Mach-O file, deepest path first (`-depth`). The app's own
+          # main executable gets re-signed with entitlements by the final app-bundle
+          # signature below, so signing it here without them is harmless.
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q 'Mach-O'; then
+              sign "$f"
+            fi
+          done < <(find "$APP" -type f -depth -print0)
+          # Pass 2 — every nested *code* bundle, deepest first, so an inner framework
+          # is sealed before its container. Only bundles that actually contain a
+          # Mach-O are signed: codesign refuses a resource-only bundle (e.g.
+          # Assets.bundle) with "bundle format unrecognized", which would abort the
+          # job; such bundles are sealed as resources of their parent regardless.
+          # `-mindepth 1` excludes the top-level .app, which Pass 3 signs with the
+          # Release entitlements.
+          while IFS= read -r -d '' b; do
+            if contains_macho "$b"; then
+              sign "$b"
+            fi
+          done < <(find "$APP" -mindepth 1 -type d \
+            \( -name '*.framework' -o -name '*.xpc' -o -name '*.bundle' \
+               -o -name '*.app' \) -depth -print0)
+          # Pass 3 — the app bundle itself, with the sandbox Release entitlements.
+          codesign --force --options runtime --timestamp \
+            --entitlements macos/Runner/Release.entitlements \
+            --sign "$MACOS_SIGN_IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          # Fail closed if the debug entitlement is present — and fail closed if the
+          # entitlements can't be read at all, rather than passing an uninspected app.
+          if ! ENTITLEMENTS="$(codesign -d --entitlements - "$APP" 2>&1)"; then
+            echo "::error::could not read entitlements from the signed app: $ENTITLEMENTS" >&2
+            exit 1
+          fi
+          case "$ENTITLEMENTS" in
+            *get-task-allow*)
+              echo "::error::get-task-allow present after Developer ID signing" >&2
+              exit 1
+              ;;
+          esac
+
+      # Submit to Apple's notary service and staple the resulting ticket into the app
+      # so Gatekeeper verifies it offline (no first-launch network round-trip). Uses
+      # an App Store Connect API key (.p8) rather than an Apple ID + password.
+      - name: Notarize and staple
+        if: ${{ steps.signing.outputs.enabled == 'true' }}
+        env:
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          cd flutter/triage_client
+          APP=build/macos/Build/Products/Release/Triage.app
+          KEY_PATH="$RUNNER_TEMP/notary_key.p8"
+          NOTARIZE_ZIP="$RUNNER_TEMP/Triage-notarize.zip"
+          # Remove the decoded API key on any exit path (see the cert import step).
+          trap 'rm -f "$KEY_PATH" "$NOTARIZE_ZIP"' EXIT
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 -D > "$KEY_PATH"
+          # notarytool submits an archive; a ditto zip of the .app is accepted.
+          ditto -c -k --keepParent "$APP" "$NOTARIZE_ZIP"
+          # Capture the result as JSON and assert Accepted explicitly: `--wait` does
+          # not reliably exit non-zero on an Invalid submission, so without this a
+          # rejected build would fall through to `stapler` and fail with an opaque
+          # "no ticket" error. On any non-Accepted status, dump the per-issue notary
+          # log (the only place that names the offending binary/entitlement).
+          SUBMIT_JSON="$(xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --key "$KEY_PATH" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --output-format json --wait)"
+          echo "$SUBMIT_JSON"
+          SUBMISSION_ID="$(echo "$SUBMIT_JSON" | jq -r '.id')"
+          STATUS="$(echo "$SUBMIT_JSON" | jq -r '.status')"
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Notarization failed with status: $STATUS"
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$KEY_PATH" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" || true
+            exit 1
+          fi
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+      # Fallback path only: when no Developer ID is configured, `flutter build macos`
+      # ad-hoc signs and Xcode injects `com.apple.security.get-task-allow` (a debug
+      # entitlement). macOS will not persist an "Always Allow" Keychain decision for a
+      # debuggable app, so flutter_secure_storage re-prompts on every launch. Re-sign
+      # ad-hoc with the Release entitlements (which omit get-task-allow) to stop that.
+      - name: Strip get-task-allow (ad-hoc fallback)
+        if: ${{ steps.signing.outputs.enabled == 'false' }}
         run: |
           cd flutter/triage_client
           APP=build/macos/Build/Products/Release/Triage.app
