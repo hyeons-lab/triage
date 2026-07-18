@@ -41,6 +41,28 @@ ad-hoc signing. User has an Apple Developer account and chose the CI-based appro
 - 2026-07-10 Preserve the runner's existing keychain search list (prepend the temp
   keychain) rather than replacing it, so the Apple intermediate certs needed to build
   the signing chain stay resolvable. (pre-push review finding)
+- 2026-07-17T19:54-0700 Generalize the signing traversal — sign every Mach-O in the
+  bundle inside-out (deepest first), discovering code by content (`file`) rather than
+  a `Contents/Frameworks` + extension whitelist, then every nested *code* bundle, then
+  the app. A future plugin shipping a helper tool / `.xpc` / `.bundle` / nested
+  framework / extension-less binary is now covered instead of failing notarization.
+  (review-fix-loop finding)
+- 2026-07-17T19:54-0700 Pass 2 only signs bundles that contain a Mach-O — `codesign`
+  refuses a resource-only bundle (e.g. `Assets.bundle`) with "bundle format
+  unrecognized", which would abort the job; resource bundles are sealed as resources
+  of their parent regardless. (review-fix-loop finding — regression caught in the
+  traversal rewrite)
+- 2026-07-17T19:54-0700 Notarization asserts `status == Accepted` from the JSON
+  output and dumps `notarytool log` on any other status, because `notarytool submit
+  --wait` does not reliably exit non-zero on an Invalid submission (would otherwise
+  fall through to `stapler` with an opaque "no ticket" error). (review-fix-loop
+  finding)
+- 2026-07-17T19:54-0700 Remove decoded secret temp files (`.p12`/`.p8`) via
+  `trap … EXIT` so a mid-step failure can't strand a private key on the runner —
+  matching the existing trap pattern in the release job. (review-fix-loop finding)
+- 2026-07-17T19:54-0700 `get-task-allow` guard fails closed if entitlements can't be
+  read (captures `codesign -d` exit) instead of silently passing an uninspected app.
+  (review-fix-loop finding)
 
 ## Next Steps
 
@@ -51,4 +73,5 @@ ad-hoc signing. User has an Apple Developer account and chose the CI-based appro
 ## Commits
 
 - 46ce42b — ci(release): Developer ID sign + notarize the macOS client
-- HEAD — ci(release): address PR review (all-six-secrets gate, portable base64, timestamps)
+- 14c9323 — ci(release): address PR review on macOS signing
+- HEAD — ci(release): harden macOS signing (traversal, notary status, secret cleanup)

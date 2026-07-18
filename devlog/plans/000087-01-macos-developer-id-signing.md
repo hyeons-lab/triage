@@ -51,3 +51,22 @@ Secrets to add (all under repo Settings → Secrets and variables → Actions):
 5. Gate the existing ad-hoc "Strip get-task-allow" step on `enabled == false` so it
    only runs on the fallback path.
 6. Leave packaging/upload unchanged.
+
+## Deviations
+
+This section supersedes the single-secret gating described in **Thinking**
+(paragraph starting "Design choice…") and **Plan** step 1. The plan is
+append-only; these are the changes made during review rather than edits to the
+text above.
+
+- **Gate on all six secrets, not just `MACOS_SIGN_IDENTITY`.** `enabled=true`
+  only when every one of `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`,
+  `MACOS_SIGN_IDENTITY`, `MACOS_NOTARY_KEY_BASE64`, `MACOS_NOTARY_KEY_ID`, and
+  `MACOS_NOTARY_ISSUER_ID` is set. Gating on the identity alone let a partially
+  configured repo enter the signed path and fail mid-job; the full-set check
+  falls back to ad-hoc cleanly and the warning names the missing secrets.
+- **Notarization asserts `Accepted` explicitly** and dumps `notarytool log` on a
+  non-Accepted status, because `notarytool submit --wait` does not reliably exit
+  non-zero on an Invalid submission.
+- **Decoded secret temp files are removed via `trap … EXIT`** so a mid-step
+  failure cannot strand the `.p12` / `.p8` on the runner.

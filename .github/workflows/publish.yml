@@ -236,6 +236,9 @@ jobs:
           CERT_PATH="$RUNNER_TEMP/developer_id.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          # Shred the decoded private key on any exit path, so a failure between
+          # decode and the trailing rm can't strand the .p12 on the runner.
+          trap 'rm -f "$CERT_PATH"' EXIT
           # -D (not --decode) is the decode flag the macOS/BSD base64 accepts on
           # every runner image; GNU-style long options are not guaranteed there.
           echo "$MACOS_CERT_P12_BASE64" | base64 -D > "$CERT_PATH"
@@ -254,7 +257,6 @@ jobs:
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$KEYCHAIN_PATH" \
             $(security list-keychains -d user | tr -d '"')
-          rm -f "$CERT_PATH"
 
       # Sign nested Flutter frameworks/dylibs inside-out, then the app bundle, all
       # with the hardened runtime + secure timestamp Apple requires for notarization.
@@ -270,28 +272,62 @@ jobs:
           set -euo pipefail
           cd flutter/triage_client
           APP=build/macos/Build/Products/Release/Triage.app
-          # Notarization requires the hardened runtime on *every* Mach-O in the
-          # bundle, which `codesign --deep` does not reliably apply to nested code.
-          # Sign inside-out — loose dylibs/shared objects first, then framework
-          # bundles, then the app — each with the hardened runtime + secure timestamp.
-          while IFS= read -r -d '' lib; do
+          sign() {
             codesign --force --options runtime --timestamp \
-              --sign "$MACOS_SIGN_IDENTITY" "$lib"
-          done < <(find "$APP/Contents/Frameworks" -type f \
-            \( -name '*.dylib' -o -name '*.so' \) -print0 2>/dev/null)
-          while IFS= read -r -d '' fw; do
-            codesign --force --options runtime --timestamp \
-              --sign "$MACOS_SIGN_IDENTITY" "$fw"
-          done < <(find "$APP/Contents/Frameworks" -type d -name '*.framework' -print0 2>/dev/null)
+              --sign "$MACOS_SIGN_IDENTITY" "$1"
+          }
+          contains_macho() {
+            while IFS= read -r -d '' m; do
+              if file -b "$m" | grep -q 'Mach-O'; then return 0; fi
+            done < <(find "$1" -type f -print0)
+            return 1
+          }
+          # Notarization requires the hardened runtime + secure timestamp on *every*
+          # Mach-O in the bundle, which `codesign --deep` does not reliably apply to
+          # nested code. Sign inside-out, discovering code by content (`file`) rather
+          # than by extension/location so a future plugin that ships a helper tool, an
+          # .xpc/.bundle, a nested framework, or an extension-less binary anywhere in
+          # the bundle is still covered instead of failing notarization.
+          #
+          # Pass 1 — every Mach-O file, deepest path first (`-depth`). The app's own
+          # main executable gets re-signed with entitlements by the final app-bundle
+          # signature below, so signing it here without them is harmless.
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q 'Mach-O'; then
+              sign "$f"
+            fi
+          done < <(find "$APP" -type f -depth -print0)
+          # Pass 2 — every nested *code* bundle, deepest first, so an inner framework
+          # is sealed before its container. Only bundles that actually contain a
+          # Mach-O are signed: codesign refuses a resource-only bundle (e.g.
+          # Assets.bundle) with "bundle format unrecognized", which would abort the
+          # job; such bundles are sealed as resources of their parent regardless.
+          # `-mindepth 1` excludes the top-level .app, which Pass 3 signs with the
+          # Release entitlements.
+          while IFS= read -r -d '' b; do
+            if contains_macho "$b"; then
+              sign "$b"
+            fi
+          done < <(find "$APP" -mindepth 1 -type d \
+            \( -name '*.framework' -o -name '*.xpc' -o -name '*.bundle' \
+               -o -name '*.app' \) -depth -print0)
+          # Pass 3 — the app bundle itself, with the sandbox Release entitlements.
           codesign --force --options runtime --timestamp \
             --entitlements macos/Runner/Release.entitlements \
             --sign "$MACOS_SIGN_IDENTITY" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
-          # Fail closed if the debug entitlement is somehow present.
-          if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q 'get-task-allow'; then
-            echo "::error::get-task-allow present after Developer ID signing" >&2
+          # Fail closed if the debug entitlement is present — and fail closed if the
+          # entitlements can't be read at all, rather than passing an uninspected app.
+          if ! ENTITLEMENTS="$(codesign -d --entitlements - "$APP" 2>&1)"; then
+            echo "::error::could not read entitlements from the signed app: $ENTITLEMENTS" >&2
             exit 1
           fi
+          case "$ENTITLEMENTS" in
+            *get-task-allow*)
+              echo "::error::get-task-allow present after Developer ID signing" >&2
+              exit 1
+              ;;
+          esac
 
       # Submit to Apple's notary service and staple the resulting ticket into the app
       # so Gatekeeper verifies it offline (no first-launch network round-trip). Uses
@@ -308,17 +344,34 @@ jobs:
           APP=build/macos/Build/Products/Release/Triage.app
           KEY_PATH="$RUNNER_TEMP/notary_key.p8"
           NOTARIZE_ZIP="$RUNNER_TEMP/Triage-notarize.zip"
+          # Shred the decoded API key on any exit path (see the cert import step).
+          trap 'rm -f "$KEY_PATH" "$NOTARIZE_ZIP"' EXIT
           echo "$MACOS_NOTARY_KEY_BASE64" | base64 -D > "$KEY_PATH"
           # notarytool submits an archive; a ditto zip of the .app is accepted.
           ditto -c -k --keepParent "$APP" "$NOTARIZE_ZIP"
-          xcrun notarytool submit "$NOTARIZE_ZIP" \
+          # Capture the result as JSON and assert Accepted explicitly: `--wait` does
+          # not reliably exit non-zero on an Invalid submission, so without this a
+          # rejected build would fall through to `stapler` and fail with an opaque
+          # "no ticket" error. On any non-Accepted status, dump the per-issue notary
+          # log (the only place that names the offending binary/entitlement).
+          SUBMIT_JSON="$(xcrun notarytool submit "$NOTARIZE_ZIP" \
             --key "$KEY_PATH" \
             --key-id "$MACOS_NOTARY_KEY_ID" \
             --issuer "$MACOS_NOTARY_ISSUER_ID" \
-            --wait
+            --output-format json --wait)"
+          echo "$SUBMIT_JSON"
+          SUBMISSION_ID="$(echo "$SUBMIT_JSON" | jq -r '.id')"
+          STATUS="$(echo "$SUBMIT_JSON" | jq -r '.status')"
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Notarization failed with status: $STATUS"
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$KEY_PATH" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" || true
+            exit 1
+          fi
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
-          rm -f "$KEY_PATH" "$NOTARIZE_ZIP"
 
       # Fallback path only: when no Developer ID is configured, `flutter build macos`
       # ad-hoc signs and Xcode injects `com.apple.security.get-task-allow` (a debug
