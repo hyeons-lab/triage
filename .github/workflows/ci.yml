@@ -130,3 +130,60 @@ jobs:
 
       - name: Run tests
         run: flutter test
+
+  android-apk:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: flutter/triage_client
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Set up JDK
+        # actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          # Matches sourceCompatibility/jvmTarget in android/app/build.gradle.kts.
+          java-version: "17"
+
+      - name: Set up Flutter
+        # subosito/flutter-action@v2 (matches publish.yml). cache: true caches
+        # both the Flutter SDK and the pub package cache (~/.pub-cache).
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.0"
+          channel: "stable"
+          cache: true
+
+      # Caches the Gradle user home (dependencies + wrapper dists + build cache)
+      # for the Gradle that `flutter build apk` shells out to. By default it only
+      # writes the cache from the default branch, so PRs restore but don't
+      # pollute it — main's CI run populates it after this merges.
+      - name: Set up Gradle cache
+        # gradle/actions/setup-gradle@v6.2.0
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # A release build, but signed with the debug keystore (see the release
+      # signingConfig in android/app/build.gradle.kts), so the artifact installs
+      # directly on any device without release-signing secrets. One universal
+      # APK — download a single file from the run summary and sideload it.
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        # actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: triage-client-apk
+          # Path is relative to the workspace root, not the job working-directory.
+          path: flutter/triage_client/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
