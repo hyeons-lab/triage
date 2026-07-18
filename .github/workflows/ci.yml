@@ -134,7 +134,9 @@ jobs:
   android-apk:
     name: Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Headroom for a cold first build (Gradle dist + deps + any SDK/NDK pull)
+    # before the Gradle cache is populated from the default branch.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: flutter/triage_client
@@ -180,8 +182,8 @@ jobs:
         run: flutter build apk --release
 
       - name: Upload APK
-        # actions/upload-artifact@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        # actions/upload-artifact@v6 (matches publish.yml)
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: triage-client-apk
           # Path is relative to the workspace root, not the job working-directory.

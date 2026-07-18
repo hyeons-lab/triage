@@ -31,10 +31,26 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        // Point the debug signing config at a committed keystore (see
+        // app/debug.keystore) instead of the per-machine ~/.android/debug.keystore
+        // Gradle would otherwise auto-generate. That gives every build — CI and
+        // local — one stable signing identity, so a freshly built APK installs
+        // over an earlier one instead of failing INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+        // These are the well-known Android debug credentials, not secrets.
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
+            // Signed with the debug keystore so `flutter build apk --release` and
+            // the CI artifact install without release-signing secrets. Swap in a
+            // real release signingConfig before publishing to a store.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
