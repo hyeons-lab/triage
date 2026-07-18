@@ -335,7 +335,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
-    _focusTerminal();
+    // Desktop only: focus on pointer-down so a mouse click focuses the terminal
+    // before a drag-select. On mobile this same pointer-down begins a scroll
+    // swipe, and requesting focus here raises the soft keyboard mid-scroll — the
+    // Scaffold then insets for the keyboard and the viewport jumps under the
+    // finger. Mobile tap-to-focus is handled by the GestureDetector.onTap
+    // (a real tap, not a swipe), so skip focusing on the raw pointer-down.
+    if (!_isMobile) {
+      _focusTerminal();
+    }
     if ((event.buttons & kPrimaryButton) == 0) return;
     // Touch: let the terminal's own gestures handle scrolling (a swipe) and
     // selection (long-press). The pointer-driven drag-select below is for a
