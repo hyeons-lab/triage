@@ -8,18 +8,28 @@ ad-hoc signing. User has an Apple Developer account and chose the CI-based appro
 
 ## What Changed
 
-- 2026-07-10T10:20-07:00 `.github/workflows/publish.yml` — `build-macos` job now
+- 2026-07-10T10:20-0700 `.github/workflows/publish.yml` — `build-macos` job now
   Developer-ID-signs (hardened runtime + timestamp), notarizes (notarytool), and
   staples the app when signing secrets are configured; falls back to the prior
   ad-hoc strip step when they are not.
-- 2026-07-10T10:20-07:00 `devlog/plans/000087-01-macos-developer-id-signing.md` —
+- 2026-07-10T10:20-0700 `devlog/plans/000087-01-macos-developer-id-signing.md` —
   plan.
 
 ## Decisions
 
-- 2026-07-10 Fallback to ad-hoc when `MACOS_SIGN_IDENTITY` is absent — keeps the
+- 2026-07-10 Fallback to ad-hoc when the signing secrets are absent — keeps the
   multi-platform release job working for forks / before secrets are set, rather than
   failing the whole release. A CI warning is emitted so it is not silent.
+- 2026-07-17 Gate the signed path on **all six** secrets, not just
+  `MACOS_SIGN_IDENTITY` — a partially configured repo (identity set, cert or notary
+  key missing) would otherwise enter the signed path and fail mid-job; now it falls
+  back to ad-hoc cleanly and the warning names which secrets are missing. (Copilot
+  review finding)
+- 2026-07-17 Decode base64 secrets with `base64 -D` rather than `--decode` — `-D` is
+  the decode flag the macOS/BSD `base64` accepts on every runner image; the GNU-style
+  long option is not guaranteed there. (Copilot review finding)
+- 2026-07-17 Devlog timestamps use numeric UTC offsets (`-0700`, no colon) per
+  `AGENTS.md`. (Copilot review finding)
 - 2026-07-10 App Store Connect API key (`--key/--key-id/--issuer`) over Apple ID +
   app-specific password for notarytool — no interactive Apple ID, revocable, standard
   for CI.
@@ -36,8 +46,9 @@ ad-hoc signing. User has an Apple Developer account and chose the CI-based appro
 
 - User creates the Developer ID Application cert + App Store Connect API key and adds
   the six repo secrets (see PR body / plan).
-- Run the Publish workflow (dry_run=false) to cut a signed v0.1.6+ release.
+- Run the Publish workflow (dry_run=false) to cut a signed v0.2.0 release.
 
 ## Commits
 
-- HEAD — ci(release): Developer ID sign + notarize the macOS client
+- 46ce42b — ci(release): Developer ID sign + notarize the macOS client
+- HEAD — ci(release): address PR review (all-six-secrets gate, portable base64, timestamps)

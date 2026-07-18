@@ -198,13 +198,29 @@ jobs:
       - name: Check for signing secrets
         id: signing
         env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
-          if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+          # The signed/notarized path needs ALL six secrets. Gating on the full
+          # set (not just the identity) means a partially configured repo falls
+          # back to ad-hoc cleanly instead of entering the signed path and failing
+          # mid-job when a cert or notary key turns up missing.
+          missing=""
+          for var in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_SIGN_IDENTITY \
+                     MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              missing="$missing $var"
+            fi
+          done
+          if [ -z "$missing" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Developer ID signing secrets not set; the macOS client will be ad-hoc signed and not notarized."
+            echo "::warning::Developer ID signing secrets not fully set (missing:$missing); the macOS client will be ad-hoc signed and not notarized."
           fi
 
       # Import the Developer ID Application cert into an ephemeral, per-job keychain
@@ -220,7 +236,9 @@ jobs:
           CERT_PATH="$RUNNER_TEMP/developer_id.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
-          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          # -D (not --decode) is the decode flag the macOS/BSD base64 accepts on
+          # every runner image; GNU-style long options are not guaranteed there.
+          echo "$MACOS_CERT_P12_BASE64" | base64 -D > "$CERT_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -290,7 +308,7 @@ jobs:
           APP=build/macos/Build/Products/Release/Triage.app
           KEY_PATH="$RUNNER_TEMP/notary_key.p8"
           NOTARIZE_ZIP="$RUNNER_TEMP/Triage-notarize.zip"
-          echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 -D > "$KEY_PATH"
           # notarytool submits an archive; a ditto zip of the .app is accepted.
           ditto -c -k --keepParent "$APP" "$NOTARIZE_ZIP"
           xcrun notarytool submit "$NOTARIZE_ZIP" \
