@@ -236,8 +236,8 @@ jobs:
           CERT_PATH="$RUNNER_TEMP/developer_id.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
-          # Shred the decoded private key on any exit path, so a failure between
-          # decode and the trailing rm can't strand the .p12 on the runner.
+          # Remove the decoded private key on any exit path, so a mid-step failure
+          # can't leave the .p12 on the runner.
           trap 'rm -f "$CERT_PATH"' EXIT
           # -D (not --decode) is the decode flag the macOS/BSD base64 accepts on
           # every runner image; GNU-style long options are not guaranteed there.
@@ -344,7 +344,7 @@ jobs:
           APP=build/macos/Build/Products/Release/Triage.app
           KEY_PATH="$RUNNER_TEMP/notary_key.p8"
           NOTARIZE_ZIP="$RUNNER_TEMP/Triage-notarize.zip"
-          # Shred the decoded API key on any exit path (see the cert import step).
+          # Remove the decoded API key on any exit path (see the cert import step).
           trap 'rm -f "$KEY_PATH" "$NOTARIZE_ZIP"' EXIT
           echo "$MACOS_NOTARY_KEY_BASE64" | base64 -D > "$KEY_PATH"
           # notarytool submits an archive; a ditto zip of the .app is accepted.

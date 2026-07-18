@@ -17,28 +17,28 @@ ad-hoc signing. User has an Apple Developer account and chose the CI-based appro
 
 ## Decisions
 
-- 2026-07-10 Fallback to ad-hoc when the signing secrets are absent — keeps the
+- 2026-07-10T10:20-0700 Fallback to ad-hoc when the signing secrets are absent — keeps the
   multi-platform release job working for forks / before secrets are set, rather than
   failing the whole release. A CI warning is emitted so it is not silent.
-- 2026-07-17 Gate the signed path on **all six** secrets, not just
+- 2026-07-17T19:05-0700 Gate the signed path on **all six** secrets, not just
   `MACOS_SIGN_IDENTITY` — a partially configured repo (identity set, cert or notary
   key missing) would otherwise enter the signed path and fail mid-job; now it falls
   back to ad-hoc cleanly and the warning names which secrets are missing. (Copilot
   review finding)
-- 2026-07-17 Decode base64 secrets with `base64 -D` rather than `--decode` — `-D` is
+- 2026-07-17T19:05-0700 Decode base64 secrets with `base64 -D` rather than `--decode` — `-D` is
   the decode flag the macOS/BSD `base64` accepts on every runner image; the GNU-style
   long option is not guaranteed there. (Copilot review finding)
-- 2026-07-17 Devlog timestamps use numeric UTC offsets (`-0700`, no colon) per
+- 2026-07-17T19:05-0700 Devlog timestamps use numeric UTC offsets (`-0700`, no colon) per
   `AGENTS.md`. (Copilot review finding)
-- 2026-07-10 App Store Connect API key (`--key/--key-id/--issuer`) over Apple ID +
+- 2026-07-10T10:20-0700 App Store Connect API key (`--key/--key-id/--issuer`) over Apple ID +
   app-specific password for notarytool — no interactive Apple ID, revocable, standard
   for CI.
-- 2026-07-10 Sign inside-out with `find` (loose dylibs/`.so`, then `.framework`
+- 2026-07-10T10:20-0700 Sign inside-out with `find` (loose dylibs/`.so`, then `.framework`
   bundles, then the app), instead of `codesign --deep`. `--deep` does not reliably
   apply `--options runtime` to nested Mach-O, and notarization requires the hardened
   runtime on *every* binary — a nested dylib left ad-hoc / without hardened runtime
   makes Apple reject the submission. (pre-push review finding)
-- 2026-07-10 Preserve the runner's existing keychain search list (prepend the temp
+- 2026-07-10T10:20-0700 Preserve the runner's existing keychain search list (prepend the temp
   keychain) rather than replacing it, so the Apple intermediate certs needed to build
   the signing chain stay resolvable. (pre-push review finding)
 - 2026-07-17T19:54-0700 Generalize the signing traversal — sign every Mach-O in the
@@ -74,4 +74,5 @@ ad-hoc signing. User has an Apple Developer account and chose the CI-based appro
 
 - 46ce42b — ci(release): Developer ID sign + notarize the macOS client
 - 14c9323 — ci(release): address PR review on macOS signing
-- HEAD — ci(release): harden macOS signing (traversal, notary status, secret cleanup)
+- 0a23b00 — ci(release): harden macOS signing (traversal, notary status, secret cleanup)
+- HEAD — ci(release): reword secret-cleanup comments and full-timestamp devlog decisions
