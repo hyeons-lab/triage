@@ -91,6 +91,22 @@ Every push to GitHub triggers CI. CI runs are expensive — minimize waste:
 - `cargo test --workspace` — run all tests
 - `cargo run -p triaged` — start the daemon (writes to `$HOME/.local/state/triage/triaged.log`)
 
+### Embedded web client
+
+`triaged` embeds the Flutter web client, and its build script keeps that bundle current
+so a build can't quietly ship a stale UI:
+
+- A staged `crates/triaged/dist/` (what `publish.yml` produces) always wins and is never rebuilt.
+- Otherwise, if any source under `flutter/triage_client/` (`lib/`, `web/`, `assets/`, `fonts/`,
+  `pubspec.yaml`, `pubspec.lock`) is newer than `flutter/triage_client/build/web`, the build
+  script runs `flutter build web --release` — matching the release build — before compiling.
+- With no Flutter SDK on `PATH` (the Rust-only CI job) or no client sources (a crates.io
+  tarball), it warns and builds against whatever bundle is present.
+- `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and uses the existing bundle. Use it for a
+  fast Rust-only iteration loop when you aren't touching Dart.
+
+A failing `flutter build web` fails the cargo build rather than silently falling back.
+
 ## Versioning and releases
 
 - The repo version is a single source of truth in the top-level `VERSION` file.
