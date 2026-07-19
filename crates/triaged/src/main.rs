@@ -87,7 +87,9 @@ enum Invocation {
     Service(String),
     /// Start the daemon. `handover` records whether `--handover`/`-U` was
     /// passed; it is advisory only (see `HELP`).
-    Daemon { handover: bool },
+    Daemon {
+        handover: bool,
+    },
 }
 
 fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
