@@ -1,9 +1,14 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+/// Bounds the recursive source walk so a symlink cycle cannot spin forever.
+const MAX_WATCH_DEPTH: u32 = 32;
 
 /// Flutter client sources whose mtimes decide whether `build/web` is stale.
 /// Relative to `flutter/triage_client/`.
@@ -65,7 +70,7 @@ fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
     let mut newest_source: Option<SystemTime> = None;
     for entry in CLIENT_SOURCES {
         let path = client_dir.join(entry);
-        watch(&path, &mut newest_source);
+        watch(&path, &mut newest_source, MAX_WATCH_DEPTH);
     }
 
     // Nothing to watch means this isn't a full checkout (e.g. a crates.io
@@ -179,20 +184,31 @@ fn build_stamp_path(client_dir: &Path) -> PathBuf {
 
 /// Advisory cross-process lock held for the duration of a Flutter build.
 ///
-/// Released on drop, including when the build panics, so a failed build does
-/// not wedge every later one.
-struct BuildLock(PathBuf);
+/// Released on drop, including when the build panics. A build *killed* outright
+/// never runs `Drop`, so the holder also refreshes the lock's mtime on a
+/// heartbeat and waiters reclaim a lock that has gone quiet.
+struct BuildLock {
+    path: PathBuf,
+    token: String,
+    stop: Arc<AtomicBool>,
+    heartbeat: Option<thread::JoinHandle<()>>,
+}
 
 impl BuildLock {
+    const TICK: Duration = Duration::from_millis(250);
+    const MAX_WAIT: Duration = Duration::from_secs(15 * 60);
+    /// How often the holder refreshes the lock's mtime while building.
+    const HEARTBEAT: Duration = Duration::from_secs(30);
+    /// A lock whose mtime has not advanced in this long belongs to a process
+    /// that died without running `Drop` — a build killed with Ctrl-C, say. Must
+    /// stay well below `MAX_WAIT`, or a waiter gives up before it can ever reap
+    /// and a single killed build wedges every later one.
+    const STALE_AFTER: Duration = Duration::from_secs(2 * 60);
+
     /// Blocks until the lock is free. Returns `None` — meaning "build anyway,
     /// unserialized" — if the lock can't be created or the wait times out;
     /// a slow build must never permanently block one.
     fn acquire(path: &Path) -> Option<Self> {
-        const POLL: Duration = Duration::from_millis(250);
-        const MAX_WAIT: Duration = Duration::from_secs(15 * 60);
-        // Longer than any plausible build, so only a crashed one is reaped.
-        const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
-
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -204,43 +220,128 @@ impl BuildLock {
                 .write(true)
                 .open(path)
             {
-                Ok(_) => return Some(Self(path.to_path_buf())),
+                Ok(mut file) => {
+                    // Stamp ownership so that a holder whose lock was reclaimed
+                    // cannot go on refreshing, or ultimately delete, the lock
+                    // that now belongs to someone else.
+                    let token = format!(
+                        "{}-{}",
+                        std::process::id(),
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|since| since.as_nanos())
+                            .unwrap_or_default()
+                    );
+                    let _ = file.write_all(token.as_bytes());
+                    return Some(Self::holding(path, token));
+                }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 // Read-only or otherwise unusable location: don't fail the build.
                 Err(_) => return None,
             }
 
-            let held_for = path
+            let idle_for = path
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .ok()
-                .and_then(|held_since| SystemTime::now().duration_since(held_since).ok());
-            if held_for.is_some_and(|age| age > STALE_AFTER) {
+                .and_then(|touched_at| SystemTime::now().duration_since(touched_at).ok());
+            if idle_for.is_some_and(|idle| idle > Self::STALE_AFTER) {
+                warn(&format!(
+                    "reclaiming the Flutter build lock {} — no heartbeat for over {}s, so the \
+                     process holding it is gone.",
+                    path.display(),
+                    Self::STALE_AFTER.as_secs()
+                ));
                 let _ = fs::remove_file(path);
                 continue;
             }
 
-            if waited >= MAX_WAIT {
+            // Say so on the first pass: an unexplained multi-minute pause in
+            // cargo is indistinguishable from a wedged build.
+            if waited.is_zero() {
+                warn(&format!(
+                    "waiting for another Flutter build to finish (lock: {}). Delete that file if \
+                     no build is running.",
+                    path.display()
+                ));
+            }
+
+            if waited >= Self::MAX_WAIT {
+                warn("gave up waiting for the Flutter build lock; building unserialized.");
                 return None;
             }
-            thread::sleep(POLL);
-            waited += POLL;
+            thread::sleep(Self::TICK);
+            waited += Self::TICK;
         }
+    }
+
+    /// Starts the heartbeat that keeps this lock looking alive to waiters.
+    fn holding(path: &Path, token: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let beat_path = path.to_path_buf();
+        let beat_stop = Arc::clone(&stop);
+        let beat_token = token.clone();
+
+        // Ticks far more often than HEARTBEAT so `Drop` can join promptly
+        // instead of blocking the build for up to a full heartbeat.
+        let heartbeat = thread::spawn(move || {
+            let mut since_touch = Duration::ZERO;
+            while !beat_stop.load(Ordering::Relaxed) {
+                thread::sleep(Self::TICK);
+                since_touch += Self::TICK;
+                if since_touch < Self::HEARTBEAT {
+                    continue;
+                }
+                since_touch = Duration::ZERO;
+
+                // Stop the moment the lock is no longer ours: refreshing it
+                // would keep another process's lock alive on its behalf.
+                if !Self::owns(&beat_path, &beat_token) {
+                    break;
+                }
+                if let Ok(file) = fs::OpenOptions::new().write(true).open(&beat_path) {
+                    let _ = file.set_modified(SystemTime::now());
+                }
+            }
+        });
+
+        Self {
+            path: path.to_path_buf(),
+            token,
+            stop,
+            heartbeat: Some(heartbeat),
+        }
+    }
+
+    /// Whether the lock file still carries this holder's token — false once it
+    /// has been reclaimed and recreated by someone else.
+    fn owns(path: &Path, token: &str) -> bool {
+        fs::read_to_string(path).is_ok_and(|content| content == token)
     }
 }
 
 impl Drop for BuildLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        // Only ever remove our own lock; after a reclaim this file belongs to
+        // whichever build took it over.
+        if Self::owns(&self.path, &self.token) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
 /// Watches `path` recursively, tracking the newest mtime seen in `newest`.
 ///
-/// Directories are walked rather than watched wholesale so that cargo re-runs
-/// this script for an edit to any individual client source.
-fn watch(path: &Path, newest: &mut Option<SystemTime>) {
-    let Ok(metadata) = path.symlink_metadata() else {
+/// Symlinks are followed so that a directory linked into the client sources is
+/// still covered; `depth` is what stops a symlink cycle from recursing forever.
+fn watch(path: &Path, newest: &mut Option<SystemTime>, depth: u32) {
+    // Follows symlinks, unlike symlink_metadata: the target's mtime is what
+    // says whether a source changed, and a broken link simply drops out here.
+    let Ok(metadata) = path.metadata() else {
         return;
     };
 
@@ -252,7 +353,7 @@ fn watch(path: &Path, newest: &mut Option<SystemTime>) {
         *newest = Some(modified);
     }
 
-    if !metadata.is_dir() {
+    if !metadata.is_dir() || depth == 0 {
         return;
     }
 
@@ -260,7 +361,7 @@ fn watch(path: &Path, newest: &mut Option<SystemTime>) {
         return;
     };
     for entry in entries.flatten() {
-        watch(&entry.path(), newest);
+        watch(&entry.path(), newest, depth - 1);
     }
 }
 

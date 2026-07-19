@@ -108,7 +108,11 @@ so a build can't quietly ship a stale UI:
 - Concurrent cargo invocations (a terminal build racing rust-analyzer's `cargo check`, which
   uses its own target dir and so isn't covered by cargo's lock) are serialized through
   `build/.triage-flutter-build.lock`. The waiter re-checks staleness and skips once the other
-  build finishes, so only one Flutter build runs.
+  build finishes, so only one Flutter build runs. The holder refreshes the lock's mtime every
+  30s from a heartbeat thread and a waiter reclaims a lock quiet for over two minutes, so a
+  build killed mid-flight (Ctrl-C skips the `Drop` guard) can't wedge later builds. The lock
+  carries the holder's identity, so a reclaimed lock is never refreshed or deleted by its
+  original owner.
 - With no Flutter SDK on `PATH` (the Rust-only CI job) or no client sources (a crates.io
   tarball), it warns and builds against whatever bundle is present.
 - `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and uses the existing bundle. Use it for a

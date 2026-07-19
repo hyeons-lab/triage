@@ -51,7 +51,8 @@ a stale client — or the placeholder — with no signal that anything was wrong
 - f311715 — build(triaged): build the Flutter web client automatically
 - 4436a66 — fix(triaged): correct the Flutter auto-build's platform, concurrency, and staleness handling
 - 19b5221 — fix(triaged): clarify the warning when the Flutter SDK is absent
-- HEAD — docs(devlog): record the review-comment pass
+- 7451371 — docs(devlog): record the review-comment pass
+- HEAD — fix(triaged): make the Flutter build lock reapable and owner-checked
 
 ## Progress
 
@@ -113,6 +114,30 @@ a stale client — or the placeholder — with no signal that anything was wrong
   passed clippy and all six CI jobs. Declined with that evidence rather than churning the code to
   satisfy the tool.
 
+- 2026-07-19T06:17-0700 — Ran `/review-fix-loop` proper (the earlier passes were an anchored
+  re-read of the diff from context, not a fresh review). Three rounds at high effort; stopped
+  when only a micro-nitpick remained. The unanchored review immediately found the worst bug on
+  the branch, in exactly the code the anchored rounds had gone over most:
+  - **Stale-lock reaping was unreachable, so a killed build wedged every later build for 15
+    minutes.** `STALE_AFTER` (30m) sat above `MAX_WAIT` (15m), so a waiter always gave up before
+    a lock aged into the reap branch. Ctrl-C during a Flutter build skips the `Drop` guard and
+    leaves the lock behind — worse than the race the lock was added to fix. Confirmed by leaving
+    a lock in place and watching `cargo check` still blocked at a 45s timeout. Fixed with a
+    heartbeat thread refreshing the lock's mtime every 30s and `STALE_AFTER` cut to 2m, well
+    under `MAX_WAIT`; a quiet lock is now reclaimed with a warning naming the file.
+  - **The lock had no owner identity**, so after a reclaim the original holder's heartbeat would
+    keep *another* process's lock alive and its `Drop` would delete it. Locks now carry a
+    `pid-nanos` token that both the heartbeat and `Drop` check before acting.
+  - Waiting printed nothing, so contention was indistinguishable from a frozen cargo; and
+    `watch()` used `symlink_metadata`, silently skipping a symlinked source directory (now
+    follows links, depth-bounded at 32 against cycles).
+
+  Verified by exercising each path: a reclaimed stale lock, two concurrent builds (one Flutter
+  run, lock released), heartbeat ticks observed ~30s apart across an 80s build, `set_modified`
+  proven to advance mtime in isolation, plus the full staleness matrix and five opt-out values.
+  Re-validated with `cargo fmt --all -- --check`, `cargo clippy -p triaged --all-targets`
+  (clean), and `cargo test -p triaged` (124 passed, 1 ignored).
+
 ## Lessons Learned
 
 - Build-script staleness must key on a marker written *after* the tool succeeds, never on a file
@@ -124,6 +149,12 @@ a stale client — or the placeholder — with no signal that anything was wrong
 - rust-analyzer runs `cargo check` in a separate target directory, so cargo's own package lock
   does not protect a build script against concurrent IDE invocations. Anything a build script
   mutates outside its `OUT_DIR` needs its own lock.
+- A lock whose stale threshold exceeds its wait timeout has no reaping at all — the timing
+  constants have to be read as a pair. And a `Drop` guard is not a release mechanism: SIGINT
+  skips it, so any lock needs liveness (a heartbeat) and identity (a token), not just cleanup.
+- Reviewing a diff you just wrote, from context, is not the same as reviewing it fresh. Five
+  anchored passes over this lock code missed a 15-minute hang that one unanchored review caught
+  in its first round.
 
 ## Next Steps
 
