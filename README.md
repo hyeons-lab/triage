@@ -47,7 +47,8 @@ Windows falls back to Session Restore. See
 Remote clients attach over WebSocket and are gated by a device-code + PIN pairing
 flow that issues a per-device token. Triage terminates no TLS itself — front it
 with a reverse proxy, or keep it on a tailnet. See
-[Pairing](crates/triaged/README.md#pairing).
+[Pairing](crates/triaged/README.md#pairing), and
+[Remote Access](docs/remote-access.md) for reaching your daemon from anywhere.
 
 ## Architecture
 
