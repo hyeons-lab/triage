@@ -13,8 +13,9 @@ a stale client — or the placeholder — with no signal that anything was wrong
 - `crates/triaged/build.rs` now rebuilds the web bundle when it is missing or stale:
   - Staged `dist/` short-circuits everything (release packaging path, never rebuilt).
   - Source mtimes under `flutter/triage_client/` (`lib/`, `web/`, `assets/`, `fonts/`,
-    `pubspec.yaml`, `pubspec.lock`) are compared against `build/web/index.html`; if any is
-    newer, run `flutter build web --release`.
+    `pubspec.yaml`, `pubspec.lock`) are compared against `build/.triage-client-stamp`, written
+    only after Flutter exits zero; if any source is newer, run `flutter build web --release`.
+    (This started out keyed on `build/web/index.html` — see Progress for why that was unsound.)
   - Skips with a warning when `flutter` is absent from `PATH` or the client sources aren't
     present; `TRIAGE_SKIP_FLUTTER_BUILD=1` is an explicit opt-out.
   - A failing `flutter build web` panics the build script rather than falling back silently.
@@ -52,7 +53,8 @@ a stale client — or the placeholder — with no signal that anything was wrong
 - 4436a66 — fix(triaged): correct the Flutter auto-build's platform, concurrency, and staleness handling
 - 19b5221 — fix(triaged): clarify the warning when the Flutter SDK is absent
 - 7451371 — docs(devlog): record the review-comment pass
-- HEAD — fix(triaged): make the Flutter build lock reapable and owner-checked
+- aa401bd — fix(triaged): make the Flutter build lock reapable and owner-checked
+- HEAD — docs: correct the stale staleness and opt-out descriptions
 
 ## Progress
 
@@ -137,6 +139,16 @@ a stale client — or the placeholder — with no signal that anything was wrong
   proven to advance mtime in isolation, plus the full staleness matrix and five opt-out values.
   Re-validated with `cargo fmt --all -- --check`, `cargo clippy -p triaged --all-targets`
   (clean), and `cargo test -p triaged` (124 passed, 1 ignored).
+
+- 2026-07-19T06:30-0700 — Second automated review pass on PR #106; both comments were real and
+  both were documentation drifting behind the code:
+  - The devlog's What Changed still described staleness as comparing sources against
+    `build/web/index.html`, three commits after that moved to the success stamp. Corrected, with
+    a pointer to the Progress entry explaining why `index.html` was unsound.
+  - `AGENTS.md` claimed `TRIAGE_SKIP_FLUTTER_BUILD=1` "uses the existing bundle", but the opt-out
+    returns before any bundle check — with no bundle present the `web_fallback/` placeholder is
+    what gets embedded. Reworded to say so, since the whole point of the branch is not to be
+    surprised by a placeholder UI.
 
 ## Lessons Learned
 

@@ -115,9 +115,11 @@ so a build can't quietly ship a stale UI:
   original owner.
 - With no Flutter SDK on `PATH` (the Rust-only CI job) or no client sources (a crates.io
   tarball), it warns and builds against whatever bundle is present.
-- `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and uses the existing bundle. Use it for a
-  fast Rust-only iteration loop when you aren't touching Dart. Empty, `0`, and `false` do
-  *not* opt out — a value that reads as negative must not silently disable the rebuild.
+- `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and builds against whatever bundle is
+  already there — including none, in which case the `web_fallback/` placeholder is embedded.
+  Use it for a fast Rust-only iteration loop when you aren't touching Dart. Empty, `0`, and
+  `false` do *not* opt out — a value that reads as negative must not silently disable the
+  rebuild.
 
 A failing `flutter build web` fails the cargo build rather than silently falling back.
 
