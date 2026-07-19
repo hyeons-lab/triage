@@ -97,13 +97,23 @@ Every push to GitHub triggers CI. CI runs are expensive — minimize waste:
 so a build can't quietly ship a stale UI:
 
 - A staged `crates/triaged/dist/` (what `publish.yml` produces) always wins and is never rebuilt.
-- Otherwise, if any source under `flutter/triage_client/` (`lib/`, `web/`, `assets/`, `fonts/`,
-  `pubspec.yaml`, `pubspec.lock`) is newer than `flutter/triage_client/build/web`, the build
+- Otherwise the bundle is considered current when `flutter/triage_client/build/web` exists and
+  `build/.triage-client-stamp` is newer than every source under `flutter/triage_client/`
+  (`lib/`, `web/`, `assets/`, `fonts/`, `pubspec.yaml`, `pubspec.lock`). If it isn't, the build
   script runs `flutter build web --release` — matching the release build — before compiling.
+- Staleness is keyed on that stamp rather than on the bundle's own files because
+  `flutter build web` copies `index.html` into place *before* it compiles: a build that fails
+  partway would otherwise leave a fresh `index.html` beside stale JS and look up to date. The
+  stamp is written only after Flutter exits zero. Deleting `build/` forces a clean rebuild.
+- Concurrent cargo invocations (a terminal build racing rust-analyzer's `cargo check`, which
+  uses its own target dir and so isn't covered by cargo's lock) are serialized through
+  `build/.triage-flutter-build.lock`. The waiter re-checks staleness and skips once the other
+  build finishes, so only one Flutter build runs.
 - With no Flutter SDK on `PATH` (the Rust-only CI job) or no client sources (a crates.io
   tarball), it warns and builds against whatever bundle is present.
 - `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and uses the existing bundle. Use it for a
-  fast Rust-only iteration loop when you aren't touching Dart.
+  fast Rust-only iteration loop when you aren't touching Dart. Empty, `0`, and `false` do
+  *not* opt out — a value that reads as negative must not silently disable the rebuild.
 
 A failing `flutter build web` fails the cargo build rather than silently falling back.
 
