@@ -12,3 +12,10 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+# Exception: the shared *debug* keystore IS committed. It is not secret (the
+# password is the well-known "android"), and committing it gives CI-built and
+# locally-built APKs one stable signing identity — so each new build installs
+# over the previous one instead of failing INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+# Never commit a real *release* keystore this way.
+!app/debug.keystore
