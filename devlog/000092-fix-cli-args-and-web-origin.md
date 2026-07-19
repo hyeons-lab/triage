@@ -82,7 +82,8 @@ service was restored with `systemctl --user start triaged.service`.
 
 ## Commits
 
-- HEAD — fix(triaged): parse CLI arguments so --help cannot displace a running daemon
+- a5a6f3c — fix(triaged): parse CLI arguments so --help cannot displace a running daemon
+- HEAD — fix(triage_client): keep the page origin when not served on the daemon port
 
 ## Next Steps
 

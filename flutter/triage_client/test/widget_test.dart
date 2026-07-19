@@ -572,6 +572,34 @@ void main() {
     );
   });
 
+  test('uses same-origin websocket target behind a TLS reverse proxy', () {
+    // A proxy terminating TLS on 443 is the only way to reach the daemon, so
+    // the origin must win even though the port is not the daemon default.
+    // Falling back to loopback here would both miss the daemon and be blocked
+    // as mixed content from an https page.
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('https://triage.example.test/app/')),
+      Uri.parse('wss://triage.example.test:443/ws'),
+    );
+  });
+
+  test('uses same-origin websocket target for a non-default daemon port', () {
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('http://triage.example.test:9000/')),
+      Uri.parse('ws://triage.example.test:9000/ws'),
+    );
+  });
+
+  test('treats a loopback origin on a non-daemon port as the dev server', () {
+    for (final host in ['localhost', '127.0.0.1', '[::1]']) {
+      expect(
+        defaultWebSocketUriForBase(Uri.parse('http://$host:8080/')),
+        Uri.parse('ws://127.0.0.1:7777/ws'),
+        reason: 'loopback host $host on 8080 should fall back to the daemon',
+      );
+    }
+  });
+
   testWidgets(
     'shows Triage session shell with daemon sessions when connected',
     (WidgetTester tester) async {

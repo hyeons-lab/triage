@@ -127,11 +127,36 @@ const double _sessionRailCollapsedWidth = 72;
 const double _sessionRailExpandedWidth = 320;
 const Duration _sessionRailAnimationDuration = Duration(milliseconds: 220);
 
+/// Hosts that mean "this developer machine" rather than a daemon that served
+/// us. Used to tell the Flutter dev server apart from a real deployment.
+bool _isLoopbackHost(String host) {
+  final normalized = host.toLowerCase();
+  return normalized == 'localhost' ||
+      normalized == '127.0.0.1' ||
+      normalized == '::1' ||
+      normalized == '[::1]';
+}
+
+/// The websocket target implied by the page that served the web client.
+///
+/// The web client is served *by* a daemon, so the page origin is normally the
+/// daemon — including when a reverse proxy fronts it on 443, where the origin
+/// is the only way to find the daemon at all. Deriving scheme from the origin
+/// also keeps an `https` page on `wss`, which a browser requires (a `ws://`
+/// target from an `https://` page is blocked as mixed content).
+///
+/// The exception is the Flutter dev server: `flutter run -d chrome` serves the
+/// app from loopback on its own port while the daemon listens separately on
+/// [_defaultDaemonPort], so a loopback origin on any other port means "dev
+/// server" and falls back to the local daemon. A non-loopback origin is always
+/// treated as the daemon, whatever its port.
 @visibleForTesting
 Uri defaultWebSocketUriForBase(Uri base) {
-  if ((base.scheme == 'http' || base.scheme == 'https') &&
-      base.host.isNotEmpty &&
-      base.port == _defaultDaemonPort) {
+  final isHttp = base.scheme == 'http' || base.scheme == 'https';
+  final isDevServer =
+      _isLoopbackHost(base.host) && base.port != _defaultDaemonPort;
+
+  if (isHttp && base.host.isNotEmpty && !isDevServer) {
     return Uri(
       scheme: base.scheme == 'https' ? 'wss' : 'ws',
       host: base.host,
