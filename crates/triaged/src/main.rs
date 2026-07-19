@@ -97,21 +97,16 @@ enum Invocation {
 fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
     let rest = &args[1.min(args.len())..];
 
-    if rest
-        .iter()
-        .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
-    {
-        return Ok(Invocation::Help);
-    }
-    if rest.iter().any(|arg| arg == "--version" || arg == "-V") {
-        return Ok(Invocation::Version);
-    }
-
     // `triaged service <action>` manages the per-user login service (LaunchAgent
     // / systemd user unit / Windows logon task) and exits, rather than running
     // the daemon in this process. It is a mode of its own — launch flags do not
     // combine with it — and anything past the action is rejected rather than
     // ignored, so `service install --hanover` can't look like it worked.
+    //
+    // Matched *before* the help and version flags because the action is the
+    // service CLI's to interpret: `service::run_cli` prints its own usage for
+    // "", "help", "-h", and "--help", and answering those here would shadow it
+    // with the daemon's help instead.
     if rest.first().map(String::as_str) == Some("service") {
         if let Some(extra) = rest.get(2) {
             anyhow::bail!("unexpected argument `{extra}` after `service`\n\n{HELP}");
@@ -119,6 +114,18 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         return Ok(Invocation::Service(
             rest.get(1).cloned().unwrap_or_default(),
         ));
+    }
+
+    // `-h`/`--help` are position-independent, but bare `help` is only a request
+    // for help as the first token — anywhere else it is a stray word, and
+    // treating it as help would mask a typo.
+    if rest.first().map(String::as_str) == Some("help")
+        || rest.iter().any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Ok(Invocation::Help);
+    }
+    if rest.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return Ok(Invocation::Version);
     }
 
     let mut handover = false;
@@ -457,12 +464,37 @@ mod tests {
         );
     }
 
-    /// Help is still reachable from the service mode rather than being eaten by
-    /// the extra-argument check.
+    /// The service CLI prints its own usage for "", "help", "-h" and "--help"
+    /// (`service::run_cli`), so those must reach it rather than being answered
+    /// with the daemon's help.
     #[test]
-    fn service_mode_still_yields_to_help() {
+    fn service_owns_its_own_help() {
+        for action in ["help", "-h", "--help"] {
+            assert_eq!(
+                parse_args(&args(&["service", action])).unwrap(),
+                Invocation::Service(action.to_string()),
+                "`service {action}` should reach the service CLI"
+            );
+        }
+    }
+
+    /// Bare `help` is a help request only as the first token. Elsewhere it is a
+    /// stray word, and silently treating it as help would mask a typo.
+    #[test]
+    fn bare_help_is_only_a_help_request_in_first_position() {
+        assert_eq!(parse_args(&args(&["help"])).unwrap(), Invocation::Help);
+
+        let error = parse_args(&args(&["--handover", "help"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unrecognized argument `help`"),
+            "unexpected error: {error}"
+        );
+
+        // The flag forms stay position-independent.
         assert_eq!(
-            parse_args(&args(&["service", "install", "--help"])).unwrap(),
+            parse_args(&args(&["--handover", "-h"])).unwrap(),
             Invocation::Help
         );
     }
