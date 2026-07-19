@@ -49,7 +49,9 @@ a stale client — or the placeholder — with no signal that anything was wrong
 ## Commits
 
 - f311715 — build(triaged): build the Flutter web client automatically
-- HEAD — fix(triaged): correct the Flutter auto-build's platform, concurrency, and staleness handling
+- 4436a66 — fix(triaged): correct the Flutter auto-build's platform, concurrency, and staleness handling
+- 19b5221 — fix(triaged): clarify the warning when the Flutter SDK is absent
+- HEAD — docs(devlog): record the review-comment pass
 
 ## Progress
 
@@ -101,6 +103,15 @@ a stale client — or the placeholder — with no signal that anything was wrong
   partial-build with a fresh `index.html` but no stamp, and a deleted `build/web` with the stamp
   left behind. Re-validated with `cargo fmt --all -- --check`, `cargo clippy -p triaged
   --all-targets` (clean), and `cargo test -p triaged` (124 passed, 1 ignored).
+
+- 2026-07-18T21:25-0700 — Addressed the automated review on PR #106. Three comments, one real:
+  the "leaving the existing web bundle in place" warning was wrong when no bundle had ever been
+  built, so it now states only that the bundle was not rebuilt. The second comment described an
+  `AGENTS.md`/code mismatch that 4436a66 had already resolved by moving staleness onto the stamp.
+  The third claimed `flutter_command()` could not compile because `find`'s predicate receives
+  `&&str` while `which()` takes `&str`; that ignores deref coercion, and the line had already
+  passed clippy and all six CI jobs. Declined with that evidence rather than churning the code to
+  satisfy the tool.
 
 ## Lessons Learned
 
