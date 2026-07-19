@@ -96,10 +96,11 @@ fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
         // Deliberately silent about what is embedded instead: the caller warns
         // when no bundle exists at all, and claiming one was "left in place"
         // here would be wrong in exactly that case.
-        warn(
-            "Flutter client sources changed but the `flutter` command was not found; \
-             the web bundle was not rebuilt.",
-        );
+        let reason = staleness_reason(dev_client_path);
+        warn(&format!(
+            "Flutter web bundle is {reason} but the `flutter` command was not found; \
+             it was not rebuilt."
+        ));
         return;
     };
 
@@ -113,11 +114,7 @@ fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
         return;
     }
 
-    let reason = if dev_client_path.exists() {
-        "out of date"
-    } else {
-        "missing"
-    };
+    let reason = staleness_reason(dev_client_path);
     println!(
         "cargo:warning=Flutter web bundle is {reason}; running `flutter build web --release` (this can take a minute)"
     );
@@ -151,6 +148,14 @@ fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
             "could not run `flutter build web --release`: {err}. Set \
              TRIAGE_SKIP_FLUTTER_BUILD=1 to build the daemon against the existing bundle."
         ),
+    }
+}
+
+fn staleness_reason(dev_client_path: &Path) -> &'static str {
+    if dev_client_path.exists() {
+        "out of date"
+    } else {
+        "missing"
     }
 }
 

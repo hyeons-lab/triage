@@ -54,7 +54,8 @@ a stale client — or the placeholder — with no signal that anything was wrong
 - 19b5221 — fix(triaged): clarify the warning when the Flutter SDK is absent
 - 7451371 — docs(devlog): record the review-comment pass
 - aa401bd — fix(triaged): make the Flutter build lock reapable and owner-checked
-- HEAD — docs: correct the stale staleness and opt-out descriptions
+- d601475 — docs: correct the stale staleness and opt-out descriptions
+- HEAD — fix(triaged): say whether the unbuilt bundle is missing or stale
 
 ## Progress
 
@@ -149,6 +150,22 @@ a stale client — or the placeholder — with no signal that anything was wrong
     returns before any bundle check — with no bundle present the `web_fallback/` placeholder is
     what gets embedded. Reworded to say so, since the whole point of the branch is not to be
     surprised by a placeholder UI.
+
+- 2026-07-19T14:10-0700 — Third automated review pass reported no new comments but listed two
+  *suppressed low-confidence* items, both of which turned out to be correct on inspection:
+  - The SDK-missing warning opened with "Flutter client sources changed", but it is reached
+    whenever the bundle is not current — most often because no bundle has ever been built, where
+    "sources changed" is simply wrong. The `missing` / `out of date` distinction the rebuild
+    message already drew is now factored into `staleness_reason()` and used by both.
+  - `AGENTS.md` described the presence check as being on the `build/web` directory; it is on
+    `build/web/index.html`, so a directory left behind by a wiped build does not read as present.
+  Verified by running both branches with Flutter removed from `PATH` (a bare `PATH` also drops
+  `cargo`, so only Flutter's directory is stripped): a deleted bundle reports "missing", a
+  touched `main.dart` against a present bundle reports "out of date".
+
+  Worth noting for future passes: Copilot suppressed both of these as low confidence, yet both
+  were real. The suppressed list is worth reading rather than trusting the "no new comments"
+  headline.
 
 ## Lessons Learned
 
