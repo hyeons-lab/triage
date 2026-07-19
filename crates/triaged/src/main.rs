@@ -62,7 +62,9 @@ fn probe_daemon_socket(socket_path: &std::path::Path) -> DaemonSocketState {
 }
 
 const HELP: &str = "\
-usage: triaged [--handover] [service <action>]
+usage: triaged [--handover]
+       triaged service <action>
+       triaged --help | --version
 
 Options:
   --handover, -U    Take over sessions from a running daemon. Optional: a live
@@ -107,8 +109,13 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
 
     // `triaged service <action>` manages the per-user login service (LaunchAgent
     // / systemd user unit / Windows logon task) and exits, rather than running
-    // the daemon in this process.
+    // the daemon in this process. It is a mode of its own — launch flags do not
+    // combine with it — and anything past the action is rejected rather than
+    // ignored, so `service install --hanover` can't look like it worked.
     if rest.first().map(String::as_str) == Some("service") {
+        if let Some(extra) = rest.get(2) {
+            anyhow::bail!("unexpected argument `{extra}` after `service`\n\n{HELP}");
+        }
         return Ok(Invocation::Service(
             rest.get(1).cloned().unwrap_or_default(),
         ));
@@ -433,6 +440,30 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["service"])).unwrap(),
             Invocation::Service(String::new())
+        );
+    }
+
+    /// `service` returns early, so extras past the action would otherwise be
+    /// silently dropped — the same "ignored argument" failure this module
+    /// exists to prevent, just one position further along.
+    #[test]
+    fn service_rejects_arguments_after_the_action() {
+        let error = parse_args(&args(&["service", "install", "--handover"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unexpected argument `--handover` after `service`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Help is still reachable from the service mode rather than being eaten by
+    /// the extra-argument check.
+    #[test]
+    fn service_mode_still_yields_to_help() {
+        assert_eq!(
+            parse_args(&args(&["service", "install", "--help"])).unwrap(),
+            Invocation::Help
         );
     }
 }

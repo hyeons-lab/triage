@@ -53,6 +53,20 @@ port.
   unintended handover, not the restart policy. `Restart=always` would race with
   legitimate handovers.
 
+## Review Feedback
+
+Two review comments on PR #107, both accepted:
+
+- The usage line read `triaged [--handover] [service <action>]`, implying the
+  two could be combined when `service` is actually a mode of its own. Rewritten
+  as alternative usage lines.
+- `service <action>` returned early, so anything after the action was silently
+  dropped — `triaged service install --hanover` looked like it worked. That is
+  the same ignored-argument failure this branch exists to fix, one position
+  further along. Extras are now rejected, with a test, plus one confirming
+  `--help` is still reachable from service mode rather than being eaten by the
+  new check.
+
 ## Issues
 
 The daemon-shutdown bug was found by triggering it: running `triaged --help`
@@ -83,7 +97,9 @@ service was restored with `systemctl --user start triaged.service`.
 ## Commits
 
 - a5a6f3c — fix(triaged): parse CLI arguments so --help cannot displace a running daemon
-- HEAD — fix(triage_client): keep the page origin when not served on the daemon port
+- 611bc65 — fix(triage_client): keep the page origin when not served on the daemon port
+- 66f6ec6 — style(triaged): apply rustfmt to the Invocation enum
+- HEAD — fix(triaged): reject arguments after `service <action>`
 
 ## Next Steps
 
