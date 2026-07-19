@@ -88,9 +88,12 @@ fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
     }
 
     let Some(flutter) = flutter_command() else {
+        // Deliberately silent about what is embedded instead: the caller warns
+        // when no bundle exists at all, and claiming one was "left in place"
+        // here would be wrong in exactly that case.
         warn(
             "Flutter client sources changed but the `flutter` command was not found; \
-             leaving the existing web bundle in place.",
+             the web bundle was not rebuilt.",
         );
         return;
     };
