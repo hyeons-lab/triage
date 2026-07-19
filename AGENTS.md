@@ -91,6 +91,38 @@ Every push to GitHub triggers CI. CI runs are expensive — minimize waste:
 - `cargo test --workspace` — run all tests
 - `cargo run -p triaged` — start the daemon (writes to `$HOME/.local/state/triage/triaged.log`)
 
+### Embedded web client
+
+`triaged` embeds the Flutter web client, and its build script keeps that bundle current
+so a build can't quietly ship a stale UI:
+
+- A staged `crates/triaged/dist/` (what `publish.yml` produces) always wins and is never rebuilt.
+- Otherwise the bundle is considered current when `flutter/triage_client/build/web` exists and
+  `build/.triage-client-stamp` is newer than every source under `flutter/triage_client/`
+  (`lib/`, `web/`, `assets/`, `fonts/`, `pubspec.yaml`, `pubspec.lock`). If it isn't, the build
+  script runs `flutter build web --release` — matching the release build — before compiling.
+- Staleness is keyed on that stamp rather than on the bundle's own files because
+  `flutter build web` copies `index.html` into place *before* it compiles: a build that fails
+  partway would otherwise leave a fresh `index.html` beside stale JS and look up to date. The
+  stamp is written only after Flutter exits zero. Deleting `build/` forces a clean rebuild.
+- Concurrent cargo invocations (a terminal build racing rust-analyzer's `cargo check`, which
+  uses its own target dir and so isn't covered by cargo's lock) are serialized through
+  `build/.triage-flutter-build.lock`. The waiter re-checks staleness and skips once the other
+  build finishes, so only one Flutter build runs. The holder refreshes the lock's mtime every
+  30s from a heartbeat thread and a waiter reclaims a lock quiet for over two minutes, so a
+  build killed mid-flight (Ctrl-C skips the `Drop` guard) can't wedge later builds. The lock
+  carries the holder's identity, so a reclaimed lock is never refreshed or deleted by its
+  original owner.
+- With no Flutter SDK on `PATH` (the Rust-only CI job) or no client sources (a crates.io
+  tarball), it warns and builds against whatever bundle is present.
+- `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and builds against whatever bundle is
+  already there — including none, in which case the `web_fallback/` placeholder is embedded.
+  Use it for a fast Rust-only iteration loop when you aren't touching Dart. Empty, `0`, and
+  `false` do *not* opt out — a value that reads as negative must not silently disable the
+  rebuild.
+
+A failing `flutter build web` fails the cargo build rather than silently falling back.
+
 ## Versioning and releases
 
 - The repo version is a single source of truth in the top-level `VERSION` file.

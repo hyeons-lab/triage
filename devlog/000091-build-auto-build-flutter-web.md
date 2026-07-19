@@ -1,0 +1,174 @@
+# 000091 — build/auto-build-flutter-web
+
+## Intent
+
+Building `triaged` never built the Flutter web client it embeds. `build.rs` only *detected* a
+bundle: it set `embed_packaged_client` for a staged `dist/`, `embed_real_client` for
+`flutter/triage_client/build/web`, and otherwise silently fell back to the `web_fallback/`
+placeholder. Forgetting the manual `flutter build web` step therefore produced a daemon serving
+a stale client — or the placeholder — with no signal that anything was wrong.
+
+## What Changed
+
+- `crates/triaged/build.rs` now rebuilds the web bundle when it is missing or stale:
+  - Staged `dist/` short-circuits everything (release packaging path, never rebuilt).
+  - Source mtimes under `flutter/triage_client/` (`lib/`, `web/`, `assets/`, `fonts/`,
+    `pubspec.yaml`, `pubspec.lock`) are compared against `build/.triage-client-stamp`, written
+    only after Flutter exits zero; if any source is newer, run `flutter build web --release`.
+    (This started out keyed on `build/web/index.html` — see Progress for why that was unsound.)
+  - Skips with a warning when `flutter` is absent from `PATH` or the client sources aren't
+    present; `TRIAGE_SKIP_FLUTTER_BUILD=1` is an explicit opt-out.
+  - A failing `flutter build web` panics the build script rather than falling back silently.
+- `AGENTS.md` documents the behavior and the opt-out under "Build and test commands".
+
+## Decisions
+
+- **Build script over a wrapper script/cargo alias.** The reported problem is *forgetting* the
+  step; anything opt-in still has to be remembered. The cost is an mtime scan on each build of
+  `triaged` and a ~1m Flutter build when Dart actually changed.
+- **`--release`, matching `publish.yml`.** Local builds embed the same bundle shape as shipped
+  ones, so the dev loop can't diverge from the released client.
+- **Fail loudly on a broken Dart build.** Silently embedding a stale bundle is the exact failure
+  mode being fixed, so a broken client build must not be papered over. `TRIAGE_SKIP_FLUTTER_BUILD=1`
+  is the escape hatch when the daemon needs to build regardless.
+- **Watch sources, not build outputs.** Emitting `rerun-if-changed` for `build/web` (as the old
+  script did) marks the crate dirty right after the build script regenerates it. Source mtimes
+  determine the bundle's content anyway, so watching them alone is sufficient and stable.
+- **`.dart_tool` is excluded** from the watch walk — Dart tooling rewrites it constantly, which
+  would defeat the staleness check.
+
+## Issues
+
+- Found and fixed a pre-existing bug: `build.rs` unconditionally emitted
+  `cargo:rerun-if-changed=dist`, but `dist/` only exists during release packaging. Cargo treats a
+  watched path that is missing as permanently dirty, so `triaged` recompiled on *every* build.
+  Confirmed via `CARGO_LOG=cargo::core::compiler::fingerprint=info`
+  (`stale: missing .../crates/triaged/dist`). `dist` is now watched only once it exists, with the
+  crate root watched so staging a `dist/` is still noticed. Steady-state `cargo check -p triaged`
+  went from ~2.1s (recompiling) to ~1.0s (no work).
+
+## Commits
+
+- f311715 — build(triaged): build the Flutter web client automatically
+- 4436a66 — fix(triaged): correct the Flutter auto-build's platform, concurrency, and staleness handling
+- 19b5221 — fix(triaged): clarify the warning when the Flutter SDK is absent
+- 7451371 — docs(devlog): record the review-comment pass
+- aa401bd — fix(triaged): make the Flutter build lock reapable and owner-checked
+- HEAD — docs: correct the stale staleness and opt-out descriptions
+
+## Progress
+
+- 2026-07-18T20:30-0700 — Verified each branch of the new logic:
+  - bundle missing → runs Flutter build (1m24s), emits `embed_real_client`
+  - sources unchanged → no Flutter invocation, no recompile
+  - Dart source touched → rebuilds (~40-77s)
+  - `TRIAGE_SKIP_FLUTTER_BUILD=1` with stale sources → skips
+  - staged `crates/triaged/dist/` with stale sources → packaged path, no Flutter invocation
+
+  Validated with `cargo fmt --all -- --check`, `cargo clippy -p triaged --all-targets` (clean),
+  `cargo test -p triaged` (124 passed, 1 ignored), and `cargo build -p triaged`.
+
+- 2026-07-18T21:05-0700 — Ran an iterated `/code-review` at high effort over the branch; four
+  rounds, nine findings, all fixed. Round 1 surfaced six:
+  - **Windows could not spawn the SDK it detected.** `flutter_available()` accepted `flutter.bat`
+    but `Command::new("flutter")` resolves only `flutter.exe`, so a Windows dev with Flutter
+    installed would panic the build. `flutter_command()` now returns the resolved launcher name
+    and that is what gets spawned. CI's `windows-latest` job has no Flutter SDK, so this could
+    never have been caught there.
+  - **Nothing serialized the Flutter build.** rust-analyzer uses its own target dir, so cargo's
+    package lock does not serialize it against a terminal build — both could run
+    `flutter build web --release` into the same output dir. Added `BuildLock`, an advisory lock
+    file with a `Drop` guard, stale-lock reaping, and a bounded wait that falls back to building
+    unserialized rather than blocking forever.
+  - **Dropping the `build/web` watch reopened the stale-embed hole** the branch exists to close:
+    a bundle regenerated by any means other than a Dart edit no longer invalidated the crate.
+    Re-added on `index.html` only; costs one extra recompile after each Flutter build, then settles.
+  - Opt-out accepted every value but `"0"`, so `TRIAGE_SKIP_FLUTTER_BUILD=` or `=false` silently
+    disabled the rebuild; `>=` on mtimes could drop a source saved in the same coarse-granularity
+    tick as the bundle write; the `.dart_tool` skip in `watch()` was unreachable dead code
+    (`.dart_tool` sits at `flutter/triage_client/.dart_tool`, outside every watched root).
+- 2026-07-18T21:05-0700 — Round 2 caught a bug introduced by round 1's own fix, and round 3 a
+  regression from round 2's:
+  - **`index.html` is an unsound freshness stamp.** `flutter build web` copies it into place
+    before compiling, so a build failing partway leaves a fresh `index.html` beside stale JS —
+    the next build would call it current and silently embed a broken bundle. Observed directly in
+    the tree: `index.html` at 20:58:20 against `main.dart.js` at 20:18:20. Staleness now keys on
+    `build/.triage-client-stamp`, written only after Flutter exits zero.
+  - **The stamp alone then broke `rm -rf build/web`** — a surviving stamp reported the deleted
+    bundle as current and the placeholder got embedded. `bundle_is_current()` now requires the
+    bundle to exist *and* the stamp to be fresh.
+  - Round 4 found the `AGENTS.md` section written earlier on this branch had gone stale against
+    the code (it still described the `build/web` mtime rule); rewritten to document the stamp,
+    the lock, and the opt-out value semantics.
+
+  Each fix was verified by exercising the path, not just recompiling: five opt-out values, a
+  two-process concurrent build (exactly one Flutter run, lock released), a simulated
+  partial-build with a fresh `index.html` but no stamp, and a deleted `build/web` with the stamp
+  left behind. Re-validated with `cargo fmt --all -- --check`, `cargo clippy -p triaged
+  --all-targets` (clean), and `cargo test -p triaged` (124 passed, 1 ignored).
+
+- 2026-07-18T21:25-0700 — Addressed the automated review on PR #106. Three comments, one real:
+  the "leaving the existing web bundle in place" warning was wrong when no bundle had ever been
+  built, so it now states only that the bundle was not rebuilt. The second comment described an
+  `AGENTS.md`/code mismatch that 4436a66 had already resolved by moving staleness onto the stamp.
+  The third claimed `flutter_command()` could not compile because `find`'s predicate receives
+  `&&str` while `which()` takes `&str`; that ignores deref coercion, and the line had already
+  passed clippy and all six CI jobs. Declined with that evidence rather than churning the code to
+  satisfy the tool.
+
+- 2026-07-19T06:17-0700 — Ran `/review-fix-loop` proper (the earlier passes were an anchored
+  re-read of the diff from context, not a fresh review). Three rounds at high effort; stopped
+  when only a micro-nitpick remained. The unanchored review immediately found the worst bug on
+  the branch, in exactly the code the anchored rounds had gone over most:
+  - **Stale-lock reaping was unreachable, so a killed build wedged every later build for 15
+    minutes.** `STALE_AFTER` (30m) sat above `MAX_WAIT` (15m), so a waiter always gave up before
+    a lock aged into the reap branch. Ctrl-C during a Flutter build skips the `Drop` guard and
+    leaves the lock behind — worse than the race the lock was added to fix. Confirmed by leaving
+    a lock in place and watching `cargo check` still blocked at a 45s timeout. Fixed with a
+    heartbeat thread refreshing the lock's mtime every 30s and `STALE_AFTER` cut to 2m, well
+    under `MAX_WAIT`; a quiet lock is now reclaimed with a warning naming the file.
+  - **The lock had no owner identity**, so after a reclaim the original holder's heartbeat would
+    keep *another* process's lock alive and its `Drop` would delete it. Locks now carry a
+    `pid-nanos` token that both the heartbeat and `Drop` check before acting.
+  - Waiting printed nothing, so contention was indistinguishable from a frozen cargo; and
+    `watch()` used `symlink_metadata`, silently skipping a symlinked source directory (now
+    follows links, depth-bounded at 32 against cycles).
+
+  Verified by exercising each path: a reclaimed stale lock, two concurrent builds (one Flutter
+  run, lock released), heartbeat ticks observed ~30s apart across an 80s build, `set_modified`
+  proven to advance mtime in isolation, plus the full staleness matrix and five opt-out values.
+  Re-validated with `cargo fmt --all -- --check`, `cargo clippy -p triaged --all-targets`
+  (clean), and `cargo test -p triaged` (124 passed, 1 ignored).
+
+- 2026-07-19T06:30-0700 — Second automated review pass on PR #106; both comments were real and
+  both were documentation drifting behind the code:
+  - The devlog's What Changed still described staleness as comparing sources against
+    `build/web/index.html`, three commits after that moved to the success stamp. Corrected, with
+    a pointer to the Progress entry explaining why `index.html` was unsound.
+  - `AGENTS.md` claimed `TRIAGE_SKIP_FLUTTER_BUILD=1` "uses the existing bundle", but the opt-out
+    returns before any bundle check — with no bundle present the `web_fallback/` placeholder is
+    what gets embedded. Reworded to say so, since the whole point of the branch is not to be
+    surprised by a placeholder UI.
+
+## Lessons Learned
+
+- Build-script staleness must key on a marker written *after* the tool succeeds, never on a file
+  the tool writes mid-run. `index.html` looked like the obvious bundle sentinel and was exactly
+  the wrong choice.
+- `cargo:rerun-if-changed` on a path that does not exist marks the crate permanently dirty. Both
+  the pre-existing `dist` bug and the re-added bundle watch turn on this, so every watch emitted
+  here is guarded by an existence check.
+- rust-analyzer runs `cargo check` in a separate target directory, so cargo's own package lock
+  does not protect a build script against concurrent IDE invocations. Anything a build script
+  mutates outside its `OUT_DIR` needs its own lock.
+- A lock whose stale threshold exceeds its wait timeout has no reaping at all — the timing
+  constants have to be read as a pair. And a `Drop` guard is not a release mechanism: SIGINT
+  skips it, so any lock needs liveness (a heartbeat) and identity (a token), not just cleanup.
+- Reviewing a diff you just wrote, from context, is not the same as reviewing it fresh. Five
+  anchored passes over this lock code missed a 15-minute hang that one unanchored review caught
+  in its first round.
+
+## Next Steps
+
+- None required. If the ~1m release build proves too slow for Dart-heavy iteration, a debug-mode
+  bundle for local builds is the obvious follow-up, at the cost of diverging from `publish.yml`.
