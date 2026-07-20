@@ -722,10 +722,58 @@ fn dispatch_request(
     Ok(())
 }
 
+/// Set while a handover is being served, so only one can run at a time.
+///
+/// Every connection is dispatched on its own thread (`spawn_client_handler`),
+/// and a handover parks that thread until its successor answers. A second
+/// handover accepted during that window would dup and ship the *same* PTY
+/// masters to a second successor; whichever successor commits first drives this
+/// daemon through teardown and exit, leaving two processes holding live masters
+/// for the same sessions. PTY reads are destructive, so each session's output
+/// would then be split arbitrarily between them.
+///
+/// This is reachable in normal operation, not just in theory: smart-start means
+/// *any* `triaged` launch attempts a handover, including the `launchctl
+/// kickstart -k` an operator runs when a swap looks stuck.
+#[cfg(unix)]
+static HANDOVER_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Releases [`HANDOVER_IN_FLIGHT`] on drop, so a handover that fails before
+/// committing leaves the daemon able to serve a later one.
+#[cfg(unix)]
+struct HandoverInFlightGuard;
+
+#[cfg(unix)]
+impl HandoverInFlightGuard {
+    /// Returns `None` when a handover is already being served.
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        HANDOVER_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HandoverInFlightGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        HANDOVER_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 #[cfg(unix)]
 fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Result<()> {
     use crate::handover::{get_active_tcp_listener_fd, send_fds};
     use std::io::{Read, Write};
+
+    // Claim before serializing anything: refusing costs the caller a fresh-start
+    // fallback, while proceeding would hand the same masters to two successors.
+    let _in_flight = HandoverInFlightGuard::acquire().ok_or_else(|| {
+        anyhow!("a handover is already in flight; refusing to serve a concurrent one")
+    })?;
 
     tracing::info!("Received handover request. Beginning process serialization...");
 
@@ -770,7 +818,7 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     tracing::info!("Handover transfer completed. Waiting for client adoption sync (Phase 2)...");
 
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(crate::handover::HANDOVER_ADOPTION_TIMEOUT))
         .context("setting read timeout on handover socket")?;
     let mut sync_byte = [0u8; 1];
     if let Err(err) = stream.try_clone()?.read_exact(&mut sync_byte) {
@@ -792,11 +840,22 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     // touching the children.
     manager.detach_all_live_sessions();
 
+    // Past the detach there is no way back: the sessions are gone from this
+    // process and the successor owns their masters. So 0x02 is a courtesy —
+    // failing to deliver it must not abort the exit. Returning Err here would
+    // leave a drained, session-less daemon still holding the socket and TCP
+    // listener, which would then happily serve a later handover and ship an
+    // empty session set, making the loss look like a clean swap.
     let mut out_stream = stream;
-    out_stream
+    if let Err(error) = out_stream
         .write_all(&[0x02])
-        .context("writing teardown sync byte (0x02) to client")?;
-    out_stream.flush().context("flushing teardown sync byte")?;
+        .and_then(|()| out_stream.flush())
+    {
+        tracing::warn!(
+            %error,
+            "failed to send teardown sync byte (0x02); exiting anyway since sessions are already detached"
+        );
+    }
 
     tracing::info!("Process handover handshake completed successfully. Exiting daemon.");
 

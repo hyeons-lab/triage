@@ -21,6 +21,52 @@ pub struct HandoverState {
     pub has_tcp_listener: bool,
 }
 
+/// How long the successor waits in Phase 1 for the outgoing daemon to ship
+/// session state and PTY descriptors.
+///
+/// Bounded because smart-start adopts any *live* socket, so a hung daemon — or
+/// a non-triaged process squatting on the socket path — must not block startup
+/// forever. Nothing is committed yet at this point, so expiring here is cheap:
+/// the caller just falls back to a fresh start.
+pub const HANDOVER_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the outgoing daemon waits in Phase 2 for its successor's `0x01`
+/// adoption byte before giving up and keeping its sessions.
+///
+/// Deliberately generous. A successor that *dies* closes the socket, and the
+/// outgoing daemon's read then fails with EOF immediately — death does not
+/// depend on this deadline. It only fires for a successor that is alive but
+/// slow to finish starting up, and aborting that handover is strictly worse
+/// than waiting: the swap is stranded and the operator is forced into a hard
+/// restart that kills every live session. The bound exists solely so a wedged
+/// successor cannot pin the outgoing daemon forever.
+///
+/// Measured successor startup was ~9s in June and ~22.6s by July, so the 5s
+/// this replaced had no headroom and was aborting valid handovers.
+pub const HANDOVER_ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the successor waits in Phase 3 for the outgoing daemon's `0x02`
+/// teardown byte before starting its own PTY readers anyway.
+///
+/// Separate from [`HANDOVER_ADOPTION_TIMEOUT`] because it bounds a different
+/// wait — post-adoption teardown, not process startup — so the startup
+/// measurements above do not justify its value. It is also the one deadline
+/// with a cost on *both* sides, which is why it is not simply generous:
+///
+/// - Expiring early makes the successor read masters the outgoing daemon may
+///   still be reading. PTY reads are destructive, so two readers split a
+///   session's output arbitrarily between them.
+/// - Expiring late leaves the system dark. By this point the successor has
+///   adopted the TCP listener but has not started serving, and the outgoing
+///   daemon has drained its sessions, so no process answers clients until the
+///   wait ends.
+///
+/// Teardown is a detach-and-exit that should take milliseconds; only a wedged
+/// outgoing daemon reaches this deadline at all. So this is set well above
+/// normal teardown but well below the startup-sized bound above, capping the
+/// dark window rather than optimising for the pathological case.
+pub const HANDOVER_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[cfg(unix)]
 pub use unix_impl::*;
 
@@ -40,6 +86,7 @@ mod unix_impl {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicI32, Ordering};
+    use std::time::Instant;
 
     pub fn send_fds(socket: &UnixStream, fds: &[RawFd], data: &[u8]) -> io::Result<()> {
         let fd = socket.as_raw_fd();
@@ -161,6 +208,11 @@ mod unix_impl {
     pub static INHERITED_FDS: Mutex<Option<Vec<RawFd>>> = Mutex::new(None);
     pub static INHERITED_STATE: Mutex<Option<String>> = Mutex::new(None);
     pub static HANDOVER_STREAM: Mutex<Option<UnixStream>> = Mutex::new(None);
+    /// When Phase 1 (state + FD transfer) finished, used to report how long this
+    /// successor took to reach Phase 2. The old daemon only waits
+    /// `HANDOVER_ADOPTION_TIMEOUT` for that byte, so this gap is what decides
+    /// whether a handover succeeds — log it rather than leaving a failure opaque.
+    static PHASE1_COMPLETED_AT: Mutex<Option<Instant>> = Mutex::new(None);
     static ACTIVE_TCP_LISTENER_FD: AtomicI32 = AtomicI32::new(-1);
 
     pub fn set_active_tcp_listener_fd(fd: RawFd) {
@@ -192,14 +244,10 @@ mod unix_impl {
     pub fn perform_handover_client(socket_path: &Path) -> Result<()> {
         let stream =
             UnixStream::connect(socket_path).context("connecting to running daemon Unix socket")?;
-        // Bound the wait on the old daemon's response. The smart-start launch
-        // path adopts any *live* socket, so a hung daemon — or a non-triaged
-        // process squatting on the socket path — must not block startup forever
-        // (recv_fds would otherwise wait on recvmsg/read_exact with no deadline).
         // On timeout recv_fds returns an error and the caller falls back to a
         // fresh start. complete_handover_adoption sets its own timeout later.
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_read_timeout(Some(HANDOVER_TRANSFER_TIMEOUT))
             .context("setting handover client read timeout")?;
 
         let request_str = "{\"Handover\":null}\n";
@@ -238,6 +286,9 @@ mod unix_impl {
         *INHERITED_FDS.lock().unwrap() = Some(fds);
         *INHERITED_STATE.lock().unwrap() = Some(state_str);
         *HANDOVER_STREAM.lock().unwrap() = Some(stream);
+        *PHASE1_COMPLETED_AT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
 
         Ok(())
     }
@@ -245,16 +296,42 @@ mod unix_impl {
     pub fn complete_handover_adoption() -> Result<()> {
         let stream = HANDOVER_STREAM.lock().unwrap().take();
         if let Some(mut stream) = stream {
-            tracing::info!("Completing handover adoption (Phase 2 sync)...");
+            // Deliberately no budget field here: the deadline that decides this
+            // handover belongs to the *outgoing* daemon's binary, which may be an
+            // older build with a different (shorter) bound. Logging our own
+            // constant would claim headroom that was never in force.
+            // Read rather than take, so the measurement survives for the error
+            // path below — the gap is the single most useful number to have when
+            // the write fails. Poisoning must not abort a swap over a log field,
+            // hence recovering the guard instead of unwrapping.
+            // `-1` rather than an absent field: a missing key is indistinguishable
+            // from an older daemon that never emitted one.
+            let gap_ms = PHASE1_COMPLETED_AT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .map_or(-1, |at| at.elapsed().as_millis() as i64);
+            tracing::info!(gap_ms, "Completing handover adoption (Phase 2 sync)...");
             stream
                 .write_all(&[0x01])
                 .context("writing adoption sync byte (0x01) to old daemon")?;
             stream.flush().context("flushing adoption sync byte")?;
 
             tracing::info!("Waiting for old daemon teardown (Phase 3 sync)...");
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            stream.set_read_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))?;
             let mut sync_byte = [0u8; 1];
             if let Err(err) = stream.read_exact(&mut sync_byte) {
+                // Proceed even on EOF, deliberately. EOF is ambiguous: the
+                // outgoing daemon may have aborted before detaching (it still
+                // owns these sessions, and adopting adds a second destructive
+                // reader on each master), or it may have detached and exited
+                // with its 0x02 lost — the teardown path treats that write as
+                // best-effort precisely so a drained daemon still exits.
+                //
+                // Those call for opposite responses and the byte stream cannot
+                // tell them apart, so this resolves toward adopting: the first
+                // case corrupts output on a daemon the operator can restart,
+                // while refusing in the second strands every live session with
+                // no daemon owning it, which nothing can recover.
                 tracing::warn!(
                     "Failed to read teardown sync byte (0x02) from old daemon, proceeding anyway: {err}"
                 );

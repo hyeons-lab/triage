@@ -242,6 +242,23 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
         }
     }
 
+    // Restoring historical sessions replays each log through the terminal
+    // emulator and shells out to git per session — measured at ~9s in June 2026
+    // and ~22.6s a month later, growing with accumulated logs. On a handover
+    // that time is spent while the outgoing daemon is parked waiting for our
+    // adoption byte, which is why `HANDOVER_ADOPTION_TIMEOUT` has to cover it.
+    //
+    // It belongs here, *above* the sync, and moving it below to shrink that wait
+    // is a trap worth naming: until the adoption byte goes out the outgoing
+    // daemon is still fully serving, so this is warm-up, not downtime. Below the
+    // sync the same work becomes downtime — nothing reads the adopted masters,
+    // so children blocking on a full PTY buffer freeze; no process answers
+    // clients; and a panic in log replay strands every session with no daemon
+    // left to own them, where up here it would merely abort a handover the
+    // outgoing daemon survives.
+    //
+    // The way to shrink the wait is to make the restore itself cheaper or lazy,
+    // not to move it past the commit point.
     let manager = Arc::new(SessionManager::default());
 
     // Load configuration
