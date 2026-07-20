@@ -97,7 +97,8 @@ Every push to GitHub triggers CI. CI runs are expensive — minimize waste:
 so a build can't quietly ship a stale UI:
 
 - A staged `crates/triaged/dist/` (what `publish.yml` produces) always wins and is never rebuilt.
-- Otherwise the bundle is considered current when `flutter/triage_client/build/web` exists and
+- Otherwise the bundle is considered current when `flutter/triage_client/build/web/index.html`
+  exists and
   `build/.triage-client-stamp` is newer than every source under `flutter/triage_client/`
   (`lib/`, `web/`, `assets/`, `fonts/`, `pubspec.yaml`, `pubspec.lock`). If it isn't, the build
   script runs `flutter build web --release` — matching the release build — before compiling.
