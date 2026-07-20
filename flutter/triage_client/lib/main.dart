@@ -127,14 +127,43 @@ const double _sessionRailCollapsedWidth = 72;
 const double _sessionRailExpandedWidth = 320;
 const Duration _sessionRailAnimationDuration = Duration(milliseconds: 220);
 
-/// Hosts that mean "this developer machine" rather than a daemon that served
-/// us. Used to tell the Flutter dev server apart from a real deployment.
+/// Matches an octet as plain decimal digits only.
+///
+/// `int.tryParse` is too permissive to use on its own here: it accepts `0x7f`
+/// (hex, no radix needed), a leading `+`/`-`, and surrounding whitespace, so
+/// `0x7f.0.0.1` and `+127.0.0.1` would parse as loopback.
+final RegExp _decimalOctet = RegExp(r'^[0-9]{1,3}$');
+
+/// Whether `host` is a dotted-quad IPv4 address in `127.0.0.0/8`.
+///
+/// Parsed rather than prefix-matched: `127.example.com` and
+/// `127.0.0.1.evil.com` are perfectly legal DNS names (only the final label is
+/// barred from being all-numeric), and a `startsWith('127.')` test treats both
+/// as loopback.
+bool _isIpv4LoopbackLiteral(String host) {
+  final parts = host.split('.');
+  if (parts.length != 4) return false;
+  for (final part in parts) {
+    if (!_decimalOctet.hasMatch(part)) return false;
+    if (int.parse(part) > 255) return false;
+  }
+  return int.parse(parts.first) == 127;
+}
+
+/// Hosts that mean "this machine" — every loopback spelling a browser, proxy,
+/// or local tool is liable to produce.
+///
+/// Shared by the dev-server check and pairing-URL verification so the two can't
+/// drift apart. Takes a bare host as `Uri.host` reports it, which strips the
+/// brackets from an IPv6 literal (`http://[::1]/` → `::1`) but does not
+/// normalize between IPv6 spellings.
 bool _isLoopbackHost(String host) {
   final normalized = host.toLowerCase();
   return normalized == 'localhost' ||
-      normalized == '127.0.0.1' ||
       normalized == '::1' ||
-      normalized == '[::1]';
+      normalized == '0:0:0:0:0:0:0:1' ||
+      normalized == '::ffff:127.0.0.1' ||
+      _isIpv4LoopbackLiteral(normalized);
 }
 
 /// The websocket target implied by the page that served the web client.
@@ -1101,7 +1130,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     String? deviceCode,
   }) {
     final wsUri = client.uri;
-    if (!_isLocalVerificationHost(wsUri.host)) {
+    if (!_isLoopbackHost(wsUri.host)) {
       return null;
     }
 
@@ -1118,15 +1147,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     return verificationUri.replace(
       queryParameters: {'device_code': deviceCode},
     );
-  }
-
-  bool _isLocalVerificationHost(String host) {
-    final normalized = host.toLowerCase();
-    return normalized == 'localhost' ||
-        normalized == '::1' ||
-        normalized == '0:0:0:0:0:0:0:1' ||
-        normalized == '::ffff:127.0.0.1' ||
-        normalized.startsWith('127.');
   }
 
   bool _isRemoteSession(SessionVm session) {
