@@ -61,18 +61,99 @@ fn probe_daemon_socket(socket_path: &std::path::Path) -> DaemonSocketState {
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+const HELP: &str = "\
+usage: triaged [--handover]
+       triaged service <action>
+       triaged --help | --version
+
+Options:
+  --handover, -U    Take over sessions from a running daemon. Optional: a live
+                    daemon is always handed over from, flag or not.
+  service <action>  Manage the per-user login service and exit
+  -h, --help        Print this help text
+  -V, --version     Print version information
+
+Running triaged with no arguments starts the daemon. If a daemon is already
+running it is handed over from and then shuts down, so an unrecognized
+argument is rejected rather than silently displacing the running daemon.";
+
+/// What a `triaged` invocation asked for. Parsed up front so that argument
+/// handling can't fall through into starting a daemon — a bare `triaged
+/// --help` used to be treated as a plain launch, which hands over from (and
+/// thereby shuts down) the running daemon as a side effect of asking for help.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    Help,
+    Version,
+    /// `triaged service <action>` — action is validated by `service::run_cli`.
+    Service(String),
+    /// Start the daemon. `handover` records whether `--handover`/`-U` was
+    /// passed; it is advisory only (see `HELP`).
+    Daemon {
+        handover: bool,
+    },
+}
+
+fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
+    let rest = &args[1.min(args.len())..];
 
     // `triaged service <action>` manages the per-user login service (LaunchAgent
     // / systemd user unit / Windows logon task) and exits, rather than running
-    // the daemon in this process.
-    if args.get(1).map(String::as_str) == Some("service") {
-        let action = args.get(2).map(String::as_str).unwrap_or("");
-        return triaged::service::run_cli(action);
+    // the daemon in this process. It is a mode of its own — launch flags do not
+    // combine with it — and anything past the action is rejected rather than
+    // ignored, so `service install --hanover` can't look like it worked.
+    //
+    // Matched *before* the help and version flags because the action is the
+    // service CLI's to interpret: `service::run_cli` prints its own usage for
+    // "", "help", "-h", and "--help", and answering those here would shadow it
+    // with the daemon's help instead.
+    if rest.first().map(String::as_str) == Some("service") {
+        if let Some(extra) = rest.get(2) {
+            anyhow::bail!("unexpected argument `{extra}` after `service`\n\n{HELP}");
+        }
+        return Ok(Invocation::Service(
+            rest.get(1).cloned().unwrap_or_default(),
+        ));
     }
 
-    let is_handover = args.contains(&"--handover".to_string()) || args.contains(&"-U".to_string());
+    // `-h`/`--help` are position-independent, but bare `help` is only a request
+    // for help as the first token — anywhere else it is a stray word, and
+    // treating it as help would mask a typo.
+    if rest.first().map(String::as_str) == Some("help")
+        || rest.iter().any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Ok(Invocation::Help);
+    }
+    if rest.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return Ok(Invocation::Version);
+    }
+
+    let mut handover = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--handover" | "-U" => handover = true,
+            other => anyhow::bail!("unrecognized argument `{other}`\n\n{HELP}"),
+        }
+    }
+
+    Ok(Invocation::Daemon { handover })
+}
+
+fn run() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    let is_handover = match parse_args(&args)? {
+        Invocation::Help => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        Invocation::Version => {
+            println!("triaged {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Invocation::Service(action) => return triaged::service::run_cli(&action),
+        Invocation::Daemon { handover } => handover,
+    };
 
     #[cfg(unix)]
     let mut has_inherited_sessions = false;
@@ -288,5 +369,133 @@ fn run() -> anyhow::Result<()> {
         loop {
             std::thread::park();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Invocation, parse_args};
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        std::iter::once("triaged")
+            .chain(rest.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn bare_invocation_starts_the_daemon() {
+        assert_eq!(
+            parse_args(&args(&[])).unwrap(),
+            Invocation::Daemon { handover: false }
+        );
+    }
+
+    #[test]
+    fn handover_flags_are_accepted() {
+        for flag in ["--handover", "-U"] {
+            assert_eq!(
+                parse_args(&args(&[flag])).unwrap(),
+                Invocation::Daemon { handover: true }
+            );
+        }
+    }
+
+    /// The regression this module exists for: asking for help must not resolve
+    /// to `Daemon`, because starting a daemon hands over from (and shuts down)
+    /// the running one.
+    #[test]
+    fn help_never_starts_the_daemon() {
+        for flag in ["--help", "-h", "help"] {
+            assert_eq!(parse_args(&args(&[flag])).unwrap(), Invocation::Help);
+        }
+    }
+
+    #[test]
+    fn version_never_starts_the_daemon() {
+        for flag in ["--version", "-V"] {
+            assert_eq!(parse_args(&args(&[flag])).unwrap(), Invocation::Version);
+        }
+    }
+
+    /// Help wins over an otherwise-valid launch flag so `triaged --handover
+    /// --help` prints usage instead of displacing the running daemon.
+    #[test]
+    fn help_takes_precedence_over_launch_flags() {
+        assert_eq!(
+            parse_args(&args(&["--handover", "--help"])).unwrap(),
+            Invocation::Help
+        );
+    }
+
+    /// A typo must fail loudly rather than fall through to a daemon start.
+    #[test]
+    fn unrecognized_arguments_are_rejected() {
+        let error = parse_args(&args(&["--handver"])).unwrap_err().to_string();
+        assert!(
+            error.contains("unrecognized argument `--handver`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn service_subcommand_is_routed_with_its_action() {
+        assert_eq!(
+            parse_args(&args(&["service", "install"])).unwrap(),
+            Invocation::Service("install".to_string())
+        );
+        assert_eq!(
+            parse_args(&args(&["service"])).unwrap(),
+            Invocation::Service(String::new())
+        );
+    }
+
+    /// `service` returns early, so extras past the action would otherwise be
+    /// silently dropped — the same "ignored argument" failure this module
+    /// exists to prevent, just one position further along.
+    #[test]
+    fn service_rejects_arguments_after_the_action() {
+        let error = parse_args(&args(&["service", "install", "--handover"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unexpected argument `--handover` after `service`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The service CLI prints its own usage for "", "help", "-h" and "--help"
+    /// (`service::run_cli`), so those must reach it rather than being answered
+    /// with the daemon's help.
+    #[test]
+    fn service_owns_its_own_help() {
+        for action in ["help", "-h", "--help"] {
+            assert_eq!(
+                parse_args(&args(&["service", action])).unwrap(),
+                Invocation::Service(action.to_string()),
+                "`service {action}` should reach the service CLI"
+            );
+        }
+    }
+
+    /// Bare `help` is a help request only as the first token. Elsewhere it is a
+    /// stray word, and silently treating it as help would mask a typo.
+    #[test]
+    fn bare_help_is_only_a_help_request_in_first_position() {
+        assert_eq!(parse_args(&args(&["help"])).unwrap(), Invocation::Help);
+
+        let error = parse_args(&args(&["--handover", "help"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unrecognized argument `help`"),
+            "unexpected error: {error}"
+        );
+
+        // The flag forms stay position-independent.
+        assert_eq!(
+            parse_args(&args(&["--handover", "-h"])).unwrap(),
+            Invocation::Help
+        );
     }
 }
