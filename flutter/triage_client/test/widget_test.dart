@@ -578,6 +578,17 @@ void main() {
     // Falling back to loopback here would both miss the daemon and be blocked
     // as mixed content from an https page.
     expect(
+      defaultWebSocketUriForBase(Uri.parse('https://triage.example.test/')),
+      Uri.parse('wss://triage.example.test:443/ws'),
+    );
+  });
+
+  test('websocket target is rooted, so a subpath mount is not supported', () {
+    // `/ws` is served at the origin root by the daemon, so the base path is
+    // intentionally discarded. Asserted rather than left implicit: a proxy
+    // mounting the client under a subpath would need `/app/ws`, and this is
+    // the line that would have to change to support it.
+    expect(
       defaultWebSocketUriForBase(Uri.parse('https://triage.example.test/app/')),
       Uri.parse('wss://triage.example.test:443/ws'),
     );
@@ -591,11 +602,56 @@ void main() {
   });
 
   test('treats a loopback origin on a non-daemon port as the dev server', () {
-    for (final host in ['localhost', '127.0.0.1', '[::1]']) {
+    // Bracketed IPv6 is included because that is how the origin is *written*,
+    // though `Uri.host` hands the predicate the unbracketed form. The rest are
+    // spellings a browser or local tool can genuinely produce, including
+    // 127.0.0.0/8 addresses other than 127.0.0.1.
+    for (final host in [
+      'localhost',
+      '127.0.0.1',
+      '127.0.0.2',
+      '[::1]',
+      '[0:0:0:0:0:0:0:1]',
+    ]) {
       expect(
         defaultWebSocketUriForBase(Uri.parse('http://$host:8080/')),
         Uri.parse('ws://127.0.0.1:7777/ws'),
         reason: 'loopback host $host on 8080 should fall back to the daemon',
+      );
+    }
+
+    // Bracketed in the URL, unbracketed once `Uri.host` has parsed it. Kept
+    // separate from the loop because the two spellings differ.
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('http://[::ffff:127.0.0.1]:8080/')),
+      Uri.parse('ws://127.0.0.1:7777/ws'),
+    );
+  });
+
+  test('a DNS name merely starting with "127." is not loopback', () {
+    // `127.example.com` is a legal hostname — only the final label is barred
+    // from being all-numeric. A prefix test would treat it as the dev server
+    // and dial loopback, missing the daemon and tripping mixed-content
+    // blocking from an https page.
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('https://127.example.com/')),
+      Uri.parse('wss://127.example.com:443/ws'),
+    );
+    expect(
+      defaultWebSocketUriForBase(Uri.parse('https://127.0.0.1.evil.com/')),
+      Uri.parse('wss://127.0.0.1.evil.com:443/ws'),
+    );
+  });
+
+  test('octets must be plain decimal, not hex or signed', () {
+    // `int.tryParse` accepts '0x7f', '+127' and surrounding whitespace with no
+    // radix argument, so a digits-only match guards the octets. `0x1` is not
+    // all-numeric, so `0x7f.0.0.0x1` is a legal DNS name a host could resolve.
+    for (final host in ['0x7f.0.0.0x1', '0x7f.0.0.1']) {
+      expect(
+        defaultWebSocketUriForBase(Uri.parse('https://$host/')),
+        Uri.parse('wss://$host:443/ws'),
+        reason: '$host is a DNS name, not an IPv4 loopback literal',
       );
     }
   });
@@ -1237,6 +1293,28 @@ void main() {
     expect(find.textContaining('triage pair'), findsOneWidget);
     expect(
       find.textContaining('192.168.1.10:7777/pair', findRichText: true),
+      findsNothing,
+    );
+  });
+
+  testWidgets('a DNS name starting with "127." is not treated as local', (
+    WidgetTester tester,
+  ) async {
+    // The pairing URL is only offered for a daemon on this machine, because a
+    // remote user's browser cannot usefully open it. `127.0.0.1.evil.com` is a
+    // legal, resolvable DNS name, and a `startsWith('127.')` host test would
+    // present it as local — rendering an attacker-controlled URL as a trusted
+    // "Verification URL" button carrying the device code.
+    final client = FakeTriageWebSocketClient(
+      uri: Uri.parse('ws://127.0.0.1.evil.com:7777/ws'),
+      authenticated: false,
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Local approval required'), findsOneWidget);
+    expect(
+      find.textContaining('127.0.0.1.evil.com', findRichText: true),
       findsNothing,
     );
   });

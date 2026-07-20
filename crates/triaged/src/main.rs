@@ -1,5 +1,6 @@
 #![cfg_attr(unix, allow(unsafe_code))]
 
+use std::ffi::OsString;
 use std::sync::Arc;
 use triaged::session::SessionManager;
 use triaged::ws;
@@ -8,10 +9,27 @@ use triaged::ws;
 use triaged::ipc::{IpcConfig, IpcServer, default_socket_path};
 
 fn main() -> anyhow::Result<()> {
+    // Arguments are parsed, and help/version answered, *before* logging is
+    // initialized: `logging::init` resolves a state directory and fails when
+    // neither HOME nor USERPROFILE is set, and `triaged --help` failing because
+    // the log directory is unwritable would be absurd.
+    let invocation = parse_args(std::env::args_os().skip(1))?;
+    match invocation {
+        Invocation::Help => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        Invocation::Version => {
+            println!("triaged {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Invocation::Service(_) | Invocation::Daemon { .. } => {}
+    }
+
     // Keep this binding alive for the lifetime of the process: dropping the
     // WorkerGuard flushes the non-blocking tracing appender thread.
     let _flush_guard = triage_core::logging::init(triage_core::logging::default_config()?)?;
-    run()
+    run(invocation)
 }
 
 /// Whether a daemon already owns the IPC socket, used to decide adopt-vs-fresh
@@ -70,8 +88,8 @@ Options:
   --handover, -U    Take over sessions from a running daemon. Optional: a live
                     daemon is always handed over from, flag or not.
   service <action>  Manage the per-user login service and exit
-  -h, --help        Print this help text
-  -V, --version     Print version information
+  -h, --help        Print this help text (also `triaged help`)
+  -V, --version     Print version information (also `triaged version`)
 
 Running triaged with no arguments starts the daemon. If a daemon is already
 running it is handed over from and then shuts down, so an unrecognized
@@ -94,8 +112,23 @@ enum Invocation {
     },
 }
 
-fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
-    let rest = &args[1.min(args.len())..];
+/// Parse the arguments *after* the program name. Takes `OsString` so a
+/// non-UTF-8 argument is reported as a usage error rather than panicking inside
+/// `env::args()` — the whole point of this function is that a bad argument can't
+/// reach the daemon-start path.
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Invocation> {
+    let rest = args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|arg| {
+                anyhow::anyhow!(
+                    "argument is not valid UTF-8: {}\n\n{HELP}",
+                    arg.to_string_lossy()
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<String>>>()?;
+    let rest = rest.as_slice();
 
     // `triaged service <action>` manages the per-user login service (LaunchAgent
     // / systemd user unit / Windows logon task) and exits, rather than running
@@ -116,15 +149,17 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         ));
     }
 
-    // `-h`/`--help` are position-independent, but bare `help` is only a request
-    // for help as the first token — anywhere else it is a stray word, and
-    // treating it as help would mask a typo.
+    // The flag forms are position-independent, but the bare words are only a
+    // request as the first token — anywhere else they are a stray word, and
+    // treating one as a request would mask a typo.
     if rest.first().map(String::as_str) == Some("help")
         || rest.iter().any(|arg| arg == "--help" || arg == "-h")
     {
         return Ok(Invocation::Help);
     }
-    if rest.iter().any(|arg| arg == "--version" || arg == "-V") {
+    if rest.first().map(String::as_str) == Some("version")
+        || rest.iter().any(|arg| arg == "--version" || arg == "-V")
+    {
         return Ok(Invocation::Version);
     }
 
@@ -139,20 +174,17 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
     Ok(Invocation::Daemon { handover })
 }
 
-fn run() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    let is_handover = match parse_args(&args)? {
-        Invocation::Help => {
-            println!("{HELP}");
-            return Ok(());
-        }
-        Invocation::Version => {
-            println!("triaged {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
+/// Run whatever the command line asked for. `Help` and `Version` are answered
+/// in `main` before logging is initialized, so they never reach here.
+fn run(invocation: Invocation) -> anyhow::Result<()> {
+    let is_handover = match invocation {
         Invocation::Service(action) => return triaged::service::run_cli(&action),
         Invocation::Daemon { handover } => handover,
+        // Answered in `main`; reachable only if that guard is refactored away.
+        // An error beats a panic for something this recoverable.
+        Invocation::Help | Invocation::Version => {
+            anyhow::bail!("help and version must be answered before logging init")
+        }
     };
 
     #[cfg(unix)]
@@ -375,18 +407,19 @@ fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Invocation, parse_args};
+    use std::ffi::OsString;
 
-    fn args(rest: &[&str]) -> Vec<String> {
-        std::iter::once("triaged")
-            .chain(rest.iter().copied())
-            .map(String::from)
-            .collect()
+    /// Arguments *after* the program name, matching what `main` passes.
+    fn args(rest: &[&str]) -> Vec<OsString> {
+        rest.iter().map(OsString::from).collect()
     }
 
+    /// `main` passes everything after the program name, so "no arguments" and
+    /// "empty argv" are the same input here — one assertion covers both.
     #[test]
     fn bare_invocation_starts_the_daemon() {
         assert_eq!(
-            parse_args(&args(&[])).unwrap(),
+            parse_args(args(&[])).unwrap(),
             Invocation::Daemon { handover: false }
         );
     }
@@ -395,7 +428,7 @@ mod tests {
     fn handover_flags_are_accepted() {
         for flag in ["--handover", "-U"] {
             assert_eq!(
-                parse_args(&args(&[flag])).unwrap(),
+                parse_args(args(&[flag])).unwrap(),
                 Invocation::Daemon { handover: true }
             );
         }
@@ -407,15 +440,45 @@ mod tests {
     #[test]
     fn help_never_starts_the_daemon() {
         for flag in ["--help", "-h", "help"] {
-            assert_eq!(parse_args(&args(&[flag])).unwrap(), Invocation::Help);
+            assert_eq!(parse_args(args(&[flag])).unwrap(), Invocation::Help);
         }
     }
 
     #[test]
     fn version_never_starts_the_daemon() {
-        for flag in ["--version", "-V"] {
-            assert_eq!(parse_args(&args(&[flag])).unwrap(), Invocation::Version);
+        for flag in ["--version", "-V", "version"] {
+            assert_eq!(parse_args(args(&[flag])).unwrap(), Invocation::Version);
         }
+    }
+
+    /// A non-UTF-8 argument is a usage error, not a panic inside `env::args()`
+    /// — anything that isn't understood must be rejected before the daemon path.
+    ///
+    /// Gated on the platforms where a non-UTF-8 `OsString` can be constructed;
+    /// the crate also builds for `not(any(unix, windows))`, where it cannot.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_utf8_arguments_are_rejected_without_panicking() {
+        let bad = bad_utf8_arg();
+        let error = parse_args(vec![bad]).unwrap_err().to_string();
+        assert!(
+            error.contains("not valid UTF-8"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn bad_utf8_arg() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff, 0xfe])
+    }
+
+    #[cfg(windows)]
+    fn bad_utf8_arg() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired surrogate is representable in an OsString but not in a
+        // Rust String.
+        OsString::from_wide(&[0xd800])
     }
 
     /// Help wins over an otherwise-valid launch flag so `triaged --handover
@@ -423,7 +486,7 @@ mod tests {
     #[test]
     fn help_takes_precedence_over_launch_flags() {
         assert_eq!(
-            parse_args(&args(&["--handover", "--help"])).unwrap(),
+            parse_args(args(&["--handover", "--help"])).unwrap(),
             Invocation::Help
         );
     }
@@ -431,7 +494,7 @@ mod tests {
     /// A typo must fail loudly rather than fall through to a daemon start.
     #[test]
     fn unrecognized_arguments_are_rejected() {
-        let error = parse_args(&args(&["--handver"])).unwrap_err().to_string();
+        let error = parse_args(args(&["--handver"])).unwrap_err().to_string();
         assert!(
             error.contains("unrecognized argument `--handver`"),
             "unexpected error: {error}"
@@ -441,11 +504,11 @@ mod tests {
     #[test]
     fn service_subcommand_is_routed_with_its_action() {
         assert_eq!(
-            parse_args(&args(&["service", "install"])).unwrap(),
+            parse_args(args(&["service", "install"])).unwrap(),
             Invocation::Service("install".to_string())
         );
         assert_eq!(
-            parse_args(&args(&["service"])).unwrap(),
+            parse_args(args(&["service"])).unwrap(),
             Invocation::Service(String::new())
         );
     }
@@ -455,7 +518,7 @@ mod tests {
     /// exists to prevent, just one position further along.
     #[test]
     fn service_rejects_arguments_after_the_action() {
-        let error = parse_args(&args(&["service", "install", "--handover"]))
+        let error = parse_args(args(&["service", "install", "--handover"]))
             .unwrap_err()
             .to_string();
         assert!(
@@ -471,7 +534,7 @@ mod tests {
     fn service_owns_its_own_help() {
         for action in ["help", "-h", "--help"] {
             assert_eq!(
-                parse_args(&args(&["service", action])).unwrap(),
+                parse_args(args(&["service", action])).unwrap(),
                 Invocation::Service(action.to_string()),
                 "`service {action}` should reach the service CLI"
             );
@@ -482,9 +545,9 @@ mod tests {
     /// stray word, and silently treating it as help would mask a typo.
     #[test]
     fn bare_help_is_only_a_help_request_in_first_position() {
-        assert_eq!(parse_args(&args(&["help"])).unwrap(), Invocation::Help);
+        assert_eq!(parse_args(args(&["help"])).unwrap(), Invocation::Help);
 
-        let error = parse_args(&args(&["--handover", "help"]))
+        let error = parse_args(args(&["--handover", "help"]))
             .unwrap_err()
             .to_string();
         assert!(
@@ -494,7 +557,7 @@ mod tests {
 
         // The flag forms stay position-independent.
         assert_eq!(
-            parse_args(&args(&["--handover", "-h"])).unwrap(),
+            parse_args(args(&["--handover", "-h"])).unwrap(),
             Invocation::Help
         );
     }
