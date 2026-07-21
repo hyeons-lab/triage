@@ -1135,15 +1135,15 @@ impl SessionManager {
     pub fn adopt_sessions(
         &self,
         state: crate::handover::HandoverState,
-        mut fds: Vec<std::os::unix::io::RawFd>,
+        fds: Vec<std::os::unix::io::RawFd>,
     ) -> Result<()> {
         let mut sessions = self.sessions()?;
+        let mut pending = UnadoptedFds::new(fds);
 
         for h_sess in state.sessions {
-            if fds.is_empty() {
+            let Some(fd) = pending.next_fd() else {
                 bail!("No inherited FDs left for session {}", h_sess.id);
-            }
-            let fd = fds.remove(0);
+            };
 
             let runtime = spawn_adopted_pty_runtime(&h_sess, fd)?;
 
@@ -1234,10 +1234,64 @@ impl SessionManager {
                     last_known_cwd,
                 },
             );
+            // The session is live, so its master PTY owns this fd from here on.
+            // Claiming it earlier would drop it from the guard while the actor
+            // that will hold it might still fail to spawn.
+            pending.claim();
         }
 
         self.persist_manifest(&sessions)?;
         Ok(())
+    }
+}
+
+/// Owns handover fds until the session each belongs to is live, closing any
+/// that are left over.
+///
+/// A `RawFd` is a bare integer with no ownership, so nothing closes one on the
+/// way out of [`SessionManager::adopt_sessions`]. That was harmless while a
+/// failed adoption propagated into a `process::exit` and the OS reclaimed every
+/// descriptor. Now that a partial adoption is logged and the daemon keeps
+/// running, an fd that never reached a session would stay open for the life of
+/// the process — one leaked master PTY per session that failed to adopt, plus
+/// every fd still queued behind it, and any surplus the state doesn't account
+/// for.
+#[cfg(unix)]
+struct UnadoptedFds {
+    fds: std::collections::VecDeque<std::os::unix::io::RawFd>,
+}
+
+#[cfg(unix)]
+impl UnadoptedFds {
+    fn new(fds: Vec<std::os::unix::io::RawFd>) -> Self {
+        Self { fds: fds.into() }
+    }
+
+    /// The fd for the next session to adopt, still owned by the guard — it is
+    /// released only by [`Self::claim`], so every early return between here and
+    /// there closes it.
+    fn next_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.fds.front().copied()
+    }
+
+    /// Hands ownership of the current fd to the session that adopted it.
+    fn claim(&mut self) {
+        self.fds.pop_front();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnadoptedFds {
+    fn drop(&mut self) {
+        for fd in self.fds.drain(..) {
+            // SAFETY: an unclaimed fd never reached a `MasterPty`, so no session
+            // holds it. The reader and writer handed to a session are `dup`ed
+            // (see `AdoptedMasterPty::try_clone_reader`/`take_writer`), so this
+            // cannot close a descriptor another owner still uses.
+            unsafe {
+                libc::close(fd);
+            }
+        }
     }
 }
 

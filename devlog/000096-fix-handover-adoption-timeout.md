@@ -64,6 +64,27 @@ changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
   concurrent launch retries instead of crash-looping, and refusing new sessions
   while a handover is in flight.
 
+## Code Review (2026-07-21)
+
+- 2026-07-21T10:09-0700 `crates/triaged/src/session.rs` — PR #113 review: making
+  `adopt_sessions` failures log-and-continue (above) leaked file descriptors.
+  `adopt_sessions` takes `Vec<RawFd>`, a bare integer with no ownership, and
+  removes one per session as it goes. While a failure propagated with `?` into a
+  `process::exit`, the OS reclaimed whatever was left; now that the daemon
+  survives, every fd the loop had taken but not yet attached to a session — plus
+  everything still queued behind it — stayed open for the life of the process.
+  The surplus case leaked on the *success* path too: more inherited fds than the
+  state lists and the extras were simply dropped.
+
+  Fixed with an RAII guard (`UnadoptedFds`) that owns the queue and closes
+  whatever it still holds on drop. Ownership transfers only after
+  `sessions.insert`, so the fd in flight is covered by every early return between
+  taking it and the session going live — including the two actor-thread spawns,
+  which can fail with `EAGAIN` under the fd pressure a leak would itself create.
+  Chose the guard over `Vec<OwnedFd>`/`OwnedFd` in `AdoptedMasterPty` because the
+  latter changes when a *live* session's master closes, which is a bigger change
+  to the adopted-PTY lifetime than this bug warrants.
+
 ## Decisions
 
 - 2026-07-19T18:20-0700 Raise the Phase-2 bound rather than tune it — a
@@ -220,4 +241,5 @@ changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
 ## Commits
 
 - cb8f4c0 — fix(triaged): stop the 5s adoption deadline from aborting valid handovers
-- HEAD — fix(triaged): gate teardown on a commit byte and fail the build on a missing client
+- 55212d4 — fix(triaged): gate teardown on a commit byte and fail the build on a missing client
+- HEAD — fix(triaged): close handover fds that no session adopts

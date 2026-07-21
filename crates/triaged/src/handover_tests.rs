@@ -2,7 +2,7 @@
 mod tests {
     use crate::session::{SessionManager, SessionManagerConfig};
     use std::path::PathBuf;
-    use triage_core::session::{SessionApi, SessionSize, StartSessionRequest};
+    use triage_core::session::{SessionApi, SessionId, SessionSize, StartSessionRequest};
 
     struct TempDir {
         path: PathBuf,
@@ -133,6 +133,90 @@ mod tests {
         // Clean up the running process (now solely owned via the adopted fd).
         let _ = new_manager.shutdown_session(session_id);
 
+        Ok(())
+    }
+
+    /// True while `fd` names an open descriptor in this process.
+    fn fd_is_open(fd: std::os::unix::io::RawFd) -> bool {
+        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) != -1
+    }
+
+    // A partial adoption is logged and survived rather than propagated into a
+    // process exit, so the OS no longer sweeps up descriptors the adoption never
+    // claimed. Any fd with no session to take it has to be closed on the way out
+    // or it leaks for the life of the daemon.
+    #[test]
+    fn adopt_sessions_closes_fds_no_session_claims() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = SessionManager::new(SessionManagerConfig::new(temp_dir.path.clone()));
+
+        // A descriptor of our own to watch: dup'ing gives one that is ours to
+        // lose, with no PTY or child hanging off it.
+        let surplus = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        assert!(
+            surplus >= 0,
+            "libc::dup failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(fd_is_open(surplus));
+
+        // No sessions to adopt, so nothing claims the fd.
+        let state = crate::handover::HandoverState {
+            sessions: Vec::new(),
+            has_tcp_listener: false,
+            sends_teardown_commit: true,
+        };
+        manager.adopt_sessions(state, vec![surplus])?;
+
+        assert!(
+            !fd_is_open(surplus),
+            "a handover fd that no session adopted was left open"
+        );
+        Ok(())
+    }
+
+    // The same guarantee on the failure path. A session whose log can't be opened
+    // fails inside `spawn_adopted_pty_runtime`, after its fd has been taken but
+    // before any session owns it — the case that used to `?` straight out to a
+    // process exit. Both that fd and everything queued behind it must be closed.
+    #[test]
+    fn adopt_sessions_closes_fds_when_adoption_fails() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = SessionManager::new(SessionManagerConfig::new(temp_dir.path.clone()));
+
+        let in_flight = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        let queued = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        assert!(in_flight >= 0 && queued >= 0);
+
+        // `log_path` points at a directory, so opening it for append fails and
+        // the first session never becomes live.
+        let session = crate::handover::HandoverSession {
+            id: SessionId::new("session-1")?,
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            cwd: Some(temp_dir.path.clone()),
+            size: SessionSize::default(),
+            log_path: temp_dir.path.clone(),
+            output_seq: 0,
+            bytes_logged: 0,
+            pid: 1,
+        };
+        let state = crate::handover::HandoverState {
+            sessions: vec![session.clone(), session],
+            has_tcp_listener: false,
+            sends_teardown_commit: true,
+        };
+
+        let result = manager.adopt_sessions(state, vec![in_flight, queued]);
+        assert!(result.is_err(), "adoption should fail on an unopenable log");
+        assert!(
+            !fd_is_open(in_flight),
+            "the fd of the session that failed to adopt was left open"
+        );
+        assert!(
+            !fd_is_open(queued),
+            "a queued handover fd was left open after adoption failed"
+        );
         Ok(())
     }
 
