@@ -1,4 +1,4 @@
-# fix/android-manifest-network
+# 000096 — fix/android-manifest-network
 
 ## Agent
 
@@ -51,6 +51,11 @@ every build, so the split was never right.
 - The debug variant's `INTERNET` line is preserved: removing it would
   regress `flutter run` on any device where the debug APK is installed
   first without the merged main declaration.
+
+## Review
+
+PR #114, first round: the devlog H1 omitted its `000096` prefix. Every other
+file in `devlog/` opens `# 0000NN — <branch>`; corrected to match.
 
 ## Commits
 
