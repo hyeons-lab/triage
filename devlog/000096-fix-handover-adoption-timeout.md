@@ -294,7 +294,10 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   `handle_handover_server`, which do cross-process socket I/O and end in
   `process::exit`. The `0x03` commit protocol was therefore validated by (a) unit
   tests on the extracted `teardown_outcome` decision function covering every
-  branch, and (b) the intent to run a real local handover. Residual risk on #4: it
+  branch, and (b) three real local handovers on 2026-07-21 (see Research &
+  Discoveries), which exercised the commit path and the legacy path against a live
+  daemon carrying 10 sessions. That is evidence, not coverage: it is manual, it
+  ran one ordering, and CI still never executes the handshake. Residual risk on #4: it
   adds no per-byte acks, so if the successor died after sending `0x01` but before
   reading a `0x03` already buffered in the socket, the outgoing daemon would have
   detached and the sessions would be lost — but a successor that dies mid-handover
@@ -327,6 +330,76 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   carried the same kernel socket address as its predecessor's — inherited via
   `SCM_RIGHTS`, not rebound. The launchd `KeepAlive` respawn converged as
   designed, handing over from the manual successor rather than fighting it.
+
+- 2026-07-21T11:00-0700 **The full protocol verified in production, across three
+  real swaps.** The branch had until now been validated only by unit tests and
+  reading; the byte-level handshake had never run outside a review argument.
+  Measured on a daemon carrying 10 sessions:
+
+  | Swap | `gap_ms` | `peer_sends_commit` | Teardown byte observed |
+  | ---- | -------- | ------------------- | ---------------------- |
+  | 1 (legacy → new) | 24360 | `false` | `0x02` — "reported teardown complete; adopting" |
+  | 2 (new → new) | 30598 | `true` | `0x03` — "committed to teardown; adopting" |
+  | 3 (new → new) | 24181 | `true` | `0x03` — "committed to teardown; adopting" |
+
+  Every gap is 24–31s against the 5s bound this branch replaced, so all three
+  would have failed before it. Both compatibility directions ran for real: swap 1
+  exercised the legacy path (`sends_teardown_commit` absent → `#[serde(default)]`
+  false → adopt on `0x02`), swaps 2 and 3 the commit-byte path. The TCP listener
+  kept one kernel socket address (`0x5614916b74cd57db`) across the whole chain,
+  proving inheritance rather than rebinding, and the `KeepAlive` respawn converged
+  each time instead of fighting the manual successor.
+- 2026-07-21T11:00-0700 **The best-effort `0x02` write earned itself in
+  production.** Swap 3 logged `failed to send teardown sync byte (0x02); exiting
+  anyway since sessions are already detached — Broken pipe`. The successor reads
+  one byte, gets `0x03`, and closes; the outgoing daemon's `0x02` then lands on a
+  closed socket. Before this branch that write was `?`, so the daemon would have
+  returned an error *after* `detach_all_live_sessions()` — the exact drained,
+  session-less-but-still-listening state described under Issues. It is also direct
+  evidence that `0x02` is now unobservable to any current successor: it is kept
+  only for daemons predating the commit byte.
+- 2026-07-21T11:00-0700 **Session survival: 8/8 on a clean run.** Verified by
+  mapping the daemon's PTY masters to their slave ttys and comparing the exact
+  shell PIDs on each before and after, which is stricter than counting the
+  daemon's children — the earlier method missed shells already reparented to PID 1
+  by a previous handover, and undercounted the live set. All eight survived and
+  reparented to PID 1, including the session this work was being driven from.
+
+  The one-time legacy → new migration (swap 1) is a different story: it started
+  with 10 live shells and ended with 8. Both losses are on that swap; every swap
+  since, on the new code, has been loss-free. Cause undetermined — an idle shell
+  at a prompt writes nothing, so a session log going quiet cannot distinguish
+  "idle" from "dead", and no adoption error was logged (the new code logs one
+  explicitly on partial failure). Recorded as suspicion against the migration off
+  the pre-fix binary, not against the protocol.
+  found in production, not in review.** Shutting the two stale sessions down
+  removed them from the daemon (`SnapshotSession` → "not found") and released two
+  of each session's three descriptors, but left exactly one open on each of their
+  PTY devices (`15,6` and `15,16`); the daemon's `ptmx` fd count fell 28 → 26 for
+  two sessions destroyed.
+
+  Cause: `AdoptedMasterPty` holds a bare `RawFd` and has no `Drop`. Its reader and
+  writer are `dup`s handed out as `File`s, so those close; the master itself never
+  does. A natively spawned session is unaffected — `portable_pty`'s master owns its
+  descriptor — so this is specific to sessions that arrived through a handover.
+  That is not a narrow case: every handover re-adopts *every* session, so after one
+  swap the whole set is adopted and each one that ends leaks a descriptor until the
+  daemon restarts.
+
+  This contradicts the reasoning recorded on `8124aed`, which chose `UnadoptedFds`
+  over an `OwnedFd`/`Drop` on `AdoptedMasterPty` on the grounds that a `Drop` would
+  "change when a *live* session's master closes". It would — and that turns out to
+  be the behaviour needed: closing when the session ends is exactly right, and on
+  the handover path it is harmless because the successor holds an independent
+  descriptor installed by `SCM_RIGHTS`, not a share of this one. `UnadoptedFds`
+  correctly covers descriptors that never reach a session; nothing covered the ones
+  that did. Fixed below.
+- 2026-07-21T11:00-0700 **A daemon keeps the master of a session whose shell has
+  exited.** Those two dead sessions still held PTY masters afterwards, so the
+  daemon reported "Adopting 10 inherited live sessions" while only 8 had shells,
+  and every subsequent handover faithfully transferred all 10. Session counts in
+  the log are therefore counts of *tracked* sessions, not live ones — worth
+  remembering when reading a handover log as evidence.
 
 ## Next Steps
 
