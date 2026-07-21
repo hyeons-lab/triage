@@ -1,4 +1,4 @@
-# 000097 — fix/adopted-master-fd-leak
+# 000098 — fix/adopted-master-fd-leak
 
 **Agent:** Claude (claude-opus-4-8[1m]) @ triage branch fix/adopted-master-fd-leak
 
