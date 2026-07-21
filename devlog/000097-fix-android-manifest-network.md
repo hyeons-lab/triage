@@ -1,4 +1,4 @@
-# 000096 — fix/android-manifest-network
+# 000097 — fix/android-manifest-network
 
 ## Agent
 
@@ -54,8 +54,14 @@ every build, so the split was never right.
 
 ## Review
 
-PR #114, first round: the devlog H1 omitted its `000096` prefix. Every other
+PR #114, first round: the devlog H1 omitted its number prefix. Every other
 file in `devlog/` opens `# 0000NN — <branch>`; corrected to match.
+
+Renumbered 000096 -> 000097 after #113 merged and took 000096. Both branches
+picked the same next number while running in parallel, which is why the repo
+already carries several duplicates (000066, 000068, 000091). Since #113 landed
+first, the convention's "highest in devlog/, incremented" now resolves to
+000097 here.
 
 ## Commits
 
