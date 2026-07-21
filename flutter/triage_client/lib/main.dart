@@ -254,6 +254,28 @@ bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
   return platform == TargetPlatform.windows;
 }
 
+/// The shells to attempt, in order, when creating a session.
+///
+/// The daemon spawns the shell, but the menu order above is derived from
+/// `defaultTargetPlatform` — the device the *client* runs on, which says
+/// nothing about the machine running `triaged`. A phone or Mac driving a
+/// Windows daemon would otherwise only ever ask for `/bin/sh`, which cannot
+/// spawn there ("spawning PTY child"), and the new-session button would fail
+/// every time with no menu to pick a working shell from.
+///
+/// Every shell is tried rather than one hard-coded partner so the chain stays
+/// correct as variants are added, and the preferred one still goes first — on a
+/// daemon that matches the client's platform the first attempt succeeds and
+/// nothing else is tried.
+@visibleForTesting
+List<NewSessionShell> newSessionShellFallbackChain(NewSessionShell preferred) {
+  return [
+    preferred,
+    for (final shell in NewSessionShell.values)
+      if (shell != preferred) shell,
+  ];
+}
+
 class SessionVm {
   SessionVm({
     required this.title,
@@ -2578,11 +2600,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _createSession(NewSessionShell preferredShell) async {
     if (_client.isConnected) {
-      final fallbackShell = switch (preferredShell) {
-        NewSessionShell.cmd => NewSessionShell.bash,
-        NewSessionShell.bash => NewSessionShell.cmd,
-        NewSessionShell.defaultPosix => null,
-      };
       setState(() {
         _newSessionShell = preferredShell;
         _connectionStatus = 'Creating session...';
@@ -2591,19 +2608,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       String sessionId = '';
       String? subId;
       try {
-        try {
-          sessionId = await _client.startSession(
-            command: preferredShell.command,
-            args: preferredShell.args,
-          );
-        } catch (_) {
-          if (fallbackShell == null) {
+        Object? lastSpawnError;
+        var spawned = false;
+        for (final shell in newSessionShellFallbackChain(preferredShell)) {
+          try {
+            sessionId = await _client.startSession(
+              command: shell.command,
+              args: shell.args,
+            );
+            spawned = true;
+            break;
+          } on TriageAuthException {
+            // Credentials, not the shell: no other command will fare better,
+            // and the pairing screen needs this to propagate.
             rethrow;
+          } catch (e) {
+            lastSpawnError = e;
           }
-          sessionId = await _client.startSession(
-            command: fallbackShell.command,
-            args: fallbackShell.args,
-          );
+        }
+        if (!spawned) {
+          throw lastSpawnError ?? Exception('no shell could be started');
         }
         if (sessionId.isNotEmpty) {
           // Subscribe to events first so we don't miss welcome messages
@@ -2681,6 +2705,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (sessionId.isNotEmpty) {
           _pendingEvents.remove(sessionId);
         }
+        // The daemon's reason (e.g. "spawning PTY child") is the only clue the
+        // user gets; swallowing it left the rail showing a bare failure with
+        // nothing to act on.
+        debugPrint('Failed to create session: $e');
         setState(() {
           _connectionStatus = 'Error creating session';
           _connectionStatusColor = const Color(0xffff6b6b);

@@ -546,6 +546,19 @@ void main() {
     expect(showNewSessionShellMenuForPlatform(TargetPlatform.linux), isFalse);
   });
 
+  test('new-session fallback chain covers every shell, preferred first', () {
+    // A client's platform says nothing about the daemon's, so each starting
+    // point must still be able to reach the shells the other OS provides —
+    // notably `defaultPosix` (an Android/Mac client) reaching `cmd`, which is
+    // the only thing that spawns on a Windows daemon.
+    for (final preferred in NewSessionShell.values) {
+      final chain = newSessionShellFallbackChain(preferred);
+      expect(chain.first, preferred);
+      expect(chain.toSet(), NewSessionShell.values.toSet());
+      expect(chain, hasLength(NewSessionShell.values.length));
+    }
+  });
+
   test('uses daemon websocket target for Flutter dev server base URL', () {
     expect(
       defaultWebSocketUriForBase(Uri.parse('http://127.0.0.1:8080/')),
