@@ -732,54 +732,52 @@ fn dispatch_request(
 /// for the same sessions. PTY reads are destructive, so each session's output
 /// would then be split arbitrarily between them.
 ///
-/// This is reachable in normal operation, not just in theory: smart-start means
-/// *any* `triaged` launch attempts a handover, including the `launchctl
-/// kickstart -k` an operator runs when a swap looks stuck.
-#[cfg(unix)]
-static HANDOVER_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Releases [`HANDOVER_IN_FLIGHT`] on drop, so a handover that fails before
-/// committing leaves the daemon able to serve a later one.
-#[cfg(unix)]
-struct HandoverInFlightGuard;
-
-#[cfg(unix)]
-impl HandoverInFlightGuard {
-    /// Returns `None` when a handover is already being served.
-    fn acquire() -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        HANDOVER_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HandoverInFlightGuard {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        HANDOVER_IN_FLIGHT.store(false, Ordering::Release);
-    }
-}
-
 #[cfg(unix)]
 fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Result<()> {
-    use crate::handover::{get_active_tcp_listener_fd, send_fds};
+    use crate::handover::{
+        HANDOVER_BUSY_MESSAGE, HANDOVER_COMMIT_BYTE, HANDOVER_DONE_BYTE,
+        get_active_tcp_listener_fd, send_fds,
+    };
     use std::io::{Read, Write};
 
-    // Claim before serializing anything: refusing costs the caller a fresh-start
-    // fallback, while proceeding would hand the same masters to two successors.
-    let _in_flight = HandoverInFlightGuard::acquire().ok_or_else(|| {
-        anyhow!("a handover is already in flight; refusing to serve a concurrent one")
-    })?;
+    // Claim before serializing anything. The guard lives on the manager so it
+    // also gates session creation: while a handover is in flight, start_session
+    // is refused, because a session created after this snapshot would not be in
+    // the transferred fds and would be lost when this daemon detaches.
+    //
+    // Serving two handovers at once would dup and ship the *same* PTY masters to
+    // two successors; whichever committed first would drive this daemon through
+    // teardown and exit, leaving both holding live masters and splitting each
+    // session's (destructive) output between them. Refusing instead is reachable
+    // in normal operation — smart-start means any `triaged` launch attempts a
+    // handover, including the `launchctl kickstart -k` an operator runs when a
+    // swap looks stuck.
+    //
+    // On refusal, answer with the busy sentinel so the caller retries rather than
+    // falling back to a fresh start that would fail to bind the port this daemon
+    // still holds. The response is best-effort: a caller that has already gone
+    // away just gets a dropped connection, exactly as before.
+    let Some(_in_flight) = manager.begin_handover() else {
+        let response = WireResponse::Err {
+            message: HANDOVER_BUSY_MESSAGE.to_string(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&response) {
+            let _ = send_fds(&stream, &[], &bytes);
+        }
+        tracing::info!("Refused a concurrent handover; a swap is already in flight.");
+        return Ok(());
+    };
 
     tracing::info!("Received handover request. Beginning process serialization...");
 
     let (mut state, pty_fds) = manager
         .serialize_active_sessions()
         .context("serializing active sessions for handover")?;
+
+    // Tell the successor this daemon sends the 0x03 commit byte before detaching,
+    // so it can read a pre-commit EOF as "aborted, sessions kept" and refuse
+    // rather than adopt into a split-brain. An older successor ignores the field.
+    state.sends_teardown_commit = true;
 
     let mut fds_to_send = Vec::new();
 
@@ -824,7 +822,7 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     if let Err(err) = stream.try_clone()?.read_exact(&mut sync_byte) {
         bail!("Failed to receive sync byte from client: {err}");
     }
-    if sync_byte[0] != 0x01 {
+    if sync_byte[0] != crate::handover::HANDOVER_ADOPT_BYTE {
         bail!(
             "Invalid sync byte received from client: {:02x}",
             sync_byte[0]
@@ -832,6 +830,24 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     }
 
     tracing::info!("Received adoption sync byte (0x01). Initiating Phase 3 (teardown)...");
+
+    let mut out_stream = stream;
+
+    // Announce the commit BEFORE detaching, and make the detach conditional on
+    // that byte landing. This is the atomicity invariant the successor relies on:
+    // it refuses to adopt on a pre-commit EOF, so we must detach *only if* the
+    // 0x03 reached it. If the write fails we keep our sessions and bail — the
+    // successor then refuses, and neither side drops them. (Bailing here runs the
+    // guard's Drop, so this daemon can serve a later handover.)
+    if let Err(error) = out_stream
+        .write_all(&[HANDOVER_COMMIT_BYTE])
+        .and_then(|()| out_stream.flush())
+    {
+        bail!(
+            "failed to send teardown-commit byte (0x03); keeping sessions rather than \
+             detaching, since the successor refuses to adopt without it: {error}"
+        );
+    }
 
     // Detach — do NOT kill. The successor daemon has already adopted these
     // sessions via the transferred master fds; sending each actor a shutdown
@@ -846,9 +862,8 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     // leave a drained, session-less daemon still holding the socket and TCP
     // listener, which would then happily serve a later handover and ship an
     // empty session set, making the loss look like a clean swap.
-    let mut out_stream = stream;
     if let Err(error) = out_stream
-        .write_all(&[0x02])
+        .write_all(&[HANDOVER_DONE_BYTE])
         .and_then(|()| out_stream.flush())
     {
         tracing::warn!(

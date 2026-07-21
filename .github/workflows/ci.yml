@@ -23,6 +23,13 @@ jobs:
     name: Format and Lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # This job compiles and lints the daemon without the Flutter SDK and never
+    # serves the embedded client, so opt out of triaged's missing-SDK hard error
+    # (build.rs). Scoped to this job, not the workflow: a job that *does* need the
+    # real client must not silently inherit the placeholder. Release packaging is
+    # unaffected — it stages a prebuilt bundle into dist/, which build.rs prefers.
+    env:
+      TRIAGE_SKIP_FLUTTER_BUILD: "1"
 
     steps:
       - name: Checkout
@@ -70,6 +77,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    # Compiles and runs the daemon's tests without the Flutter SDK and never
+    # serves the embedded client, so opt out of the missing-SDK hard error.
+    # Scoped to this job (see the check job) rather than the whole workflow.
+    env:
+      TRIAGE_SKIP_FLUTTER_BUILD: "1"
 
     steps:
       - name: Checkout

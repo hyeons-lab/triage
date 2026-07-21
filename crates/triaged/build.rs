@@ -64,8 +64,9 @@ fn main() {
 
 /// Rebuild `flutter/triage_client/build/web` when the Dart sources are newer
 /// than the last bundle, so `cargo build`/`cargo install` can't quietly embed a
-/// stale client. Skipped when the sources aren't present (crates.io consumers),
-/// when Flutter isn't installed (the Rust-only CI job), or on explicit opt-out.
+/// stale client. Skipped when the sources aren't present (crates.io consumers)
+/// or on explicit opt-out via TRIAGE_SKIP_FLUTTER_BUILD; a checkout that has the
+/// sources but no Flutter SDK is a hard error rather than a silent placeholder.
 fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
     let mut newest_source: Option<SystemTime> = None;
     for entry in CLIENT_SOURCES {
@@ -93,15 +94,20 @@ fn ensure_dev_client(client_dir: &Path, dev_client_path: &Path) {
     }
 
     let Some(flutter) = flutter_command() else {
-        // Deliberately silent about what is embedded instead: the caller warns
-        // when no bundle exists at all, and claiming one was "left in place"
-        // here would be wrong in exactly that case.
+        // Warning and falling through to the placeholder made a missing SDK a
+        // silent defect: the build succeeded, the daemon started, and the only
+        // symptom was a client that could not connect — diagnosed nowhere near
+        // the build that caused it. A full checkout that reaches here is asking
+        // for the real client, so refuse to produce a daemon without one.
+        // TRIAGE_SKIP_FLUTTER_BUILD (checked above) remains the supported way to
+        // build deliberately without Flutter.
         let reason = staleness_reason(dev_client_path);
-        warn(&format!(
-            "Flutter web bundle is {reason} but the `flutter` command was not found; \
-             it was not rebuilt."
-        ));
-        return;
+        panic!(
+            "Flutter web bundle is {reason} and the `flutter` command was not found on PATH. \
+             Install the Flutter SDK or add it to PATH so the real client is built. To build \
+             without it on purpose, set TRIAGE_SKIP_FLUTTER_BUILD=1 — that embeds the existing \
+             bundle, or the web_fallback/ placeholder when there is none."
+        );
     };
 
     // Serialize against other cargo invocations (a terminal build racing

@@ -19,7 +19,80 @@ pub struct HandoverSession {
 pub struct HandoverState {
     pub sessions: Vec<HandoverSession>,
     pub has_tcp_listener: bool,
+    /// Whether the outgoing daemon sends a `0x03` teardown-commit byte (Phase 3)
+    /// *before* detaching its sessions. When true, the successor can tell a real
+    /// teardown from an abort: a pre-commit EOF means the daemon kept its
+    /// sessions, so adopting would create a second destructive reader on each
+    /// master. Defaults to false so a state serialized by an older daemon — which
+    /// never sends the byte — is read as "cannot disambiguate", preserving the
+    /// legacy adopt-on-EOF behavior for it. See [`teardown_outcome`].
+    #[serde(default)]
+    pub sends_teardown_commit: bool,
 }
+
+/// Result of asking a running daemon to hand over (Phase 1, before the successor
+/// commits to anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverClientOutcome {
+    /// State and descriptors were received; the successor now holds them and must
+    /// complete the Phase-2/3 sync.
+    Transferred,
+    /// The daemon is already serving another handover and refused this one. The
+    /// caller should retry shortly rather than fall back to a fresh start.
+    Busy,
+}
+
+/// Whether the successor should adopt the transferred sessions or refuse them,
+/// decided after it has sent its `0x01` adoption byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownOutcome {
+    /// The outgoing daemon committed to (or completed) teardown; its sessions are
+    /// the successor's to own.
+    Adopt,
+    /// The outgoing daemon aborted before committing and still owns its sessions.
+    /// Adopting would put a second destructive reader on each PTY master, so the
+    /// successor must not adopt; the outgoing daemon keeps serving and a later
+    /// attempt can hand over cleanly.
+    Refuse,
+}
+
+/// Decide adopt-vs-refuse from the byte (if any) the outgoing daemon sent on the
+/// Phase-3 socket and whether that daemon announced it commits before detaching.
+///
+/// - `Some(0x03)` — explicit teardown-commit: the daemon has (or is about to)
+///   detach, so adopt.
+/// - `Some(0x02)` — a daemon predating the commit byte reporting a clean
+///   teardown; it detached before sending, so adopt.
+/// - anything else, or nothing (EOF / read timeout):
+///   - if the peer announced the commit byte, its absence means the peer aborted
+///     *before* committing and still owns the sessions → refuse.
+///   - if it did not (an older build), the byte stream cannot tell an abort from
+///     a lost `0x02`, and refusing would strand every session an old daemon
+///     genuinely handed off, so adopt — the historical behavior.
+///
+/// This is the whole adopt/refuse contract, factored out as a pure function so
+/// it can be unit-tested without the two-process socket dance around it.
+pub fn teardown_outcome(peer_sends_commit: bool, byte: Option<u8>) -> TeardownOutcome {
+    match byte {
+        Some(0x03) | Some(0x02) => TeardownOutcome::Adopt,
+        _ if peer_sends_commit => TeardownOutcome::Refuse,
+        _ => TeardownOutcome::Adopt,
+    }
+}
+
+/// Raw Phase-3 signals on the handover socket. `0x01` (successor → outgoing) is
+/// the adoption byte; `0x03` and `0x02` (outgoing → successor) are the
+/// teardown-commit and teardown-done bytes. Named here so both sides of the
+/// protocol read from one place.
+pub const HANDOVER_ADOPT_BYTE: u8 = 0x01;
+pub const HANDOVER_COMMIT_BYTE: u8 = 0x03;
+pub const HANDOVER_DONE_BYTE: u8 = 0x02;
+
+/// Sentinel `WireResponse::Err` message a daemon returns when it refuses a
+/// handover because it is already serving one. Distinguishes "busy, retry
+/// shortly" from a dead or non-triaged peer, so the client can retry instead of
+/// falling back to a fresh start that would fail to bind the still-held port.
+pub const HANDOVER_BUSY_MESSAGE: &str = "handover already in flight";
 
 /// How long the successor waits in Phase 1 for the outgoing daemon to ship
 /// session state and PTY descriptors.
@@ -241,7 +314,7 @@ mod unix_impl {
         None
     }
 
-    pub fn perform_handover_client(socket_path: &Path) -> Result<()> {
+    pub fn perform_handover_client(socket_path: &Path) -> Result<HandoverClientOutcome> {
         let stream =
             UnixStream::connect(socket_path).context("connecting to running daemon Unix socket")?;
         // On timeout recv_fds returns an error and the caller falls back to a
@@ -271,6 +344,21 @@ mod unix_impl {
         let wire_resp: serde_json::Value =
             serde_json::from_str(response_str).context("parsing handover response JSON")?;
 
+        // A daemon already serving a handover refuses with this sentinel error so
+        // the caller can retry rather than fall back to a fresh start (which would
+        // fail to bind the port the outgoing daemon still holds). Any *other*
+        // error response, or a malformed one, is a genuine failure: fall back.
+        if let Some(message) = wire_resp
+            .get("Err")
+            .and_then(|err| err.get("message"))
+            .and_then(|message| message.as_str())
+        {
+            if message == HANDOVER_BUSY_MESSAGE {
+                return Ok(HandoverClientOutcome::Busy);
+            }
+            bail!("daemon refused handover: {message}");
+        }
+
         let state_val = wire_resp
             .get("Ok")
             .and_then(|ok| ok.get("HandoverState"))
@@ -290,61 +378,101 @@ mod unix_impl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
 
-        Ok(())
+        Ok(HandoverClientOutcome::Transferred)
     }
 
-    pub fn complete_handover_adoption() -> Result<()> {
+    /// Send the `0x01` adoption byte and read the outgoing daemon's Phase-3
+    /// response, returning whether the successor should adopt or refuse.
+    ///
+    /// `peer_sends_commit` comes from the transferred [`HandoverState`]: it says
+    /// whether the outgoing daemon announces a `0x03` commit byte before it
+    /// detaches, which is what lets a pre-commit EOF be read as "the daemon kept
+    /// its sessions" (refuse) rather than "detached, `0x02` lost" (adopt). See
+    /// [`teardown_outcome`].
+    pub fn complete_handover_adoption(peer_sends_commit: bool) -> Result<TeardownOutcome> {
         let stream = HANDOVER_STREAM.lock().unwrap().take();
-        if let Some(mut stream) = stream {
-            // Deliberately no budget field here: the deadline that decides this
-            // handover belongs to the *outgoing* daemon's binary, which may be an
-            // older build with a different (shorter) bound. Logging our own
-            // constant would claim headroom that was never in force.
-            // Read rather than take, so the measurement survives for the error
-            // path below — the gap is the single most useful number to have when
-            // the write fails. Poisoning must not abort a swap over a log field,
-            // hence recovering the guard instead of unwrapping.
-            // `-1` rather than an absent field: a missing key is indistinguishable
-            // from an older daemon that never emitted one.
-            let gap_ms = PHASE1_COMPLETED_AT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .map_or(-1, |at| at.elapsed().as_millis() as i64);
-            tracing::info!(gap_ms, "Completing handover adoption (Phase 2 sync)...");
-            stream
-                .write_all(&[0x01])
-                .context("writing adoption sync byte (0x01) to old daemon")?;
-            stream.flush().context("flushing adoption sync byte")?;
+        let Some(mut stream) = stream else {
+            // No handover stream: this start was not driven by a handover, so
+            // there is no old daemon to sync with. Nothing to refuse.
+            return Ok(TeardownOutcome::Adopt);
+        };
 
-            tracing::info!("Waiting for old daemon teardown (Phase 3 sync)...");
-            stream.set_read_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))?;
-            let mut sync_byte = [0u8; 1];
-            if let Err(err) = stream.read_exact(&mut sync_byte) {
-                // Proceed even on EOF, deliberately. EOF is ambiguous: the
-                // outgoing daemon may have aborted before detaching (it still
-                // owns these sessions, and adopting adds a second destructive
-                // reader on each master), or it may have detached and exited
-                // with its 0x02 lost — the teardown path treats that write as
-                // best-effort precisely so a drained daemon still exits.
-                //
-                // Those call for opposite responses and the byte stream cannot
-                // tell them apart, so this resolves toward adopting: the first
-                // case corrupts output on a daemon the operator can restart,
-                // while refusing in the second strands every live session with
-                // no daemon owning it, which nothing can recover.
+        // Deliberately no budget field here: the deadline that decides this
+        // handover belongs to the *outgoing* daemon's binary, which may be an
+        // older build with a different (shorter) bound. Logging our own
+        // constant would claim headroom that was never in force.
+        // Read rather than take, so the measurement survives for the error
+        // path below — the gap is the single most useful number to have when
+        // the write fails. Poisoning must not abort a swap over a log field,
+        // hence recovering the guard instead of unwrapping.
+        // `-1` rather than an absent field: a missing key is indistinguishable
+        // from an older daemon that never emitted one.
+        let gap_ms = PHASE1_COMPLETED_AT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map_or(-1, |at| at.elapsed().as_millis() as i64);
+        tracing::info!(
+            gap_ms,
+            peer_sends_commit,
+            "Completing handover adoption (Phase 2 sync)..."
+        );
+
+        // Arm the Phase-3 read deadline *before* writing 0x01. Once that byte
+        // lands the outgoing daemon may detach its sessions, so from here on any
+        // error must not abort adoption — doing so would strand every session
+        // with no daemon owning it. set_read_timeout is a local setsockopt with
+        // no effect on the peer, so moving it ahead of the commit is free and
+        // removes the one fallible call that used to sit past the point of no
+        // return. (A failure on the 0x01 write itself is still fatal-by-`?`, and
+        // correctly so: a byte that never left means the outgoing daemon times
+        // out and keeps its sessions, so aborting here strands nothing.)
+        stream
+            .set_read_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))
+            .context("setting teardown read timeout on handover socket")?;
+        stream
+            .write_all(&[HANDOVER_ADOPT_BYTE])
+            .context("writing adoption sync byte (0x01) to old daemon")?;
+        stream.flush().context("flushing adoption sync byte")?;
+
+        tracing::info!("Waiting for old daemon teardown (Phase 3 sync)...");
+        let mut sync_byte = [0u8; 1];
+        let byte = match stream.read_exact(&mut sync_byte) {
+            Ok(()) => Some(sync_byte[0]),
+            Err(err) => {
+                tracing::warn!("Failed to read teardown byte from old daemon: {err}");
+                None
+            }
+        };
+
+        let outcome = teardown_outcome(peer_sends_commit, byte);
+        match (outcome, byte) {
+            (TeardownOutcome::Adopt, Some(HANDOVER_COMMIT_BYTE)) => {
+                tracing::info!("Old daemon committed to teardown (0x03); adopting.");
+            }
+            (TeardownOutcome::Adopt, Some(HANDOVER_DONE_BYTE)) => {
+                tracing::info!("Old daemon reported teardown complete (0x02); adopting.");
+            }
+            (TeardownOutcome::Adopt, _) => {
+                // Legacy peer (no commit byte announced) with an ambiguous EOF or
+                // stray byte: adopt, matching the historical behavior, because
+                // refusing would strand sessions an old daemon really did detach.
                 tracing::warn!(
-                    "Failed to read teardown sync byte (0x02) from old daemon, proceeding anyway: {err}"
+                    "Old daemon sent no commit byte and predates the commit protocol; \
+                     adopting to avoid stranding a real handover."
                 );
-            } else if sync_byte[0] != 0x02 {
-                tracing::warn!(
-                    "Unexpected sync byte from old daemon: {:02x}, proceeding anyway",
-                    sync_byte[0]
+            }
+            (TeardownOutcome::Refuse, _) => {
+                // The peer announced it commits before detaching, yet we saw no
+                // commit byte — it aborted and still owns its sessions. Adopting
+                // would put a second destructive reader on each master.
+                tracing::error!(
+                    "Old daemon announced a teardown-commit byte but never sent it, so it \
+                     aborted the handover and still owns its sessions. Refusing to adopt to \
+                     avoid corrupting them."
                 );
-            } else {
-                tracing::info!("Old daemon successfully shut down.");
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     #[derive(Debug)]

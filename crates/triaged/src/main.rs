@@ -203,32 +203,64 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     //     fight an in-flight manual deploy.
     #[cfg(unix)]
     {
+        use triaged::handover::HandoverClientOutcome;
+
         let socket_path = default_socket_path();
-        match probe_daemon_socket(&socket_path) {
-            DaemonSocketState::Live | DaemonSocketState::Unverifiable => {
-                tracing::info!(
-                    socket_path = %socket_path.display(),
-                    "existing daemon detected; initiating zero-downtime process handover"
-                );
-                // The handover client bounds its own wait; if the peer never
-                // completes the protocol (a hung daemon, or a non-triaged process
-                // on the socket), fall back to a fresh start rather than aborting
-                // launch. A fresh start that then finds the socket genuinely held
-                // will fail to bind with a clear error.
-                match triaged::handover::perform_handover_client(&socket_path) {
-                    Ok(()) => has_inherited_sessions = true,
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "handover to existing daemon failed; starting fresh"
-                    ),
-                }
-            }
-            DaemonSocketState::Absent => {
-                if is_handover {
-                    tracing::warn!(
+        // A daemon already serving a handover refuses ours with a "busy" signal
+        // (distinct from a dead peer). Retry on busy rather than fall back: the
+        // in-flight swap will finish shortly, and a fresh start would only fail to
+        // bind the port the outgoing daemon still holds. The deadline covers the
+        // outgoing daemon's full adoption wait so we converge instead of racing
+        // launchd's respawn. A genuine failure (dead/non-triaged peer) returns Err
+        // and falls back immediately — no long wait against a dead socket.
+        let busy_deadline = std::time::Instant::now()
+            + triaged::handover::HANDOVER_ADOPTION_TIMEOUT
+            + std::time::Duration::from_secs(5);
+        let mut backoff = std::time::Duration::from_millis(200);
+        loop {
+            match probe_daemon_socket(&socket_path) {
+                DaemonSocketState::Live | DaemonSocketState::Unverifiable => {
+                    tracing::info!(
                         socket_path = %socket_path.display(),
-                        "--handover requested but no running daemon found; starting fresh"
+                        "existing daemon detected; initiating zero-downtime process handover"
                     );
+                    match triaged::handover::perform_handover_client(&socket_path) {
+                        Ok(HandoverClientOutcome::Transferred) => {
+                            has_inherited_sessions = true;
+                            break;
+                        }
+                        Ok(HandoverClientOutcome::Busy) => {
+                            if std::time::Instant::now() >= busy_deadline {
+                                tracing::warn!(
+                                    "daemon stayed busy with another handover past the deadline; \
+                                     starting fresh"
+                                );
+                                break;
+                            }
+                            tracing::info!(
+                                "daemon is serving another handover; retrying in {}ms",
+                                backoff.as_millis()
+                            );
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "handover to existing daemon failed; starting fresh"
+                            );
+                            break;
+                        }
+                    }
+                }
+                DaemonSocketState::Absent => {
+                    if is_handover {
+                        tracing::warn!(
+                            socket_path = %socket_path.display(),
+                            "--handover requested but no running daemon found; starting fresh"
+                        );
+                    }
+                    break;
                 }
             }
         }
@@ -345,12 +377,53 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                 let state: triaged::handover::HandoverState = serde_json::from_str(&state_str)?;
                 let fds = triaged::handover::INHERITED_FDS.lock().unwrap().take();
                 if let Some(fds) = fds {
+                    use triaged::handover::TeardownOutcome;
+
                     // Complete Phase 2/3 sync FIRST before starting any PTY readers!
                     // This shuts down the old daemon's readers before we start ours.
-                    triaged::handover::complete_handover_adoption()?;
+                    // The outcome says whether the old daemon actually committed to
+                    // teardown (Adopt) or aborted while still owning its sessions
+                    // (Refuse) — see complete_handover_adoption / teardown_outcome.
+                    match triaged::handover::complete_handover_adoption(
+                        state.sends_teardown_commit,
+                    )? {
+                        TeardownOutcome::Refuse => {
+                            // The old daemon aborted and kept its sessions, so it is
+                            // still serving them on its own copies of the masters and
+                            // listener. Adopting our dup'd copies would put a second
+                            // destructive reader on each. Exit and let the OS close
+                            // our copies; the old daemon is unaffected, and launchd
+                            // respawns us to retry a clean handover. Exit here is
+                            // before the WS/IPC servers start, so nothing is torn
+                            // down that the old daemon isn't already running.
+                            tracing::error!(
+                                "outgoing daemon did not commit its teardown; it still owns its \
+                                 sessions. Exiting without adopting so a retry can hand over \
+                                 cleanly (the daemon keeps serving in the meantime)."
+                            );
+                            std::process::exit(0);
+                        }
+                        TeardownOutcome::Adopt => {}
+                    }
 
                     tracing::info!("Adopting {} inherited live sessions", state.sessions.len());
-                    manager.adopt_sessions(state, fds)?;
+                    // complete_handover_adoption() above sent the 0x01 commit
+                    // byte and the old daemon committed, so it has detached and
+                    // no longer owns these sessions. adopt_sessions inserts each
+                    // session as it goes, so a mid-loop failure (a rotated log
+                    // file, thread-spawn EAGAIN under fd pressure) still leaves
+                    // the ones already adopted live in this manager. Propagating
+                    // with `?` here would exit the successor too and close *every*
+                    // adopted master, orphaning the sessions that did adopt
+                    // cleanly — the exact loss handover exists to avoid. Keep the
+                    // daemon up and owning what it got instead.
+                    if let Err(error) = manager.adopt_sessions(state, fds) {
+                        tracing::error!(
+                            %error,
+                            "failed to fully adopt inherited sessions after the handover commit; \
+                             continuing with those already adopted so the daemon still owns them"
+                        );
+                    }
                     // Seed snippets now that adopted sessions are live, so the
                     // rail shows a description for each immediately after handover.
                     manager.seed_session_snippets();

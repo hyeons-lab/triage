@@ -135,4 +135,51 @@ mod tests {
 
         Ok(())
     }
+
+    // The two-process Phase-3 handshake (complete_handover_adoption /
+    // handle_handover_server) can't be exercised in-process — it does socket I/O
+    // between two daemons and ends in process::exit. The adopt-vs-refuse decision
+    // is factored into `teardown_outcome` precisely so its contract is testable
+    // here without that dance.
+    use crate::handover::{TeardownOutcome, teardown_outcome};
+
+    #[test]
+    fn commit_byte_always_adopts() {
+        // 0x03 is the explicit teardown-commit: adopt regardless of what the peer
+        // announced (a peer that sends the byte obviously supports it).
+        assert_eq!(teardown_outcome(true, Some(0x03)), TeardownOutcome::Adopt);
+        assert_eq!(teardown_outcome(false, Some(0x03)), TeardownOutcome::Adopt);
+    }
+
+    #[test]
+    fn done_byte_always_adopts() {
+        // 0x02 is a clean teardown from a daemon predating the commit byte; it
+        // detached before sending, so adopt.
+        assert_eq!(teardown_outcome(true, Some(0x02)), TeardownOutcome::Adopt);
+        assert_eq!(teardown_outcome(false, Some(0x02)), TeardownOutcome::Adopt);
+    }
+
+    #[test]
+    fn eof_from_committing_peer_refuses() {
+        // The peer announced it commits before detaching, yet sent no commit
+        // byte: it aborted and still owns its sessions. Adopting would put a
+        // second destructive reader on each master — refuse.
+        assert_eq!(teardown_outcome(true, None), TeardownOutcome::Refuse);
+    }
+
+    #[test]
+    fn eof_from_legacy_peer_adopts() {
+        // An older daemon that never announces the commit byte: EOF cannot tell an
+        // abort from a lost 0x02, and refusing would strand a real handover, so
+        // adopt — the historical behavior we must preserve for old peers.
+        assert_eq!(teardown_outcome(false, None), TeardownOutcome::Adopt);
+    }
+
+    #[test]
+    fn stray_byte_follows_the_eof_rule() {
+        // An unexpected byte is treated like no commit byte: refuse only when the
+        // peer claimed it would commit, adopt otherwise.
+        assert_eq!(teardown_outcome(true, Some(0x7f)), TeardownOutcome::Refuse);
+        assert_eq!(teardown_outcome(false, Some(0x7f)), TeardownOutcome::Adopt);
+    }
 }

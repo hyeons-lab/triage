@@ -31,6 +31,38 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   now best-effort (warn, still `process::exit(0)`) instead of `?`.
 - 2026-07-19T19:00-0700 `crates/triaged/src/main.rs` — comment only, recording
   why `SessionManager::default()` must stay *above* the Phase-2 sync.
+- 2026-07-20T12:31-0700 `crates/triaged/build.rs` — a missing `flutter` on PATH
+  when the bundle is missing or stale is now a `panic!` instead of a
+  `cargo:warning` that fell through to the `web_fallback/` placeholder.
+- 2026-07-20T12:32-0700 `.github/workflows/ci.yml` — workflow-level
+  `TRIAGE_SKIP_FLUTTER_BUILD: "1"`. The Rust jobs never install Flutter and would
+  now hit the new hard error; release packaging is unaffected because it stages a
+  prebuilt bundle into `dist/`, which the build script prefers.
+
+## Code Review (2026-07-20)
+
+A `/code-review max` pass over the branch diff plus the uncommitted build.rs/ci.yml
+changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
+
+- 2026-07-20T14:30-0700 `crates/triaged/build.rs`, `AGENTS.md`, `.github/workflows/ci.yml`
+  — the uncommitted missing-SDK hard-fail. Kept the hard failure for both a
+  missing *and* a stale bundle when Flutter is absent (an out-of-date client must
+  be corrected before building, per the project owner). Updated AGENTS.md to
+  document the new contract (it still described warn-and-fallback). Moved
+  `TRIAGE_SKIP_FLUTTER_BUILD` from workflow scope to the `check` and `test` jobs
+  so a future job that needs the real client can't silently inherit the
+  placeholder.
+- 2026-07-20T14:30-0700 `crates/triaged/src/handover.rs`, `main.rs` — post-commit
+  error handling. Moved `set_read_timeout` ahead of the 0x01 write so the last
+  fallible call no longer sits past the point of no return, and made
+  `adopt_sessions` failures log-and-continue rather than exit the successor
+  (exiting closed every already-adopted master, orphaning sessions that adopted
+  cleanly).
+- 2026-07-20T14:30-0700 `handover.rs`, `ipc.rs`, `session.rs`, `main.rs` — the
+  three protocol-level findings (see Decisions and Issues below): a teardown-commit
+  byte to end the EOF-adopt split-brain, a distinguishable busy refusal so a
+  concurrent launch retries instead of crash-looping, and refusing new sessions
+  while a handover is in flight.
 
 ## Decisions
 
@@ -54,6 +86,34 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   second destructive reader) from "detached, `0x02` lost" (refusing strands every
   session). Resolved toward adopting: the first is corruption on a daemon that
   can be restarted, the second is unrecoverable loss.
+- 2026-07-20T14:30-0700 End the EOF-adopt split-brain with a `0x03` teardown-commit
+  byte, gated on a backward-compatible `HandoverState.sends_teardown_commit` flag
+  (`#[serde(default)]`). The outgoing daemon sends `0x03` *before* detaching and
+  detaches only if that byte landed — the atomicity invariant `detach ⟺
+  commit-sent`. The successor, knowing the peer commits, reads a pre-commit EOF as
+  "aborted, sessions kept" and refuses rather than adopting a second destructive
+  reader. An older daemon sets no flag, so the successor keeps the legacy
+  adopt-on-EOF behavior for it — no regression across versions. The adopt/refuse
+  contract is the pure `teardown_outcome` fn so it is unit-tested without the
+  two-process socket dance (which has no automated harness).
+- 2026-07-20T14:30-0700 Refuse a concurrent handover with a distinguishable
+  `WireResponse::Err("handover already in flight")` sentinel instead of dropping
+  the connection. The client tells "busy, retry" from a dead peer and retries with
+  backoff up to the outgoing daemon's adoption deadline, instead of falling back to
+  a fresh start that fails to bind the still-held port and crash-loops under
+  launchd `KeepAlive`.
+- 2026-07-20T14:30-0700 Move the handover-in-flight flag onto `SessionManager`
+  (from an ipc-local static) so it also gates `start_session`: a session created
+  after the outgoing daemon snapshotted its set would not be in the transferred
+  fds and would be lost on detach. Refusing loudly for the ~swap duration beats a
+  silent loss. The 5s→60s widening had turned this from a <=5s window into a ~23s
+  one.
+- 2026-07-20T12:31-0700 A build that cannot produce the real client fails rather
+  than substituting the placeholder. The placeholder makes a missing SDK a silent
+  defect: the build succeeds, the daemon starts, and the only symptom is a client
+  that cannot connect — surfacing far from the build that caused it, on whatever
+  device someone next picks up. `TRIAGE_SKIP_FLUTTER_BUILD` stays as the
+  deliberate opt-out, so the escape hatch is explicit rather than the default.
 
 ## Issues
 
@@ -83,6 +143,37 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   non-fatal and making a Phase-3 EOF fatal are each defensible, but combined they
   lose every session when a daemon detaches and its `0x02` does not arrive. Only
   the pairing was wrong, which is why it survived review of each change alone.
+- **Deploying the fix shipped a placeholder client (2026-07-20).** The first
+  build of this branch ran without `flutter` on PATH, so `build.rs` warned and
+  embedded `web_fallback/`. The warning was not read closely — absence of it in a
+  truncated build log was taken as proof the real bundle was embedded — and the
+  19.6 MB binary was installed over `~/.cargo/bin/triaged` and hard-restarted.
+  The daemon then served a stub with no client in it, and the symptom appeared as
+  "cannot connect from my phone", nowhere near the build. The previous binary was
+  overwritten by the install with no backup, so the only way back was building the
+  bundle and rebuilding: 37.1 MB with the client, versus 19.6 MB without. Size is
+  the cheap check. This is what motivated the `build.rs` hard error above.
+- **The daemon's tracing output goes nowhere reachable.** `StandardOutPath` and
+  `StandardErrorPath` in the LaunchAgent have not been written since 2026-06-21,
+  and a successor launched by hand with stdout/stderr redirected produced an empty
+  file. There is no log-based way to watch a handover; the swap above had to be
+  verified from process state (`lsof` on the PTY masters and the listener). Worth
+  fixing before the next protocol change — this branch added a `gap_ms` field
+  precisely so the timing could be observed, and right now nothing can read it.
+
+- **The byte-level handshake has no automated integration coverage (2026-07-20).**
+  `handover_tests.rs` exercises serialize→adopt→detach in-process at the
+  `SessionManager` level; it never runs `complete_handover_adoption` /
+  `handle_handover_server`, which do cross-process socket I/O and end in
+  `process::exit`. The `0x03` commit protocol was therefore validated by (a) unit
+  tests on the extracted `teardown_outcome` decision function covering every
+  branch, and (b) the intent to run a real local handover. Residual risk on #4: it
+  adds no per-byte acks, so if the successor died after sending `0x01` but before
+  reading a `0x03` already buffered in the socket, the outgoing daemon would have
+  detached and the sessions would be lost — but a successor that dies mid-handover
+  loses those sessions in the pre-change code too, so this is a strict improvement,
+  not a new failure mode. A two-process handover test harness is the right
+  follow-up before further protocol changes.
 
 ## Research & Discoveries
 
@@ -100,6 +191,15 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   live daemon — including the `launchctl kickstart -k` an operator runs when a
   swap looks stuck. That is what makes the concurrent-handover race reachable
   rather than theoretical.
+- 2026-07-20T12:29-0700 **The fix validated itself in production.** Landing it
+  needed a hard restart, because the deadline is enforced by the *outgoing*
+  daemon and the running one still had the 5s bound — the fix could not be
+  deployed by the mechanism it repairs. Once it was running, the next swap went
+  through as a real handover: both live shells survived, reparented to PID 1
+  (adoption moves descriptors, not parentage), and the successor's listener
+  carried the same kernel socket address as its predecessor's — inherited via
+  `SCM_RIGHTS`, not rebound. The launchd `KeepAlive` respawn converged as
+  designed, handing over from the manual successor rather than fighting it.
 
 ## Next Steps
 
@@ -109,7 +209,15 @@ which kills every live PTY session — the exact outcome handover exists to avoi
 - Consider a distinct "committed to teardown" signal so a Phase-3 EOF can be
   disambiguated, which would let the successor refuse safely in the
   aborted-before-detach case.
+- Give the daemon a log sink that can actually be read. `gap_ms` and the handover
+  phase lines are unobservable while tracing goes nowhere, which cost real time
+  diagnosing the swap above.
+- Build a two-process handover integration test harness. The `0x03` commit
+  protocol, the busy-refusal retry, and the start_session gate are all validated
+  only by unit tests on extracted logic plus manual handovers; the wire sequencing
+  itself is untested by CI.
 
 ## Commits
 
-- HEAD — fix(triaged): stop the 5s adoption deadline from aborting valid handovers
+- cb8f4c0 — fix(triaged): stop the 5s adoption deadline from aborting valid handovers
+- HEAD — fix(triaged): gate teardown on a commit byte and fail the build on a missing client

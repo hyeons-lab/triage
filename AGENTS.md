@@ -114,15 +114,25 @@ so a build can't quietly ship a stale UI:
   build killed mid-flight (Ctrl-C skips the `Drop` guard) can't wedge later builds. The lock
   carries the holder's identity, so a reclaimed lock is never refreshed or deleted by its
   original owner.
-- With no Flutter SDK on `PATH` (the Rust-only CI job) or no client sources (a crates.io
-  tarball), it warns and builds against whatever bundle is present.
-- `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild and builds against whatever bundle is
-  already there — including none, in which case the `web_fallback/` placeholder is embedded.
-  Use it for a fast Rust-only iteration loop when you aren't touching Dart. Empty, `0`, and
-  `false` do *not* opt out — a value that reads as negative must not silently disable the
-  rebuild.
+- With no client sources present (a crates.io tarball), there is nothing to build from and
+  the script does nothing.
+- With client sources present but no Flutter SDK on `PATH`, a bundle that is missing or stale
+  is a **hard build failure**, not a warning. Silently embedding the `web_fallback/`
+  placeholder shipped a daemon that could not serve its client, with the only symptom
+  surfacing far from the build; and embedding a stale bundle ships a UI that does not match
+  the sources. Either way the situation must be corrected — install the SDK / put it on `PATH`
+  so the real client is built — before the build proceeds. Set `TRIAGE_SKIP_FLUTTER_BUILD=1`
+  to build without Flutter on purpose.
+- `TRIAGE_SKIP_FLUTTER_BUILD=1` skips the rebuild *and* the missing-SDK hard failure, building
+  against whatever bundle is already there — including none, in which case the `web_fallback/`
+  placeholder is embedded. Use it for a fast Rust-only iteration loop when you aren't touching
+  Dart, and for Rust jobs in CI that compile or test the daemon but never serve its client
+  (scope it to those jobs, not the whole workflow, so a job that *does* need the real client
+  can't silently inherit the placeholder). Empty, `0`, and `false` do *not* opt out — a value
+  that reads as negative must not silently disable the rebuild.
 
-A failing `flutter build web` fails the cargo build rather than silently falling back.
+A failing `flutter build web`, like a missing SDK with no current bundle, fails the cargo
+build rather than silently falling back.
 
 ## Versioning and releases
 

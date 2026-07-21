@@ -242,6 +242,12 @@ pub struct SessionManager {
     /// so a daemon kill can restore a session into the directory it was last in.
     /// `None` until `start_cwd_persistence` runs (e.g. in tests).
     cwd_update_tx: Mutex<Option<CwdUpdateSender>>,
+    /// Set while this daemon is serving a handover. It enforces one handover at a
+    /// time and, critically, blocks `start_session`: a session created after the
+    /// outgoing daemon snapshotted its set would not be among the transferred
+    /// descriptors and would be lost when that daemon detaches and exits. Set and
+    /// cleared through [`SessionManager::begin_handover`].
+    handover_in_flight: AtomicBool,
 }
 
 /// Channel an actor uses to report a working-directory change to the manager's
@@ -450,7 +456,20 @@ impl SessionManager {
             global_senders: Arc::new(Mutex::new(Vec::new())),
             update_status: Arc::new(RwLock::new(crate::update::UpdateStatus::current())),
             cwd_update_tx: Mutex::new(None),
+            handover_in_flight: AtomicBool::new(false),
         }
+    }
+
+    /// Claim the handover slot for the caller. Returns `None` when a handover is
+    /// already in flight, so the caller can refuse a concurrent one. While the
+    /// returned guard lives, [`SessionApi::start_session`] is refused. Cleared on
+    /// drop — a handover that fails before committing leaves the daemon able to
+    /// serve a later one and to start sessions again.
+    pub fn begin_handover(&self) -> Option<HandoverGuard<'_>> {
+        self.handover_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| HandoverGuard { manager: self })
     }
 
     fn allocate_session_id(&self) -> Result<SessionId> {
@@ -1088,6 +1107,9 @@ impl SessionManager {
         let state = crate::handover::HandoverState {
             sessions: handover_sessions,
             has_tcp_listener: false,
+            // handle_handover_server sets this true once it takes over the wire
+            // protocol; the manager itself makes no protocol promise.
+            sends_teardown_commit: false,
         };
 
         Ok((state, fds))
@@ -1299,6 +1321,20 @@ impl Default for SessionManager {
     }
 }
 
+/// Held for the duration of a handover this daemon serves; clears the manager's
+/// handover-in-flight flag on drop. See [`SessionManager::begin_handover`].
+pub struct HandoverGuard<'a> {
+    manager: &'a SessionManager,
+}
+
+impl Drop for HandoverGuard<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .handover_in_flight
+            .store(false, Ordering::Release);
+    }
+}
+
 impl SessionApi for SessionManager {
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
         let sessions = self.sessions()?;
@@ -1306,6 +1342,14 @@ impl SessionApi for SessionManager {
     }
 
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
+        // Refuse while a handover is in flight: the outgoing daemon has already
+        // snapshotted the session set it is transferring, so a session started
+        // now would not be among the handed-off descriptors and would be lost
+        // when that daemon detaches and exits. The window is brief (a swap), and
+        // failing loudly is far better than silently dropping the session.
+        if self.handover_in_flight.load(Ordering::Acquire) {
+            bail!("a handover is in progress; try again once the daemon swap completes");
+        }
         request.validate()?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
