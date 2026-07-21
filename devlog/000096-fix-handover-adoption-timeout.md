@@ -25,8 +25,12 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   recording it.
 - 2026-07-19T18:30-0700 `crates/triaged/src/ipc.rs` — Phase-2 wait uses the
   shared 60s constant.
-- 2026-07-19T18:52-0700 `crates/triaged/src/ipc.rs` — added
-  `HandoverInFlightGuard`, a single-flight guard around `handle_handover_server`.
+- 2026-07-19T18:52-0700 `crates/triaged/src/session.rs`, `ipc.rs` — single-flight
+  handover guard. Final state: the flag lives on `SessionManager`
+  (`handover_in_flight`) and is claimed via `begin_handover()`, which returns a
+  `HandoverGuard` that clears it on drop; `handle_handover_server` acquires it.
+  It began as an ipc-local `HandoverInFlightGuard` static and moved onto the
+  manager so it also gates `start_session` (see Decisions).
 - 2026-07-19T18:57-0700 `crates/triaged/src/ipc.rs` — the Phase-3 `0x02` write is
   now best-effort (warn, still `process::exit(0)`) instead of `?`.
 - 2026-07-19T19:00-0700 `crates/triaged/src/main.rs` — comment only, recording
@@ -34,15 +38,12 @@ which kills every live PTY session — the exact outcome handover exists to avoi
 - 2026-07-20T12:31-0700 `crates/triaged/build.rs` — a missing `flutter` on PATH
   when the bundle is missing or stale is now a `panic!` instead of a
   `cargo:warning` that fell through to the `web_fallback/` placeholder.
-- 2026-07-20T12:32-0700 `.github/workflows/ci.yml` — workflow-level
-  `TRIAGE_SKIP_FLUTTER_BUILD: "1"`. The Rust jobs never install Flutter and would
-  now hit the new hard error; release packaging is unaffected because it stages a
-  prebuilt bundle into `dist/`, which the build script prefers.
-
-## Code Review (2026-07-20)
-
-A `/code-review max` pass over the branch diff plus the uncommitted build.rs/ci.yml
-changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
+- 2026-07-20T12:32-0700 `.github/workflows/ci.yml` — `TRIAGE_SKIP_FLUTTER_BUILD:
+  "1"` scoped to the `check` and `test` jobs (not the workflow), so a future job
+  that needs the real client can't silently inherit the placeholder. Those Rust
+  jobs never install Flutter and would otherwise hit the new hard error; release
+  packaging is unaffected because it stages a prebuilt bundle into `dist/`, which
+  the build script prefers.
 
 - 2026-07-20T14:30-0700 `crates/triaged/build.rs`, `AGENTS.md`, `.github/workflows/ci.yml`
   — the uncommitted missing-SDK hard-fail. Kept the hard failure for both a
@@ -63,6 +64,98 @@ changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
   byte to end the EOF-adopt split-brain, a distinguishable busy refusal so a
   concurrent launch retries instead of crash-looping, and refusing new sessions
   while a handover is in flight.
+- 2026-07-20T19:50-0700 `crates/triaged/src/session.rs` — `restore_session` gained
+  the same authoritative handover gate as `start_session`; it also inserts a Live
+  session, so without it the gate was only half-closed.
+- 2026-07-21T09:15-0700 `crates/triaged/src/handover.rs`, `main.rs`,
+  `handover_tests.rs` — a Phase-3 EOF now probes whether the peer is still
+  listening (`peer_still_listening`) and `TeardownSignal::Eof` carries
+  `peer_alive`. A daemon that *aborted* closes the connection and keeps serving
+  (refuse), but one that was **killed** closes it by dying — and refusing there
+  destroyed sessions that were still perfectly alive, since the successor held
+  the only remaining handles. Reachable via the documented `launchctl kickstart
+  -k` on a stuck swap. A dead peer now always adopts.
+- 2026-07-21T09:40-0700 `crates/triaged/src/session.rs` — `restore_session`'s new
+  handover gate rolls the entry back to `Historical` before bailing, matching the
+  spawn- and snapshot-failure paths beside it. Without the rollback the entry
+  stuck as `Restoring` forever, and since an aborted handover leaves this daemon
+  serving, the "try again once the swap completes" it returns could never come
+  true — the session was unusable until a restart.
+- 2026-07-21T09:40-0700 `crates/triaged/src/ipc.rs`, `session.rs` — descriptors
+  staged for an SCM_RIGHTS send are now closed by `Drop` (`StagedFds`) rather than
+  a trailing loop, and `serialize_active_sessions` closes what it duplicated when
+  it aborts. Both previously leaked on paths between staging and sending (the TCP
+  `dup`, response serialization, an actor that stopped answering). This used to be
+  harmless because the process was about to exit; now that an aborted handover
+  leaves the daemon running and retryable, the leaks accumulate.
+- 2026-07-21T10:05-0700 `crates/triaged/src/ipc.rs`, `main.rs` — closed the two
+  remaining swap races, both created by the commit byte releasing the successor
+  *before* the outgoing daemon finishes teardown:
+  - The successor could adopt and then die at `bind_owner_socket`, which bailed
+    while the predecessor still held the socket — taking every adopted session
+    with it. `IpcConfig::bind_grace` (only set when sessions were inherited) now
+    waits the predecessor out for `HANDOVER_TEARDOWN_TIMEOUT`; the bind split into
+    `try_bind_owner_socket`, whose `Ok(None)` marks the one retryable condition. A
+    fresh start keeps a zero grace, so a genuinely occupied socket still fails
+    immediately.
+  - The outgoing daemon now unlinks the socket only while it is still the one it
+    bound, matched on `(dev, ino)` recorded at bind time (`unlink_own_socket`). It
+    was released before that unlink, so a fast successor could bind and then have
+    its *live* socket deleted by its predecessor, leaving it serving where no
+    client could reach it. Skipping the unlink entirely was the first attempt and
+    was worse in a different way: a file left behind on every swap widens the
+    window where two concurrent starters both remove it and both bind. Checking
+    identity keeps the cleanup and touches no one else's socket.
+- 2026-07-21T10:35-0700 `crates/triaged/src/ipc.rs` — inside a bind grace, *any*
+  bind failure retries rather than propagating. The caller that sets a grace holds
+  adopted masters, so returning exits the process and loses every one of them; the
+  races are real and benign (a predecessor on an older build still unlinks, so our
+  `remove_file` can lose to it and report `NotFound`; a bind can lose to another
+  launch and report `EADDRINUSE`). Zero grace still propagates immediately. Added
+  tests for both grace paths — the zero-grace default is the only thing keeping a
+  fresh start from waiting instead of failing loudly, and nothing covered it.
+- 2026-07-21T10:50-0700 `crates/triaged/src/handover.rs` — noted at
+  `AdoptedMasterPty` why it deliberately has no `Drop`. This branch briefly added
+  one to plug the same leak `UnadoptedFds` covers; it was removed on rebase. The
+  assumption behind it — that a handover's `process::exit` skips the `Drop` — is
+  false: `SessionActor::detach` drops the actor's command sender, `run_actor`
+  unwinds its state, and the close would run while the session is live. Closing
+  unclaimed descriptors in `adopt_sessions` is the narrower fix and covers the
+  in-flight fd, which the `Drop` did not.
+- 2026-07-20T19:50-0700 `crates/triaged/src/handover.rs`, `handover_tests.rs` —
+  a Phase-3 read **timeout** and a **closed socket** were both collapsed to
+  `None` and both resolved to `Refuse`. They are opposites: a timeout leaves the
+  peer connected and able to commit, and the outgoing daemon's detach is gated
+  only on its own commit-byte write succeeding — never on the successor still
+  being alive. So refusing on a slow peer orphaned every session the moment that
+  write landed late. Introduced `TeardownSignal { Byte, Eof, Timeout }`;
+  `Timeout` now always adopts, `Eof` refuses only from a committing peer.
+  `teardown_outcome` also matches the named byte constants instead of literals.
+- 2026-07-20T19:50-0700 `crates/triaged/src/session.rs` — the `start_session`
+  handover gate was a TOCTOU: it checked the flag, then forked a PTY (tens of
+  ms), then inserted. A handover starting in that window snapshotted without the
+  session and `detach_all_live_sessions` dropped it. The authoritative check now
+  runs under the same `sessions` lock `serialize_active_sessions` holds for its
+  whole snapshot, so the session is either transferred or refused.
+- 2026-07-20T19:50-0700 `crates/triaged/src/session.rs` — `adopt_sessions` now
+  owns its inherited descriptors through `PendingFds`, which closes any it never
+  adopted. A bare `Vec<RawFd>` closes nothing on drop, so a partial adoption
+  leaked fds and left children attached to a PTY nobody drains.
+- 2026-07-20T19:50-0700 `crates/triaged/src/main.rs` — the busy-retry loop no
+  longer treats an absent socket as terminal once a swap is known to be in
+  flight (the outgoing daemon unlinks the socket before exit, while the winner
+  binds much later); and the `Refuse` path now returns an `Err` instead of
+  `process::exit`, so a manual deploy still gets a non-zero status *and* main's
+  `WorkerGuard` drops — `process::exit` skipped it, and that guard is the only
+  thing that flushes the non-blocking tracing appender, so the message explaining
+  the refusal would likely never have reached the log. launchd respawns either
+  way (`KeepAlive: true`, not `SuccessfulExit`).
+- 2026-07-20T19:50-0700 `crates/triaged/src/ipc.rs`, `handover.rs`, `main.rs` —
+  documentation accuracy: `handle_handover_server`'s doc comment described the
+  deleted `HANDOVER_IN_FLIGHT` static, and two comments claimed the teardown
+  handshake ends the double-reader window. It does not — `detach()` only drops
+  join handles, so the outgoing daemon reads until `process::exit`. Corrected
+  and recorded as a follow-up.
 
 ## Code Review (2026-07-21)
 
@@ -227,12 +320,18 @@ changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
 - Make the historical-session restore lazy or cheaper. It is the actual root
   cause; the gap grows on the same trajectory that breached 5s, and `gap_ms` now
   makes that trend visible.
-- Consider a distinct "committed to teardown" signal so a Phase-3 EOF can be
-  disambiguated, which would let the successor refuse safely in the
-  aborted-before-detach case.
+- Make `SessionActor::detach()` join its reader threads, so the handoff becomes
+  exclusive at the commit byte rather than at the outgoing daemon's
+  `process::exit`. Today `detach` only drops the join handles, so both daemons
+  read the same masters until that exit; the window is short but real, and it is
+  the last place a handover can still split a session's output.
 - Give the daemon a log sink that can actually be read. `gap_ms` and the handover
   phase lines are unobservable while tracing goes nowhere, which cost real time
   diagnosing the swap above.
+- Teach the actor to tear down a half-built session. If the worker thread fails to
+  spawn during adoption, the reader thread started just before it lingers (parked
+  in `read`) until the child's next output, holding a dup'd master fd. Bounded and
+  self-clearing, but not deterministic.
 - Build a two-process handover integration test harness. The `0x03` commit
   protocol, the busy-refusal retry, and the start_session gate are all validated
   only by unit tests on extracted logic plus manual handovers; the wire sequencing
@@ -242,4 +341,5 @@ changes surfaced 8 findings; all were addressed. Grouped by the code they touch:
 
 - cb8f4c0 — fix(triaged): stop the 5s adoption deadline from aborting valid handovers
 - 55212d4 — fix(triaged): gate teardown on a commit byte and fail the build on a missing client
-- HEAD — fix(triaged): close handover fds that no session adopts
+- 8124aed — fix(triaged): close handover fds that no session adopts
+- HEAD — fix(triaged): close the session-loss holes a multi-round review found

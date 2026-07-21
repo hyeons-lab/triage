@@ -1080,11 +1080,26 @@ impl SessionManager {
                     continue;
                 }
 
-                let ext = match rx.recv().context("waiting for extract response")? {
-                    Ok(ext) => ext,
-                    Err(err) => {
+                let ext = match rx.recv() {
+                    Ok(Ok(ext)) => ext,
+                    Ok(Err(err)) => {
                         tracing::warn!(session_id = %id, ?err, "Actor failed to extract handover state");
                         continue;
+                    }
+                    Err(err) => {
+                        // Aborting the whole handover here is deliberate: a
+                        // half-transferred set would silently drop the sessions we
+                        // skipped. But the daemon survives this abort and can serve
+                        // a later attempt, so the masters already duplicated for
+                        // this attempt must be closed rather than left to
+                        // accumulate across retries.
+                        for fd in fds.drain(..) {
+                            // Safety: each fd is a `dup` produced for this transfer
+                            // and owned solely by this vector; nothing has been sent
+                            // to a peer yet.
+                            unsafe { libc::close(fd) };
+                        }
+                        return Err(err).context("waiting for extract response");
                     }
                 };
 
@@ -1217,6 +1232,15 @@ impl SessionManager {
                     };
                     run_actor(state, command_rx, output_rx);
                 })
+                // If this spawn fails the closure is dropped, which drops `master`
+                // (closing the adopted fd — see AdoptedMasterPty's Drop) and
+                // `output_rx`. The reader thread started just above outlives that
+                // by design: it is blocked in `read`, and only notices on its next
+                // send, which fails against the dropped receiver and ends it. So an
+                // idle session leaves one thread and its dup'd fd parked until the
+                // child next writes. Bounded and self-clearing, but not immediate —
+                // making it deterministic means teaching the actor to tear down a
+                // half-built session, which is tracked as a follow-up.
                 .context("spawning session actor worker thread")?;
 
             let actor = SessionActor {
@@ -1401,6 +1425,10 @@ impl SessionApi for SessionManager {
         // now would not be among the handed-off descriptors and would be lost
         // when that daemon detaches and exits. The window is brief (a swap), and
         // failing loudly is far better than silently dropping the session.
+        //
+        // This early check is only a courtesy so we don't fork a PTY we are about
+        // to throw away; it is NOT the one that makes this safe. The authoritative
+        // re-check happens below under the `sessions` lock — see there.
         if self.handover_in_flight.load(Ordering::Acquire) {
             bail!("a handover is in progress; try again once the daemon swap completes");
         }
@@ -1429,6 +1457,23 @@ impl SessionApi for SessionManager {
         )?;
 
         let mut sessions = self.sessions()?;
+
+        // Authoritative handover gate. The check at the top of this function ran
+        // before `spawn_managed` forked the PTY — tens of milliseconds ago — so a
+        // handover that began in the meantime would have snapshotted the session
+        // set without this session, and `detach_all_live_sessions` would then drop
+        // it on the floor when the outgoing daemon exits. Re-checking here closes
+        // that window, because `serialize_active_sessions` holds this same lock
+        // for the whole of its snapshot: either we insert before it starts (and
+        // are transferred), or we observe the flag it set and refuse.
+        //
+        // The forked child is killed by dropping `actor` on this path, which is
+        // correct — it never became a session anyone can reach.
+        if self.handover_in_flight.load(Ordering::Acquire) {
+            drop(sessions);
+            bail!("a handover is in progress; try again once the daemon swap completes");
+        }
+
         sessions.insert(
             session_id.clone(),
             ManagedSession::Live {
@@ -1686,6 +1731,27 @@ impl SessionApi for SessionManager {
         };
 
         let mut sessions = self.sessions()?;
+
+        // Same authoritative handover gate as `start_session`: this also inserts a
+        // Live session, so a swap that snapshotted before we got here would leave
+        // this one out of the transferred descriptors and `detach_all_live_sessions`
+        // would drop it. Checked under the `sessions` lock that
+        // `serialize_active_sessions` holds across its whole snapshot, so we either
+        // land before it starts or observe the flag it set.
+        if self.handover_in_flight.load(Ordering::Acquire) {
+            drop(sessions);
+            // Roll back to Historical before bailing, exactly as the spawn- and
+            // snapshot-failure paths above do. Without this the entry stays
+            // `Restoring` forever: `restore_session` would reject it as "already
+            // live or restoring" and snapshotting bails on `Restoring`, so if the
+            // handover then aborts — which it can, leaving this daemon serving —
+            // the session is unusable until a restart, and the "try again once the
+            // swap completes" this returns could never come true.
+            self.rollback_restoring_session(request.session_id.clone())?;
+            actor.shutdown()?;
+            bail!("a handover is in progress; try again once the daemon swap completes");
+        }
+
         let existing = sessions
             .remove(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;

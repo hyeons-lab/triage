@@ -225,30 +225,52 @@ mod tests {
     // between two daemons and ends in process::exit. The adopt-vs-refuse decision
     // is factored into `teardown_outcome` precisely so its contract is testable
     // here without that dance.
-    use crate::handover::{TeardownOutcome, teardown_outcome};
+    use crate::handover::{TeardownOutcome, TeardownSignal, teardown_outcome};
 
     #[test]
     fn commit_byte_always_adopts() {
         // 0x03 is the explicit teardown-commit: adopt regardless of what the peer
         // announced (a peer that sends the byte obviously supports it).
-        assert_eq!(teardown_outcome(true, Some(0x03)), TeardownOutcome::Adopt);
-        assert_eq!(teardown_outcome(false, Some(0x03)), TeardownOutcome::Adopt);
+        let signal = TeardownSignal::Byte(0x03);
+        assert_eq!(teardown_outcome(true, signal), TeardownOutcome::Adopt);
+        assert_eq!(teardown_outcome(false, signal), TeardownOutcome::Adopt);
     }
 
     #[test]
     fn done_byte_always_adopts() {
         // 0x02 is a clean teardown from a daemon predating the commit byte; it
         // detached before sending, so adopt.
-        assert_eq!(teardown_outcome(true, Some(0x02)), TeardownOutcome::Adopt);
-        assert_eq!(teardown_outcome(false, Some(0x02)), TeardownOutcome::Adopt);
+        let signal = TeardownSignal::Byte(0x02);
+        assert_eq!(teardown_outcome(true, signal), TeardownOutcome::Adopt);
+        assert_eq!(teardown_outcome(false, signal), TeardownOutcome::Adopt);
     }
 
     #[test]
-    fn eof_from_committing_peer_refuses() {
-        // The peer announced it commits before detaching, yet sent no commit
-        // byte: it aborted and still owns its sessions. Adopting would put a
-        // second destructive reader on each master — refuse.
-        assert_eq!(teardown_outcome(true, None), TeardownOutcome::Refuse);
+    fn eof_from_a_living_committing_peer_refuses() {
+        // The peer announced it commits before detaching, closed the connection
+        // without sending the byte, and is still serving: it aborted and still
+        // owns its sessions. Adopting would put a second destructive reader on
+        // each master — refuse.
+        assert_eq!(
+            teardown_outcome(true, TeardownSignal::Eof { peer_alive: true }),
+            TeardownOutcome::Refuse
+        );
+    }
+
+    #[test]
+    fn eof_from_a_dead_peer_always_adopts() {
+        // The peer died mid-handover (e.g. `launchctl kickstart -k` on a swap that
+        // looked stuck). Its descriptors died with it, so this process holds the
+        // only handles left and refusing would destroy sessions that are still
+        // alive. Adopt regardless of what it announced.
+        assert_eq!(
+            teardown_outcome(true, TeardownSignal::Eof { peer_alive: false }),
+            TeardownOutcome::Adopt
+        );
+        assert_eq!(
+            teardown_outcome(false, TeardownSignal::Eof { peer_alive: false }),
+            TeardownOutcome::Adopt
+        );
     }
 
     #[test]
@@ -256,14 +278,34 @@ mod tests {
         // An older daemon that never announces the commit byte: EOF cannot tell an
         // abort from a lost 0x02, and refusing would strand a real handover, so
         // adopt — the historical behavior we must preserve for old peers.
-        assert_eq!(teardown_outcome(false, None), TeardownOutcome::Adopt);
+        assert_eq!(
+            teardown_outcome(false, TeardownSignal::Eof { peer_alive: true }),
+            TeardownOutcome::Adopt
+        );
+    }
+
+    #[test]
+    fn timeout_always_adopts_even_from_a_committing_peer() {
+        // The distinction that matters most: unlike EOF, a timeout leaves the peer
+        // connected and able to commit. Its detach is gated only on its own
+        // commit-byte write, so refusing here would exit the successor and orphan
+        // every session the moment that write lands late. Adopt in both cases.
+        assert_eq!(
+            teardown_outcome(true, TeardownSignal::Timeout),
+            TeardownOutcome::Adopt
+        );
+        assert_eq!(
+            teardown_outcome(false, TeardownSignal::Timeout),
+            TeardownOutcome::Adopt
+        );
     }
 
     #[test]
     fn stray_byte_follows_the_eof_rule() {
         // An unexpected byte is treated like no commit byte: refuse only when the
         // peer claimed it would commit, adopt otherwise.
-        assert_eq!(teardown_outcome(true, Some(0x7f)), TeardownOutcome::Refuse);
-        assert_eq!(teardown_outcome(false, Some(0x7f)), TeardownOutcome::Adopt);
+        let signal = TeardownSignal::Byte(0x7f);
+        assert_eq!(teardown_outcome(true, signal), TeardownOutcome::Refuse);
+        assert_eq!(teardown_outcome(false, signal), TeardownOutcome::Adopt);
     }
 }

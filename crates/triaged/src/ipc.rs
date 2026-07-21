@@ -191,13 +191,35 @@ pub fn display_endpoint(path: &Path) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcConfig {
     pub socket_path: PathBuf,
+    /// How long to keep retrying a bind that fails only because another daemon
+    /// still holds the socket.
+    ///
+    /// Zero for a normal start: finding the socket genuinely owned means another
+    /// daemon is running, and failing immediately is the correct, loud answer.
+    ///
+    /// A successor that adopted sessions through a handover is the exception. It
+    /// can reach this point while its predecessor is still finishing teardown, and
+    /// there it owns live PTY masters — exiting would take every adopted session
+    /// down with it. Waiting out the predecessor's exit turns a lost swap into a
+    /// slightly slower one. See [`IpcConfig::with_bind_grace`].
+    pub bind_grace: std::time::Duration,
 }
 
 impl IpcConfig {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            bind_grace: std::time::Duration::ZERO,
         }
+    }
+
+    /// Tolerate a socket still held by a predecessor for up to `grace`.
+    ///
+    /// Only meaningful for a daemon that adopted sessions via handover; see
+    /// [`IpcConfig::bind_grace`].
+    pub fn with_bind_grace(mut self, grace: std::time::Duration) -> Self {
+        self.bind_grace = grace;
+        self
     }
 }
 
@@ -222,7 +244,7 @@ impl IpcServer {
 
     #[cfg(unix)]
     pub fn serve(self) -> Result<()> {
-        let listener = bind_owner_socket(&self.config.socket_path)?;
+        let listener = bind_owner_socket(&self.config.socket_path, self.config.bind_grace)?;
 
         loop {
             match listener.accept() {
@@ -616,8 +638,84 @@ fn sanitize_path_component(value: String) -> String {
         .collect()
 }
 
+/// `(device, inode)` of the socket this daemon bound.
+///
+/// Recorded so teardown can tell its own socket from one a successor has since
+/// bound at the same path. Without that check the choice is between never
+/// cleaning up (leaving a stale file every swap, which widens the
+/// unlink-then-bind race between two concurrent starters) and unlinking blindly
+/// (which can delete a live successor's socket, since the commit byte releases it
+/// before we exit). Comparing identity gets both: we clean up after ourselves and
+/// never touch anyone else's.
 #[cfg(unix)]
-fn bind_owner_socket(socket_path: &Path) -> Result<UnixListener> {
+static OWNED_SOCKET_ID: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+
+/// Remove `socket_path`, but only while it still refers to the socket this
+/// process bound. A no-op if a successor has already rebound the path.
+#[cfg(unix)]
+fn unlink_own_socket(socket_path: &Path) {
+    let owned = *OWNED_SOCKET_ID
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(owned) = owned else {
+        return;
+    };
+    if let Ok(meta) = fs::metadata(socket_path)
+        && (meta.dev(), meta.ino()) == owned
+    {
+        let _ = fs::remove_file(socket_path);
+    }
+}
+
+/// Bind the owner socket, waiting out a predecessor that still holds it for up to
+/// `grace` (see [`IpcConfig::bind_grace`]). With a zero grace this fails on the
+/// first attempt, exactly as an ordinary start should.
+#[cfg(unix)]
+fn bind_owner_socket(socket_path: &Path, grace: std::time::Duration) -> Result<UnixListener> {
+    let deadline = std::time::Instant::now() + grace;
+    let mut backoff = std::time::Duration::from_millis(50);
+    loop {
+        match try_bind_owner_socket(socket_path) {
+            Ok(Some(listener)) => return Ok(listener),
+            Ok(None) => {}
+            // Inside the grace, retry *any* failure rather than propagating it.
+            // The caller that sets a grace is holding adopted PTY masters, so
+            // returning here exits the process and loses every one of them —
+            // strictly worse than trying again. These races are real and benign:
+            // a predecessor on an older build still unlinks on its way out, so
+            // our `remove_file` can lose to it and report NotFound, and a bind can
+            // lose to whoever else is starting and report EADDRINUSE. With a zero
+            // grace the deadline has already passed and the error propagates
+            // immediately, exactly as a fresh start requires.
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    socket_path = %socket_path.display(),
+                    %error,
+                    "bind attempt failed while a predecessor finishes teardown; retrying"
+                );
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("Unix socket {} is already in use", socket_path.display());
+        }
+        tracing::info!(
+            socket_path = %socket_path.display(),
+            "socket still held by the outgoing daemon; retrying bind in {}ms",
+            backoff.as_millis()
+        );
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+    }
+}
+
+/// One bind attempt. `Ok(None)` means a live daemon currently owns the socket —
+/// the single condition that is worth retrying; every other failure is returned
+/// as an error.
+#[cfg(unix)]
+fn try_bind_owner_socket(socket_path: &Path) -> Result<Option<UnixListener>> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating socket directory {}", parent.display()))?;
@@ -627,7 +725,9 @@ fn bind_owner_socket(socket_path: &Path) -> Result<UnixListener> {
 
     if socket_path.exists() {
         match UnixStream::connect(socket_path) {
-            Ok(_) => bail!("Unix socket {} is already in use", socket_path.display()),
+            // Someone is answering: retryable, since during a handover that
+            // someone is a predecessor on its way out.
+            Ok(_) => return Ok(None),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -649,7 +749,14 @@ fn bind_owner_socket(socket_path: &Path) -> Result<UnixListener> {
         .with_context(|| format!("binding Unix socket {}", socket_path.display()))?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("securing Unix socket {}", socket_path.display()))?;
-    Ok(listener)
+    // Remember which socket is ours so teardown never unlinks a successor's. A
+    // failure here only costs the cleanup, so it must not fail the bind.
+    if let Ok(meta) = fs::metadata(socket_path) {
+        *OWNED_SOCKET_ID
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((meta.dev(), meta.ino()));
+    }
+    Ok(Some(listener))
 }
 
 #[cfg(unix)]
@@ -722,16 +829,44 @@ fn dispatch_request(
     Ok(())
 }
 
-/// Set while a handover is being served, so only one can run at a time.
+/// Descriptors duplicated for an SCM_RIGHTS send, closed on drop.
 ///
-/// Every connection is dispatched on its own thread (`spawn_client_handler`),
-/// and a handover parks that thread until its successor answers. A second
-/// handover accepted during that window would dup and ship the *same* PTY
-/// masters to a second successor; whichever successor commits first drives this
-/// daemon through teardown and exit, leaving two processes holding live masters
-/// for the same sessions. PTY reads are destructive, so each session's output
-/// would then be split arbitrarily between them.
+/// `sendmsg` installs independent descriptors in the receiver, so this process
+/// must always close its own copies. Doing that through `Drop` rather than a
+/// trailing loop covers the fallible steps in between — duplicating the TCP
+/// listener, serializing the response — which would otherwise return with the
+/// masters still open. That matters now that an aborted handover leaves this
+/// daemon running and able to serve a later attempt: leaks accumulate across
+/// retries instead of being reclaimed by process exit.
+#[cfg(unix)]
+struct StagedFds(Vec<std::os::unix::io::RawFd>);
+
+#[cfg(unix)]
+impl Drop for StagedFds {
+    fn drop(&mut self) {
+        for fd in self.0.drain(..) {
+            // Safety: each fd is a `dup` this function owns; the receiver's copies
+            // are separate descriptors installed by the kernel.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Serve this daemon's side of a process handover: ship session state and the
+/// PTY master descriptors to the successor, wait for its adoption byte, then
+/// commit to teardown and exit.
 ///
+/// Only one handover runs at a time — the slot is claimed through
+/// `SessionManager::begin_handover`, whose guard also blocks `start_session` for
+/// the duration. A concurrent request is refused with
+/// [`crate::handover::HANDOVER_BUSY_MESSAGE`] rather than served; see the body
+/// for why serving two at once would split every session's output.
+///
+/// Every connection is dispatched on its own thread (`spawn_client_handler`), so
+/// parking this one until the successor answers costs nothing else.
+///
+/// This function does not return on success: it ends in `process::exit(0)` once
+/// the sessions are detached.
 #[cfg(unix)]
 fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Result<()> {
     use crate::handover::{
@@ -779,7 +914,12 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     // rather than adopt into a split-brain. An older successor ignores the field.
     state.sends_teardown_commit = true;
 
-    let mut fds_to_send = Vec::new();
+    // Take ownership of the PTY dups immediately. Everything between here and the
+    // send can fail (the TCP dup, serializing the response), and an aborted
+    // handover no longer ends the process — this daemon keeps its sessions and
+    // stays available to serve a later attempt — so a descriptor leaked on those
+    // paths accumulates across retries instead of vanishing with the process.
+    let mut fds_to_send = StagedFds(pty_fds);
 
     let tcp_fd = get_active_tcp_listener_fd();
     if tcp_fd >= 0 {
@@ -790,26 +930,24 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
                 std::io::Error::last_os_error()
             );
         }
-        fds_to_send.push(dup_tcp);
+        // Front of the queue: the successor's `take_inherited_tcp_listener` claims
+        // index 0, and the PTY masters must line up with the session list after it.
+        fds_to_send.0.insert(0, dup_tcp);
         state.has_tcp_listener = true;
     } else {
         state.has_tcp_listener = false;
     }
 
-    fds_to_send.extend(pty_fds);
-
     let response = WireResponse::Ok(Box::new(WireSuccess::HandoverState(state)));
     let response_bytes =
         serde_json::to_vec(&response).context("serializing handover response JSON")?;
 
-    let send_res = send_fds(&stream, &fds_to_send, &response_bytes);
+    let send_res = send_fds(&stream, &fds_to_send.0, &response_bytes);
 
-    // Close duplicated FDs in this process to prevent FD leaks!
-    for fd in fds_to_send {
-        unsafe {
-            libc::close(fd);
-        }
-    }
+    // Close our copies now that the kernel has installed the receiver's: keeping
+    // them open across the Phase 2/3 wait would hold every master for the whole
+    // adoption window.
+    drop(fds_to_send);
 
     send_res.context("sending handover state and FDs via SCM_RIGHTS")?;
 
@@ -874,10 +1012,15 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
 
     tracing::info!("Process handover handshake completed successfully. Exiting daemon.");
 
-    let socket_path = default_socket_path();
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
-    }
+    // Clean up only if the socket at this path is still the one we bound. The
+    // commit byte released the successor before this point, so it may already have
+    // rebound the path; unlinking blindly would delete *its* live socket, leaving
+    // it serving somewhere no client can reach (`probe_daemon_socket` would report
+    // Absent and the next launch would fight it for the TCP port). Skipping the
+    // unlink entirely is not the answer either — a file left behind on every swap
+    // widens the window where two concurrent starters both remove it and both
+    // bind. Identity-checked removal avoids both.
+    unlink_own_socket(&default_socket_path());
 
     std::process::exit(0);
 }
@@ -1035,6 +1178,61 @@ mod tests {
     use crate::session::SessionManagerConfig;
     use std::time::{Duration, Instant};
     use triage_core::session::{AttachMode, RestoreSessionRequest, SessionEvent, SessionSize};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_grace_bind_fails_immediately_on_an_occupied_socket() {
+        // The default for an ordinary start: another daemon owning the socket must
+        // fail loudly and at once, never wait. This is what keeps a plain launch
+        // from silently hanging behind a running daemon.
+        let socket_path = unique_socket_path("bind-zero");
+        fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("socket dir");
+        let _held = UnixListener::bind(&socket_path).expect("bind holder");
+
+        let started = Instant::now();
+        let error = bind_owner_socket(&socket_path, Duration::ZERO)
+            .expect_err("an occupied socket must not bind");
+
+        assert!(error.to_string().contains("already in use"));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "zero grace must not wait, took {:?}",
+            started.elapsed()
+        );
+        let _ = fs::remove_dir_all(socket_path.parent().expect("socket parent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bind_grace_waits_for_the_predecessor_to_release_the_socket() {
+        // The handover successor's case: it already owns adopted PTY masters, so
+        // rather than dying while the predecessor finishes teardown it waits, then
+        // reclaims the now-stale socket.
+        let socket_path = unique_socket_path("bind-grace");
+        fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("socket dir");
+        let held = UnixListener::bind(&socket_path).expect("bind holder");
+
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let listener = bind_owner_socket(&socket_path, Duration::from_secs(5))
+            .expect("bind should succeed once the predecessor releases the socket");
+
+        // It must actually have waited rather than sneaking in immediately —
+        // otherwise the test would pass even if the grace did nothing.
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "expected the bind to wait for the holder, took {:?}",
+            started.elapsed()
+        );
+
+        releaser.join().expect("releaser thread");
+        drop(listener);
+        let _ = fs::remove_dir_all(socket_path.parent().expect("socket parent"));
+    }
 
     #[test]
     fn client_reports_server_errors() {

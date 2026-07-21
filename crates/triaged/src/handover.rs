@@ -56,36 +56,88 @@ pub enum TeardownOutcome {
     Refuse,
 }
 
-/// Decide adopt-vs-refuse from the byte (if any) the outgoing daemon sent on the
-/// Phase-3 socket and whether that daemon announced it commits before detaching.
+/// What the successor observed while waiting for the outgoing daemon's Phase-3
+/// teardown byte. `Eof` and `Timeout` are kept apart deliberately: they look the
+/// same on the byte stream but mean opposite things about the peer, and
+/// collapsing them costs sessions either way (see [`teardown_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownSignal {
+    /// A byte arrived.
+    Byte(u8),
+    /// The peer closed the socket without sending a teardown byte, or the read
+    /// failed outright (a reset counts as a close).
+    ///
+    /// `peer_alive` records whether the daemon was still accepting on its IPC
+    /// socket afterwards, which is the only thing that separates the two very
+    /// different causes of this: a daemon that *aborted* its handover closes this
+    /// connection and keeps serving, while one that was killed mid-handover
+    /// closes it by dying. They demand opposite responses — see
+    /// [`teardown_outcome`].
+    Eof { peer_alive: bool },
+    /// [`HANDOVER_TEARDOWN_TIMEOUT`] expired with the socket still open, so the
+    /// peer is alive and may yet commit.
+    Timeout,
+}
+
+/// Decide adopt-vs-refuse from what the successor saw on the Phase-3 socket and
+/// whether the outgoing daemon announced it commits before detaching.
 ///
-/// - `Some(0x03)` — explicit teardown-commit: the daemon has (or is about to)
-///   detach, so adopt.
-/// - `Some(0x02)` — a daemon predating the commit byte reporting a clean
-///   teardown; it detached before sending, so adopt.
-/// - anything else, or nothing (EOF / read timeout):
+/// - [`HANDOVER_COMMIT_BYTE`] — explicit teardown-commit: the daemon has (or is
+///   about to) detach, so adopt.
+/// - [`HANDOVER_DONE_BYTE`] — a daemon predating the commit byte reporting a
+///   clean teardown; it detached before sending, so adopt.
+/// - `Timeout` — always adopt, whatever the peer announced. The peer is still
+///   connected, and its detach is gated only on *its own* commit-byte write
+///   succeeding, never on the successor still being there. So refusing (and
+///   exiting) on a slow peer loses every session the moment that write lands a
+///   little late: the outgoing daemon detaches and exits into a successor that
+///   is already gone. Adopting risks at worst a second reader on a daemon an
+///   operator can restart; refusing risks unrecoverable loss.
+/// - `Eof { peer_alive: false }` — the peer died mid-handover (killed, panicked).
+///   Always adopt, whatever it announced: it is not coming back to finish, and
+///   its descriptors died with it, so this process holds the only handles left.
+///   Refusing here would close them and take down every session that was still
+///   perfectly rescuable. This is reachable in normal operation — an operator
+///   running `launchctl kickstart -k` on a swap that looks stuck kills the
+///   outgoing daemon in exactly this window.
+/// - `Eof { peer_alive: true }`, or an unexpected byte:
 ///   - if the peer announced the commit byte, its absence means the peer aborted
-///     *before* committing and still owns the sessions → refuse.
+///     *before* committing and still owns the sessions → refuse. A committing
+///     peer always writes the commit byte before it detaches, so a closed
+///     connection from a *still-running* daemon is proof it never committed.
 ///   - if it did not (an older build), the byte stream cannot tell an abort from
-///     a lost `0x02`, and refusing would strand every session an old daemon
+///     a lost done-byte, and refusing would strand every session an old daemon
 ///     genuinely handed off, so adopt — the historical behavior.
 ///
 /// This is the whole adopt/refuse contract, factored out as a pure function so
 /// it can be unit-tested without the two-process socket dance around it.
-pub fn teardown_outcome(peer_sends_commit: bool, byte: Option<u8>) -> TeardownOutcome {
-    match byte {
-        Some(0x03) | Some(0x02) => TeardownOutcome::Adopt,
-        _ if peer_sends_commit => TeardownOutcome::Refuse,
-        _ => TeardownOutcome::Adopt,
+pub fn teardown_outcome(peer_sends_commit: bool, signal: TeardownSignal) -> TeardownOutcome {
+    match signal {
+        TeardownSignal::Byte(HANDOVER_COMMIT_BYTE | HANDOVER_DONE_BYTE) => TeardownOutcome::Adopt,
+        // A live-but-slow peer must never be refused: see the doc above.
+        TeardownSignal::Timeout => TeardownOutcome::Adopt,
+        // A dead peer owns nothing; only we can still save these sessions.
+        TeardownSignal::Eof { peer_alive: false } => TeardownOutcome::Adopt,
+        TeardownSignal::Byte(_) | TeardownSignal::Eof { .. } if peer_sends_commit => {
+            TeardownOutcome::Refuse
+        }
+        TeardownSignal::Byte(_) | TeardownSignal::Eof { .. } => TeardownOutcome::Adopt,
     }
 }
 
-/// Raw Phase-3 signals on the handover socket. `0x01` (successor → outgoing) is
-/// the adoption byte; `0x03` and `0x02` (outgoing → successor) are the
-/// teardown-commit and teardown-done bytes. Named here so both sides of the
-/// protocol read from one place.
+/// Successor → outgoing: "I have the state and descriptors; commit the handover."
+/// The point of no return — before it the outgoing daemon can still bail and keep
+/// serving, after it there is no rollback.
 pub const HANDOVER_ADOPT_BYTE: u8 = 0x01;
+
+/// Outgoing → successor: "I am committing to teardown." Sent *before* detaching,
+/// and the detach happens only if this byte landed, so its absence on a closed
+/// socket proves the peer never committed. See [`teardown_outcome`].
 pub const HANDOVER_COMMIT_BYTE: u8 = 0x03;
+
+/// Outgoing → successor: "teardown complete." The only teardown byte daemons
+/// predating [`HANDOVER_COMMIT_BYTE`] send, so it is still accepted as an adopt
+/// signal; a current peer sends it after detaching, where nothing reads it.
 pub const HANDOVER_DONE_BYTE: u8 = 0x02;
 
 /// Sentinel `WireResponse::Err` message a daemon returns when it refuses a
@@ -126,9 +178,18 @@ pub const HANDOVER_ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::
 /// measurements above do not justify its value. It is also the one deadline
 /// with a cost on *both* sides, which is why it is not simply generous:
 ///
-/// - Expiring early makes the successor read masters the outgoing daemon may
-///   still be reading. PTY reads are destructive, so two readers split a
-///   session's output arbitrarily between them.
+/// - Expiring early makes the successor adopt (see [`teardown_outcome`]) and
+///   start reading masters the outgoing daemon is still reading. PTY reads are
+///   destructive, so two readers split a session's output arbitrarily between
+///   them.
+///
+///   Note what actually ends that overlap: not this byte, and not the commit
+///   byte. `SessionActor::detach` only drops the reader/worker join handles — it
+///   deliberately never signals shutdown, so those threads keep draining the
+///   masters until the outgoing daemon's `process::exit`. The teardown bytes
+///   bound how long the successor *waits*; the old daemon's exit is what makes
+///   the handoff exclusive. Keeping that window short is therefore about
+///   reaching that exit promptly, not about the handshake.
 /// - Expiring late leaves the system dark. By this point the successor has
 ///   adopted the TCP listener but has not started serving, and the outgoing
 ///   daemon has drained its sessions, so no process answers clients until the
@@ -381,15 +442,34 @@ mod unix_impl {
         Ok(HandoverClientOutcome::Transferred)
     }
 
+    /// Whether the outgoing daemon is still accepting on its IPC socket.
+    ///
+    /// After a Phase-3 EOF this is the only thing that separates "aborted but
+    /// alive — it kept its sessions, refuse" from "died mid-handover — nothing
+    /// owns them, adopt or lose them". A daemon that is killed takes its listener
+    /// with it, so the connect is refused; one that merely aborted this handover
+    /// is still serving and accepts. Treat any connect error as "gone": the
+    /// dangerous mistake is refusing (and destroying sessions) on a false
+    /// "alive", not adopting on a false "dead".
+    fn peer_still_listening(socket_path: &Path) -> bool {
+        UnixStream::connect(socket_path).is_ok()
+    }
+
     /// Send the `0x01` adoption byte and read the outgoing daemon's Phase-3
     /// response, returning whether the successor should adopt or refuse.
     ///
     /// `peer_sends_commit` comes from the transferred [`HandoverState`]: it says
     /// whether the outgoing daemon announces a `0x03` commit byte before it
     /// detaches, which is what lets a pre-commit EOF be read as "the daemon kept
-    /// its sessions" (refuse) rather than "detached, `0x02` lost" (adopt). See
+    /// its sessions" (refuse) rather than "detached, `0x02` lost" (adopt).
+    ///
+    /// `socket_path` is the peer's IPC socket, probed to tell an aborted peer from
+    /// a dead one when the read ends without a teardown byte. See
     /// [`teardown_outcome`].
-    pub fn complete_handover_adoption(peer_sends_commit: bool) -> Result<TeardownOutcome> {
+    pub fn complete_handover_adoption(
+        socket_path: &Path,
+        peer_sends_commit: bool,
+    ) -> Result<TeardownOutcome> {
         let stream = HANDOVER_STREAM.lock().unwrap().take();
         let Some(mut stream) = stream else {
             // No handover stream: this start was not driven by a handover, so
@@ -436,21 +516,60 @@ mod unix_impl {
 
         tracing::info!("Waiting for old daemon teardown (Phase 3 sync)...");
         let mut sync_byte = [0u8; 1];
-        let byte = match stream.read_exact(&mut sync_byte) {
-            Ok(()) => Some(sync_byte[0]),
+        // A timeout and a closed socket are NOT interchangeable here. The read
+        // deadline is enforced locally via SO_RCVTIMEO, which surfaces as
+        // WouldBlock (or TimedOut on some platforms) and leaves the peer
+        // connected; anything else means the peer is gone. teardown_outcome
+        // resolves them in opposite directions, so the kind must survive.
+        let signal = match stream.read_exact(&mut sync_byte) {
+            Ok(()) => TeardownSignal::Byte(sync_byte[0]),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                tracing::warn!("Timed out waiting for teardown byte from old daemon: {err}");
+                TeardownSignal::Timeout
+            }
             Err(err) => {
-                tracing::warn!("Failed to read teardown byte from old daemon: {err}");
-                None
+                // The peer closed on us. Whether it aborted (and kept serving) or
+                // died decides adopt-vs-refuse, and only a liveness probe can tell
+                // them apart — see `peer_still_listening`.
+                let peer_alive = peer_still_listening(socket_path);
+                tracing::warn!(
+                    peer_alive,
+                    "Failed to read teardown byte from old daemon: {err}"
+                );
+                TeardownSignal::Eof { peer_alive }
             }
         };
 
-        let outcome = teardown_outcome(peer_sends_commit, byte);
-        match (outcome, byte) {
-            (TeardownOutcome::Adopt, Some(HANDOVER_COMMIT_BYTE)) => {
+        let outcome = teardown_outcome(peer_sends_commit, signal);
+        match (outcome, signal) {
+            (TeardownOutcome::Adopt, TeardownSignal::Byte(HANDOVER_COMMIT_BYTE)) => {
                 tracing::info!("Old daemon committed to teardown (0x03); adopting.");
             }
-            (TeardownOutcome::Adopt, Some(HANDOVER_DONE_BYTE)) => {
+            (TeardownOutcome::Adopt, TeardownSignal::Byte(HANDOVER_DONE_BYTE)) => {
                 tracing::info!("Old daemon reported teardown complete (0x02); adopting.");
+            }
+            (TeardownOutcome::Adopt, TeardownSignal::Timeout) => {
+                // Deliberately adopting a slow peer rather than refusing it — the
+                // peer is still connected and its detach is gated only on its own
+                // commit-byte write, so refusing here risks orphaning everything.
+                tracing::warn!(
+                    "Old daemon did not send a teardown byte before the deadline but is still \
+                     connected; adopting rather than risk orphaning its sessions if it commits."
+                );
+            }
+            (TeardownOutcome::Adopt, TeardownSignal::Eof { peer_alive: false }) => {
+                // The peer died mid-handover. Its descriptors went with it, so we
+                // hold the only handles to these sessions; refusing would destroy
+                // sessions that are still perfectly alive.
+                tracing::warn!(
+                    "Old daemon died before committing its teardown; adopting because nothing \
+                     else holds these sessions."
+                );
             }
             (TeardownOutcome::Adopt, _) => {
                 // Legacy peer (no commit byte announced) with an ambiguous EOF or
@@ -552,6 +671,13 @@ mod unix_impl {
             self.fd
         }
     }
+
+    // Deliberately no `Drop`: closing here would change when a *live* adopted
+    // session's master closes, since `SessionActor::detach` drops the actor's
+    // command sender and `run_actor` then unwinds its state before the daemon
+    // exits. Descriptors that never reach a session are closed by `UnadoptedFds`
+    // in `adopt_sessions` instead, which owns the queue until each session is
+    // live and so covers the in-flight fd too.
 
     #[derive(Debug)]
     pub struct AdoptedChild {

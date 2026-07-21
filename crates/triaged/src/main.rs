@@ -217,6 +217,17 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
             + triaged::handover::HANDOVER_ADOPTION_TIMEOUT
             + std::time::Duration::from_secs(5);
         let mut backoff = std::time::Duration::from_millis(200);
+        // Set once the peer has told us a swap is in flight. After that, an
+        // *absent* socket no longer means "no daemon". The outgoing daemon leaves
+        // its socket file behind, but once it exits, connecting to that file is
+        // refused — which `probe_daemon_socket` reports as Absent — and the winning
+        // successor only binds its own much later (after adopting sessions and
+        // starting the WS server), briefly unlinking the stale file first. Falling
+        // back to a fresh start inside that gap lands us exactly where the busy
+        // sentinel exists to prevent — racing for a port the new daemon is about to
+        // hold, then crash-looping under launchd. So once we know a swap is
+        // running, keep retrying through the gap until the deadline.
+        let mut swap_in_flight = false;
         loop {
             match probe_daemon_socket(&socket_path) {
                 DaemonSocketState::Live | DaemonSocketState::Unverifiable => {
@@ -230,6 +241,7 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                             break;
                         }
                         Ok(HandoverClientOutcome::Busy) => {
+                            swap_in_flight = true;
                             if std::time::Instant::now() >= busy_deadline {
                                 tracing::warn!(
                                     "daemon stayed busy with another handover past the deadline; \
@@ -252,6 +264,25 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                             break;
                         }
                     }
+                }
+                DaemonSocketState::Absent if swap_in_flight => {
+                    // The socket vanished mid-swap (see `swap_in_flight`). The
+                    // successor that won will bind shortly; wait for it rather
+                    // than race it, and re-probe so we hand over to it instead.
+                    if std::time::Instant::now() >= busy_deadline {
+                        tracing::warn!(
+                            socket_path = %socket_path.display(),
+                            "socket still absent after an in-flight swap passed the deadline; \
+                             starting fresh"
+                        );
+                        break;
+                    }
+                    tracing::info!(
+                        "socket is absent while a swap completes; retrying in {}ms",
+                        backoff.as_millis()
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
                 }
                 DaemonSocketState::Absent => {
                     if is_handover {
@@ -379,12 +410,16 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                 if let Some(fds) = fds {
                     use triaged::handover::TeardownOutcome;
 
-                    // Complete Phase 2/3 sync FIRST before starting any PTY readers!
-                    // This shuts down the old daemon's readers before we start ours.
+                    // Complete the Phase 2/3 sync FIRST, before starting any PTY
+                    // readers, so our readers start as late as possible relative to
+                    // the outgoing daemon's exit. (That exit — not this handshake —
+                    // is what actually stops its readers: `SessionActor::detach`
+                    // only drops join handles. See HANDOVER_TEARDOWN_TIMEOUT.)
                     // The outcome says whether the old daemon actually committed to
                     // teardown (Adopt) or aborted while still owning its sessions
                     // (Refuse) — see complete_handover_adoption / teardown_outcome.
                     match triaged::handover::complete_handover_adoption(
+                        &default_socket_path(),
                         state.sends_teardown_commit,
                     )? {
                         TeardownOutcome::Refuse => {
@@ -396,12 +431,28 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                             // respawns us to retry a clean handover. Exit here is
                             // before the WS/IPC servers start, so nothing is torn
                             // down that the old daemon isn't already running.
+                            //
+                            // Return rather than `process::exit`: exiting here would
+                            // skip main's WorkerGuard drop, which is the only thing
+                            // that flushes the non-blocking tracing appender — so
+                            // the very message explaining this exit would likely
+                            // never reach the log. Returning unwinds normally, the
+                            // guard flushes, and `main`'s `Result` still yields a
+                            // non-zero status so a manual deploy can tell a refused
+                            // swap from a clean one. launchd respawns us either way
+                            // (KeepAlive: true, not SuccessfulExit), so the retry
+                            // path is unaffected. Our dup'd listener and masters
+                            // close as their owners drop; the old daemon keeps its
+                            // own copies and keeps serving.
                             tracing::error!(
                                 "outgoing daemon did not commit its teardown; it still owns its \
                                  sessions. Exiting without adopting so a retry can hand over \
                                  cleanly (the daemon keeps serving in the meantime)."
                             );
-                            std::process::exit(0);
+                            return Err(anyhow::anyhow!(
+                                "handover refused: outgoing daemon did not commit its teardown \
+                                 and still owns its sessions"
+                            ));
                         }
                         TeardownOutcome::Adopt => {}
                     }
@@ -467,7 +518,19 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     {
         let socket_path = default_socket_path();
         tracing::info!(socket_path = %socket_path.display(), "triaged starting Unix socket server");
-        IpcServer::new(manager, web_cache, IpcConfig::new(socket_path)).serve()?;
+        // Having adopted sessions, this process owns live PTY masters, so failing
+        // the bind would take them all down. The predecessor can still be finishing
+        // its teardown here — it releases us at the commit byte and only then
+        // detaches and exits — so wait that out rather than die holding everything.
+        // A fresh start keeps the zero grace: a socket genuinely owned by another
+        // daemon should fail immediately and loudly.
+        let config = IpcConfig::new(socket_path);
+        let config = if has_inherited_sessions {
+            config.with_bind_grace(triaged::handover::HANDOVER_TEARDOWN_TIMEOUT)
+        } else {
+            config
+        };
+        IpcServer::new(manager, web_cache, config).serve()?;
         Ok(())
     }
 
