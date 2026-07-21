@@ -25,8 +25,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     this.disconnectAfterHello = false,
     Set<String>? exitedSessionIds,
     Set<String>? failedStartSessionCommands,
+    Set<String>? emptyIdStartSessionCommands,
   }) : exitedSessionIds = {...?exitedSessionIds},
        failedStartSessionCommands = {...?failedStartSessionCommands},
+       emptyIdStartSessionCommands = {...?emptyIdStartSessionCommands},
        super(uri ?? Uri.parse('ws://localhost:8080/ws'));
 
   final bool shouldFailConnection;
@@ -41,6 +43,9 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final bool disconnectAfterHello;
   final Set<String> exitedSessionIds;
   final Set<String> failedStartSessionCommands;
+  // Commands the daemon answers without a `session_id` — the response shape
+  // `startSession` degrades to ''. Distinct from an outright throw.
+  final Set<String> emptyIdStartSessionCommands;
 
   final StreamController<Map<String, dynamic>> _testEventController =
       StreamController<Map<String, dynamic>>.broadcast(sync: true);
@@ -316,6 +321,9 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (failedStartSessionCommands.contains(command)) {
       throw Exception('start session failed for $command');
     }
+    if (emptyIdStartSessionCommands.contains(command)) {
+      return '';
+    }
     final nextId = 'scratch-${startSessionCalls.length + 1}';
     startSessionCalls.add(nextId);
     return nextId;
@@ -544,6 +552,19 @@ void main() {
     expect(showNewSessionShellMenuForPlatform(TargetPlatform.windows), isTrue);
     expect(showNewSessionShellMenuForPlatform(TargetPlatform.macOS), isFalse);
     expect(showNewSessionShellMenuForPlatform(TargetPlatform.linux), isFalse);
+  });
+
+  test('new-session fallback chain covers every shell, preferred first', () {
+    // A client's platform says nothing about the daemon's, so each starting
+    // point must still be able to reach the shells the other OS provides —
+    // notably `defaultPosix` (an Android/Mac client) reaching `cmd`, which is
+    // the only thing that spawns on a Windows daemon.
+    for (final preferred in NewSessionShell.values) {
+      final chain = newSessionShellFallbackChain(preferred);
+      expect(chain.first, preferred);
+      expect(chain.toSet(), NewSessionShell.values.toSet());
+      expect(chain, hasLength(NewSessionShell.values.length));
+    }
   });
 
   test('uses daemon websocket target for Flutter dev server base URL', () {
@@ -1149,6 +1170,57 @@ void main() {
       expect(find.text('triage / scratch-1'), findsWidgets);
       expect(find.text('line 1 from scratch-1'), findsOneWidget);
       expect(client.startSessionCommands, ['cmd.exe', 'bash']);
+    });
+  });
+
+  testWidgets('a mobile client reaches a Windows daemon shell', (
+    WidgetTester tester,
+  ) async {
+    // The regression this fixes: an Android client only ever offers
+    // `defaultPosix`, and `/bin/sh` cannot spawn on a Windows daemon. With no
+    // shell menu on mobile there is no way to pick another by hand, so the
+    // chain has to reach `cmd.exe` on its own.
+    await withPlatform(TargetPlatform.android, () async {
+      final client = FakeTriageWebSocketClient(
+        failedStartSessionCommands: {'/bin/sh'},
+      );
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / scratch-1'), findsWidgets);
+      expect(client.startSessionCommands, ['/bin/sh', 'cmd.exe']);
+    });
+  });
+
+  testWidgets('a session id-less response falls through to the next shell', (
+    WidgetTester tester,
+  ) async {
+    // A response carrying no `session_id` degrades to '' rather than throwing.
+    // Breaking out of the chain on it would leave nothing to subscribe or
+    // attach to and strand the rail on "Creating session...".
+    await withPlatform(TargetPlatform.windows, () async {
+      final client = FakeTriageWebSocketClient(
+        emptyIdStartSessionCommands: {'cmd.exe'},
+      );
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.widgetWithText(
+          CheckedPopupMenuItem<NewSessionShell>,
+          'Cmd (cmd.exe)',
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(client.startSessionCommands, ['cmd.exe', 'bash']);
+      expect(find.text('triage / scratch-1'), findsWidgets);
+      expect(find.text('Creating session...'), findsNothing);
     });
   });
 
