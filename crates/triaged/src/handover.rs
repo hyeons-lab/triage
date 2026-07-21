@@ -215,7 +215,7 @@ mod unix_impl {
     use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
     use std::io::{self, BufWriter, Read, Write};
     use std::net::TcpListener;
-    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -594,9 +594,36 @@ mod unix_impl {
         Ok(outcome)
     }
 
+    /// A PTY master inherited through a handover.
+    ///
+    /// The descriptor is an [`OwnedFd`] rather than a bare `RawFd` so the leak
+    /// this type used to cause is unrepresentable: it closes when the master is
+    /// dropped, which is when the session ends. Holding a raw number meant nothing
+    /// closed it — the reader and writer handed to a session are `dup`s that close
+    /// themselves, so an adopted session that ended leaked exactly its master. That
+    /// compounds, because every handover re-adopts every session.
     #[derive(Debug)]
     pub struct AdoptedMasterPty {
-        pub fd: RawFd,
+        pub fd: OwnedFd,
+    }
+
+    impl AdoptedMasterPty {
+        /// Take ownership of an inherited descriptor.
+        ///
+        /// # Safety
+        ///
+        /// `fd` must be an open descriptor this process owns and nothing else will
+        /// close — in practice one handed over by `UnadoptedFds::take_next`, which
+        /// gives up its claim precisely so this type can take it.
+        pub unsafe fn from_raw_fd(fd: RawFd) -> Self {
+            Self {
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            }
+        }
+
+        fn raw(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
     }
 
     impl MasterPty for AdoptedMasterPty {
@@ -607,7 +634,7 @@ mod unix_impl {
                 ws_xpixel: size.pixel_width,
                 ws_ypixel: size.pixel_height,
             };
-            let res = unsafe { libc::ioctl(self.fd, libc::TIOCSWINSZ, &ws) };
+            let res = unsafe { libc::ioctl(self.raw(), libc::TIOCSWINSZ, &ws) };
             if res < 0 {
                 Err(anyhow::Error::new(std::io::Error::last_os_error()))
             } else {
@@ -622,7 +649,7 @@ mod unix_impl {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
-            let res = unsafe { libc::ioctl(self.fd, libc::TIOCGWINSZ, &mut ws) };
+            let res = unsafe { libc::ioctl(self.raw(), libc::TIOCGWINSZ, &mut ws) };
             if res < 0 {
                 Err(anyhow::Error::new(std::io::Error::last_os_error()))
             } else {
@@ -636,7 +663,7 @@ mod unix_impl {
         }
 
         fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
-            let dup_fd = unsafe { libc::dup(self.fd) };
+            let dup_fd = unsafe { libc::dup(self.raw()) };
             if dup_fd < 0 {
                 return Err(anyhow::Error::new(std::io::Error::last_os_error()));
             }
@@ -645,7 +672,7 @@ mod unix_impl {
         }
 
         fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
-            let dup_fd = unsafe { libc::dup(self.fd) };
+            let dup_fd = unsafe { libc::dup(self.raw()) };
             if dup_fd < 0 {
                 return Err(anyhow::Error::new(std::io::Error::last_os_error()));
             }
@@ -654,7 +681,7 @@ mod unix_impl {
         }
 
         fn as_raw_fd(&self) -> Option<RawFd> {
-            Some(self.fd)
+            Some(self.raw())
         }
 
         fn process_group_leader(&self) -> Option<i32> {
@@ -668,16 +695,9 @@ mod unix_impl {
 
     impl AsRawFd for AdoptedMasterPty {
         fn as_raw_fd(&self) -> RawFd {
-            self.fd
+            self.raw()
         }
     }
-
-    // Deliberately no `Drop`: closing here would change when a *live* adopted
-    // session's master closes, since `SessionActor::detach` drops the actor's
-    // command sender and `run_actor` then unwinds its state before the daemon
-    // exits. Descriptors that never reach a session are closed by `UnadoptedFds`
-    // in `adopt_sessions` instead, which owns the queue until each session is
-    // live and so covers the in-flight fd too.
 
     #[derive(Debug)]
     pub struct AdoptedChild {

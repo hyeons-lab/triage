@@ -186,6 +186,35 @@ mod tests {
         }
     }
 
+    // The descriptors `UnadoptedFds` closes are the ones no session ever took.
+    // Once a session takes one it belongs to that session's master, and nothing
+    // used to close it: the reader and writer are `dup`s that close themselves,
+    // while the master held a bare `RawFd`. So every adopted session that ended
+    // leaked its master — and since a handover re-adopts *every* session, one swap
+    // makes that true of the whole set.
+    //
+    // Tested on the type directly rather than through a live session: a PTY master
+    // cannot be identified the way `FdProbe` identifies a descriptor, because every
+    // `/dev/ptmx` clone reports the same inode, so "closed and the number reissued
+    // to another master" would be indistinguishable from "still open".
+    #[test]
+    fn adopted_master_closes_its_fd_on_drop() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let probe = FdProbe::new(&temp_dir.path, "adopted-master")?;
+        assert!(!probe.is_closed(), "probe should start open");
+
+        {
+            // SAFETY: the probe hands its descriptor over and does not close it.
+            let _master = unsafe { crate::handover::AdoptedMasterPty::from_raw_fd(probe.fd) };
+        }
+
+        assert!(
+            probe.is_closed(),
+            "an adopted session leaked its PTY master when it ended"
+        );
+        Ok(())
+    }
+
     // A partial adoption is logged and survived rather than propagated into a
     // process exit, so the OS no longer sweeps up descriptors the adoption never
     // claimed. Any fd with no session to take it has to be closed on the way out
