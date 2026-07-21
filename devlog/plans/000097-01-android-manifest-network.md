@@ -5,13 +5,14 @@ the app on a Pixel loops "Reconnecting..." forever while the daemon log
 records zero connection attempts from the phone. Two independent Android
 manifest defaults hit at once:
 
-1. **`INTERNET` permission is declared only in the debug variant**
-   (`android/app/src/debug/AndroidManifest.xml`). `flutter run` merges
-   that variant, so a debug install has network access; a release build
-   uses only `src/main`, which never had the permission. `flutter build
-   apk --release` — what CI runs and uploads as an artifact — produces
-   an APK that Android refuses to give a socket to. Silent by design:
-   no permission dialog, no log entry.
+1. **`INTERNET` is declared in every variant except the one that ships.**
+   `android/app/src/debug/` and `android/app/src/profile/` both declare
+   it; `src/main` does not. Debug and profile installs therefore have
+   network access, and only a release build — which merges `src/main`
+   alone — comes out without it. `flutter build apk --release`, what CI
+   runs and uploads as an artifact, produces an APK Android refuses to
+   give a socket to. Silent by design: no permission dialog, no log
+   entry.
 
 2. **Cleartext traffic is blocked on `targetSdk >= 28`**. `triaged`
    terminates no TLS (`docs/remote-access.md`), so the client speaks

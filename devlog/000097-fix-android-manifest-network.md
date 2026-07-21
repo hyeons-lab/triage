@@ -22,10 +22,10 @@ connection attempts in `triaged.log` from the device.
 ## Decisions
 
 - **`src/main` rather than a new `src/release`**: the missing bits are
-  needed by every non-debug build (release, profile, and any future
-  variant). Duplicating them into a variant-specific manifest is the
-  bug that got us here — the `debug` variant declared `INTERNET` and
-  nothing else did.
+  needed by every build, and `src/main` is the one manifest they all
+  merge. Duplicating them per variant is the bug that got us here —
+  `debug` and `profile` each declared `INTERNET` while `src/main` did
+  not, so the only variant without it was the one that ships.
 - **Blanket `usesCleartextTraffic="true"` over `network_security_config`**:
   the daemon terminates no TLS by design (`docs/remote-access.md`), and
   the user configures daemon addresses at runtime via the multi-server
@@ -36,9 +36,12 @@ connection attempts in `triaged.log` from the device.
 ## Issues
 
 Root cause is a Flutter template artefact: `flutter create` scaffolds
-`INTERNET` only into the debug variant to keep hot-reload working. On
-this project the runtime dependency on network access is the same for
-every build, so the split was never right.
+`INTERNET` into the `debug` and `profile` variants — the two the tool
+attaches to for hot reload and profiling — and leaves `src/main` alone,
+on the assumption that an app needing the network in production will
+declare it there itself. This project never did. Because the runtime
+dependency on network access is identical for every build here, the
+split was never right for it.
 
 ## Research & Discoveries
 
@@ -56,6 +59,21 @@ every build, so the split was never right.
 
 PR #114, first round: the devlog H1 omitted its number prefix. Every other
 file in `devlog/` opens `# 0000NN — <branch>`; corrected to match.
+
+Second round: the write-up had the prior state wrong. It said `INTERNET`
+lived only in the `debug` variant, but `src/profile/AndroidManifest.xml`
+declares it too — the template scaffolds both. That does not change the fix
+(release still shipped without it, which is the bug), but it misdescribes
+which builds were affected: profile builds had network access all along, and
+release was the *only* variant without it. Corrected in the plan, the
+Decisions bullet, and the Issues section.
+
+Also documented the two manifest entries in place. `usesCleartextTraffic` in
+particular reads like something to tidy up during a security pass, and the
+reason it must stay lives in `docs/remote-access.md` where nobody editing the
+manifest will see it. Verified the claim it rests on before writing it down:
+`remote.tls_cert`/`tls_key` appear in `crates/triage-core/src/config.rs` only
+to be validated, and nothing in the daemon ever reads them.
 
 Renumbered 000096 -> 000097 after #113 merged and took 000096. Both branches
 picked the same next number while running in parallel, which is why the repo

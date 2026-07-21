@@ -1,5 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Declared here rather than per-variant: `src/debug` and `src/profile`
+         each carry their own copy from the Flutter template, so a release
+         build — the only one that merges `src/main` alone — was the single
+         variant shipping without network access. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- `usesCleartextTraffic` is deliberate, not an oversight to tidy up:
+         `triaged` terminates no TLS at all (`remote.tls_cert`/`tls_key` are
+         schema-validated and never read), so the client speaks plain `ws://`
+         and Android would drop the connect on `targetSdk >= 28` without this.
+         Confidentiality comes from the transport underneath — a tailnet, where
+         WireGuard encrypts end to end — not from HTTPS. A
+         `network_security_config` allowlist is not usable instead: daemon
+         addresses are entered by the user at runtime via the multi-server
+         switcher, so there is no fixed host set to pin. See
+         `docs/remote-access.md`. -->
     <application
         android:label="Triage"
         android:name="${applicationName}"
