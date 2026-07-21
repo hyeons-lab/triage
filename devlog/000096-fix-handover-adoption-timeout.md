@@ -178,6 +178,19 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   latter changes when a *live* session's master closes, which is a bigger change
   to the adopted-PTY lifetime than this bug warrants.
 
+- 2026-07-21T10:34-0700 `crates/triaged/src/handover_tests.rs` — the first version
+  of these tests passed locally and failed on CI, and both of the obvious ways to
+  ask "is this fd closed?" are wrong inside a parallel test binary.
+  `fcntl(F_GETFD)` cannot separate "never closed" from "closed, and the number
+  already reissued"; descriptors are recycled immediately, so a correctly-closed
+  fd reads as open. Switching to a pipe and watching for EOF was worse — other
+  tests in the binary `start_session`, and the children they fork inherit a copy
+  of the write end, so the read end reports a live writer regardless of what this
+  process did. Settled on identifying the descriptor: a fresh temp file has an
+  inode nothing else shares, so "gone" and "now points somewhere else" both mean
+  closed, independent of other threads and forked children. Confirmed by running
+  the full suite (where the parallelism actually bites) seven times.
+
 ## Decisions
 
 - 2026-07-19T18:20-0700 Raise the Phase-2 bound rather than tune it — a

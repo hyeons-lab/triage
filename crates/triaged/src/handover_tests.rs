@@ -136,9 +136,54 @@ mod tests {
         Ok(())
     }
 
-    /// True while `fd` names an open descriptor in this process.
-    fn fd_is_open(fd: std::os::unix::io::RawFd) -> bool {
-        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) != -1
+    /// A descriptor handed to the code under test, whose closure can be
+    /// observed reliably from inside a parallel test binary.
+    ///
+    /// Two simpler probes both give wrong answers here:
+    ///
+    /// - `fcntl(F_GETFD)` alone cannot tell "never closed" from "closed, and the
+    ///   number already reissued". Descriptors are recycled immediately, and
+    ///   tests share one process, so this reported a correctly-closed fd as open.
+    /// - A pipe's EOF cannot be trusted either: other tests in this binary
+    ///   `start_session`, and the children they fork inherit a copy of the write
+    ///   end, so the read end keeps reporting "writer alive" no matter what this
+    ///   process did with its own copy.
+    ///
+    /// Identify the descriptor instead. A fresh temp file has an inode nothing
+    /// else shares, so afterwards "the number is gone" and "the number now
+    /// points at something else" both mean our fd was closed — and neither
+    /// depends on what other threads or forked children are doing.
+    struct FdProbe {
+        fd: std::os::unix::io::RawFd,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl FdProbe {
+        fn new(dir: &std::path::Path, name: &str) -> std::io::Result<Self> {
+            use std::os::unix::io::IntoRawFd;
+            let file = std::fs::File::create(dir.join(name))?;
+            let fd = file.into_raw_fd();
+            let (dev, ino) = Self::identity(fd).ok_or_else(std::io::Error::last_os_error)?;
+            Ok(Self { fd, dev, ino })
+        }
+
+        fn identity(fd: std::os::unix::io::RawFd) -> Option<(u64, u64)> {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                return None;
+            }
+            Some((st.st_dev as u64, st.st_ino as u64))
+        }
+
+        /// True once this descriptor no longer refers to the file it was opened
+        /// on — either closed outright, or closed and the number reissued.
+        fn is_closed(&self) -> bool {
+            match Self::identity(self.fd) {
+                None => true,
+                Some(identity) => identity != (self.dev, self.ino),
+            }
+        }
     }
 
     // A partial adoption is logged and survived rather than propagated into a
@@ -150,15 +195,8 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let manager = SessionManager::new(SessionManagerConfig::new(temp_dir.path.clone()));
 
-        // A descriptor of our own to watch: dup'ing gives one that is ours to
-        // lose, with no PTY or child hanging off it.
-        let surplus = unsafe { libc::dup(libc::STDOUT_FILENO) };
-        assert!(
-            surplus >= 0,
-            "libc::dup failed: {}",
-            std::io::Error::last_os_error()
-        );
-        assert!(fd_is_open(surplus));
+        let surplus = FdProbe::new(&temp_dir.path, "surplus")?;
+        assert!(!surplus.is_closed(), "probe should start open");
 
         // No sessions to adopt, so nothing claims the fd.
         let state = crate::handover::HandoverState {
@@ -166,10 +204,10 @@ mod tests {
             has_tcp_listener: false,
             sends_teardown_commit: true,
         };
-        manager.adopt_sessions(state, vec![surplus])?;
+        manager.adopt_sessions(state, vec![surplus.fd])?;
 
         assert!(
-            !fd_is_open(surplus),
+            surplus.is_closed(),
             "a handover fd that no session adopted was left open"
         );
         Ok(())
@@ -184,9 +222,8 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let manager = SessionManager::new(SessionManagerConfig::new(temp_dir.path.clone()));
 
-        let in_flight = unsafe { libc::dup(libc::STDOUT_FILENO) };
-        let queued = unsafe { libc::dup(libc::STDOUT_FILENO) };
-        assert!(in_flight >= 0 && queued >= 0);
+        let in_flight = FdProbe::new(&temp_dir.path, "in-flight")?;
+        let queued = FdProbe::new(&temp_dir.path, "queued")?;
 
         // `log_path` points at a directory, so opening it for append fails and
         // the first session never becomes live.
@@ -207,14 +244,14 @@ mod tests {
             sends_teardown_commit: true,
         };
 
-        let result = manager.adopt_sessions(state, vec![in_flight, queued]);
+        let result = manager.adopt_sessions(state, vec![in_flight.fd, queued.fd]);
         assert!(result.is_err(), "adoption should fail on an unopenable log");
         assert!(
-            !fd_is_open(in_flight),
+            in_flight.is_closed(),
             "the fd of the session that failed to adopt was left open"
         );
         assert!(
-            !fd_is_open(queued),
+            queued.is_closed(),
             "a queued handover fd was left open after adoption failed"
         );
         Ok(())
