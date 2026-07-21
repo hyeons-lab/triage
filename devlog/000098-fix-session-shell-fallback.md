@@ -1,4 +1,4 @@
-# 000096 — fix/session-shell-fallback
+# 000098 — fix/session-shell-fallback
 
 ## Agent
 
@@ -93,9 +93,16 @@ PR #115, first round:
 Both code findings are covered by tests that were confirmed to fail without
 their fix, rather than being assumed to.
 
+Renumbered 000096 -> 000098 after #113 merged and took 000096, with #114
+taking 000097. Parallel branches all picked the same next number; with #113
+landed, the convention's "highest in devlog/, incremented" resolves to 000098
+here.
+
 ## Commits
 
-- HEAD — fix(triage_client): try every shell when creating a session
+- e35c117 — fix(triage_client): try every shell when creating a session
+- 85856be — fix(triage_client): treat an id-less start_session as a failed attempt
+- HEAD — docs(devlog): renumber to 000098 after 000096 landed on main
 
 ## Progress
 
