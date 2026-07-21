@@ -2,7 +2,7 @@
 mod tests {
     use crate::session::{SessionManager, SessionManagerConfig};
     use std::path::PathBuf;
-    use triage_core::session::{SessionApi, SessionSize, StartSessionRequest};
+    use triage_core::session::{SessionApi, SessionId, SessionSize, StartSessionRequest};
 
     struct TempDir {
         path: PathBuf,
@@ -134,5 +134,215 @@ mod tests {
         let _ = new_manager.shutdown_session(session_id);
 
         Ok(())
+    }
+
+    /// A descriptor handed to the code under test, whose closure can be
+    /// observed reliably from inside a parallel test binary.
+    ///
+    /// Two simpler probes both give wrong answers here:
+    ///
+    /// - `fcntl(F_GETFD)` alone cannot tell "never closed" from "closed, and the
+    ///   number already reissued". Descriptors are recycled immediately, and
+    ///   tests share one process, so this reported a correctly-closed fd as open.
+    /// - A pipe's EOF cannot be trusted either: other tests in this binary
+    ///   `start_session`, and the children they fork inherit a copy of the write
+    ///   end, so the read end keeps reporting "writer alive" no matter what this
+    ///   process did with its own copy.
+    ///
+    /// Identify the descriptor instead. A fresh temp file has an inode nothing
+    /// else shares, so afterwards "the number is gone" and "the number now
+    /// points at something else" both mean our fd was closed — and neither
+    /// depends on what other threads or forked children are doing.
+    struct FdProbe {
+        fd: std::os::unix::io::RawFd,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl FdProbe {
+        fn new(dir: &std::path::Path, name: &str) -> std::io::Result<Self> {
+            use std::os::unix::io::IntoRawFd;
+            let file = std::fs::File::create(dir.join(name))?;
+            let fd = file.into_raw_fd();
+            let (dev, ino) = Self::identity(fd).ok_or_else(std::io::Error::last_os_error)?;
+            Ok(Self { fd, dev, ino })
+        }
+
+        fn identity(fd: std::os::unix::io::RawFd) -> Option<(u64, u64)> {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                return None;
+            }
+            Some((st.st_dev as u64, st.st_ino as u64))
+        }
+
+        /// True once this descriptor no longer refers to the file it was opened
+        /// on — either closed outright, or closed and the number reissued.
+        fn is_closed(&self) -> bool {
+            match Self::identity(self.fd) {
+                None => true,
+                Some(identity) => identity != (self.dev, self.ino),
+            }
+        }
+    }
+
+    // A partial adoption is logged and survived rather than propagated into a
+    // process exit, so the OS no longer sweeps up descriptors the adoption never
+    // claimed. Any fd with no session to take it has to be closed on the way out
+    // or it leaks for the life of the daemon.
+    #[test]
+    fn adopt_sessions_closes_fds_no_session_claims() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = SessionManager::new(SessionManagerConfig::new(temp_dir.path.clone()));
+
+        let surplus = FdProbe::new(&temp_dir.path, "surplus")?;
+        assert!(!surplus.is_closed(), "probe should start open");
+
+        // No sessions to adopt, so nothing claims the fd.
+        let state = crate::handover::HandoverState {
+            sessions: Vec::new(),
+            has_tcp_listener: false,
+            sends_teardown_commit: true,
+        };
+        manager.adopt_sessions(state, vec![surplus.fd])?;
+
+        assert!(
+            surplus.is_closed(),
+            "a handover fd that no session adopted was left open"
+        );
+        Ok(())
+    }
+
+    // The same guarantee on the failure path. A session whose log can't be opened
+    // fails inside `spawn_adopted_pty_runtime`, after its fd has been taken but
+    // before any session owns it — the case that used to `?` straight out to a
+    // process exit. Both that fd and everything queued behind it must be closed.
+    #[test]
+    fn adopt_sessions_closes_fds_when_adoption_fails() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = SessionManager::new(SessionManagerConfig::new(temp_dir.path.clone()));
+
+        let in_flight = FdProbe::new(&temp_dir.path, "in-flight")?;
+        let queued = FdProbe::new(&temp_dir.path, "queued")?;
+
+        // `log_path` points at a directory, so opening it for append fails and
+        // the first session never becomes live.
+        let session = crate::handover::HandoverSession {
+            id: SessionId::new("session-1")?,
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            cwd: Some(temp_dir.path.clone()),
+            size: SessionSize::default(),
+            log_path: temp_dir.path.clone(),
+            output_seq: 0,
+            bytes_logged: 0,
+            pid: 1,
+        };
+        let state = crate::handover::HandoverState {
+            sessions: vec![session.clone(), session],
+            has_tcp_listener: false,
+            sends_teardown_commit: true,
+        };
+
+        let result = manager.adopt_sessions(state, vec![in_flight.fd, queued.fd]);
+        assert!(result.is_err(), "adoption should fail on an unopenable log");
+        assert!(
+            in_flight.is_closed(),
+            "the fd of the session that failed to adopt was left open"
+        );
+        assert!(
+            queued.is_closed(),
+            "a queued handover fd was left open after adoption failed"
+        );
+        Ok(())
+    }
+
+    // The two-process Phase-3 handshake (complete_handover_adoption /
+    // handle_handover_server) can't be exercised in-process — it does socket I/O
+    // between two daemons and ends in process::exit. The adopt-vs-refuse decision
+    // is factored into `teardown_outcome` precisely so its contract is testable
+    // here without that dance.
+    use crate::handover::{TeardownOutcome, TeardownSignal, teardown_outcome};
+
+    #[test]
+    fn commit_byte_always_adopts() {
+        // 0x03 is the explicit teardown-commit: adopt regardless of what the peer
+        // announced (a peer that sends the byte obviously supports it).
+        let signal = TeardownSignal::Byte(0x03);
+        assert_eq!(teardown_outcome(true, signal), TeardownOutcome::Adopt);
+        assert_eq!(teardown_outcome(false, signal), TeardownOutcome::Adopt);
+    }
+
+    #[test]
+    fn done_byte_always_adopts() {
+        // 0x02 is a clean teardown from a daemon predating the commit byte; it
+        // detached before sending, so adopt.
+        let signal = TeardownSignal::Byte(0x02);
+        assert_eq!(teardown_outcome(true, signal), TeardownOutcome::Adopt);
+        assert_eq!(teardown_outcome(false, signal), TeardownOutcome::Adopt);
+    }
+
+    #[test]
+    fn eof_from_a_living_committing_peer_refuses() {
+        // The peer announced it commits before detaching, closed the connection
+        // without sending the byte, and is still serving: it aborted and still
+        // owns its sessions. Adopting would put a second destructive reader on
+        // each master — refuse.
+        assert_eq!(
+            teardown_outcome(true, TeardownSignal::Eof { peer_alive: true }),
+            TeardownOutcome::Refuse
+        );
+    }
+
+    #[test]
+    fn eof_from_a_dead_peer_always_adopts() {
+        // The peer died mid-handover (e.g. `launchctl kickstart -k` on a swap that
+        // looked stuck). Its descriptors died with it, so this process holds the
+        // only handles left and refusing would destroy sessions that are still
+        // alive. Adopt regardless of what it announced.
+        assert_eq!(
+            teardown_outcome(true, TeardownSignal::Eof { peer_alive: false }),
+            TeardownOutcome::Adopt
+        );
+        assert_eq!(
+            teardown_outcome(false, TeardownSignal::Eof { peer_alive: false }),
+            TeardownOutcome::Adopt
+        );
+    }
+
+    #[test]
+    fn eof_from_legacy_peer_adopts() {
+        // An older daemon that never announces the commit byte: EOF cannot tell an
+        // abort from a lost 0x02, and refusing would strand a real handover, so
+        // adopt — the historical behavior we must preserve for old peers.
+        assert_eq!(
+            teardown_outcome(false, TeardownSignal::Eof { peer_alive: true }),
+            TeardownOutcome::Adopt
+        );
+    }
+
+    #[test]
+    fn timeout_always_adopts_even_from_a_committing_peer() {
+        // The distinction that matters most: unlike EOF, a timeout leaves the peer
+        // connected and able to commit. Its detach is gated only on its own
+        // commit-byte write, so refusing here would exit the successor and orphan
+        // every session the moment that write lands late. Adopt in both cases.
+        assert_eq!(
+            teardown_outcome(true, TeardownSignal::Timeout),
+            TeardownOutcome::Adopt
+        );
+        assert_eq!(
+            teardown_outcome(false, TeardownSignal::Timeout),
+            TeardownOutcome::Adopt
+        );
+    }
+
+    #[test]
+    fn stray_byte_follows_the_eof_rule() {
+        // An unexpected byte is treated like no commit byte: refuse only when the
+        // peer claimed it would commit, adopt otherwise.
+        let signal = TeardownSignal::Byte(0x7f);
+        assert_eq!(teardown_outcome(true, signal), TeardownOutcome::Refuse);
+        assert_eq!(teardown_outcome(false, signal), TeardownOutcome::Adopt);
     }
 }
