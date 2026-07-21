@@ -1,4 +1,4 @@
-# fix/session-shell-fallback
+# 000096 — fix/session-shell-fallback
 
 ## Agent
 
@@ -72,6 +72,26 @@ this from being opaque.
   occupying two rows at 80 columns came back as one row at 120. Whatever is
   wrong is client-side, in the pane's fit -> `sendResizeOut` path or in how the
   resulting snapshot is rendered. Not addressed here.
+
+## Review
+
+PR #115, first round:
+
+- **An empty session id broke out of the chain.** `startSession` degrades a
+  response carrying no `session_id` to `''` rather than throwing, so the loop
+  marked it spawned and stopped. The `sessionId.isNotEmpty` guard below then
+  skipped the whole subscribe/attach block and the method returned with the
+  rail still reading "Creating session..." — no success, no error, nothing to
+  retry. A real dead end, not a theoretical one. Now treated as a failed
+  attempt so the chain continues.
+- **`debugPrint` carried no stack trace**, which is what distinguishes a spawn
+  failure from a later subscribe/attach failure; the message alone does not.
+  Now `catch (e, stackTrace)`.
+- **Devlog H1 was missing its number.** Every other devlog opens
+  `# 0000NN — <branch>`; this one opened with the branch alone.
+
+Both code findings are covered by tests that were confirmed to fail without
+their fix, rather than being assumed to.
 
 ## Commits
 

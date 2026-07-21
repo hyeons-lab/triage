@@ -2612,10 +2612,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         var spawned = false;
         for (final shell in newSessionShellFallbackChain(preferredShell)) {
           try {
-            sessionId = await _client.startSession(
+            final startedId = await _client.startSession(
               command: shell.command,
               args: shell.args,
             );
+            // `startSession` degrades a response with no `session_id` to '',
+            // which there is nothing to subscribe or attach to. Treat it as a
+            // failed attempt so the chain keeps going instead of breaking out
+            // into a create that silently does nothing and strands the rail on
+            // "Creating session...".
+            if (startedId.isEmpty) {
+              lastSpawnError = Exception(
+                'daemon returned no session id for ${shell.command}',
+              );
+              continue;
+            }
+            sessionId = startedId;
             spawned = true;
             break;
           } on TriageAuthException {
@@ -2696,7 +2708,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // (_onSessionViewFit); doing it here would use an estimated size,
           // since the terminal view has not laid out yet.
         }
-      } catch (e) {
+      } catch (e, stackTrace) {
         // Roll back partial state so a failed create doesn't strand a subscription
         // id or accumulate buffered events for a session that will never appear.
         if (subId != null && subId.isNotEmpty) {
@@ -2707,8 +2719,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
         // The daemon's reason (e.g. "spawning PTY child") is the only clue the
         // user gets; swallowing it left the rail showing a bare failure with
-        // nothing to act on.
-        debugPrint('Failed to create session: $e');
+        // nothing to act on. The trace distinguishes a spawn failure from a
+        // later subscribe/attach one, which the message alone does not.
+        debugPrint('Failed to create session: $e\n$stackTrace');
         setState(() {
           _connectionStatus = 'Error creating session';
           _connectionStatusColor = const Color(0xffff6b6b);
