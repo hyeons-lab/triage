@@ -18,11 +18,14 @@ re-pairing.
 
 Native desktop builds (macOS, Windows, Linux) are attached to every
 [GitHub release](https://github.com/hyeons-lab/triage/releases) as
-`Triage-<os>-v<version>` archives. These builds are **unsigned**, so each OS
-warns before running them — see
+`Triage-<os>-v<version>` archives. These builds carry **no OS code-signing
+certificate**: the macOS client is ad-hoc signed, and the Windows and Linux
+builds are unsigned. macOS and Windows warn before running them — see
 [Prebuilt desktop clients](../../crates/triaged/README.md#prebuilt-desktop-clients)
 in the `triaged` docs for the per-platform unzip / unquarantine / "Run anyway"
-steps.
+steps. Independently of that, archives from releases after `v0.1.6` are signed
+and checksummed; see
+[Verifying a download](../../crates/triaged/README.md#verifying-a-download).
 
 ### Build from source
 

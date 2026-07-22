@@ -16,12 +16,13 @@ sessions run on ConPTY on Windows and on a standard PTY elsewhere.
 cargo install triaged
 ```
 
-Or grab a prebuilt binary instead of compiling: every
-[GitHub release](https://github.com/hyeons-lab/triage/releases) attaches a
+Or grab a prebuilt binary instead of compiling: releases after `v0.1.6` attach a
 `Triage-cli-<os>-v<version>` archive (`.tar.gz` for macOS/Linux, `.zip` for
-Windows) containing the `triaged`, `triage`, and `triage-mcp` binaries — unpack
-it and put them on your `PATH`. The bundled `triaged` already embeds the web
-client.
+Windows) to the
+[Releases page](https://github.com/hyeons-lab/triage/releases), containing the
+`triaged`, `triage`, and `triage-mcp` binaries — unpack it and put them on your
+`PATH`. The bundled `triaged` already embeds the web client. Each archive is
+signed and checksummed — see [Verifying a download](#verifying-a-download).
 
 > **Architecture.** Each archive is built on its GitHub-hosted runner: the macOS
 > binaries are **Apple Silicon (arm64)** (`macos-latest`), Linux and Windows are
@@ -122,17 +123,24 @@ builds to the [Releases](https://github.com/hyeons-lab/triage/releases) page:
 
 Download the one for your OS, unpack it, and point it at your daemon's address.
 
-> **The release binaries are unsigned.** They are ad-hoc signed (macOS) or fully
-> unsigned (Windows/Linux) — no notarization and no code-signing certificate — so
-> each OS will warn before running them. This is expected for these builds; follow
-> the per-platform steps below, or build from source if you'd rather not bypass
-> those protections.
+> **These builds carry no OS code-signing certificate.** The macOS client is
+> ad-hoc signed; the Windows and Linux clients are unsigned. macOS and Windows
+> will warn before running them — follow the per-platform steps below, or build
+> from source if you'd rather not bypass those protections.
+>
+> This is unrelated to the minisign signatures carried by assets from releases
+> after `v0.1.6` (see [Verifying a download](#verifying-a-download)). Developer ID
+> signing and
+> notarization for the macOS client are wired up but conditional — see
+> [Release signing](https://github.com/hyeons-lab/triage/blob/main/docs/release-signing.md).
 
-**macOS** — unzip, then clear the download quarantine so Gatekeeper allows the app:
+**macOS** — unzip, then open the app. If Gatekeeper blocks it (the download
+quarantine flag), clear the flag and retry:
 
 ```bash
 unzip Triage-macos-v<version>.zip
-# Remove the "downloaded from the internet" flag so macOS will run the unsigned app:
+open Triage.app
+# Blocked? Drop the "downloaded from the internet" flag and retry:
 xattr -dr com.apple.quarantine Triage.app
 open Triage.app
 ```
@@ -152,6 +160,29 @@ tar -xzf Triage-linux-v<version>.tar.gz
 chmod +x triage_client
 ./triage_client
 ```
+
+---
+
+## Verifying a download
+
+Releases after `v0.1.6` attach a
+[minisign](https://jedisct1.github.io/minisign/) signature (`.minisig`) and a
+`.sha256` checksum to every asset — the desktop clients above and the CLI
+archives alike; releases through `v0.1.6` predate this and have neither.
+Download the asset and both files, then (with
+`<asset>` your archive's filename, and `minisign` from your package manager —
+`brew install minisign`, `apt install minisign`):
+
+```bash
+minisign -Vm <asset> -P RWRinpvI8phW62LgDacQlEXg1JqBPZxvWKROZWAqmyToxr7Pw0e534yH
+sha256sum -c <asset>.sha256   # macOS: shasum -a 256 -c
+```
+
+A good signature prints `Signature and comment signature verified` and a trusted
+comment of the form `triage release vX.Y.Z`. The public key above is pinned from
+[`.github/minisign.pub`](https://github.com/hyeons-lab/triage/blob/main/.github/minisign.pub);
+see [Release signing](https://github.com/hyeons-lab/triage/blob/main/docs/release-signing.md)
+for the scheme, key custody, and rotation policy.
 
 ---
 
