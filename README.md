@@ -11,6 +11,14 @@ cargo install triaged triage        # daemon + TUI
 cargo install triage-mcp            # optional: expose sessions to local AI agents
 ```
 
+When installing from a local checkout, use `scripts/install.sh` rather than copying
+the built binaries into place yourself. The binaries are adhoc-signed and macOS
+caches a binary's code signature against its *inode*, so overwriting an installed
+binary in place (what `cp` over a destination does) makes the kernel SIGKILL both
+the running daemon and every relaunch with `Code Signature Invalid`. The script
+installs through a temp file plus `rename`, which allocates a fresh inode and
+avoids that entirely.
+
 Desktop client builds are attached to every
 [GitHub release](https://github.com/hyeons-lab/triage/releases). Releases after
 `v0.1.6` also attach prebuilt CLI archives, plus a signature and checksum for

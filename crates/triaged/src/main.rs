@@ -483,6 +483,29 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
         }
     }
 
+    // Startup has settled: whichever path got us here (cold start, session
+    // restore, or handover adoption), every session this daemon owns is now in
+    // the manager. Only now is it safe to decide which logs are unreferenced —
+    // doing it at manifest-load time would race adoption and could delete a live
+    // session's log.
+    //
+    // Off-thread, though. This point is below the handover commit, where the
+    // same reasoning as the restore comment above applies: nothing is serving
+    // clients yet, so a directory scan plus unlinks of potentially many
+    // multi-megabyte logs would be pure downtime. The purge needs no ordering
+    // against anything that follows — it only ever removes logs no session
+    // refers to — so let it run alongside startup. A session created by a client
+    // while it is mid-scan is safe on the age check: its log was written
+    // seconds ago, and nothing within the retention window is eligible.
+    let purge_manager = Arc::clone(&manager);
+    if let Err(error) = std::thread::Builder::new()
+        .name("triage-log-purge".into())
+        .spawn(move || purge_manager.purge_orphaned_logs())
+    {
+        // Not worth failing startup over; the next start tries again.
+        tracing::warn!(%error, "could not spawn the orphaned-log purge thread");
+    }
+
     // Initialize in-memory Web Asset Cache with custom config path or default state path overrides
     let override_dir = config
         .remote
