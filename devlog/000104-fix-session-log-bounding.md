@@ -1,4 +1,4 @@
-# 000102 — fix/session-log-bounding
+# 000104 — fix/session-log-bounding
 
 **Agent:** Claude Code (claude-opus-4-8[1m]) @ triage branch fix/session-log-bounding
 
@@ -6,7 +6,7 @@
 
 Investigate why `triaged` was killing sessions and stalling the machine, then fix
 the causes. Three independent causes were found; see
-`devlog/plans/000102-01-crash-causes-and-log-bounding.md` for the full
+`devlog/plans/000104-01-crash-causes-and-log-bounding.md` for the full
 derivation and evidence.
 
 1. macOS SIGKILLed the daemon with `CODESIGNING / Launch Constraint Violation`
@@ -70,13 +70,15 @@ the two bounds as fields
 (the latter so tests can drive the real trim path without writing megabytes).
 The size bounds are pinned in order by `const _: () = assert!(…)`.
 
-2026-07-22T10:26-0700 `crates/triaged/src/session.rs` — reclaimed leaked logs.
-`shutdown_session` now deletes the log of the session it removed from the
-manifest (`remove_session_log`), using the session's own recorded `log_path`, and
-`restore_sessions` runs `purge_orphaned_session_logs` for logs no *manifest*
-entry references that are also older than `ORPHANED_LOG_RETENTION` (7 days).
-Matching is by file name, since a manifest path and a freshly scanned one can
-spell the same location differently.
+2026-07-22T10:26-0700 `crates/triaged/src/session.rs`, `crates/triaged/src/main.rs`
+— reclaimed leaked logs. `shutdown_session` deletes the log of the session it
+removed from the manifest (`remove_session_log`), using the session's own
+recorded `log_path` and refusing any path not named `{session_id}.log`.
+`SessionManager::purge_orphaned_logs` reclaims logs that neither the live session
+map nor the on-disk manifest references and that are older than
+`ORPHANED_LOG_RETENTION` (7 days); `main` calls it on a background thread once
+startup has settled. Matching is by file name, since a manifest path and a
+freshly scanned one can spell the same location differently.
 
 2026-07-22T10:29-0700 `scripts/install.sh` — new. Builds and installs via a
 temp file in the destination directory plus `mv`, so each install allocates a
@@ -248,6 +250,48 @@ left implied, since the earlier wording overclaimed.
 specified "Rotation: 100MB per session, last 7 days" — never implemented, and
 ~6x looser than what landed. Recorded the revision and its effect on the planned
 `rg` search scope rather than letting the spec silently contradict the code.
+
+2026-07-22T14:18-0700 Addressed Copilot's review on the PR. Three findings, all
+real:
+
+- `remove_session_log` unlinked whatever path the manifest or handover payload
+  recorded, without checking it. That path is *data*, not something this process
+  derived, so a corrupted manifest could have made shutdown delete an arbitrary
+  file. It now requires the name to be `{session_id}.log` and warns otherwise —
+  leaking a stray log is recoverable, deleting the wrong file is not. Kept the
+  recorded path rather than reverting to a derived one, since an adopted
+  session's log legitimately comes from the handover payload.
+- `read_replay_tail` could report a length past EOF. `start` is computed from the
+  pre-read size, so a log trimmed below it in between (another daemon still owns
+  the session mid-adoption) left the seek past the end, the read empty, and
+  `start` describing a length the file no longer had. Now clamped to the
+  post-read size.
+- The orphan purge ran inside `restore_sessions`, before handover adoption, so a
+  live-but-idle session whose log had not been written within the retention
+  window could have had it deleted moments before adoption. This was the gap in
+  my earlier reasoning: I had argued the manifest always lists live sessions, but
+  that only holds if it was persisted after the last change — a stale manifest
+  plus a handover defeats it.
+
+2026-07-22T14:20-0700 Moved the purge out of `restore_sessions` into
+`SessionManager::purge_orphaned_logs`, called from `main` once startup has
+settled (after cold start, restore, and handover adoption all converge). It
+treats a log as referenced if *either* the live session map or the on-disk
+manifest points at it: the map misses failed-restore sessions, the manifest
+misses anything adopted since it was last written, and only the union is safe.
+If the manifest cannot be read the purge is skipped rather than run on half the
+picture.
+
+2026-07-22T14:26-0700 Ran the purge on a background thread rather than inline.
+The call site sits below the handover commit point, where `main`'s own comment
+notes that work is downtime — nothing is serving clients yet — and a directory
+scan plus unlinks of multi-megabyte logs is exactly that. The purge needs no
+ordering against what follows, and a session created while it scans is safe on
+the age check, its log being seconds old.
+
+2026-07-22T14:28-0700 Renumbered this devlog and its plan 000102 → 000104.
+Both `000102` (docs, #120) and `000103` (rail row identity, #121) merged to main
+while this branch was open.
 
 ## Commits
 

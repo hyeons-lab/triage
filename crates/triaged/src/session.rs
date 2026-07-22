@@ -818,6 +818,69 @@ impl SessionManager {
         self.config.log_dir.join(format!("{session_id}.log"))
     }
 
+    /// Reclaims session logs that nothing refers to any more.
+    ///
+    /// Deliberately *not* run from `restore_sessions`. At manifest-load time the
+    /// picture is incomplete: sessions adopted across a handover join the map
+    /// afterwards, so a live-but-idle session's log — one untouched for longer
+    /// than the retention window, which a shell sitting at a prompt manages
+    /// easily — could be deleted moments before its session was adopted. The
+    /// daemon calls this once startup has settled instead.
+    ///
+    /// A log is referenced if *either* a session in the map points at it or the
+    /// on-disk manifest does. The union matters in both directions: the map
+    /// misses sessions whose `HistoricalSession::restore` failed (warn-skipped,
+    /// but still listed in the manifest and still recoverable), and the manifest
+    /// misses anything adopted since it was last written.
+    pub fn purge_orphaned_logs(&self) {
+        self.purge_orphaned_logs_with_retention(ORPHANED_LOG_RETENTION);
+    }
+
+    /// [`Self::purge_orphaned_logs`] with an explicit grace period, so tests can
+    /// drive the real union without backdating file mtimes.
+    fn purge_orphaned_logs_with_retention(&self, retention: std::time::Duration) {
+        let Ok(sessions) = self.sessions() else {
+            tracing::warn!("session lock poisoned; skipping orphaned log purge");
+            return;
+        };
+        let mut referenced: HashSet<PathBuf> = sessions
+            .values()
+            .map(|session| match session {
+                ManagedSession::Live { launch, .. } => launch.log_path.clone(),
+                ManagedSession::Historical { session, .. }
+                | ManagedSession::Restoring { session, .. } => session.persisted.log_path.clone(),
+            })
+            .collect();
+        drop(sessions);
+
+        let manifest_path = self.config.manifest_path();
+        if manifest_path.exists() {
+            let manifest = fs::read(&manifest_path)
+                .context("reading session manifest")
+                .and_then(|bytes| {
+                    serde_json::from_slice::<SessionManifest>(&bytes)
+                        .context("decoding session manifest")
+                });
+            match manifest {
+                Ok(manifest) => {
+                    referenced.extend(manifest.sessions.into_iter().map(|s| s.log_path));
+                }
+                Err(error) => {
+                    // Without the manifest half of the union, a failed-restore
+                    // session's log looks orphaned. Skip rather than guess.
+                    tracing::warn!(
+                        manifest_path = %manifest_path.display(),
+                        ?error,
+                        "could not read session manifest; skipping orphaned log purge"
+                    );
+                    return;
+                }
+            }
+        }
+
+        purge_orphaned_session_logs(&self.config.log_dir, &referenced, retention);
+    }
+
     fn sessions(&self) -> Result<std::sync::MutexGuard<'_, HashMap<SessionId, ManagedSession>>> {
         self.sessions
             .lock()
@@ -2317,9 +2380,6 @@ fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> R
 fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, ManagedSession>> {
     let manifest_path = config.manifest_path();
     if !manifest_path.exists() {
-        // Still purge: no manifest means *every* log is unreferenced, which is
-        // exactly the case with the most to reclaim.
-        purge_orphaned_session_logs(&config.log_dir, &HashSet::new(), ORPHANED_LOG_RETENTION);
         return Ok(HashMap::new());
     }
 
@@ -2335,13 +2395,7 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, 
     );
 
     let mut sessions = HashMap::new();
-    // Collected from the manifest rather than from the restored map, and using
-    // each entry's own `log_path` rather than re-deriving the name. A session
-    // whose restore fails below is still referenced — its log must not be
-    // mistaken for an orphan and deleted out from under a later recovery.
-    let mut referenced = HashSet::new();
     for persisted in manifest.sessions {
-        referenced.insert(persisted.log_path.clone());
         match HistoricalSession::restore(persisted) {
             Ok(session) => {
                 sessions.insert(
@@ -2357,14 +2411,35 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, 
             }
         }
     }
-    purge_orphaned_session_logs(&config.log_dir, &referenced, ORPHANED_LOG_RETENTION);
     Ok(sessions)
 }
 
 /// Deletes the output log of a session that has just been removed from the
 /// manifest. Best-effort: a failure leaks one log file, which must not turn a
 /// successful shutdown into an error.
+///
+/// The path comes from the manifest or a handover payload, so it is *data*, not
+/// something this process derived. Before unlinking, require it to be named
+/// `{session_id}.log`: a corrupted manifest — or a future bug recording the
+/// wrong path — would otherwise make this delete an arbitrary file. Leaking a
+/// stray log is recoverable; deleting the wrong file is not.
+///
+/// Only the basename is constrained, not the directory, so this narrows the hole
+/// rather than closing it. That is deliberate: a session adopted from a
+/// predecessor with a different `log_dir` carries that directory in its path,
+/// and rejecting it would leak exactly the logs this is meant to reclaim. The
+/// basename is the part that never legitimately varies.
 fn remove_session_log(session_id: &SessionId, log_path: &Path) {
+    let expected = format!("{session_id}.log");
+    if log_path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        tracing::warn!(
+            session_id = %session_id,
+            log_path = %log_path.display(),
+            "refusing to remove a session log whose name does not match the session; \
+             leaving it in place"
+        );
+        return;
+    }
     match fs::remove_file(log_path) {
         Ok(()) => tracing::info!(
             session_id = %session_id,
@@ -2383,12 +2458,14 @@ fn remove_session_log(session_id: &SessionId, log_path: &Path) {
 
 /// Grace period before an unreferenced session log is deleted.
 ///
-/// Manifest membership is the primary safety check; this age check is a second
-/// one, covering the window in which the manifest is not yet the whole picture —
-/// sessions adopted across a handover join the map *after* the purge runs. It is
-/// not a guarantee on its own (an idle shell can sit at a prompt for weeks
-/// without writing), which is why it is applied *in addition to* membership and
-/// never instead of it.
+/// Reference checking is the real safety property — [`SessionManager::purge_orphaned_logs`]
+/// runs only once every session this daemon owns is in the map, and unions that
+/// with the manifest. This age check is a second, weaker line: it bounds the
+/// damage if that picture is ever wrong (a manifest written mid-change, a
+/// session created by a path not yet considered). It is emphatically *not* a
+/// guarantee on its own — an idle shell can sit at a prompt for weeks without
+/// writing a byte — so it is applied in addition to reference checking, never
+/// instead of it.
 const ORPHANED_LOG_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -4370,10 +4447,12 @@ fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, V
 /// snapshot, but here it would leave `bytes_logged` at zero while the file holds
 /// data — silently breaking the invariant above — so I/O errors propagate.
 ///
-/// The offset and the length come from a single open handle, and the length is
-/// the read's own end position rather than a separately stat'd size. A session
-/// log is still being written during a handover adoption, so a stat-then-reopen
-/// pair can disagree; deriving both from one handle keeps them consistent.
+/// The offset and the length come from a single open handle rather than a
+/// stat-then-reopen pair, which can disagree because a session log is still
+/// being written during a handover adoption. The reported length is the read's
+/// own end position, clamped to the file's post-read size: `start` is derived
+/// from the *pre*-read length, so a log trimmed below it in between would
+/// otherwise have this report a length past EOF.
 fn read_replay_tail(log_path: &Path) -> Result<(u64, Vec<u8>)> {
     let mut file = File::open(log_path)
         .with_context(|| format!("opening session log {}", log_path.display()))?;
@@ -4389,7 +4468,18 @@ fn read_replay_tail(log_path: &Path) -> Result<(u64, Vec<u8>)> {
     let mut tail = Vec::new();
     file.read_to_end(&mut tail)
         .with_context(|| format!("reading session log {}", log_path.display()))?;
-    Ok((start + tail.len() as u64, tail))
+
+    // Clamp to the log's post-read size. `start` was computed from the *pre*-read
+    // length, so a log trimmed below it in between (another daemon still owns
+    // this session during a handover adoption) leaves the seek past EOF, the read
+    // empty, and `start` describing a length the file no longer has. Reporting
+    // that would put `bytes_logged` past EOF and send `read_raw_output_tail`
+    // seeking beyond the end.
+    let after = file
+        .metadata()
+        .with_context(|| format!("reading session log metadata {}", log_path.display()))?
+        .len();
+    Ok(((start + tail.len() as u64).min(after), tail))
 }
 
 /// Trims the log at `log_path` down to its trailing `retain` bytes, returning
@@ -7788,6 +7878,36 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// The log path is data from the manifest or a handover payload, so a
+    /// corrupted one must not turn shutdown into an arbitrary-file delete.
+    #[test]
+    fn remove_session_log_refuses_a_mismatched_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "triage-rmguard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test dir");
+
+        let session_id = SessionId::new("session-7").expect("session id");
+        let bystander = dir.join("something-important.txt");
+        let correct = dir.join("session-7.log");
+        fs::write(&bystander, b"do not delete").expect("write bystander");
+        fs::write(&correct, b"log").expect("write log");
+
+        remove_session_log(&session_id, &bystander);
+        assert!(
+            bystander.exists(),
+            "a path that is not this session's log must never be unlinked"
+        );
+
+        remove_session_log(&session_id, &correct);
+        assert!(!correct.exists(), "the session's own log must be removed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Orphaned logs are reclaimed, but only once stale — and a log a session
     /// still refers to is never touched, however old it looks.
     #[test]
@@ -8110,6 +8230,96 @@ mod tests {
             .status()
             .expect("run git test command");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The manifest half of the union is what protects a session whose restore
+    /// *failed*: it is warn-skipped from the map but still listed, and still
+    /// recoverable, so its log must survive the purge.
+    ///
+    /// Unix-only: the failure is forced by making the log unopenable, and the
+    /// mode bits that do that are not portable (nor effective as root).
+    #[cfg(not(windows))]
+    #[test]
+    fn purge_orphaned_logs_keeps_logs_the_manifest_still_references() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log_dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&log_dir);
+        fs::create_dir_all(&log_dir).expect("create log dir");
+
+        let referenced = log_dir.join("session-1.log");
+        let orphan = log_dir.join("session-2.log");
+        fs::write(&referenced, b"kept").expect("write referenced log");
+        fs::write(&orphan, b"dropped").expect("write orphan log");
+        // Unopenable, so `HistoricalSession::restore` fails and this session
+        // never reaches the map — leaving the manifest as its only voucher.
+        fs::set_permissions(&referenced, fs::Permissions::from_mode(0o000))
+            .expect("make log unreadable");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: SessionId::new("session-1").expect("session id"),
+                command: "/bin/sh".into(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize::default(),
+                log_path: referenced.clone(),
+                exited: true,
+                last_known_cwd: None,
+            },
+        );
+
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        // Guard the premise: if the log were still restorable the session would
+        // be in the map and the map half would protect it, so the assertion
+        // below would pass without the manifest half ever being exercised.
+        assert!(
+            !manager
+                .sessions()
+                .expect("sessions")
+                .contains_key(&SessionId::new("session-1").expect("session id")),
+            "restore must have failed for this test to exercise the manifest half"
+        );
+
+        manager.purge_orphaned_logs_with_retention(std::time::Duration::ZERO);
+
+        assert!(
+            referenced.exists(),
+            "a log the manifest still references must survive, even with no live session"
+        );
+        assert!(
+            !orphan.exists(),
+            "an unreferenced stale log must be removed"
+        );
+
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    /// An unreadable manifest means the union is missing half its input, so the
+    /// purge must decline rather than delete on a partial picture.
+    #[test]
+    fn purge_orphaned_logs_skips_when_the_manifest_is_unreadable() {
+        let log_dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&log_dir);
+        fs::create_dir_all(&log_dir).expect("create log dir");
+
+        let orphan = log_dir.join("session-9.log");
+        fs::write(&orphan, b"stale").expect("write orphan log");
+        fs::write(
+            SessionManagerConfig::new(log_dir.clone()).manifest_path(),
+            b"{ this is not json",
+        )
+        .expect("write corrupt manifest");
+
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        manager.purge_orphaned_logs_with_retention(std::time::Duration::ZERO);
+
+        assert!(
+            orphan.exists(),
+            "a corrupt manifest must abort the purge, not license deleting everything"
+        );
+
+        let _ = fs::remove_dir_all(&log_dir);
     }
 
     fn write_manifest(log_dir: &PathBuf, persisted: PersistedSession) {
