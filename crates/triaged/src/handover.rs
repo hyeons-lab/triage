@@ -597,11 +597,29 @@ mod unix_impl {
     /// A PTY master inherited through a handover.
     ///
     /// The descriptor is an [`OwnedFd`] rather than a bare `RawFd` so the leak
-    /// this type used to cause is unrepresentable: it closes when the master is
-    /// dropped, which is when the session ends. Holding a raw number meant nothing
-    /// closed it — the reader and writer handed to a session are `dup`s that close
-    /// themselves, so an adopted session that ended leaked exactly its master. That
-    /// compounds, because every handover re-adopts every session.
+    /// this type used to cause is unrepresentable. Holding a raw number meant
+    /// nothing closed it — the reader and writer handed to a session are `dup`s
+    /// that close themselves, so an adopted session that ended leaked exactly its
+    /// master. That compounds, because every handover re-adopts every session.
+    ///
+    /// It closes whenever the value is dropped, which is at three points, not
+    /// only at session end:
+    ///
+    /// - the actor loop returning, either on an explicit shutdown or when its
+    ///   session ends;
+    /// - an early return in `spawn_adopted_pty_runtime` before the actor takes
+    ///   ownership — the case `UnadoptedFds::take_next` hands the descriptor over
+    ///   for;
+    /// - **a handover detach.** `detach_all_live_sessions` drops each
+    ///   `SessionActor`, and with it the command `Sender`, so the worker's
+    ///   `try_recv` sees `Disconnected` and breaks; `ActorState` unwinds and this
+    ///   master closes even though the session lives on.
+    ///
+    /// That last one is safe, and is the reason closing here does not undo the
+    /// handover: the successor is not sharing this descriptor. `SCM_RIGHTS`
+    /// installs an independent one in that process, and `extract_handover_state`
+    /// sends a `libc::dup` rather than this fd itself. The child keeps its slave
+    /// side regardless, so the session survives on the successor's copy.
     #[derive(Debug)]
     pub struct AdoptedMasterPty {
         /// Private, and reachable only through [`Self::from_raw_fd`]: the whole
