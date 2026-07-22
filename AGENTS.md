@@ -55,7 +55,12 @@ Common types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `ci`, `chore`,
   cd worktrees/<branch-name>
   git branch --unset-upstream
   ```
-  `--unset-upstream` is required because git auto-tracks `origin/main` when branching from a remote ref — a push without it would target `main`. The correct upstream is set on the first `git push -u origin <type>/<branch-name>`.
+  `--unset-upstream` removes the `origin/main` tracking git sets up automatically when branching from a remote ref. The push form below is immune to that tracking, but under the `push.default` settings described there a source-only push would still target `main`, so clear it. Verify it applied — from inside the worktree, `git rev-parse --abbrev-ref @{u}` should error with "no upstream" rather than print `origin/main`. (From the main checkout, run `git -C worktrees/<branch-name> rev-parse --abbrev-ref @{u}` — a `cd` that silently failed would otherwise check the main checkout instead.)
+- Push with an explicit destination refspec, which also sets the upstream:
+  ```bash
+  git push -u origin HEAD:refs/heads/<type>/<branch-name>
+  ```
+  Never use the source-only form (`git push -u origin <type>/<branch-name>`). Under `push.default = upstream`/`tracking`, git resolves the *destination* from the branch's upstream — so if `--unset-upstream` was skipped or silently failed, that upstream is still `origin/main` and the push lands on `main`, bypassing the PR. The `HEAD:refs/heads/<branch>` form names its destination and cannot resolve anywhere else.
 - After PR merges, clean up from the main checkout:
   ```bash
   git worktree remove worktrees/<branch-name>

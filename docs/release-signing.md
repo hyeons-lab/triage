@@ -1,8 +1,9 @@
 # Release signing
 
-Every binary attached to a Triage GitHub release is signed and checksummed in CI
-so clients can verify a download before installing it (self-update, in-app
-install). This is the signing infrastructure for the self-update epic
+Every asset the release workflow attaches to a Triage GitHub release is signed and
+checksummed in CI so clients can verify a download before installing it
+(self-update, in-app install). Releases through `v0.1.6` predate this and carry no
+sidecars. This is the signing infrastructure for the self-update epic
 (`devlog/plans/000066-01-self-update.md`, Phase 0b); the clients that *consume*
 these signatures land in later phases.
 
@@ -21,6 +22,21 @@ For each release archive `Triage-…`, the `release` job in
 | `<asset>.minisig` | `minisign -S` | `minisign -Vm <asset> -P <pinned public key>` |
 | `<asset>.sha256` | `sha256sum` | `sha256sum -c <asset>.sha256` |
 
+### Not to be confused with OS code signing
+
+This is Triage's own scheme, and it covers **every** asset of every release the
+workflow cuts — the step fails closed if the key is missing (see
+[Key custody](#key-custody)).
+
+Separately, the `build-macos` job can sign `Triage.app` with an Apple Developer
+ID identity and notarize it. That path is **conditional**: it runs only when all
+six `MACOS_*` secrets are configured on the repository, and otherwise falls back
+to an ad-hoc signature with a CI warning. It applies to `Triage.app` alone — no
+other asset is ever Developer ID signed or notarized, so for the Windows and
+Linux clients and the CLI archives, minisign is the only integrity check
+available. (Mach-O binaries built on the macOS runners are ad-hoc signed by the
+linker, which establishes no identity and is not a substitute.)
+
 ## Public key
 
 The release-signing **public** key is committed at
@@ -30,19 +46,10 @@ The release-signing **public** key is committed at
 RWRinpvI8phW62LgDacQlEXg1JqBPZxvWKROZWAqmyToxr7Pw0e534yH
 ```
 
-### Verifying a downloaded asset
-
-```sh
-# 1. Fetch the asset and its .minisig from the GitHub release.
-# 2. Verify the signature against the pinned public key:
-minisign -Vm Triage-cli-linux-v0.1.7.tar.gz -P RWRinpvI8phW62LgDacQlEXg1JqBPZxvWKROZWAqmyToxr7Pw0e534yH
-
-# Optionally also check the sha256 sidecar:
-sha256sum -c Triage-cli-linux-v0.1.7.tar.gz.sha256
-```
-
-A good signature prints `Signature and comment signature verified` and a trusted
-comment of the form `triage release vX.Y.Z`.
+The user-facing verification steps live in
+[Verifying a download](../crates/triaged/README.md#verifying-a-download) — that is
+the copy to point downloaders at. A good signature prints `Signature and comment
+signature verified` with a trusted comment of the form `triage release vX.Y.Z`.
 
 ## Key custody
 
@@ -67,6 +74,16 @@ deliberate event — not routine:
    verify in the interim.
 4. Treat a suspected private-key compromise as urgent: rotate immediately and
    re-sign (or yank) any releases produced with the old key.
+
+> **The key literal is quoted outside `.github/minisign.pub`** — in
+> [Public key](#public-key) above, and in **Verifying a download** in
+> `crates/triaged/README.md`. Update both in the same commit as step 3; a stale
+> copy sends users to verify against a retired key. The trusted-comment format is
+> duplicated the same way — `publish.yml`'s signing step sets it, and this doc and
+> that README both quote it as `triage release vX.Y.Z`. (The success string
+> `Signature and comment signature verified` comes from minisign itself, so it
+> changes only if minisign does. Devlogs quote the key too; they are an
+> append-only record and are left alone.)
 
 There is intentionally no automatic rotation — minisign supports only a single
 pinned key per verification, so overlap has to be managed by client rollout.

@@ -11,10 +11,14 @@ cargo install triaged triage        # daemon + TUI
 cargo install triage-mcp            # optional: expose sessions to local AI agents
 ```
 
-Prebuilt binaries and desktop/mobile client builds are attached to every
-[GitHub release](https://github.com/hyeons-lab/triage/releases). See
-[`crates/triaged/README.md`](crates/triaged/README.md#installation) for the
-per-platform notes (the release builds are unsigned, so each OS warns once).
+Desktop client builds are attached to every
+[GitHub release](https://github.com/hyeons-lab/triage/releases). Releases after
+`v0.1.6` also attach prebuilt CLI archives, plus a signature and checksum for
+every asset — see
+[Verifying a download](crates/triaged/README.md#verifying-a-download). No release
+build carries an OS code-signing certificate, so macOS and Windows warn once; see
+[Prebuilt desktop clients](crates/triaged/README.md#prebuilt-desktop-clients) for
+the per-platform steps.
 
 ## Run
 
