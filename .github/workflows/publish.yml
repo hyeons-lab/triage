@@ -30,10 +30,12 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Install Rust toolchain
-        # Nightly required by the `cera` dep on aarch64 (see rust-toolchain.toml).
-        uses: dtolnay/rust-toolchain@nightly
+        # dtolnay/rust-toolchain@v1 (SHA-pinned to match ci.yml). Nightly is
+        # required by the `cera` dep on aarch64 (see rust-toolchain.toml); the
+        # toolchain is chosen by the `with:` key below, not by the action ref.
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
 
       - name: Determine workspace version
         id: version
@@ -48,7 +50,8 @@ jobs:
           echo "Workspace version: $VERSION"
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache@v2 (SHA-pinned to match ci.yml).
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           cache-bin: false
 
@@ -533,7 +536,7 @@ jobs:
         # required by the `cera` dep on aarch64 (see rust-toolchain.toml).
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
 
       - name: Cache Rust build artifacts
         # Swatinem/rust-cache@v2 (SHA-pinned to match ci.yml).

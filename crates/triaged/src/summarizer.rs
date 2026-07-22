@@ -242,7 +242,7 @@ fn generate_one_line(
     config: &SummarizerConfig,
     prompt_text: &str,
 ) -> anyhow::Result<Option<String>> {
-    let mut session = engine.new_session(cera::SessionConfig::default());
+    let mut session = engine.new_session(cera::SessionConfig::default())?;
     let messages = [
         ChatMessage {
             role: "system".to_string(),
@@ -280,7 +280,7 @@ fn generate_detail(
     prompt_text: &str,
     context: Option<&SessionContext>,
 ) -> anyhow::Result<Option<String>> {
-    let mut session = engine.new_session(cera::SessionConfig::default());
+    let mut session = engine.new_session(cera::SessionConfig::default())?;
     let messages = [
         ChatMessage {
             role: "system".to_string(),

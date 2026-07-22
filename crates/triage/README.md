@@ -20,6 +20,12 @@ Install both the client and daemon:
 cargo install triage triaged
 ```
 
+> On **aarch64**, building `triaged` from source needs a nightly toolchain —
+> 1.99.0-nightly or newer (`nightly-2026-07-08`+) — because its `cera` inference
+> dependency uses unstable NEON intrinsics. Use `cargo +nightly install triage triaged`,
+> or take a prebuilt binary from a
+> [release](https://github.com/hyeons-lab/triage/releases).
+
 ## Usage
 
 First make sure the daemon is running. Start it in the foreground:
