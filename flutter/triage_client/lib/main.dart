@@ -254,6 +254,16 @@ bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
   return platform == TargetPlatform.windows;
 }
 
+/// True on touch platforms — where the terminal takes IME input, so requesting
+/// focus raises the soft keyboard and insets the viewport.
+///
+/// False under the widget tests: their default platform is android, but they
+/// assert the desktop side-by-side layout.
+bool isMobilePlatform() =>
+    !runningUnderFlutterTest() &&
+    (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android);
+
 /// The shells to attempt, in order, when creating a session.
 ///
 /// The daemon spawns the shell, but the menu order above is derived from
@@ -689,7 +699,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // sleep/wake that never delivered a lifecycle event.
         _reconnectNowOnResume();
         _refitActiveSession();
-        _refocusActiveSessionOnResume();
+        _refocusActiveSession();
       }
     });
     _clientId = _loadOrCreateClientId();
@@ -1034,7 +1044,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // accrued while we were backgrounded.
           _reconnectNowOnResume();
           _refitActiveSession();
-          _refocusActiveSessionOnResume();
+          _refocusActiveSession();
         }
         break;
       case AppLifecycleState.inactive:
@@ -1089,14 +1099,32 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }());
   }
 
+  // Refit and reclaim focus together — what the header "refit" button runs.
+  //
+  // The button is pressed precisely when a session is misbehaving, and a refit
+  // alone leaves the terminal correctly sized but unfocused, so the user has to
+  // click into the pane before they can type.
+  //
+  // Not on mobile, though: there the terminal takes IME input
+  // (`hardwareKeyboardOnly: false`), so requesting focus raises the soft
+  // keyboard, which insets the Scaffold, shrinks the viewport and fires another
+  // fit at the smaller size — undoing the resize the user just asked for. That
+  // viewport jump is the same one #105 fixed for scroll swipes, and it would be
+  // worst on the one control whose whole purpose is sizing.
+  void _refitAndFocusActiveSession() {
+    _refitActiveSession();
+    if (!isMobilePlatform()) _refocusActiveSession();
+  }
+
   // Resuming from sleep/occlusion drops the terminal's keyboard focus, so the
   // active session silently ignores input until the user switches sessions and
   // back. Re-request focus here through the same channel that the session
   // switch uses: bumping the session's focus revision makes the pane refocus on
   // its next rebuild (honored by both the native and web panes). Kept separate
-  // from the resize-heal above so it also covers local / not-yet-attached
-  // sessions, which that path intentionally skips.
-  void _refocusActiveSessionOnResume() {
+  // from the resize-heal so it also covers local / not-yet-attached sessions,
+  // which that path intentionally skips. Also used by the refit button, via
+  // _refitAndFocusActiveSession.
+  void _refocusActiveSession() {
     if (_disposed || !mounted || _sessions.isEmpty) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     setState(() {
@@ -2950,12 +2978,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // terminal to a sliver. Mobile shows a full-screen workspace with the rail
     // as a scrim-backed overlay that dismisses on select; desktop keeps the
     // side-by-side layout.
-    // The widget tests assert the desktop side-by-side layout, so keep it in the
-    // test harness even though the default test platform is android.
-    final isMobile =
-        !runningUnderFlutterTest() &&
-        (defaultTargetPlatform == TargetPlatform.iOS ||
-            defaultTargetPlatform == TargetPlatform.android);
+    final isMobile = isMobilePlatform();
 
     void collapseRail() {
       if (!_sidebarCollapsed) setState(() => _sidebarCollapsed = true);
@@ -3046,7 +3069,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             onOpenRail: isMobile ? openRail : null,
             // Manual escape hatch for reclaiming the shared PTY size when
             // switching back to this device (auto-refit only fires on resume).
-            onRefit: _refitActiveSession,
+            onRefit: _refitAndFocusActiveSession,
           );
 
     if (isMobile) {
@@ -3419,10 +3442,7 @@ class SessionRail extends StatelessWidget {
               // a long-press (ReorderableDelayedDragStartListener). Mouse: the
               // whole row is an immediate drag handle; a click still selects
               // since a tap registers no movement.
-              final isTouch =
-                  !runningUnderFlutterTest() &&
-                  (defaultTargetPlatform == TargetPlatform.iOS ||
-                      defaultTargetPlatform == TargetPlatform.android);
+              final isTouch = isMobilePlatform();
               return isTouch
                   ? ReorderableDelayedDragStartListener(
                       key: key,

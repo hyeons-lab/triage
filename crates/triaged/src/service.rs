@@ -136,8 +136,28 @@ fn xml_escape(input: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Seconds launchd waits between respawns of the daemon. Deliberately above
+/// launchd's 10s default: a binary that cannot launch at all — e.g. one macOS
+/// SIGKILLs for an invalid code signature after an in-place upgrade — is
+/// otherwise retried every 10s indefinitely.
+#[cfg(any(target_os = "macos", test))]
+const THROTTLE_INTERVAL_SECS: u32 = 30;
+
+#[cfg(any(target_os = "macos", test))]
+const _: () = assert!(
+    THROTTLE_INTERVAL_SECS > 10,
+    "the throttle must exceed launchd's 10s default, or it slows nothing down"
+);
+
 /// macOS LaunchAgent plist that runs `exe` at load, keeps it alive, and captures
 /// stdout/stderr to the given log files.
+///
+/// `KeepAlive` stays unconditional. Making it conditional on `SuccessfulExit`
+/// looks tempting — it would stop launchd respawning the job after the clean
+/// exit that ends a handover — but that respawn is load-bearing: it is how
+/// supervision returns to a launchd-owned process after a manual handover (see
+/// `devlog/000085-fix-daemon-smart-start.md`), and `main`'s refused-teardown
+/// path documents that it relies on being respawned regardless of exit status.
 #[cfg(any(target_os = "macos", test))]
 fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
     format!(
@@ -155,6 +175,8 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>{throttle}</integer>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
@@ -166,6 +188,7 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
 "#,
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
+        throttle = THROTTLE_INTERVAL_SECS,
         stdout = xml_escape(&stdout_log.display().to_string()),
         stderr = xml_escape(&stderr_log.display().to_string()),
     )
@@ -568,6 +591,40 @@ mod tests {
         assert!(body.contains("<string>/tmp/err.log</string>"));
         assert!(body.contains("<key>RunAtLoad</key>"));
         assert!(body.contains("<key>KeepAlive</key>"));
+    }
+
+    /// The daemon must stay supervised unconditionally, but a binary launchd
+    /// cannot start — one macOS SIGKILLs for an invalid code signature after an
+    /// in-place upgrade — must not be retried at launchd's 10s default forever.
+    #[test]
+    fn plist_keeps_alive_unconditionally_and_throttles_respawns() {
+        let body = plist_contents(
+            Path::new("/usr/local/bin/triaged"),
+            Path::new("/tmp/out.log"),
+            Path::new("/tmp/err.log"),
+        );
+
+        // KeepAlive must stay unconditional. Making it depend on SuccessfulExit
+        // would stop launchd respawning the job after a handover's clean exit,
+        // which is how supervision returns to a launchd-owned process.
+        assert!(
+            body.contains("<key>KeepAlive</key>\n    <true/>"),
+            "KeepAlive must be unconditional <true/>: {body}"
+        );
+
+        // The value must belong to the ThrottleInterval key, not merely appear
+        // somewhere in the plist. (That it exceeds launchd's 10s default is
+        // pinned by a compile-time assertion on the constant itself.)
+        let throttle = body
+            .split_once("<key>ThrottleInterval</key>")
+            .expect("plist declares ThrottleInterval")
+            .1;
+        assert!(
+            throttle
+                .trim_start()
+                .starts_with(&format!("<integer>{THROTTLE_INTERVAL_SECS}</integer>")),
+            "ThrottleInterval must be followed by its value: {throttle}"
+        );
     }
 
     #[test]

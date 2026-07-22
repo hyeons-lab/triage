@@ -180,7 +180,7 @@ The agent's `set_note` text remains useful as intent narration ("bisecting the t
 
 ### 7. Search, Logs, Overview Cards
 
-- **Per-session logs** at `~/.local/state/triage/sessions/<id>.log`. Rotation: 100MB per session, last 7 days.
+- **Per-session logs** at `~/.local/state/triage/sessions/<id>.log`. Trimmed to 12 MiB once a log passes 16 MiB; a session's log is deleted when the session is shut down, and unreferenced logs are purged after 7 days. (Originally specified as 100MB per session — revised down once unbounded logs proved to cost gigabytes of disk and multi-second handovers, since replay and history only ever read the tail. Note this bounds how far back `rg` search can reach.)
 - **Search:** modal hotkey shells out to `rg` over the log directory. MVP, fast, zero new deps.
 - **Tantivy is deferred** and re-scoped to indexing *semantic events* (commits, file edits, errors, test runs) extracted from streams — a separate feature, not v2 of raw-text search.
 - **Overview grid** (`Ctrl+E`): card per session — title, repo+worktree+branch, status pill, AI note, runtime, last 3 lines. **No downsampled thumbnails** — they're illegible. The status card is the right primitive.
