@@ -990,8 +990,8 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     // Detach — do NOT kill. The successor daemon has already adopted these
     // sessions via the transferred master fds; sending each actor a shutdown
     // (which calls child.kill()) is what made handovers tear down every session.
-    // We process::exit(0) below, so the OS reaps our threads and fds without
-    // touching the children.
+    // We process::exit(0) below, which reaps whatever the detach left running;
+    // see SessionManager::detach_all_live_sessions for what that is.
     manager.detach_all_live_sessions();
 
     // Past the detach there is no way back: the sessions are gone from this

@@ -170,6 +170,9 @@ pub const HANDOVER_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::
 /// this replaced had no headroom and was aborting valid handovers.
 pub const HANDOVER_ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+// `detach_all_live_sessions` stays a plain code span in the doc below: this
+// constant is not `#[cfg(unix)]` and that item is, so a link would dangle on a
+// non-unix build, and windows is a CI target.
 /// How long the successor waits in Phase 3 for the outgoing daemon's `0x02`
 /// teardown byte before starting its own PTY readers anyway.
 ///
@@ -184,12 +187,13 @@ pub const HANDOVER_ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::
 ///   them.
 ///
 ///   Note what actually ends that overlap: not this byte, and not the commit
-///   byte. `SessionActor::detach` only drops the reader/worker join handles — it
-///   deliberately never signals shutdown, so those threads keep draining the
-///   masters until the outgoing daemon's `process::exit`. The teardown bytes
-///   bound how long the successor *waits*; the old daemon's exit is what makes
-///   the handoff exclusive. Keeping that window short is therefore about
-///   reaching that exit promptly, not about the handshake.
+///   byte. Detaching a session does not *reliably* stop this daemon reading its
+///   master — `SessionManager::detach_all_live_sessions` documents what actually
+///   becomes of those threads — so up until `process::exit` this process can
+///   still win a destructive read the successor then never sees. The teardown
+///   bytes bound how long the successor *waits*; the old daemon's exit is what
+///   closes that window for good. Keeping that window short is therefore about
+///   reaching the exit promptly, not about the handshake.
 /// - Expiring late leaves the system dark. By this point the successor has
 ///   adopted the TCP listener but has not started serving, and the outgoing
 ///   daemon has drained its sessions, so no process answers clients until the
@@ -602,24 +606,23 @@ mod unix_impl {
     /// that close themselves, so an adopted session that ended leaked exactly its
     /// master. That compounds, because every handover re-adopts every session.
     ///
-    /// It closes whenever the value is dropped, which is at three points, not
-    /// only at session end:
+    /// The descriptor closes when this value drops — which session end is not: a
+    /// session whose child has exited leaves `run_actor` polling for commands with
+    /// this master still open. What does drop it:
     ///
-    /// - the actor loop returning, either on an explicit shutdown or when its
-    ///   session ends;
-    /// - an early return in `spawn_adopted_pty_runtime` before the actor takes
-    ///   ownership — the case `UnadoptedFds::take_next` hands the descriptor over
-    ///   for;
-    /// - **a handover detach.** `detach_all_live_sessions` drops each
-    ///   `SessionActor`, and with it the command `Sender`, so the worker's
-    ///   `try_recv` sees `Disconnected` and breaks; `ActorState` unwinds and this
-    ///   master closes even though the session lives on.
+    /// - the actor loop returns, on a `Shutdown` command or when its command
+    ///   channel disconnects. That second case includes a handover detach, which
+    ///   closes this master while the session lives on; see
+    ///   [`crate::session::SessionManager::detach_all_live_sessions`].
+    /// - adoption gives up before the loop starts — any early return on the path
+    ///   from `UnadoptedFds::take_next` to a running actor, a failed reader- or
+    ///   worker-thread spawn included, drops the wrapper it was handed.
     ///
-    /// That last one is safe, and is the reason closing here does not undo the
-    /// handover: the successor is not sharing this descriptor. `SCM_RIGHTS`
-    /// installs an independent one in that process, and `extract_handover_state`
-    /// sends a `libc::dup` rather than this fd itself. The child keeps its slave
-    /// side regardless, so the session survives on the successor's copy.
+    /// Closing it under a live session does not undo the handover, because the
+    /// successor is not sharing this descriptor: `SCM_RIGHTS` installs an
+    /// independent one in that process, and `extract_handover_state` sends a
+    /// `libc::dup` rather than this fd itself. The child keeps its slave side
+    /// regardless, so the session survives on the successor's copy.
     #[derive(Debug)]
     pub struct AdoptedMasterPty {
         /// Private, and reachable only through [`Self::from_raw_fd`]: the whole

@@ -413,8 +413,8 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                     // Complete the Phase 2/3 sync FIRST, before starting any PTY
                     // readers, so our readers start as late as possible relative to
                     // the outgoing daemon's exit. (That exit — not this handshake —
-                    // is what actually stops its readers: `SessionActor::detach`
-                    // only drops join handles. See HANDOVER_TEARDOWN_TIMEOUT.)
+                    // is what makes the handoff exclusive; see
+                    // HANDOVER_TEARDOWN_TIMEOUT.)
                     // The outcome says whether the old daemon actually committed to
                     // teardown (Adopt) or aborted while still owning its sessions
                     // (Refuse) — see complete_handover_adoption / teardown_outcome.
