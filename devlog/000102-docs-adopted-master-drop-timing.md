@@ -61,6 +61,16 @@ session ends", when it also closes on a handover detach.
   `ActorState` also drops the last `SharedPtyWriter`, whose `Drop` can send a
   newline and EOF to a natively spawned session's child. Step 1 no longer says the
   child is untouched, because for those sessions it is not (see Issues).
+- 2026-07-22T13:55-0700 `crates/triaged/src/session.rs` — the caveat now reports
+  that the kill it describes could not be reproduced, and says the reason is not
+  understood. The first version asserted the consequence on the strength of the
+  mechanism; only the mechanism is established.
+- 2026-07-22T14:05-0700 `crates/triaged/src/session.rs` — step 1 no longer calls a
+  sender clone in flight "a scheduling delay rather than a hold". Review of #120
+  is right that those clones are round-trips the actor itself serves, so their
+  duration is not bounded by anything the detach controls.
+- 2026-07-22T14:05-0700 `crates/triaged/src/handover.rs` — "windows" → "Windows"
+  in the cfg note, per review of #120.
 
 ## Decisions
 
@@ -107,18 +117,34 @@ session ends", when it also closes on a handover detach.
   left as they stand rather than rewriting pushed history; Progress records what
   actually ran, and the PR description was corrected to match. 24b9575's body is
   also now stale — it advertises a plan-file change that this branch reverted.
-- 2026-07-22T11:45-0700 Documenting the drop turned up a hazard in it. `ActorState`
-  holds the last reference to the session's `SharedPtyWriter`, and for a natively
-  spawned session that is portable-pty's `UnixMasterWriter`, whose `Drop` writes
-  `\n` + `VEOF` to the tty (`portable-pty-0.9.0/src/unix.rs:393`). A shell reading
-  that on an empty line exits — so the detach-driven drop can kill the child the
-  handover exists to preserve. Two accidents hide it: `process::exit` usually wins
-  the race, and a session adopted from an earlier handover takes its writer from
-  `AdoptedMasterPty::take_writer`, a plain `File` with no such `Drop` — so the
-  exposure is a daemon's *own* sessions on their *first* handover. Documented as a
-  hazard rather than fixed: this branch is docs-only, and the fix is a code change
-  (leak the writer on the detach path, or hand `ActorState` a writer without that
-  `Drop`) that deserves its own PR and a test.
+- 2026-07-22T11:45-0700 Documenting the drop turned up an apparent hazard.
+  `ActorState` holds the last reference to the session's `SharedPtyWriter`, and
+  for a natively spawned session that is portable-pty's `UnixMasterWriter`, whose
+  `Drop` writes `\n` + `VEOF` to the tty (`portable-pty-0.9.0/src/unix.rs:393`).
+  A shell reading that on an empty line exits, so on the face of it the
+  detach-driven drop can kill the child the handover exists to preserve.
+- 2026-07-22T13:55-0700 It does not, and I could not find out why. Written up
+  because the failed reproduction is worth more than the original claim:
+  - A probe confirmed the sequence is dangerous *in principle*: `VEOF` is 4 in
+    these PTYs, and writing `\n` + `\x04` to a live session's master killed an
+    interactive `/bin/sh` within five seconds.
+  - On the actual detach path it survives. A test that detaches a natively
+    spawned session and polls its liveness passes with or without a fix, so the
+    fix has nothing to prove.
+  - Instrumenting the exit shows the detached branch *is* reached with the
+    writer's `Arc` strong count at 2 — both references inside `ActorState` — so
+    its `Drop` should run. Writing the same two bytes to the master by hand at
+    that exact point (`write` returned 2) also failed to kill the child.
+  - So the write is possible and the kill is not reproducible on this path, and
+    the mechanism connecting them is not understood. Left documented as an
+    unexplained gap rather than asserted as a bug.
+- 2026-07-22T13:55-0700 Two liveness checks were wrong before one was right, and
+  both failed *safe-looking*: `waitpid` cannot see the child from a test at all
+  (`ECHILD`, and a blocking call hung the test binary for twenty minutes), and
+  `kill(pid, 0)` succeeds for a zombie — which is exactly what a detached child
+  becomes when it dies, since the actor that would reap it is gone. `ps -o state=`
+  rejecting `Z` is the one that can tell running from dead. The first two would
+  have reported a killed child as a healthy one.
 
 ## Research & Discoveries
 
@@ -174,7 +200,8 @@ session ends", when it also closes on a handover detach.
 
 - 0805066 — docs(triaged): describe every point an adopted master closes
 - 24b9575 — docs(triaged): reconcile detach's doc with the master it drops
-- HEAD — docs(triaged): give handover teardown one canonical account
+- 6cb4b4b — docs(triaged): give handover teardown one canonical account
+- HEAD — docs(triaged): report the writer-Drop hazard as unreproduced
 
 ## Progress
 
@@ -208,8 +235,11 @@ boundary are plain code spans.
 - None. The behaviour is unchanged; this only makes the existing behaviour
   discoverable. (Superseded at 11:45: still true of this branch, but documenting
   the drop turned up a hazard that needs its own PR — below.)
-- 2026-07-22T11:45-0700 Follow-up PR for the `UnixMasterWriter::Drop` hazard
-  recorded in Issues: on the detach path the writer should not be dropped
-  normally, since its `Drop` sends a newline and EOF to a child that is supposed
-  to survive into the successor. Needs a test that detaches a natively spawned
-  session and asserts the child is still alive.
+- 2026-07-22T13:55-0700 Open question, not a queued fix: why does injecting
+  `\n` + `VEOF` kill an interactive child mid-session but not at the moment the
+  detached actor drops its writer? Answering it either retires the caveat on
+  `detach_all_live_sessions` or turns it into a real bug report. Likely suspects
+  are the termios mode the shell has put its tty in by then and the order in
+  which `ActorState`'s fields close their descriptors. No fix should be written
+  before that is understood — the one I drafted passed its test with the fix
+  reverted, which is a fix with nothing to prove.

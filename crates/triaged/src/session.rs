@@ -1141,11 +1141,13 @@ impl SessionManager {
     /// neither is simply "alive until `process::exit`". They end in a chain:
     ///
     /// 1. `SessionActor::detach` takes the actor by value, dropping the stored
-    ///    `Sender<ActorCommand>`. Once no clone of it is still in flight — they
-    ///    are all short off-lock round-trips, so this is a scheduling delay rather
-    ///    than a hold — the worker's next poll of `command_rx` (a `try_recv`, or
-    ///    the `recv_timeout` it switches to after the child exits) sees the channel
-    ///    disconnected and returns. That drops `ActorState`, and with it this
+    ///    `Sender<ActorCommand>`. That is not necessarily the last one: three call
+    ///    sites clone it and use the clone off-lock for a round-trip the actor
+    ///    itself has to serve, so a clone in flight keeps the channel connected
+    ///    for however long the actor takes to answer — which is not bounded by
+    ///    anything this call controls. Once none is left, the worker's next poll of
+    ///    `command_rx` (a `try_recv`, or the `recv_timeout` it switches to after
+    ///    the child exits) sees the channel disconnected and returns. That drops `ActorState`, and with it this
     ///    process's PTY master. Nothing kills or reaps the child, which is the
     ///    point of the detach — but see the caveat below before reading that as
     ///    "the child is untouched".
@@ -1166,17 +1168,22 @@ impl SessionManager {
     /// exit, which is what [`crate::handover::HANDOVER_TEARDOWN_TIMEOUT`] is sized
     /// around.
     ///
-    /// The caveat, which is a hazard rather than a documentation detail: for a
-    /// session *this* daemon spawned, `ActorState` holds the last reference to
-    /// portable-pty's master writer, and `UnixMasterWriter::Drop` writes `\n` plus
-    /// `VEOF` to the tty. The newline submits whatever the user had typed and not
-    /// entered, and the `VEOF` that follows lands on the now-empty line, which
-    /// exits a shell — so step 1 can run an unintended command in the very session
-    /// the handover exists to preserve, and then end it. It has not been seen in
-    /// practice, and there are two reasons why: `process::exit` usually wins the
-    /// race, and a session adopted from a previous handover takes its writer from
-    /// `AdoptedMasterPty`, a plain `File` with no such `Drop`. Neither is a
-    /// guarantee. Do not treat step 1 as proof the child survives.
+    /// The caveat on step 1, stated carefully because it is a loaded gun that has
+    /// so far refused to fire: for a session *this* daemon spawned, `ActorState`
+    /// holds the last reference to portable-pty's master writer, and
+    /// `UnixMasterWriter::Drop` writes `\n` plus `VEOF` to the tty. Written to a
+    /// shell's tty that sequence submits any partially typed line and then ends
+    /// the shell on the resulting empty one, which would destroy the session the
+    /// handover exists to preserve.
+    ///
+    /// An attempt to reproduce that end to end did *not* kill the child: after a
+    /// detach it stayed running, and injecting the same two bytes by hand at that
+    /// moment did not end it either, though injecting them mid-session does. So
+    /// the mechanism is real and the consequence is not demonstrated, and the
+    /// reason is not understood. It is written down because the analysis that gets
+    /// you to "the child is untouched" — nothing kills it, nothing reaps it — does
+    /// not account for the writer at all, and that gap is worth more than the
+    /// reassurance. Do not read step 1 as proof the child survives.
     ///
     /// Closing a live session's master here is safe;
     /// [`crate::handover::AdoptedMasterPty`] documents why.

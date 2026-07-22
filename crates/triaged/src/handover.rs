@@ -172,7 +172,7 @@ pub const HANDOVER_ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::
 
 // `detach_all_live_sessions` stays a plain code span in the doc below: this
 // constant is not `#[cfg(unix)]` and that item is, so a link would dangle on a
-// non-unix build, and windows is a CI target.
+// non-unix build, and Windows is a CI target.
 /// How long the successor waits in Phase 3 for the outgoing daemon's `0x02`
 /// teardown byte before starting its own PTY readers anyway.
 ///
