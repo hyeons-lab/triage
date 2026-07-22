@@ -940,6 +940,11 @@ impl SessionManager {
                     "failed to reap exited actor while demoting to historical"
                 );
             }
+            // The `Live` -> `Historical` transition is otherwise invisible: it
+            // happens lazily on a restore request, so without this the map can
+            // change shape with nothing in the log to explain it.
+            tracing::info!(session_id = %session_id, "demoting exited live session for restore");
+
             sessions.insert(
                 session_id.clone(),
                 ManagedSession::Historical {
@@ -1257,6 +1262,15 @@ impl SessionManager {
                     launch,
                     last_known_cwd,
                 },
+            );
+
+            // Per session, so a shell that later turns out to be dead can be
+            // identified from the log rather than inferred from a total.
+            tracing::info!(
+                session_id = %h_sess.id,
+                pid = h_sess.pid,
+                command = %h_sess.command,
+                "adopted inherited live session"
             );
         }
 
@@ -3322,6 +3336,14 @@ impl ActorState {
         if !self.exited {
             self.reap_child();
             if !self.exited {
+                // Logged here rather than at the exit broadcast: killing the
+                // child closes the PTY, and the resulting EOF usually broadcasts
+                // the exit from `drain_shutdown_output` before this function
+                // reaches its own broadcast, which therefore cannot report the
+                // cause. Correlate with `session child is gone` by session_id.
+                if let Some(session_id) = self.event_session_id.as_ref() {
+                    tracing::info!(session_id = %session_id, "killing session child");
+                }
                 self.child.kill().context("terminating PTY child")?;
                 self.exited = true;
             }
@@ -3446,6 +3468,7 @@ impl ActorState {
         }
 
         if let Some(session_id) = self.event_session_id.clone() {
+            tracing::info!(session_id = %session_id, "session child is gone");
             self.broadcast(SessionEvent::Exited {
                 session_id,
                 completed,
