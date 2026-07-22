@@ -175,7 +175,8 @@ Download the asset and both files, then (with
 
 ```bash
 minisign -Vm <asset> -P RWRinpvI8phW62LgDacQlEXg1JqBPZxvWKROZWAqmyToxr7Pw0e534yH
-sha256sum -c <asset>.sha256   # macOS: shasum -a 256 -c
+sha256sum -c <asset>.sha256
+# macOS has no sha256sum; use: shasum -a 256 -c <asset>.sha256
 ```
 
 A good signature prints `Signature and comment signature verified` and a trusted

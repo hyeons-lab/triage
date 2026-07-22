@@ -115,6 +115,13 @@ push form that can land on `main`.
   was too far the other way — it left the entry-point docs flatly asserting sidecars that
   no downloadable release has. The rule that came out of it: state the scope wherever the
   claim appears, but explain it in exactly one place.
+- 2026-07-21T23:48-0700 Copilot caught a real defect on PR #117 that seven local review
+  rounds missed: the macOS checksum hint was written as a trailing comment,
+  `# macOS: shasum -a 256 -c`, with no file argument. Run as shown it reads stdin and
+  fails with "no properly formatted SHA checksum lines found" — verified both forms
+  against a real sidecar. The lesson is about *form*: an abbreviated variant tucked into
+  a trailing comment stops looking like a command, so neither I nor the reviewers checked
+  whether it would run. It is now a full command on its own line.
 - 2026-07-21T22:13-0700 `crates/triaged/README.md`'s Installation section claimed "every
   GitHub release attaches a `Triage-cli-*` archive" — false for the same reason (#90
   postdates `v0.1.6`) and directly contradicted the root README. Pre-existing text, but in
@@ -144,7 +151,8 @@ push form that can land on `main`.
 
 ## Commits
 
-- HEAD — docs: scope the release signing claims and surface download verification
+- 9bb4cfe — docs: scope the release signing claims and surface download verification
+- HEAD — docs: give the macOS checksum command its file argument
 
 ## Next Steps
 
