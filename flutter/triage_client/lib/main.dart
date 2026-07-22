@@ -337,6 +337,16 @@ class SessionVm {
   // Local-LLM longer-form summary for the hover popover / future search. Null
   // until the daemon generates one (or summarization is off).
   String? snippetDetail;
+  // When a `session_snippet_updated` push last brought a non-empty snippet for
+  // this session — the closest thing to "last did something" the client can
+  // observe for a session it isn't attached to.
+  //
+  // Deliberately *not* seeded from the bulk snippet fetch on connect: that says
+  // when we asked, not when the session moved. There is no activity history on
+  // the wire to backfill from (`SessionSnapshot` carries `output_seq` and
+  // `bytes_logged`, no timestamp), so a freshly connected row stays null until
+  // it next moves, and the rail renders nothing rather than inventing a time.
+  DateTime? snippetUpdatedAt;
 
   /// Last path segment of [repoRoot], for compact display (e.g. "triage").
   String? get repoName => _leafOf(repoRoot);
@@ -379,6 +389,27 @@ class SessionVm {
     // <id>") rather than a bare id, so a context-less session still reads
     // sensibly.
     return title;
+  }
+
+  /// Rail-specific title, leading with the *workstream* rather than the repo.
+  ///
+  /// The rail's job is telling sibling sessions apart, and siblings share the
+  /// repo — so leading with it, as [displayTitle] does, makes every row on one
+  /// repo open with the same words and buries the part that differs mid-string.
+  /// The repo moves to the meta line beneath (see `_SessionListTileState`).
+  ///
+  /// [displayTitle] keeps its repo-first form for the workspace header, where
+  /// there is no sibling to disambiguate against and naming the repo is the
+  /// point.
+  String get railTitle {
+    final b = branch?.trim();
+    if (b != null && b.isNotEmpty) return b;
+    // No branch: a detached HEAD, or a host too old to report one. The worktree
+    // directory is the next most specific thing that still names the workstream.
+    // Past this point there is no branch to promote, so displayTitle's own
+    // fallbacks (repo, else cwd leaf, else the stable title) are already right
+    // and are not worth restating.
+    return worktreeName ?? displayTitle;
   }
 
   final IconData icon;
@@ -2088,6 +2119,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // A regeneration always reports the current detail; null means the
         // detail pass produced nothing this round, so clear the stale one.
         _sessions[index].snippetDetail = detail;
+        // Stamp only on a real summary. The summarizer re-running and producing
+        // nothing is not the session doing something, and dating the row from
+        // it would report activity that never happened.
+        if (snippet != null && snippet.isNotEmpty) {
+          _sessions[index].snippetUpdatedAt = DateTime.now();
+        }
       }
 
       if (mounted) {
@@ -3226,7 +3263,7 @@ class SessionRail extends StatelessWidget {
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),
                       child: Tooltip(
-                        message: indexed.$2.title,
+                        message: indexed.$2.displayTitle,
                         child: InkWell(
                           onTap: () => onSelectSession(indexed.$1),
                           borderRadius: BorderRadius.circular(8),
@@ -3267,6 +3304,9 @@ class SessionRail extends StatelessWidget {
   }
 
   Widget _buildExpandedRail() {
+    // Once per build, not once per row: the item builder runs lazily and this
+    // is a whole-list property.
+    final indistinguishable = indistinguishableRailRows(sessions);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -3358,7 +3398,10 @@ class SessionRail extends StatelessWidget {
               final tile = SessionListTile(
                 key: index == selectedIndex ? selectedTileKey : null,
                 selected: index == selectedIndex,
-                title: session.displayTitle,
+                title: session.railTitle,
+                // The header's repo-first name, kept for the hover card, which
+                // states the session in full rather than disambiguating it.
+                glanceTitle: session.displayTitle,
                 subtitle: session.status,
                 statusColor: session.statusColor,
                 icon: session.icon,
@@ -3368,6 +3411,8 @@ class SessionRail extends StatelessWidget {
                 cwd: session.cwd,
                 snippet: session.snippet,
                 snippetDetail: session.snippetDetail,
+                activityAt: session.snippetUpdatedAt,
+                indistinguishable: indistinguishable.contains(index),
                 onTap: () => onSelectSession(index),
               );
               // Touch: a plain drag must scroll the list, so reordering waits for
@@ -3903,16 +3948,25 @@ class SessionListTile extends StatefulWidget {
     required this.statusColor,
     required this.icon,
     required this.onTap,
+    this.glanceTitle,
     this.branch,
     this.repoName,
     this.worktreeName,
     this.cwd,
     this.snippet,
     this.snippetDetail,
+    this.activityAt,
+    this.indistinguishable = false,
     this.selected = false,
   });
 
+  /// Leading line: the workstream (branch/worktree), not the repo — see
+  /// [SessionVm.railTitle].
   final String title;
+
+  /// Repo-first name for the hover card, which describes the session rather
+  /// than distinguishing it from its siblings. Falls back to [title].
+  final String? glanceTitle;
   final String subtitle;
   final Color statusColor;
   final IconData icon;
@@ -3928,6 +3982,13 @@ class SessionListTile extends StatefulWidget {
   final String? snippet;
   // Local-LLM longer-form summary, shown in the hover popover.
   final String? snippetDetail;
+  // When this session last produced a summary; renders as a compact relative
+  // time. Null when unknown, which is the normal state until the session moves
+  // (see [SessionVm.snippetUpdatedAt]).
+  final DateTime? activityAt;
+  // True when another row renders the same title and repo, so the snippet is
+  // the only thing telling them apart and gets room to say it.
+  final bool indistinguishable;
   final bool selected;
 
   @override
@@ -3938,13 +3999,21 @@ class _SessionListTileState extends State<SessionListTile> {
   final OverlayPortalController _popover = OverlayPortalController();
   final LayerLink _link = LayerLink();
 
-  /// One-line "repo · branch · worktree" summary, omitting absent parts. Null
-  /// when the session has no git context — the rail then falls back to the cwd.
+  /// Context line beneath the title: the repo, plus the worktree when it says
+  /// something the title has not already said.
+  ///
+  /// Null both when there is no git context *and* when every component was
+  /// promoted into the title, so it cannot be used to tell those apart — see
+  /// `inRepo` in [build], which keys the cwd fallback off `repoName` instead.
+  /// Nothing is lost by omitting a component: the hover glance card states
+  /// repo, branch, worktree and cwd in full.
   String? get _gitMeta {
     final parts = <String>[
-      if (widget.repoName != null) widget.repoName!,
-      if (widget.branch != null && widget.branch!.isNotEmpty) widget.branch!,
-      if (widget.worktreeName != null && widget.worktreeName != widget.branch)
+      if (widget.repoName != null && widget.repoName != widget.title)
+        widget.repoName!,
+      if (widget.worktreeName != null &&
+          widget.worktreeName != widget.title &&
+          !worktreeEchoesBranch(widget.worktreeName!, widget.branch))
         widget.worktreeName!,
     ];
     return parts.isEmpty ? null : parts.join('  ·  ');
@@ -3966,12 +4035,17 @@ class _SessionListTileState extends State<SessionListTile> {
 
   @override
   Widget build(BuildContext context) {
-    // The rail meta line is the git "repo · branch · worktree" summary when the
-    // session is in a repo; otherwise it falls back to the working directory.
+    // The rail meta line is the repo, plus a worktree that says something the
+    // title has not; it falls back to the working directory outside a repo.
     final gitMeta = _gitMeta;
     final cwd = widget.cwd;
-    final hasCwdFallback = gitMeta == null && cwd != null && cwd.isNotEmpty;
-    final metaIcon = gitMeta != null
+    // An empty meta line is not the same as having no git context: a repo
+    // session whose components were all promoted into the title has nothing
+    // left to say here. Keying the folder icon and the absolute-cwd fallback
+    // off `repoName` keeps them signalling "not in a repo" only when true.
+    final inRepo = widget.repoName != null;
+    final hasCwdFallback = !inRepo && cwd != null && cwd.isNotEmpty;
+    final metaIcon = inRepo
         ? Icons.account_tree_outlined
         : Icons.folder_outlined;
     return CompositedTransformTarget(
@@ -3991,7 +4065,7 @@ class _SessionListTileState extends State<SessionListTile> {
               offset: const Offset(10, 0),
               child: IgnorePointer(
                 child: _SessionGlanceCard(
-                  title: widget.title,
+                  title: widget.glanceTitle ?? widget.title,
                   status: widget.subtitle,
                   statusColor: widget.statusColor,
                   repoName: widget.repoName,
@@ -4007,7 +4081,9 @@ class _SessionListTileState extends State<SessionListTile> {
           child: Semantics(
             button: true,
             selected: widget.selected,
-            label: widget.title,
+            // The full repo-first name: the visible title is a bare branch, and
+            // a screen reader has no meta line beside it to supply the repo.
+            label: widget.glanceTitle ?? widget.title,
             child: InkWell(
               onTap: widget.onTap,
               borderRadius: BorderRadius.circular(8),
@@ -4070,6 +4146,26 @@ class _SessionListTileState extends State<SessionListTile> {
                               ],
                             ),
                           ],
+                          // Outranks the status line: for two sessions on one
+                          // branch this is the only field that differs, where
+                          // every row shares a status.
+                          if (widget.snippet != null &&
+                              widget.snippet!.isNotEmpty) ...[
+                            const SizedBox(height: 3),
+                            Text(
+                              widget.snippet!,
+                              // Indistinguishable rows get a second line rather
+                              // than ellipsising the one thing that would have
+                              // told them apart.
+                              maxLines: widget.indistinguishable ? 2 : 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Color(0xffc4cecd),
+                                fontSize: 12,
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ],
                           const SizedBox(height: 3),
                           Row(
                             children: [
@@ -4092,22 +4188,12 @@ class _SessionListTileState extends State<SessionListTile> {
                                   ),
                                 ),
                               ),
+                              if (widget.activityAt != null) ...[
+                                const SizedBox(width: 6),
+                                _RelativeActivityText(at: widget.activityAt!),
+                              ],
                             ],
                           ),
-                          if (widget.snippet != null &&
-                              widget.snippet!.isNotEmpty) ...[
-                            const SizedBox(height: 3),
-                            Text(
-                              widget.snippet!,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Color(0xff6f7b7d),
-                                fontSize: 12,
-                                fontStyle: FontStyle.italic,
-                              ),
-                            ),
-                          ],
                         ],
                       ),
                     ),
@@ -4281,6 +4367,85 @@ class _GlanceRow extends StatelessWidget {
   }
 }
 
+/// Lowercases [value] and reduces every run of non-alphanumerics to a single
+/// `-`, so `feat/rail-row` and `feat-rail-row` compare equal.
+String _slugify(String value) => value
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+    .replaceAll(RegExp(r'^-+|-+$'), '');
+
+/// True when [worktree] only restates [branch], under either common naming
+/// convention: the whole branch flattened (`feat/rail-row` → `feat-rail-row`),
+/// or just its last segment, which is what this project's own
+/// `git worktree add worktrees/<name> -b <type>/<name>` recipe produces
+/// (`feat/rail-row` → `rail-row`).
+///
+/// The rail leads with the branch, so an echoing worktree name would spend the
+/// tile's second line repeating the first. The hover glance card still shows
+/// both, unabbreviated, for the cases where the distinction matters.
+@visibleForTesting
+bool worktreeEchoesBranch(String worktree, String? branch) {
+  if (branch == null) return false;
+  final full = _slugify(branch);
+  if (full.isEmpty) return false;
+  final slug = _slugify(worktree);
+  if (slug == full) return true;
+  final lastSegment = branch.split('/').last;
+  final tail = _slugify(lastSegment);
+  return tail.isNotEmpty && slug == tail;
+}
+
+/// Indices of rail rows whose title *and* repo both match another row's, so
+/// their leading lines are identical and cannot tell them apart.
+///
+/// This is the two-agents-on-one-branch case. The snippet is then the only
+/// differentiator that exists, so the tile gives it a second line rather than
+/// ellipsising the one thing that would have distinguished the rows.
+///
+/// Keyed on the rendered title and the repo rather than on the underlying git
+/// fields, since the defect is "these rows read the same". It deliberately
+/// ignores the meta line: two rows can share a title and repo yet differ there,
+/// which costs a needless second snippet line and nothing else.
+/// Separator for the grouping key in [indistinguishableRailRows].
+///
+/// `\u0000` because it cannot occur in a title or a repo name, so no pair of
+/// rows can collide by containing the separator themselves — `a|b` + `c` and
+/// `a` + `b|c` would otherwise group together. Written as an escape rather than
+/// the literal control character, which is invisible in an editor and can make
+/// tooling treat the file as binary.
+const String _railGroupSeparator = '\u0000';
+
+@visibleForTesting
+Set<int> indistinguishableRailRows(List<SessionVm> sessions) {
+  final groups = <String, List<int>>{};
+  for (var i = 0; i < sessions.length; i++) {
+    final key =
+        '${sessions[i].railTitle}$_railGroupSeparator${sessions[i].repoName ?? ''}';
+    groups.putIfAbsent(key, () => <int>[]).add(i);
+  }
+  return {
+    for (final group in groups.values)
+      if (group.length > 1) ...group,
+  };
+}
+
+/// Compact "how long since this session last did something" label, e.g. `now`,
+/// `4m`, `2h`, `3d`.
+///
+/// Null when [at] is null; see [SessionVm.snippetUpdatedAt] for why a row may
+/// legitimately have no stamp.
+@visibleForTesting
+String? formatRelativeActivity(DateTime? at, DateTime now) {
+  if (at == null) return null;
+  final elapsed = now.difference(at);
+  // A stamp in the future is clock skew between stamping and rendering, not
+  // time travel; `inSeconds` going negative lands here and reads as "now".
+  if (elapsed.inSeconds < 60) return 'now';
+  if (elapsed.inMinutes < 60) return '${elapsed.inMinutes}m';
+  if (elapsed.inHours < 24) return '${elapsed.inHours}h';
+  return '${elapsed.inDays}d';
+}
+
 /// Collapses a leading local-home prefix to `~` — e.g. `/Users/me/dev` →
 /// `~/dev`. Returns null when [path] is not under the local home (e.g. a path
 /// from a remote daemon), so callers fall back to showing it in full.
@@ -4295,6 +4460,57 @@ String? _homeAbbreviatedPath(String path) {
     return '~${path.substring(normalized.length)}';
   }
   return null;
+}
+
+/// A relative activity stamp ("4m") that ages in place.
+///
+/// Owns its ticker instead of having the page drive one: a `setState` on the
+/// host rebuilds the workspace and its terminal panes, and re-running that
+/// layout on a timer just to age a label is a bad trade. Only this text
+/// rebuilds.
+class _RelativeActivityText extends StatefulWidget {
+  const _RelativeActivityText({required this.at});
+
+  final DateTime at;
+
+  @override
+  State<_RelativeActivityText> createState() => _RelativeActivityTextState();
+}
+
+class _RelativeActivityTextState extends State<_RelativeActivityText> {
+  // Half the label's finest step (a minute), so the visible value is never more
+  // than ~30s stale without waking the widget more than twice a minute.
+  static const Duration _tickInterval = Duration(seconds: 30);
+
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!runningUnderFlutterTest()) {
+      _timer = Timer.periodic(_tickInterval, (_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Non-null: `at` is non-nullable, and the formatter returns null only for a
+    // null stamp.
+    final label = formatRelativeActivity(widget.at, DateTime.now())!;
+    return Text(
+      label,
+      maxLines: 1,
+      style: const TextStyle(color: Color(0xff7f8b8d), fontSize: 11),
+    );
+  }
 }
 
 /// Renders a single-line meta string that adapts to the available width: shows
