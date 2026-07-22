@@ -740,9 +740,36 @@ void main() {
 
     expect(find.text('Connected to Daemon'), findsOneWidget);
 
-    await tester.tap(find.text('triage / flutter-spike').first);
+    // Rail rows lead with the workstream, so this session's row reads by its
+    // branch; 'triage / flutter-spike' now only appears in the workspace header.
+    await tester.tap(find.text('experiment/flutter-spike').first);
     await tester.pumpAndSettle();
     expect(find.text('flutter-spike ready'), findsOneWidget);
+  });
+
+  testWidgets('the rail leads rows with the workstream, not the repo', (
+    WidgetTester tester,
+  ) async {
+    // Regression guard on the rail/header split. Asserted through the real app
+    // because SessionRail's reorderable list does not survive being hosted
+    // bare in a test harness.
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    final tiles = tester
+        .widgetList<SessionListTile>(find.byType(SessionListTile))
+        .toList();
+    expect(tiles, isNotEmpty);
+
+    // Every row with git context leads with its branch. These fixtures carry
+    // no repository_root, so displayTitle falls back to the stable title —
+    // pointing the rail back at it renders 'triage / flutter-spike' here.
+    expect(tiles.map((t) => t.title), contains('experiment/flutter-spike'));
+    expect(
+      tiles.map((t) => t.title),
+      isNot(contains('triage / flutter-spike')),
+    );
   });
 
   testWidgets('buffers output while daemon session placeholder is loading', (
@@ -757,6 +784,9 @@ void main() {
 
     expect(find.text('Loading session flutter-spike...'), findsOneWidget);
 
+    // Git context is seeded after the session list lands, so this early in the
+    // load the row has no branch yet and still falls back to its stable title.
+    // Once context arrives the same row leads with 'main' instead.
     await tester.tap(find.text('triage / main').first);
     await tester.pumpAndSettle();
     expect(find.text('line 1 from main'), findsOneWidget);
@@ -777,7 +807,7 @@ void main() {
 
     final delayedRefresh = Completer<Map<String, dynamic>>();
     client.attachCompleters['flutter-spike'] = delayedRefresh;
-    await tester.tap(find.text('triage / flutter-spike').first);
+    await tester.tap(find.text('experiment/flutter-spike').first);
     await tester.pump();
 
     // Before the post-select refresh resolves, fallback rows only show the
@@ -1556,7 +1586,9 @@ void main() {
               child: SizedBox(
                 width: 320,
                 child: SessionListTile(
-                  title: 'triage / abc',
+                  // The rail leads with the workstream; the repo drops to the
+                  // meta line beneath (see SessionVm.railTitle).
+                  title: 'feat/side-rail-glance',
                   subtitle: 'attached',
                   statusColor: const Color(0xff7fd1c7),
                   icon: Icons.terminal,
@@ -1574,11 +1606,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      // Glance row combines repo, branch and worktree on one line.
-      expect(
-        find.text('triage  ·  feat/side-rail-glance  ·  side-rail-glance'),
-        findsOneWidget,
-      );
+      // The meta line carries the repo only: the branch is already the title,
+      // and this worktree name is just the branch's last segment.
+      expect(find.text('triage'), findsOneWidget);
       // The detail summary is not shown until hover.
       expect(
         find.text('Running the daemon test suite; all green.'),
