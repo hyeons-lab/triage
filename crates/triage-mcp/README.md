@@ -10,6 +10,12 @@ It lets an agent *read* what is happening in your terminals — which sessions e
 cargo install triage-mcp
 ```
 
+> On **aarch64**, this builds `triaged` as a dependency and so needs a nightly
+> toolchain — 1.99.0-nightly or newer (`nightly-2026-07-08`+) — because `triaged`'s
+> `cera` inference dependency uses unstable NEON intrinsics. Use
+> `cargo +nightly install triage-mcp`, or take a prebuilt binary from a
+> [release](https://github.com/hyeons-lab/triage/releases).
+
 ## Prerequisite: a running daemon
 
 `triage-mcp` is a thin client — it connects to the `triaged` daemon over the
