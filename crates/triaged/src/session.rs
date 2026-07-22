@@ -1156,7 +1156,7 @@ impl SessionManager {
         let mut pending = UnadoptedFds::new(fds);
 
         for h_sess in state.sessions {
-            let Some(fd) = pending.next_fd() else {
+            let Some(fd) = pending.take_next() else {
                 bail!("No inherited FDs left for session {}", h_sess.id);
             };
 
@@ -1258,10 +1258,6 @@ impl SessionManager {
                     last_known_cwd,
                 },
             );
-            // The session is live, so its master PTY owns this fd from here on.
-            // Claiming it earlier would drop it from the guard while the actor
-            // that will hold it might still fail to spawn.
-            pending.claim();
         }
 
         self.persist_manifest(&sessions)?;
@@ -1269,17 +1265,21 @@ impl SessionManager {
     }
 }
 
-/// Owns handover fds until the session each belongs to is live, closing any
-/// that are left over.
+/// Owns the inherited descriptors that have not been handed out yet, and closes
+/// whatever it still holds when adoption ends.
+///
+/// Ownership is strictly one-at-a-time and moves at [`Self::take_next`]: before
+/// it the guard owns the descriptor, after it the `AdoptedMasterPty` does. The
+/// guard therefore never holds one a session might also be holding, which is
+/// what makes closing its remainder in `Drop` sound.
 ///
 /// A `RawFd` is a bare integer with no ownership, so nothing closes one on the
 /// way out of [`SessionManager::adopt_sessions`]. That was harmless while a
 /// failed adoption propagated into a `process::exit` and the OS reclaimed every
 /// descriptor. Now that a partial adoption is logged and the daemon keeps
-/// running, an fd that never reached a session would stay open for the life of
-/// the process — one leaked master PTY per session that failed to adopt, plus
-/// every fd still queued behind it, and any surplus the state doesn't account
-/// for.
+/// running, a descriptor that never reached a session would stay open for the
+/// life of the process — the tail left when adoption gives up partway, and any
+/// surplus the handover state does not account for.
 #[cfg(unix)]
 struct UnadoptedFds {
     fds: std::collections::VecDeque<std::os::unix::io::RawFd>,
@@ -1291,16 +1291,16 @@ impl UnadoptedFds {
         Self { fds: fds.into() }
     }
 
-    /// The fd for the next session to adopt, still owned by the guard — it is
-    /// released only by [`Self::claim`], so every early return between here and
-    /// there closes it.
-    fn next_fd(&self) -> Option<std::os::unix::io::RawFd> {
-        self.fds.front().copied()
-    }
-
-    /// Hands ownership of the current fd to the session that adopted it.
-    fn claim(&mut self) {
-        self.fds.pop_front();
+    /// Hand the next descriptor to the session about to adopt it.
+    ///
+    /// Ownership transfers here, to the `AdoptedMasterPty` that
+    /// `spawn_adopted_pty_runtime` wraps it in as its very first act. That type
+    /// closes on drop, so every early return after the wrap — a rotated log, a
+    /// thread spawn hitting EAGAIN — still closes it, and so does the session
+    /// ending later. Holding it in the guard past this point instead would put it
+    /// under two owners at once and close it twice on the failure path.
+    fn take_next(&mut self) -> Option<std::os::unix::io::RawFd> {
+        self.fds.pop_front()
     }
 }
 
@@ -1308,10 +1308,11 @@ impl UnadoptedFds {
 impl Drop for UnadoptedFds {
     fn drop(&mut self) {
         for fd in self.fds.drain(..) {
-            // SAFETY: an unclaimed fd never reached a `MasterPty`, so no session
-            // holds it. The reader and writer handed to a session are `dup`ed
-            // (see `AdoptedMasterPty::try_clone_reader`/`take_writer`), so this
-            // cannot close a descriptor another owner still uses.
+            // SAFETY: these are the descriptors `take_next` never handed out — a
+            // surplus the handover state does not account for, or the tail left
+            // when adoption gave up partway. Ownership of everything else moved to
+            // its `AdoptedMasterPty`, so this cannot close a descriptor another
+            // owner still holds.
             unsafe {
                 libc::close(fd);
             }
@@ -1326,7 +1327,9 @@ fn spawn_adopted_pty_runtime(
 ) -> Result<PtyRuntime> {
     use crate::handover::{AdoptedChild, AdoptedMasterPty};
 
-    let master = Box::new(AdoptedMasterPty { fd });
+    // SAFETY: `UnadoptedFds::take_next` gave up its claim on this descriptor so
+    // the master can own it; nothing else holds or will close it.
+    let master = Box::new(unsafe { AdoptedMasterPty::from_raw_fd(fd) });
     let child = Box::new(AdoptedChild { pid: h_sess.pid });
 
     let reader = master.try_clone_reader().context("cloning PTY reader")?;
