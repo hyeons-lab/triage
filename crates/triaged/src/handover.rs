@@ -604,18 +604,26 @@ mod unix_impl {
     /// compounds, because every handover re-adopts every session.
     #[derive(Debug)]
     pub struct AdoptedMasterPty {
-        pub fd: OwnedFd,
+        /// Private, and reachable only through [`Self::from_raw_fd`]: the whole
+        /// point of the type is that exactly one owner holds this descriptor, and
+        /// a `pub` field lets a caller construct or replace it without going
+        /// through the one constructor that documents what that costs.
+        fd: OwnedFd,
     }
 
     impl AdoptedMasterPty {
         /// Take ownership of an inherited descriptor.
+        ///
+        /// `pub(crate)` rather than `pub`: both callers live in this crate
+        /// (`spawn_adopted_pty_runtime` and its test), and an `unsafe` constructor
+        /// is worth keeping as close to its invariant as the call sites allow.
         ///
         /// # Safety
         ///
         /// `fd` must be an open descriptor this process owns and nothing else will
         /// close — in practice one handed over by `UnadoptedFds::take_next`, which
         /// gives up its claim precisely so this type can take it.
-        pub unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Self {
             Self {
                 fd: unsafe { OwnedFd::from_raw_fd(fd) },
             }

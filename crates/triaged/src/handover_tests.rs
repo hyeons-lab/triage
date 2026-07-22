@@ -210,7 +210,8 @@ mod tests {
 
         assert!(
             probe.is_closed(),
-            "an adopted session leaked its PTY master when it ended"
+            "AdoptedMasterPty did not close its descriptor on drop — an adopted \
+             session would leak its PTY master every time one ends"
         );
         Ok(())
     }

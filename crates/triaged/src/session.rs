@@ -1265,17 +1265,21 @@ impl SessionManager {
     }
 }
 
-/// Owns handover fds until the session each belongs to is live, closing any
-/// that are left over.
+/// Owns the inherited descriptors that have not been handed out yet, and closes
+/// whatever it still holds when adoption ends.
+///
+/// Ownership is strictly one-at-a-time and moves at [`Self::take_next`]: before
+/// it the guard owns the descriptor, after it the `AdoptedMasterPty` does. The
+/// guard therefore never holds one a session might also be holding, which is
+/// what makes closing its remainder in `Drop` sound.
 ///
 /// A `RawFd` is a bare integer with no ownership, so nothing closes one on the
 /// way out of [`SessionManager::adopt_sessions`]. That was harmless while a
 /// failed adoption propagated into a `process::exit` and the OS reclaimed every
 /// descriptor. Now that a partial adoption is logged and the daemon keeps
-/// running, an fd that never reached a session would stay open for the life of
-/// the process — one leaked master PTY per session that failed to adopt, plus
-/// every fd still queued behind it, and any surplus the state doesn't account
-/// for.
+/// running, a descriptor that never reached a session would stay open for the
+/// life of the process — the tail left when adoption gives up partway, and any
+/// surplus the handover state does not account for.
 #[cfg(unix)]
 struct UnadoptedFds {
     fds: std::collections::VecDeque<std::os::unix::io::RawFd>,

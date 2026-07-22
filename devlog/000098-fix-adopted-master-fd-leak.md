@@ -84,6 +84,35 @@ live daemon after #113 merged, not by reading the code.
   `AdoptedMasterPty`)"); `UnadoptedFds` answered the queued-fd half of that comment
   in #113, and this answers the rest.
 
+## Review
+
+PR #116, first round — all findings were about the ownership story being stated
+less tightly than the code now enforces it:
+
+- 2026-07-21T14:40-0700 `AdoptedMasterPty.fd` was still `pub`. The type's whole
+  purpose is that exactly one owner holds the descriptor, and a public field lets
+  a caller build or replace one without passing through `from_raw_fd` — the only
+  place that invariant is written down. Made private; the sole reader was the
+  type's own `raw()`.
+- 2026-07-21T14:40-0700 Narrowed `from_raw_fd` to `pub(crate)`. Both call sites
+  (`spawn_adopted_pty_runtime` and its test) are in this crate, so an `unsafe`
+  constructor need not be reachable beyond it.
+- 2026-07-21T14:40-0700 `UnadoptedFds`' struct doc still said it owns each
+  descriptor "until the session it belongs to is live", which `take_next` made
+  false — ownership now moves at the pop, before the session exists. That is the
+  same class of stale claim as the `SAFETY` note this branch already rewrote, so
+  it now states the linear-ownership rule explicitly.
+- 2026-07-21T14:40-0700 The drop test asserted "an adopted session leaked its PTY
+  master when it ended", but exercises `AdoptedMasterPty` directly with no session
+  involved. Message now names the type and keeps the consequence as context.
+- 2026-07-21T14:40-0700 A devlog entry in `000096` had lost its list marker and
+  timestamp, leaving `found in production, not in review.**` as a dangling line
+  with an unmatched bold. It was malformed in the commit that introduced it
+  (833ad91), not by a later edit. Restored the marker and the lead-in.
+- 2026-07-21T14:40-0700 The PR description said switching to `OwnedFd` was left
+  out as a follow-up, while the diff does switch to it. The description was stale,
+  not the code; corrected on the PR.
+
 ## Next Steps
 
 - Nothing outstanding for this change. `UnadoptedFds` could itself hold `OwnedFd`s
@@ -92,4 +121,7 @@ live daemon after #113 merged, not by reading the code.
 
 ## Commits
 
-- HEAD — fix(triaged): close an adopted session's PTY master when it ends
+- 6831ec7 — fix(triaged): own an adopted session's PTY master so it closes when the session ends
+- 833ad91 — docs(devlog): record the production handover results from #113
+- f6fd257 — docs(devlog): renumber to 000098 after 000097 landed on main
+- HEAD — fix(triaged): constrain AdoptedMasterPty's descriptor to one owner

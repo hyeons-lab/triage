@@ -372,6 +372,7 @@ which kills every live PTY session — the exact outcome handover exists to avoi
   "idle" from "dead", and no adoption error was logged (the new code logs one
   explicitly on partial failure). Recorded as suspicion against the migration off
   the pre-fix binary, not against the protocol.
+- 2026-07-21T11:15-0700 **An adopted session leaks its PTY master when it ends —
   found in production, not in review.** Shutting the two stale sessions down
   removed them from the daemon (`SnapshotSession` → "not found") and released two
   of each session's three descriptors, but left exactly one open on each of their
