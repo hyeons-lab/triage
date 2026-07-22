@@ -1138,8 +1138,60 @@ impl SessionManager {
     /// Detaches every live session from this daemon for a process handover:
     /// removes them from the map and disarms their actors (no shutdown signal, no
     /// `child.kill()`) so the shared child processes survive into the successor
-    /// daemon, which already holds their master fds. The daemon `process::exit`s
-    /// right after, so the OS reaps the detached worker threads and fds.
+    /// daemon, which already holds their master fds.
+    ///
+    /// What becomes of each actor's threads afterwards is stated once, here,
+    /// because it is easy to get wrong in the reassuring direction. Detaching
+    /// gives up the right to *join* them; it is not what keeps them running, and
+    /// neither is simply "alive until `process::exit`". They end in a chain:
+    ///
+    /// 1. `SessionActor::detach` takes the actor by value, dropping the stored
+    ///    `Sender<ActorCommand>`. That is not necessarily the last one: three call
+    ///    sites clone it and use the clone off-lock for a round-trip the actor
+    ///    itself has to serve, so a clone in flight keeps the channel connected
+    ///    for however long the actor takes to answer — which is not bounded by
+    ///    anything this call controls. Once none is left, the worker's next poll of
+    ///    `command_rx` (a `try_recv`, or the `recv_timeout` it switches to after
+    ///    the child exits) sees the channel disconnected and returns. That drops `ActorState`, and with it this
+    ///    process's PTY master. Nothing kills or reaps the child, which is the
+    ///    point of the detach — but see the caveat below before reading that as
+    ///    "the child is untouched".
+    /// 2. That return also drops the output receiver, so the reader ends at its
+    ///    next send. It reads through its own `dup`, so closing the master above
+    ///    does not disturb it — which is exactly why it can still take a chunk
+    ///    nobody receives: the one it was already parked in `send` with, or the
+    ///    one it reads first. Only if that read reports EOF or an error does it
+    ///    end having consumed nothing.
+    ///
+    /// Nothing sequences that chain against this call and nothing bounds it: the
+    /// worker may be mid-iteration or waiting out a 20ms `output_rx` timeout, and
+    /// a reader whose child is quiet is blocked in `read` indefinitely.
+    /// `process::exit` routinely arrives before either step and reaps what is
+    /// left, `dup`ed fds included. So the loop does not *depend* on the exit to
+    /// end, but nothing guarantees it ended before one: assume this daemon can
+    /// still take a destructive read from the successor at any point up to that
+    /// exit, which is what [`crate::handover::HANDOVER_TEARDOWN_TIMEOUT`] is sized
+    /// around.
+    ///
+    /// The caveat on step 1, stated carefully because it is a loaded gun that has
+    /// so far refused to fire: for a session *this* daemon spawned, `ActorState`
+    /// holds the last reference to portable-pty's master writer, and
+    /// `UnixMasterWriter::Drop` writes `\n` plus `VEOF` to the tty. Written to a
+    /// shell's tty that sequence submits any partially typed line and then ends
+    /// the shell on the resulting empty one, which would destroy the session the
+    /// handover exists to preserve.
+    ///
+    /// An attempt to reproduce that end to end did *not* kill the child: after a
+    /// detach it stayed running, and injecting the same two bytes by hand at that
+    /// moment did not end it either, though injecting them mid-session does. So
+    /// the mechanism is real and the consequence is not demonstrated, and the
+    /// reason is not understood. It is written down because the analysis that gets
+    /// you to "the child is untouched" — nothing kills it, nothing reaps it — does
+    /// not account for the writer at all, and that gap is worth more than the
+    /// reassurance. Do not read step 1 as proof the child survives.
+    ///
+    /// Closing a live session's master here is safe;
+    /// [`crate::handover::AdoptedMasterPty`] documents why.
     #[cfg(unix)]
     pub fn detach_all_live_sessions(&self) {
         if let Ok(mut sessions) = self.sessions() {
@@ -1310,9 +1362,10 @@ impl UnadoptedFds {
     /// Ownership transfers here, to the `AdoptedMasterPty` that
     /// `spawn_adopted_pty_runtime` wraps it in as its very first act. That type
     /// closes on drop, so every early return after the wrap — a rotated log, a
-    /// thread spawn hitting EAGAIN — still closes it, and so does the session
-    /// ending later. Holding it in the guard past this point instead would put it
-    /// under two owners at once and close it twice on the failure path.
+    /// thread spawn hitting EAGAIN — still closes it, as does the actor loop
+    /// returning later (see [`crate::handover::AdoptedMasterPty`]; a session merely
+    /// *ending* does not). Holding it in the guard past this point instead would
+    /// put it under two owners at once and close it twice on the failure path.
     fn take_next(&mut self) -> Option<std::os::unix::io::RawFd> {
         self.fds.pop_front()
     }
@@ -2731,11 +2784,17 @@ impl SessionActor {
     }
 
     /// Disarms the actor for a process handover: drops the worker/reader join
-    /// handles WITHOUT signalling shutdown, so the worker thread keeps owning the
-    /// live PTY child until this process exits. The successor daemon already owns
-    /// the session through the transferred master fd; killing the child here (as
-    /// [`Self::shutdown`] and [`Drop`] do) is exactly what tears every session
-    /// down across a handover.
+    /// handles WITHOUT signalling shutdown, so nothing kills the live PTY child.
+    /// Killing it here (as [`Self::shutdown`] and [`Drop`] do) is exactly what
+    /// tears every session down across a handover; the successor daemon already
+    /// owns the session through the transferred master fd.
+    ///
+    /// Taking `self` by value is load-bearing, not incidental: it is what stops a
+    /// future caller keeping a detached actor — and so its `Sender` — alive, which
+    /// would leave the worker loop nothing to end on. Clearing the handles only
+    /// gives up the right to join. The sole caller,
+    /// `SessionManager::detach_all_live_sessions`, documents what both threads do
+    /// from here and why the PTY master closing is safe.
     fn detach(mut self) {
         self.worker = None;
         self.reader = None;
