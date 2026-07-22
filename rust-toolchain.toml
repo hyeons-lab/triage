@@ -1,8 +1,18 @@
 # Nightly is required by the `cera` inference engine (session summarizer): on
-# aarch64 it uses the still-unstable NEON dotprod / prefetch intrinsics
-# (`stdarch_neon_dotprod`, `stdarch_aarch64_prefetch`). triage/triaged ship as
+# aarch64 it uses the still-unstable NEON i8mm / prefetch intrinsics
+# (`stdarch_neon_i8mm`, `stdarch_aarch64_prefetch`). triage/triaged ship as
 # apps, not libraries, so pinning a nightly toolchain is acceptable. Pinned for
 # reproducible local + CI builds; bump deliberately.
+#
+# The floor is 1.99.0-nightly (first nightly ~2026-07-08). cera 0.3.1 stopped
+# gating `stdarch_neon_dotprod` because it stabilized in 1.99, so it now calls
+# `vdotq_s32` unguarded — on an older nightly cera's aarch64 NEON backend fails
+# to compile. (Only aarch64: that code is behind `cfg(target_arch = "aarch64")`,
+# and cera builds fine for x86-64 on the older pin.) Do not lower this pin
+# without dropping back to cera 0.2.x or earlier.
+# The same pin is duplicated in .github/workflows/{ci,publish}.yml; keep them in
+# lockstep, since those jobs install the toolchain by name rather than reading
+# this file.
 [toolchain]
-channel = "nightly-2026-04-02"
+channel = "nightly-2026-07-10"
 components = ["rustfmt", "clippy"]

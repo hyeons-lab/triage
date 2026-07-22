@@ -16,6 +16,15 @@ sessions run on ConPTY on Windows and on a standard PTY elsewhere.
 cargo install triaged
 ```
 
+> **Building from source needs a nightly toolchain on aarch64.** The `cera`
+> inference engine behind the session summarizer uses unstable NEON intrinsics
+> there, and currently requires **1.99.0-nightly or newer** (`nightly-2026-07-08`
+> and later). On an older toolchain the build fails inside `cera` with a wall of
+> `E0658` errors rather than a clear message. `rustup toolchain install nightly`
+> and retry with `cargo +nightly install triaged`. The unstable intrinsics are
+> gated to aarch64, so x86-64 does not hit this. Prebuilt binaries below need
+> none of this.
+
 Or grab a prebuilt binary instead of compiling: releases after `v0.1.6` attach a
 `Triage-cli-<os>-v<version>` archive (`.tar.gz` for macOS/Linux, `.zip` for
 Windows) to the
