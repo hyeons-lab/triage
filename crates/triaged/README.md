@@ -169,11 +169,14 @@ Releases after `v0.1.6` attach a
 [minisign](https://jedisct1.github.io/minisign/) signature (`.minisig`) and a
 `.sha256` checksum to every asset — the desktop clients above and the CLI
 archives alike; releases through `v0.1.6` predate this and have neither.
-Download the asset and both files, then (with
-`<asset>` your archive's filename, and `minisign` from your package manager —
-`brew install minisign`, `apt install minisign`):
+Download the asset and both sidecars **into the same directory** and run the
+commands from there: the `.sha256` records only the asset's basename, so
+`sha256sum -c` fails to find it from anywhere else. With `<asset>` your
+archive's filename, and `minisign` from your package manager
+(`brew install minisign`, `apt install minisign`):
 
 ```bash
+cd <the directory you downloaded into>
 minisign -Vm <asset> -P RWRinpvI8phW62LgDacQlEXg1JqBPZxvWKROZWAqmyToxr7Pw0e534yH
 sha256sum -c <asset>.sha256
 # macOS has no sha256sum; use: shasum -a 256 -c <asset>.sha256
