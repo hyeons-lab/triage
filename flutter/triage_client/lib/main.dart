@@ -4406,11 +4406,21 @@ bool worktreeEchoesBranch(String worktree, String? branch) {
 /// fields, since the defect is "these rows read the same". It deliberately
 /// ignores the meta line: two rows can share a title and repo yet differ there,
 /// which costs a needless second snippet line and nothing else.
+/// Separator for the grouping key in [indistinguishableRailRows].
+///
+/// `\u0000` because it cannot occur in a title or a repo name, so no pair of
+/// rows can collide by containing the separator themselves — `a|b` + `c` and
+/// `a` + `b|c` would otherwise group together. Written as an escape rather than
+/// the literal control character, which is invisible in an editor and can make
+/// tooling treat the file as binary.
+const String _railGroupSeparator = '\u0000';
+
 @visibleForTesting
 Set<int> indistinguishableRailRows(List<SessionVm> sessions) {
   final groups = <String, List<int>>{};
   for (var i = 0; i < sessions.length; i++) {
-    final key = '${sessions[i].railTitle} ${sessions[i].repoName ?? ''}';
+    final key =
+        '${sessions[i].railTitle}$_railGroupSeparator${sessions[i].repoName ?? ''}';
     groups.putIfAbsent(key, () => <int>[]).add(i);
   }
   return {

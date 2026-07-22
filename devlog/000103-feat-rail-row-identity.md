@@ -40,6 +40,13 @@ deferred — see Decisions.
   name, `railTitle`'s tail delegates to `displayTitle` instead of restating its fallbacks,
   and four doc comments were corrected or trimmed.
 
+- 2026-07-22T13:52-0700 `flutter/triage_client/lib/main.dart` — the grouping key
+  in `indistinguishableRailRows` used a *literal* NUL byte as its separator,
+  which review of #121 caught: invisible in an editor, and enough to make some
+  tooling treat the file as binary. Now a documented `_railGroupSeparator`
+  constant written as the escape `\u0000`. Same byte, same collision-proofing,
+  visible in the source.
+
 ## Decisions
 
 - 2026-07-21T16:03-0700 Row identity before grouping — Grouping by repo
