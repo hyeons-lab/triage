@@ -14,6 +14,15 @@ session ends", when it also closes on a handover detach.
   all three points the descriptor closes (actor loop end, an early return in
   `spawn_adopted_pty_runtime` before the actor takes ownership, a handover
   detach) and records why the handover case does not undo the handover.
+- 2026-07-22T10:35-0700 `crates/triaged/src/session.rs` — `SessionActor::detach`'s
+  doc no longer claims the worker thread "keeps owning the live PTY child until
+  this process exits". It says what actually happens: clearing the handles only
+  gives up the right to join, the dropped `Sender` ends the loop, and the master
+  closes — with the child left alive because nothing signals shutdown.
+- 2026-07-22T10:35-0700 `devlog/plans/000102-01-adopted-master-drop-timing.md` —
+  the verification step now names `AGENTS.md`'s exact check commands instead of
+  paraphrasing them (`cargo fmt` without `--check` would have *applied* formatting
+  rather than gating on it).
 
 ## Decisions
 
@@ -49,7 +58,10 @@ which was documented nowhere near the type.
   the loop (`session.rs:2935`), unwinding the `ActorState` that owns the master
   (`session.rs:2762`). The intuitive reading — that detaching the `JoinHandle`s
   leaves the thread running to `process::exit` with the master alive — is wrong,
-  and was the reading taken on the first pass through #116's review.
+  and was the reading taken on the first pass through #116's review — and it was
+  also, as review of this PR pointed out, what `detach`'s own doc asserted. Two
+  docs describing the same teardown by different mechanisms; the one on `detach`
+  was the wrong one.
 - Safety of that close confirmed at both ends: `SCM_RIGHTS` installs an
   independent descriptor in the successor (`handover.rs:254`), and
   `extract_handover_state` sends `libc::dup(fd)` (`session.rs:2963`) rather than
@@ -57,7 +69,8 @@ which was documented nowhere near the type.
 
 ## Commits
 
-- HEAD — docs(triaged): describe every point an adopted master closes
+- 0805066 — docs(triaged): describe every point an adopted master closes
+- HEAD — docs(triaged): reconcile detach's doc with the master it drops
 
 ## Progress
 

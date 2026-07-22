@@ -2717,11 +2717,18 @@ impl SessionActor {
     }
 
     /// Disarms the actor for a process handover: drops the worker/reader join
-    /// handles WITHOUT signalling shutdown, so the worker thread keeps owning the
-    /// live PTY child until this process exits. The successor daemon already owns
-    /// the session through the transferred master fd; killing the child here (as
-    /// [`Self::shutdown`] and [`Drop`] do) is exactly what tears every session
-    /// down across a handover.
+    /// handles WITHOUT signalling shutdown, so nothing kills the live PTY child.
+    /// Killing it here (as [`Self::shutdown`] and [`Drop`] do) is exactly what
+    /// tears every session down across a handover; the successor daemon already
+    /// owns the session through the transferred master fd.
+    ///
+    /// The worker thread does *not* outlive this call. Clearing the handles only
+    /// gives up the right to join it — `self` is taken by value, so the command
+    /// `Sender` drops here too, the worker's `try_recv` sees `Disconnected` and
+    /// breaks the loop, and `ActorState` unwinds. That closes this process's PTY
+    /// master while the session lives on, which is safe because the successor
+    /// holds an independent descriptor rather than a share of this one; see
+    /// `handover::AdoptedMasterPty` for the full accounting.
     fn detach(mut self) {
         self.worker = None;
         self.reader = None;

@@ -36,6 +36,8 @@ shares this descriptor. `SCM_RIGHTS` installs an independent one in that process
   terminal escape, and rewriting it would name a different model than the one
   that did the work.
 - Verify every factual claim in the doc against `main` before writing it down,
-  then `cargo fmt`, `clippy -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc`
-  (the change is doc comments, so a broken intra-doc link is the live risk), and
-  the full test suite on Linux, since this path is `#[cfg(unix)]`.
+  then run the check set `AGENTS.md` documents — `cargo fmt --all -- --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc` (the change is doc comments, so a broken
+  intra-doc link is the live risk), and `cargo test --workspace` — on Linux,
+  since this path is `#[cfg(unix)]`.
