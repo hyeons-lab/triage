@@ -2,7 +2,7 @@
     windows,
     allow(dead_code, clippy::needless_return, clippy::large_enum_variant)
 )]
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -1412,6 +1412,10 @@ fn spawn_adopted_pty_runtime(
 
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
+        log_path: h_sess.log_path.clone(),
+        trim_disabled: false,
+        max_log_bytes: MAX_SESSION_LOG_BYTES,
+        retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
         terminal,
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: 0,
@@ -1419,12 +1423,11 @@ fn spawn_adopted_pty_runtime(
         log_cache: None,
     };
 
-    let replay = fs::read(&h_sess.log_path)
-        .with_context(|| format!("reading session log {}", h_sess.log_path.display()))?;
-    let replayed_working_directory = if replay.is_empty() {
+    let (replay_len, replay) = read_replay_tail(&h_sess.log_path)?;
+    let replayed_working_directory = if replay_len == 0 {
         None
     } else {
-        output.replay(&replay)?
+        output.replay_tail(replay_len, &replay)?
     };
     let current_working_directory = adopted_session_cwd(
         h_sess.pid,
@@ -1904,11 +1907,34 @@ impl SessionApi for SessionManager {
             session
         };
         self.forget_snippet(&session_id);
-        match session {
+        // Each session's own recorded path, never a re-derived name: a session
+        // adopted across a handover carries the log path from the handover
+        // payload, which need not match `log_dir/{id}.log`. Deleting a derived
+        // path would unlink nothing and leak the real log — the very leak this
+        // fixes.
+        //
+        // `Restoring` is deliberately absent. `restore_session` inserts that
+        // state, releases the sessions lock, and only then spawns the actor that
+        // opens the log, so a shutdown landing in that window would delete a log
+        // an in-flight spawn is about to write to. Leaving it is the safe side of
+        // the trade: the startup purge reclaims it later.
+        let log_path = match &session {
+            ManagedSession::Live { launch, .. } => Some(launch.log_path.clone()),
+            ManagedSession::Historical { session, .. } => Some(session.persisted.log_path.clone()),
+            ManagedSession::Restoring { .. } => None,
+        };
+        let completed = match session {
             ManagedSession::Live { actor, .. } => actor.shutdown(),
             ManagedSession::Historical { session, .. } => Ok(session.completed_session()),
             ManagedSession::Restoring { session, .. } => Ok(session.completed_session()),
+        };
+        // Only after the actor has shut down, so nothing is still writing to it.
+        // A session removed from the manifest can never be restored, so its log
+        // is unreachable from here on and would otherwise leak forever.
+        if let Some(log_path) = log_path {
+            remove_session_log(&session_id, &log_path);
         }
+        completed
     }
 
     #[allow(clippy::type_complexity)]
@@ -2291,6 +2317,9 @@ fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> R
 fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, ManagedSession>> {
     let manifest_path = config.manifest_path();
     if !manifest_path.exists() {
+        // Still purge: no manifest means *every* log is unreferenced, which is
+        // exactly the case with the most to reclaim.
+        purge_orphaned_session_logs(&config.log_dir, &HashSet::new(), ORPHANED_LOG_RETENTION);
         return Ok(HashMap::new());
     }
 
@@ -2306,7 +2335,13 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, 
     );
 
     let mut sessions = HashMap::new();
+    // Collected from the manifest rather than from the restored map, and using
+    // each entry's own `log_path` rather than re-deriving the name. A session
+    // whose restore fails below is still referenced — its log must not be
+    // mistaken for an orphan and deleted out from under a later recovery.
+    let mut referenced = HashSet::new();
     for persisted in manifest.sessions {
+        referenced.insert(persisted.log_path.clone());
         match HistoricalSession::restore(persisted) {
             Ok(session) => {
                 sessions.insert(
@@ -2322,7 +2357,126 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, 
             }
         }
     }
+    purge_orphaned_session_logs(&config.log_dir, &referenced, ORPHANED_LOG_RETENTION);
     Ok(sessions)
+}
+
+/// Deletes the output log of a session that has just been removed from the
+/// manifest. Best-effort: a failure leaks one log file, which must not turn a
+/// successful shutdown into an error.
+fn remove_session_log(session_id: &SessionId, log_path: &Path) {
+    match fs::remove_file(log_path) {
+        Ok(()) => tracing::info!(
+            session_id = %session_id,
+            log_path = %log_path.display(),
+            "removed session log for shut-down session"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            session_id = %session_id,
+            log_path = %log_path.display(),
+            ?error,
+            "failed to remove session log for shut-down session"
+        ),
+    }
+}
+
+/// Grace period before an unreferenced session log is deleted.
+///
+/// Manifest membership is the primary safety check; this age check is a second
+/// one, covering the window in which the manifest is not yet the whole picture —
+/// sessions adopted across a handover join the map *after* the purge runs. It is
+/// not a guarantee on its own (an idle shell can sit at a prompt for weeks
+/// without writing), which is why it is applied *in addition to* membership and
+/// never instead of it.
+const ORPHANED_LOG_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Deletes session logs in `log_dir` that are absent from `referenced` and have
+/// not been written to for `retention`.
+///
+/// Before session shutdown learned to delete its own log, every shut-down
+/// session leaked one; this reclaims that backlog and anything a failed deletion
+/// leaves behind. Best-effort throughout — this runs on the startup path and
+/// must never prevent the daemon from coming up.
+///
+/// Matching is by *file name*, not by full path. A manifest records the absolute
+/// `log_path` a session was created with and keeps it for the session's whole
+/// life, while the scanned paths are rebuilt from the current `log_dir`; the two
+/// can spell the same location differently (a symlinked `$HOME`, macOS's
+/// `/var` → `/private/var`, a re-pointed `XDG_STATE_HOME`). Comparing whole
+/// paths would then match nothing and classify *every* referenced log as an
+/// orphan — and since historical sessions are exactly the ones untouched for
+/// weeks, the age guard would not save them.
+fn purge_orphaned_session_logs(
+    log_dir: &Path,
+    referenced: &HashSet<PathBuf>,
+    retention: std::time::Duration,
+) {
+    let referenced_names: HashSet<&std::ffi::OsStr> = referenced
+        .iter()
+        .filter_map(|path| path.file_name())
+        .collect();
+
+    let entries = match fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                log_dir = %log_dir.display(),
+                ?error,
+                "failed to scan session log directory; skipping orphan purge"
+            );
+            return;
+        }
+    };
+
+    let now = std::time::SystemTime::now();
+    let (mut removed, mut reclaimed) = (0_u64, 0_u64);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| referenced_names.contains(name))
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= retention);
+        if !stale {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                removed += 1;
+                reclaimed += metadata.len();
+            }
+            Err(error) => tracing::warn!(
+                log_path = %path.display(),
+                ?error,
+                "failed to remove orphaned session log"
+            ),
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!(
+            removed_logs = removed,
+            reclaimed_bytes = reclaimed,
+            "purged orphaned session logs"
+        );
+    }
 }
 
 fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u64 {
@@ -2500,15 +2654,24 @@ impl HistoricalSession {
     fn restore(persisted: PersistedSession) -> Result<Self> {
         let size = persisted.size.clone();
         let mut output = output_state_for_log(&persisted.log_path, persisted.size.clone())?;
-        let log = fs::read(&persisted.log_path)
-            .with_context(|| format!("reading session log {}", persisted.log_path.display()))?;
+        let (log_len, log) = read_replay_tail(&persisted.log_path)?;
         // Always replay to rebuild the terminal screen; its OSC 7 cwd result is a
-        // by-product used as one cwd candidate below.
-        let replayed_cwd = if log.is_empty() {
+        // by-product used as one cwd candidate below. Guarded on the reported
+        // length rather than on the tail being empty: those agree today, but the
+        // length is what `bytes_logged` must end up holding.
+        let replayed_cwd = if log_len == 0 {
             None
         } else {
-            output.replay(&log)?
+            output.replay_tail(log_len, &log)?
         };
+        // Deliberately no trim here. Restore runs during a handover *before* the
+        // adoption byte, while the outgoing daemon is still fully serving and
+        // writing these same logs (see the comment above `SessionManager::default`
+        // in `main.rs`), so truncating one would corrupt a live writer's file:
+        // a `write(true)` handle would resume at its pre-truncation offset and
+        // punch a sparse hole, and an `append(true)` one would leave the other
+        // daemon's `bytes_logged` past EOF. A log that is already oversized is
+        // trimmed once its session next ingests output.
         // Choose the cwd by precedence, validating each so a removed worktree
         // falls through to the next candidate (rather than surfacing a dead path
         // / losing git context in the side rail for a never-restored session):
@@ -2894,6 +3057,18 @@ struct PtyRuntime {
 
 struct OutputState {
     log: File,
+    /// Path of `log`, retained so the log can be trimmed once it outgrows
+    /// [`MAX_SESSION_LOG_BYTES`]. Trimming rewrites the file through a separate
+    /// non-append handle, which has to be opened by path.
+    log_path: PathBuf,
+    /// Set after a trim fails, to stop retrying it on every subsequent write.
+    trim_disabled: bool,
+    /// Size at which the log is trimmed, and the size it is trimmed back to.
+    /// Fields rather than direct uses of [`MAX_SESSION_LOG_BYTES`] /
+    /// [`SESSION_LOG_RETAIN_BYTES`] so tests can drive the real trim path
+    /// without writing megabytes.
+    max_log_bytes: u64,
+    retain_log_bytes: u64,
     terminal: Terminal,
     cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
@@ -3343,8 +3518,7 @@ impl ActorState {
         self.master
             .resize(pty_size(&size))
             .context("resizing PTY")?;
-        self.output
-            .reflow_from_log(&self.log_path, &size, self.writer.clone())?;
+        self.output.reflow_from_log(&size, self.writer.clone())?;
         self.size = size;
         let snapshot = self.snapshot();
         if let Some(session_id) = self.event_session_id.clone() {
@@ -3660,6 +3834,7 @@ impl OutputState {
             .context("writing PTY output log")?;
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
+        self.trim_log_if_oversized();
         if let Some(cache) = &mut self.log_cache {
             if cache.len() + bytes.len() <= 1024 * 1024 {
                 cache.extend_from_slice(bytes);
@@ -3671,6 +3846,87 @@ impl OutputState {
         let translated = translate_newlines(bytes);
         self.terminal.advance_bytes(&translated);
         Ok(current_working_directory)
+    }
+
+    /// Trims the log back to [`SESSION_LOG_RETAIN_BYTES`] once it grows past
+    /// [`MAX_SESSION_LOG_BYTES`], rebasing `bytes_logged` onto the new length.
+    ///
+    /// Best-effort: a failure here means the log keeps growing, which is worth a
+    /// warning but must not take the session down mid-output.
+    fn trim_log_if_oversized(&mut self) {
+        if self.trim_disabled || self.bytes_logged <= self.max_log_bytes {
+            return;
+        }
+        let len = match trim_session_log(&self.log_path, self.retain_log_bytes) {
+            Ok(len) => len,
+            Err(error) => {
+                // Give up permanently for this session rather than retrying.
+                // `bytes_logged` stays above `max`, so an unconditional retry
+                // would re-attempt a multi-megabyte read/write on *every*
+                // subsequent chunk of PTY output — turning a full disk into an
+                // I/O storm on the actor's hot path. An un-trimmed log is the
+                // lesser failure.
+                self.trim_disabled = true;
+                tracing::warn!(
+                    log_path = %self.log_path.display(),
+                    ?error,
+                    "failed to trim oversized session log; \
+                     it will keep growing and no further trims will be attempted"
+                );
+                return;
+            }
+        };
+
+        // The trim is already committed to disk, so `bytes_logged` must be
+        // rebased onto the new length before anything else can fail — leaving it
+        // stale would break the invariant that it equals the file length, and
+        // `read_raw_output_tail` would then seek past EOF.
+        let dropped = self.bytes_logged.saturating_sub(len);
+        self.bytes_logged = len;
+        // The cache mirrors the head of the log, so it no longer corresponds to
+        // anything on disk once the front is dropped.
+        self.log_cache = None;
+
+        // Reposition our own handle to the new end. Not all session logs are
+        // opened in append mode — the freshly-created-session path opens a plain
+        // `write(true).truncate(true)` handle, which keeps its own offset. Left
+        // alone, that offset still points past the now-shorter file and the next
+        // write would punch a sparse hole of NUL bytes into the log.
+        //
+        // A handle that cannot even seek is unusable for this, so fall back to
+        // reopening it rather than leaving it parked past the end: disabling
+        // future trims alone would not stop the *existing* handle from writing
+        // at the stale offset. If the reopen fails too there is nothing left to
+        // try — a seek and an open both failing on a file that was just
+        // rewritten means the log is gone or the fd is broken, and the next
+        // write will surface the real error.
+        if let Err(error) = self.log.seek(SeekFrom::End(0)) {
+            match OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.log_path)
+            {
+                Ok(reopened) => self.log = reopened,
+                Err(reopen_error) => {
+                    self.trim_disabled = true;
+                    tracing::warn!(
+                        log_path = %self.log_path.display(),
+                        ?error,
+                        ?reopen_error,
+                        "failed to reposition or reopen session log handle after trimming; \
+                         no further trims will be attempted"
+                    );
+                    return;
+                }
+            }
+        }
+
+        tracing::debug!(
+            log_path = %self.log_path.display(),
+            dropped_bytes = dropped,
+            retained_bytes = len,
+            "trimmed oversized session log"
+        );
     }
 
     fn replay(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
@@ -3686,12 +3942,25 @@ impl OutputState {
         Ok(self.advance_replayed_bytes(bytes))
     }
 
-    fn reflow_from_log(
-        &mut self,
-        log_path: &PathBuf,
-        size: &SessionSize,
-        writer: SharedPtyWriter,
-    ) -> Result<()> {
+    /// Replays the trailing `tail` of a log whose full length is `total_len`.
+    ///
+    /// Used by the adopt and restore paths, which need the emulator rebuilt from
+    /// the end of the log but must still report the log's true length: replaying
+    /// a truncated tail would otherwise leave `bytes_logged` short of the file
+    /// size, and [`read_raw_output_tail`] would then seek to the wrong offset and
+    /// hand clients a misaligned history.
+    fn replay_tail(&mut self, total_len: u64, tail: &[u8]) -> Result<Option<PathBuf>> {
+        let current_working_directory = self.replay(tail)?;
+        if total_len != tail.len() as u64 {
+            // The cache is only valid as a stand-in for the whole log; it holds
+            // the tail alone here, so drop it and let readers go to the file.
+            self.log_cache = None;
+        }
+        self.bytes_logged = total_len;
+        Ok(current_working_directory)
+    }
+
+    fn reflow_from_log(&mut self, size: &SessionSize, writer: SharedPtyWriter) -> Result<()> {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
         self.cwd_sequence_buffer.clear();
@@ -3702,18 +3971,11 @@ impl OutputState {
             self.log
                 .flush()
                 .context("flushing session log before reflow")?;
-            let mut replay = File::open(log_path)
-                .with_context(|| format!("opening session log {}", log_path.display()))?;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = replay
-                    .read(&mut buffer)
-                    .with_context(|| format!("reading session log {}", log_path.display()))?;
-                if read == 0 {
-                    break;
-                }
-                self.advance_replayed_bytes(&buffer[..read]);
-            }
+            // Same bounded read as the adopt and restore paths, so all three
+            // agree on how much of a log a replay covers. Trimming keeps logs
+            // within `REPLAY_TAIL_CAP`, so this is normally the whole file.
+            let (_, replay) = read_replay_tail(&self.log_path)?;
+            self.advance_replayed_bytes(&replay);
         }
 
         let replay_writes = replay_gate.dropped_write_count();
@@ -3868,6 +4130,10 @@ fn spawn_pty_runtime(
                 writer,
                 output: OutputState {
                     log,
+                    log_path: config.log_path.clone(),
+                    trim_disabled: false,
+                    max_log_bytes: MAX_SESSION_LOG_BYTES,
+                    retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
                     terminal,
                     cwd_sequence_buffer: Vec::new(),
                     bytes_logged: 0,
@@ -3890,18 +4156,21 @@ fn spawn_pty_runtime(
                 .with_context(|| format!("opening session log {}", config.log_path.display()))?;
             let mut output = OutputState {
                 log: log.try_clone().context("cloning restored session log")?,
+                log_path: config.log_path.clone(),
+                trim_disabled: false,
+                max_log_bytes: MAX_SESSION_LOG_BYTES,
+                retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
                 terminal,
                 cwd_sequence_buffer: Vec::new(),
                 bytes_logged: 0,
                 output_seq: 0,
                 log_cache: Some(Vec::new()),
             };
-            let replay = fs::read(&config.log_path)
-                .with_context(|| format!("reading session log {}", config.log_path.display()))?;
-            let replayed_working_directory = if replay.is_empty() {
+            let (replay_len, replay) = read_replay_tail(&config.log_path)?;
+            let replayed_working_directory = if replay_len == 0 {
                 None
             } else {
-                output.replay(&replay)?
+                output.replay_tail(replay_len, &replay)?
             };
             let current_working_directory =
                 restorable_cwd(replayed_working_directory, config.cwd.clone());
@@ -3932,6 +4201,10 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         .with_context(|| format!("opening session log {}", log_path.display()))?;
     Ok(OutputState {
         log,
+        log_path: log_path.clone(),
+        trim_disabled: false,
+        max_log_bytes: MAX_SESSION_LOG_BYTES,
+        retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
         terminal: terminal_with_writer(&size, shared_pty_writer(Box::new(std::io::sink()))),
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: 0,
@@ -3993,6 +4266,53 @@ fn snapshot_from_output(
 /// gives generous headroom for full-screen TUIs run inside a session.
 const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
 
+/// Size at which a live session log is trimmed back to
+/// [`SESSION_LOG_RETAIN_BYTES`]. Without this a long-lived session grows without
+/// bound — logs of ~100 MB, and gigabytes across a session directory, are what
+/// motivated the cap.
+const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bytes of log kept when [`MAX_SESSION_LOG_BYTES`] is exceeded. The gap between
+/// the two bounds is what makes trimming amortised: one rewrite buys
+/// `MAX_SESSION_LOG_BYTES - SESSION_LOG_RETAIN_BYTES` of further output.
+const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
+
+/// Maximum bytes of a session log replayed through the terminal emulator when a
+/// session is adopted, restored, or reflowed after a resize.
+///
+/// Replay is not just about the visible screen: it also rebuilds terminal
+/// *modes* (bracketed paste, alternate screen, cursor-key and charset state) and
+/// recovers the OSC 7 working directory, all of which are set early in a session
+/// rather than in its tail.
+///
+/// This is therefore `>= MAX_SESSION_LOG_BYTES`, so replay never discards bytes
+/// the log still holds: whatever survives on disk is replayed in full, exactly
+/// like the full-file read this replaces. What the cap buys is a ceiling on a
+/// legacy log written before trimming existed — 16 MiB of work instead of 100 MB.
+///
+/// Note what this does *not* promise. Trimming drops the front of the log, so a
+/// session that outgrows [`MAX_SESSION_LOG_BYTES`] does lose the early bytes
+/// where those modes were set — the loss moves from replay time to trim time,
+/// it does not disappear. That is the accepted cost of bounding the log at all;
+/// shells and full-screen TUIs re-assert their modes on the next repaint, and
+/// `last_known_cwd` outranks the replayed OSC 7 cwd precisely because the replay
+/// cannot be relied on to recover it.
+const REPLAY_TAIL_CAP: u64 = MAX_SESSION_LOG_BYTES;
+
+// These bounds only work together, so pin their ordering at compile time.
+const _: () = assert!(
+    SESSION_LOG_RETAIN_BYTES < MAX_SESSION_LOG_BYTES,
+    "retaining at least the max would trim on every write"
+);
+const _: () = assert!(
+    REPLAY_TAIL_CAP >= MAX_SESSION_LOG_BYTES,
+    "a trimmed log must replay in full, or it loses terminal modes set before the tail"
+);
+const _: () = assert!(
+    REPLAY_TAIL_CAP >= RAW_OUTPUT_TAIL_CAP,
+    "replay must rebuild at least as much history as clients can request"
+);
+
 /// Overlays the raw output-history tail onto a snapshot for client-side
 /// re-emulation. Used by the attach/resync/snapshot paths; the resize broadcast
 /// keeps the plain `snapshot()` so it never carries the tail.
@@ -4035,6 +4355,91 @@ fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, V
             (0, Vec::new())
         }
     }
+}
+
+/// Reads the trailing [`REPLAY_TAIL_CAP`] bytes of a session log for replay,
+/// returning the log's full length alongside them.
+///
+/// The length is the log's true size, not the length of the returned tail: it
+/// becomes `bytes_logged`, which must stay equal to the on-disk file length so
+/// the absolute offsets in [`read_raw_output_tail`] keep addressing the right
+/// bytes.
+///
+/// Deliberately *not* built on [`read_raw_output_tail`], which reports an
+/// unreadable log as empty history. That is the right call when serving a
+/// snapshot, but here it would leave `bytes_logged` at zero while the file holds
+/// data — silently breaking the invariant above — so I/O errors propagate.
+///
+/// The offset and the length come from a single open handle, and the length is
+/// the read's own end position rather than a separately stat'd size. A session
+/// log is still being written during a handover adoption, so a stat-then-reopen
+/// pair can disagree; deriving both from one handle keeps them consistent.
+fn read_replay_tail(log_path: &Path) -> Result<(u64, Vec<u8>)> {
+    let mut file = File::open(log_path)
+        .with_context(|| format!("opening session log {}", log_path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("reading session log metadata {}", log_path.display()))?
+        .len();
+    let start = len.saturating_sub(REPLAY_TAIL_CAP);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))
+            .with_context(|| format!("seeking session log tail {}", log_path.display()))?;
+    }
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)
+        .with_context(|| format!("reading session log {}", log_path.display()))?;
+    Ok((start + tail.len() as u64, tail))
+}
+
+/// Trims the log at `log_path` down to its trailing `retain` bytes, returning
+/// the new file length (or the unchanged length if it was already under).
+///
+/// Rewrites through a *separate* handle on the same inode, because the caller's
+/// handle cannot do the job in either of the two forms it takes: the restore and
+/// adoption paths open the log with `append(true)`, where writes ignore the seek
+/// position and always land at the end, while the fresh-session path opens a
+/// plain `write(true).truncate(true)` handle that keeps its own offset. Sharing
+/// the inode means the caller keeps its handle, but it *must* reseek it to the
+/// end afterwards — the plain handle would otherwise still be positioned past
+/// the now-shorter file and punch a sparse hole into it.
+///
+/// Callers must assign the returned length to `bytes_logged`: the front of the
+/// stream is gone, so every absolute offset rebases by the number of bytes
+/// dropped. That is safe because `bytes_logged` is never persisted — restore
+/// re-derives it from the file — so absolute offsets are already per-daemon-run,
+/// and `raw_output_start` only ever reaches a client paired with the
+/// `raw_output` it describes.
+///
+/// The rewrite is not atomic: a crash between the write and the `set_len` leaves
+/// the retained tail spliced onto stale bytes, which replays as garbled
+/// scrollback. A temp-file-plus-rename would be atomic but would give the file a
+/// new inode, breaking the shared-inode contract with the caller's still-open
+/// handle — so the in-place rewrite is deliberate, and the next trim repairs the
+/// length.
+fn trim_session_log(log_path: &Path, retain: u64) -> std::io::Result<u64> {
+    // One read/write handle: writes go to the seek position (no `append`), so the
+    // same handle can read the tail and then write it back over the front.
+    let mut file = OpenOptions::new().read(true).write(true).open(log_path)?;
+    let len = file.metadata()?.len();
+    if len <= retain {
+        return Ok(len);
+    }
+
+    file.seek(SeekFrom::Start(len - retain))?;
+    let mut tail = Vec::with_capacity(retain as usize);
+    file.read_to_end(&mut tail)?;
+
+    // Length comes from what was actually read, never from `retain`. The two
+    // agree only if the file was exactly `len` bytes at read time; a log that
+    // changed size in between would otherwise be either NUL-extended by
+    // `set_len` or truncated past the bytes just written, and the returned
+    // length — which the caller assigns to `bytes_logged` — would be a lie.
+    let retained = tail.len() as u64;
+    file.rewind()?;
+    file.write_all(&tail)?;
+    file.set_len(retained)?;
+    Ok(retained)
 }
 
 fn pty_size(size: &SessionSize) -> PtySize {
@@ -5145,11 +5550,7 @@ mod tests {
         );
 
         output
-            .reflow_from_log(
-                &log_path,
-                &wide,
-                shared_pty_writer(Box::new(std::io::sink())),
-            )
+            .reflow_from_log(&wide, shared_pty_writer(Box::new(std::io::sink())))
             .expect("reflow log");
 
         let wide_rows = visible_rows(&output.terminal);
@@ -5175,7 +5576,7 @@ mod tests {
         captured.lock().expect("captured writer lock").clear();
 
         output
-            .reflow_from_log(&log_path, &SessionSize::default(), writer)
+            .reflow_from_log(&SessionSize::default(), writer)
             .expect("reflow log");
         assert!(
             captured.lock().expect("captured writer lock").is_empty(),
@@ -5900,11 +6301,17 @@ mod tests {
             "released holder should not be allowed to write"
         );
 
+        // Read the log before shutting down: shutdown removes the session from
+        // the manifest and reclaims its log, so it is gone afterwards.
+        let log_path = log_dir.join(format!("{session_id}.log"));
+        let logged = std::fs::read(&log_path).expect("read managed session log");
         let completed = manager
             .shutdown_session(session_id.clone())
             .expect("shutdown managed session");
-        let logged = std::fs::read(log_dir.join(format!("{session_id}.log")))
-            .expect("read managed session log");
+        assert!(
+            !log_path.exists(),
+            "shutdown must reclaim the session log; an unreferenced log is leaked disk"
+        );
         let _ = std::fs::remove_dir_all(&log_dir);
 
         assert_eq!(completed.bytes_logged, logged.len() as u64);
@@ -7158,6 +7565,10 @@ mod tests {
         let (writer, replay_gate) = replay_gated_pty_writer();
         let mut output = OutputState {
             log,
+            log_path: log_path.clone(),
+            trim_disabled: false,
+            max_log_bytes: MAX_SESSION_LOG_BYTES,
+            retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
             terminal: terminal_with_writer(&SessionSize::default(), writer.clone()),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
@@ -7241,6 +7652,186 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
+    /// Trimming must drop the *front* of the log and keep the newest bytes: the
+    /// tail is what rebuilds the screen, and it is what clients are served.
+    #[test]
+    fn trim_session_log_keeps_the_newest_bytes() {
+        let path = unique_log_path();
+        fs::write(&path, b"0123456789").expect("write test log");
+
+        let len = trim_session_log(&path, 4).expect("trim log");
+        assert_eq!(len, 4);
+        assert_eq!(fs::read(&path).expect("read trimmed log"), b"6789");
+
+        // Already under the retain size -> untouched, reported length unchanged.
+        let len = trim_session_log(&path, 100).expect("trim under-size log");
+        assert_eq!(len, 4);
+        assert_eq!(fs::read(&path).expect("read log"), b"6789");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// After a trim, appends through the caller's existing append-mode handle
+    /// must land at the new, shorter end — the whole reason trimming rewrites
+    /// through a separate non-append handle instead of the caller's.
+    #[test]
+    fn trimming_leaves_an_append_mode_handle_writing_at_the_new_end() {
+        let path = unique_log_path();
+        fs::write(&path, b"").expect("create test log");
+        // Unlike `test_output_state`, this opens the log the way the restore and
+        // handover-adoption paths do — `append(true)`, sharing the inode that
+        // `trim_session_log` rewrites through its own handle.
+        let mut output =
+            output_state_for_log(&path, SessionSize::default()).expect("open append-mode log");
+        output.max_log_bytes = 8;
+        output.retain_log_bytes = 4;
+
+        output.ingest(b"0123456789").expect("ingest past the bound");
+        assert_eq!(output.bytes_logged, 4);
+        assert_eq!(fs::read(&path).expect("read log"), b"6789");
+
+        output.ingest(b"ab").expect("ingest after trim");
+        assert_eq!(fs::read(&path).expect("read log"), b"6789ab");
+        assert_eq!(output.bytes_logged, 6);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `bytes_logged` must track the log's true length, not the length of the
+    /// replayed tail — `read_raw_output_tail` seeks by absolute offset, so a
+    /// short count would hand clients a misaligned history.
+    #[test]
+    fn replay_tail_reports_the_full_log_length() {
+        let path = unique_log_path();
+        // After the output state, which truncates the log it opens.
+        let mut output = test_output_state(&path, SessionSize::default());
+        fs::write(&path, b"0123456789").expect("write test log");
+
+        output.replay_tail(10, b"6789").expect("replay tail");
+
+        assert_eq!(output.bytes_logged, 10);
+        // A partial replay invalidates the cache, so history reads hit the file.
+        assert!(output.log_cache.is_none());
+
+        let (start, bytes) = read_raw_output_tail(&path, output.bytes_logged, 4);
+        assert_eq!(start, 6);
+        assert_eq!(bytes, b"6789");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A full-length "tail" is the whole log, so the cache stays usable.
+    #[test]
+    fn replay_tail_of_a_whole_log_keeps_the_cache() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        fs::write(&path, b"0123456789").expect("write test log");
+
+        output.replay_tail(10, b"0123456789").expect("replay tail");
+
+        assert_eq!(output.bytes_logged, 10);
+        assert_eq!(output.log_cache.as_deref(), Some(&b"0123456789"[..]));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `ingest` must drive the trim end to end: write past the bound, and the
+    /// log shrinks, `bytes_logged` follows it, and subsequent output still lands
+    /// at the end.
+    #[test]
+    fn ingest_trims_the_log_once_it_passes_the_bound() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.max_log_bytes = 8;
+        output.retain_log_bytes = 4;
+
+        output.ingest(b"0123456789").expect("ingest past the bound");
+
+        assert_eq!(output.bytes_logged, 4, "bytes_logged must track the trim");
+        assert_eq!(fs::read(&path).expect("read log"), b"6789");
+
+        output.ingest(b"ab").expect("ingest after trim");
+        assert_eq!(fs::read(&path).expect("read log"), b"6789ab");
+        assert_eq!(output.bytes_logged, 6);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A failed trim must latch off, not retry on every subsequent write — an
+    /// unwritable log would otherwise re-attempt a multi-megabyte rewrite per
+    /// chunk of PTY output.
+    ///
+    /// Unix-only: it forces the failure by unlinking a file that is still open,
+    /// which Windows may refuse or leave delete-pending.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_failed_trim_is_not_retried() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.max_log_bytes = 8;
+        output.retain_log_bytes = 4;
+
+        // Delete the log out from under the handle so the trim's open fails.
+        fs::remove_file(&path).expect("remove log");
+        output.ingest(b"0123456789").expect("ingest past the bound");
+
+        assert!(output.trim_disabled, "a failed trim must disable trimming");
+        let logged = output.bytes_logged;
+        assert!(logged > 8, "a failed trim must leave bytes_logged alone");
+
+        // Re-create the log; a retry would now succeed, so if trimming still
+        // fires the latch did not hold.
+        fs::write(&path, b"0123456789").expect("recreate log");
+        output.ingest(b"cd").expect("ingest after failed trim");
+        assert!(output.bytes_logged > logged, "trimming must stay disabled");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Orphaned logs are reclaimed, but only once stale — and a log a session
+    /// still refers to is never touched, however old it looks.
+    #[test]
+    fn purge_removes_only_stale_unreferenced_logs() {
+        let dir = std::env::temp_dir().join(format!(
+            "triage-purge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create purge test dir");
+
+        let orphan = dir.join("session-1.log");
+        let referenced = dir.join("session-2.log");
+        let unrelated = dir.join("sessions.json");
+        for path in [&orphan, &referenced, &unrelated] {
+            fs::write(path, b"x").expect("write test file");
+        }
+
+        // Spelled differently from what `read_dir` will produce — the manifest
+        // records whatever absolute path a session was created with, and that can
+        // denote the same file by another spelling. Matching must survive it, or
+        // every referenced log is mistaken for an orphan and deleted.
+        let manifest_paths = HashSet::from([dir.join("nested").join("..").join("session-2.log")]);
+        assert_ne!(
+            manifest_paths.iter().next().expect("manifest path"),
+            &referenced,
+            "the manifest path must differ textually from the scanned path"
+        );
+
+        // Nothing is stale yet, so even the orphan survives.
+        purge_orphaned_session_logs(&dir, &manifest_paths, std::time::Duration::from_secs(3600));
+        assert!(orphan.exists(), "fresh orphan must be kept");
+
+        // With no grace period the orphan goes; the referenced log and the
+        // non-.log manifest must both survive.
+        purge_orphaned_session_logs(&dir, &manifest_paths, std::time::Duration::ZERO);
+        assert!(!orphan.exists(), "stale orphan must be removed");
+        assert!(referenced.exists(), "referenced log must never be removed");
+        assert!(unrelated.exists(), "non-log files must be left alone");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn test_output_state(log_path: &PathBuf, size: SessionSize) -> OutputState {
         test_output_state_with_writer(log_path, size, Box::new(std::io::sink()))
     }
@@ -7259,6 +7850,10 @@ mod tests {
         let writer = shared_pty_writer(writer);
         OutputState {
             log,
+            log_path: log_path.clone(),
+            trim_disabled: false,
+            max_log_bytes: MAX_SESSION_LOG_BYTES,
+            retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
             terminal: terminal_with_writer(&size, writer),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
