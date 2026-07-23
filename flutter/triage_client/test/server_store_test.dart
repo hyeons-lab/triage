@@ -189,14 +189,16 @@ void main() {
       expect(retrieveLegacyToken(), 'web-token');
     });
 
-    test('returns false and copies nothing when there is no legacy token',
-        () async {
-      await hydrateCredentials({});
+    test(
+      'returns false and copies nothing when there is no legacy token',
+      () async {
+        await hydrateCredentials({});
 
-      expect(copyLegacyTokenTo('web-my-mac-7777'), isFalse);
+        expect(copyLegacyTokenTo('web-my-mac-7777'), isFalse);
 
-      expect(retrieveTokenFor('web-my-mac-7777'), isNull);
-    });
+        expect(retrieveTokenFor('web-my-mac-7777'), isNull);
+      },
+    );
   });
 
   group('tokens are per server', () {
@@ -211,6 +213,222 @@ void main() {
       clearTokenFor('server-a');
       expect(retrieveTokenFor('server-a'), isNull);
       expect(retrieveTokenFor('server-b'), 'token-b');
+    });
+  });
+
+  group('reconcileWebOriginSelection', () {
+    // A web-origin entry from an earlier origin (e.g. loopback:7777 on the
+    // pre-proxy build) that a since-proxied client would otherwise keep dialing.
+    const stale = DaemonServer(
+      id: 'web-127.0.0.1-7777',
+      label: '127.0.0.1',
+      address: 'ws://127.0.0.1:7777/ws',
+    );
+    // The current page origin the client is now served from.
+    const origin = DaemonServer(
+      id: 'web-proxy.example.com-443',
+      label: 'proxy.example.com',
+      address: 'wss://proxy.example.com:443/ws',
+    );
+
+    test('repoints a stale web selection at the current origin, carrying the '
+        'token', () {
+      persistTokenFor(stale.id, 'paired-token');
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        const ServerConfig(servers: [stale], selectedId: 'web-127.0.0.1-7777'),
+        origin,
+      );
+
+      // The selection now names the current origin, and the dead entry is gone
+      // rather than accumulating alongside it.
+      expect(reconciled.selectedId, origin.id);
+      expect(reconciled.servers.single.id, origin.id);
+      // The token rides across, so an already-paired user is not silently
+      // un-paired by the swap.
+      expect(retrieveTokenFor(origin.id), 'paired-token');
+      // The stale id is reported so the caller can clean its per-server state,
+      // but its old token copy is kept until the caller durably saves the swap.
+      expect(staleServerId, stale.id);
+      expect(retrieveTokenFor(stale.id), 'paired-token');
+    });
+
+    test('trims a whitespace-padded token when carrying it across', () {
+      persistTokenFor(stale.id, '  paired-token  ');
+      final (reconciled, _) = reconcileWebOriginSelection(
+        const ServerConfig(servers: [stale], selectedId: 'web-127.0.0.1-7777'),
+        origin,
+      );
+      expect(reconciled.selectedId, origin.id);
+      expect(retrieveTokenFor(origin.id), 'paired-token');
+    });
+
+    test('is a no-op when the selection already names the current origin', () {
+      const config = ServerConfig(
+        servers: [origin],
+        selectedId: 'web-proxy.example.com-443',
+      );
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        config,
+        origin,
+      );
+      expect(identical(reconciled, config), isTrue);
+      expect(staleServerId, isNull);
+    });
+
+    test('is a no-op when a web selection is not among the known servers', () {
+      // _resolveSelected keeps a persisted selection from dangling, but guard
+      // against a corrupt store all the same: a selected id with no matching
+      // entry must not be repointed (there is nothing to migrate a token from).
+      const other = DaemonServer(
+        id: 'web-proxy.example.com-443',
+        label: 'proxy.example.com',
+        address: 'wss://proxy.example.com:443/ws',
+      );
+      const config = ServerConfig(
+        servers: [other],
+        selectedId: 'web-127.0.0.1-7777',
+      );
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        config,
+        origin,
+      );
+      expect(identical(reconciled, config), isTrue);
+      expect(staleServerId, isNull);
+    });
+
+    test(
+      'leaves a manually added server selected, even for the same daemon',
+      () {
+        // A user-added server owns a stable id it controls; the origin default
+        // must never rewrite it, even when it points at the same daemon.
+        const manual = DaemonServer(
+          id: 'server-abc',
+          label: 'proxy',
+          address: 'wss://proxy.example.com/ws',
+        );
+        persistTokenFor('server-abc', 'manual-token');
+        final (reconciled, staleServerId) = reconcileWebOriginSelection(
+          const ServerConfig(servers: [manual], selectedId: 'server-abc'),
+          origin,
+        );
+
+        expect(reconciled.servers.single.id, 'server-abc');
+        expect(reconciled.selectedId, 'server-abc');
+        // Nothing carried onto the origin id, and nothing to retire.
+        expect(retrieveTokenFor(origin.id), isNull);
+        expect(staleServerId, isNull);
+      },
+    );
+
+    test('drops only the stale entry, preserving other known servers', () {
+      const manual = DaemonServer(
+        id: 'server-abc',
+        label: 'lan',
+        address: 'lan-host:7777',
+      );
+      persistTokenFor(stale.id, 't');
+      final (reconciled, _) = reconcileWebOriginSelection(
+        const ServerConfig(
+          servers: [manual, stale],
+          selectedId: 'web-127.0.0.1-7777',
+        ),
+        origin,
+      );
+
+      final ids = reconciled.servers.map((s) => s.id).toSet();
+      expect(ids, {'server-abc', origin.id});
+      expect(ids.contains(stale.id), isFalse);
+      expect(reconciled.selectedId, origin.id);
+    });
+
+    test('does not duplicate a pre-existing origin entry when repointing', () {
+      // Defensive: were an earlier reconcile to have left a `web-` entry already
+      // using origin.id, repointing the stale selection must not yield two
+      // entries sharing that id.
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        const ServerConfig(
+          servers: [stale, origin],
+          selectedId: 'web-127.0.0.1-7777',
+        ),
+        origin,
+      );
+      expect(reconciled.servers.map((s) => s.id).toList(), [origin.id]);
+      expect(reconciled.selectedId, origin.id);
+      expect(staleServerId, stale.id);
+    });
+
+    test(
+      'repoints even an unpaired stale entry, still reporting the stale id',
+      () {
+        final (reconciled, staleServerId) = reconcileWebOriginSelection(
+          const ServerConfig(
+            servers: [stale],
+            selectedId: 'web-127.0.0.1-7777',
+          ),
+          origin,
+        );
+        // The wrong origin is corrected regardless of pairing state, and the
+        // stale id is still reported so its (empty) per-server state is cleaned...
+        expect(reconciled.selectedId, origin.id);
+        expect(staleServerId, stale.id);
+        // ...but nothing was carried, since there was no token.
+        expect(retrieveTokenFor(origin.id), isNull);
+      },
+    );
+
+    test('is a no-op when nothing is selected', () {
+      const config = ServerConfig(servers: [], selectedId: null);
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        config,
+        origin,
+      );
+      expect(identical(reconciled, config), isTrue);
+      expect(staleServerId, isNull);
+    });
+  });
+
+  group('migrateSessionOrder', () {
+    test(
+      'moves the rail order onto the new id and deletes the old key',
+      () async {
+        SharedPreferences.setMockInitialValues({
+          sessionOrderPrefKeyFor('web-127.0.0.1-7777'): ['c', 'a', 'b'],
+        });
+
+        await migrateSessionOrder(
+          'web-127.0.0.1-7777',
+          'web-proxy.example.com-443',
+        );
+
+        final prefs = await SharedPreferences.getInstance();
+        expect(
+          prefs.getStringList(
+            sessionOrderPrefKeyFor('web-proxy.example.com-443'),
+          ),
+          ['c', 'a', 'b'],
+        );
+        // The stale key does not linger once its order has moved.
+        expect(
+          prefs.getStringList(sessionOrderPrefKeyFor('web-127.0.0.1-7777')),
+          isNull,
+        );
+      },
+    );
+
+    test('does nothing when the source has no saved order', () async {
+      await migrateSessionOrder('web-a-1', 'web-b-2');
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getStringList(sessionOrderPrefKeyFor('web-b-2')), isNull);
+    });
+
+    test('is a no-op when the ids are the same', () async {
+      SharedPreferences.setMockInitialValues({
+        sessionOrderPrefKeyFor('web-a-1'): ['x'],
+      });
+      await migrateSessionOrder('web-a-1', 'web-a-1');
+      final prefs = await SharedPreferences.getInstance();
+      // Order preserved, not deleted by a self-move.
+      expect(prefs.getStringList(sessionOrderPrefKeyFor('web-a-1')), ['x']);
     });
   });
 }

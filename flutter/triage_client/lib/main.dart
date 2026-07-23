@@ -906,6 +906,39 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       s.applyHistory(_seedBytesFromRows(s.rows));
     }
     final isMockMode = Uri.base.queryParameters['mock'] == 'true';
+    if (!isMockMode && widget.client == null && kIsWeb) {
+      // A server entry adopted from an earlier page origin (before this client
+      // moved behind a reverse proxy, say) is still selected and would
+      // short-circuit the checks below, dialing the dead origin forever. Repoint
+      // it at the current origin — carrying its token — so the same-origin
+      // default reaches already-loaded users, not just clean installs.
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        ServerConfig(servers: _servers, selectedId: _selectedServerId),
+        webOriginServer(_defaultWebSocketUri()),
+      );
+      if (staleServerId != null) {
+        final originId = reconciled.selectedId!;
+        _servers = reconciled.servers;
+        _selectedServerId = originId;
+        unawaited(
+          saveServers(_servers, selectedId: originId).then((saved) {
+            // Retire the stale entry's per-server state only once the swap is
+            // durably stored; a failed save leaves it for the next launch to
+            // re-reconcile. The rail order follows the daemon (best-effort), then
+            // is re-restored so this session keeps it, exactly as the web-origin
+            // adoption path below does.
+            if (!saved) return;
+            clearTokenFor(staleServerId);
+            unawaited(
+              migrateSessionOrder(
+                staleServerId,
+                originId,
+              ).then((_) => _restoreSessionOrder()),
+            );
+          }),
+        );
+      }
+    }
     if (isMockMode) {
       _connectionStatus = 'Offline (Local Mock)';
       _connectionStatusColor = const Color(0xff7f8b8d);
