@@ -72,6 +72,227 @@ void main() {
     });
   });
 
+  group('railTitle inferred worktree', () {
+    // A root/`main` session that drives a worktree with `git -C worktrees/x` is
+    // seen on the worktree only for the instant the command runs, then reverts.
+    // These simulate that: observe the worktree (transient), observe root again
+    // (the revert), then assert the rail keeps leading with the worktree.
+    final t0 = DateTime(2026, 7, 22, 12, 0);
+
+    SessionVm rootSession() => _session(
+      branch: 'main',
+      repoRoot: '/dev/triage',
+      worktreeRoot: '/dev/triage',
+    );
+
+    void observeWorktree(
+      SessionVm s, {
+      String branch = 'feat/x',
+      String worktree = '/dev/triage/worktrees/x',
+      required DateTime now,
+    }) {
+      s.applyContext(
+        repoRoot: '/dev/triage',
+        worktreeRoot: worktree,
+        branch: branch,
+        now: now,
+      );
+    }
+
+    void observeRoot(SessionVm s, {required DateTime now}) {
+      s.applyContext(
+        repoRoot: '/dev/triage',
+        worktreeRoot: '/dev/triage',
+        branch: 'main',
+        now: now,
+      );
+    }
+
+    test('a root/main row leads with the worktree it was seen driving', () {
+      final s = rootSession();
+      expect(s.railTitleAt(t0), 'main');
+      observeWorktree(s, now: t0);
+      observeRoot(s, now: t0); // the command finished; back at the root.
+      expect(s.railTitleAt(t0), 'feat/x');
+    });
+
+    test('the inferred worktree expires back to main after the TTL', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      observeRoot(s, now: t0);
+      expect(
+        s.railTitleAt(
+          t0.add(SessionVm.stickyWorktreeTtl - const Duration(minutes: 1)),
+        ),
+        'feat/x',
+      );
+      expect(s.railTitleAt(t0.add(SessionVm.stickyWorktreeTtl)), 'main');
+    });
+
+    test('a fresh observation refreshes the expiry', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      observeRoot(s, now: t0);
+      // Re-run `git -C worktrees/x` 20 minutes later.
+      final t1 = t0.add(const Duration(minutes: 20));
+      observeWorktree(s, now: t1);
+      observeRoot(s, now: t1);
+      // 45 min past the first sighting, but only 25 past the refresh — still shown.
+      expect(s.railTitleAt(t0.add(const Duration(minutes: 45))), 'feat/x');
+    });
+
+    test('a live feature branch is never overridden by the inference', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      // The primary checkout itself is now on a feature branch (no worktree).
+      s.applyContext(
+        repoRoot: '/dev/triage',
+        worktreeRoot: '/dev/triage',
+        branch: 'feat/live',
+        now: t0,
+      );
+      expect(s.railTitleAt(t0), 'feat/live');
+    });
+
+    test('a distinct current worktree still wins over the inference', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      // Now genuinely cd'd into a different worktree.
+      s.applyContext(
+        repoRoot: '/dev/triage',
+        worktreeRoot: '/dev/triage/worktrees/y',
+        branch: 'feat/y',
+        now: t0,
+      );
+      expect(s.railTitleAt(t0), 'feat/y');
+    });
+
+    test('a later worktree replaces the earlier inference', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      observeRoot(s, now: t0);
+      final t1 = t0.add(const Duration(minutes: 5));
+      observeWorktree(
+        s,
+        branch: 'feat/z',
+        worktree: '/dev/triage/worktrees/z',
+        now: t1,
+      );
+      observeRoot(s, now: t1);
+      expect(s.railTitleAt(t1), 'feat/z');
+    });
+
+    test('a row that never touched a worktree stays on main', () {
+      final s = rootSession();
+      observeRoot(s, now: t0);
+      expect(s.railTitleAt(t0), 'main');
+    });
+
+    test('leaving the repo shows the cwd, not the old worktree', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      // cd'd out of the repo entirely — no git context, just a directory.
+      s.applyContext(
+        repoRoot: null,
+        worktreeRoot: null,
+        branch: null,
+        cwd: '/tmp/scratch',
+        now: t0,
+      );
+      expect(s.railTitleAt(t0), 'scratch');
+    });
+
+    test('a different repo does not inherit this repo\'s worktree', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      // Now sitting at the root of an entirely different repo. It shows that
+      // repo's own `main`, never this repo's `feat/x`.
+      s.applyContext(
+        repoRoot: '/dev/other',
+        worktreeRoot: '/dev/other',
+        branch: 'main',
+        now: t0,
+      );
+      expect(s.railTitleAt(t0), 'main');
+      expect(s.railTitleAt(t0), isNot('feat/x'));
+    });
+
+    test('an inferred worktree on a default branch leads with its leaf', () {
+      final s = rootSession();
+      observeWorktree(
+        s,
+        branch: 'master',
+        worktree: '/dev/triage/worktrees/hotfix',
+        now: t0,
+      );
+      observeRoot(s, now: t0);
+      // `master` says no more than the repo, so the worktree leaf is clearer.
+      expect(s.railTitleAt(t0), 'hotfix');
+    });
+
+    test('the glance title follows the inferred worktree, repo-first', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      observeRoot(s, now: t0);
+      // Card heading and screen-reader label track the visible line.
+      expect(s.railTitleAt(t0), 'feat/x');
+      expect(s.glanceTitleAt(t0), 'triage · feat/x');
+    });
+
+    test('the glance title is the live display name when not inferring', () {
+      final s = rootSession();
+      observeRoot(s, now: t0);
+      // No inference: the card keeps the plain repo-first display name.
+      expect(s.glanceTitleAt(t0), s.displayTitle);
+      expect(s.glanceTitleAt(t0), 'triage · main');
+    });
+
+    test('the glance title reverts with the title after the TTL', () {
+      final s = rootSession();
+      observeWorktree(s, now: t0);
+      observeRoot(s, now: t0);
+      final expired = t0.add(SessionVm.stickyWorktreeTtl);
+      expect(s.railTitleAt(expired), 'main');
+      expect(s.glanceTitleAt(expired), 'triage · main');
+    });
+
+    test(
+      'the inferred lead uses the worktree leaf when its branch is empty',
+      () {
+        final s = rootSession();
+        observeWorktree(
+          s,
+          branch: '   ',
+          worktree: '/dev/triage/worktrees/detached-x',
+          now: t0,
+        );
+        observeRoot(s, now: t0);
+        expect(s.railTitleAt(t0), 'detached-x');
+      },
+    );
+
+    test(
+      'an attach straight into a worktree is remembered across a revert',
+      () {
+        // The constructor seeds the inference, so a reconnect that opens on the
+        // worktree survives the session dropping back to the root.
+        final s = _session(
+          branch: 'feat/x',
+          repoRoot: '/dev/triage',
+          worktreeRoot: '/dev/triage/worktrees/x',
+        );
+        final now = DateTime.now();
+        s.applyContext(
+          repoRoot: '/dev/triage',
+          worktreeRoot: '/dev/triage',
+          branch: 'main',
+          now: now,
+        );
+        expect(s.railTitleAt(now), 'feat/x');
+      },
+    );
+  });
+
   group('worktreeEchoesBranch', () {
     test('matches the branch flattened whole', () {
       expect(worktreeEchoesBranch('feat-rail-row', 'feat/rail-row'), isTrue);
