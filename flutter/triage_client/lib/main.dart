@@ -325,6 +325,9 @@ class SessionVm {
       terminal.resize(cols, rows);
     });
     store = TerminalStore(TerminalControllerSink(terminalController));
+    // Seed the inferred worktree from the constructor's own context so an attach
+    // straight into a worktree is remembered from the first frame.
+    _recordInferredWorktree();
   }
 
   final String title;
@@ -335,6 +338,18 @@ class SessionVm {
   // Absolute git repository root and worktree root for this session.
   String? repoRoot;
   String? worktreeRoot;
+  // The last distinct linked worktree this session was seen driving, kept so the
+  // rail can lead a root/`main` row with it (see [railTitleAt]). A `git -C
+  // worktrees/x …` run from the primary checkout chdirs git into the worktree,
+  // so the daemon reports that worktree only for the instant the command runs;
+  // this remembers it across the gaps. `_inferredRepoRoot` pins it to the repo
+  // it belonged to, so a session that moves to a *different* repo does not
+  // inherit this one's workstream. `_inferredWorktreeAt` stamps the last
+  // observation for the [stickyWorktreeTtl] expiry.
+  String? _inferredRepoRoot;
+  String? _inferredWorktreeRoot;
+  String? _inferredBranch;
+  DateTime? _inferredWorktreeAt;
   // Absolute current working directory, shown in the rail in place of the git
   // line when the session isn't inside a repo. Mutable so live context pushes
   // can update it without recreating the view-model.
@@ -357,6 +372,47 @@ class SessionVm {
   // `bytes_logged`, no timestamp), so a freshly connected row stays null until
   // it next moves, and the rail renders nothing rather than inventing a time.
   DateTime? snippetUpdatedAt;
+
+  /// Apply a freshly observed git context, updating the live fields and, when the
+  /// context names a distinct linked worktree, refreshing the inferred-worktree
+  /// memory the rail falls back to for a root/`main` row. The funnel for the two
+  /// *live* context sources — the connect-time seed and `session_context_updated`
+  /// pushes — so both feed the inference; the attach snapshot instead seeds it
+  /// straight from the constructor.
+  ///
+  /// The seed carries no cwd, so it passes `updateCwd: false` to avoid clobbering
+  /// a cwd a live push already set. `now` overrides the observation stamp for
+  /// tests.
+  void applyContext({
+    required String? repoRoot,
+    required String? worktreeRoot,
+    required String? branch,
+    String? cwd,
+    bool updateCwd = true,
+    DateTime? now,
+  }) {
+    this.repoRoot = repoRoot;
+    this.worktreeRoot = worktreeRoot;
+    this.branch = branch;
+    if (updateCwd) this.cwd = cwd;
+    _recordInferredWorktree(now: now);
+  }
+
+  /// Remember the current context as the session's inferred workstream when it
+  /// names a distinct linked worktree — the same distinctness test the rail uses
+  /// via [worktreeName]. A context with no distinct worktree — a root/`main`
+  /// observation — leaves the memory untouched rather than clearing it, which is
+  /// what lets the label survive the quiet gaps between `git -C worktrees/x`
+  /// commands. The repo is pinned too, so [railTitleAt] can refuse to lend this
+  /// workstream to a different repo's checkout.
+  void _recordInferredWorktree({DateTime? now}) {
+    if (worktreeName == null) return;
+    _inferredRepoRoot = repoRoot;
+    _inferredWorktreeRoot = worktreeRoot;
+    final trimmed = branch?.trim();
+    _inferredBranch = (trimmed != null && trimmed.isNotEmpty) ? trimmed : null;
+    _inferredWorktreeAt = now ?? DateTime.now();
+  }
 
   /// Last path segment of [repoRoot], for compact display (e.g. "triage").
   String? get repoName => _leafOf(repoRoot);
@@ -401,6 +457,18 @@ class SessionVm {
     return title;
   }
 
+  /// How long the rail keeps leading a root/`main` row with the last worktree it
+  /// was seen driving before reverting to the repo. Sessions drive a worktree
+  /// from the primary checkout with `git -C worktrees/x …`, which the daemon only
+  /// observes for the instant the command runs (see [railTitleAt]); this window
+  /// makes that transient observation stick across the quiet gaps between
+  /// commands, and expires it once the session genuinely stops touching the
+  /// worktree. Long because these are long-lived agent sessions that revisit a
+  /// worktree every few minutes while active. Not self-enforcing: the revert
+  /// surfaces on the next rail rebuild (any output, selection, or activity tick),
+  /// not via a dedicated timer.
+  static const Duration stickyWorktreeTtl = Duration(minutes: 30);
+
   /// Rail-specific title, leading with the *workstream* rather than the repo.
   ///
   /// The rail's job is telling sibling sessions apart, and siblings share the
@@ -411,7 +479,21 @@ class SessionVm {
   /// [displayTitle] keeps its repo-first form for the workspace header, where
   /// there is no sibling to disambiguate against and naming the repo is the
   /// point.
-  String get railTitle {
+  String get railTitle => railTitleAt(DateTime.now());
+
+  /// [railTitle] resolved against an explicit clock, so the [stickyWorktreeTtl]
+  /// expiry of the inferred worktree is testable.
+  ///
+  /// A row whose *live* context already names a workstream — a distinct current
+  /// worktree, or any branch that isn't the default — uses it directly. Only a
+  /// row that is inside a repo but reads as its root (no distinct worktree, and
+  /// no branch or just `main`) would otherwise show the same uninformative word
+  /// as every other root session, so it defers to the last worktree this session
+  /// was seen driving in *this same repo*. The inference never overrides ground
+  /// truth, and reverts once it goes stale.
+  String railTitleAt(DateTime now) {
+    final inferred = _activeInferredLead(now);
+    if (inferred != null) return inferred;
     final b = branch?.trim();
     if (b != null && b.isNotEmpty) return b;
     // No branch: a detached HEAD, or a host too old to report one. The worktree
@@ -420,6 +502,67 @@ class SessionVm {
     // fallbacks (repo, else cwd leaf, else the stable title) are already right
     // and are not worth restating.
     return worktreeName ?? displayTitle;
+  }
+
+  /// Repo-first name for the hover card and screen-reader label, following the
+  /// same lead the rail shows: when an inferred worktree is leading the row it
+  /// reads "repo · <worktree>", so the visible line, the card heading, and the
+  /// screen reader never disagree and two inferred rows stay distinguishable to
+  /// assistive tech. Otherwise it is the plain [displayTitle]. The workspace
+  /// header keeps its own [displayTitle] — only the rail's card/label follow the
+  /// inference.
+  String glanceTitleAt(DateTime now) {
+    final inferred = _activeInferredLead(now);
+    if (inferred != null) {
+      final repo = repoName;
+      // Match the rail line even in the degenerate case where the repo has no
+      // displayable leaf, so the two never disagree within a frame.
+      return repo != null ? '$repo · $inferred' : inferred;
+    }
+    return displayTitle;
+  }
+
+  /// The inferred worktree currently leading the row, or null when the live
+  /// context names its own workstream — a distinct current worktree or a branch
+  /// that isn't the default — so the inference stays out of the way, or when
+  /// nothing fresh and in-repo applies. Shared by [railTitleAt] and
+  /// [glanceTitleAt] so a row's title, card, and label move together.
+  String? _activeInferredLead(DateTime now) {
+    final b = branch?.trim();
+    final liveIsUninformative =
+        worktreeName == null &&
+        repoRoot != null &&
+        (b == null || b.isEmpty || _isDefaultBranch(b));
+    if (!liveIsUninformative) return null;
+    return _freshInferredWorktreeLabel(now);
+  }
+
+  /// The default branch of a primary checkout, which the user treats as
+  /// synonymous with "the repo root" — leading a rail row with it says nothing
+  /// the repo line doesn't. Matched by name because the client has no cheap way
+  /// to ask git which branch is default.
+  static bool _isDefaultBranch(String branch) {
+    final b = branch.trim().toLowerCase();
+    return b == 'main' || b == 'master';
+  }
+
+  /// The inferred-worktree lead — its branch (unless that is itself a default
+  /// name, which says no more than the repo), else its directory leaf — but only
+  /// while it is both fresh and still relevant. Null once [stickyWorktreeTtl] has
+  /// elapsed with no new observation, or once the session has moved to a
+  /// different repo than the worktree belonged to, so the row reverts to its live
+  /// identity instead of advertising a stale or foreign workstream.
+  String? _freshInferredWorktreeLabel(DateTime now) {
+    final at = _inferredWorktreeAt;
+    final root = _inferredWorktreeRoot;
+    if (at == null || root == null) return null;
+    if (_inferredRepoRoot != repoRoot) return null;
+    if (now.difference(at) >= stickyWorktreeTtl) return null;
+    final inferredBranch = _inferredBranch;
+    if (inferredBranch != null && !_isDefaultBranch(inferredBranch)) {
+      return inferredBranch;
+    }
+    return _leafOf(root);
   }
 
   final IconData icon;
@@ -1811,9 +1954,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           final sid = session.remoteSessionId;
           final entry = sid == null ? null : contexts[sid];
           if (entry != null) {
-            session.repoRoot = entry.repositoryRoot;
-            session.worktreeRoot = entry.worktreeRoot;
-            session.branch = entry.branch;
+            // The bulk response carries no cwd, so leave the live cwd alone.
+            session.applyContext(
+              repoRoot: entry.repositoryRoot,
+              worktreeRoot: entry.worktreeRoot,
+              branch: entry.branch,
+              updateCwd: false,
+            );
           }
         }
       });
@@ -2182,11 +2329,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Each push carries the full current context, so a null field genuinely
       // means "absent" (e.g. cd'd out of a repo) — assign directly, don't merge.
       void apply() {
-        final session = _sessions[index];
-        session.cwd = message['current_working_directory']?.toString();
-        session.repoRoot = message['repository_root']?.toString();
-        session.worktreeRoot = message['worktree_root']?.toString();
-        session.branch = message['branch']?.toString();
+        _sessions[index].applyContext(
+          repoRoot: message['repository_root']?.toString(),
+          worktreeRoot: message['worktree_root']?.toString(),
+          branch: message['branch']?.toString(),
+          cwd: message['current_working_directory']?.toString(),
+        );
       }
 
       if (mounted) {
@@ -3339,8 +3487,11 @@ class SessionRail extends StatelessWidget {
 
   Widget _buildExpandedRail() {
     // Once per build, not once per row: the item builder runs lazily and this
-    // is a whole-list property.
-    final indistinguishable = indistinguishableRailRows(sessions);
+    // is a whole-list property. One clock for the whole frame, captured for the
+    // lazy item builder below so grouping and titles resolve the inferred-worktree
+    // window at the same instant.
+    final now = DateTime.now();
+    final indistinguishable = indistinguishableRailRows(sessions, now);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -3432,10 +3583,11 @@ class SessionRail extends StatelessWidget {
               final tile = SessionListTile(
                 key: index == selectedIndex ? selectedTileKey : null,
                 selected: index == selectedIndex,
-                title: session.railTitle,
-                // The header's repo-first name, kept for the hover card, which
-                // states the session in full rather than disambiguating it.
-                glanceTitle: session.displayTitle,
+                title: session.railTitleAt(now),
+                // The repo-first name for the hover card and screen-reader label,
+                // following the same lead the title shows (an inferred worktree
+                // included) so the row reads consistently everywhere.
+                glanceTitle: session.glanceTitleAt(now),
                 subtitle: session.status,
                 statusColor: session.statusColor,
                 icon: session.icon,
@@ -4447,11 +4599,15 @@ bool worktreeEchoesBranch(String worktree, String? branch) {
 const String _railGroupSeparator = '\u0000';
 
 @visibleForTesting
-Set<int> indistinguishableRailRows(List<SessionVm> sessions) {
+Set<int> indistinguishableRailRows(List<SessionVm> sessions, [DateTime? now]) {
+  // One clock for the whole pass, and the same one the tiles render against, so
+  // the grouping key can never sample the inferred-worktree TTL at a different
+  // instant than the rendered [SessionVm.railTitleAt] title it is grouping on.
+  final at = now ?? DateTime.now();
   final groups = <String, List<int>>{};
   for (var i = 0; i < sessions.length; i++) {
     final key =
-        '${sessions[i].railTitle}$_railGroupSeparator${sessions[i].repoName ?? ''}';
+        '${sessions[i].railTitleAt(at)}$_railGroupSeparator${sessions[i].repoName ?? ''}';
     groups.putIfAbsent(key, () => <int>[]).add(i);
   }
   return {
