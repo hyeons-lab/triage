@@ -126,6 +126,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   // flushes the session's staged history) using the last fitted size.
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
+  // Bumped on every explicit refit so a superseded refit's delayed retries stop
+  // firing. `_lastRefit*` dedupes host resize-outs across a single refit's
+  // retries so a settled refit jiggles the host once, not once per tick.
+  int _refitGeneration = 0;
+  int? _lastRefitCols;
+  int? _lastRefitRows;
 
   @override
   void initState() {
@@ -533,13 +539,77 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.addClearListener(_onClear);
     widget.controller.addResizeListener(_onResize);
     widget.controller.addFitListener(_onFit);
+    widget.controller.addRefitListener(_onRefit);
   }
 
-  void _unbindController() {
-    widget.controller.removeWriteListener(_onWrite);
-    widget.controller.removeClearListener(_onClear);
-    widget.controller.removeResizeListener(_onResize);
-    widget.controller.removeFitListener(_onFit);
+  void _unbindController() => _unbindControllerFrom(widget.controller);
+
+  // Removes every listener `_bindController` adds, from an explicit controller —
+  // the controller swap in `didUpdateWidget` must detach from the *old* one, and
+  // routing both through here keeps the add/remove sets from drifting (a missed
+  // `removeRefitListener` on swap would leave an orphaned controller able to
+  // force-send a resize-out for this pane).
+  void _unbindControllerFrom(TerminalController controller) {
+    controller.removeWriteListener(_onWrite);
+    controller.removeClearListener(_onClear);
+    controller.removeResizeListener(_onResize);
+    controller.removeFitListener(_onFit);
+    controller.removeRefitListener(_onRefit);
+  }
+
+  // The explicit refit — the header button and resume-from-occlusion — as
+  // opposed to `_onFit`, which the ResizeObserver fires on an actual element
+  // resize.
+  //
+  // Two things go wrong without it, both because `main.dart` can only see the
+  // Dart-side shadow terminal, never this xterm.js grid:
+  //
+  //  - On resume, a fit that ran while the tab was transitioning can leave the
+  //    grid too narrow. `FitAddon.fit()` recomputes it from the real pixels.
+  //  - The host may sit at another size — its own stale value, or a second
+  //    device's width on a shared PTY. A plain fit only tells the host when the
+  //    grid *changed*, so it would not correct a wrong host under a right grid.
+  //
+  // So: fit, then force our fitted size onto the host by jiggling one row
+  // shorter and back. The jiggle guarantees a SIGWINCH even when the size is
+  // unchanged, and the program repaints over the live stream at our width.
+  //
+  // Retried on a delay ladder, because resume fires before the tab's layout has
+  // settled: while the element is still 0-width, `_onFit`'s `width>0` guard
+  // skips the fit and an immediate send would ship the stale size. The retries
+  // land the correct size once layout settles, mirroring the init fit ladder.
+  void _onRefit() {
+    if (!_initialized) return;
+    final generation = ++_refitGeneration;
+    _refitAndSend(force: true);
+    for (final ms in const [50, 200, 600, 1500]) {
+      Future.delayed(Duration(milliseconds: ms), () {
+        if (mounted && _initialized && generation == _refitGeneration) {
+          _refitAndSend(force: false);
+        }
+      });
+    }
+  }
+
+  // One fit-and-force-send pass. `force` sends even when the fitted size is
+  // unchanged — needed on the first pass so a device-reclaim (right grid, wrong
+  // host) still corrects; the delayed retries pass `false`, so a settled refit
+  // does not jiggle the host on every tick, only when a tick actually changes
+  // the fitted size.
+  void _refitAndSend({required bool force}) {
+    // Not during the first-fit handshake: that path owns the initial size and
+    // its own host sync, and a force-send here would bypass its history-flush
+    // gate. Refit/resume happen well after load, so this only guards the edge.
+    if (!_initialContentWritten) return;
+    _onFit();
+    final cols = (js_util.getProperty(_term, 'cols') as num).toInt();
+    final rows = (js_util.getProperty(_term, 'rows') as num).toInt();
+    if (cols < 2 || rows < 2) return;
+    if (!force && cols == _lastRefitCols && rows == _lastRefitRows) return;
+    _lastRefitCols = cols;
+    _lastRefitRows = rows;
+    _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows - 1);
+    _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
   }
 
   void _bindContainerEvents() {
@@ -850,10 +920,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _focusCursorNowAndAfterReplay();
     }
     if (oldWidget.controller != widget.controller) {
-      oldWidget.controller.removeWriteListener(_onWrite);
-      oldWidget.controller.removeClearListener(_onClear);
-      oldWidget.controller.removeResizeListener(_onResize);
-      oldWidget.controller.removeFitListener(_onFit);
+      _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
       _inputRouteToken = _sessionInputRouter.bind(
         _sanitizedId,

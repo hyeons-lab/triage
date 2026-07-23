@@ -1053,17 +1053,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  // Re-assert this device's terminal size on the shared PTY and force a repaint.
-  // Called on resume-from-occlusion and from the header "refit" button, so a user
-  // switching between devices (each with its own width) can reclaim the PTY for
-  // the device they are now on. Mimics a manual resize: jiggle the host PTY size
-  // (one row shorter, then back to our real size) so the program receives
-  // SIGWINCH and repaints over the live stream at our current width. We
-  // deliberately do NOT replay history — re-emulating the raw-output tail
-  // re-introduces the width-mismatched/truncated frame, which is what makes it
-  // render correctly and then switch to incorrect. A same-size resize sends no
-  // SIGWINCH, so the jiggle guarantees a repaint even when the host already
-  // believes it is at our size.
+  // Re-fit this device's terminal to its real size and re-assert it on the
+  // shared PTY, forcing a repaint. Called on resume-from-occlusion and from the
+  // header "refit" button, so a user switching between devices (each with its
+  // own width) can reclaim the PTY for the device they are now on.
+  //
+  // The re-fit is delegated to the pane via `controller.refit()` because only
+  // the pane knows the true render grid. On web that is the xterm.js FitAddon
+  // size; `session.terminal` is a Dart-side shadow that does not track it, so
+  // reading its `viewWidth` here (as this used to) re-asserted a stale, often
+  // too-narrow width on resume. The web pane re-fits from real pixels and
+  // force-sends the result to the host itself, so we stop here on web.
+  //
+  // On native `TerminalView` auto-fits `session.terminal`, so its `viewWidth`
+  // *is* authoritative; the pane registers no refit listener and this jiggles
+  // the host to it. `lastFittedCols` is deliberately not used — it is polluted
+  // by host-size broadcasts from other devices on a shared PTY. A same-size
+  // resize sends no SIGWINCH, so the jiggle (one row shorter, then back)
+  // guarantees a repaint over the live stream. History is deliberately not
+  // replayed: re-emulating the raw-output tail re-introduces the
+  // width-mismatched frame.
   void _refitActiveSession() {
     // `_client` is `late` and only assigned by _connectWebSocket; in mock mode it
     // is never set, so guard on _clientInitialized before touching it.
@@ -1074,11 +1083,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!session.isRemote || session.status != 'attached') return;
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
-    // Target the xterm's ACTUAL grid size — the one true width the client renders
-    // at. lastFittedCols can be polluted by host-size broadcasts from other
-    // controllers, so jiggling to it repaints the program at the wrong width and
-    // the frame stays fragmented. Matching the host to terminal.viewWidth makes
-    // the program repaint at exactly our render width.
+
+    // The pane owns the re-fit. On web this is the whole operation; running the
+    // native jiggle below afterward would nudge the host straight back to the
+    // stale shadow width.
+    session.terminalController.refit();
+    if (kIsWeb) return;
+
     final cols = session.terminal.viewWidth;
     final rows = session.terminal.viewHeight;
     if (cols < 2 || rows < 2) return;
