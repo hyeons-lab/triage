@@ -7,6 +7,7 @@ class TerminalController {
   final List<void Function()> _clearListeners = [];
   final List<void Function(int, int)> _resizeListeners = [];
   final List<void Function()> _fitListeners = [];
+  final List<void Function()> _refitListeners = [];
   final List<void Function(String)> _inputListeners = [];
   final List<void Function(int, int)> _resizeOutListeners = [];
 
@@ -38,6 +39,16 @@ class TerminalController {
   void addFitListener(void Function() listener) => _fitListeners.add(listener);
   void removeFitListener(void Function() listener) =>
       _fitListeners.remove(listener);
+
+  // `fit` is what the view's own resize observer fires — recompute the grid from
+  // the current pixels. `refit` is the explicit user/resume request, which must
+  // do that *and* re-assert the fitted size on the host even when the grid did
+  // not change (so a stale-narrow grid on tab resume is corrected and a
+  // shared-PTY device-reclaim takes effect). The view implements the difference.
+  void addRefitListener(void Function() listener) =>
+      _refitListeners.add(listener);
+  void removeRefitListener(void Function() listener) =>
+      _refitListeners.remove(listener);
 
   void addInputListener(void Function(String) listener) =>
       _inputListeners.add(listener);
@@ -77,6 +88,12 @@ class TerminalController {
     }
   }
 
+  void refit() {
+    for (final listener in List.from(_refitListeners)) {
+      listener();
+    }
+  }
+
   void sendInput(String data) {
     for (final listener in List.from(_inputListeners)) {
       listener(data);
@@ -94,6 +111,7 @@ class TerminalController {
     _clearListeners.clear();
     _resizeListeners.clear();
     _fitListeners.clear();
+    _refitListeners.clear();
     _inputListeners.clear();
     _resizeOutListeners.clear();
     _writeBuffer.clear();
