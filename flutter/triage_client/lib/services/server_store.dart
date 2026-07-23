@@ -156,6 +156,80 @@ bool copyLegacyTokenTo(String serverId) {
   return true;
 }
 
+/// Repoints a stale web-origin selection at the current page [origin], carrying
+/// its token across.
+///
+/// The web client derives its daemon from the page origin, persisting a
+/// `web-<host>-<port>` entry (`webOriginServer`) that is selected on first load.
+/// If the origin later changes — most often a client moving behind a TLS reverse
+/// proxy on a new port (the case #107 addressed) — that entry still names the
+/// old origin and, because it is selected, short-circuits server selection so
+/// the client keeps dialing the dead address; the same-origin default is never
+/// re-consulted. This migrates the selected `web-` entry onto [origin]'s id.
+///
+/// Returns the reconciled config plus the *stale* id whose per-server state (its
+/// token and rail order) the caller must clean up once the config is durably
+/// saved — null when nothing was reconciled. The token is copied onto [origin]'s
+/// id here synchronously so the caller can connect this frame, but — exactly as
+/// the legacy migration does — the stale copy is retired only after the swap
+/// persists, so a failed save leaves it for the next launch to retry rather than
+/// orphaning the credential.
+///
+/// A no-op unless the selection is a `web-`-prefixed entry that differs from
+/// [origin]. Manually added servers (a stable, user-owned id) and an already
+/// current origin are left untouched; the stale entry is dropped rather than
+/// kept, so origins do not accumulate one dead entry each.
+(ServerConfig, String?) reconcileWebOriginSelection(
+  ServerConfig config,
+  DaemonServer origin,
+) {
+  final selectedId = config.selectedId;
+  if (selectedId == null ||
+      !selectedId.startsWith('web-') ||
+      selectedId == origin.id ||
+      !config.servers.any((s) => s.id == selectedId)) {
+    return (config, null);
+  }
+
+  // Carry the token onto the new id now so the caller connects this frame
+  // without a re-pair; the caller clears the stale copy only after the swap
+  // persists. Trimmed to match copyLegacyTokenTo — a whitespace-only value is
+  // no credential. Never overwrite an existing origin credential: if the origin
+  // is already paired (e.g. a prior sync), that token is the live one for this
+  // frame, so the stale entry's copy would only downgrade it.
+  final existing = retrieveTokenFor(origin.id)?.trim();
+  if (existing == null || existing.isEmpty) {
+    final token = retrieveTokenFor(selectedId)?.trim();
+    if (token != null && token.isNotEmpty) persistTokenFor(origin.id, token);
+  }
+
+  // Drop the stale entry and any pre-existing origin entry before appending the
+  // fresh one, so the list can never end up with two entries sharing origin.id
+  // even if an earlier reconcile left one behind.
+  final servers = <DaemonServer>[
+    for (final server in config.servers)
+      if (server.id != selectedId && server.id != origin.id) server,
+    origin,
+  ];
+  return (ServerConfig(servers: servers, selectedId: origin.id), selectedId);
+}
+
+/// Moves one server's saved rail order from [fromId] onto [toId], deleting the
+/// old key. Used when [reconcileWebOriginSelection] repoints a web-origin entry
+/// so the user's session order follows the daemon rather than resetting, and the
+/// stale key does not linger. Best-effort: ordering is a convenience, unlike the
+/// token, so a failure just leaves the order to rebuild.
+Future<void> migrateSessionOrder(String fromId, String toId) async {
+  if (fromId == toId) return;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final order = prefs.getStringList(sessionOrderPrefKeyFor(fromId));
+    if (order == null) return;
+    await prefs.setStringList(sessionOrderPrefKeyFor(toId), order);
+    await prefs.remove(sessionOrderPrefKeyFor(fromId));
+  } catch (_) {}
+}
+
 /// Moves the pre-multi-server unkeyed rail order onto [serverId]. Best-effort:
 /// ordering is a convenience, unlike the token.
 Future<void> adoptLegacySessionOrder(String serverId) async {
