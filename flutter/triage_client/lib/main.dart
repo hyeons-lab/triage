@@ -712,6 +712,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   bool _pairingChallengeLoading = false;
   String? _pairingDeviceCode;
   Uri? _pairingVerificationUri;
+  // The `127.0.0.1:<port>/pair` URL to open on the daemon host, shown for a
+  // remote daemon where `_pairingVerificationUri` (the clickable, loopback-only
+  // one) is null.
+  Uri? _pairingDaemonHostUri;
   DateTime? _pairingExpiresAt;
   String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
@@ -1384,6 +1388,44 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     );
   }
 
+  /// The URL to open *on the machine running triaged* to approve pairing, shown
+  /// even for a remote daemon (where [_verificationUriForClient] is null because
+  /// clicking it here would hit this client's own loopback).
+  ///
+  /// Always the fixed loopback literal `127.0.0.1:<port>` — never the daemon's
+  /// claimed host. `/pair` only authorizes a same-host request, so loopback *is*
+  /// the address to use on the daemon box; and echoing the claimed host would
+  /// render an attacker-influenced name (e.g. `127.0.0.1.evil.com`) as a
+  /// pairing URL carrying the device code. The device code is the daemon-issued
+  /// challenge already on screen.
+  ///
+  /// Returns null when the connection carries no explicit port (e.g. a
+  /// `wss://host/ws` reverse proxy on the default 443): the daemon's real
+  /// loopback listen port is unknowable from here, so any port we printed would
+  /// be the proxy's public port, not the daemon's. Callers fall back to generic
+  /// guidance rather than show a URL that won't resolve on the daemon box. Only
+  /// the port the user actually typed to connect is trustworthy enough to render.
+  Uri? _daemonHostPairingUri(
+    TriageWebSocketClient client, {
+    String? deviceCode,
+  }) {
+    final wsUri = client.uri;
+    if (!wsUri.hasPort) {
+      return null;
+    }
+    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
+    final base = Uri(
+      scheme: scheme,
+      host: '127.0.0.1',
+      port: wsUri.port,
+      path: '/pair',
+    );
+    if (deviceCode == null || deviceCode.trim().isEmpty) {
+      return base;
+    }
+    return base.replace(queryParameters: {'device_code': deviceCode});
+  }
+
   bool _isRemoteSession(SessionVm session) {
     return session.isRemote;
   }
@@ -1728,6 +1770,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       _pairingChallengeLoading = true;
       _pairingChallengeError = null;
+      // Drop the prior challenge so a refresh renders the loading spinner
+      // instead of the previous device code and pairing URL — the URL now embeds
+      // the device code, so a stale one would point at a challenge that no
+      // longer exists. The build shows the spinner only while the code is null.
+      _pairingDeviceCode = null;
+      _pairingVerificationUri = null;
+      _pairingDaemonHostUri = null;
+      _pairingExpiresAt = null;
     });
 
     try {
@@ -1741,6 +1791,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       setState(() {
         _pairingDeviceCode = challenge['device_code']?.toString();
         _pairingVerificationUri = _verificationUriForClient(
+          _client,
+          deviceCode: _pairingDeviceCode,
+        );
+        _pairingDaemonHostUri = _daemonHostPairingUri(
           _client,
           deviceCode: _pairingDeviceCode,
         );
@@ -3108,6 +3162,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               child: _PairingView(
                 deviceCode: _pairingDeviceCode,
                 verificationUri: _pairingVerificationUri,
+                daemonHostUri: _pairingDaemonHostUri,
                 expiresAt: _pairingExpiresAt,
                 isChallengeLoading: _pairingChallengeLoading,
                 challengeError: _pairingChallengeError,
@@ -5002,6 +5057,7 @@ class _PairingView extends StatefulWidget {
   const _PairingView({
     required this.deviceCode,
     required this.verificationUri,
+    required this.daemonHostUri,
     required this.expiresAt,
     required this.isChallengeLoading,
     required this.challengeError,
@@ -5011,7 +5067,11 @@ class _PairingView extends StatefulWidget {
   });
 
   final String? deviceCode;
+  // The clickable pairing URL, non-null only when the daemon is on this machine.
   final Uri? verificationUri;
+  // The `127.0.0.1:<port>/pair` URL to open on the daemon host, shown as an
+  // instruction when `verificationUri` is null (a remote daemon).
+  final Uri? daemonHostUri;
   final DateTime? expiresAt;
   final bool isChallengeLoading;
   final String? challengeError;
@@ -5100,6 +5160,7 @@ class _PairingViewState extends State<_PairingView> {
     final deviceCode = widget.deviceCode;
     final verificationUri = widget.verificationUri;
     final hasVerificationUri = verificationUri != null;
+    final daemonHostUri = widget.daemonHostUri;
     final expiryLabel = _expiryLabel(widget.expiresAt);
 
     return Column(
@@ -5124,7 +5185,9 @@ class _PairingViewState extends State<_PairingView> {
         Text(
           hasVerificationUri
               ? 'This browser is not paired with the Triage daemon. Open the verification URL, enter this device code to get a PIN, then enter the PIN below.'
-              : 'This browser is not paired with the Triage daemon. Approve pairing from the computer running triaged, then enter the PIN below.',
+              : daemonHostUri != null
+              ? 'This browser is not paired with the Triage daemon. On the computer running triaged, open the URL below and enter this device code to get a PIN, then enter the PIN below.'
+              : 'This browser is not paired with the Triage daemon. On the computer running triaged, open the daemon pairing page and enter this device code to get a PIN, then enter the PIN below.',
           style: const TextStyle(
             color: Color(0xffa5b1b4),
             fontSize: 14,
@@ -5181,14 +5244,45 @@ class _PairingViewState extends State<_PairingView> {
             ),
           ] else ...[
             const Text(
-              'Local approval required',
+              'Open on the computer running triaged',
               style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
             ),
             const SizedBox(height: 6),
-            const Text(
-              'Use the daemon host pairing page or run triage pair.',
-              style: TextStyle(color: Color(0xffcdd7d6), fontSize: 14),
-            ),
+            if (daemonHostUri != null)
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: SelectableText(
+                      daemonHostUri.toString(),
+                      style: const TextStyle(
+                        color: Color(0xffcdd7d6),
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Tooltip(
+                    message: 'Copy pairing URL',
+                    child: IconButton(
+                      icon: const Icon(
+                        Icons.copy,
+                        size: 18,
+                        color: Color(0xff7f8b8d),
+                      ),
+                      onPressed: () =>
+                          _copyText('Pairing URL', daemonHostUri.toString()),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                    ),
+                  ),
+                ],
+              )
+            else
+              const Text(
+                'Use the daemon host pairing page or run triage pair.',
+                style: TextStyle(color: Color(0xffcdd7d6), fontSize: 14),
+              ),
           ],
           const SizedBox(height: 14),
           Row(
