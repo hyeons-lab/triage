@@ -16,7 +16,7 @@ reaches already-loaded users, not just clean installs.
 
 - 2026-07-22T22:14-0700 `flutter/triage_client/lib/services/server_store.dart` —
   added `reconcileWebOriginSelection(config, origin)`, a pure function returning
-  the reconciled `ServerConfig` plus the stale token id to retire once saved. It
+  the reconciled `ServerConfig` plus the stale server id to retire once saved. It
   repoints a selected `web-`-prefixed entry that differs from the current origin
   onto the origin's id, carries the token across, and drops the stale entry.
   No-op for a manual (non-`web-`) selection, an already-current origin, or no
@@ -68,6 +68,19 @@ carried, flagged by 3 reviewers) drove the `migrateSessionOrder` addition above,
 and the round-2 nitpick (de-dup branch untested) added the pre-existing-origin
 test. Skipped: converting the record return to a named-field type (cosmetic).
 
+## Review Comments
+
+- 2026-07-23T00:10-0700 Copilot (PR #127) flagged a real edge case:
+  `reconcileWebOriginSelection` unconditionally overwrote any token already stored
+  under `origin.id` when carrying the stale entry's token across, so an origin
+  that was already paired (e.g. from a prior sync) could be downgraded to the
+  stale credential. Guarded the carry to skip when the origin already holds a
+  non-empty token, and added a `never clobbers an existing origin credential`
+  test. Also corrected the "stale token id" wording in the devlog and plan to
+  "stale server id" (the second return value is the server id used to clean up
+  both token and rail order), per three doc-nit comments.
+
 ## Commits
 
-- HEAD — fix(triage_client): reconcile a stale web-origin selection with the page origin
+- HEAD — fix(triage_client): preserve an existing origin credential when reconciling
+- ec2098d — fix(triage_client): reconcile a stale web-origin selection with the page origin

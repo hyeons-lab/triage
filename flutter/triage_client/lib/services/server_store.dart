@@ -194,9 +194,14 @@ bool copyLegacyTokenTo(String serverId) {
   // Carry the token onto the new id now so the caller connects this frame
   // without a re-pair; the caller clears the stale copy only after the swap
   // persists. Trimmed to match copyLegacyTokenTo — a whitespace-only value is
-  // no credential.
-  final token = retrieveTokenFor(selectedId)?.trim();
-  if (token != null && token.isNotEmpty) persistTokenFor(origin.id, token);
+  // no credential. Never overwrite an existing origin credential: if the origin
+  // is already paired (e.g. a prior sync), that token is the live one for this
+  // frame, so the stale entry's copy would only downgrade it.
+  final existing = retrieveTokenFor(origin.id)?.trim();
+  if (existing == null || existing.isEmpty) {
+    final token = retrieveTokenFor(selectedId)?.trim();
+    if (token != null && token.isNotEmpty) persistTokenFor(origin.id, token);
+  }
 
   // Drop the stale entry and any pre-existing origin entry before appending the
   // fresh one, so the list can never end up with two entries sharing origin.id

@@ -53,16 +53,16 @@ orphaning the credential.
 the VM). So the decision logic goes in `server_store.dart` as a pure function,
 `reconcileWebOriginSelection(config, origin) -> (ServerConfig, String?)`, unit-tested
 alongside the existing migration. `main.dart` only wires it: apply the returned
-config to `_servers`/`_selectedServerId`, persist, and clear the returned stale
-token id once the save lands. The `String?` second element is the stale token id
-to retire (null when nothing was reconciled or no token was carried).
+config to `_servers`/`_selectedServerId`, persist, and clean up the returned stale
+server's per-server state (token + rail order) once the save lands. The `String?`
+second element is the stale server id to retire (null when nothing was reconciled).
 
 ## Plan
 
 1. `lib/services/server_store.dart` — add `reconcileWebOriginSelection`. No-op
    unless the selection is a `web-` entry present in the list and differing from
    `origin`. Carry the token, drop the stale entry, return the new config plus the
-   stale token id (or null).
+   stale server id (or null).
 2. `lib/main.dart` — in `initState`, before the selection cascade and only when
    `!isMockMode && widget.client == null && kIsWeb`, call it with the current
    `_servers`/`_selectedServerId` and `webOriginServer(_defaultWebSocketUri())`.

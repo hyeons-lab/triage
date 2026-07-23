@@ -262,6 +262,26 @@ void main() {
       expect(retrieveTokenFor(origin.id), 'paired-token');
     });
 
+    test('never clobbers an existing origin credential with the stale token',
+        () {
+      // The origin is already paired (e.g. from a prior sync); that token is the
+      // live one, so a stale entry's copy must not overwrite it.
+      persistTokenFor(stale.id, 'stale-token');
+      persistTokenFor(origin.id, 'origin-token');
+      final (reconciled, staleServerId) = reconcileWebOriginSelection(
+        const ServerConfig(
+          servers: [stale, origin],
+          selectedId: 'web-127.0.0.1-7777',
+        ),
+        origin,
+      );
+
+      expect(reconciled.selectedId, origin.id);
+      // The origin keeps its own credential rather than being downgraded.
+      expect(retrieveTokenFor(origin.id), 'origin-token');
+      expect(staleServerId, stale.id);
+    });
+
     test('is a no-op when the selection already names the current origin', () {
       const config = ServerConfig(
         servers: [origin],
