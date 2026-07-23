@@ -14,8 +14,10 @@ import 'package:flutter/services.dart'
         LogicalKeyboardKey;
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
+import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
+import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
 
 /// Native terminal view. A thin presentation layer over the persistent
@@ -777,71 +779,13 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   // On-screen row of keys a soft keyboard lacks (Esc, Ctrl, Tab, arrows, common
   // shell symbols). Sits directly above the keyboard via the Scaffold's
-  // resize-to-inset. Horizontally scrollable so it fits narrow phones.
+  // resize-to-inset. The shared widget renders the identical row on the mobile
+  // web client.
   Widget _buildAccessoryBar() {
-    return Container(
-      color: const Color(0xff141a1c),
-      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          children: [
-            _accessoryKey('esc', () => _sendAccessory('\x1b')),
-            _accessoryKey('ctrl', _toggleCtrl, active: _ctrlArmed),
-            _accessoryKey('tab', () => _sendAccessory('\t')),
-            // Shift+Tab (back-tab, `ESC [ Z`) — e.g. to cycle Claude Code's
-            // auto / accept-edits / plan modes from a phone.
-            _accessoryKey('⇧tab', () => _sendAccessory('\x1b[Z')),
-            // Enter/Return: the soft keyboard's return key maps to an IME action
-            // that never reaches the terminal, so a terminal needs an explicit
-            // one. `\r` (carriage return) is what a terminal expects on Enter.
-            _accessoryKey('enter', () => _sendAccessory('\r')),
-            _accessoryKey('▲', () => _sendAccessory('\x1b[A')),
-            _accessoryKey('▼', () => _sendAccessory('\x1b[B')),
-            _accessoryKey('◀', () => _sendAccessory('\x1b[D')),
-            _accessoryKey('▶', () => _sendAccessory('\x1b[C')),
-            _accessoryKey('^C', () => _sendAccessory('\x03')),
-            _accessoryKey('/', () => _sendAccessory('/')),
-            _accessoryKey('|', () => _sendAccessory('|')),
-            _accessoryKey('-', () => _sendAccessory('-')),
-            _accessoryKey('~', () => _sendAccessory('~')),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // A single accessory key. Uses a raw GestureDetector (no focus node) so a tap
-  // never steals focus from the terminal and dismisses the keyboard. [active]
-  // highlights a latched modifier (sticky Ctrl).
-  Widget _accessoryKey(String label, VoidCallback onTap, {bool active = false}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 3),
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: onTap,
-        child: Container(
-          constraints: const BoxConstraints(minWidth: 40, minHeight: 34),
-          alignment: Alignment.center,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          decoration: BoxDecoration(
-            color: active ? const Color(0xff2b6a63) : const Color(0xff232c2f),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Text(
-            label,
-            style: const TextStyle(
-              color: Color(0xffd9e5e3),
-              fontSize: 13,
-              fontFamily: 'JetBrains Mono',
-              // Fall back for glyphs the bundled JetBrains Mono subset may lack
-              // (the arrow triangles ▲▼◀▶), so the arrow keys never render as
-              // tofu on a device whose default only covers them elsewhere.
-              fontFamilyFallback: ['Menlo', 'Noto Sans Symbols', 'monospace'],
-            ),
-          ),
-        ),
-      ),
+    return TerminalAccessoryBar(
+      onSend: _sendAccessory,
+      onToggleCtrl: _toggleCtrl,
+      ctrlArmed: _ctrlArmed,
     );
   }
 
@@ -945,20 +889,4 @@ class _TerminalPaneState extends State<TerminalPane> {
       ),
     );
   }
-}
-
-/// The control code a character produces when combined with Ctrl, or null if it
-/// has none. Letters and the `@ [ \ ] ^ _` range map via `& 0x1f` — so Ctrl+C
-/// and Ctrl+c both yield `0x03` (SIGINT) and Ctrl+[ yields ESC — matching a
-/// terminal's standard control encoding. Digits, spaces, and other punctuation
-/// have no control form and return null (the character is sent as typed).
-String? controlByteForChar(String char) {
-  if (char.length != 1) return null;
-  final code = char.codeUnitAt(0);
-  // Uppercase the letter range so Ctrl+c and Ctrl+C both yield 0x03.
-  final upper = (code >= 0x61 && code <= 0x7a) ? code - 0x20 : code;
-  if (upper >= 0x40 && upper <= 0x5f) {
-    return String.fromCharCode(upper & 0x1f);
-  }
-  return null;
 }

@@ -4,9 +4,12 @@ import 'dart:async';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
+import 'package:triage_client/terminal/control_bytes.dart';
+import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
 
 class TerminalPane extends StatefulWidget {
@@ -60,6 +63,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Set<String> _registeredViewTypes = {};
 
   static void _discardCachedSession(String sanitizedId) {
+    _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
+    _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionContainers.remove(sanitizedId);
     final term = _TerminalPaneState._sessionTerms.remove(sanitizedId);
     if (term != null) {
@@ -143,6 +148,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     );
     _sanitizedId = sanitizedId;
     _viewType = 'xterm-view-$sanitizedId';
+    // Point the session's sticky-Ctrl rebuild hook at this (now current-mounted)
+    // instance, so the cached onData fold can un-highlight the bar after folding.
+    // Overwritten by the next instance for this session; safe when stale (the
+    // mounted guard makes it a no-op) and cleared on session destroy.
+    _sessionCtrlRebuild[sanitizedId] = () {
+      if (mounted) setState(() {});
+    };
 
     final cachedContainer = _sessionContainers[sanitizedId];
     final cachedTerm = _sessionTerms[sanitizedId];
@@ -308,6 +320,12 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _sendInput(String data) {
     _sessionInputRouter.sendInput(_sanitizedId, data);
+    _focusTerminal();
+  }
+
+  // Refocus the terminal without sending anything, so a bar tap never steals
+  // focus and so never dismisses the soft keyboard.
+  void _focusTerminal() {
     if (_initialized && !widget.isExited) {
       try {
         _focusNode.requestFocus();
@@ -315,6 +333,45 @@ class _TerminalPaneState extends State<TerminalPane> {
       } catch (_) {}
     }
   }
+
+  // Sticky Ctrl for the on-screen accessory bar (mobile web): when armed, the
+  // next single character typed on the soft keyboard is folded into its control
+  // byte instead of being sent literally. Mirrors the native pane.
+  //
+  // Keyed by *session*, not held on the State: the pane caches one xterm terminal
+  // and its `onData` callback per session id and reuses them across State
+  // instances (session switch and return). That cached fold can't close over a
+  // field of whichever instance created it — it would go stale — so the arm flag
+  // lives here and a rebuild hook lets the fold un-highlight the mounted bar.
+  static final Map<String, bool> _sessionCtrlArmed = {};
+  static final Map<String, VoidCallback> _sessionCtrlRebuild = {};
+
+  bool get _ctrlArmed => _sessionCtrlArmed[_sanitizedId] ?? false;
+
+  void _setCtrlArmed(bool value) {
+    if (_ctrlArmed == value) return;
+    _sessionCtrlArmed[_sanitizedId] = value;
+    if (mounted) setState(() {});
+  }
+
+  void _toggleCtrl() {
+    _setCtrlArmed(!_ctrlArmed);
+    _focusTerminal();
+  }
+
+  // Send a raw byte sequence from an accessory-bar key, then disarm sticky Ctrl
+  // (a bare Ctrl toggle arms it via _toggleCtrl instead of coming through here)
+  // and refocus so tapping a key never dismisses the soft keyboard.
+  void _sendAccessory(String bytes) {
+    _sendInput(bytes);
+    _setCtrlArmed(false);
+  }
+
+  // Touch clients (mobile-OS browser) get the on-screen accessory bar; desktop
+  // browsers keep the full-height terminal and their hardware keyboard.
+  bool get _isMobile =>
+      defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.android;
 
   void _activateTerminal() {
     if (!_initialized) return;
@@ -462,6 +519,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+        // Sticky Ctrl (accessory bar): fold an armed Ctrl into the next single
+        // character before it reaches the session — arming Ctrl then typing "c"
+        // on the soft keyboard sends 0x03 (SIGINT), not a literal "c". A
+        // multi-character chunk (paste, IME commit) still consumes the armed
+        // Ctrl untransformed, so a latched Ctrl can never linger. State is keyed
+        // by session (not `this`) because this callback is cached and reused
+        // across State instances.
+        if (_sessionCtrlArmed[sessionId] ?? false) {
+          final ctrl = data.length == 1 ? controlByteForChar(data) : null;
+          _sessionCtrlArmed[sessionId] = false;
+          _sessionCtrlRebuild[sessionId]?.call();
+          if (ctrl != null) {
+            _sessionInputRouter.sendInput(sessionId, ctrl);
+            return;
+          }
+        }
         _sessionInputRouter.sendInput(sessionId, data);
       });
       _onDataSubscription = js_util.callMethod(_term, 'onData', [
@@ -974,9 +1047,32 @@ class _TerminalPaneState extends State<TerminalPane> {
               widget.controller.fit();
             });
           }
-          return Container(
+          final terminal = Container(
             color: const Color(0xff0d1113),
             child: HtmlElementView(viewType: _viewType),
+          );
+          // Desktop browsers keep the full-height terminal; only a mobile-OS
+          // browser gets the on-screen key row (the soft keyboard lacks Esc, Tab,
+          // arrows, etc.). The xterm fit addon re-measures the shrunken container
+          // on the size change, so the grid stays correct above the bar.
+          if (!_isMobile) return terminal;
+          return Column(
+            children: [
+              Expanded(child: terminal),
+              Padding(
+                // Float above the soft keyboard when the browser reports its
+                // inset; a resizing Scaffold already zeroes this out, so it never
+                // double-counts.
+                padding: EdgeInsets.only(
+                  bottom: MediaQuery.of(context).viewInsets.bottom,
+                ),
+                child: TerminalAccessoryBar(
+                  onSend: _sendAccessory,
+                  onToggleCtrl: _toggleCtrl,
+                  ctrlArmed: _ctrlArmed,
+                ),
+              ),
+            ],
           );
         },
       ),
