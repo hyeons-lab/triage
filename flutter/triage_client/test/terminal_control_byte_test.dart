@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:triage_client/widgets/terminal_pane_stub.dart';
+import 'package:triage_client/terminal/control_bytes.dart';
 
 void main() {
   group('controlByteForChar (accessory-bar sticky Ctrl)', () {
