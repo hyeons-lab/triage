@@ -61,8 +61,8 @@ class TerminalAccessoryBar extends StatelessWidget {
   }
 
   // A single accessory key. Uses a raw GestureDetector (no focus node) so a tap
-  // never steals focus from the terminal and dismisses the keyboard. [active]
-  // highlights a latched modifier (sticky Ctrl).
+  // never steals focus from the terminal and so never dismisses the keyboard.
+  // [active] highlights a latched modifier (sticky Ctrl).
   Widget _key(String label, VoidCallback onTap, {bool active = false}) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 3),

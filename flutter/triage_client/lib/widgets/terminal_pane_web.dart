@@ -324,7 +324,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   // Refocus the terminal without sending anything, so a bar tap never steals
-  // focus and dismisses the soft keyboard.
+  // focus and so never dismisses the soft keyboard.
   void _focusTerminal() {
     if (_initialized && !widget.isExited) {
       try {

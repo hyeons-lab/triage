@@ -68,6 +68,16 @@ bar; both cleared in `_discardCachedSession`. Also deduped the web send/focus
 helpers and widened the widget test to all keys. Round 2 (focused, 1 reviewer) on
 the fix: NO FINDINGS.
 
+## Review Comments
+
+- 2026-07-23T00:05-0700 Copilot (PR #128) flagged the accessory-key doc comment
+  in `terminal_accessory_bar.dart` and the `_focusTerminal` comment in
+  `terminal_pane_web.dart` as reading like a tap *might* still dismiss the soft
+  keyboard — the single "never" didn't distribute across the "and". Reworded both
+  to "never steals focus … and so never dismisses the keyboard" so the intent is
+  unambiguous. Comment-only; no behavior change.
+
 ## Commits
 
-- HEAD — feat(triage_client): show the terminal accessory row on the mobile web client
+- HEAD — docs(triage_client): clarify the accessory-bar focus comments per review
+- c887ec8 — feat(triage_client): show the terminal accessory row on the mobile web client
