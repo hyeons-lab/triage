@@ -26,7 +26,7 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - [x] Flutter tests (218 pass) + `flutter analyze` clean
 - [x] Client: group headers in the rail
 - [x] Group-aware drag + pins + reset
-- [ ] `/review-fix-loop high`
+- [x] `/review-fix-loop high` — five rounds
 - [x] Per-item unpin — the pin indicator is itself the release control
 - [ ] Run the app against a live daemon (the binary transport is unproven end to end)
 
@@ -130,7 +130,89 @@ reset-to-activity affordance are deferred to Phase 2 — see
   is acceptable for a purely corrective action whose row-tap neighbour (select)
   is far more common.
 
+- 2026-07-29T14:20-0700 `flutter/triage_client/test/widget_test.dart` —
+  `FakeTriageWebSocketClient` now answers `listSessionContexts` (empty by
+  default, so the tests that predate grouping keep the ungrouped rail they
+  assume), plus a `grouped rail` group of six widget tests: grouping and
+  activity order at both levels, the repo-less "Other" group, a repository at
+  `/`, header drags, group unpinning, and stored pins ordering the first paint.
+  This was the gap round 4 called out, and it caught a real bug on its first run
+  (below).
+- 2026-07-29T14:20-0700 `flutter/triage_client/lib/main.dart` — carry
+  `repoRoot`/`worktreeRoot` across the open-session swap; re-group when
+  `_restorePins` lands after a load; stamp and re-group a newly created session;
+  `_groupLabelFor` falls back to the key rather than "Other"; `_rowKeyFor`
+  shared by the three places that spell a row's identity; the rail's `Builder`
+  and the unreachable row-index guard removed.
+- 2026-07-29T14:20-0700 `flutter/triage_client/lib/session_rail_layout.dart` —
+  `_reorderWithinGroup` deleted; the flat pinned list now goes through
+  `pinPrefixTo` directly. A drag inside a single-row group pins nothing.
+- 2026-07-29T14:20-0700 `flutter/triage_client/lib/session_grouping.dart` —
+  group tie-break index precomputed instead of recomputed per comparison.
+- 2026-07-29T14:20-0700 `crates/triaged/src/session.rs` —
+  `seed_last_activity_ms` uses `fetch_max`.
+
+- 2026-07-29T14:50-0700 `flutter/triage_client/lib/main.dart` — round 5:
+  `_regroupRail()` re-derives grouping wherever a session's repository can
+  change after the rail was built (the `session_context_updated` push, and the
+  open-session swap when the snapshot reports a different repo); `_closeSession`
+  drops the closed session's pin; the new-session stamp is derived from the
+  rail's own stamps rather than the local wall clock; the `onReorder`
+  coordinate-space contract is recorded at the call site.
+- 2026-07-29T14:50-0700 `crates/triaged/src/session.rs` +
+  `crates/triage-transport-ws/src/lib.rs` — round 5 test repairs: the restore
+  test now asserts equality (see Issues), `start_activity_persistence_is_idempotent`
+  counts the loop's `Weak` instead of re-reading the flag it sets, and a new
+  `flatbuffers_session_contexts_carry_activity` covers the binary encoder.
+- 2026-07-29T14:50-0700 `flutter/triage_client/test/widget_test.dart` — three
+  more widget tests: opening a session keeps its repository, rank and selection;
+  a `cd` across repositories moves the row's group; closing a pinned session
+  drops its pin.
+
 ## Issues
+
+- 2026-07-29T14:50-0700 Round 5 caught a bug I had just introduced. Round 4 left
+  a nitpick suggesting `fetch_max` in `seed_last_activity_ms`; I applied it, and
+  it is wrong — the actor seeds that field with *spawn time*, so a max against a
+  restored (older) stamp is a no-op and every restored session comes back as
+  "just now", the exact collapse the seed exists to prevent. The test that
+  should have caught it asserted `restored >= persisted`, which an unseeded
+  actor satisfies trivially, and its own comment admitted as much. Reverted to
+  `store`, documented why, and made the test assert equality — verified by
+  re-applying `fetch_max` and watching it fail. A nitpick is still a change to
+  the code, and a test that cannot fail is not protection.
+- 2026-07-29T14:50-0700 Running `dart format lib test` reformatted two things it
+  had no business touching: four files unrelated to this branch, and
+  `lib/generated/`, which CI's drift gate compares byte-for-byte against fresh
+  `flatc` output — a 2,100-line diff that would have failed the gate. Reverted
+  both. Format the files the change actually touches.
+- 2026-07-29T14:50-0700 Undoing a temporary debug patch with
+  `git checkout HEAD -- lib/main.dart` discarded every uncommitted edit in that
+  file, not just the patch — about an hour of round-4 and round-5 fixes.
+  Reconstructed them, then verified each was back before moving on. For a
+  scratch edit to a file with unsaved work, copy the file aside and restore from
+  the copy.
+
+- 2026-07-29T14:20-0700 The new grouped-rail widget tests failed on their first
+  run, and the failure was a real bug rather than a bad test: after any
+  re-group, the *selected* session had moved out of its repository into "Other".
+  `_loadDaemonSessionInto` builds a replacement `SessionVm` from the attach
+  snapshot, and a snapshot without `repository_root` nulls the field — the exact
+  shape of the `lastActivityMs` bug round 4 fixed, one field over. Carried both
+  grouping fields forward, filled in only when the snapshot says nothing so a
+  genuine change still wins. Worth stating plainly: four review rounds over pure
+  functions did not find this, and the first widget test through the real path
+  did.
+- 2026-07-29T14:20-0700 The first attempt at the absent-session-pin fix wove the
+  reordered group entries back into the slots they held. It worked, but the test
+  written for it failed — and the failure was right: the weave was a *second*
+  implementation of "a pin naming something absent keeps the index it held",
+  which `pinPrefixTo` already had, and the two disagreed on which entry got
+  displaced. Passing the whole flat list to `pinPrefixTo` gives the same answer
+  with one rule instead of two, so `_reorderWithinGroup` is gone. The original
+  bug stands: the old split-and-rejoin collected untouched pins in *front*,
+  which promoted a pinned-but-not-running session to the top of its own group
+  the moment it came back.
 
 - 2026-07-29T12:15-0700 Round 4 found two more bugs, both regressions of the
   branch's own promises rather than edge cases:
@@ -364,33 +446,22 @@ Hashes below are post-rebase.
 - 8840974 — fix(triage_client): decode last_activity_ms over the binary transport
 - 83a668c — fix(triage_client): stop drags from silently releasing pins
 - 17bdbc8 — refactor: collapse the rail's duplicated helpers and cover the activity loop
-- HEAD — fix(triage_client): keep a session's activity stamp when it is opened
+- e752c04 — fix(triage_client): keep a session's activity stamp when it is opened
+- HEAD — fix(triage_client): keep a session in its repository and its rank
 
 ## Next Steps
 
-- **The loop has not converged.** Rounds 2–4 are applied; round 4 still found
-  two real bugs, so a round 5 is required before this is done.
-- Add widget coverage for the grouped rail. `FakeTriageWebSocketClient` does not
-  override `listSessionContexts`, so every widget test exercises the ungrouped
-  fallback — group headers, header drags, `onUnpinGroup` and the first-paint
-  `applyContext` path have no widget-level test, which is how round 4's two bugs
-  reached the branch.
 - Run the app against a live daemon: the binary transport is verified at the
   handshake level and under fakes, but no full request/response round-trip has
   been exercised against a real daemon.
-- Open findings from round 4, carried into round 5: `_reorderWithinGroup` treats
-  a pinned-but-absent session of the moved row's own group as "other" and
-  prefixes it, so it jumps to the top of the group's pinned run (the session-side
-  twin of the absent-group-pin bug already fixed in `pinPrefixTo`); `_restorePins`
-  sets `_pins` without recomputing `_sessionGroups`, and `pinPrefixTo` assumes
-  its `displayOrder` already leads with the pinned block, an unenforced
-  load-bearing invariant; a client-created session is inserted at index 0 with
-  activity 0 and no regroup; a drag that clamps back into a single-row group
-  still pins it, so the reset button appears for a layout the user never made; a
-  repository rooted at `/` labels as "Other" and collides with the repo-less
-  group.
-- Remaining nitpicks: hoist `earliestInput` out of the group-sort comparator,
-  drop the unreachable row-index guard, lift the rail's `Builder` wrapper into
-  `_buildExpandedRail`, share one `_rowKeyFor` between the three places that
-  spell out a row's identity key, fold `_homeAbbreviatedPath`'s inline trim into
-  `trimTrailingSlash`, and use `fetch_max` in `seed_last_activity_ms`.
+- The rail re-sorts only at load, reconnect, drag, and now a repository change —
+  `lastActivityMs` is never updated from live output events, so a session that
+  starts producing output does not climb the rail until something else triggers
+  a re-group. That is deliberate for now (a rail that re-sorted under the cursor
+  mid-stream would be hostile), but it means "ordered by activity" is a
+  snapshot, not a live ranking. Worth revisiting with an explicit debounce if it
+  reads as stale.
+- `ReorderableListView.onReorder` is deprecated in favour of `onReorderItem`,
+  which reports `newIndex` already adjusted for the removed item. Migrating
+  means deleting the pre-removal conversion in `resolveRailReorder`, not just
+  renaming the callback — noted at both sites.

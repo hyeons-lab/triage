@@ -17,10 +17,14 @@ const String legacyDaemonAddressPrefKey = 'daemon_address_v1';
 /// Retired side-rail order keys: the single unkeyed list written before
 /// multi-server support, and its per-server successor.
 ///
-/// Both are now write-only history. The rail's order is derived — repository
-/// grouping plus activity, with explicit pins on top — so a stored list of
-/// session ids no longer has anything to say about it. [purgeRetiredSessionOrder]
-/// deletes them once so they do not sit in preferences forever.
+/// Both are now dead history. The rail's order is derived — repository grouping
+/// plus activity, with explicit pins on top — so a stored list of session ids no
+/// longer has anything to say about it. [purgeRetiredSessionOrder] deletes them
+/// on the paths that already rewrite a server's keys (legacy migration, the
+/// web-origin adopt, and removal); a server configured before this change and
+/// left alone keeps its stale key until one of those runs. That is deliberate —
+/// the key is inert, and sweeping every server's prefs at startup would cost a
+/// write on a path that must not await prefs at all.
 const String legacySessionOrderPrefKey = 'session_order_v1';
 String retiredSessionOrderPrefKeyFor(String serverId) =>
     'session_order_v1_$serverId';

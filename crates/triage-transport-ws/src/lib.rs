@@ -1506,6 +1506,49 @@ mod tests {
     }
 
     #[test]
+    fn flatbuffers_session_contexts_carry_activity() {
+        // The binary encoder is a separate hand-written path from the JSON one,
+        // and this is exactly where the two drifted: `last_activity_ms` reached
+        // the schema and the JSON form while the FlatBuffers writer kept
+        // omitting it, so the rail read 0 for every session over the default
+        // transport and ordered them arbitrarily. Read straight off the buffer
+        // because the borrowed parser has no case for this result — only the
+        // Dart client decodes it, so nothing else on this side would notice.
+        let msg = ServerMessage::Response {
+            id: Some(json!("req-1")),
+            result: ServerResult::SessionContexts {
+                entries: vec![SessionContextEntry {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    current_working_directory: Some("/repo/wt".to_string()),
+                    repository_root: Some("/repo".to_string()),
+                    worktree_root: Some("/repo/wt".to_string()),
+                    branch: Some("main".to_string()),
+                    last_activity_ms: 1_700_000_000_000,
+                }],
+            },
+        };
+
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        let entries = flatbuffers::root::<fb::ServerMessage>(&bytes)
+            .unwrap()
+            .payload_as_response_payload()
+            .unwrap()
+            .result_as_session_contexts_result()
+            .unwrap()
+            .entries()
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let entry = entries.get(0);
+        assert_eq!(entry.session_id(), Some("session-1"));
+        assert_eq!(entry.current_working_directory(), Some("/repo/wt"));
+        assert_eq!(entry.repository_root(), Some("/repo"));
+        assert_eq!(entry.worktree_root(), Some("/repo/wt"));
+        assert_eq!(entry.branch(), Some("main"));
+        assert_eq!(entry.last_activity_ms(), 1_700_000_000_000);
+    }
+
+    #[test]
     fn flatbuffers_session_context_updated_roundtrip() {
         // In a repo: every git field is carried alongside the cwd.
         let in_repo = ServerMessage::SessionContextUpdated {

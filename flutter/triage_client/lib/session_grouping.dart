@@ -208,9 +208,15 @@ List<SessionGroup> groupSessionsByRepo(
     );
   }
 
-  int earliestInput(SessionGroup group) => group.sessionIds
-      .map((id) => inputIndex[id] ?? 0)
-      .reduce((a, b) => a < b ? a : b);
+  // Each group's earliest-listed session, computed once rather than inside the
+  // comparator — `sort` calls that O(n log n) times, and the fresh-daemon case
+  // where every stamp is 0 is exactly the one that reaches it every time.
+  final earliestInput = {
+    for (final group in groups)
+      group.pinKey: group.sessionIds
+          .map((id) => inputIndex[id] ?? 0)
+          .reduce((a, b) => a < b ? a : b),
+  };
 
   groups.sort((a, b) {
     if (a.lastActivityMs != b.lastActivityMs) {
@@ -218,17 +224,12 @@ List<SessionGroup> groupSessionsByRepo(
     }
     // Tie-break on the group's earliest-listed session, so group order is total
     // and stable — the common case being a fresh daemon where every stamp is 0.
-    return earliestInput(a).compareTo(earliestInput(b));
+    return earliestInput[a.pinKey]!.compareTo(earliestInput[b.pinKey]!);
   });
 
   return _hoistPinned(groups, pins.groupKeys, (group) => group.pinKey);
 }
 
-/// Hoists pinned entries of [ordered] into a leading block, in [pinned] order.
-///
-/// Pins that name something absent are skipped rather than dropped from the
-/// stored list: a repository with no live sessions right now should keep its
-/// place for when one starts again, instead of silently losing its pin.
 /// Moves the entries named by [pinned] to the front of [items], in pinned order,
 /// leaving everything else in its existing order behind them.
 ///

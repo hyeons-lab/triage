@@ -414,10 +414,7 @@ void main() {
         pinnedSessionsPrefKeyFor('web-127.0.0.1-7777'): ['session-2'],
       });
 
-      await migrateRailPins(
-        'web-127.0.0.1-7777',
-        'web-proxy.example.com-443',
-      );
+      await migrateRailPins('web-127.0.0.1-7777', 'web-proxy.example.com-443');
 
       final prefs = await SharedPreferences.getInstance();
       expect(

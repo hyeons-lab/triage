@@ -3168,8 +3168,13 @@ impl SessionActor {
         self.last_activity_ms.load(Ordering::Relaxed)
     }
 
-    /// Overwrite the activity stamp with a session's restored value, so a
-    /// daemon restart doesn't promote every restored session to "just now".
+    /// Restore a session's persisted activity stamp, so a daemon restart doesn't
+    /// promote every restored session to "just now".
+    ///
+    /// Deliberately `store`, not `fetch_max`: the actor seeds this field with
+    /// spawn time (see `SessionActor::spawn`), which is *always* newer than the
+    /// persisted value, so a max would discard every restored stamp and
+    /// reintroduce the exact collapse this exists to prevent.
     fn seed_last_activity_ms(&self, millis: u64) {
         self.last_activity_ms.store(millis, Ordering::Relaxed);
     }
@@ -7486,7 +7491,16 @@ mod tests {
             PersistedSession {
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
-                args: Vec::new(),
+                // The `-c` wrapper shape triage itself launches with, so
+                // `is_restorable_shell_launch` accepts it, but sleeping before
+                // the exec so the restored session writes nothing. An
+                // interactive shell prints a prompt, which re-stamps activity
+                // and would make the assertion below a race — which is how it
+                // ended up as the toothless `>=` this replaces.
+                args: vec![
+                    "-c".to_string(),
+                    "sleep 60; exec \"${SHELL:-/bin/sh}\"".to_string(),
+                ],
                 cwd: None,
                 size: SessionSize {
                     rows: 6,
@@ -7524,14 +7538,14 @@ mod tests {
             }
         };
 
-        // The restored shell may emit a prompt, which legitimately re-stamps
-        // activity to "now". Assert only that the seed was applied rather than
-        // discarded: an unseeded actor would read as spawn time, which is far
-        // newer than the day-old value but also cannot be older than it.
-        assert!(
-            restored_activity_ms >= persisted_activity_ms,
-            "restored stamp {restored_activity_ms} must not predate the persisted \
-             {persisted_activity_ms}",
+        // Exactly the persisted value. A `>=` assertion here would pass under
+        // the very bug it names: an actor whose seed was discarded reads back
+        // spawn time, which is newer than a day-old stamp and so satisfies
+        // `>=`. Equality is what distinguishes "restored" from "re-stamped".
+        assert_eq!(
+            restored_activity_ms, persisted_activity_ms,
+            "a restored session must come back with its persisted stamp, not the \
+             restart instant",
         );
 
         let _ = manager.shutdown_session(session_id);
@@ -7818,10 +7832,23 @@ mod tests {
             log_dir.clone(),
         )));
         manager.start_activity_persistence();
+        assert_eq!(
+            Arc::weak_count(&manager),
+            1,
+            "the first call spawns the loop, which holds one Weak"
+        );
+
         // A second call must not spawn a second thread writing the same
-        // manifest; the guard flag is what prevents it.
+        // manifest; the guard flag is what prevents it. Counted through the
+        // `Weak` each spawned loop holds, because asserting the flag alone is
+        // true after the *first* call — that test stayed green with the guard
+        // deleted entirely.
         manager.start_activity_persistence();
-        assert!(manager.activity_persistence_started.load(Ordering::Acquire));
+        assert_eq!(
+            Arc::weak_count(&manager),
+            1,
+            "a second call must not spawn a second persistence loop"
+        );
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 

@@ -116,17 +116,38 @@ void main() {
       expect(groups.map((g) => g.repoRoot), ['/b', '/a']);
     });
 
-    test('ordering is total, so a repeated call agrees with itself', () {
-      final inputs = [
-        session('session-1', repo: '/a', activity: 100),
-        session('session-2', repo: '/b', activity: 100),
-        session('session-3', repo: '/a', activity: 100),
-      ];
-
-      // Every stamp is equal here, so only a total order makes these agree.
+    test('an all-tied set falls back to the order the daemon listed', () {
+      // Every stamp is equal, so this is entirely decided by the tie-break —
+      // the case a fresh daemon hits, where nothing has produced output yet.
+      // Asserting the concrete order rather than that two identical calls agree
+      // with each other: `List.sort` is deterministic for identical input
+      // whether or not the comparator is a total order, so self-agreement is
+      // true even of the arbitrary ordering this replaces.
       expect(
-        flattenGroups(groupSessionsByRepo(inputs)),
-        flattenGroups(groupSessionsByRepo(inputs)),
+        flattenGroups(
+          groupSessionsByRepo([
+            session('session-1', repo: '/a', activity: 100),
+            session('session-2', repo: '/b', activity: 100),
+            session('session-3', repo: '/a', activity: 100),
+          ]),
+        ),
+        ['session-1', 'session-3', 'session-2'],
+      );
+
+      // The same three sessions listed differently order differently, and that
+      // is correct rather than a wobble: the tie-break is the daemon's own
+      // creation order, which it sorts before sending. Re-deriving an order from
+      // the ids here would duplicate that sort in a second language and disagree
+      // with it for any id that is not `session-N`.
+      expect(
+        flattenGroups(
+          groupSessionsByRepo([
+            session('session-3', repo: '/a', activity: 100),
+            session('session-2', repo: '/b', activity: 100),
+            session('session-1', repo: '/a', activity: 100),
+          ]),
+        ),
+        ['session-3', 'session-1', 'session-2'],
       );
     });
   });

@@ -2115,11 +2115,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     try {
       final prefs = await SharedPreferences.getInstance();
       if (_disposed || serverId != _activeServerId) return;
-      _pins = SessionPins(
+      final restored = SessionPins(
         groupKeys: prefs.getStringList(pinnedGroupsPrefKeyFor(serverId)) ?? [],
         sessionIds:
             prefs.getStringList(pinnedSessionsPrefKeyFor(serverId)) ?? [],
       );
+      // A load that finished while this read was in flight grouped the rail with
+      // no pins, so assigning the field alone would leave [_pins] describing a
+      // layout [_sessionGroups] does not have. `pinPrefixTo` reads the displayed
+      // order and assumes the pinned block already leads it, so the next drag
+      // would compute its prefix against the wrong list and drop pins. Re-group
+      // instead — without persisting, since this is what storage already says.
+      if (!restored.isEmpty && _sessionsServerId == serverId) {
+        _applyPins(restored, persist: false);
+      } else {
+        _pins = restored;
+      }
     } catch (_) {
       // Pinning is a best-effort convenience; ignore load failures.
     }
@@ -2168,9 +2179,37 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         ),
   ];
 
+  /// An activity stamp that ranks above every session currently on the rail.
+  ///
+  /// Deliberately not a wall-clock reading: these stamps come from the daemon,
+  /// and a client whose clock trails the daemon's would produce a "newest" value
+  /// that sorts below sessions idle for minutes.
+  int _nextLocalActivityStamp() {
+    var newest = 0;
+    for (final session in _sessions) {
+      if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+    }
+    return newest + 1;
+  }
+
+  /// Re-derives the rail's grouping from the sessions as they stand now,
+  /// leaving the pins alone.
+  ///
+  /// Needed wherever a session's repository can change after the rail was built:
+  /// membership follows [SessionVm.repoRoot], but the groups are a snapshot, so
+  /// assigning the field without this leaves the two disagreeing about which
+  /// header a row sits under.
+  void _regroupRail() {
+    if (_disposed || !mounted) return;
+    _applyPins(_pins, persist: false);
+  }
+
   /// Re-applies [pins], reordering the rail and keeping the selection on the
   /// same session rather than the same index.
-  void _applyPins(SessionPins pins) {
+  ///
+  /// [persist] is false when the caller is applying pins it just read back from
+  /// storage, which has nothing to write.
+  void _applyPins(SessionPins pins, {bool persist = true}) {
     final groups = groupSessionsByRepo(_orderingInputs(), pins: pins);
     final order = flattenGroups(groups);
     final byId = <String, SessionVm>{
@@ -2200,7 +2239,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (index != -1) _selectedIndex = index;
       }
     });
-    unawaited(_persistPins(pins));
+    if (persist) unawaited(_persistPins(pins));
   }
 
   /// Interprets a rail drag: the moved group or row is pinned where it was put,
@@ -2209,8 +2248,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _applyPins(
       resolveRailReorder(
         items: buildRailItems([
-          for (final session in _sessions)
-            session.remoteSessionId ?? 'local:${session.title}',
+          for (final session in _sessions) _rowKeyFor(session),
         ], _sessionGroups),
         pins: _pins,
         oldIndex: oldIndex,
@@ -2306,6 +2344,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.dispose();
         return;
       }
+      // Set inside the `setState` below, acted on after it: the snapshot is
+      // allowed to report a repository the rail has not seen — a session that
+      // `cd`ed elsewhere since connect — and that moves the row to a different
+      // group, which the swap alone does not recompute.
+      var regrouped = false;
       setState(() {
         final existingIndex = _sessions.indexWhere(
           (s) => s.remoteSessionId == sid,
@@ -2319,12 +2362,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // recent as its most recent member), to the bottom of a rail that is
         // supposed to surface exactly what is being used.
         session.lastActivityMs = oldSession.lastActivityMs;
+        // Same reasoning for the repository, which is what decides the session's
+        // *group*: the replacement takes its context from the attach snapshot,
+        // and a snapshot that omits one — an older daemon, or a session outside
+        // the cases the daemon fills in — would move the session out of its
+        // repository and into "Other" the moment it was opened. Only filled in
+        // when the snapshot said nothing, so a genuine change still wins.
+        session.repoRoot ??= oldSession.repoRoot;
+        session.worktreeRoot ??= oldSession.worktreeRoot;
+        regrouped = session.repoRoot != oldSession.repoRoot;
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);
         }
         _sessions[existingIndex] = session;
       });
+      if (regrouped) _regroupRail();
       _drainPendingEvents(sid);
     } on TriageAuthException {
       // The daemon refused the attach: this client is no longer paired. Painting
@@ -2615,9 +2668,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (index == -1) return;
       // Each push carries the full current context, so a null field genuinely
       // means "absent" (e.g. cd'd out of a repo) — assign directly, don't merge.
+      final previousRepoRoot = _sessions[index].repoRoot;
+      final nextRepoRoot = message['repository_root']?.toString();
       void apply() {
         _sessions[index].applyContext(
-          repoRoot: message['repository_root']?.toString(),
+          repoRoot: nextRepoRoot,
           worktreeRoot: message['worktree_root']?.toString(),
           branch: message['branch']?.toString(),
           cwd: message['current_working_directory']?.toString(),
@@ -2628,6 +2683,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         setState(apply);
       } else {
         apply();
+      }
+      // A `cd` across repositories changes which group the row belongs to, and
+      // the grouping is not recomputed by the assignment above. Leaving it stale
+      // shows the row under its old repository's header, and — worse — makes a
+      // drag on it incoherent: `resolveRailReorder` would resolve the drop
+      // against the old group while `_applyPins` immediately re-derives the new
+      // one, landing the row somewhere it was not dropped and pinning its former
+      // neighbours on the way.
+      if (previousRepoRoot != nextRepoRoot) {
+        _regroupRail();
       }
       return;
     }
@@ -3115,12 +3180,28 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             throughOutputSeq: outputSeq,
           );
 
+          // Rank it above everything already on the rail. The daemon has no
+          // output for a session it just spawned, so it reports activity 0 — and
+          // a session left at 0 sorts as "never active", sinking the one just
+          // asked for to the bottom on the next re-group. Derived from the
+          // stamps already in hand rather than from `DateTime.now()`, which
+          // would rank a local clock against daemon-issued ones: a client
+          // running behind the daemon would bury the new session, the exact
+          // outcome this is here to prevent. The real stamp arrives with the
+          // next context fetch and takes over.
+          session.lastActivityMs = _nextLocalActivityStamp();
+
           setState(() {
             _sessions.insert(0, session);
             _selectedIndex = 0;
             _connectionStatus = 'Connected to Daemon';
             _connectionStatusColor = const Color(0xff7fd1c7);
           });
+          // Insertion alone leaves it outside every group — rendered under no
+          // header, above the first one — until something else triggers a
+          // re-group. Place it in its repository now, keeping the selection that
+          // was just set on it.
+          _applyPins(_pins, persist: false);
 
           // Drain and replay any pending events that arrived during attach
           final pending = _pendingEvents.remove(sessionId);
@@ -3207,6 +3288,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       }
     });
+
+    // Drop the pin with the session. A pin naming a session that is merely not
+    // running is deliberately kept — that is the slot being held for when it
+    // comes back — but a session closed on purpose is never coming back under
+    // that id, so its pin is dead weight: it would keep the reset control
+    // showing with no indicator anywhere to explain it, and sit in this
+    // server's preferences forever.
+    if (sessionId != null && _pins.sessionIds.contains(sessionId)) {
+      _applyPins(unpin(_pins, sessionId: sessionId));
+    }
   }
 
   Future<bool?> _confirmCloseSession(SessionVm session) {
@@ -3718,6 +3809,20 @@ class SessionRail extends StatelessWidget {
     // window at the same instant.
     final now = DateTime.now();
     final indistinguishable = indistinguishableRailRows(sessions, now);
+    // Headers and rows share one list so there is a single gesture arena;
+    // `resolveRailReorder` maps a flat drop index back to the right level. Built
+    // from the rail's own sessions, so a session started since the last grouping
+    // still gets a row (ungrouped) rather than vanishing until the next load.
+    final items = buildRailItems([
+      for (final session in sessions) _rowKeyFor(session),
+    ], sessionGroups);
+    // Rows appear in `items` in the same order as `sessions`, so the nth
+    // non-header item is the nth session.
+    var rowIndex = 0;
+    final rowIndexFor = <int, int>{};
+    for (var i = 0; i < items.length; i++) {
+      if (!items[i].isHeader) rowIndexFor[i] = rowIndex++;
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -3817,98 +3922,78 @@ class SessionRail extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         Expanded(
-          child: Builder(
-            builder: (context) {
-              // Headers and rows share one list so there is a single gesture
-              // arena; `resolveRailReorder` maps a flat drop index back to the
-              // right level. Built from the rail's own sessions, so a session
-              // started since the last grouping still gets a row (ungrouped)
-              // rather than vanishing until the next load.
-              final rowKeys = [
-                for (final session in sessions)
-                  session.remoteSessionId ?? 'local:${session.title}',
-              ];
-              final items = buildRailItems(rowKeys, sessionGroups);
-              // Rows appear in `items` in the same order as `sessions`, so the
-              // nth non-header item is the nth session.
-              var rowIndex = 0;
-              final rowIndexFor = <int, int>{};
-              for (var i = 0; i < items.length; i++) {
-                if (!items[i].isHeader) rowIndexFor[i] = rowIndex++;
+          child: ReorderableListView.builder(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+            buildDefaultDragHandles: false,
+            // `onReorder`, not its `onReorderItem` replacement, and the
+            // difference is load-bearing: `onReorder` reports `newIndex` in
+            // pre-removal coordinates, which is what `resolveRailReorder`
+            // documents and converts itself. `onReorderItem` has already made
+            // that adjustment, so migrating means *deleting* the conversion
+            // there, not just renaming the callback here.
+            // ignore: deprecated_member_use
+            onReorder: onReorderSession,
+            itemCount: items.length,
+            itemBuilder: (context, index) {
+              final item = items[index];
+              if (item.isHeader) {
+                return _SessionGroupHeader(
+                  key: ValueKey<String>('group:${item.groupKey}'),
+                  index: index,
+                  label: _groupLabelFor(item.groupKey),
+                  pinned: pins.groupKeys.contains(item.groupKey),
+                  onUnpin: () => onUnpinGroup(item.groupKey),
+                  isFirst: index == 0,
+                );
               }
-
-              return ReorderableListView.builder(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-                buildDefaultDragHandles: false,
-                onReorder: onReorderSession,
-                itemCount: items.length,
-                itemBuilder: (context, index) {
-                  final item = items[index];
-                  if (item.isHeader) {
-                    return _SessionGroupHeader(
-                      key: ValueKey<String>('group:${item.groupKey}'),
-                      index: index,
-                      label: _groupLabelFor(item.groupKey),
-                      pinned: pins.groupKeys.contains(item.groupKey),
-                      onUnpin: () => onUnpinGroup(item.groupKey),
-                      isFirst: index == 0,
-                    );
-                  }
-                  final sessionIndex = rowIndexFor[index]!;
-                  if (sessionIndex >= sessions.length) {
-                    // Groups and sessions disagreed; render nothing rather than
-                    // throwing, since the next load rebuilds both.
-                    return SizedBox.shrink(key: ValueKey<String>('gap:$index'));
-                  }
-                  final session = sessions[sessionIndex];
-                  final key = ValueKey<String>(
-                    session.remoteSessionId ?? 'local:${session.title}',
-                  );
-                  final tile = SessionListTile(
-                    key: sessionIndex == selectedIndex ? selectedTileKey : null,
-                    selected: sessionIndex == selectedIndex,
-                    title: session.railTitleAt(now),
-                    // The repo-first name for the hover card and screen-reader
-                    // label, following the same lead the title shows (an
-                    // inferred worktree included) so the row reads consistently
-                    // everywhere.
-                    glanceTitle: session.glanceTitleAt(now),
-                    subtitle: session.status,
-                    statusColor: session.statusColor,
-                    icon: session.icon,
-                    branch: session.branch,
-                    repoName: session.repoName,
-                    worktreeName: session.worktreeName,
-                    cwd: session.cwd,
-                    snippet: session.snippet,
-                    snippetDetail: session.snippetDetail,
-                    activityAt: session.snippetUpdatedAt,
-                    pinned: pins.sessionIds.contains(session.remoteSessionId),
-                    onUnpin: session.remoteSessionId == null
-                        ? null
-                        : () => onUnpinSession(session.remoteSessionId!),
-                    indistinguishable: indistinguishable.contains(sessionIndex),
-                    onTap: () => onSelectSession(sessionIndex),
-                  );
-                  // Touch: a plain drag must scroll the list, so reordering
-                  // waits for a long-press
-                  // (ReorderableDelayedDragStartListener). Mouse: the whole row
-                  // is an immediate drag handle; a click still selects since a
-                  // tap registers no movement.
-                  final isTouch = isMobilePlatform();
-                  return isTouch
-                      ? ReorderableDelayedDragStartListener(
-                          key: key,
-                          index: index,
-                          child: tile,
-                        )
-                      : ReorderableDragStartListener(
-                          key: key,
-                          index: index,
-                          child: tile,
-                        );
-                },
+              // `items` is built from `sessions` above, one row each, so
+              // this index is always in range.
+              final sessionIndex = rowIndexFor[index]!;
+              final session = sessions[sessionIndex];
+              final key = ValueKey<String>(_rowKeyFor(session));
+              final tile = SessionListTile(
+                key: sessionIndex == selectedIndex ? selectedTileKey : null,
+                selected: sessionIndex == selectedIndex,
+                title: session.railTitleAt(now),
+                // The repo-first name for the hover card and screen-reader
+                // label, following the same lead the title shows (an
+                // inferred worktree included) so the row reads consistently
+                // everywhere.
+                glanceTitle: session.glanceTitleAt(now),
+                subtitle: session.status,
+                statusColor: session.statusColor,
+                icon: session.icon,
+                branch: session.branch,
+                repoName: session.repoName,
+                worktreeName: session.worktreeName,
+                cwd: session.cwd,
+                snippet: session.snippet,
+                snippetDetail: session.snippetDetail,
+                activityAt: session.snippetUpdatedAt,
+                pinned: pins.sessionIds.contains(session.remoteSessionId),
+                onUnpin: session.remoteSessionId == null
+                    ? null
+                    : () => onUnpinSession(session.remoteSessionId!),
+                indistinguishable: indistinguishable.contains(sessionIndex),
+                onTap: () => onSelectSession(sessionIndex),
               );
+              // Touch: a plain drag must scroll the list, so reordering
+              // waits for a long-press
+              // (ReorderableDelayedDragStartListener). Mouse: the whole row
+              // is an immediate drag handle; a click still selects since a
+              // tap registers no movement.
+              final isTouch = isMobilePlatform();
+              return isTouch
+                  ? ReorderableDelayedDragStartListener(
+                      key: key,
+                      index: index,
+                      child: tile,
+                    )
+                  : ReorderableDragStartListener(
+                      key: key,
+                      index: index,
+                      child: tile,
+                    );
             },
           ),
         ),
@@ -3918,9 +4003,14 @@ class SessionRail extends StatelessWidget {
 
   /// A group's display name: the repository's directory name, or "Other" for the
   /// catch-all holding sessions outside any repository.
+  ///
+  /// Falls back to the key itself rather than to "Other", so that a repository
+  /// with no directory name — `/` is the only one — reads as the path it is
+  /// instead of collecting a second header identically labelled to the
+  /// genuinely repo-less group.
   String _groupLabelFor(String groupKey) {
     if (groupKey == otherGroupPinKey) return 'Other';
-    return leafOf(groupKey) ?? 'Other';
+    return leafOf(groupKey) ?? groupKey;
   }
 }
 
@@ -5052,15 +5142,22 @@ String? formatRelativeActivity(DateTime? at, DateTime now) {
   return '${elapsed.inDays}d';
 }
 
+/// A rail row's identity: the daemon's session id, or a local-only fallback for
+/// a scratch session that has none.
+///
+/// The rail spells this out in three places — the reorder handler, the layout's
+/// row list, and the tile's `ValueKey` — and they must agree exactly: the layout
+/// maps a drop index back to a row by this key, and a `ValueKey` that disagreed
+/// with the list it was built from would reorder the wrong row.
+String _rowKeyFor(SessionVm session) =>
+    session.remoteSessionId ?? 'local:${session.title}';
+
 /// Collapses a leading local-home prefix to `~` — e.g. `/Users/me/dev` →
 /// `~/dev`. Returns null when [path] is not under the local home (e.g. a path
 /// from a remote daemon), so callers fall back to showing it in full.
 String? _homeAbbreviatedPath(String path) {
-  final home = localHomeDir();
-  if (home == null || home.isEmpty) return null;
-  final normalized = home.endsWith('/')
-      ? home.substring(0, home.length - 1)
-      : home;
+  final normalized = trimTrailingSlash(localHomeDir());
+  if (normalized == null) return null;
   if (path == normalized) return '~';
   if (path.startsWith('$normalized/')) {
     return '~${path.substring(normalized.length)}';

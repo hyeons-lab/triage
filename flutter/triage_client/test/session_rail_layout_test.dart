@@ -43,26 +43,20 @@ void main() {
     });
 
     test('pinned groups keep their pinned order relative to each other', () {
-      final groups = groupSessionsByRepo(
-        [
-          session('session-1', repo: '/a', activity: 1),
-          session('session-2', repo: '/b', activity: 999),
-          session('session-3', repo: '/c', activity: 500),
-        ],
-        pins: const SessionPins(groupKeys: ['/c', '/a']),
-      );
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 1),
+        session('session-2', repo: '/b', activity: 999),
+        session('session-3', repo: '/c', activity: 500),
+      ], pins: const SessionPins(groupKeys: ['/c', '/a']));
 
       expect(groups.map((g) => g.repoRoot), ['/c', '/a', '/b']);
     });
 
     test('a pinned session leads its group', () {
-      final groups = groupSessionsByRepo(
-        [
-          session('session-1', repo: '/a', activity: 10),
-          session('session-2', repo: '/a', activity: 900),
-        ],
-        pins: const SessionPins(sessionIds: ['session-1']),
-      );
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 10),
+        session('session-2', repo: '/a', activity: 900),
+      ], pins: const SessionPins(sessionIds: ['session-1']));
 
       expect(groups.single.sessionIds, ['session-1', 'session-2']);
     });
@@ -70,35 +64,28 @@ void main() {
     test('pinning does not alter a group\'s activity', () {
       // Activity is what a group reverts to on unpin, so pinning must not
       // overwrite it — otherwise unpinning would strand the group.
-      final groups = groupSessionsByRepo(
-        [
-          session('session-1', repo: '/a', activity: 5),
-          session('session-2', repo: '/b', activity: 900),
-        ],
-        pins: const SessionPins(groupKeys: ['/a']),
-      );
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 5),
+        session('session-2', repo: '/b', activity: 900),
+      ], pins: const SessionPins(groupKeys: ['/a']));
 
       expect(groups.first.repoRoot, '/a');
       expect(groups.first.lastActivityMs, 5);
     });
 
     test('a pin naming an absent group is ignored, not fatal', () {
-      final groups = groupSessionsByRepo(
-        [session('session-1', repo: '/a', activity: 1)],
-        pins: const SessionPins(groupKeys: ['/gone', '/a']),
-      );
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 1),
+      ], pins: const SessionPins(groupKeys: ['/gone', '/a']));
 
       expect(groups.map((g) => g.repoRoot), ['/a']);
     });
 
     test('the repo-less group can be pinned via its sentinel key', () {
-      final groups = groupSessionsByRepo(
-        [
-          session('session-1', repo: '/a', activity: 900),
-          session('session-2', activity: 1),
-        ],
-        pins: const SessionPins(groupKeys: [otherGroupPinKey]),
-      );
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 900),
+        session('session-2', activity: 1),
+      ], pins: const SessionPins(groupKeys: [otherGroupPinKey]));
 
       expect(groups.first.isOther, isTrue);
       expect(groups.first.pinKey, otherGroupPinKey);
@@ -182,10 +169,13 @@ void main() {
       );
 
       expect(pins.groupKeys, ['/b']);
-      expect(
-        render(railFor(sessions, pins: pins)),
-        ['#/b', 'session-3', '#/a', 'session-1', 'session-2'],
-      );
+      expect(render(railFor(sessions, pins: pins)), [
+        '#/b',
+        'session-3',
+        '#/a',
+        'session-1',
+        'session-2',
+      ]);
     });
 
     test('dragging a row reorders it within its group', () {
@@ -201,9 +191,10 @@ void main() {
 
       expect(pins.sessionIds, ['session-2']);
       expect(
-        railFor(sessions, pins: pins).where((i) => !i.isHeader).map(
-          (i) => i.sessionId,
-        ),
+        railFor(
+          sessions,
+          pins: pins,
+        ).where((i) => !i.isHeader).map((i) => i.sessionId),
         ['session-2', 'session-1', 'session-3'],
       );
     });
@@ -250,10 +241,13 @@ void main() {
         newIndex: 3,
       );
 
-      expect(
-        render(railFor(sessions, pins: pins)),
-        ['#/a', 'session-2', 'session-1', '#/b', 'session-3'],
-      );
+      expect(render(railFor(sessions, pins: pins)), [
+        '#/a',
+        'session-2',
+        'session-1',
+        '#/b',
+        'session-3',
+      ]);
     });
 
     test('dragging a header DOWN moves that group down', () {
@@ -267,10 +261,13 @@ void main() {
         newIndex: 4,
       );
 
-      expect(
-        render(railFor(sessions, pins: pins)),
-        ['#/b', 'session-3', '#/a', 'session-1', 'session-2'],
-      );
+      expect(render(railFor(sessions, pins: pins)), [
+        '#/b',
+        'session-3',
+        '#/a',
+        'session-1',
+        'session-2',
+      ]);
     });
 
     test('a downward drag does not release pins above it', () {
@@ -304,7 +301,10 @@ void main() {
     });
 
     test('re-dragging an already-pinned group moves it without duplicating', () {
-      final rail = railFor(sessions, pins: const SessionPins(groupKeys: ['/b']));
+      final rail = railFor(
+        sessions,
+        pins: const SessionPins(groupKeys: ['/b']),
+      );
       // Rail is now: #/b, session-3, #/a, session-1, session-2
       final pins = resolveRailReorder(
         items: rail,
@@ -318,10 +318,69 @@ void main() {
       // that the entry moves rather than accumulating a second time.
       expect(pins.groupKeys, ['/a', '/b']);
       expect(pins.groupKeys.toSet().length, pins.groupKeys.length);
-      expect(
-        render(railFor(sessions, pins: pins)),
-        ['#/a', 'session-1', 'session-2', '#/b', 'session-3'],
+      expect(render(railFor(sessions, pins: pins)), [
+        '#/a',
+        'session-1',
+        'session-2',
+        '#/b',
+        'session-3',
+      ]);
+    });
+  });
+
+  group('session drags and absent pins', () {
+    test('a pin naming a session with no live row keeps its slot', () {
+      // `session-2` is pinned but not running right now — its repository is
+      // still on the rail through `session-1` and `session-3`. Its pin has to
+      // survive a drag *and* stay ranked where it was, because that slot is the
+      // whole promise being made: it is held for when the session comes back.
+      final sessions = [
+        session('session-1', repo: '/a', activity: 10),
+        session('session-3', repo: '/a', activity: 900),
+      ];
+      final rail = railFor(
+        sessions,
+        pins: const SessionPins(sessionIds: ['session-1', 'session-2']),
       );
+
+      // Drag session-3 (last row) to the top of its group.
+      final pins = resolveRailReorder(
+        items: rail,
+        pins: const SessionPins(sessionIds: ['session-1', 'session-2']),
+        oldIndex: rail.indexWhere((i) => i.sessionId == 'session-3'),
+        newIndex: 0,
+      );
+
+      expect(
+        pins.sessionIds,
+        contains('session-2'),
+        reason: 'an absent pin is skipped, never dropped',
+      );
+      // Held at the index it had, rather than collected in front of the live
+      // rows: hoisting it would silently promote session-2 to the top of its own
+      // group the moment it came back, which is not the slot it was held for.
+      expect(pins.sessionIds, ['session-3', 'session-2', 'session-1']);
+    });
+
+    test('dragging the only row in a group pins nothing', () {
+      // The clamp lands it back on itself: a row alone in its group has no
+      // other row to move past. Pinning anyway would record a layout the user
+      // never produced, and leave the reset action showing with nothing to
+      // reset.
+      final sessions = [
+        session('session-1', repo: '/a', activity: 900),
+        session('session-2', repo: '/b', activity: 10),
+      ];
+      final rail = railFor(sessions);
+
+      final pins = resolveRailReorder(
+        items: rail,
+        pins: SessionPins.none,
+        oldIndex: rail.indexWhere((i) => i.sessionId == 'session-2'),
+        newIndex: 0,
+      );
+
+      expect(pins.isEmpty, isTrue);
     });
   });
 

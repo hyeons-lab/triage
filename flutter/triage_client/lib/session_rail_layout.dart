@@ -140,32 +140,27 @@ SessionPins resolveRailReorder({
     for (final item in items)
       if (!item.isHeader && item.groupKey == moved.groupKey) item.sessionId!,
   ];
+  // A lone row in its group has nowhere to go: the clamp above lands it back on
+  // itself. Pinning it anyway would record a layout the user never produced and
+  // leave the reset control showing with nothing visible to reset.
+  if (displayOrder.length < 2) return pins;
+  // The whole flat list goes through `pinPrefixTo` against this group's rows.
+  // Relative order *between* groups carries no meaning — groups are positioned
+  // by [SessionPins.groupKeys], and each group reads only its own members back
+  // out — so every pin that is not a row of this group is "absent" as far as
+  // this call is concerned, and `pinPrefixTo` already keeps those at the index
+  // they held. Splitting the list up first and re-joining it instead gave that
+  // rule a second implementation, which disagreed: it collected the untouched
+  // pins in front, silently promoting a pinned-but-not-running session to the
+  // top of its own group the moment it came back.
   return pins.copyWith(
-    sessionIds: _reorderWithinGroup(
+    sessionIds: pinPrefixTo(
       pins.sessionIds,
       displayOrder,
       moved.sessionId!,
       withinGroup,
     ),
   );
-}
-
-/// Rewrites the flat pinned-session list so [movedId] sits at [index] among its
-/// own group's pinned entries.
-///
-/// Relative order *between* groups carries no meaning — groups are positioned by
-/// [SessionPins.groupKeys], and each group reads only its own members out of
-/// this list — so entries from other groups can simply be carried along.
-List<String> _reorderWithinGroup(
-  List<String> pinnedSessions,
-  List<String> groupDisplayOrder,
-  String movedId,
-  int index,
-) {
-  final members = groupDisplayOrder.toSet();
-  final mine = pinnedSessions.where(members.contains).toList();
-  final others = pinnedSessions.where((id) => !members.contains(id)).toList();
-  return [...others, ...pinPrefixTo(mine, groupDisplayOrder, movedId, index)];
 }
 
 /// Removes a group or session from [pins], returning it to activity ordering.
