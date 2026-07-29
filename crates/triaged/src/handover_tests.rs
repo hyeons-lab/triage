@@ -267,6 +267,7 @@ mod tests {
             output_seq: 0,
             bytes_logged: 0,
             pid: 1,
+            last_activity_ms: 0,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],

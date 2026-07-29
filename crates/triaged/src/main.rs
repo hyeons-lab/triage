@@ -344,6 +344,13 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // than at their launch dir. Always on, independent of the summarizer.
     manager.start_cwd_persistence();
 
+    // Start periodically recording each live session's last-output time into the
+    // manifest, so the client rail's activity ordering survives a daemon kill.
+    // A session that only ever produces output (a build, a running agent) never
+    // triggers a manifest write on its own. Always on, independent of the
+    // summarizer.
+    manager.start_activity_persistence();
+
     // Start the background update check (on by default). Polls the release host
     // for a newer tag via `git ls-remote`; failures are silent and never block
     // startup. No-op when `[update] check` is false.
