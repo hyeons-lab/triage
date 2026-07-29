@@ -1621,6 +1621,40 @@ void main() {
     expect(pinned, contains('main'));
   });
 
+  testWidgets('tapping a row\'s pin indicator releases just that pin', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await tester.pumpWidget(TriageClientApp(client: FakeTriageWebSocketClient()));
+    await tester.pumpAndSettle();
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text('triage / main')),
+    );
+    await tester.pump(const Duration(milliseconds: 200));
+    await gesture.moveBy(const Offset(0, -260));
+    await tester.pump(const Duration(milliseconds: 200));
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    // The indicator is also the control: on touch a long-press already starts a
+    // drag, so a context menu would compete with it.
+    final indicator = find.byTooltip(
+      'Unpin triage / main (return it to activity order)',
+    );
+    expect(indicator, findsOneWidget);
+
+    await tester.tap(indicator);
+    await tester.pumpAndSettle();
+
+    expect(indicator, findsNothing);
+    final prefs = await SharedPreferences.getInstance();
+    expect(
+      prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
+      isEmpty,
+    );
+  });
+
   testWidgets('resetting the rail order clears every pin', (
     WidgetTester tester,
   ) async {

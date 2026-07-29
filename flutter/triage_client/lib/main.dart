@@ -2214,6 +2214,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// Drops every pin, returning the whole rail to activity ordering.
   void _resetRailOrder() => _applyPins(SessionPins.none);
 
+  /// Releases one group back to activity ordering, leaving other pins alone.
+  void _unpinGroup(String groupKey) =>
+      _applyPins(unpin(_pins, groupKey: groupKey));
+
+  /// Releases one session back to activity ordering within its group.
+  void _unpinSession(String sessionId) =>
+      _applyPins(unpin(_pins, sessionId: sessionId));
+
   /// Groups [sessionIds] by repository and orders them by activity.
   ///
   /// Sessions missing from [contexts] still appear — as repo-less entries with
@@ -3363,6 +3371,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       sessionGroups: _sessionGroups,
       pins: _pins,
       onResetOrder: _resetRailOrder,
+      onUnpinGroup: _unpinGroup,
+      onUnpinSession: _unpinSession,
       selectedIndex: _selectedIndex,
       selectedTileKey: _selectedTileKey,
       // On mobile, selecting or creating a session dismisses the overlay so the
@@ -3518,6 +3528,8 @@ class SessionRail extends StatelessWidget {
     required this.sessionGroups,
     required this.pins,
     required this.onResetOrder,
+    required this.onUnpinGroup,
+    required this.onUnpinSession,
     required this.selectedIndex,
     required this.onSelectSession,
     required this.onReorderSession,
@@ -3544,6 +3556,11 @@ class SessionRail extends StatelessWidget {
   final SessionPins pins;
   // Drops every pin, returning the rail to activity ordering.
   final VoidCallback onResetOrder;
+  // Release a single group or row, leaving the rest of the layout intact. Bound
+  // to the pin indicator itself rather than a context menu: on touch, the rail's
+  // long-press is already the drag trigger, so a menu would compete with it.
+  final ValueChanged<String> onUnpinGroup;
+  final ValueChanged<String> onUnpinSession;
   final int selectedIndex;
   // Attached to the selected session's tile so the host can scroll it to the
   // top when the rail (re)opens.
@@ -3838,6 +3855,7 @@ class SessionRail extends StatelessWidget {
                       index: index,
                       label: _groupLabelFor(item.groupKey),
                       pinned: pins.groupKeys.contains(item.groupKey),
+                      onUnpin: () => onUnpinGroup(item.groupKey),
                       isFirst: index == 0,
                     );
                   }
@@ -3871,6 +3889,9 @@ class SessionRail extends StatelessWidget {
                     snippetDetail: session.snippetDetail,
                     activityAt: session.snippetUpdatedAt,
                     pinned: pins.sessionIds.contains(session.remoteSessionId),
+                    onUnpin: session.remoteSessionId == null
+                        ? null
+                        : () => onUnpinSession(session.remoteSessionId!),
                     indistinguishable: indistinguishable.contains(sessionIndex),
                     onTap: () => onSelectSession(sessionIndex),
                   );
@@ -3921,11 +3942,15 @@ class _SessionGroupHeader extends StatelessWidget {
     required this.index,
     required this.label,
     required this.pinned,
+    required this.onUnpin,
     required this.isFirst,
   });
 
   final int index;
   final String label;
+
+  /// Releases this group. Reached by tapping the pin indicator.
+  final VoidCallback onUnpin;
 
   /// Whether this group holds a fixed slot. Shown because otherwise "why isn't
   /// this moving?" has no answer on screen — the reset action alone doesn't say
@@ -3956,16 +3981,7 @@ class _SessionGroupHeader extends StatelessWidget {
               ),
             ),
           ),
-          if (pinned)
-            const Padding(
-              padding: EdgeInsets.only(left: 4),
-              child: Icon(
-                Icons.push_pin,
-                size: 11,
-                color: Color(0xff7fd1c7),
-                semanticLabel: 'Pinned',
-              ),
-            ),
+          if (pinned) _UnpinButton(onUnpin: onUnpin, what: label),
         ],
       ),
     );
@@ -3974,6 +3990,45 @@ class _SessionGroupHeader extends StatelessWidget {
     return isMobilePlatform()
         ? ReorderableDelayedDragStartListener(index: index, child: header)
         : ReorderableDragStartListener(index: index, child: header);
+  }
+}
+
+/// The pin indicator, which is also the control that releases the pin.
+///
+/// Doing both jobs with one affordance keeps the rail out of a gesture conflict:
+/// on touch, a long-press already starts a drag, so a context menu would have to
+/// compete with it. A tap target this small is acceptable because it is purely
+/// corrective — nothing is lost by missing it, and the row's own tap (select) is
+/// the far more common action.
+class _UnpinButton extends StatelessWidget {
+  const _UnpinButton({required this.onUnpin, required this.what});
+
+  final VoidCallback onUnpin;
+
+  /// Name of the thing being unpinned, for the tooltip and screen readers.
+  final String what;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Tooltip(
+        message: 'Unpin $what (return it to activity order)',
+        child: InkWell(
+          onTap: onUnpin,
+          borderRadius: BorderRadius.circular(4),
+          child: const Padding(
+            padding: EdgeInsets.all(2),
+            child: Icon(
+              Icons.push_pin,
+              size: 11,
+              color: Color(0xff7fd1c7),
+              semanticLabel: 'Pinned',
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -4492,6 +4547,7 @@ class SessionListTile extends StatefulWidget {
     this.snippetDetail,
     this.activityAt,
     this.pinned = false,
+    this.onUnpin,
     this.indistinguishable = false,
     this.selected = false,
   });
@@ -4526,6 +4582,9 @@ class SessionListTile extends StatefulWidget {
   // flowing with activity. Marked because a row sitting still while its
   // neighbours move is otherwise unexplained.
   final bool pinned;
+  // Releases this row's pin. Null for a local session, which has no daemon id
+  // and so can never be pinned in the first place.
+  final VoidCallback? onUnpin;
   // True when another row renders the same title and repo, so the snippet is
   // the only thing telling them apart and gets room to say it.
   final bool indistinguishable;
@@ -4661,15 +4720,10 @@ class _SessionListTileState extends State<SessionListTile> {
                                   ),
                                 ),
                               ),
-                              if (widget.pinned)
-                                const Padding(
-                                  padding: EdgeInsets.only(left: 4),
-                                  child: Icon(
-                                    Icons.push_pin,
-                                    size: 11,
-                                    color: Color(0xff7fd1c7),
-                                    semanticLabel: 'Pinned',
-                                  ),
+                              if (widget.pinned && widget.onUnpin != null)
+                                _UnpinButton(
+                                  onUnpin: widget.onUnpin!,
+                                  what: widget.title,
                                 ),
                             ],
                           ),

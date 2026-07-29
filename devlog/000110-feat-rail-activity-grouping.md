@@ -27,7 +27,7 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - [x] Client: group headers in the rail
 - [x] Group-aware drag + pins + reset
 - [ ] `/review-fix-loop high`
-- [ ] Per-item unpin (context menu) — reset clears all; finer control still to do
+- [x] Per-item unpin — the pin indicator is itself the release control
 - [ ] Run the app against a live daemon (the binary transport is unproven end to end)
 
 ## What Changed
@@ -123,6 +123,12 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - 2026-07-28T23:32-0700 `flutter/triage_client/test/session_rail_layout_test.dart`
   (new, 19 tests) + widget tests for pinning-by-drag and for reset.
 
+- 2026-07-28T23:40-0700 `flutter/triage_client/lib/main.dart` — `_UnpinButton`
+  makes the pin indicator its own release control, for both group headers and
+  rows. Chosen over a context menu because on touch the rail's long-press is
+  already the drag trigger, so a menu would compete with it; the small tap target
+  is acceptable for a purely corrective action whose row-tap neighbour (select)
+  is far more common.
 
 ## Verification
 
