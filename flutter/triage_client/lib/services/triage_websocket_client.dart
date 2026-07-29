@@ -386,7 +386,12 @@ class TriageWebSocketClient {
   Future<
     Map<
       String,
-      ({String? repositoryRoot, String? worktreeRoot, String? branch})
+      ({
+        String? repositoryRoot,
+        String? worktreeRoot,
+        String? branch,
+        int lastActivityMs,
+      })
     >
   >
   listSessionContexts() async {
@@ -395,7 +400,12 @@ class TriageWebSocketClient {
     final result =
         <
           String,
-          ({String? repositoryRoot, String? worktreeRoot, String? branch})
+          ({
+            String? repositoryRoot,
+            String? worktreeRoot,
+            String? branch,
+            int lastActivityMs,
+          })
         >{};
     for (final entry in entries ?? const []) {
       final map = entry as Map<String, dynamic>;
@@ -405,6 +415,9 @@ class TriageWebSocketClient {
           repositoryRoot: map['repository_root'] as String?,
           worktreeRoot: map['worktree_root'] as String?,
           branch: map['branch'] as String?,
+          // Absent from a daemon predating activity tracking; 0 reads as
+          // "unknown", which the rail orders last rather than as epoch-old.
+          lastActivityMs: (map['last_activity_ms'] as num?)?.toInt() ?? 0,
         );
       }
     }

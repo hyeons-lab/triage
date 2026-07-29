@@ -29,8 +29,8 @@ use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSi
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi,
-    SessionContext, SessionEvent, SessionEventEnvelope, SessionEventReceiver, SessionId,
-    SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
+    SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope, SessionEventReceiver,
+    SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
     StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
     TerminalStyle, WriteInputRequest,
 };
@@ -2120,15 +2120,18 @@ impl SessionApi for SessionManager {
             .collect())
     }
 
-    /// Every session's most recently resolved git context, for the
-    /// `list_session_contexts` control request. Reads the already-resolved
+    /// Every session's rail metadata — git context plus last-output time — for
+    /// the `list_session_contexts` control request. Reads the already-resolved
     /// per-session context — it never re-runs git (`resolve_session_context`):
     /// live sessions return the actor's cached `SessionContext` via a brief
     /// off-lock round-trip (mirroring `summary_rows`), and historical /
     /// restoring sessions read their stored context directly. Sessions with no
     /// resolved context (e.g. a cwd outside any repository) carry `None`.
-    #[allow(clippy::type_complexity)]
-    fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+    ///
+    /// Rows come back in the same creation order as [`Self::list_sessions`], so a
+    /// client that builds its list from this response inherits a deterministic
+    /// order even when every session's activity is unknown.
+    fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
         // Capture each session's context source under a brief lock: a cloned
         // actor channel for live sessions (read OFF-LOCK so the round-trip never
         // holds the global `sessions` mutex during actor I/O) or the
@@ -2137,32 +2140,43 @@ impl SessionApi for SessionManager {
             Ready(Option<SessionContext>),
             Live(Sender<ActorCommand>),
         }
-        let sources: Vec<(SessionId, ContextSource)> = {
+        let mut sources: Vec<(SessionId, ContextSource, u64)> = {
             let sessions = self.sessions()?;
             sessions
                 .iter()
                 .map(|(session_id, managed)| {
-                    let source = match managed {
-                        ManagedSession::Live { actor, .. } => ContextSource::Live(actor.tx.clone()),
+                    let (source, last_activity_ms) = match managed {
+                        ManagedSession::Live { actor, .. } => (
+                            ContextSource::Live(actor.tx.clone()),
+                            actor.last_activity_ms(),
+                        ),
                         ManagedSession::Historical { session, .. }
-                        | ManagedSession::Restoring { session, .. } => {
-                            ContextSource::Ready(session.context.clone())
-                        }
+                        | ManagedSession::Restoring { session, .. } => (
+                            ContextSource::Ready(session.context.clone()),
+                            session.persisted.last_activity_ms,
+                        ),
                     };
-                    (session_id.clone(), source)
+                    (session_id.clone(), source, last_activity_ms)
                 })
                 .collect()
         };
+        // Same `HashMap`-iteration hazard as `list_sessions`: sort so a client
+        // building its list from this response gets a stable fallback order.
+        sources.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
         Ok(sources
             .into_iter()
-            .map(|(session_id, source)| {
+            .map(|(session_id, source, last_activity_ms)| {
                 let context = match source {
                     ContextSource::Ready(context) => context,
                     // A live actor mid-shutdown simply yields no context rather
                     // than failing the whole batch.
                     ContextSource::Live(tx) => request_session_context(&tx).ok().flatten(),
                 };
-                (session_id, context)
+                SessionContextRow {
+                    session_id,
+                    context,
+                    last_activity_ms,
+                }
             })
             .collect())
     }

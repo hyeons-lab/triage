@@ -21,10 +21,12 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - [x] Daemon: persist/restore `last_activity_at`
 - [x] Daemon: deterministic `list_sessions` order
 - [x] Rust CI gate green (fmt, clippy, rustdoc, `cargo test --workspace`)
-- [ ] Protocol: context + activity on the session-list response (fixes first paint)
-- [ ] Client: group by `repoRoot`, "Other" bucket, activity ordering
-- [ ] Client: rail rendering — nested vs flat, decided by prototype
-- [ ] Flutter tests + `flutter analyze` + `/review-fix-loop high`
+- [x] Protocol: context + activity on the session-list response (fixes first paint)
+- [x] Client: group by `repoRoot`, "Other" bucket, activity ordering
+- [x] Flutter tests (218 pass) + `flutter analyze` clean
+- [ ] Client: group headers in the rail — deferred, see Decisions
+- [ ] Group-aware drag + pins + reset (Phase 2)
+- [ ] `/review-fix-loop high`
 
 ## What Changed
 
@@ -66,6 +68,38 @@ reset-to-activity affordance are deferred to Phase 2 — see
   custom-id ordering, `list_sessions` stability across repeated calls, a restored
   session keeping its persisted stamp, and a live session persisting a real one.
 
+- 2026-07-28T21:22-0700 `crates/triage-core/src/session.rs` — new
+  `SessionContextRow { session_id, context, last_activity_ms }` replaces the
+  `Vec<(SessionId, Option<SessionContext>)>` return of
+  `SessionApi::list_session_contexts`. Carrying context and activity together is
+  what lets a client build its whole list from one response; fetching them
+  separately is what made the rail rearrange after first paint. Also drops two
+  `#[allow(clippy::type_complexity)]` the tuple needed.
+- 2026-07-28T21:22-0700 `crates/triaged/src/session.rs` — `list_session_contexts`
+  fills in activity (live sessions from the actor, historical from the manifest)
+  and sorts by `session_sort_key`, the same `HashMap`-iteration fix as
+  `list_sessions`. A client building its list from this response now inherits a
+  deterministic order even when every stamp is unknown.
+- 2026-07-28T21:22-0700 `crates/triage-core/schema/triage.fbs` +
+  `crates/triage-transport-ws/` — `last_activity_ms` on `SessionContextEntry`,
+  appended last to stay wire-compatible, with `#[serde(default)]` on the JSON
+  form so an older peer decodes as 0 ("unknown").
+- 2026-07-28T21:22-0700 `flutter/triage_client/lib/session_grouping.dart` (new) —
+  `groupSessionsByRepo` / `flattenGroups`, pure functions over
+  `SessionOrderingInput`. Kept out of `main.dart` so the ordering rules are
+  unit-testable against plain data: groups ordered by their *most recent* member
+  (so one active worktree surfaces its whole repository), rows by activity, and
+  every tie broken on the session's creation sequence so the order is total.
+- 2026-07-28T21:22-0700 `flutter/triage_client/lib/main.dart` —
+  `_loadDaemonSessions` fetches contexts *before* building rows and applies each
+  session's context inline, so grouping, ordering, and "repo · worktree" titles
+  all land on the first frame. `_seedSessionContexts` is gone; only the snippet
+  seed remains after the rail is built.
+- 2026-07-28T21:22-0700 `flutter/triage_client/test/session_grouping_test.dart`
+  (new) — 12 tests: adjacency, group ordering by max member, within-group
+  ordering, the "Other" bucket, trailing-slash normalization, numeric vs custom
+  id tie-breaks, independence from input order, and unknown-activity handling.
+
 ## Issues
 
 - 2026-07-28T20:12-0700 `cargo check -p triaged` fails outright because the build
@@ -81,6 +115,23 @@ reset-to-activity affordance are deferred to Phase 2 — see
   exact trap called out in the global instructions. Switched the intra-doc link
   to a plain code span. `cargo clippy` and `cargo test` both passed before this,
   so only the doc gate catches it.
+- 2026-07-28T21:22-0700 Regenerating the checked-in Dart flatbuffers bindings
+  (`flatc --dart`) produced a far larger diff than the one added field: the
+  checked-in file is **stale**, missing `ListSessionContextsRequest` and
+  `SessionContextsResult` entirely. That path is not actually used for control
+  requests — the client sends them as JSON (`_send('list_session_contexts')`,
+  reading `map['repository_root']`) — so the regeneration was reverted rather
+  than carry unrelated drift on this branch. The drift is pre-existing and worth
+  a separate cleanup.
+- 2026-07-28T21:22-0700 Building the header-segmented rail broke two widget
+  tests, both tracing to the removal of drag (one asserts drag persistence, the
+  other uses a drag as setup for a cross-daemon isolation check). Not a hidden
+  bug — but it is what made clear that headers cannot land before their drag
+  replacement. Backed the rendering change out; see Decisions.
+- 2026-07-28T21:22-0700 A script inserting `last_activity_ms` into the test
+  fixtures matched on indentation and also hit the `ManagedSession::Live`
+  destructuring pattern; caught by E0026. Indentation is a poor discriminator for
+  "initializer vs pattern" — the compiler was the real check.
 
 ## Decisions
 
@@ -111,6 +162,21 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - 2026-07-28T20:00-0700 Leave the saved flat drag order key in place (unused by
   Phase 1) rather than deleting it, so Phase 2 can seed pins from it and the
   user's existing hand-built layout is not silently discarded on upgrade.
+
+- 2026-07-28T21:22-0700 Deferred group headers and group-aware drag to Phase 2,
+  after building them and backing them out. Headers require replacing the rail's
+  `ReorderableListView` with a header-segmented list, which removes drag — and
+  drag is a real, tested feature (`widget_test.dart` covers both its persistence
+  and its per-daemon isolation). Landing headers without a drag replacement would
+  have been a silent regression, and the replacement is the full pinning model,
+  not a small addition. Phase 1 therefore ships the ordering with the rail's
+  existing rendering: same-repo sessions come back adjacent because grouping
+  decides the load order, just without a labelled header.
+- 2026-07-28T21:22-0700 Retired the saved flat drag order as the *load* order
+  rather than deleting the feature. Dragging still works and still persists to
+  `sessionOrderPrefKeyFor`; what changed is that a reload now re-derives the
+  order from grouping + activity instead of replaying the saved list. Phase 2
+  turns that stored list into seed pins, so the hand-built layout is not lost.
 
 ## Research & Discoveries
 

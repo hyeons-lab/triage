@@ -901,6 +901,7 @@ pub fn build_server_message<'a>(
                                 repository_root: repo,
                                 worktree_root: wt,
                                 branch,
+                                last_activity_ms: entry.last_activity_ms,
                             },
                         ));
                     }

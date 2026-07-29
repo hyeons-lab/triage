@@ -15,6 +15,7 @@ import 'package:triage_client/models/daemon_server.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
+import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
@@ -742,10 +743,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
-  // Per-server side-rail order (remote session ids), loaded when the active
-  // server resolves and read synchronously when sessions load so the load path
-  // never awaits prefs.
-  List<String> _savedSessionOrder = const [];
   // The daemon the sessions currently in the rail came from. Null while none are
   // loaded, or while a switch is in flight and the tiles still belong to the
   // daemon we are leaving — their ids mean nothing to the one we are joining.
@@ -833,9 +830,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // order below is stored per server.
     _servers = List.of(widget.initialServers.servers);
     _selectedServerId = widget.initialServers.selectedId;
-    // Restore this server's side-rail order in the background; it's read
-    // synchronously from the cache when sessions load.
-    unawaited(_restoreSessionOrder());
     _lastWatchdogTick = DateTime.now();
     _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
       final now = DateTime.now();
@@ -933,7 +927,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               migrateSessionOrder(
                 staleServerId,
                 originId,
-              ).then((_) => _restoreSessionOrder()),
+              ),
             );
           }),
         );
@@ -968,9 +962,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           if (saved && copiedToken) clearLegacyToken();
         }),
       );
-      unawaited(
-        adoptLegacySessionOrder(origin.id).then((_) => _restoreSessionOrder()),
-      );
+      unawaited(adoptLegacySessionOrder(origin.id));
       _connectWebSocket();
     } else {
       // First run on native: no daemon yet, so ask for one instead of dialing a
@@ -1029,7 +1021,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
 
     _purgeDaemonLocalState();
-    await _restoreSessionOrder();
     if (_disposed) return;
     unawaited(_connectWebSocket());
   }
@@ -1065,7 +1056,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _refreshInFlight.clear();
     _loadingSessionIds.clear();
     _sessionsServerId = null;
-    _savedSessionOrder = const [];
   }
 
   /// Renames a daemon or re-points it at a new address.
@@ -1103,11 +1093,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _needsPairing = false;
       });
       _purgeDaemonLocalState();
-      // The purge cleared the in-memory order; reload this server's saved order
-      // (its id is unchanged) before connecting, exactly as _selectServer does —
-      // otherwise the rail reverts to the daemon's default order on an address
-      // edit, and a later drag then overwrites the good on-disk order.
-      await _restoreSessionOrder();
       if (_disposed) return;
       unawaited(_connectWebSocket());
     }
@@ -1897,11 +1882,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final generation = _connectGeneration;
     try {
       final rawSessionIds = await _client.listSessions();
-      // Apply the per-device saved order (cached at startup) before building
-      // rows so selection, history-on-load, and rendering all flow from the
-      // displayed order. Read synchronously — never await prefs on this path.
-      final sessionIds = _applySavedOrder(rawSessionIds, _savedSessionOrder);
+      // Fetch git context + activity *before* building rows, so the rail's first
+      // paint is already grouped by repository and ordered by recency. This used
+      // to run after the rail was built, which meant every load painted in
+      // daemon order and then visibly rearranged itself once context landed.
+      final contexts = await _fetchSessionContexts(generation);
       if (_disposed || generation != _connectGeneration) return;
+      final groups = _groupSessions(rawSessionIds, contexts);
+      final sessionIds = flattenGroups(groups);
       final List<String> failedSessionIds = [];
       final targetSelectedIndex = _selectedIndex >= sessionIds.length
           ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
@@ -1932,6 +1920,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             sessionIds[i],
             loading: i == targetSelectedIndex,
           );
+          // Apply the context fetched above so the row renders with its final
+          // "repo · worktree" title on the first frame, rather than showing a
+          // session-id fallback that swaps out a moment later.
+          final entry = contexts[sessionIds[i]];
+          if (entry != null) {
+            session.applyContext(
+              repoRoot: entry.repositoryRoot,
+              worktreeRoot: entry.worktreeRoot,
+              branch: entry.branch,
+              // The bulk response carries no cwd; live cwd arrives via push.
+              updateCwd: false,
+            );
+          }
           _setupSessionInputListener(session);
           _sessions.add(session);
         }
@@ -1979,15 +1980,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         });
       }
 
-      // Seed side-rail snippets and git context for all sessions (best-effort).
-      // Context gives every session a "repo · worktree" title immediately;
-      // snippets add the one-line summary. Live updates arrive via push events.
-      // Independent best-effort requests — run concurrently to save a connect
-      // round-trip (matters on high-latency mobile links).
-      await Future.wait([
-        _seedSessionSnippets(generation),
-        _seedSessionContexts(generation),
-      ]);
+      // Git context is already applied — it was fetched before the rail was
+      // built so grouping and titles land on the first frame. Only snippets
+      // remain, and they are purely additive: a row renders fine without one.
+      await _seedSessionSnippets(generation);
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
@@ -2024,37 +2020,59 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  // Seed each session's git context on connect so the rail title reads
-  // "repo · worktree" for every session immediately, instead of waiting for a
-  // per-session load (which may never happen / may time out). Only sets the git
-  // fields — the bulk response carries no cwd; live cwd arrives via
-  // `session_context_updated`. Best-effort: an older daemon errors on the
-  // unknown request, which is swallowed here.
-  Future<void> _seedSessionContexts(int generation) async {
+  /// Every session's git context and last-output time, fetched before the rail
+  /// is built so grouping, ordering, and titles are all correct on first paint.
+  ///
+  /// Best-effort: a daemon without the request (pre-upgrade) yields an empty map,
+  /// which leaves the rail ungrouped and on the daemon's own deterministic order
+  /// rather than failing the load.
+  Future<
+    Map<
+      String,
+      ({
+        String? repositoryRoot,
+        String? worktreeRoot,
+        String? branch,
+        int lastActivityMs,
+      })
+    >
+  >
+  _fetchSessionContexts(int generation) async {
     try {
       final contexts = await _client.listSessionContexts();
-      if (_disposed || generation != _connectGeneration || contexts.isEmpty) {
-        return;
-      }
-      setState(() {
-        for (final session in _sessions) {
-          final sid = session.remoteSessionId;
-          final entry = sid == null ? null : contexts[sid];
-          if (entry != null) {
-            // The bulk response carries no cwd, so leave the live cwd alone.
-            session.applyContext(
-              repoRoot: entry.repositoryRoot,
-              worktreeRoot: entry.worktreeRoot,
-              branch: entry.branch,
-              updateCwd: false,
-            );
-          }
-        }
-      });
+      if (_disposed || generation != _connectGeneration) return const {};
+      return contexts;
     } catch (_) {
-      // Context is best-effort rail metadata; a daemon without the request
-      // (pre-upgrade) just leaves titles on their session-id fallback.
+      return const {};
     }
+  }
+
+  /// Groups [sessionIds] by repository and orders them by activity.
+  ///
+  /// Sessions missing from [contexts] still appear — as repo-less entries with
+  /// unknown activity — so a context response that omits a session can never
+  /// drop it from the rail.
+  List<SessionGroup> _groupSessions(
+    List<String> sessionIds,
+    Map<
+      String,
+      ({
+        String? repositoryRoot,
+        String? worktreeRoot,
+        String? branch,
+        int lastActivityMs,
+      })
+    >
+    contexts,
+  ) {
+    return groupSessionsByRepo([
+      for (final sessionId in sessionIds)
+        SessionOrderingInput(
+          sessionId: sessionId,
+          repoRoot: contexts[sessionId]?.repositoryRoot,
+          lastActivityMs: contexts[sessionId]?.lastActivityMs ?? 0,
+        ),
+    ]);
   }
 
   // Placeholder rail row for a daemon session. [loading] true means it is being
@@ -2674,20 +2692,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     unawaited(_persistSessionOrder());
   }
 
-  Future<void> _restoreSessionOrder() async {
-    // The server can change while the prefs read is in flight; capture the one
-    // being read for so a slow read can't apply a stale order to a new daemon.
-    final serverId = _activeServerId;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final order = prefs.getStringList(sessionOrderPrefKeyFor(serverId));
-      if (_disposed || serverId != _activeServerId) return;
-      _savedSessionOrder = order ?? const [];
-    } catch (_) {
-      // Ordering is a best-effort convenience; ignore load failures.
-    }
-  }
-
+  /// Records the rail's current order under the active server's key.
+  ///
+  /// Nothing reads this back yet — repository grouping plus activity ordering
+  /// now decide the load order, and a flat id list cannot express "keep this
+  /// repo's sessions together". It is still written so the pinning work can seed
+  /// initial pins from the layout the user built by hand, rather than discarding
+  /// it on upgrade.
   Future<void> _persistSessionOrder() async {
     final serverId = _activeServerId;
     // The rail keeps rendering — and accepting drags on — the outgoing daemon's
@@ -2699,7 +2710,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         .map((s) => s.remoteSessionId)
         .whereType<String>()
         .toList();
-    _savedSessionOrder = ids;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setStringList(sessionOrderPrefKeyFor(serverId), ids);
@@ -2715,28 +2725,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     } catch (_) {
       // Ordering is a best-effort convenience; ignore removal failures.
     }
-  }
-
-  /// Stable-sorts daemon session ids by the saved per-device order: known ids
-  /// first in saved order, then any new ids in the daemon's original order.
-  List<String> _applySavedOrder(List<String> ids, List<String> savedOrder) {
-    if (savedOrder.isEmpty) return ids;
-    final rank = <String, int>{
-      for (var i = 0; i < savedOrder.length; i++) savedOrder[i]: i,
-    };
-    final daemonRank = <String, int>{
-      for (var i = 0; i < ids.length; i++) ids[i]: i,
-    };
-    final ordered = [...ids];
-    ordered.sort((a, b) {
-      final ra = rank[a];
-      final rb = rank[b];
-      if (ra != null && rb != null) return ra.compareTo(rb);
-      if (ra != null) return -1; // known (saved) ids sort before new ones
-      if (rb != null) return 1;
-      return (daemonRank[a] ?? 0).compareTo(daemonRank[b] ?? 0);
-    });
-    return ordered;
   }
 
   void _selectSession(int index) {

@@ -388,13 +388,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     .api
                     .list_session_contexts()?
                     .into_iter()
-                    .map(|(session_id, context)| {
+                    .map(|row| {
                         let to_string = |path: &Path| path.to_string_lossy().into_owned();
                         // Convert the cached `SessionContext` paths to strings the
                         // same way the `SessionContextUpdated` push does; the bulk
                         // fetch carries no live cwd (the cached context holds only
                         // the git fields), so `current_working_directory` is None.
-                        let (repository_root, worktree_root, branch) = match &context {
+                        let (repository_root, worktree_root, branch) = match &row.context {
                             Some(context) => (
                                 context.repository_root.as_deref().map(to_string),
                                 context.worktree_root.as_deref().map(to_string),
@@ -403,11 +403,12 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                             None => (None, None, None),
                         };
                         SessionContextEntry {
-                            session_id,
+                            session_id: row.session_id,
                             current_working_directory: None,
                             repository_root,
                             worktree_root,
                             branch,
+                            last_activity_ms: row.last_activity_ms,
                         }
                     })
                     .collect();
@@ -530,6 +531,11 @@ pub struct SessionContextEntry {
     pub worktree_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Milliseconds since the Unix epoch of the session's most recent output, so
+    /// a client can order its session list by recency. 0 means unknown — a
+    /// session that has produced no output, or a daemon predating this field.
+    #[serde(default)]
+    pub last_activity_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -682,8 +688,8 @@ mod tests {
     use serde_json::json;
     use triage_core::generated::triage::generated as fb;
     use triage_core::session::{
-        AttachMode, InputLeaseState, SessionContext, SessionEvent, SessionSize, StyledRow,
-        TerminalCursor,
+        AttachMode, InputLeaseState, SessionContext, SessionContextRow, SessionEvent, SessionSize,
+        StyledRow, TerminalCursor,
     };
 
     use super::*;
@@ -764,6 +770,7 @@ mod tests {
                         repository_root: Some("/repo".to_string()),
                         worktree_root: Some("/repo/worktree".to_string()),
                         branch: Some("main".to_string()),
+                        last_activity_ms: 1_700_000_000_000,
                     }],
                 },
             }
@@ -949,22 +956,21 @@ mod tests {
             Ok(self.sessions.lock().unwrap().clone())
         }
 
-        fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+        fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
             Ok(self
                 .sessions
                 .lock()
                 .unwrap()
                 .iter()
                 .cloned()
-                .map(|session_id| {
-                    (
-                        session_id,
-                        Some(SessionContext {
-                            repository_root: Some(PathBuf::from("/repo")),
-                            worktree_root: Some(PathBuf::from("/repo/worktree")),
-                            branch: Some("main".to_string()),
-                        }),
-                    )
+                .map(|session_id| SessionContextRow {
+                    session_id,
+                    context: Some(SessionContext {
+                        repository_root: Some(PathBuf::from("/repo")),
+                        worktree_root: Some(PathBuf::from("/repo/worktree")),
+                        branch: Some("main".to_string()),
+                    }),
+                    last_activity_ms: 1_700_000_000_000,
                 })
                 .collect())
         }
