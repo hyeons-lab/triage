@@ -233,10 +233,20 @@ Future<void> migrateSessionOrder(String fromId, String toId) async {
   if (fromId == toId) return;
   try {
     final prefs = await SharedPreferences.getInstance();
-    final order = prefs.getStringList(sessionOrderPrefKeyFor(fromId));
-    if (order == null) return;
-    await prefs.setStringList(sessionOrderPrefKeyFor(toId), order);
-    await prefs.remove(sessionOrderPrefKeyFor(fromId));
+    // Every per-server rail key moves together. Missing the pin keys here would
+    // silently drop a hand-built layout whenever a server's id changes — which
+    // `reconcileWebOriginSelection` does routinely when a web origin is
+    // repointed, so it is a real loss, not a corner case.
+    for (final key in [
+      sessionOrderPrefKeyFor,
+      pinnedGroupsPrefKeyFor,
+      pinnedSessionsPrefKeyFor,
+    ]) {
+      final value = prefs.getStringList(key(fromId));
+      if (value == null) continue;
+      await prefs.setStringList(key(toId), value);
+      await prefs.remove(key(fromId));
+    }
   } catch (_) {}
 }
 

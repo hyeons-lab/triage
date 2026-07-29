@@ -261,3 +261,28 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - 2026-07-28T20:00-0700 `triage.fbs` has copies in each worktree; schema edits
   must target `crates/triage-core/schema/triage.fbs` in this worktree and the
   checked-in Dart under `lib/generated/` must be regenerated.
+
+## Commits
+
+- 8feceab — feat(triaged): track per-session activity and order sessions deterministically
+- 68f9acc — feat(triage_client): group the session rail by repository, ordered by activity
+- 9d37b89 — fix(triage_client): restore list_session_contexts over the binary transport
+- 6ef6c1b — feat(triage_client): negotiate FlatBuffers by default, keeping JSON as fallback
+- 6e16343 — feat(triage_client): pin rail groups and sessions by dragging, with a reset
+- 226649f — feat(triage_client): release a single pin by tapping its indicator
+- 8127771 — fix(triage_client): make downward rail drags actually move the item
+- HEAD — fix(triage_client): carry pins across a server-id change
+
+## Next Steps
+
+- Run `/review-fix-loop high` to convergence — round 2 is still outstanding.
+- Run the app against a live daemon: the binary transport is verified at the
+  handshake level and under fakes, but no full request/response round-trip has
+  been exercised against a real daemon.
+- Deferred review findings, none blocking: fold the three trailing-slash/leaf
+  helpers into one, `typedef` the four-field context record spelled out five
+  times, merge the two hoist-pinned-to-front functions, hoist `earliestInput`
+  out of the group-sort comparator, drop the unreachable row-index guard, retire
+  or use the now write-only `session_order_v1_*` pref subsystem, share one
+  `session-N` parser between `session_sort_key` and `next_session_sequence`, and
+  add coverage for `run_activity_persistence_loop`.

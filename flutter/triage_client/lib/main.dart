@@ -1969,7 +1969,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _sessionsServerId = _activeServerId;
         _sessions.clear();
         _sessionGroups = groups;
-        _pins = pins;
+        // `_pins` is deliberately *not* reassigned from the local captured above:
+        // a background `_restorePins` may have completed during the awaits since,
+        // and writing the stale capture back would silently discard it.
         for (var i = 0; i < sessionIds.length; i++) {
           // Only the selected session loads now; the rest rest as rail rows
           // until selected (see the lazy-load note below).
@@ -2867,8 +2869,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Reorders the side rail in response to a drag, keeping the current
-  /// selection pointed at the same session, and persists the new order.
+  /// Drops the legacy per-server rail order when its daemon is forgotten.
   Future<void> _clearSessionOrderFor(String serverId) async {
     try {
       final prefs = await SharedPreferences.getInstance();

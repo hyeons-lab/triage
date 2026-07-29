@@ -606,7 +606,6 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         (**self).list_session_snippets()
     }
-    #[allow(clippy::type_complexity)]
     fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
         (**self).list_session_contexts()
     }

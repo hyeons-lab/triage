@@ -1619,6 +1619,12 @@ void main() {
     );
     expect(pinned, isNotNull);
     expect(pinned, contains('main'));
+    // Assert the *position*, not just membership. The old flat-order test
+    // checked where the moved id landed; the first migration of this test
+    // dropped that, and the gap let a bug through where every downward drag
+    // pinned the row back at the top instead of moving it.
+    expect(pinned!.first, 'main', reason: 'dragged to the top of its group');
+    expect(find.text('triage / main'), findsOneWidget);
   });
 
   testWidgets('tapping a row\'s pin indicator releases just that pin', (
