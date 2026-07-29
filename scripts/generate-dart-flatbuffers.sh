@@ -22,9 +22,27 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 schema="$repo_root/crates/triage-core/schema/triage.fbs"
 out_dir="$repo_root/flutter/triage_client/lib/generated"
 
+# flatc's output is not byte-stable across releases — even a blank line moving is
+# enough to fail --check — so the checked-in bindings are only meaningful against
+# one compiler version. Must match the default in
+# .github/actions/setup-flatc/action.yml.
+expected_version="25.2.10"
+
 if ! command -v flatc >/dev/null 2>&1; then
   echo "error: flatc not found on PATH." >&2
-  echo "       Install it (e.g. 'brew install flatbuffers') and re-run." >&2
+  echo "       Install v$expected_version from" >&2
+  echo "       https://github.com/google/flatbuffers/releases/tag/v$expected_version" >&2
+  exit 1
+fi
+
+actual_version="$(flatc --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [[ "$actual_version" != "$expected_version" ]]; then
+  echo "error: flatc $actual_version found, but the checked-in bindings are" >&2
+  echo "       generated with $expected_version. Regenerating with a different" >&2
+  echo "       version produces cosmetically different output that fails CI's" >&2
+  echo "       --check for no real reason." >&2
+  echo "       Get v$expected_version from" >&2
+  echo "       https://github.com/google/flatbuffers/releases/tag/v$expected_version" >&2
   exit 1
 fi
 
@@ -51,5 +69,11 @@ if [[ $check_only -eq 1 ]]; then
   exit 0
 fi
 
+# Regenerate into a clean directory: flatc only writes the files the schema
+# still produces, so a removed or renamed type would otherwise leave its stale
+# output behind — which --check then reports as drift that regenerating never
+# fixes. Everything here is generated, so nothing hand-written is at risk.
+rm -rf "$out_dir"
+mkdir -p "$out_dir"
 flatc --dart -o "$out_dir" "$schema"
 echo "Regenerated Dart FlatBuffers bindings in $out_dir"

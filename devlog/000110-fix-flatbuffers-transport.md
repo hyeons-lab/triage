@@ -84,6 +84,21 @@ observed on its own.
   recognized token, with no server-side preference, so the order in
   `websocketSubprotocols` is genuinely what decides the format.
 
+## Issues
+
+- 2026-07-29T08:52-0700 CI's drift check failed on the first run over a single
+  blank line: the bindings were generated locally with flatc 25.12.19 while CI
+  pins 25.2.10. flatc's output is not byte-stable across releases, so the
+  checked-in file is only meaningful against one compiler version — a hazard
+  flagged as a nitpick in review and immediately proven real. Regenerated with
+  25.2.10, and the script now verifies `flatc --version` and fails with the
+  release URL rather than producing output that CI rejects for no real reason.
+- 2026-07-29T08:52-0700 Regeneration wrote into the existing output directory
+  without clearing it (raised by Copilot on the PR). A type removed or renamed in
+  the schema would leave its stale file behind, and `--check` would then report
+  drift that re-running the script never fixes. Now regenerates into a cleaned
+  directory.
+
 ## Next Steps
 
 - Run the app against a live daemon before merging. The binary transport is

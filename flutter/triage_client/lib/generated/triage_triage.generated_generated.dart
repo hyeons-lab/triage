@@ -7,7 +7,6 @@ import 'dart:typed_data' show Uint8List;
 import 'package:flat_buffers/flat_buffers.dart' as fb;
 
 
-
 enum AttachMode {
   Observer(0),
   InteractiveController(1),
