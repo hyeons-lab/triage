@@ -132,6 +132,31 @@ reset-to-activity affordance are deferred to Phase 2 — see
 
 ## Issues
 
+- 2026-07-29T12:15-0700 Round 4 found two more bugs, both regressions of the
+  branch's own promises rather than edge cases:
+  - `_loadDaemonSessionInto` swaps a freshly built `SessionVm` into the list,
+    and a fresh one has `lastActivityMs` 0. So **opening a session erased its
+    activity stamp** — and since a group is as recent as its most recent member,
+    the next re-group sank that session's whole repository to the bottom as
+    "unknown". Sorting by activity demoted precisely the sessions being used.
+  - The `migrateRailPins` call lost the `_restorePins()` that used to follow it,
+    so after a server-id change the session ran with empty pins and the first
+    drag persisted a one-entry list over everything just migrated. This is the
+    exact failure `c329d75` was written to fix, reintroduced by the rename; the
+    comment above it still claimed the layout "is re-restored so this session
+    keeps it".
+  Neither was caught by a test. The widget suite's fake client never overrides
+  `listSessionContexts`, so every widget test renders the *ungrouped* fallback —
+  the grouped rail has no widget coverage at all, only pure-function coverage.
+  That gap is what let both through and is the most valuable thing round 4
+  surfaced.
+- 2026-07-29T12:15-0700 Extracting `activity_advanced` in round 3 moved the loop
+  body but not the comment boundary, leaving the loop's doc block attached to
+  the predicate and `run_activity_persistence_loop` — the function
+  `start_activity_persistence` points readers at — with no doc at all. Same
+  class of slip in `_hoistPinned`, which ended up with both merged doc blocks
+  stacked and a `[ordered]` reference to a parameter that no longer exists.
+
 - 2026-07-29T11:40-0700 Round 3 cleared the duplication the earlier rounds had
   only recorded. The three trailing-slash/leaf helpers had already drifted —
   only `_normalizeRepoRoot` kept `/` intact, so a repo root of `/` grouped and
@@ -338,18 +363,34 @@ Hashes below are post-rebase.
 - c329d75 — fix(triage_client): carry pins across a server-id change
 - 8840974 — fix(triage_client): decode last_activity_ms over the binary transport
 - 83a668c — fix(triage_client): stop drags from silently releasing pins
-- HEAD — refactor: collapse the rail's duplicated helpers and cover the activity loop
+- 17bdbc8 — refactor: collapse the rail's duplicated helpers and cover the activity loop
+- HEAD — fix(triage_client): keep a session's activity stamp when it is opened
 
 ## Next Steps
 
-- Run `/review-fix-loop high` to convergence — rounds 2 and 3 are applied;
-  round 4 is the confirming pass.
+- **The loop has not converged.** Rounds 2–4 are applied; round 4 still found
+  two real bugs, so a round 5 is required before this is done.
+- Add widget coverage for the grouped rail. `FakeTriageWebSocketClient` does not
+  override `listSessionContexts`, so every widget test exercises the ungrouped
+  fallback — group headers, header drags, `onUnpinGroup` and the first-paint
+  `applyContext` path have no widget-level test, which is how round 4's two bugs
+  reached the branch.
 - Run the app against a live daemon: the binary transport is verified at the
   handshake level and under fakes, but no full request/response round-trip has
   been exercised against a real daemon.
-- Remaining review nitpicks, none blocking: hoist `earliestInput` out of the
-  group-sort comparator, drop the unreachable row-index guard, lift the rail's
-  `Builder` wrapper into `_buildExpandedRail`, share one `_rowKeyFor` between the
-  three places that spell out a row's identity key, and use `fetch_max` in
-  `seed_last_activity_ms` so a restored actor's first output cannot be
-  overwritten by the seed.
+- Open findings from round 4, carried into round 5: `_reorderWithinGroup` treats
+  a pinned-but-absent session of the moved row's own group as "other" and
+  prefixes it, so it jumps to the top of the group's pinned run (the session-side
+  twin of the absent-group-pin bug already fixed in `pinPrefixTo`); `_restorePins`
+  sets `_pins` without recomputing `_sessionGroups`, and `pinPrefixTo` assumes
+  its `displayOrder` already leads with the pinned block, an unenforced
+  load-bearing invariant; a client-created session is inserted at index 0 with
+  activity 0 and no regroup; a drag that clamps back into a single-row group
+  still pins it, so the reset button appears for a layout the user never made; a
+  repository rooted at `/` labels as "Other" and collides with the repo-less
+  group.
+- Remaining nitpicks: hoist `earliestInput` out of the group-sort comparator,
+  drop the unreachable row-index guard, lift the rail's `Builder` wrapper into
+  `_buildExpandedRail`, share one `_rowKeyFor` between the three places that
+  spell out a row's identity key, fold `_homeAbbreviatedPath`'s inline trim into
+  `trimTrailingSlash`, and use `fetch_max` in `seed_last_activity_ms`.

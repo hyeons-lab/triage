@@ -126,10 +126,9 @@ Future<ServerConfig> _migrateLegacyServer(SharedPreferences prefs) async {
   // stored. Dropping them after a failed save would leave nothing recoverable —
   // no server list, an orphaned token under a random id nothing references, and
   // no legacy address or token to retry from — forgetting the user's only
-  // daemon and forcing a re-pair on the next launch. Adopting the rail order
-  // (which deletes the legacy order key) belongs inside this guard for the same
-  // reason: a failed save would otherwise strand the order under an id that
-  // never reached disk, with the legacy key already gone.
+  // daemon and forcing a re-pair on the next launch. Purging the retired rail
+  // order sits inside the guard too, though only for tidiness now that it just
+  // deletes: a retry on the next launch is harmless either way.
   if (saved) {
     await purgeRetiredSessionOrder(server.id);
     if (copiedToken) clearLegacyToken();

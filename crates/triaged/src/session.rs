@@ -2315,16 +2315,6 @@ const CWD_PERSIST_SETTLE: Duration = Duration::from_millis(500);
 /// persisting per output would rewrite the manifest continuously under a build.
 const ACTIVITY_PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Periodically re-persists the manifest when a live session's activity stamp has
-/// advanced, so recency survives an ungraceful daemon kill.
-///
-/// Needed because the manifest is otherwise only rewritten on structural events
-/// (start, exit, `cd`). A session that produces output without ever changing
-/// directory — a long build, a running agent — would persist no activity at all
-/// between those events, which is precisely the session the rail most needs to
-/// order correctly.
-///
-/// Runs on its own thread; exits when the manager is dropped.
 /// Whether any live session's stamp differs from what the last write persisted.
 ///
 /// Only additions and advances count: a session that has *disappeared* since the
@@ -2340,6 +2330,16 @@ fn activity_advanced(
         .any(|(session_id, millis)| persisted.get(session_id) != Some(millis))
 }
 
+/// Periodically re-persists the manifest when a live session's activity stamp has
+/// advanced, so recency survives an ungraceful daemon kill.
+///
+/// Needed because the manifest is otherwise only rewritten on structural events
+/// (start, exit, `cd`). A session that produces output without ever changing
+/// directory — a long build, a running agent — would persist no activity at all
+/// between those events, which is precisely the session the rail most needs to
+/// order correctly.
+///
+/// Runs on its own thread; exits when the manager is dropped.
 fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
     // Mirrors what the last write put in the manifest, so a quiet daemon does no
     // disk I/O at all: with every session idle the stamps stop advancing and the

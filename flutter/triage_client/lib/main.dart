@@ -929,12 +929,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           saveServers(_servers, selectedId: originId).then((saved) {
             // Retire the stale entry's per-server state only once the swap is
             // durably stored; a failed save leaves it for the next launch to
-            // re-reconcile. The rail order follows the daemon (best-effort), then
-            // is re-restored so this session keeps it, exactly as the web-origin
-            // adoption path below does.
+            // re-reconcile. The pins follow the daemon (best-effort) and are
+            // then re-read, so this session keeps the layout it had.
             if (!saved) return;
             clearTokenFor(staleServerId);
-            unawaited(migrateRailPins(staleServerId, originId));
+            // Re-read after the move: `_restorePins` has already run for this
+            // launch and found nothing under the new id, so without this the
+            // session carries empty pins and the first drag persists a
+            // one-entry list over everything just migrated.
+            unawaited(
+              migrateRailPins(staleServerId, originId).then((_) async {
+                if (_disposed || _activeServerId != originId) return;
+                await _restorePins();
+              }),
+            );
           }),
         );
       }
@@ -2304,6 +2312,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         );
         if (existingIndex == -1) return;
         final oldSession = _sessions[existingIndex];
+        // The replacement is built fresh, so its activity stamp is 0 —
+        // "unknown". Carrying the old one forward matters because this runs for
+        // every session the user actually opens: without it the next re-group
+        // sinks the session, and with it its whole repository (a group is as
+        // recent as its most recent member), to the bottom of a rail that is
+        // supposed to surface exactly what is being used.
+        session.lastActivityMs = oldSession.lastActivityMs;
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);

@@ -233,10 +233,10 @@ List<SessionGroup> groupSessionsByRepo(
 /// leaving everything else in its existing order behind them.
 ///
 /// One implementation for groups and sessions: they differ only in how an
-/// element yields its key. The rule that a pin naming something absent is
-/// *skipped rather than dropped* has to hold for both — a repository with no
-/// live sessions right now keeps its slot for when one starts again — and
-/// stating it twice is how the two would eventually disagree.
+/// element yields its key. The rule that a pin naming something absent from
+/// [items] is *skipped rather than dropped* has to hold for both — a repository
+/// with no live sessions right now keeps its slot for when one starts again —
+/// and stating it twice is how the two would eventually disagree.
 List<T> _hoistPinned<T>(
   List<T> items,
   List<String> pinned,
