@@ -25,6 +25,16 @@ const String legacySessionOrderPrefKey = 'session_order_v1';
 /// ids it has never seen.
 String sessionOrderPrefKeyFor(String serverId) => 'session_order_v1_$serverId';
 
+/// shared_preferences key holding one server's pinned repository groups, in
+/// display order. Keyed by server for the same reason as [sessionOrderPrefKeyFor]
+/// — repository paths are specific to the machine the daemon runs on.
+String pinnedGroupsPrefKeyFor(String serverId) => 'pinned_groups_v1_$serverId';
+
+/// shared_preferences key holding one server's pinned session ids, in display
+/// order. Flat across groups; each group reads out only its own members.
+String pinnedSessionsPrefKeyFor(String serverId) =>
+    'pinned_sessions_v1_$serverId';
+
 /// The known daemons plus which one to connect to.
 class ServerConfig {
   const ServerConfig({required this.servers, required this.selectedId});

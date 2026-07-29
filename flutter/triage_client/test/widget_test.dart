@@ -1591,7 +1591,7 @@ void main() {
     expect(client.connectCalls, 2);
   });
 
-  testWidgets('drag-reordering the rail persists a per-device session order', (
+  testWidgets('drag-reordering the rail pins the moved session', (
     WidgetTester tester,
   ) async {
     SharedPreferences.setMockInitialValues({});
@@ -1609,16 +1609,52 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
 
-    // The new order is persisted — under this server's key, since session ids
-    // are daemon-local and one global list would let another daemon's order
-    // overwrite this one's.
+    // Moving a row is what creates a pin: it says the session belongs where it
+    // was put, so it holds that slot instead of flowing with activity. Stored
+    // under this server's key, since session ids are daemon-local and one
+    // global list would let another daemon's layout overwrite this one's.
     final prefs = await SharedPreferences.getInstance();
-    final order = prefs.getStringList(
-      sessionOrderPrefKeyFor(unconfiguredServerId),
+    final pinned = prefs.getStringList(
+      pinnedSessionsPrefKeyFor(unconfiguredServerId),
     );
-    expect(order, isNotNull);
-    expect(order, contains('main'));
-    expect(order!.last, isNot('main'));
+    expect(pinned, isNotNull);
+    expect(pinned, contains('main'));
+  });
+
+  testWidgets('resetting the rail order clears every pin', (
+    WidgetTester tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await tester.pumpWidget(TriageClientApp(client: FakeTriageWebSocketClient()));
+    await tester.pumpAndSettle();
+
+    const resetTooltip = 'Sort by activity (clears pinned order)';
+    // Offered only once something is pinned, so its presence doubles as the
+    // signal that the rail is holding a manual order at all.
+    expect(find.byTooltip(resetTooltip), findsNothing);
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text('triage / main')),
+    );
+    await tester.pump(const Duration(milliseconds: 200));
+    await gesture.moveBy(const Offset(0, -260));
+    await tester.pump(const Duration(milliseconds: 200));
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(find.byTooltip(resetTooltip), findsOneWidget);
+
+    await tester.tap(find.byTooltip(resetTooltip));
+    await tester.pumpAndSettle();
+
+    // Cleared in memory (the action is gone again) and on disk, so the next
+    // load comes back on activity order rather than replaying the old pins.
+    expect(find.byTooltip(resetTooltip), findsNothing);
+    final prefs = await SharedPreferences.getInstance();
+    expect(
+      prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
+      isEmpty,
+    );
   });
 
   testWidgets(
@@ -1944,14 +1980,14 @@ void main() {
       persistTokenFor(homeMac.id, 'home-token');
       final client = await pumpWithServers(tester, selectedId: workLaptop.id);
 
-      // The rail order recorded against the work laptop.
+      // The rail layout recorded against the work laptop.
       await tester.drag(find.text('triage / main'), const Offset(0, -260));
       await tester.pumpAndSettle();
       final prefs = await SharedPreferences.getInstance();
-      final workOrder = prefs.getStringList(
-        sessionOrderPrefKeyFor(workLaptop.id),
+      final workPins = prefs.getStringList(
+        pinnedSessionsPrefKeyFor(workLaptop.id),
       );
-      expect(workOrder, isNotNull);
+      expect(workPins, isNotNull);
 
       // Switch to the home mac, holding its connect open so we can inspect the
       // window between daemons.
@@ -1970,11 +2006,11 @@ void main() {
       expect(find.text('triage / main'), findsNothing);
 
       // So nothing can have been filed under the home mac, and the work laptop's
-      // own order is untouched.
-      expect(prefs.getStringList(sessionOrderPrefKeyFor(homeMac.id)), isNull);
+      // own layout is untouched.
+      expect(prefs.getStringList(pinnedSessionsPrefKeyFor(homeMac.id)), isNull);
       expect(
-        prefs.getStringList(sessionOrderPrefKeyFor(workLaptop.id)),
-        workOrder,
+        prefs.getStringList(pinnedSessionsPrefKeyFor(workLaptop.id)),
+        workPins,
       );
 
       client.hangConnect!.complete();

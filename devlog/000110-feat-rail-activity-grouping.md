@@ -24,9 +24,11 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - [x] Protocol: context + activity on the session-list response (fixes first paint)
 - [x] Client: group by `repoRoot`, "Other" bucket, activity ordering
 - [x] Flutter tests (218 pass) + `flutter analyze` clean
-- [ ] Client: group headers in the rail — deferred, see Decisions
-- [ ] Group-aware drag + pins + reset (Phase 2)
+- [x] Client: group headers in the rail
+- [x] Group-aware drag + pins + reset
 - [ ] `/review-fix-loop high`
+- [ ] Per-item unpin (context menu) — reset clears all; finer control still to do
+- [ ] Run the app against a live daemon (the binary transport is unproven end to end)
 
 ## What Changed
 
@@ -100,6 +102,35 @@ reset-to-activity affordance are deferred to Phase 2 — see
   ordering, the "Other" bucket, trailing-slash normalization, numeric vs custom
   id tie-breaks, independence from input order, and unknown-activity handling.
 
+- 2026-07-28T23:32-0700 `flutter/triage_client/lib/session_rail_layout.dart` (new)
+  — flat rail layout plus the drag→pin mapping. One `ReorderableListView` with
+  headers interleaved, not nested lists: nesting reads better but puts two
+  reorderables in one gesture arena, where an inner row's drag gets captured by
+  the outer list and a touch long-press on a header is ambiguous between levels.
+  One list means one gesture space, at the cost of index arithmetic — which is
+  why the arithmetic lives in pure functions instead of the widget.
+- 2026-07-28T23:32-0700 `flutter/triage_client/lib/session_grouping.dart` —
+  `SessionPins` (top-block) plus pin-aware ordering. A group's activity is
+  computed from its sessions regardless of pinning, so unpinning restores its
+  true position rather than stranding it. Pins naming an absent group or session
+  are skipped, not dropped, so a repository with no live sessions keeps its slot
+  for when one starts again.
+- 2026-07-28T23:32-0700 `flutter/triage_client/lib/main.dart` — pins state,
+  per-server persistence, `_applyPins` (re-groups and keeps the selection on the
+  same *session*, not the same index), `_reorderRail`, `_resetRailOrder`, group
+  headers as drag handles, pin indicators on headers and rows, and the reset
+  action in the SESSIONS row shown only while something is pinned.
+- 2026-07-28T23:32-0700 `flutter/triage_client/test/session_rail_layout_test.dart`
+  (new, 19 tests) + widget tests for pinning-by-drag and for reset.
+
+
+## Verification
+
+- 2026-07-28T23:32-0700 Reversed the earlier deferral of headers and group-aware
+  drag. They were deferred because landing headers meant removing drag; building
+  the pinning model *is* the replacement, so both ship together and no capability
+  is lost.
+
 ## Issues
 
 - 2026-07-28T20:12-0700 `cargo check -p triaged` fails outright because the build
@@ -132,6 +163,19 @@ reset-to-activity affordance are deferred to Phase 2 — see
   fixtures matched on indentation and also hit the `ManagedSession::Live`
   destructuring pattern; caught by E0026. Indentation is a poor discriminator for
   "initializer vs pattern" — the compiler was the real check.
+- 2026-07-28T23:32-0700 Wiring pins into the load path broke ten-plus widget
+  tests: the selected session stopped blocking on its snapshot, so the rail
+  finished loading when it should still have been pending. Two hypotheses were
+  wrong before instrumentation found it — `_restorePins` awaited
+  `SharedPreferences.getInstance()`, which never completes in tests that don't
+  call `setMockInitialValues`, stalling the whole load behind it. Reasoning about
+  the diff got nowhere; a `print` either side of each await found it immediately.
+  **The constraint was already documented** in the code this replaced: *"read
+  synchronously from the cache when sessions load so the load path never awaits
+  prefs."* Restored that shape — pins are primed in the background when the
+  server resolves, and the load path reads `_pins` synchronously. Worth
+  remembering that a comment explaining why something is structured oddly is
+  usually load-bearing.
 
 ## Decisions
 

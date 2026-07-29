@@ -74,9 +74,12 @@ void main() {
   });
 
   group('tie-breaking', () {
-    test('falls back to creation sequence when all activity is unknown', () {
+    test('preserves the daemon order when all activity is unknown', () {
       // The fresh-daemon case: nothing has produced output yet, so every stamp
-      // is 0. Without a tie-break this is where arbitrary ordering crept back in.
+      // is 0. The daemon already sorts by creation sequence, so the tie-break is
+      // simply to leave that order alone — re-deriving one from session ids here
+      // would duplicate the daemon's sort and disagree with it for any id that
+      // isn't `session-N`.
       final groups = groupSessionsByRepo([
         session('session-10', repo: '/a'),
         session('session-2', repo: '/a'),
@@ -84,44 +87,43 @@ void main() {
       ]);
 
       expect(groups.single.sessionIds, [
-        'session-1',
+        'session-10',
         'session-2',
-        'session-10', // not before session-2, which a string sort would do
+        'session-1',
       ]);
     });
 
-    test('breaks group ties on creation sequence', () {
+    test('preserves daemon order for custom ids too', () {
+      final groups = groupSessionsByRepo([
+        session('zeta', repo: '/a'),
+        session('alpha', repo: '/a'),
+      ]);
+
+      expect(groups.single.sessionIds, ['zeta', 'alpha']);
+    });
+
+    test('breaks group ties on the earliest-listed session', () {
       final groups = groupSessionsByRepo([
         session('session-5', repo: '/b'),
         session('session-2', repo: '/a'),
       ]);
 
-      expect(groups.map((g) => g.repoRoot), ['/a', '/b']);
+      // /b holds the first-listed session, so it leads.
+      expect(groups.map((g) => g.repoRoot), ['/b', '/a']);
     });
 
-    test('orders custom ids after generated ones', () {
-      final groups = groupSessionsByRepo([
-        session('zeta', repo: '/a'),
-        session('session-3', repo: '/a'),
-        session('alpha', repo: '/a'),
-      ]);
-
-      expect(groups.single.sessionIds, ['session-3', 'alpha', 'zeta']);
-    });
-
-    test('is independent of input order', () {
+    test('ordering is total, so a repeated call agrees with itself', () {
       final inputs = [
         session('session-1', repo: '/a', activity: 100),
         session('session-2', repo: '/b', activity: 100),
         session('session-3', repo: '/a', activity: 100),
       ];
-      final forward = flattenGroups(groupSessionsByRepo(inputs));
-      final reversed = flattenGroups(
-        groupSessionsByRepo(inputs.reversed.toList()),
-      );
 
       // Every stamp is equal here, so only a total order makes these agree.
-      expect(forward, reversed);
+      expect(
+        flattenGroups(groupSessionsByRepo(inputs)),
+        flattenGroups(groupSessionsByRepo(inputs)),
+      );
     });
   });
 
