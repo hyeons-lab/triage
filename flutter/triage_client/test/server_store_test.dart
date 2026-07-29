@@ -71,12 +71,13 @@ void main() {
       expect(retrieveTokenFor(server.id), 'legacy-token');
       expect(retrieveLegacyToken(), isNull);
 
-      // The rail order follows the daemon it was recorded against.
+      // The retired rail order is cleared rather than carried onto the server:
+      // ordering is derived now, so a stored id list has nothing to say.
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getStringList(sessionOrderPrefKeyFor(server.id)), [
-        'b',
-        'a',
-      ]);
+      expect(
+        prefs.getStringList(retiredSessionOrderPrefKeyFor(server.id)),
+        isNull,
+      );
       expect(prefs.getStringList(legacySessionOrderPrefKey), isNull);
     });
 
@@ -262,8 +263,7 @@ void main() {
       expect(retrieveTokenFor(origin.id), 'paired-token');
     });
 
-    test('never clobbers an existing origin credential with the stale token',
-        () {
+    test('never clobbers an existing origin credential with the stale token', () {
       // The origin is already paired (e.g. from a prior sync); that token is the
       // live one, so a stale entry's copy must not overwrite it.
       persistTokenFor(stale.id, 'stale-token');
@@ -407,48 +407,77 @@ void main() {
     });
   });
 
-  group('migrateSessionOrder', () {
-    test(
-      'moves the rail order onto the new id and deletes the old key',
-      () async {
-        SharedPreferences.setMockInitialValues({
-          sessionOrderPrefKeyFor('web-127.0.0.1-7777'): ['c', 'a', 'b'],
-        });
+  group('migrateRailPins', () {
+    test('moves the pins onto the new id and deletes the old keys', () async {
+      SharedPreferences.setMockInitialValues({
+        pinnedGroupsPrefKeyFor('web-127.0.0.1-7777'): ['/repo'],
+        pinnedSessionsPrefKeyFor('web-127.0.0.1-7777'): ['session-2'],
+      });
 
-        await migrateSessionOrder(
-          'web-127.0.0.1-7777',
-          'web-proxy.example.com-443',
-        );
+      await migrateRailPins(
+        'web-127.0.0.1-7777',
+        'web-proxy.example.com-443',
+      );
 
-        final prefs = await SharedPreferences.getInstance();
-        expect(
-          prefs.getStringList(
-            sessionOrderPrefKeyFor('web-proxy.example.com-443'),
-          ),
-          ['c', 'a', 'b'],
-        );
-        // The stale key does not linger once its order has moved.
-        expect(
-          prefs.getStringList(sessionOrderPrefKeyFor('web-127.0.0.1-7777')),
-          isNull,
-        );
-      },
-    );
-
-    test('does nothing when the source has no saved order', () async {
-      await migrateSessionOrder('web-a-1', 'web-b-2');
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getStringList(sessionOrderPrefKeyFor('web-b-2')), isNull);
+      expect(
+        prefs.getStringList(
+          pinnedGroupsPrefKeyFor('web-proxy.example.com-443'),
+        ),
+        ['/repo'],
+      );
+      expect(
+        prefs.getStringList(
+          pinnedSessionsPrefKeyFor('web-proxy.example.com-443'),
+        ),
+        ['session-2'],
+      );
+      // The stale keys do not linger once their pins have moved.
+      expect(
+        prefs.getStringList(pinnedGroupsPrefKeyFor('web-127.0.0.1-7777')),
+        isNull,
+      );
+      expect(
+        prefs.getStringList(pinnedSessionsPrefKeyFor('web-127.0.0.1-7777')),
+        isNull,
+      );
+    });
+
+    test('does nothing when the source has no saved pins', () async {
+      await migrateRailPins('web-a-1', 'web-b-2');
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getStringList(pinnedGroupsPrefKeyFor('web-b-2')), isNull);
     });
 
     test('is a no-op when the ids are the same', () async {
       SharedPreferences.setMockInitialValues({
-        sessionOrderPrefKeyFor('web-a-1'): ['x'],
+        pinnedGroupsPrefKeyFor('web-a-1'): ['/repo'],
       });
-      await migrateSessionOrder('web-a-1', 'web-a-1');
+      await migrateRailPins('web-a-1', 'web-a-1');
       final prefs = await SharedPreferences.getInstance();
-      // Order preserved, not deleted by a self-move.
-      expect(prefs.getStringList(sessionOrderPrefKeyFor('web-a-1')), ['x']);
+      // Pins preserved, not deleted by a self-move.
+      expect(prefs.getStringList(pinnedGroupsPrefKeyFor('web-a-1')), ['/repo']);
+    });
+  });
+
+  group('purgeRetiredSessionOrder', () {
+    test('deletes both retired keys', () async {
+      SharedPreferences.setMockInitialValues({
+        legacySessionOrderPrefKey: ['b', 'a'],
+        retiredSessionOrderPrefKeyFor('web-a-1'): ['c', 'd'],
+        pinnedGroupsPrefKeyFor('web-a-1'): ['/repo'],
+      });
+
+      await purgeRetiredSessionOrder('web-a-1');
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getStringList(legacySessionOrderPrefKey), isNull);
+      expect(
+        prefs.getStringList(retiredSessionOrderPrefKeyFor('web-a-1')),
+        isNull,
+      );
+      // Pins are a live feature and must survive the purge.
+      expect(prefs.getStringList(pinnedGroupsPrefKeyFor('web-a-1')), ['/repo']);
     });
   });
 }

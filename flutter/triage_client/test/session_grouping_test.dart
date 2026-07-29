@@ -68,7 +68,11 @@ void main() {
         session('session-2', repo: '/a/', activity: 20),
       ]);
 
-      expect(groups.length, 1, reason: 'a trailing slash must not split a repo');
+      expect(
+        groups.length,
+        1,
+        reason: 'a trailing slash must not split a repo',
+      );
       expect(groups.single.sessionIds, ['session-2', 'session-1']);
     });
   });
@@ -152,5 +156,49 @@ void main() {
   test('handles an empty session list', () {
     expect(groupSessionsByRepo([]), isEmpty);
     expect(flattenGroups([]), isEmpty);
+  });
+
+  group('pinPrefixTo', () {
+    test('pins the whole prefix through the drop position', () {
+      expect(
+        pinPrefixTo(const [], const ['/a', '/b', '/c'], '/c', 1),
+        equals(['/a', '/c']),
+      );
+    });
+
+    test('a downward drag pins rather than springing back to the top', () {
+      // With nothing pinned, inserting into the pinned list alone clamps every
+      // target to 0, which silently ate half the drag gesture.
+      expect(
+        pinPrefixTo(const [], const ['/a', '/b', '/c'], '/a', 2),
+        equals(['/b', '/c', '/a']),
+      );
+    });
+
+    test('dropping a new entry into the block does not release the last pin', () {
+      // Regression: the prefix was sized `max(index + 1, alreadyPinned)`, one
+      // short whenever the dragged key was not already pinned — so this dropped
+      // '/b' out of the block and back into activity order.
+      expect(
+        pinPrefixTo(const ['/a', '/b'], const ['/a', '/b', '/c'], '/c', 0),
+        equals(['/c', '/a', '/b']),
+      );
+    });
+
+    test('re-dragging an already-pinned entry does not grow the block', () {
+      expect(
+        pinPrefixTo(const ['/a', '/b'], const ['/a', '/b', '/c'], '/b', 0),
+        equals(['/b', '/a']),
+      );
+    });
+
+    test('a pin whose sessions are all gone survives a drag elsewhere', () {
+      // `displayOrder` cannot contain a group with no live sessions, so a naive
+      // rebuild drops it — losing the slot the rail promises to hold for it.
+      expect(
+        pinPrefixTo(const ['/gone', '/a'], const ['/a', '/b'], '/b', 0),
+        equals(['/gone', '/b', '/a']),
+      );
+    });
   });
 }

@@ -130,12 +130,30 @@ reset-to-activity affordance are deferred to Phase 2 — see
   is acceptable for a purely corrective action whose row-tap neighbour (select)
   is far more common.
 
-## Verification
+## Issues
 
-- 2026-07-28T23:32-0700 Reversed the earlier deferral of headers and group-aware
-  drag. They were deferred because landing headers meant removing drag; building
-  the pinning model *is* the replacement, so both ship together and no capability
-  is lost.
+- 2026-07-29T11:05-0700 Review round 2 (`/review-fix-loop high`, 2 reviewers)
+  found three more bugs in the pin model, all reproduced before fixing:
+  - `pinPrefixTo` sized the pinned block `max(index + 1, alreadyPinned)`, one
+    short whenever the dragged key was not already pinned. Dropping a third
+    entry into a block of two pushed the bottom one out and **silently released
+    it** — the exact side effect the function's own doc promised never happened.
+  - A pin naming a group or session with no live session right now is invisible
+    to `displayOrder`, so the next drag anywhere in the rail dropped it. A
+    repository whose last session exited lost its slot the moment the user
+    touched anything, against the stated "keeps its place for when one starts
+    again".
+  - `_loadDaemonSessions` clamped `_selectedIndex` whenever the session list
+    shrank, overriding the session-anchored reselection computed just above it.
+    The rail highlighted one session while the terminal attached another.
+  None of the three had direct coverage: `pinPrefixTo` had no unit tests at all,
+  only indirect ones through the layout. Added five.
+- 2026-07-29T11:05-0700 `buildRailItems` compared each row's group against only
+  the immediately preceding one, so an ungrouped row between two rows of one
+  group would emit that header twice — duplicate `ValueKey` inside a
+  `ReorderableListView`, which throws. Not reachable today because new sessions
+  are always inserted at the head, but one insertion-point change away. Tracks a
+  set of emitted keys now.
 
 - 2026-07-28T23:55-0700 Review round 1 (`/review-fix-loop high`, 2 reviewers)
   found a real bug: **every downward drag was a no-op**. Pins are a leading
@@ -148,9 +166,6 @@ reset-to-activity affordance are deferred to Phase 2 — see
   *upward* — the one downward assertion the old suite had
   (`expect(order!.last, isNot('main'))`) was deleted when those tests were
   migrated to pins. Migrating a test is where coverage quietly goes missing.
-
-## Issues
-
 - 2026-07-28T20:12-0700 `cargo check -p triaged` fails outright because the build
   script builds the Flutter client. `TRIAGE_SKIP_FLUTTER_BUILD=1` skips it and
   embeds the placeholder bundle — needed for any Rust-only check in this repo.
@@ -256,6 +271,21 @@ reset-to-activity affordance are deferred to Phase 2 — see
   order from grouping + activity instead of replaying the saved list. Phase 2
   turns that stored list into seed pins, so the hand-built layout is not lost.
 
+- 2026-07-28T23:32-0700 Reversed the earlier deferral of headers and group-aware
+  drag. They were deferred because landing headers meant removing drag; building
+  the pinning model *is* the replacement, so both ship together and no capability
+  is lost.
+
+- 2026-07-29T11:05-0700 Retired the `session_order_v1*` preferences rather than
+  seeding pins from them. Phase 1 kept the key on the promise that Phase 2 would
+  turn a saved order into pins; shipping Phase 2 made clear why that is the
+  wrong trade. The saved list is an order over *every* session, so honouring it
+  means pinning every session — which freezes the rail against the activity
+  ordering that is the whole point of the branch. Deleted once on load instead,
+  so upgrading users land on activity order with nothing pinned and pin what
+  they actually want. `migrateSessionOrder` moved only pin keys after this, so
+  it is now `migrateRailPins`.
+
 ## Research & Discoveries
 
 - 2026-07-28T20:00-0700 `git_repository_root` (`session.rs:4894-4904`) resolves via
@@ -290,18 +320,18 @@ Hashes below are post-rebase.
 - e4ba7a0 — feat(triage_client): release a single pin by tapping its indicator
 - d593a08 — fix(triage_client): make downward rail drags actually move the item
 - c329d75 — fix(triage_client): carry pins across a server-id change
-- HEAD — fix(triage_client): decode last_activity_ms over the binary transport
+- 8840974 — fix(triage_client): decode last_activity_ms over the binary transport
+- HEAD — fix(triage_client): stop drags from silently releasing pins
 
 ## Next Steps
 
-- Run `/review-fix-loop high` to convergence — round 2 is still outstanding.
+- Run `/review-fix-loop high` to convergence — round 2 applied its actionable
+  findings; round 3 has not run, so the loop has not converged.
 - Run the app against a live daemon: the binary transport is verified at the
   handshake level and under fakes, but no full request/response round-trip has
   been exercised against a real daemon.
-- Deferred review findings, none blocking: fold the three trailing-slash/leaf
-  helpers into one, `typedef` the four-field context record spelled out five
-  times, merge the two hoist-pinned-to-front functions, hoist `earliestInput`
-  out of the group-sort comparator, drop the unreachable row-index guard, retire
-  or use the now write-only `session_order_v1_*` pref subsystem, share one
+- Deferred review findings, none blocking (round 2 re-confirmed each): fold the three trailing-slash/leaf
+  helpers into one, merge the two hoist-pinned-to-front functions, hoist `earliestInput`
+  out of the group-sort comparator, drop the unreachable row-index guard, share one
   `session-N` parser between `session_sort_key` and `next_session_sequence`, and
   add coverage for `run_activity_persistence_loop`.

@@ -407,18 +407,7 @@ void main() {
         // swallows the throw, so flipping the default would have degraded the
         // side rail silently rather than failing loudly.
         final f = client.listSessionContexts();
-        f.catchError(
-          (_) =>
-              const <
-                String,
-                ({
-                  String? repositoryRoot,
-                  String? worktreeRoot,
-                  String? branch,
-                  int lastActivityMs,
-                })
-              >{},
-        );
+        f.catchError((_) => const <String, SessionContextRecord>{});
 
         expect(sink.sent, hasLength(1));
         final bytes = sink.sent.first as List<int>;

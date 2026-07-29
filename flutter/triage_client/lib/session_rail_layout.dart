@@ -58,14 +58,19 @@ List<RailItem> buildRailItems(
   final withHeaders = distinct.length > 1;
 
   final items = <RailItem>[];
-  String? previousKey;
+  // Tracked as a set rather than by comparing against the previous key alone:
+  // an ungrouped row landing between two rows of one group would otherwise emit
+  // that group's header twice, and both headers carry `ValueKey('group:$key')`
+  // — a duplicate-key exception inside the `ReorderableListView`. Grouping keeps
+  // a group's rows contiguous today, so this is a guard on the invariant rather
+  // than a live fix.
+  final emitted = <String>{};
   for (final sessionId in sessionIds) {
     final key = groupOf[sessionId];
-    if (withHeaders && key != null && key != previousKey) {
+    if (withHeaders && key != null && emitted.add(key)) {
       items.add(RailItem.header(key));
     }
     items.add(RailItem.session(key ?? '', sessionId));
-    previousKey = key;
   }
   return items;
 }

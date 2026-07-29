@@ -944,12 +944,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             // adoption path below does.
             if (!saved) return;
             clearTokenFor(staleServerId);
-            unawaited(
-              migrateSessionOrder(
-                staleServerId,
-                originId,
-              ),
-            );
+            unawaited(migrateRailPins(staleServerId, originId));
           }),
         );
       }
@@ -983,7 +978,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           if (saved && copiedToken) clearLegacyToken();
         }),
       );
-      unawaited(adoptLegacySessionOrder(origin.id));
+      unawaited(purgeRetiredSessionOrder(origin.id));
       _connectWebSocket();
     } else {
       // First run on native: no daemon yet, so ask for one instead of dialing a
@@ -1147,7 +1142,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // snapshot when it is assigned afterwards.
     setState(() => _servers = servers);
     clearTokenFor(serverId);
-    await _clearSessionOrderFor(serverId);
+    await purgeRetiredSessionOrder(serverId);
     await _clearPinsFor(serverId);
     await saveServers(servers, selectedId: nextId);
     if (!mounted) return;
@@ -1996,11 +1991,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _setupSessionInputListener(session);
           _sessions.add(session);
         }
-        if (_selectedIndex >= _sessions.length) {
-          _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
-        } else {
-          _selectedIndex = targetSelectedIndex;
-        }
+        // `targetSelectedIndex` already clamps for a list that shrank, so the
+        // old bounds check here is not just redundant — taking its branch
+        // discards the session-anchored reselection and leaves the rail
+        // highlighting a different row than `_loadDaemonSessionInto` attaches.
+        _selectedIndex = targetSelectedIndex;
         if (sessionIds.isEmpty) {
           _connectionStatus = 'Connected to Daemon';
           _connectionStatusColor = const Color(0xff7fd1c7);
@@ -2086,18 +2081,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// Best-effort: a daemon without the request (pre-upgrade) yields an empty map,
   /// which leaves the rail ungrouped and on the daemon's own deterministic order
   /// rather than failing the load.
-  Future<
-    Map<
-      String,
-      ({
-        String? repositoryRoot,
-        String? worktreeRoot,
-        String? branch,
-        int lastActivityMs,
-      })
-    >
-  >
-  _fetchSessionContexts(int generation) async {
+  Future<Map<String, SessionContextRecord>> _fetchSessionContexts(
+    int generation,
+  ) async {
     try {
       final contexts = await _client.listSessionContexts();
       if (_disposed || generation != _connectGeneration) return const {};
@@ -2108,7 +2094,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // rail to ungrouped-and-unordered with nothing to explain why. A silent
       // catch on exactly this call is what hid the missing FlatBuffers request
       // case until someone noticed the rail had no repository context at all.
-      debugPrint('list_session_contexts failed; rail will be ungrouped: $error');
+      debugPrint(
+        'list_session_contexts failed; rail will be ungrouped: $error',
+      );
       return const {};
     }
   }
@@ -2251,16 +2239,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// drop it from the rail.
   List<SessionGroup> _groupSessions(
     List<String> sessionIds,
-    Map<
-      String,
-      ({
-        String? repositoryRoot,
-        String? worktreeRoot,
-        String? branch,
-        int lastActivityMs,
-      })
-    >
-    contexts,
+    Map<String, SessionContextRecord> contexts,
     SessionPins pins,
   ) {
     return groupSessionsByRepo([
@@ -2866,16 +2845,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (session.isRemote && _client.isConnected) {
         unawaited(_refreshSessionSnapshot(session, includeHistory: true));
       }
-    }
-  }
-
-  /// Drops the legacy per-server rail order when its daemon is forgotten.
-  Future<void> _clearSessionOrderFor(String serverId) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(sessionOrderPrefKeyFor(serverId));
-    } catch (_) {
-      // Ordering is a best-effort convenience; ignore removal failures.
     }
   }
 

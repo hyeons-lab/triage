@@ -120,9 +120,29 @@ List<String> pinPrefixTo(
 ) {
   final reordered = [...displayOrder]..remove(key);
   reordered.insert(index.clamp(0, reordered.length), key);
+
+  // The block has to grow to hold [key] *on top of* what was already pinned.
+  // Taking `max(index + 1, alreadyPinned)` looks equivalent but is one short
+  // whenever [key] is newly pinned: dropping a third entry into a block of two
+  // would push the bottom one out and silently release it.
   final alreadyPinned = pinned.where(displayOrder.contains).length;
-  final take = index + 1 > alreadyPinned ? index + 1 : alreadyPinned;
-  return reordered.take(take.clamp(0, reordered.length)).toList();
+  final needed = alreadyPinned + (pinned.contains(key) ? 0 : 1);
+  final take = index + 1 > needed ? index + 1 : needed;
+  final head = reordered.take(take.clamp(0, reordered.length)).toList();
+
+  // A pin naming a group or session with no live session right now is invisible
+  // to [displayOrder], so it cannot survive a rebuild that reads from it — the
+  // next drag anywhere in the rail would drop it. Splice those back at the index
+  // they held, which is what makes the "keeps its slot for when one starts
+  // again" promise hold through a drag and not just through a re-group.
+  final result = [...head];
+  for (var i = 0; i < pinned.length; i++) {
+    final absent = pinned[i];
+    if (absent != key && !displayOrder.contains(absent)) {
+      result.insert(i.clamp(0, result.length), absent);
+    }
+  }
+  return result;
 }
 
 /// Groups [sessions] by repository and orders both the groups and the sessions

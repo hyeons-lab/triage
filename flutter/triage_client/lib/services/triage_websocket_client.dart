@@ -53,6 +53,20 @@ const flatBuffersSubprotocol = 'triage-flatbuffers';
 /// The subprotocol token that selects the JSON encoding.
 const jsonSubprotocol = 'triage-json';
 
+/// One session's rail metadata as `listSessionContexts` returns it.
+///
+/// Distinct from the wire type `fbs.SessionContextEntry`: this is the decoded
+/// shape both transports agree on.
+///
+/// Named because the same shape is spelled out at every hop between the socket
+/// and the rail — adding `lastActivityMs` was a five-site edit without it.
+typedef SessionContextRecord = ({
+  String? repositoryRoot,
+  String? worktreeRoot,
+  String? branch,
+  int lastActivityMs,
+});
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
@@ -383,30 +397,10 @@ class TriageWebSocketClient {
   /// carries only the git fields (no live cwd — that arrives via
   /// `session_context_updated`). Best-effort: an older daemon that predates this
   /// request will error, which the caller swallows.
-  Future<
-    Map<
-      String,
-      ({
-        String? repositoryRoot,
-        String? worktreeRoot,
-        String? branch,
-        int lastActivityMs,
-      })
-    >
-  >
-  listSessionContexts() async {
+  Future<Map<String, SessionContextRecord>> listSessionContexts() async {
     final response = await _send('list_session_contexts');
     final entries = response['entries'] as List<dynamic>?;
-    final result =
-        <
-          String,
-          ({
-            String? repositoryRoot,
-            String? worktreeRoot,
-            String? branch,
-            int lastActivityMs,
-          })
-        >{};
+    final result = <String, SessionContextRecord>{};
     for (final entry in entries ?? const []) {
       final map = entry as Map<String, dynamic>;
       final sessionId = map['session_id'] as String?;
