@@ -1,4 +1,4 @@
-# 000110 — feat/rail-activity-grouping
+# 000111 — feat/rail-activity-grouping
 
 **Agent:** Claude (claude-opus-5[1m]) @ triage branch feat/rail-activity-grouping
 
@@ -12,7 +12,7 @@ deterministic floor so it never reshuffles for no reason.
 
 Phase 1 (this branch) covers grouping + activity ordering. Pinning and a
 reset-to-activity affordance are deferred to Phase 2 — see
-`devlog/plans/000110-01-rail-activity-grouping.md`.
+`devlog/plans/000111-01-rail-activity-grouping.md`.
 
 ## Progress
 
@@ -166,12 +166,28 @@ reset-to-activity affordance are deferred to Phase 2 — see
   so only the doc gate catches it.
 - 2026-07-28T21:22-0700 Regenerating the checked-in Dart flatbuffers bindings
   (`flatc --dart`) produced a far larger diff than the one added field: the
-  checked-in file is **stale**, missing `ListSessionContextsRequest` and
-  `SessionContextsResult` entirely. That path is not actually used for control
-  requests — the client sends them as JSON (`_send('list_session_contexts')`,
-  reading `map['repository_root']`) — so the regeneration was reverted rather
-  than carry unrelated drift on this branch. The drift is pre-existing and worth
-  a separate cleanup.
+  checked-in file was **stale**, missing `ListSessionContextsRequest` and
+  `SessionContextsResult` entirely. Reverted the regeneration at the time on the
+  grounds that "the client sends control requests as JSON, so that path is not
+  used" — which was **wrong**. `_send` is negotiation-aware and does use
+  FlatBuffers whenever the subprotocol is selected; the client simply never
+  offered it. The breakage was latent, not absent. Split out and fixed
+  separately in #129, which also made FlatBuffers the default.
+- 2026-07-29T10:05-0700 Rebasing onto #129 left the schema's new
+  `last_activity_ms` with no regenerated bindings — that work lived in the two
+  commits the rebase dropped. CI's new drift gate would have caught it; running
+  `scripts/generate-dart-flatbuffers.sh` locally caught it first. The
+  regenerated field routes through the dart2js compat layer automatically
+  (`fbjs.readUint64` / `fbjs.addUint64`), so a new `ulong` is web-safe by
+  construction rather than by remembering.
+- 2026-07-29T10:05-0700 The binary decoder for `SessionContextsResult` omitted
+  `last_activity_ms`, since it was written in #129 before the field existed.
+  Nothing would have failed: `listSessionContexts` defaults it to 0, so every
+  session would report "unknown activity" and the rail would quietly fall back
+  to id order — this branch's entire feature, silently inert, on the transport
+  that is now the default. The same shape as the bug #129 was opened to fix,
+  found the same way: by diffing the decoder against the JSON form field by
+  field rather than trusting that a passing suite means parity.
 - 2026-07-28T21:22-0700 Building the header-segmented rail broke two widget
   tests, both tracing to the removal of drag (one asserts drag persistence, the
   other uses a drag as setup for a cross-daemon isolation check). Not a hidden
@@ -264,14 +280,17 @@ reset-to-activity affordance are deferred to Phase 2 — see
 
 ## Commits
 
-- 8feceab — feat(triaged): track per-session activity and order sessions deterministically
-- 68f9acc — feat(triage_client): group the session rail by repository, ordered by activity
-- 9d37b89 — fix(triage_client): restore list_session_contexts over the binary transport
-- 6ef6c1b — feat(triage_client): negotiate FlatBuffers by default, keeping JSON as fallback
-- 6e16343 — feat(triage_client): pin rail groups and sessions by dragging, with a reset
-- 226649f — feat(triage_client): release a single pin by tapping its indicator
-- 8127771 — fix(triage_client): make downward rail drags actually move the item
-- HEAD — fix(triage_client): carry pins across a server-id change
+Rebased onto `main` after #129 merged, which dropped the two FlatBuffers commits
+this branch carried (`9d37b89`, `6ef6c1b`) — that work landed in #129 instead.
+Hashes below are post-rebase.
+
+- 0e636b1 — feat(triaged): track per-session activity and order sessions deterministically
+- d028d45 — feat(triage_client): group the session rail by repository, ordered by activity
+- d8bc94f — feat(triage_client): pin rail groups and sessions by dragging, with a reset
+- e4ba7a0 — feat(triage_client): release a single pin by tapping its indicator
+- d593a08 — fix(triage_client): make downward rail drags actually move the item
+- c329d75 — fix(triage_client): carry pins across a server-id change
+- HEAD — fix(triage_client): decode last_activity_ms over the binary transport
 
 ## Next Steps
 

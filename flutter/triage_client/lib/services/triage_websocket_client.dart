@@ -782,6 +782,11 @@ class TriageWebSocketClient {
                   'repository_root': entry.repositoryRoot,
                   'worktree_root': entry.worktreeRoot,
                   'branch': entry.branch,
+                  // Omitting this would not fail — `listSessionContexts`
+                  // defaults it to 0 — it would just silently flatten every
+                  // session's activity to "unknown" and drop the rail back to
+                  // id order, on the transport that is now the default.
+                  'last_activity_ms': entry.lastActivityMs,
                 },
               )
               .toList(),
