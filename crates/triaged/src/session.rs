@@ -1016,7 +1016,7 @@ impl SessionManager {
     fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
         // Phase 1 (brief lock): grab the actor command channel + launch of a
         // `Live` session, without doing the actor round-trip under the lock.
-        let (cmd_tx, launch, last_known_cwd) = {
+        let (cmd_tx, launch, last_known_cwd, last_activity_ms) = {
             let sessions = self.sessions()?;
             let Some(ManagedSession::Live {
                 actor,
@@ -1027,7 +1027,12 @@ impl SessionManager {
             else {
                 return Ok(());
             };
-            (actor.tx.clone(), launch.clone(), last_known_cwd.clone())
+            (
+                actor.tx.clone(),
+                launch.clone(),
+                last_known_cwd.clone(),
+                actor.last_activity_ms(),
+            )
         };
 
         // Off-lock: only a cleanly-exited actor is a demote candidate. A snapshot
@@ -1045,6 +1050,12 @@ impl SessionManager {
         // only carries the launch dir, so without this an exit-then-restore would
         // overwrite the persisted cwd with `None` and re-spawn at the launch dir.
         persisted.last_known_cwd = last_known_cwd;
+        // Carry the activity stamp across the demotion for the same reason as the
+        // cwd: `into_persisted` builds from the launch config and zeroes it, so a
+        // session that exits would be written to the manifest as "activity
+        // unknown" and sort to the bottom of the rail despite having been busy
+        // moments earlier.
+        persisted.last_activity_ms = last_activity_ms;
         if !is_restorable_shell_launch(&persisted) {
             return Ok(());
         }
@@ -2350,6 +2361,8 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
             // treating the failed write as if it had landed.
             continue;
         }
+        // Replacing rather than merging also drops shut-down sessions, so this
+        // map tracks the live set instead of growing for the daemon's lifetime.
         persisted = current;
     }
 }

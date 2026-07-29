@@ -90,6 +90,13 @@ SessionPins resolveRailReorder({
   required int newIndex,
 }) {
   if (oldIndex < 0 || oldIndex >= items.length) return pins;
+  // A row with no group is a local session — it has no daemon session id, so it
+  // never appears in a group and a pin naming it could never match anything. Left
+  // unpinned rather than stored, which would otherwise accumulate dead keys in
+  // this server's prefs and keep the reset action permanently visible.
+  if (!items[oldIndex].isHeader && items[oldIndex].groupKey.isEmpty) {
+    return pins;
+  }
   // Convert to post-removal space, matching how the list itself will settle.
   final target = newIndex > oldIndex ? newIndex - 1 : newIndex;
   final moved = items[oldIndex];
@@ -103,8 +110,17 @@ SessionPins resolveRailReorder({
         .take(landing)
         .where((item) => item.isHeader)
         .length;
+    final displayOrder = [
+      for (final item in items)
+        if (item.isHeader) item.groupKey,
+    ];
     return pins.copyWith(
-      groupKeys: pinAt(pins.groupKeys, moved.groupKey, groupIndex),
+      groupKeys: pinPrefixTo(
+        pins.groupKeys,
+        displayOrder,
+        moved.groupKey,
+        groupIndex,
+      ),
     );
   }
 
@@ -115,14 +131,14 @@ SessionPins resolveRailReorder({
       .where((item) => !item.isHeader && item.groupKey == moved.groupKey)
       .length;
 
-  final members = {
+  final displayOrder = [
     for (final item in items)
       if (!item.isHeader && item.groupKey == moved.groupKey) item.sessionId!,
-  };
+  ];
   return pins.copyWith(
     sessionIds: _reorderWithinGroup(
       pins.sessionIds,
-      members,
+      displayOrder,
       moved.sessionId!,
       withinGroup,
     ),
@@ -137,15 +153,14 @@ SessionPins resolveRailReorder({
 /// this list — so entries from other groups can simply be carried along.
 List<String> _reorderWithinGroup(
   List<String> pinnedSessions,
-  Set<String> groupMembers,
+  List<String> groupDisplayOrder,
   String movedId,
   int index,
 ) {
-  final mine = pinnedSessions.where(groupMembers.contains).toList();
-  final others = pinnedSessions
-      .where((id) => !groupMembers.contains(id))
-      .toList();
-  return [...others, ...pinAt(mine, movedId, index)];
+  final members = groupDisplayOrder.toSet();
+  final mine = pinnedSessions.where(members.contains).toList();
+  final others = pinnedSessions.where((id) => !members.contains(id)).toList();
+  return [...others, ...pinPrefixTo(mine, groupDisplayOrder, movedId, index)];
 }
 
 /// Removes a group or session from [pins], returning it to activity ordering.

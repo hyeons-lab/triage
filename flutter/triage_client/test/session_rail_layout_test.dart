@@ -228,6 +228,69 @@ void main() {
       expect(a.sessionIds, isNot(contains('session-3')));
     });
 
+    test('dragging a row DOWN moves it down', () {
+      // Regression: a top-block pin can only hold a position if everything above
+      // it is pinned too, so inserting into the pinned list alone made every
+      // downward drag clamp to 0 and spring back to the top. Half the gesture
+      // silently did nothing, and every test only ever dragged upward.
+      final rail = railFor(sessions);
+      expect(render(rail), [
+        '#/a',
+        'session-1',
+        'session-2',
+        '#/b',
+        'session-3',
+      ]);
+
+      // Drag session-1 (index 1) below session-2 (drop index 3).
+      final pins = resolveRailReorder(
+        items: rail,
+        pins: SessionPins.none,
+        oldIndex: 1,
+        newIndex: 3,
+      );
+
+      expect(
+        render(railFor(sessions, pins: pins)),
+        ['#/a', 'session-2', 'session-1', '#/b', 'session-3'],
+      );
+    });
+
+    test('dragging a header DOWN moves that group down', () {
+      final rail = railFor(sessions);
+
+      // Drag /a's header (index 0) below /b.
+      final pins = resolveRailReorder(
+        items: rail,
+        pins: SessionPins.none,
+        oldIndex: 0,
+        newIndex: 4,
+      );
+
+      expect(
+        render(railFor(sessions, pins: pins)),
+        ['#/b', 'session-3', '#/a', 'session-1', 'session-2'],
+      );
+    });
+
+    test('a downward drag does not release pins above it', () {
+      // Pin session-1 first, then drag session-2 below it; session-1 must stay
+      // pinned rather than being truncated out of the prefix.
+      final pins0 = const SessionPins(sessionIds: ['session-1']);
+      final rail = railFor(sessions, pins: pins0);
+      final rows = rail.where((i) => !i.isHeader).map((i) => i.sessionId);
+      expect(rows, ['session-1', 'session-2', 'session-3']);
+
+      final pins = resolveRailReorder(
+        items: rail,
+        pins: pins0,
+        oldIndex: 2, // session-2
+        newIndex: 3, // below session-2's current slot -> no visible move
+      );
+
+      expect(pins.sessionIds, contains('session-1'));
+    });
+
     test('an out-of-range drag is a no-op rather than a crash', () {
       final rail = railFor(sessions);
       final pins = resolveRailReorder(
@@ -240,7 +303,7 @@ void main() {
       expect(pins.isEmpty, isTrue);
     });
 
-    test('re-dragging an already-pinned group moves it, not duplicates it', () {
+    test('re-dragging an already-pinned group moves it without duplicating', () {
       final rail = railFor(sessions, pins: const SessionPins(groupKeys: ['/b']));
       // Rail is now: #/b, session-3, #/a, session-1, session-2
       final pins = resolveRailReorder(
@@ -250,7 +313,15 @@ void main() {
         newIndex: 3,
       );
 
-      expect(pins.groupKeys, ['/b'], reason: 'no duplicate entry');
+      // /b lands below /a, which means /a has to be pinned too — a leading block
+      // cannot hold an entry beneath an unpinned one. The invariant under test is
+      // that the entry moves rather than accumulating a second time.
+      expect(pins.groupKeys, ['/a', '/b']);
+      expect(pins.groupKeys.toSet().length, pins.groupKeys.length);
+      expect(
+        render(railFor(sessions, pins: pins)),
+        ['#/a', 'session-1', 'session-2', '#/b', 'session-3'],
+      );
     });
   });
 

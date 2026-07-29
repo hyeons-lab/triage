@@ -1932,9 +1932,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final groups = _groupSessions(rawSessionIds, contexts, pins);
       final sessionIds = flattenGroups(groups);
       final List<String> failedSessionIds = [];
-      final targetSelectedIndex = _selectedIndex >= sessionIds.length
-          ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
-          : _selectedIndex;
+      // Re-anchor the selection on the *session*, not the slot it used to
+      // occupy. The rail's order is now derived from activity, so any reconnect
+      // — a network blip, an app resume, an address edit — can legitimately
+      // re-sort it; carrying the old index across would attach and display
+      // whichever session happened to inherit that position.
+      final previouslySelected =
+          (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
+          ? _sessions[_selectedIndex].remoteSessionId
+          : null;
+      final reselected = previouslySelected == null
+          ? -1
+          : sessionIds.indexOf(previouslySelected);
+      final targetSelectedIndex = reselected != -1
+          ? reselected
+          : (_selectedIndex >= sessionIds.length
+                ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
+                : _selectedIndex);
 
       if (_disposed || generation != _connectGeneration) return;
       // Keep a pane only when it is the *same* daemon's session of that name. A
@@ -2086,7 +2100,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final contexts = await _client.listSessionContexts();
       if (_disposed || generation != _connectGeneration) return const {};
       return contexts;
-    } catch (_) {
+    } catch (error) {
+      // Logged rather than swallowed silently: this now drives grouping and
+      // ordering, not just titles, and an unreported failure here degrades the
+      // rail to ungrouped-and-unordered with nothing to explain why. A silent
+      // catch on exactly this call is what hid the missing FlatBuffers request
+      // case until someone noticed the rail had no repository context at all.
+      debugPrint('list_session_contexts failed; rail will be ungrouped: $error');
       return const {};
     }
   }

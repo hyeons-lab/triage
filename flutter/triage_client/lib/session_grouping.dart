@@ -97,16 +97,32 @@ class SessionPins {
       );
 }
 
-/// Moves [key] to [index] within [pinned], pinning it if it was not already.
+/// Pins whatever it takes to put [key] at [index] of [displayOrder].
 ///
 /// Shared by group and session drags because both mean the same thing: "put this
-/// here and keep it there". Clamped into the pinned block — a drop below the
-/// unpinned entries lands at the end of the block rather than being discarded,
-/// since silently ignoring a drag reads as a broken control.
-List<String> pinAt(List<String> pinned, String key, int index) {
-  final next = [...pinned]..remove(key);
-  next.insert(index.clamp(0, next.length), key);
-  return next;
+/// here and keep it there".
+///
+/// Because pins are a leading block, an entry can only hold a position if
+/// everything above it is pinned too — so landing [key] at [index] means pinning
+/// the whole prefix through it, in the order the drop produces. Inserting into
+/// the pinned list alone cannot express a downward drag: with nothing yet
+/// pinned, every target clamps to 0 and the item springs back to the top, which
+/// silently ate half of the rail's drag gesture.
+///
+/// Existing pins are never released as a side effect: the prefix taken is at
+/// least as long as the set already pinned, so dragging one entry cannot unpin
+/// another.
+List<String> pinPrefixTo(
+  List<String> pinned,
+  List<String> displayOrder,
+  String key,
+  int index,
+) {
+  final reordered = [...displayOrder]..remove(key);
+  reordered.insert(index.clamp(0, reordered.length), key);
+  final alreadyPinned = pinned.where(displayOrder.contains).length;
+  final take = index + 1 > alreadyPinned ? index + 1 : alreadyPinned;
+  return reordered.take(take.clamp(0, reordered.length)).toList();
 }
 
 /// Groups [sessions] by repository and orders both the groups and the sessions

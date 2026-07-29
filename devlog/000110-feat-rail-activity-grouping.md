@@ -137,6 +137,18 @@ reset-to-activity affordance are deferred to Phase 2 — see
   the pinning model *is* the replacement, so both ship together and no capability
   is lost.
 
+- 2026-07-28T23:55-0700 Review round 1 (`/review-fix-loop high`, 2 reviewers)
+  found a real bug: **every downward drag was a no-op**. Pins are a leading
+  block, so an entry can only hold a position if everything above it is pinned
+  too — but the drag inserted only the moved key into the pinned list, which with
+  nothing yet pinned clamped every target to 0 and sprang the row back to the
+  top. Replaced `pinAt` with `pinPrefixTo`, which pins the whole prefix through
+  the drop point (never releasing pins already held). Half the rail's primary
+  gesture silently did nothing, and no test caught it because every test dragged
+  *upward* — the one downward assertion the old suite had
+  (`expect(order!.last, isNot('main'))`) was deleted when those tests were
+  migrated to pins. Migrating a test is where coverage quietly goes missing.
+
 ## Issues
 
 - 2026-07-28T20:12-0700 `cargo check -p triaged` fails outright because the build
