@@ -54,8 +54,6 @@ jobs:
 
       - name: Install flatc
         uses: ./.github/actions/setup-flatc
-        with:
-          version: "25.2.10"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -102,8 +100,6 @@ jobs:
 
       - name: Install flatc
         uses: ./.github/actions/setup-flatc
-        with:
-          version: "25.2.10"
 
       - name: Run tests
         run: cargo test --workspace --all-features --locked
@@ -132,16 +128,51 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # The client carries a large pre-existing analyzer backlog (mostly the
-      # generated FlatBuffers bindings), so gate on error-severity only: genuine
-      # breakage fails the build without drowning in the existing info/warning
-      # noise. Tightening this (excluding generated files, clearing the backlog,
-      # then making warnings fatal) is a worthwhile follow-up.
+      - name: Install flatc
+        # Version comes from the action's own default, which the drift check
+        # below reads too — the checked-in bindings are only byte-comparable
+        # against one flatc release, so both sides must name the same one.
+        uses: ./.github/actions/setup-flatc
+
+      # The Rust bindings regenerate from the schema via triage-core's build.rs,
+      # but the Dart ones are checked in with no such trigger. That asymmetry let
+      # them go stale once already: `list_session_contexts` was missing from the
+      # Dart bindings entirely, which would have thrown UnimplementedError on any
+      # flatbuffers-negotiated connection. It went unnoticed because the client
+      # offered only `triage-json` at the time, so nothing negotiated the binary
+      # format — the bug sat latent until the default was flipped. Fail the build
+      # rather than rely on someone noticing.
+      - name: Check Dart FlatBuffers bindings are current
+        working-directory: .
+        run: scripts/generate-dart-flatbuffers.sh --check
+
+      # The generated FlatBuffers bindings are excluded from analysis (see
+      # analysis_options.yaml); what remains is a small backlog of genuine
+      # findings in hand-written code. Still gated on error-severity only until
+      # that is cleared, after which warnings can be made fatal.
       - name: Analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Run tests
         run: flutter test
+
+      # `flutter test` runs on the Dart VM, where ByteData has the uint64
+      # accessors dart2js lacks — so a VM-only suite cannot see the transport
+      # break on web, and once didn't: #48 patched the generated bindings for
+      # dart2js and #53 regenerated the patch away with nothing failing, because
+      # the client still negotiated triage-json. Now that FlatBuffers is the
+      # default and the daemon serves this client as its embedded web UI
+      # (crates/triaged/build.rs runs `flutter build web --release`), the binary
+      # path has to be exercised on the platform that actually ships it.
+      #
+      # Scoped to the transport tests rather than the whole suite: the storage
+      # and widget tests have pre-existing web failures that are unrelated to
+      # this and would only make the gate noise.
+      - name: Run transport tests on web (dart2js)
+        run: |
+          flutter test --platform chrome \
+            test/triage_websocket_client_test.dart \
+            test/flatbuffers_js_compat_test.dart
 
   android-apk:
     name: Android APK

@@ -9,6 +9,16 @@
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  exclude:
+    # flatc output, regenerated from crates/triage-core/schema/triage.fbs by
+    # scripts/generate-dart-flatbuffers.sh. It accounts for the overwhelming
+    # majority of this package's analyzer findings (chiefly
+    # unnecessary_non_null_assertion), none of which are actionable — the file
+    # is machine-written, and its `ignore_for_file` header is reset on every
+    # regeneration, so excluding it here is the only durable fix.
+    - lib/generated/**
+
 linter:
   # The lint rules applied to this project can be customized in the
   # section below to disable rules from the `package:flutter_lints/flutter.yaml`

@@ -34,11 +34,31 @@ const _unauthorizedCode = 'unauthorized';
 bool _isUnauthorized(String value) =>
     value.trim().toLowerCase() == _unauthorizedCode;
 
+/// WebSocket subprotocols offered at connect, in descending preference.
+///
+/// Order is the whole mechanism: the daemon walks the client's offered tokens
+/// and takes the first it recognizes, so listing FlatBuffers first is what makes
+/// it the default. JSON stays as the second offer rather than being dropped —
+/// a daemon that predates the binary format, or one that ignores the header
+/// entirely, then still negotiates something this client can speak.
+///
+/// Nothing keys off this list directly. [TriageWebSocketClient.isFlatBuffersNegotiated]
+/// reads the protocol the server actually *selected*, so a peer that declines
+/// the binary format transparently gets the JSON encoder with no version check.
+const websocketSubprotocols = <String>[flatBuffersSubprotocol, jsonSubprotocol];
+
+/// The subprotocol token that selects the binary encoding.
+const flatBuffersSubprotocol = 'triage-flatbuffers';
+
+/// The subprotocol token that selects the JSON encoding.
+const jsonSubprotocol = 'triage-json';
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
           channelFactory ??
-          ((uri) => WebSocketChannel.connect(uri, protocols: ['triage-json']));
+          ((uri) =>
+              WebSocketChannel.connect(uri, protocols: websocketSubprotocols));
 
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
@@ -62,7 +82,7 @@ class TriageWebSocketClient {
   bool get isConnected => _channel != null;
 
   bool get isFlatBuffersNegotiated =>
-      _channel?.protocol == 'triage-flatbuffers';
+      _channel?.protocol == flatBuffersSubprotocol;
 
   /// How long [connect] waits for the WebSocket handshake before failing.
   ///
@@ -207,6 +227,11 @@ class TriageWebSocketClient {
         // stays fresh without re-attaching.
         _eventController.add(message);
       }
+      // No branch for `update_available`: this client has never forwarded that
+      // push, on JSON any more than on FlatBuffers, and nothing subscribes to
+      // it. Both decoders produce it identically (see `_parseFlatBuffers`) and
+      // both drop it here — parity preserved, behaviour unchanged. Wiring it up
+      // is a self-update change, not a transport one.
     } catch (error) {
       debugPrint(
         'Failed to parse WebSocket message '
@@ -420,7 +445,7 @@ class TriageWebSocketClient {
       throw StateError('WebSocket is not connected');
     }
     try {
-      final isFb = channel.protocol == 'triage-flatbuffers';
+      final isFb = channel.protocol == flatBuffersSubprotocol;
       if (isFb) {
         final bytesPayload = fbs.WriteInputRequestTableObjectBuilder(
           sessionId: sessionId,
@@ -609,8 +634,36 @@ class TriageWebSocketClient {
         'worktree_root': updated.worktreeRoot,
         'branch': updated.branch,
       };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.UpdateAvailablePayload) {
+      final update = payload as fbs.UpdateAvailablePayload;
+      return {
+        'type': 'update_available',
+        'current_version': update.currentVersion,
+        'latest_version': update.latestVersion,
+      };
     }
-    return {};
+    // Reached for `NONE`, or for a union member the bindings know but the
+    // branches above have not been taught — which is exactly how the missing
+    // `SessionContextsResult` case went unnoticed. Tag it rather than returning
+    // a bare `{}`, so a forgotten branch is distinguishable from a decode that
+    // legitimately produced nothing.
+    //
+    // Note this is not the forward-compatibility path: a tag from a *newer*
+    // daemon never arrives here, because `ServerMessagePayloadTypeId.fromValue`
+    // throws on an unknown value and `_handleIncomingMessage` catches that as a
+    // `protocol_error`.
+    return _unhandled('server payload', payloadType?.value);
+  }
+
+  /// Result for a union member no branch handles, carrying the tag so the gap
+  /// is visible instead of looking like an empty decode.
+  Map<String, dynamic> _unhandled(String what, int? tag) {
+    assert(() {
+      debugPrint('TriageWebSocketClient: unhandled FlatBuffers $what $tag');
+      return true;
+    }());
+    return {'type': 'unknown', 'unhandled': what, 'tag': tag};
   }
 
   Map<String, dynamic> _parseServerResult(
@@ -623,10 +676,21 @@ class TriageWebSocketClient {
         return {'result': 'unit'};
       case 2: // HelloResult
         final hello = result as fbs.HelloResult;
+        // `hello` hands its whole map back to callers, so every field the JSON
+        // form carries has to survive the binary one too — the self-update
+        // fields below would otherwise just stop arriving once FlatBuffers is
+        // the negotiated default. `latest_version` stays null rather than ""
+        // until the daemon has completed a release check (see the schema).
         return {
           'result': 'hello',
           'protocol_version': hello.protocolVersion,
           'authenticated': hello.authenticated,
+          'server_version': hello.serverVersion,
+          'update_available': hello.updateAvailable,
+          // Omitted rather than null when unset, matching the daemon's
+          // `skip_serializing_if` on the JSON side.
+          if (hello.latestVersion != null)
+            'latest_version': hello.latestVersion,
         };
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
@@ -691,8 +755,26 @@ class TriageWebSocketClient {
               )
               .toList(),
         };
+      case 14: // SessionContextsResult
+        final contexts = result as fbs.SessionContextsResult;
+        // Shaped to match the JSON form exactly, since `listSessionContexts`
+        // reads one map regardless of which transport produced it.
+        return {
+          'result': 'session_contexts',
+          'entries': (contexts.entries ?? [])
+              .map(
+                (entry) => {
+                  'session_id': entry.sessionId,
+                  'current_working_directory': entry.currentWorkingDirectory,
+                  'repository_root': entry.repositoryRoot,
+                  'worktree_root': entry.worktreeRoot,
+                  'branch': entry.branch,
+                },
+              )
+              .toList(),
+        };
       default:
-        return {};
+        return _unhandled('server result', type.value);
     }
   }
 
@@ -885,7 +967,7 @@ class TriageWebSocketClient {
           },
         };
       default:
-        return {};
+        return _unhandled('session event', type.value);
     }
   }
 
@@ -1041,6 +1123,11 @@ class TriageWebSocketClient {
       case 'list_session_snippets':
         payloadType = fbs.ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
         payload = fbs.ListSessionSnippetsRequestObjectBuilder();
+        break;
+
+      case 'list_session_contexts':
+        payloadType = fbs.ClientRequestPayloadTypeId.ListSessionContextsRequest;
+        payload = fbs.ListSessionContextsRequestObjectBuilder();
         break;
 
       default:
