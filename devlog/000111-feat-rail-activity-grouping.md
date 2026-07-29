@@ -132,6 +132,22 @@ reset-to-activity affordance are deferred to Phase 2 — see
 
 ## Issues
 
+- 2026-07-29T11:40-0700 Round 3 cleared the duplication the earlier rounds had
+  only recorded. The three trailing-slash/leaf helpers had already drifted —
+  only `_normalizeRepoRoot` kept `/` intact, so a repo root of `/` grouped and
+  labelled inconsistently. Now one `trimTrailingSlash` / `leafOf` pair in
+  `session_grouping.dart`. `_applyPinnedOrder` and `_applyPinnedGroupOrder`
+  became one generic `_hoistPinned`, which matters because the "a pin naming an
+  absent entry is skipped, not dropped" rule had to hold in both and was stated
+  twice. `session_sort_key` and `next_session_sequence` now share
+  `generated_session_sequence`.
+- 2026-07-29T11:40-0700 `run_activity_persistence_loop` had no test at all — the
+  only thing making activity survive an ungraceful kill. Its advance predicate
+  was inlined in the loop body and so untestable without a 60s sleep; extracted
+  as `activity_advanced` and covered four ways, including that a *disappearing*
+  session deliberately does not trigger a write (shutdown and demotion persist
+  the manifest themselves, so firing here would double every shutdown's I/O).
+
 - 2026-07-29T11:05-0700 Review round 2 (`/review-fix-loop high`, 2 reviewers)
   found three more bugs in the pin model, all reproduced before fixing:
   - `pinPrefixTo` sized the pinned block `max(index + 1, alreadyPinned)`, one
@@ -321,17 +337,19 @@ Hashes below are post-rebase.
 - d593a08 — fix(triage_client): make downward rail drags actually move the item
 - c329d75 — fix(triage_client): carry pins across a server-id change
 - 8840974 — fix(triage_client): decode last_activity_ms over the binary transport
-- HEAD — fix(triage_client): stop drags from silently releasing pins
+- 83a668c — fix(triage_client): stop drags from silently releasing pins
+- HEAD — refactor: collapse the rail's duplicated helpers and cover the activity loop
 
 ## Next Steps
 
-- Run `/review-fix-loop high` to convergence — round 2 applied its actionable
-  findings; round 3 has not run, so the loop has not converged.
+- Run `/review-fix-loop high` to convergence — rounds 2 and 3 are applied;
+  round 4 is the confirming pass.
 - Run the app against a live daemon: the binary transport is verified at the
   handshake level and under fakes, but no full request/response round-trip has
   been exercised against a real daemon.
-- Deferred review findings, none blocking (round 2 re-confirmed each): fold the three trailing-slash/leaf
-  helpers into one, merge the two hoist-pinned-to-front functions, hoist `earliestInput`
-  out of the group-sort comparator, drop the unreachable row-index guard, share one
-  `session-N` parser between `session_sort_key` and `next_session_sequence`, and
-  add coverage for `run_activity_persistence_loop`.
+- Remaining review nitpicks, none blocking: hoist `earliestInput` out of the
+  group-sort comparator, drop the unreachable row-index guard, lift the rail's
+  `Builder` wrapper into `_buildExpandedRail`, share one `_rowKeyFor` between the
+  three places that spell out a row's identity key, and use `fetch_max` in
+  `seed_last_activity_ms` so a restored actor's first output cannot be
+  overwritten by the seed.

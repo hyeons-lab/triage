@@ -426,24 +426,14 @@ class SessionVm {
   }
 
   /// Last path segment of [repoRoot], for compact display (e.g. "triage").
-  String? get repoName => _leafOf(repoRoot);
+  String? get repoName => leafOf(repoRoot);
 
   /// Last path segment of [worktreeRoot], for compact display. Null when it is
   /// the repo root itself (not a separate worktree) so the rail can hide it.
   String? get worktreeName {
     final wt = worktreeRoot;
     if (wt == null || wt.isEmpty || wt == repoRoot) return null;
-    return _leafOf(wt);
-  }
-
-  static String? _leafOf(String? path) {
-    if (path == null || path.isEmpty) return null;
-    final trimmed = path.endsWith('/')
-        ? path.substring(0, path.length - 1)
-        : path;
-    final slash = trimmed.lastIndexOf('/');
-    final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
-    return leaf.isEmpty ? null : leaf;
+    return leafOf(wt);
   }
 
   /// Human-facing name for the rail/header, so sessions are identifiable at a
@@ -460,7 +450,7 @@ class SessionVm {
       if (b != null && b.trim().isNotEmpty) return '$repo · ${b.trim()}';
       return repo;
     }
-    final cwdLeaf = _leafOf(cwd);
+    final cwdLeaf = leafOf(cwd);
     if (cwdLeaf != null) return cwdLeaf;
     // No git context and no cwd: fall back to the stable title ("triage /
     // <id>") rather than a bare id, so a context-less session still reads
@@ -573,7 +563,7 @@ class SessionVm {
     if (inferredBranch != null && !_isDefaultBranch(inferredBranch)) {
       return inferredBranch;
     }
-    return _leafOf(root);
+    return leafOf(root);
   }
 
   final IconData icon;
@@ -3914,13 +3904,8 @@ class SessionRail extends StatelessWidget {
   /// A group's display name: the repository's directory name, or "Other" for the
   /// catch-all holding sessions outside any repository.
   String _groupLabelFor(String groupKey) {
-    if (groupKey == otherGroupPinKey || groupKey.isEmpty) return 'Other';
-    final trimmed = groupKey.endsWith('/')
-        ? groupKey.substring(0, groupKey.length - 1)
-        : groupKey;
-    final slash = trimmed.lastIndexOf('/');
-    final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
-    return leaf.isEmpty ? 'Other' : leaf;
+    if (groupKey == otherGroupPinKey) return 'Other';
+    return leafOf(groupKey) ?? 'Other';
   }
 }
 

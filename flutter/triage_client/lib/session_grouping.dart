@@ -163,7 +163,7 @@ List<SessionGroup> groupSessionsByRepo(
   final byRepo = <String?, List<SessionOrderingInput>>{};
   for (final session in sessions) {
     // Normalize so a trailing slash doesn't split one repository in two.
-    final key = _normalizeRepoRoot(session.repoRoot);
+    final key = trimTrailingSlash(session.repoRoot);
     byRepo.putIfAbsent(key, () => []).add(session);
   }
 
@@ -179,7 +179,9 @@ List<SessionGroup> groupSessionsByRepo(
     if (a.lastActivityMs != b.lastActivityMs) {
       return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
     }
-    return (inputIndex[a.sessionId] ?? 0).compareTo(inputIndex[b.sessionId] ?? 0);
+    return (inputIndex[a.sessionId] ?? 0).compareTo(
+      inputIndex[b.sessionId] ?? 0,
+    );
   }
 
   final groups = <SessionGroup>[];
@@ -188,9 +190,10 @@ List<SessionGroup> groupSessionsByRepo(
     groups.add(
       SessionGroup(
         repoRoot: entry.key,
-        sessionIds: _applyPinnedOrder(
+        sessionIds: _hoistPinned(
           members.map((s) => s.sessionId).toList(),
           pins.sessionIds,
+          (id) => id,
         ),
         // Max, not min or mean: a group is as recent as its most recent session,
         // so one active worktree surfaces its whole repository. Computed from
@@ -218,7 +221,7 @@ List<SessionGroup> groupSessionsByRepo(
     return earliestInput(a).compareTo(earliestInput(b));
   });
 
-  return _applyPinnedGroupOrder(groups, pins.groupKeys);
+  return _hoistPinned(groups, pins.groupKeys, (group) => group.pinKey);
 }
 
 /// Hoists pinned entries of [ordered] into a leading block, in [pinned] order.
@@ -226,38 +229,31 @@ List<SessionGroup> groupSessionsByRepo(
 /// Pins that name something absent are skipped rather than dropped from the
 /// stored list: a repository with no live sessions right now should keep its
 /// place for when one starts again, instead of silently losing its pin.
-List<String> _applyPinnedOrder(List<String> ordered, List<String> pinned) {
-  if (pinned.isEmpty) return ordered;
-  final present = ordered.toSet();
+/// Moves the entries named by [pinned] to the front of [items], in pinned order,
+/// leaving everything else in its existing order behind them.
+///
+/// One implementation for groups and sessions: they differ only in how an
+/// element yields its key. The rule that a pin naming something absent is
+/// *skipped rather than dropped* has to hold for both — a repository with no
+/// live sessions right now keeps its slot for when one starts again — and
+/// stating it twice is how the two would eventually disagree.
+List<T> _hoistPinned<T>(
+  List<T> items,
+  List<String> pinned,
+  String Function(T) keyOf,
+) {
+  if (pinned.isEmpty) return items;
+  final byKey = {for (final item in items) keyOf(item): item};
   final head = [
     for (final key in pinned)
-      if (present.contains(key)) key,
+      if (byKey.containsKey(key)) byKey[key] as T,
   ];
-  if (head.isEmpty) return ordered;
-  final headSet = head.toSet();
+  if (head.isEmpty) return items;
+  final headKeys = head.map(keyOf).toSet();
   return [
     ...head,
-    for (final key in ordered)
-      if (!headSet.contains(key)) key,
-  ];
-}
-
-List<SessionGroup> _applyPinnedGroupOrder(
-  List<SessionGroup> groups,
-  List<String> pinnedKeys,
-) {
-  if (pinnedKeys.isEmpty) return groups;
-  final byKey = {for (final group in groups) group.pinKey: group};
-  final head = [
-    for (final key in pinnedKeys)
-      if (byKey.containsKey(key)) byKey[key]!,
-  ];
-  if (head.isEmpty) return groups;
-  final headKeys = head.map((g) => g.pinKey).toSet();
-  return [
-    ...head,
-    for (final group in groups)
-      if (!headKeys.contains(group.pinKey)) group,
+    for (final item in items)
+      if (!headKeys.contains(keyOf(item))) item,
   ];
 }
 
@@ -266,10 +262,25 @@ List<String> flattenGroups(List<SessionGroup> groups) => [
   for (final group in groups) ...group.sessionIds,
 ];
 
-String? _normalizeRepoRoot(String? repoRoot) {
-  if (repoRoot == null || repoRoot.isEmpty) return null;
-  if (repoRoot.length > 1 && repoRoot.endsWith('/')) {
-    return repoRoot.substring(0, repoRoot.length - 1);
+/// Drops one trailing `/`, except from the filesystem root itself.
+///
+/// The rail derives a group key, a group header label, and a session title from
+/// the same paths. Three private copies of this rule had already drifted apart —
+/// only this one kept `/` intact — so a fix in one silently disagreed with the
+/// others.
+String? trimTrailingSlash(String? path) {
+  if (path == null || path.isEmpty) return null;
+  if (path.length > 1 && path.endsWith('/')) {
+    return path.substring(0, path.length - 1);
   }
-  return repoRoot;
+  return path;
+}
+
+/// The last path segment of [path], or null when it has none.
+String? leafOf(String? path) {
+  final trimmed = trimTrailingSlash(path);
+  if (trimmed == null) return null;
+  final slash = trimmed.lastIndexOf('/');
+  final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
+  return leaf.isEmpty ? null : leaf;
 }

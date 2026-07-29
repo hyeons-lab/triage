@@ -2325,6 +2325,21 @@ const ACTIVITY_PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 /// order correctly.
 ///
 /// Runs on its own thread; exits when the manager is dropped.
+/// Whether any live session's stamp differs from what the last write persisted.
+///
+/// Only additions and advances count: a session that has *disappeared* since the
+/// last tick is deliberately not a reason to write, because the paths that
+/// remove a session (shutdown, demotion) persist the manifest themselves. Firing
+/// here as well would make every shutdown cost two writes.
+fn activity_advanced(
+    persisted: &HashMap<SessionId, u64>,
+    current: &HashMap<SessionId, u64>,
+) -> bool {
+    current
+        .iter()
+        .any(|(session_id, millis)| persisted.get(session_id) != Some(millis))
+}
+
 fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
     // Mirrors what the last write put in the manifest, so a quiet daemon does no
     // disk I/O at all: with every session idle the stamps stop advancing and the
@@ -2349,10 +2364,7 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
                 _ => None,
             })
             .collect();
-        let advanced = current
-            .iter()
-            .any(|(session_id, millis)| persisted.get(session_id) != Some(millis));
-        if !advanced {
+        if !activity_advanced(&persisted, &current) {
             continue;
         }
         if let Err(error) = manager.persist_manifest(&sessions) {
@@ -2754,25 +2766,27 @@ fn purge_orphaned_session_logs(
 /// creation order while still giving custom ids (which carry no sequence) a
 /// stable, deterministic place.
 fn session_sort_key(session_id: &SessionId) -> (u8, u64, &str) {
-    match session_id
-        .as_str()
-        .strip_prefix("session-")
-        .and_then(|sequence| sequence.parse::<u64>().ok())
-    {
+    match generated_session_sequence(session_id) {
         Some(sequence) => (0, sequence, session_id.as_str()),
         None => (1, 0, session_id.as_str()),
     }
 }
 
+/// The `N` of a generated `session-N` id, or `None` for a custom one.
+///
+/// The single place that knows the generated-id format, so changing the scheme
+/// cannot leave the ordering and the allocator reading it differently.
+fn generated_session_sequence(session_id: &SessionId) -> Option<u64> {
+    session_id
+        .as_str()
+        .strip_prefix("session-")?
+        .parse::<u64>()
+        .ok()
+}
+
 fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u64 {
     sessions
-        .filter_map(|session_id| {
-            session_id
-                .as_str()
-                .strip_prefix("session-")?
-                .parse::<u64>()
-                .ok()
-        })
+        .filter_map(generated_session_sequence)
         .max()
         .map_or(1, |sequence| sequence.saturating_add(1))
 }
@@ -7755,6 +7769,59 @@ mod tests {
                 .expect("historical session remains available")
                 .exited
         );
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    fn activity_map(entries: &[(&str, u64)]) -> HashMap<SessionId, u64> {
+        entries
+            .iter()
+            .map(|(id, millis)| (SessionId::new(*id).expect("session id"), *millis))
+            .collect()
+    }
+
+    #[test]
+    fn activity_advanced_is_false_when_nothing_moved() {
+        // The property that keeps an idle daemon off the disk entirely: with
+        // every session quiet, the stamps stop advancing and this keeps
+        // returning false, so the 60s tick does no I/O.
+        let persisted = activity_map(&[("session-1", 100), ("session-2", 200)]);
+        assert!(!activity_advanced(&persisted, &persisted.clone()));
+    }
+
+    #[test]
+    fn activity_advanced_detects_a_newer_stamp() {
+        let persisted = activity_map(&[("session-1", 100)]);
+        let current = activity_map(&[("session-1", 101)]);
+        assert!(activity_advanced(&persisted, &current));
+    }
+
+    #[test]
+    fn activity_advanced_detects_a_session_that_did_not_exist_before() {
+        let persisted = activity_map(&[("session-1", 100)]);
+        let current = activity_map(&[("session-1", 100), ("session-2", 5)]);
+        assert!(activity_advanced(&persisted, &current));
+    }
+
+    #[test]
+    fn activity_advanced_ignores_a_session_that_went_away() {
+        // Shutdown and demotion persist the manifest themselves, so firing here
+        // too would make every shutdown cost a second write.
+        let persisted = activity_map(&[("session-1", 100), ("session-2", 200)]);
+        let current = activity_map(&[("session-1", 100)]);
+        assert!(!activity_advanced(&persisted, &current));
+    }
+
+    #[test]
+    fn start_activity_persistence_is_idempotent() {
+        let log_dir = unique_log_dir();
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_activity_persistence();
+        // A second call must not spawn a second thread writing the same
+        // manifest; the guard flag is what prevents it.
+        manager.start_activity_persistence();
+        assert!(manager.activity_persistence_started.load(Ordering::Acquire));
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
