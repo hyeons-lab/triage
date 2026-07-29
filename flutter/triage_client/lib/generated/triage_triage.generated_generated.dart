@@ -131,7 +131,8 @@ enum ClientRequestPayloadTypeId {
   StyledRowsRequestTable(13),
   ShutdownSessionRequest(14),
   PairingChallengeRequest(15),
-  ListSessionSnippetsRequest(16);
+  ListSessionSnippetsRequest(16),
+  ListSessionContextsRequest(17);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -155,6 +156,7 @@ enum ClientRequestPayloadTypeId {
       case 14: return ClientRequestPayloadTypeId.ShutdownSessionRequest;
       case 15: return ClientRequestPayloadTypeId.PairingChallengeRequest;
       case 16: return ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
+      case 17: return ClientRequestPayloadTypeId.ListSessionContextsRequest;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -163,7 +165,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 16;
+  static const int maxValue = 17;
   static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
@@ -192,7 +194,8 @@ enum ServerResultPayloadTypeId {
   StyledRowsResult(10),
   CompletedSessionResult(11),
   PairingChallengeResult(12),
-  SessionSnippetsResult(13);
+  SessionSnippetsResult(13),
+  SessionContextsResult(14);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
@@ -213,6 +216,7 @@ enum ServerResultPayloadTypeId {
       case 11: return ServerResultPayloadTypeId.CompletedSessionResult;
       case 12: return ServerResultPayloadTypeId.PairingChallengeResult;
       case 13: return ServerResultPayloadTypeId.SessionSnippetsResult;
+      case 14: return ServerResultPayloadTypeId.SessionContextsResult;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -221,7 +225,7 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 13;
+  static const int maxValue = 14;
   static const fb.Reader<ServerResultPayloadTypeId> reader = _ServerResultPayloadTypeIdReader();
 }
 
@@ -2954,6 +2958,52 @@ class ListSessionSnippetsRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class ListSessionContextsRequest {
+  ListSessionContextsRequest._(this._bc, this._bcOffset);
+  factory ListSessionContextsRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<ListSessionContextsRequest> reader = _ListSessionContextsRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'ListSessionContextsRequest{}';
+  }
+}
+
+class _ListSessionContextsRequestReader extends fb.TableReader<ListSessionContextsRequest> {
+  const _ListSessionContextsRequestReader();
+
+  @override
+  ListSessionContextsRequest createObject(fb.BufferContext bc, int offset) => 
+    ListSessionContextsRequest._(bc, offset);
+}
+
+class ListSessionContextsRequestObjectBuilder extends fb.ObjectBuilder {
+
+  ListSessionContextsRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ClientMessage {
   ClientMessage._(this._bc, this._bcOffset);
   factory ClientMessage(List<int> bytes) {
@@ -2986,6 +3036,7 @@ class ClientMessage {
       case 14: return ShutdownSessionRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 15: return PairingChallengeRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 16: return ListSessionSnippetsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 17: return ListSessionContextsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -4127,6 +4178,196 @@ class SessionSnippetsResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionContextEntry {
+  SessionContextEntry._(this._bc, this._bcOffset);
+  factory SessionContextEntry(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionContextEntry> reader = _SessionContextEntryReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get currentWorkingDirectory => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get repositoryRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
+  String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+
+  @override
+  String toString() {
+    return 'SessionContextEntry{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
+  }
+}
+
+class _SessionContextEntryReader extends fb.TableReader<SessionContextEntry> {
+  const _SessionContextEntryReader();
+
+  @override
+  SessionContextEntry createObject(fb.BufferContext bc, int offset) => 
+    SessionContextEntry._(bc, offset);
+}
+
+class SessionContextEntryBuilder {
+  SessionContextEntryBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(5);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addCurrentWorkingDirectoryOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addRepositoryRootOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addWorktreeRootOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+  int addBranchOffset(int? offset) {
+    fbBuilder.addOffset(4, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _currentWorkingDirectory;
+  final String? _repositoryRoot;
+  final String? _worktreeRoot;
+  final String? _branch;
+
+  SessionContextEntryObjectBuilder({
+    String? sessionId,
+    String? currentWorkingDirectory,
+    String? repositoryRoot,
+    String? worktreeRoot,
+    String? branch,
+  })
+      : _sessionId = sessionId,
+        _currentWorkingDirectory = currentWorkingDirectory,
+        _repositoryRoot = repositoryRoot,
+        _worktreeRoot = worktreeRoot,
+        _branch = branch;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? currentWorkingDirectoryOffset = _currentWorkingDirectory == null ? null
+        : fbBuilder.writeString(_currentWorkingDirectory!);
+    final int? repositoryRootOffset = _repositoryRoot == null ? null
+        : fbBuilder.writeString(_repositoryRoot!);
+    final int? worktreeRootOffset = _worktreeRoot == null ? null
+        : fbBuilder.writeString(_worktreeRoot!);
+    final int? branchOffset = _branch == null ? null
+        : fbBuilder.writeString(_branch!);
+    fbBuilder.startTable(5);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, currentWorkingDirectoryOffset);
+    fbBuilder.addOffset(2, repositoryRootOffset);
+    fbBuilder.addOffset(3, worktreeRootOffset);
+    fbBuilder.addOffset(4, branchOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SessionContextsResult {
+  SessionContextsResult._(this._bc, this._bcOffset);
+  factory SessionContextsResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionContextsResult> reader = _SessionContextsResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<SessionContextEntry>? get entries => const fb.ListReader<SessionContextEntry>(SessionContextEntry.reader).vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'SessionContextsResult{entries: ${entries}}';
+  }
+}
+
+class _SessionContextsResultReader extends fb.TableReader<SessionContextsResult> {
+  const _SessionContextsResultReader();
+
+  @override
+  SessionContextsResult createObject(fb.BufferContext bc, int offset) => 
+    SessionContextsResult._(bc, offset);
+}
+
+class SessionContextsResultBuilder {
+  SessionContextsResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addEntriesOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionContextsResultObjectBuilder extends fb.ObjectBuilder {
+  final List<SessionContextEntryObjectBuilder>? _entries;
+
+  SessionContextsResultObjectBuilder({
+    List<SessionContextEntryObjectBuilder>? entries,
+  })
+      : _entries = entries;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? entriesOffset = _entries == null ? null
+        : fbBuilder.writeList(_entries!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, entriesOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ResponsePayload {
   ResponsePayload._(this._bc, this._bcOffset);
   factory ResponsePayload(List<int> bytes) {
@@ -4156,6 +4397,7 @@ class ResponsePayload {
       case 11: return CompletedSessionResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 12: return PairingChallengeResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 13: return SessionSnippetsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 14: return SessionContextsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }

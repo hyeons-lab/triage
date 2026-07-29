@@ -34,11 +34,25 @@ const _unauthorizedCode = 'unauthorized';
 bool _isUnauthorized(String value) =>
     value.trim().toLowerCase() == _unauthorizedCode;
 
+/// WebSocket subprotocols offered at connect, in descending preference.
+///
+/// Order is the whole mechanism: the daemon walks the client's offered tokens
+/// and takes the first it recognizes, so listing FlatBuffers first is what makes
+/// it the default. JSON stays as the second offer rather than being dropped —
+/// a daemon that predates the binary format, or one that ignores the header
+/// entirely, then still negotiates something this client can speak.
+///
+/// Nothing keys off this list directly. [TriageWebSocketClient.isFlatBuffersNegotiated]
+/// reads the protocol the server actually *selected*, so a peer that declines
+/// the binary format transparently gets the JSON encoder with no version check.
+const websocketSubprotocols = <String>['triage-flatbuffers', 'triage-json'];
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
           channelFactory ??
-          ((uri) => WebSocketChannel.connect(uri, protocols: ['triage-json']));
+          ((uri) =>
+              WebSocketChannel.connect(uri, protocols: websocketSubprotocols));
 
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
@@ -691,6 +705,24 @@ class TriageWebSocketClient {
               )
               .toList(),
         };
+      case 14: // SessionContextsResult
+        final contexts = result as fbs.SessionContextsResult;
+        // Shaped to match the JSON form exactly, since `listSessionContexts`
+        // reads one map regardless of which transport produced it.
+        return {
+          'result': 'session_contexts',
+          'entries': (contexts.entries ?? [])
+              .map(
+                (entry) => {
+                  'session_id': entry.sessionId,
+                  'current_working_directory': entry.currentWorkingDirectory,
+                  'repository_root': entry.repositoryRoot,
+                  'worktree_root': entry.worktreeRoot,
+                  'branch': entry.branch,
+                },
+              )
+              .toList(),
+        };
       default:
         return {};
     }
@@ -1041,6 +1073,11 @@ class TriageWebSocketClient {
       case 'list_session_snippets':
         payloadType = fbs.ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
         payload = fbs.ListSessionSnippetsRequestObjectBuilder();
+        break;
+
+      case 'list_session_contexts':
+        payloadType = fbs.ClientRequestPayloadTypeId.ListSessionContextsRequest;
+        payload = fbs.ListSessionContextsRequestObjectBuilder();
         break;
 
       default:

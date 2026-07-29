@@ -132,11 +132,29 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      # The client carries a large pre-existing analyzer backlog (mostly the
-      # generated FlatBuffers bindings), so gate on error-severity only: genuine
-      # breakage fails the build without drowning in the existing info/warning
-      # noise. Tightening this (excluding generated files, clearing the backlog,
-      # then making warnings fatal) is a worthwhile follow-up.
+      - name: Install flatc
+        # Pinned to match the Rust jobs: the drift check below compares generated
+        # output byte for byte, so a different flatc fails it for no real reason.
+        uses: ./.github/actions/setup-flatc
+        with:
+          version: "25.2.10"
+
+      # The Rust bindings regenerate from the schema via triage-core's build.rs,
+      # but the Dart ones are checked in with no such trigger. That asymmetry let
+      # them go stale once already: `list_session_contexts` was missing from the
+      # Dart bindings entirely, which would have thrown UnimplementedError on any
+      # flatbuffers-negotiated connection. It went unnoticed because the client
+      # offered only `triage-json` at the time, so nothing negotiated the binary
+      # format — the bug sat latent until the default was flipped. Fail the build
+      # rather than rely on someone noticing.
+      - name: Check Dart FlatBuffers bindings are current
+        working-directory: .
+        run: scripts/generate-dart-flatbuffers.sh --check
+
+      # The generated FlatBuffers bindings are excluded from analysis (see
+      # analysis_options.yaml); what remains is a small backlog of genuine
+      # findings in hand-written code. Still gated on error-severity only until
+      # that is cleared, after which warnings can be made fatal.
       - name: Analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
