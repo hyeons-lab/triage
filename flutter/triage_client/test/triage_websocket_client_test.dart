@@ -391,33 +391,41 @@ void main() {
       // The daemon takes the first token it recognizes from the client's list,
       // so this order *is* the default-format decision. JSON must stay present:
       // dropping it would leave a pre-binary daemon with nothing to negotiate.
-      expect(websocketSubprotocols, equals(['triage-flatbuffers', 'triage-json']));
-    });
-
-    test('listSessionContexts request translates to binary FlatBuffers', () async {
-      // Regression: this case was missing from the request switch, so the
-      // request threw UnimplementedError on any flatbuffers-negotiated
-      // connection. It stayed hidden because the client offered only
-      // `triage-json`, so the binary path was never taken — and the caller
-      // swallows the throw, so flipping the default would have degraded the
-      // side rail silently rather than failing loudly.
-      final f = client.listSessionContexts();
-      f.catchError((_) => const <String, ({
-        String? repositoryRoot,
-        String? worktreeRoot,
-        String? branch,
-      })>{});
-
-      expect(sink.sent, hasLength(1));
-      final bytes = sink.sent.first as List<int>;
-
-      final msg = fbs.ClientMessage(bytes);
-      expect(msg.id, equals('req-0'));
       expect(
-        msg.payloadType,
-        equals(fbs.ClientRequestPayloadTypeId.ListSessionContextsRequest),
+        websocketSubprotocols,
+        equals(['triage-flatbuffers', 'triage-json']),
       );
     });
+
+    test(
+      'listSessionContexts request translates to binary FlatBuffers',
+      () async {
+        // Regression: this case was missing from the request switch, so the
+        // request threw UnimplementedError on any flatbuffers-negotiated
+        // connection. It stayed hidden because the client offered only
+        // `triage-json`, so the binary path was never taken — and the caller
+        // swallows the throw, so flipping the default would have degraded the
+        // side rail silently rather than failing loudly.
+        final f = client.listSessionContexts();
+        f.catchError(
+          (_) =>
+              const <
+                String,
+                ({String? repositoryRoot, String? worktreeRoot, String? branch})
+              >{},
+        );
+
+        expect(sink.sent, hasLength(1));
+        final bytes = sink.sent.first as List<int>;
+
+        final msg = fbs.ClientMessage(bytes);
+        expect(msg.id, equals('req-0'));
+        expect(
+          msg.payloadType,
+          equals(fbs.ClientRequestPayloadTypeId.ListSessionContextsRequest),
+        );
+      },
+    );
 
     test('pairingChallenge request translates to binary FlatBuffers', () async {
       final f = client.pairingChallenge(clientId: 'client-123');
@@ -644,49 +652,55 @@ void main() {
       expect(result['response']['snapshot']['visible_rows'], equals(['ready']));
     });
 
-    test('listSessionContexts completes from binary FlatBuffers response', () async {
-      final channel = FakeWebSocketChannel(
-        sink: sink,
-        protocol: 'triage-flatbuffers',
-      );
-      client = TriageWebSocketClient(
-        Uri.parse('ws://localhost/ws'),
-        channelFactory: (_) => channel,
-      );
-      await client.connect();
+    test(
+      'listSessionContexts completes from binary FlatBuffers response',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
 
-      final future = client.listSessionContexts();
+        final future = client.listSessionContexts();
 
-      final response = fbs.ServerMessageObjectBuilder(
-        payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
-        payload: fbs.ResponsePayloadObjectBuilder(
-          id: 'req-0',
-          resultType: fbs.ServerResultPayloadTypeId.SessionContextsResult,
-          result: fbs.SessionContextsResultObjectBuilder(
-            entries: [
-              fbs.SessionContextEntryObjectBuilder(
-                sessionId: 'session-1',
-                repositoryRoot: '/repo',
-                worktreeRoot: '/repo/worktrees/feat',
-                branch: 'feat/x',
-              ),
-              // A session outside any repository: its fields must decode as
-              // absent rather than throwing or dropping the entry.
-              fbs.SessionContextEntryObjectBuilder(sessionId: 'session-2'),
-            ],
+        final response = fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.SessionContextsResult,
+            result: fbs.SessionContextsResultObjectBuilder(
+              entries: [
+                fbs.SessionContextEntryObjectBuilder(
+                  sessionId: 'session-1',
+                  repositoryRoot: '/repo',
+                  worktreeRoot: '/repo/worktrees/feat',
+                  branch: 'feat/x',
+                ),
+                // A session outside any repository: its fields must decode as
+                // absent rather than throwing or dropping the entry.
+                fbs.SessionContextEntryObjectBuilder(sessionId: 'session-2'),
+              ],
+            ),
           ),
-        ),
-      ).toBytes();
+        ).toBytes();
 
-      channel.addIncoming(response);
+        channel.addIncoming(response);
 
-      final result = await future;
-      expect(result.keys, containsAll(<String>['session-1', 'session-2']));
-      expect(result['session-1']!.repositoryRoot, equals('/repo'));
-      expect(result['session-1']!.worktreeRoot, equals('/repo/worktrees/feat'));
-      expect(result['session-1']!.branch, equals('feat/x'));
-      expect(result['session-2']!.repositoryRoot, isNull);
-    });
+        final result = await future;
+        expect(result.keys, containsAll(<String>['session-1', 'session-2']));
+        expect(result['session-1']!.repositoryRoot, equals('/repo'));
+        expect(
+          result['session-1']!.worktreeRoot,
+          equals('/repo/worktrees/feat'),
+        );
+        expect(result['session-1']!.branch, equals('feat/x'));
+        expect(result['session-2']!.repositoryRoot, isNull);
+      },
+    );
 
     test(
       'pairingChallenge completes from binary FlatBuffers response',
@@ -865,5 +879,80 @@ void main() {
         });
       },
     );
+
+    // The self-update fields ride HelloResult, and `hello` hands its whole map
+    // to callers — so a field the binary decoder forgets simply stops arriving
+    // once FlatBuffers is the negotiated default, with nothing failing.
+    test(
+      'hello carries the self-update fields, not just the handshake',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final future = client.hello(clientId: 'client-abc');
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+            payload: fbs.ResponsePayloadObjectBuilder(
+              id: 'req-0',
+              resultType: fbs.ServerResultPayloadTypeId.HelloResult,
+              result: fbs.HelloResultObjectBuilder(
+                protocolVersion: '1',
+                authenticated: true,
+                serverVersion: '0.9.0',
+                updateAvailable: true,
+                latestVersion: '1.0.0',
+              ),
+            ),
+          ).toBytes(),
+        );
+
+        final result = await future;
+        expect(result['protocol_version'], equals('1'));
+        expect(result['authenticated'], isTrue);
+        expect(result['server_version'], equals('0.9.0'));
+        expect(result['update_available'], isTrue);
+        expect(result['latest_version'], equals('1.0.0'));
+      },
+    );
+
+    test('hello omits latest_version until a release check has run', () async {
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-flatbuffers',
+      );
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await client.connect();
+
+      final future = client.hello(clientId: 'client-abc');
+      channel.addIncoming(
+        fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.HelloResult,
+            result: fbs.HelloResultObjectBuilder(
+              protocolVersion: '1',
+              authenticated: true,
+              serverVersion: '0.9.0',
+              updateAvailable: false,
+            ),
+          ),
+        ).toBytes(),
+      );
+
+      // Absent rather than null, matching the daemon's `skip_serializing_if`.
+      expect(await future, isNot(contains('latest_version')));
+    });
   });
 }

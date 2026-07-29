@@ -5,6 +5,8 @@ library triage.generated;
 
 import 'dart:typed_data' show Uint8List;
 import 'package:flat_buffers/flat_buffers.dart' as fb;
+import 'package:triage_client/services/flatbuffers_js_compat.dart'
+    as fbjs;
 
 
 enum AttachMode {
@@ -937,8 +939,8 @@ class SessionSnapshot {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  int get bytesLogged => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get outputSeq => fbjs.readUint64(_bc, _bcOffset, 4, 0);
+  int get bytesLogged => fbjs.readUint64(_bc, _bcOffset, 6, 0);
   SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 8);
   List<String>? get visibleRows => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 10);
   int get styledRowsStart => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 12, 0);
@@ -949,7 +951,7 @@ class SessionSnapshot {
   bool get bracketedPasteEnabled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 22, false);
   bool get exited => const fb.BoolReader().vTableGet(_bc, _bcOffset, 24, false);
   List<int>? get rawOutput => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 26);
-  int get rawOutputStart => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 28, 0);
+  int get rawOutputStart => fbjs.readUint64(_bc, _bcOffset, 28, 0);
   String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 30);
   String? get snippetDetail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 32);
 
@@ -977,11 +979,11 @@ class SessionSnapshotBuilder {
   }
 
   int addOutputSeq(int? outputSeq) {
-    fbBuilder.addUint64(0, outputSeq);
+    fbjs.addUint64(fbBuilder, 0, outputSeq);
     return fbBuilder.offset;
   }
   int addBytesLogged(int? bytesLogged) {
-    fbBuilder.addUint64(1, bytesLogged);
+    fbjs.addUint64(fbBuilder, 1, bytesLogged);
     return fbBuilder.offset;
   }
   int addSize(int offset) {
@@ -1025,7 +1027,7 @@ class SessionSnapshotBuilder {
     return fbBuilder.offset;
   }
   int addRawOutputStart(int? rawOutputStart) {
-    fbBuilder.addUint64(12, rawOutputStart);
+    fbjs.addUint64(fbBuilder, 12, rawOutputStart);
     return fbBuilder.offset;
   }
   int addSnippetOffset(int? offset) {
@@ -1109,8 +1111,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     final int? snippetDetailOffset = _snippetDetail == null ? null
         : fbBuilder.writeString(_snippetDetail!);
     fbBuilder.startTable(15);
-    fbBuilder.addUint64(0, _outputSeq);
-    fbBuilder.addUint64(1, _bytesLogged);
+    fbjs.addUint64(fbBuilder, 0, _outputSeq);
+    fbjs.addUint64(fbBuilder, 1, _bytesLogged);
     if (_size != null) {
       fbBuilder.addStruct(2, _size!.finish(fbBuilder));
     }
@@ -1125,7 +1127,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.addBool(9, _bracketedPasteEnabled);
     fbBuilder.addBool(10, _exited);
     fbBuilder.addOffset(11, rawOutputOffset);
-    fbBuilder.addUint64(12, _rawOutputStart);
+    fbjs.addUint64(fbBuilder, 12, _rawOutputStart);
     fbBuilder.addOffset(13, snippetOffset);
     fbBuilder.addOffset(14, snippetDetailOffset);
     return fbBuilder.endTable();
@@ -1151,8 +1153,8 @@ class CompletedSession {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
-  int get bytesLogged => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get outputSeq => fbjs.readUint64(_bc, _bcOffset, 4, 0);
+  int get bytesLogged => fbjs.readUint64(_bc, _bcOffset, 6, 0);
   List<String>? get visibleRows => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
@@ -1179,11 +1181,11 @@ class CompletedSessionBuilder {
   }
 
   int addOutputSeq(int? outputSeq) {
-    fbBuilder.addUint64(0, outputSeq);
+    fbjs.addUint64(fbBuilder, 0, outputSeq);
     return fbBuilder.offset;
   }
   int addBytesLogged(int? bytesLogged) {
-    fbBuilder.addUint64(1, bytesLogged);
+    fbjs.addUint64(fbBuilder, 1, bytesLogged);
     return fbBuilder.offset;
   }
   int addVisibleRowsOffset(int? offset) {
@@ -1216,8 +1218,8 @@ class CompletedSessionObjectBuilder extends fb.ObjectBuilder {
     final int? visibleRowsOffset = _visibleRows == null ? null
         : fbBuilder.writeList(_visibleRows!.map(fbBuilder.writeString).toList());
     fbBuilder.startTable(3);
-    fbBuilder.addUint64(0, _outputSeq);
-    fbBuilder.addUint64(1, _bytesLogged);
+    fbjs.addUint64(fbBuilder, 0, _outputSeq);
+    fbjs.addUint64(fbBuilder, 1, _bytesLogged);
     fbBuilder.addOffset(2, visibleRowsOffset);
     return fbBuilder.endTable();
   }
@@ -1325,7 +1327,7 @@ class InputLeaseState {
   final int _bcOffset;
 
   InputLeaseHolder? get holder => InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 4);
-  int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get generation => fbjs.readUint64(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
@@ -1355,7 +1357,7 @@ class InputLeaseStateBuilder {
     return fbBuilder.offset;
   }
   int addGeneration(int? generation) {
-    fbBuilder.addUint64(1, generation);
+    fbjs.addUint64(fbBuilder, 1, generation);
     return fbBuilder.offset;
   }
 
@@ -1381,7 +1383,7 @@ class InputLeaseStateObjectBuilder extends fb.ObjectBuilder {
     final int? holderOffset = _holder?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, holderOffset);
-    fbBuilder.addUint64(1, _generation);
+    fbjs.addUint64(fbBuilder, 1, _generation);
     return fbBuilder.endTable();
   }
 
@@ -1405,7 +1407,7 @@ class LeaseChange {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get generation => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
+  int get generation => fbjs.readUint64(_bc, _bcOffset, 4, 0);
   InputLeaseHolder? get previous => InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 6);
   InputLeaseHolder? get current => InputLeaseHolder.reader.vTableGetNullable(_bc, _bcOffset, 8);
   LeaseChangeAction get action => LeaseChangeAction.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 10, 0));
@@ -1434,7 +1436,7 @@ class LeaseChangeBuilder {
   }
 
   int addGeneration(int? generation) {
-    fbBuilder.addUint64(0, generation);
+    fbjs.addUint64(fbBuilder, 0, generation);
     return fbBuilder.offset;
   }
   int addPreviousOffset(int? offset) {
@@ -1478,7 +1480,7 @@ class LeaseChangeObjectBuilder extends fb.ObjectBuilder {
     final int? previousOffset = _previous?.getOrCreateOffset(fbBuilder);
     final int? currentOffset = _current?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(4);
-    fbBuilder.addUint64(0, _generation);
+    fbjs.addUint64(fbBuilder, 0, _generation);
     fbBuilder.addOffset(1, previousOffset);
     fbBuilder.addOffset(2, currentOffset);
     fbBuilder.addInt8(3, _action?.value);
@@ -1587,7 +1589,7 @@ class StyledRowsResponse {
   final fb.BufferContext _bc;
   final int _bcOffset;
 
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 4, 0);
+  int get outputSeq => fbjs.readUint64(_bc, _bcOffset, 4, 0);
   int get start => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 6, 0);
   List<StyledRow>? get rows => const fb.ListReader<StyledRow>(StyledRow.reader).vTableGetNullable(_bc, _bcOffset, 8);
 
@@ -1615,7 +1617,7 @@ class StyledRowsResponseBuilder {
   }
 
   int addOutputSeq(int? outputSeq) {
-    fbBuilder.addUint64(0, outputSeq);
+    fbjs.addUint64(fbBuilder, 0, outputSeq);
     return fbBuilder.offset;
   }
   int addStart(int? start) {
@@ -1652,7 +1654,7 @@ class StyledRowsResponseObjectBuilder extends fb.ObjectBuilder {
     final int? rowsOffset = _rows == null ? null
         : fbBuilder.writeList(_rows!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
     fbBuilder.startTable(3);
-    fbBuilder.addUint64(0, _outputSeq);
+    fbjs.addUint64(fbBuilder, 0, _outputSeq);
     fbBuilder.addUint32(1, _start);
     fbBuilder.addOffset(2, rowsOffset);
     return fbBuilder.endTable();
@@ -2165,7 +2167,7 @@ class SubscribeSessionEventsRequestTable {
   final int _bcOffset;
 
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get afterEventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get afterEventSeq => fbjs.readUint64(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
@@ -2195,7 +2197,7 @@ class SubscribeSessionEventsRequestTableBuilder {
     return fbBuilder.offset;
   }
   int addAfterEventSeq(int? afterEventSeq) {
-    fbBuilder.addUint64(1, afterEventSeq);
+    fbjs.addUint64(fbBuilder, 1, afterEventSeq);
     return fbBuilder.offset;
   }
 
@@ -2222,7 +2224,7 @@ class SubscribeSessionEventsRequestTableObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_sessionId!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint64(1, _afterEventSeq);
+    fbjs.addUint64(fbBuilder, 1, _afterEventSeq);
     return fbBuilder.endTable();
   }
 
@@ -3361,7 +3363,7 @@ class PairingChallengeResult {
   final int _bcOffset;
 
   String? get deviceCode => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get expiresAt => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get expiresAt => fbjs.readUint64(_bc, _bcOffset, 6, 0);
 
   @override
   String toString() {
@@ -3391,7 +3393,7 @@ class PairingChallengeResultBuilder {
     return fbBuilder.offset;
   }
   int addExpiresAt(int? expiresAt) {
-    fbBuilder.addUint64(1, expiresAt);
+    fbjs.addUint64(fbBuilder, 1, expiresAt);
     return fbBuilder.offset;
   }
 
@@ -3418,7 +3420,7 @@ class PairingChallengeResultObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_deviceCode!);
     fbBuilder.startTable(2);
     fbBuilder.addOffset(0, deviceCodeOffset);
-    fbBuilder.addUint64(1, _expiresAt);
+    fbjs.addUint64(fbBuilder, 1, _expiresAt);
     return fbBuilder.endTable();
   }
 
@@ -4585,7 +4587,7 @@ class ResyncRequiredEvent {
   final int _bcOffset;
 
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get latestEventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get latestEventSeq => fbjs.readUint64(_bc, _bcOffset, 6, 0);
   SessionSnapshot? get snapshot => SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
@@ -4616,7 +4618,7 @@ class ResyncRequiredEventBuilder {
     return fbBuilder.offset;
   }
   int addLatestEventSeq(int? latestEventSeq) {
-    fbBuilder.addUint64(1, latestEventSeq);
+    fbjs.addUint64(fbBuilder, 1, latestEventSeq);
     return fbBuilder.offset;
   }
   int addSnapshotOffset(int? offset) {
@@ -4651,7 +4653,7 @@ class ResyncRequiredEventObjectBuilder extends fb.ObjectBuilder {
     final int? snapshotOffset = _snapshot?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint64(1, _latestEventSeq);
+    fbjs.addUint64(fbBuilder, 1, _latestEventSeq);
     fbBuilder.addOffset(2, snapshotOffset);
     return fbBuilder.endTable();
   }
@@ -4677,7 +4679,7 @@ class OutputEvent {
   final int _bcOffset;
 
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get outputSeq => fbjs.readUint64(_bc, _bcOffset, 6, 0);
   List<int>? get bytes => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 8);
 
   @override
@@ -4708,7 +4710,7 @@ class OutputEventBuilder {
     return fbBuilder.offset;
   }
   int addOutputSeq(int? outputSeq) {
-    fbBuilder.addUint64(1, outputSeq);
+    fbjs.addUint64(fbBuilder, 1, outputSeq);
     return fbBuilder.offset;
   }
   int addBytesOffset(int? offset) {
@@ -4744,7 +4746,7 @@ class OutputEventObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeListUint8(_bytes!);
     fbBuilder.startTable(3);
     fbBuilder.addOffset(0, sessionIdOffset);
-    fbBuilder.addUint64(1, _outputSeq);
+    fbjs.addUint64(fbBuilder, 1, _outputSeq);
     fbBuilder.addOffset(2, bytesOffset);
     return fbBuilder.endTable();
   }
@@ -5019,7 +5021,7 @@ class EventPayload {
   final int _bcOffset;
 
   String? get subscriptionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
-  int get eventSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get eventSeq => fbjs.readUint64(_bc, _bcOffset, 6, 0);
   SessionEventPayloadTypeId? get eventType => SessionEventPayloadTypeId._createOrNull(const fb.Uint8Reader().vTableGetNullable(_bc, _bcOffset, 8));
   dynamic get event {
     switch (eventType?.value) {
@@ -5060,7 +5062,7 @@ class EventPayloadBuilder {
     return fbBuilder.offset;
   }
   int addEventSeq(int? eventSeq) {
-    fbBuilder.addUint64(1, eventSeq);
+    fbjs.addUint64(fbBuilder, 1, eventSeq);
     return fbBuilder.offset;
   }
   int addEventType(SessionEventPayloadTypeId? eventType) {
@@ -5102,7 +5104,7 @@ class EventPayloadObjectBuilder extends fb.ObjectBuilder {
     final int? eventOffset = _event?.getOrCreateOffset(fbBuilder);
     fbBuilder.startTable(4);
     fbBuilder.addOffset(0, subscriptionIdOffset);
-    fbBuilder.addUint64(1, _eventSeq);
+    fbjs.addUint64(fbBuilder, 1, _eventSeq);
     fbBuilder.addUint8(2, _eventType?.value);
     fbBuilder.addOffset(3, eventOffset);
     return fbBuilder.endTable();
@@ -5203,7 +5205,7 @@ class SessionSnippetUpdatedPayload {
 
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
-  int get outputSeq => const fb.Uint64Reader().vTableGet(_bc, _bcOffset, 8, 0);
+  int get outputSeq => fbjs.readUint64(_bc, _bcOffset, 8, 0);
   String? get detail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
 
   @override
@@ -5238,7 +5240,7 @@ class SessionSnippetUpdatedPayloadBuilder {
     return fbBuilder.offset;
   }
   int addOutputSeq(int? outputSeq) {
-    fbBuilder.addUint64(2, outputSeq);
+    fbjs.addUint64(fbBuilder, 2, outputSeq);
     return fbBuilder.offset;
   }
   int addDetailOffset(int? offset) {
@@ -5280,7 +5282,7 @@ class SessionSnippetUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.startTable(4);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, snippetOffset);
-    fbBuilder.addUint64(2, _outputSeq);
+    fbjs.addUint64(fbBuilder, 2, _outputSeq);
     fbBuilder.addOffset(3, detailOffset);
     return fbBuilder.endTable();
   }

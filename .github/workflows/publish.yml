@@ -57,8 +57,6 @@ jobs:
 
       - name: Install flatc
         uses: ./.github/actions/setup-flatc
-        with:
-          version: "25.2.10"
 
       - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
@@ -546,8 +544,6 @@ jobs:
 
       - name: Install flatc
         uses: ./.github/actions/setup-flatc
-        with:
-          version: "25.2.10"
 
       # Embed the same web UI the published daemon serves, built once by the
       # publish job, so we don't rebuild Flutter on three runners.
