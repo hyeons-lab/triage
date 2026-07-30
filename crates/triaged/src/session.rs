@@ -2341,9 +2341,12 @@ fn activity_advanced(
 ///
 /// Runs on its own thread; exits when the manager is dropped.
 fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
-    // Mirrors what the last write put in the manifest, so a quiet daemon does no
-    // disk I/O at all: with every session idle the stamps stop advancing and the
-    // comparison below keeps failing.
+    // Mirrors what the last write put in the manifest, so a quiet daemon settles
+    // into doing no disk I/O: with every session idle the stamps stop advancing
+    // and the comparison below keeps failing. Starting empty rather than seeded
+    // from the manifest means the first tick after startup always writes once —
+    // every live session reads as newly advanced — which is a fair price for not
+    // parsing the manifest again here.
     let mut persisted: HashMap<SessionId, u64> = HashMap::new();
     loop {
         thread::sleep(ACTIVITY_PERSIST_INTERVAL);
@@ -7885,7 +7888,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn list_sessions_returns_a_stable_order_across_managers() {
+    fn list_sessions_returns_ids_in_creation_order() {
         // `sessions` is a HashMap whose iteration order is reseeded per process,
         // so this is the regression guard for the original complaint: the rail
         // was ordered differently on every daemon restart.
@@ -7900,10 +7903,13 @@ mod tests {
             );
         }
 
+        // Compared against `started` directly, which *is* creation order.
+        // Deriving the expectation by sorting with `session_sort_key` — the
+        // function under test — would make this pass under the very bug it
+        // names: a lexicographic key satisfies its own sort, and `session-10`
+        // would sit before `session-2` on both sides.
         let listed = manager.list_sessions().expect("list sessions");
-        let mut expected = started.clone();
-        expected.sort_by(|left, right| session_sort_key(left).cmp(&session_sort_key(right)));
-        assert_eq!(listed, expected, "ids must come back in creation order");
+        assert_eq!(listed, started, "ids must come back in creation order");
 
         // Repeated calls against the same map must not vary either.
         assert_eq!(

@@ -87,7 +87,7 @@ void main() {
         session('session-2', activity: 1),
       ], pins: const SessionPins(groupKeys: [otherGroupPinKey]));
 
-      expect(groups.first.isOther, isTrue);
+      expect(groups.first.repoRoot, isNull);
       expect(groups.first.pinKey, otherGroupPinKey);
     });
   });
@@ -271,21 +271,62 @@ void main() {
     });
 
     test('a downward drag does not release pins above it', () {
-      // Pin session-1 first, then drag session-2 below it; session-1 must stay
-      // pinned rather than being truncated out of the prefix.
+      // Three rows in one group, so there are no headers and a downward drag has
+      // somewhere to land. Pin session-1, then drag session-2 past session-3;
+      // session-1 must stay pinned rather than being truncated out of the prefix.
+      final oneGroup = [
+        session('session-1', repo: '/a', activity: 900),
+        session('session-2', repo: '/a', activity: 800),
+        session('session-3', repo: '/a', activity: 100),
+      ];
       final pins0 = const SessionPins(sessionIds: ['session-1']);
-      final rail = railFor(sessions, pins: pins0);
-      final rows = rail.where((i) => !i.isHeader).map((i) => i.sessionId);
-      expect(rows, ['session-1', 'session-2', 'session-3']);
+      final rail = railFor(oneGroup, pins: pins0);
+      expect(render(rail), ['session-1', 'session-2', 'session-3']);
 
       final pins = resolveRailReorder(
         items: rail,
         pins: pins0,
-        oldIndex: 2, // session-2
-        newIndex: 3, // below session-2's current slot -> no visible move
+        oldIndex: 1, // session-2
+        newIndex: 3, // past session-3
       );
 
       expect(pins.sessionIds, contains('session-1'));
+      expect(pins.sessionIds, ['session-1', 'session-3', 'session-2']);
+    });
+
+    test('a drag that ends where it started pins nothing', () {
+      // `ReorderableListView` reports a row dragged down past its neighbour's
+      // midpoint and released back on its own slot as `newIndex == oldIndex + 1`.
+      // That is a null gesture, and it used to pin the whole prefix above the
+      // row: badges on rows the user never moved, and a reset control offered for
+      // a layout they never made.
+      final rail = railFor(sessions);
+      for (final oldIndex in [1, 2, 4]) {
+        expect(
+          resolveRailReorder(
+            items: rail,
+            pins: SessionPins.none,
+            oldIndex: oldIndex,
+            newIndex: oldIndex + 1,
+          ).isEmpty,
+          isTrue,
+          reason: 'row at $oldIndex did not move',
+        );
+      }
+      // Headers report it the same way, and a group move is the more damaging
+      // one — it pins every group above as well.
+      for (final headerIndex in [0, 3]) {
+        expect(
+          resolveRailReorder(
+            items: rail,
+            pins: SessionPins.none,
+            oldIndex: headerIndex,
+            newIndex: headerIndex + 1,
+          ).isEmpty,
+          isTrue,
+          reason: 'header at $headerIndex did not move',
+        );
+      }
     });
 
     test('an out-of-range drag is a no-op rather than a crash', () {

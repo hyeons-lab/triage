@@ -263,7 +263,8 @@ void main() {
       expect(retrieveTokenFor(origin.id), 'paired-token');
     });
 
-    test('never clobbers an existing origin credential with the stale token', () {
+    test('never clobbers an existing origin credential with the stale token',
+        () {
       // The origin is already paired (e.g. from a prior sync); that token is the
       // live one, so a stale entry's copy must not overwrite it.
       persistTokenFor(stale.id, 'stale-token');

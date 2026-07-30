@@ -108,6 +108,14 @@ SessionPins resolveRailReorder({
   final remaining = [...items]..removeAt(oldIndex);
   final landing = target.clamp(0, remaining.length);
 
+  // The gesture ended where it began, so nothing was reordered and there is
+  // nothing to pin. `ReorderableListView` reports exactly this as
+  // `newIndex == oldIndex + 1`: dragging a row down past its neighbour's midpoint
+  // and releasing it back on its own slot is a real, easy gesture, and without
+  // this it silently pinned the whole prefix above the row — badges on rows the
+  // user never moved, and a reset control for a layout they never made.
+  if (landing == oldIndex) return pins;
+
   if (moved.isHeader) {
     // Group move: its position among groups is the number of *other* group
     // headers landing above it.

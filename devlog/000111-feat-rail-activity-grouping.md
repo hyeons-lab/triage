@@ -10,9 +10,12 @@ reshuffles on every daemon restart. Group same-repo sessions adjacent, order
 groups and rows by real activity (most recent first), and give the ordering a
 deterministic floor so it never reshuffles for no reason.
 
-Phase 1 (this branch) covers grouping + activity ordering. Pinning and a
-reset-to-activity affordance are deferred to Phase 2 — see
-`devlog/plans/000111-01-rail-activity-grouping.md`.
+Pinning and a reset-to-activity affordance were planned as a separate Phase 2
+(`devlog/plans/000111-01-rail-activity-grouping.md`) and then pulled into this
+branch: landing group headers means the rail is no longer a flat list, which
+breaks the existing flat-list drag, so the drag replacement is the other half of
+the same change rather than a follow-up. See the Decisions entry for the
+reversal, and `devlog/plans/000111-02-rail-pinning.md` for the pinning design.
 
 ## Progress
 
@@ -150,7 +153,10 @@ reset-to-activity affordance are deferred to Phase 2 — see
 - 2026-07-29T14:20-0700 `flutter/triage_client/lib/session_grouping.dart` —
   group tie-break index precomputed instead of recomputed per comparison.
 - 2026-07-29T14:20-0700 `crates/triaged/src/session.rs` —
-  `seed_last_activity_ms` uses `fetch_max`.
+  `seed_last_activity_ms` keeps `store`, now with a comment saying why
+  `fetch_max` is wrong here. (An earlier entry in this section claimed the
+  `fetch_max` change; it was applied, found to be a bug, and reverted — see
+  Issues.)
 
 - 2026-07-29T14:50-0700 `flutter/triage_client/lib/main.dart` — round 5:
   `_regroupRail()` re-derives grouping wherever a session's repository can
@@ -168,8 +174,37 @@ reset-to-activity affordance are deferred to Phase 2 — see
   more widget tests: opening a session keeps its repository, rank and selection;
   a `cd` across repositories moves the row's group; closing a pinned session
   drops its pin.
+- 2026-07-29T18:16-0700 `flutter/triage_client/lib/session_rail_layout.dart` —
+  `resolveRailReorder` returns unchanged when the drag ends where it started.
+  `flutter/triage_client/lib/main.dart` — the web-origin adopt path re-reads pins
+  under the id it just adopted. `crates/triaged/src/session.rs` — the
+  activity-loop comment no longer claims a quiet daemon does *no* disk I/O; the
+  first tick after startup always writes once.
+- 2026-07-29T18:16-0700 Round 6: the rail passes its own `RailItem` list to the
+  reorder callback instead of `_reorderRail` rebuilding an identical one — drag
+  indices only mean anything against the list they were measured on.
+  `_fetchSessionContexts` drops a connect-generation guard that earned nothing
+  (its caller re-checks the same condition on the next line; the guard was
+  needed by the `setState`-ing seeder it replaced). `_createSession` re-groups
+  through `_regroupRail` like the other sites. `SessionGroup.isOther` removed —
+  only its own tests used it. Two Rust tests that could not fail their own names
+  fixed (`list_sessions_returns_ids_in_creation_order` no longer derives its
+  expectation from the function under test), and the handover fixture now
+  asserts activity survives serialize→adopt.
 
 ## Issues
+
+- 2026-07-29T18:16-0700 Round 6 found the last real bug, and a test was actively
+  covering for it. `ReorderableListView` reports a row dragged down past its
+  neighbour's midpoint and released back on its own slot as
+  `newIndex == oldIndex + 1`, which converts to `target == oldIndex` — a null
+  gesture. `resolveRailReorder` pinned the whole prefix through the row anyway,
+  putting pin badges on rows the user never moved and offering a reset for a
+  layout they never made. The existing test drove exactly that index pair, with
+  the comment "no visible move", but only asserted that an *unrelated* pin
+  survived — so it green-lit the behaviour it was closest to catching. Fixed with
+  an explicit no-move return; the old test now drives a real downward move, and a
+  new one covers the null gesture for both rows and headers.
 
 - 2026-07-29T14:50-0700 Round 5 caught a bug I had just introduced. Round 4 left
   a nitpick suggesting `fetch_max` in `seed_last_activity_ms`; I applied it, and
@@ -447,7 +482,8 @@ Hashes below are post-rebase.
 - 83a668c — fix(triage_client): stop drags from silently releasing pins
 - 17bdbc8 — refactor: collapse the rail's duplicated helpers and cover the activity loop
 - e752c04 — fix(triage_client): keep a session's activity stamp when it is opened
-- HEAD — fix(triage_client): keep a session in its repository and its rank
+- c3b9cde — fix(triage_client): keep a session in its repository and its rank
+- HEAD — fix(triage_client): stop a drag that goes nowhere from pinning
 
 ## Next Steps
 

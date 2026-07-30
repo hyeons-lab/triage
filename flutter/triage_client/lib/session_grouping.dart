@@ -50,9 +50,6 @@ class SessionGroup {
   /// 0 when no member has known activity.
   final int lastActivityMs;
 
-  /// True for the catch-all group of repo-less sessions.
-  bool get isOther => repoRoot == null;
-
   /// Stable key for this group in persisted pin lists. Repository roots are
   /// absolute paths, so the sentinel used for the repo-less group cannot collide
   /// with a real one.

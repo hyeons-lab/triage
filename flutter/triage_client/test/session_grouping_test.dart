@@ -57,7 +57,7 @@ void main() {
 
       // The "Other" group sorts by activity like any other group rather than
       // being pinned last, so an active stray shell still surfaces.
-      expect(groups.first.isOther, isTrue);
+      expect(groups.first.repoRoot, isNull);
       expect(groups.first.sessionIds, ['session-2', 'session-3']);
       expect(groups.length, 2);
     });
