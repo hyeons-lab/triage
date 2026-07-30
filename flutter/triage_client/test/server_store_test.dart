@@ -263,8 +263,7 @@ void main() {
       expect(retrieveTokenFor(origin.id), 'paired-token');
     });
 
-    test('never clobbers an existing origin credential with the stale token',
-        () {
+    test('never clobbers an existing origin credential with the stale token', () {
       // The origin is already paired (e.g. from a prior sync); that token is the
       // live one, so a stale entry's copy must not overwrite it.
       persistTokenFor(stale.id, 'stale-token');
@@ -445,6 +444,24 @@ void main() {
       await migrateRailPins('web-a-1', 'web-b-2');
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getStringList(pinnedGroupsPrefKeyFor('web-b-2')), isNull);
+    });
+
+    test('moves session pins even when no group pin exists', () async {
+      // The two keys are migrated in one loop, and a missing group pin must skip
+      // only that key rather than abandoning the rest: `continue`, not `return`.
+      // Both existing cases store either both keys or neither, so a server that
+      // had only pinned sessions would have lost them silently.
+      SharedPreferences.setMockInitialValues({
+        pinnedSessionsPrefKeyFor('web-a-1'): ['session-2'],
+      });
+
+      await migrateRailPins('web-a-1', 'web-b-2');
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getStringList(pinnedSessionsPrefKeyFor('web-b-2')), [
+        'session-2',
+      ]);
+      expect(prefs.getStringList(pinnedSessionsPrefKeyFor('web-a-1')), isNull);
     });
 
     test('is a no-op when the ids are the same', () async {

@@ -294,6 +294,58 @@ void main() {
       expect(pins.sessionIds, ['session-1', 'session-3', 'session-2']);
     });
 
+    test('a drag that resolves to its own position pins nothing', () {
+      // The clamp that keeps a drag from feeling dead also maps plenty of real
+      // drags back onto themselves, and every one of them looks to the user like
+      // nothing happened. Rail: [#/a, session-1, session-2, #/b, session-3].
+      final rail = railFor(sessions);
+      expect(render(rail), [
+        '#/a',
+        'session-1',
+        'session-2',
+        '#/b',
+        'session-3',
+      ]);
+
+      // A header dragged down over its own rows never reaches the next header,
+      // so its group index does not change.
+      expect(
+        resolveRailReorder(
+          items: rail,
+          pins: SessionPins.none,
+          oldIndex: 0,
+          newIndex: 2,
+        ).isEmpty,
+        isTrue,
+        reason: '/a dragged over its own rows stays first',
+      );
+      // A header dragged up into the group above, but not past that group's
+      // header, likewise. This one is the worst case: a leading block would pin
+      // /a as well as /b.
+      expect(
+        resolveRailReorder(
+          items: rail,
+          pins: SessionPins.none,
+          oldIndex: 3,
+          newIndex: 1,
+        ).isEmpty,
+        isTrue,
+        reason: '/b dragged short of /a\'s header stays second',
+      );
+      // A group's first row dragged onto its own header clamps back to index 0
+      // of its group, which is where it already was.
+      expect(
+        resolveRailReorder(
+          items: rail,
+          pins: SessionPins.none,
+          oldIndex: 1,
+          newIndex: 0,
+        ).isEmpty,
+        isTrue,
+        reason: 'session-1 dragged onto its header stays first in /a',
+      );
+    });
+
     test('a drag that ends where it started pins nothing', () {
       // `ReorderableListView` reports a row dragged down past its neighbour's
       // midpoint and released back on its own slot as `newIndex == oldIndex + 1`.

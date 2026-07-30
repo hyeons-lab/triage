@@ -755,6 +755,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Groups and sessions the user placed by hand, which hold their slot instead
   // of flowing with activity. Loaded per server alongside the session list.
   SessionPins _pins = SessionPins.none;
+  // True between a rail drag's start and its drop. A re-group during that window
+  // invalidates the indices the drop will be resolved with, so re-groups defer.
+  bool _railDragInFlight = false;
+  bool _railRegroupDeferred = false;
+  // Set when the daemon could not supply session contexts, which leaves every
+  // session in one repo-less group. The rail then looks exactly like an ordinary
+  // single-repository rail, so a drag in that state must not be read as a
+  // statement about repositories it cannot see.
+  bool _railGroupingDegraded = false;
   // The daemon the sessions currently in the rail came from. Null while none are
   // loaded, or while a switch is in flight and the tiles still belong to the
   // daemon we are leaving — their ids mean nothing to the one we are joining.
@@ -2098,7 +2107,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// `setState`-ing seeder this replaced.
   Future<Map<String, SessionContextRecord>> _fetchSessionContexts() async {
     try {
-      return await _client.listSessionContexts();
+      final contexts = await _client.listSessionContexts();
+      _railGroupingDegraded = false;
+      return contexts;
     } catch (error) {
       // Logged rather than swallowed silently: this now drives grouping and
       // ordering, not just titles, and an unreported failure here degrades the
@@ -2108,6 +2119,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       debugPrint(
         'list_session_contexts failed; rail will be ungrouped: $error',
       );
+      // Remembered, not just logged: without repository context every session
+      // collapses into the repo-less group and the rail renders headerless —
+      // indistinguishable from a genuine single-repository rail. A drag read in
+      // that state would pin a prefix spanning sessions that really belong to
+      // different repositories, and the next successful load would hoist each of
+      // them to the top of its own group.
+      _railGroupingDegraded = true;
       return const {};
     }
   }
@@ -2214,7 +2232,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// header a row sits under.
   void _regroupRail() {
     if (_disposed || !mounted) return;
+    // Never reorder the rail out from under a drag in progress.
+    // `SliverReorderableList` re-syncs a live drag only when the item *count*
+    // changes; a session moving between repositories changes neither the row
+    // count nor the group count, so the drag survives with the index it captured
+    // at drag start and the drop then resolves that index against a list it no
+    // longer describes — pinning whichever row inherited the slot. Deferred
+    // rather than dropped, so the regroup still happens once the gesture ends.
+    if (_railDragInFlight) {
+      _railRegroupDeferred = true;
+      return;
+    }
     _applyPins(_pins, persist: false);
+  }
+
+  /// Tracks a rail drag between its start and drop so a background re-group
+  /// cannot reorder the list the drag is measured against.
+  void _onRailDragStart() => _railDragInFlight = true;
+
+  void _onRailDragEnd() {
+    _railDragInFlight = false;
+    if (!_railRegroupDeferred) return;
+    _railRegroupDeferred = false;
+    _regroupRail();
   }
 
   /// Re-applies [pins], reordering the rail and keeping the selection on the
@@ -2263,14 +2303,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// measured on, and reconstructing it is both redundant work and a way for the
   /// two to drift.
   void _reorderRail(List<RailItem> items, int oldIndex, int newIndex) {
-    _applyPins(
-      resolveRailReorder(
-        items: items,
-        pins: _pins,
-        oldIndex: oldIndex,
-        newIndex: newIndex,
-      ),
+    // The rail is showing its degraded, contextless grouping — see
+    // [_railGroupingDegraded]. The drop position cannot be mapped onto anything
+    // durable, so let the row spring back rather than persist a pin that means
+    // something different once context arrives.
+    if (_railGroupingDegraded) return;
+    final pins = resolveRailReorder(
+      items: items,
+      pins: _pins,
+      oldIndex: oldIndex,
+      newIndex: newIndex,
     );
+    // A drag that resolved to no change returns the pins it was given. Applying
+    // them anyway would rebuild the rail and write prefs values identical to
+    // what is already stored, on every cancelled gesture.
+    if (identical(pins, _pins)) return;
+    _applyPins(pins);
   }
 
   /// Drops every pin, returning the whole rail to activity ordering.
@@ -3484,6 +3532,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (isMobile) collapseRail();
       },
       onReorderSession: _reorderRail,
+      onReorderStart: _onRailDragStart,
+      onReorderEnd: _onRailDragEnd,
       onCreateSession: (shell) {
         _createSession(shell);
         if (isMobile) collapseRail();
@@ -3635,6 +3685,8 @@ class SessionRail extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelectSession,
     required this.onReorderSession,
+    required this.onReorderStart,
+    required this.onReorderEnd,
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
@@ -3672,6 +3724,11 @@ class SessionRail extends StatelessWidget {
   final ValueChanged<int> onSelectSession;
   final void Function(List<RailItem> items, int oldIndex, int newIndex)
   onReorderSession;
+
+  /// Bracket a drag so a background re-group cannot reorder the list the drop
+  /// will be resolved against.
+  final VoidCallback onReorderStart;
+  final VoidCallback onReorderEnd;
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
@@ -3953,6 +4010,8 @@ class SessionRail extends StatelessWidget {
             // ignore: deprecated_member_use
             onReorder: (oldIndex, newIndex) =>
                 onReorderSession(items, oldIndex, newIndex),
+            onReorderStart: (_) => onReorderStart(),
+            onReorderEnd: (_) => onReorderEnd(),
             itemCount: items.length,
             itemBuilder: (context, index) {
               final item = items[index];

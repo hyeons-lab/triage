@@ -88,6 +88,13 @@ List<RailItem> buildRailItems(
 ///
 /// [newIndex] is taken in `ReorderableListView`'s pre-removal coordinate space,
 /// as its `onReorder` reports it.
+///
+/// A drag that resolves to the position its subject already holds pins nothing.
+/// That is not just the released-where-it-started case: the clamping above means
+/// plenty of real drags land back on themselves, and every one of them looks to
+/// the user like nothing happened. The cost is that the top group cannot be
+/// pinned by dragging it onto itself — to hold it there, drag the group below it
+/// up past it, which pins both.
 SessionPins resolveRailReorder({
   required List<RailItem> items,
   required SessionPins pins,
@@ -108,14 +115,6 @@ SessionPins resolveRailReorder({
   final remaining = [...items]..removeAt(oldIndex);
   final landing = target.clamp(0, remaining.length);
 
-  // The gesture ended where it began, so nothing was reordered and there is
-  // nothing to pin. `ReorderableListView` reports exactly this as
-  // `newIndex == oldIndex + 1`: dragging a row down past its neighbour's midpoint
-  // and releasing it back on its own slot is a real, easy gesture, and without
-  // this it silently pinned the whole prefix above the row — badges on rows the
-  // user never moved, and a reset control for a layout they never made.
-  if (landing == oldIndex) return pins;
-
   if (moved.isHeader) {
     // Group move: its position among groups is the number of *other* group
     // headers landing above it.
@@ -127,6 +126,15 @@ SessionPins resolveRailReorder({
       for (final item in items)
         if (item.isHeader) item.groupKey,
     ];
+    // The drop resolved to the slot this group already holds, so nothing was
+    // reordered and there is nothing to pin. Checked at the *group* level rather
+    // than on the flat index: a header dragged down over its own rows, or up
+    // into the group above without passing that group's header, moves a real
+    // distance in flat coordinates and still lands back on itself. Pinning there
+    // put badges on groups the user never moved and offered a reset for a layout
+    // they never made — and because pins are a leading block, it pinned every
+    // group above as well.
+    if (groupIndex == displayOrder.indexOf(moved.groupKey)) return pins;
     return pins.copyWith(
       groupKeys: pinPrefixTo(
         pins.groupKeys,
@@ -148,10 +156,10 @@ SessionPins resolveRailReorder({
     for (final item in items)
       if (!item.isHeader && item.groupKey == moved.groupKey) item.sessionId!,
   ];
-  // A lone row in its group has nowhere to go: the clamp above lands it back on
-  // itself. Pinning it anyway would record a layout the user never produced and
-  // leave the reset control showing with nothing visible to reset.
-  if (displayOrder.length < 2) return pins;
+  // Same no-op test one level down, which also subsumes the lone-row case: a row
+  // alone in its group, or dragged onto its own group's header, resolves to the
+  // index it already has.
+  if (withinGroup == displayOrder.indexOf(moved.sessionId!)) return pins;
   // The whole flat list goes through `pinPrefixTo` against this group's rows.
   // Relative order *between* groups carries no meaning — groups are positioned
   // by [SessionPins.groupKeys], and each group reads only its own members back

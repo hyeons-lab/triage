@@ -151,9 +151,22 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   /// grouping assume. A test that cares about grouping fills this in.
   final Map<String, SessionContextRecord> sessionContexts = {};
 
+  /// When true, `list_session_contexts` fails — a daemon predating the request,
+  /// or a request lost on a flaky link.
+  bool sessionContextsFail = false;
+
+  /// Repository roots the *attach snapshot* reports, per session. Distinct from
+  /// [sessionContexts], which is the bulk pre-load fetch: the two disagree
+  /// exactly when a session `cd`s between connect and being opened.
+  final Map<String, String> attachRepoRoots = {};
+
   @override
-  Future<Map<String, SessionContextRecord>> listSessionContexts() async =>
-      sessionContexts;
+  Future<Map<String, SessionContextRecord>> listSessionContexts() async {
+    if (sessionContextsFail) {
+      throw Exception('list_session_contexts unsupported');
+    }
+    return sessionContexts;
+  }
 
   @override
   Future<Map<String, dynamic>> attachSession({
@@ -211,6 +224,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
         'snapshot': {
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
+            // Normally absent, matching a daemon that reports only the branch on
+            // attach. A test that cares about a session whose repository moved
+            // between connect and open fills this in.
+            if (attachRepoRoots.containsKey(sessionId))
+              'repository_root': attachRepoRoots[sessionId],
           },
           'size': {'rows': 24, 'cols': 80},
           'exited': exitedSessionIds.contains(sessionId),
@@ -2051,6 +2069,150 @@ void main() {
         prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
         isEmpty,
       );
+    });
+
+    testWidgets('opening a session whose repository moved re-groups it', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      // Between the bulk context fetch and the open, `flutter-spike` moved from
+      // alpha to beta — the attach snapshot is the first place that shows up.
+      client.attachRepoRoots['flutter-spike'] = '/work/beta';
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(header('/work/alpha')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      await tester.tap(row('flutter-spike'));
+      await tester.pumpAndSettle();
+
+      // The snapshot's repository wins over the one carried forward, and the row
+      // has to move with it rather than sitting under a header that no longer
+      // describes it.
+      expect(
+        tester.getTopLeft(header('/work/beta')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+      expect(
+        tester.getTopLeft(row('flutter-spike')).dy,
+        lessThan(tester.getTopLeft(header('/work/alpha')).dy),
+      );
+    });
+
+    testWidgets('a session created into a repository lands in its group', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      // The daemon spawns it in alpha; the attach snapshot is where that shows
+      // up, since the bulk context fetch ran before the session existed.
+      client.attachRepoRoots['scratch-1'] = '/work/alpha';
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+
+      // Inserted at the top of the rail and then re-grouped: without the
+      // re-group it renders under no header at all, above the first one. Without
+      // the activity stamp it sorts as "never active" and sinks to the bottom of
+      // its group instead of leading it.
+      final created = client.startSessionCalls.last;
+      expect(created, 'scratch-1');
+      expect(
+        tester.getTopLeft(header('/work/alpha')).dy,
+        lessThan(tester.getTopLeft(row(created)).dy),
+        reason: 'the new session sits under its repository header',
+      );
+      expect(
+        tester.getTopLeft(row(created)).dy,
+        lessThan(tester.getTopLeft(row('main')).dy),
+        reason: 'and leads the group it joined',
+      );
+    });
+
+    testWidgets('a drag is not persisted while grouping is degraded', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      client.sessionContextsFail = true;
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // With no context every session collapses into the repo-less group and
+      // headers are suppressed, so the rail is indistinguishable from an
+      // ordinary single-repository one — the user has no way to know the drag
+      // means something different from usual.
+      expect(header('/work/alpha'), findsNothing);
+      expect(header(otherGroupPinKey), findsNothing);
+
+      final gesture = await tester.startGesture(tester.getCenter(row('main')));
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -260));
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      // Those ids belong to different repositories; pinning a prefix across them
+      // would hoist each one to the top of its own group on the next successful
+      // load.
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
+        isNull,
+      );
+      expect(
+        find.byTooltip('Sort by activity (clears pinned order)'),
+        findsNothing,
+      );
+    });
+
+    testWidgets('a re-group during a drag is deferred until the drop', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Start dragging `flutter-spike` up within alpha.
+      final gesture = await tester.startGesture(
+        tester.getCenter(row('flutter-spike')),
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -90));
+      await tester.pump(const Duration(milliseconds: 200));
+
+      // A background session changes repository mid-drag. This changes neither
+      // the row count nor the group count, so `SliverReorderableList` does not
+      // cancel the drag — it would happily resolve the drop against a list that
+      // had been reordered underneath it.
+      client.emitContextUpdated(
+        'websocket-session-api',
+        repositoryRoot: '/work/alpha',
+        worktreeRoot: '/work/alpha',
+        branch: 'feat/ws',
+        cwd: '/work/alpha',
+      );
+      await tester.pump();
+
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      // The drop pinned the row that was actually dragged, and the deferred
+      // re-group then ran: beta has no sessions left, so its header is gone.
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
+        contains('flutter-spike'),
+      );
+      expect(header('/work/beta'), findsNothing);
+      expect(row('websocket-session-api'), findsOneWidget);
     });
 
     testWidgets('stored pins order the rail on first paint', (

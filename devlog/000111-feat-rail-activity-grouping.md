@@ -174,6 +174,23 @@ reversal, and `devlog/plans/000111-02-rail-pinning.md` for the pinning design.
   more widget tests: opening a session keeps its repository, rank and selection;
   a `cd` across repositories moves the row's group; closing a pinned session
   drops its pin.
+- 2026-07-30T10:59-0700 Round 7. `session_rail_layout.dart` — the no-op test
+  moved from the flat index to the *resolved* group/session position.
+  `main.dart` — re-groups defer while a rail drag is in flight and run at the
+  drop; a drag is ignored entirely while grouping is degraded
+  (`_railGroupingDegraded`); a drag that resolves to no change skips `_applyPins`
+  altogether. `crates/triaged/src/session.rs` — the restore stamp is handed to
+  `spawn_restored` instead of stored after it, so the reader thread cannot win a
+  race against it; `seed_last_activity_ms` is gone.
+- 2026-07-30T10:59-0700 Round 7 tests, all mutation-checked: the actor's
+  per-output stamp (`session_activity_advances_when_output_arrives` — nothing
+  covered the core mechanism), the manifest read-through compared against the
+  actor rather than `> 0`, the demote carry (asserted against the manifest on
+  disk, since the revived shell's prompt re-stamps activity), a pre-field
+  manifest keeping the spawn-time default, `migrateRailPins` with only one key
+  set, and four widget tests: a repository that moved between connect and open,
+  a created session landing in its group, a drag under degraded grouping, and a
+  re-group arriving mid-drag.
 - 2026-07-29T18:16-0700 `flutter/triage_client/lib/session_rail_layout.dart` —
   `resolveRailReorder` returns unchanged when the drag ends where it started.
   `flutter/triage_client/lib/main.dart` — the web-origin adopt path re-reads pins
@@ -193,6 +210,32 @@ reversal, and `devlog/plans/000111-02-rail-pinning.md` for the pinning design.
   asserts activity survives serialize→adopt.
 
 ## Issues
+
+- 2026-07-30T10:59-0700 Round 7: the round-6 fix was incomplete, and both
+  reviewers found it independently. Guarding on `landing == oldIndex` only
+  catches a *flat-index* no-op, but the clamping that keeps a drag from feeling
+  dead maps plenty of real drags back onto themselves — a header dragged over its
+  own rows, a header dragged up but not past the header above, a group's first
+  row dragged onto its own header. Each still pinned, and for headers that means
+  pinning every group above too. The test written in round 6 only ever drove
+  `oldIndex + 1`. The check now compares the *resolved* group or within-group
+  position, which subsumes both the flat case and the single-row case. Known
+  cost, documented at the function: the top group can no longer be pinned by
+  dragging it onto itself — drag the group below it up past it, which pins both.
+- 2026-07-30T10:59-0700 A re-group during a drag could corrupt it.
+  `SliverReorderableList` re-syncs a live drag only when the item *count*
+  changes, so a session moving between repositories — same row count, same group
+  count — left the drag holding an index into a list that had been reordered
+  underneath it, and the drop pinned whichever row inherited the slot. Re-groups
+  now defer to the drop.
+- 2026-07-30T10:59-0700 The adversarial test audit was worth more than any
+  review lens this branch has had. It mutated the production code each test
+  names and reported every mutation that survived: deleting the actor's
+  per-output activity stamp — the mechanism the whole feature rests on — left all
+  272 tests green, because every other test is satisfied by the spawn-time seed.
+  So did deleting the demote carry, the create-session stamp, the create-session
+  re-group, and the attach re-group. Six of those are now covered and each was
+  re-verified by re-applying the mutation.
 
 - 2026-07-29T18:16-0700 Round 6 found the last real bug, and a test was actively
   covering for it. `ReorderableListView` reports a row dragged down past its
@@ -483,21 +526,33 @@ Hashes below are post-rebase.
 - 17bdbc8 — refactor: collapse the rail's duplicated helpers and cover the activity loop
 - e752c04 — fix(triage_client): keep a session's activity stamp when it is opened
 - c3b9cde — fix(triage_client): keep a session in its repository and its rank
-- HEAD — fix(triage_client): stop a drag that goes nowhere from pinning
+- 238c5b0 — fix(triage_client): stop a drag that goes nowhere from pinning
+- HEAD — fix(triage_client): pin only when a drag actually reorders something
 
 ## Next Steps
 
 - Run the app against a live daemon: the binary transport is verified at the
   handshake level and under fakes, but no full request/response round-trip has
   been exercised against a real daemon.
-- The rail re-sorts only at load, reconnect, drag, and now a repository change —
-  `lastActivityMs` is never updated from live output events, so a session that
-  starts producing output does not climb the rail until something else triggers
-  a re-group. That is deliberate for now (a rail that re-sorted under the cursor
-  mid-stream would be hostile), but it means "ordered by activity" is a
-  snapshot, not a live ranking. Worth revisiting with an explicit debounce if it
-  reads as stale.
+- Known untested branches, all named by round 7's test audit and left as
+  deliberate gaps rather than oversights:
+  - the handover zero-fallback (`session.rs:1399`, adopting from a daemon that
+    predates `last_activity_ms`) — covering it needs a second full handover
+    fixture with real PTY fds for one assertion;
+  - `run_activity_persistence_loop` itself (only its `activity_advanced` helper
+    and the spawn guard are covered) — it is a 60s loop;
+  - the load path's session-anchored selection re-anchor, and `_restorePins`
+    landing *after* a load (the widget fixture always completes the prefs read
+    first), both of which need a driveable reconnect in the fake;
+  - `_applyPins`'s local-session preservation, `_persistPins`'s cross-server
+    guard, and the forget-a-daemon pin cleanup — reachable only through
+    multi-daemon widget setups.
+- The rail re-sorts only on structural events — load, reconnect, drag, session
+  created or closed, repository change. `lastActivityMs` is never updated from
+  live output, so "ordered by activity" is a snapshot rather than a live ranking.
+  Deliberate (a rail re-sorting under the cursor mid-stream would be hostile),
+  but worth revisiting with an explicit debounce if it reads as stale.
 - `ReorderableListView.onReorder` is deprecated in favour of `onReorderItem`,
-  which reports `newIndex` already adjusted for the removed item. Migrating
-  means deleting the pre-removal conversion in `resolveRailReorder`, not just
-  renaming the callback — noted at both sites.
+  which reports `newIndex` already adjusted for the removed item. Migrating means
+  deleting the pre-removal conversion in `resolveRailReorder`, not just renaming
+  the callback — noted at both sites.
