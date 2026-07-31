@@ -584,23 +584,26 @@ Rebased onto `main` after #129 merged, which dropped the two FlatBuffers commits
 this branch carried (`9d37b89`, `6ef6c1b`), that work landed in #129 instead.
 Hashes below are post-rebase.
 
-- 0e636b1, feat(triaged): track per-session activity and order sessions deterministically
-- d028d45, feat(triage_client): group the session rail by repository, ordered by activity
-- d8bc94f, feat(triage_client): pin rail groups and sessions by dragging, with a reset
-- e4ba7a0, feat(triage_client): release a single pin by tapping its indicator
-- d593a08, fix(triage_client): make downward rail drags actually move the item
-- c329d75, fix(triage_client): carry pins across a server-id change
-- 8840974, fix(triage_client): decode last_activity_ms over the binary transport
-- 83a668c, fix(triage_client): stop drags from silently releasing pins
-- 17bdbc8, refactor: collapse the rail's duplicated helpers and cover the activity loop
-- e752c04, fix(triage_client): keep a session's activity stamp when it is opened
-- c3b9cde, fix(triage_client): keep a session in its repository and its rank
-- 238c5b0, fix(triage_client): stop a drag that goes nowhere from pinning
-- 5b6d963, fix(triage_client): pin only when a drag actually reorders something
-- HEAD, fix(triage_client): cancel a rail drag before re-grouping under it
+- 2b78255, feat(triaged): track per-session activity and order sessions deterministically
+- 24688d4, feat(triage_client): group the session rail by repository, ordered by activity
+- c7dd0b5, feat(triage_client): pin rail groups and sessions by dragging, with a reset
+- d6e00eb, feat(triage_client): release a single pin by tapping its indicator
+- e9c6d24, fix(triage_client): make downward rail drags actually move the item
+- 2a00796, fix(triage_client): carry pins across a server-id change
+- 85bd4ce, fix(triage_client): decode last_activity_ms over the binary transport
+- 1ee6fca, fix(triage_client): stop drags from silently releasing pins
+- 0ba47b2, refactor: collapse the rail's duplicated helpers and cover the activity loop
+- 425dc7b, fix(triage_client): keep a session's activity stamp when it is opened
+- 2a296c9, fix(triage_client): keep a session in its repository and its rank
+- 3e7cee4, fix(triage_client): stop a drag that goes nowhere from pinning
+- 1d83284, fix(triage_client): pin only when a drag actually reorders something
+- 0922797, fix(triage_client): cancel a rail drag before re-grouping under it
+- HEAD, docs(devlog): record round 8 and the rewritten commit hashes
 
-All thirteen messages above were rewritten to drop em dashes, so the hashes
-changed; the tree at each commit is byte-identical to what it was.
+Every message above was rewritten to drop em dashes, so the hashes changed from
+the ones this file listed before. The tree at each commit is byte-identical to
+what it was: verified by diffing the pre-rewrite tip against the post-rewrite
+tip, which is empty, and by the root tree hash `c8010b2` being unchanged.
 
 ## Next Steps
 
