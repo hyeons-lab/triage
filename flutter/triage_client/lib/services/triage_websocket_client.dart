@@ -53,6 +53,20 @@ const flatBuffersSubprotocol = 'triage-flatbuffers';
 /// The subprotocol token that selects the JSON encoding.
 const jsonSubprotocol = 'triage-json';
 
+/// One session's rail metadata as `listSessionContexts` returns it.
+///
+/// Distinct from the wire type `fbs.SessionContextEntry`: this is the decoded
+/// shape both transports agree on.
+///
+/// Named because the same shape is spelled out at every hop between the socket
+/// and the rail; adding `lastActivityMs` was a five-site edit without it.
+typedef SessionContextRecord = ({
+  String? repositoryRoot,
+  String? worktreeRoot,
+  String? branch,
+  int lastActivityMs,
+});
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
@@ -383,20 +397,10 @@ class TriageWebSocketClient {
   /// carries only the git fields (no live cwd — that arrives via
   /// `session_context_updated`). Best-effort: an older daemon that predates this
   /// request will error, which the caller swallows.
-  Future<
-    Map<
-      String,
-      ({String? repositoryRoot, String? worktreeRoot, String? branch})
-    >
-  >
-  listSessionContexts() async {
+  Future<Map<String, SessionContextRecord>> listSessionContexts() async {
     final response = await _send('list_session_contexts');
     final entries = response['entries'] as List<dynamic>?;
-    final result =
-        <
-          String,
-          ({String? repositoryRoot, String? worktreeRoot, String? branch})
-        >{};
+    final result = <String, SessionContextRecord>{};
     for (final entry in entries ?? const []) {
       final map = entry as Map<String, dynamic>;
       final sessionId = map['session_id'] as String?;
@@ -405,6 +409,9 @@ class TriageWebSocketClient {
           repositoryRoot: map['repository_root'] as String?,
           worktreeRoot: map['worktree_root'] as String?,
           branch: map['branch'] as String?,
+          // Absent from a daemon predating activity tracking; 0 reads as
+          // "unknown", which the rail orders last rather than as epoch-old.
+          lastActivityMs: (map['last_activity_ms'] as num?)?.toInt() ?? 0,
         );
       }
     }
@@ -769,6 +776,11 @@ class TriageWebSocketClient {
                   'repository_root': entry.repositoryRoot,
                   'worktree_root': entry.worktreeRoot,
                   'branch': entry.branch,
+                  // Omitting this would not fail (`listSessionContexts`
+                  // defaults it to 0) but it would silently flatten every
+                  // session's activity to "unknown" and drop the rail back to
+                  // id order, on the transport that is now the default.
+                  'last_activity_ms': entry.lastActivityMs,
                 },
               )
               .toList(),

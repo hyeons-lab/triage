@@ -61,6 +61,16 @@ mod tests {
         assert!(h_sess.pid > 0);
         assert!(h_sess.bytes_logged > 0);
         assert_eq!(fds.len(), 1); // 1 PTY master fd
+        // The session echoed above, so it has a real activity stamp. Captured
+        // here to compare after adoption: recency has to survive the swap, or
+        // every session lands in the successor looking equally (un)recent and the
+        // rail's ordering collapses into one arbitrary tie on the other side of
+        // an upgrade.
+        let serialized_activity = h_sess.last_activity_ms;
+        assert!(
+            serialized_activity > 0,
+            "a session that produced output must serialize a real activity stamp"
+        );
 
         // 4. Set the has_tcp_listener and active listener fd matching handover.rs
         let dup_tcp = unsafe { libc::dup(listener.as_raw_fd()) };
@@ -99,6 +109,18 @@ mod tests {
         let snap = new_manager.snapshot_session(session_id.clone())?;
         assert!(!snap.exited);
         assert_eq!(snap.size, SessionSize::default());
+
+        // Recency carried across the swap rather than being re-stamped.
+        let adopted_activity = new_manager
+            .list_session_contexts()?
+            .into_iter()
+            .find(|row| row.session_id == session_id)
+            .expect("adopted session in contexts")
+            .last_activity_ms;
+        assert_eq!(
+            adopted_activity, serialized_activity,
+            "the adopted session must keep the stamp it was handed over with"
+        );
 
         // Verify that replayed scrollback contains the output of the session!
         let rows = snap.styled_rows;
@@ -267,6 +289,7 @@ mod tests {
             output_seq: 0,
             bytes_logged: 0,
             pid: 1,
+            last_activity_ms: 0,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],

@@ -14,16 +14,30 @@ const String selectedServerPrefKey = 'daemon_selected_server_v1';
 /// migrate it into the server list, then deleted.
 const String legacyDaemonAddressPrefKey = 'daemon_address_v1';
 
-/// The single unkeyed side-rail order written before multi-server support.
-const String legacySessionOrderPrefKey = 'session_order_v1';
-
-/// shared_preferences key holding one server's side-rail order (an ordered list
-/// of its session ids).
+/// Retired side-rail order keys: the single unkeyed list written before
+/// multi-server support, and its per-server successor.
 ///
-/// Keyed by server because session ids are daemon-local: with one global list,
-/// switching to another daemon would overwrite the previous server's order with
-/// ids it has never seen.
-String sessionOrderPrefKeyFor(String serverId) => 'session_order_v1_$serverId';
+/// Both are now dead history. The rail's order is derived (repository grouping
+/// plus activity, with explicit pins on top), so a stored list of session ids no
+/// longer has anything to say about it. [purgeRetiredSessionOrder] deletes them
+/// on the paths that already rewrite a server's keys (legacy migration, the
+/// web-origin adopt, and removal); a server configured before this change and
+/// left alone keeps its stale key until one of those runs. That is deliberate:
+/// the key is inert, and sweeping every server's prefs at startup would cost a
+/// write on a path that must not await prefs at all.
+const String legacySessionOrderPrefKey = 'session_order_v1';
+String retiredSessionOrderPrefKeyFor(String serverId) =>
+    'session_order_v1_$serverId';
+
+/// shared_preferences key holding one server's pinned repository groups, in
+/// display order. Keyed by server because repository paths are specific to the
+/// machine the daemon runs on.
+String pinnedGroupsPrefKeyFor(String serverId) => 'pinned_groups_v1_$serverId';
+
+/// shared_preferences key holding one server's pinned session ids, in display
+/// order. Flat across groups; each group reads out only its own members.
+String pinnedSessionsPrefKeyFor(String serverId) =>
+    'pinned_sessions_v1_$serverId';
 
 /// The known daemons plus which one to connect to.
 class ServerConfig {
@@ -116,12 +130,11 @@ Future<ServerConfig> _migrateLegacyServer(SharedPreferences prefs) async {
   // stored. Dropping them after a failed save would leave nothing recoverable —
   // no server list, an orphaned token under a random id nothing references, and
   // no legacy address or token to retry from — forgetting the user's only
-  // daemon and forcing a re-pair on the next launch. Adopting the rail order
-  // (which deletes the legacy order key) belongs inside this guard for the same
-  // reason: a failed save would otherwise strand the order under an id that
-  // never reached disk, with the legacy key already gone.
+  // daemon and forcing a re-pair on the next launch. Purging the retired rail
+  // order sits inside the guard too, though only for tidiness now that it just
+  // deletes: a retry on the next launch is harmless either way.
   if (saved) {
-    await adoptLegacySessionOrder(server.id);
+    await purgeRetiredSessionOrder(server.id);
     if (copiedToken) clearLegacyToken();
     try {
       await prefs.remove(legacyDaemonAddressPrefKey);
@@ -214,30 +227,44 @@ bool copyLegacyTokenTo(String serverId) {
   return (ServerConfig(servers: servers, selectedId: origin.id), selectedId);
 }
 
-/// Moves one server's saved rail order from [fromId] onto [toId], deleting the
-/// old key. Used when [reconcileWebOriginSelection] repoints a web-origin entry
-/// so the user's session order follows the daemon rather than resetting, and the
-/// stale key does not linger. Best-effort: ordering is a convenience, unlike the
-/// token, so a failure just leaves the order to rebuild.
-Future<void> migrateSessionOrder(String fromId, String toId) async {
+/// Moves one server's rail pins from [fromId] onto [toId], deleting the old
+/// keys.
+///
+/// Used when [reconcileWebOriginSelection] repoints a web-origin entry, so the
+/// user's pins follow the daemon rather than resetting. Both pin keys move
+/// together: a server's id changes routinely when a web origin is repointed, so
+/// dropping one would be a real loss of a hand-built layout, not a corner case.
+///
+/// Best-effort: pinning is a convenience, unlike the token, so a failure just
+/// leaves the pins to be rebuilt by dragging.
+Future<void> migrateRailPins(String fromId, String toId) async {
   if (fromId == toId) return;
   try {
     final prefs = await SharedPreferences.getInstance();
-    final order = prefs.getStringList(sessionOrderPrefKeyFor(fromId));
-    if (order == null) return;
-    await prefs.setStringList(sessionOrderPrefKeyFor(toId), order);
-    await prefs.remove(sessionOrderPrefKeyFor(fromId));
+    for (final key in [pinnedGroupsPrefKeyFor, pinnedSessionsPrefKeyFor]) {
+      final value = prefs.getStringList(key(fromId));
+      if (value == null) continue;
+      await prefs.setStringList(key(toId), value);
+      await prefs.remove(key(fromId));
+    }
   } catch (_) {}
 }
 
-/// Moves the pre-multi-server unkeyed rail order onto [serverId]. Best-effort:
-/// ordering is a convenience, unlike the token.
-Future<void> adoptLegacySessionOrder(String serverId) async {
+/// Deletes the retired rail-order keys for [serverId], and the pre-multi-server
+/// unkeyed one.
+///
+/// A hand-built order stored by an older build is not carried forward: the rail
+/// is now ordered by repository and activity, and translating an arbitrary saved
+/// sequence into pins would pin every session and so freeze the rail against the
+/// very ordering this replaces. Users land on activity order with nothing
+/// pinned, and can pin whatever they want by dragging.
+///
+/// Best-effort: leftover preference keys are inert, so a failure here costs
+/// nothing but a retry next launch.
+Future<void> purgeRetiredSessionOrder(String serverId) async {
   try {
     final prefs = await SharedPreferences.getInstance();
-    final legacyOrder = prefs.getStringList(legacySessionOrderPrefKey);
-    if (legacyOrder == null) return;
-    await prefs.setStringList(sessionOrderPrefKeyFor(serverId), legacyOrder);
+    await prefs.remove(retiredSessionOrderPrefKeyFor(serverId));
     await prefs.remove(legacySessionOrderPrefKey);
   } catch (_) {}
 }

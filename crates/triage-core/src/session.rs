@@ -136,6 +136,25 @@ pub struct SessionContext {
     pub branch: Option<String>,
 }
 
+/// One session's rail metadata, as returned by [`SessionApi::list_session_contexts`].
+///
+/// Carries context and activity together because a client needs both to build its
+/// session list: grouping sessions by repository and ordering them by recency.
+/// Fetching them separately would leave the list momentarily grouped by one and
+/// ordered by the other, so it would visibly rearrange itself after first paint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionContextRow {
+    pub session_id: SessionId,
+    /// `None` when the session's working directory is outside any repository.
+    pub context: Option<SessionContext>,
+    /// Milliseconds since the Unix epoch of the session's most recent output.
+    ///
+    /// 0 means unknown: a session that has produced no output, or a daemon that
+    /// predates activity tracking. Consumers order unknown last rather than
+    /// treating it as the epoch, which would rank it as infinitely stale.
+    pub last_activity_ms: u64,
+}
+
 /// Separator between the parts of [`SessionContext::localization_label`].
 const LABEL_SEPARATOR: &str = "  ·  ";
 
@@ -518,12 +537,10 @@ pub trait SessionApi {
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         Ok(Vec::new())
     }
-    /// Every session's most recently resolved git context (repository/worktree
-    /// root + branch), so a client can fetch all sessions' locations in one
-    /// request without subscribing to each session's event stream. Sessions
-    /// without a resolved context carry `None`. Default: no contexts.
-    #[allow(clippy::type_complexity)]
-    fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+    /// Every session's rail metadata (git context plus last-output time), so a
+    /// client can build its whole session list from one request without
+    /// subscribing to each session's event stream. Default: no rows.
+    fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
         Ok(Vec::new())
     }
     /// Update status to embed in the `Hello` handshake. Defaults to "this build,
@@ -589,8 +606,7 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         (**self).list_session_snippets()
     }
-    #[allow(clippy::type_complexity)]
-    fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+    fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
         (**self).list_session_contexts()
     }
     fn server_update_info(&self) -> ServerUpdateInfo {

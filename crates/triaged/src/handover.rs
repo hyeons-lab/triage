@@ -13,6 +13,14 @@ pub struct HandoverSession {
     pub output_seq: u64,
     pub bytes_logged: u64,
     pub pid: u32,
+    /// Wall-clock of the session's most recent output, as milliseconds since the
+    /// Unix epoch. Carried across the swap so the incoming daemon restores each
+    /// session's real recency; without it every adopted session would look like
+    /// it had just been active, collapsing the rail's activity ordering into a
+    /// single tie at the handover instant. Defaults to 0 ("unknown") for a state
+    /// blob written before this field existed.
+    #[serde(default)]
+    pub last_activity_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

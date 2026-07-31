@@ -388,13 +388,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     .api
                     .list_session_contexts()?
                     .into_iter()
-                    .map(|(session_id, context)| {
+                    .map(|row| {
                         let to_string = |path: &Path| path.to_string_lossy().into_owned();
                         // Convert the cached `SessionContext` paths to strings the
                         // same way the `SessionContextUpdated` push does; the bulk
                         // fetch carries no live cwd (the cached context holds only
                         // the git fields), so `current_working_directory` is None.
-                        let (repository_root, worktree_root, branch) = match &context {
+                        let (repository_root, worktree_root, branch) = match &row.context {
                             Some(context) => (
                                 context.repository_root.as_deref().map(to_string),
                                 context.worktree_root.as_deref().map(to_string),
@@ -403,11 +403,12 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                             None => (None, None, None),
                         };
                         SessionContextEntry {
-                            session_id,
+                            session_id: row.session_id,
                             current_working_directory: None,
                             repository_root,
                             worktree_root,
                             branch,
+                            last_activity_ms: row.last_activity_ms,
                         }
                     })
                     .collect();
@@ -530,6 +531,11 @@ pub struct SessionContextEntry {
     pub worktree_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Milliseconds since the Unix epoch of the session's most recent output, so
+    /// a client can order its session list by recency. 0 means unknown: a
+    /// session that has produced no output, or a daemon predating this field.
+    #[serde(default)]
+    pub last_activity_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -682,8 +688,8 @@ mod tests {
     use serde_json::json;
     use triage_core::generated::triage::generated as fb;
     use triage_core::session::{
-        AttachMode, InputLeaseState, SessionContext, SessionEvent, SessionSize, StyledRow,
-        TerminalCursor,
+        AttachMode, InputLeaseState, SessionContext, SessionContextRow, SessionEvent, SessionSize,
+        StyledRow, TerminalCursor,
     };
 
     use super::*;
@@ -764,6 +770,7 @@ mod tests {
                         repository_root: Some("/repo".to_string()),
                         worktree_root: Some("/repo/worktree".to_string()),
                         branch: Some("main".to_string()),
+                        last_activity_ms: 1_700_000_000_000,
                     }],
                 },
             }
@@ -949,22 +956,21 @@ mod tests {
             Ok(self.sessions.lock().unwrap().clone())
         }
 
-        fn list_session_contexts(&self) -> Result<Vec<(SessionId, Option<SessionContext>)>> {
+        fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
             Ok(self
                 .sessions
                 .lock()
                 .unwrap()
                 .iter()
                 .cloned()
-                .map(|session_id| {
-                    (
-                        session_id,
-                        Some(SessionContext {
-                            repository_root: Some(PathBuf::from("/repo")),
-                            worktree_root: Some(PathBuf::from("/repo/worktree")),
-                            branch: Some("main".to_string()),
-                        }),
-                    )
+                .map(|session_id| SessionContextRow {
+                    session_id,
+                    context: Some(SessionContext {
+                        repository_root: Some(PathBuf::from("/repo")),
+                        worktree_root: Some(PathBuf::from("/repo/worktree")),
+                        branch: Some("main".to_string()),
+                    }),
+                    last_activity_ms: 1_700_000_000_000,
                 })
                 .collect())
         }
@@ -1497,6 +1503,49 @@ mod tests {
         let err = root.payload_as_error_payload().unwrap();
         assert_eq!(err.code().unwrap(), "invalid_flatbuffer");
         assert!(!err.message().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flatbuffers_session_contexts_carry_activity() {
+        // The binary encoder is a separate hand-written path from the JSON one,
+        // and this is exactly where the two drifted: `last_activity_ms` reached
+        // the schema and the JSON form while the FlatBuffers writer kept
+        // omitting it, so the rail read 0 for every session over the default
+        // transport and ordered them arbitrarily. Read straight off the buffer
+        // because the borrowed parser has no case for this result, only the
+        // Dart client decodes it, so nothing else on this side would notice.
+        let msg = ServerMessage::Response {
+            id: Some(json!("req-1")),
+            result: ServerResult::SessionContexts {
+                entries: vec![SessionContextEntry {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    current_working_directory: Some("/repo/wt".to_string()),
+                    repository_root: Some("/repo".to_string()),
+                    worktree_root: Some("/repo/wt".to_string()),
+                    branch: Some("main".to_string()),
+                    last_activity_ms: 1_700_000_000_000,
+                }],
+            },
+        };
+
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        let entries = flatbuffers::root::<fb::ServerMessage>(&bytes)
+            .unwrap()
+            .payload_as_response_payload()
+            .unwrap()
+            .result_as_session_contexts_result()
+            .unwrap()
+            .entries()
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        let entry = entries.get(0);
+        assert_eq!(entry.session_id(), Some("session-1"));
+        assert_eq!(entry.current_working_directory(), Some("/repo/wt"));
+        assert_eq!(entry.repository_root(), Some("/repo"));
+        assert_eq!(entry.worktree_root(), Some("/repo/wt"));
+        assert_eq!(entry.branch(), Some("main"));
+        assert_eq!(entry.last_activity_ms(), 1_700_000_000_000);
     }
 
     #[test]

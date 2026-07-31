@@ -15,6 +15,8 @@ import 'package:triage_client/models/daemon_server.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
+import 'package:triage_client/session_grouping.dart';
+import 'package:triage_client/session_rail_layout.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
@@ -338,6 +340,17 @@ class SessionVm {
   // Absolute git repository root and worktree root for this session.
   String? repoRoot;
   String? worktreeRoot;
+  // Milliseconds since the Unix epoch of this session's most recent output, as
+  // last reported by the daemon; 0 when unknown. Held here so the rail can
+  // re-group after a drag without another round-trip: the grouping needs
+  // per-session activity, and a `SessionGroup` only carries the group's max.
+  //
+  // Deliberately *not* refreshed from live output events: the rail re-sorts only
+  // when something structural happens (see [_sessionGroups]), not continuously,
+  // so that rows do not slide out from under the pointer while a background
+  // build is producing output. The cost is that this is a snapshot of recency
+  // rather than a live ranking.
+  int lastActivityMs = 0;
   // The last distinct linked worktree this session was seen driving, kept so the
   // rail can lead a root/`main` row with it (see [railTitleAt]). A `git -C
   // worktrees/x …` run from the primary checkout chdirs git into the worktree,
@@ -415,24 +428,14 @@ class SessionVm {
   }
 
   /// Last path segment of [repoRoot], for compact display (e.g. "triage").
-  String? get repoName => _leafOf(repoRoot);
+  String? get repoName => leafOf(repoRoot);
 
   /// Last path segment of [worktreeRoot], for compact display. Null when it is
   /// the repo root itself (not a separate worktree) so the rail can hide it.
   String? get worktreeName {
     final wt = worktreeRoot;
     if (wt == null || wt.isEmpty || wt == repoRoot) return null;
-    return _leafOf(wt);
-  }
-
-  static String? _leafOf(String? path) {
-    if (path == null || path.isEmpty) return null;
-    final trimmed = path.endsWith('/')
-        ? path.substring(0, path.length - 1)
-        : path;
-    final slash = trimmed.lastIndexOf('/');
-    final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
-    return leaf.isEmpty ? null : leaf;
+    return leafOf(wt);
   }
 
   /// Human-facing name for the rail/header, so sessions are identifiable at a
@@ -449,7 +452,7 @@ class SessionVm {
       if (b != null && b.trim().isNotEmpty) return '$repo · ${b.trim()}';
       return repo;
     }
-    final cwdLeaf = _leafOf(cwd);
+    final cwdLeaf = leafOf(cwd);
     if (cwdLeaf != null) return cwdLeaf;
     // No git context and no cwd: fall back to the stable title ("triage /
     // <id>") rather than a bare id, so a context-less session still reads
@@ -562,7 +565,7 @@ class SessionVm {
     if (inferredBranch != null && !_isDefaultBranch(inferredBranch)) {
       return inferredBranch;
     }
-    return _leafOf(root);
+    return leafOf(root);
   }
 
   final IconData icon;
@@ -742,10 +745,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   late final List<SessionVm> _sessions;
   int _selectedIndex = 0;
-  // Per-server side-rail order (remote session ids), loaded when the active
-  // server resolves and read synchronously when sessions load so the load path
-  // never awaits prefs.
-  List<String> _savedSessionOrder = const [];
+  // The rail's current grouping. Recomputed on the events that can actually
+  // change it: a load or reconnect, a drag, a session created or closed, and a
+  // session changing repository. Held in state rather than derived per build so
+  // the rail does not rearrange under the user mid-session as background output
+  // arrives: a freshly active group surfaces on the next load, not while they
+  // are clicking.
+  List<SessionGroup> _sessionGroups = const [];
+  // Groups and sessions the user placed by hand, which hold their slot instead
+  // of flowing with activity. Loaded per server alongside the session list.
+  SessionPins _pins = SessionPins.none;
+  // Reaches the rail list's state so a re-group can cancel a drag in progress
+  // before it reorders the rows out from under it. See [_regroupRail].
+  final GlobalKey<ReorderableListState> _railListKey =
+      GlobalKey<ReorderableListState>();
+  // Set when the daemon could not supply session contexts, which leaves every
+  // session in one repo-less group. On its own that is not enough to reject a
+  // drag: see [_railGroupingIsCollapsed], which pairs it with what the rail is
+  // actually showing.
+  bool _railGroupingDegraded = false;
   // The daemon the sessions currently in the rail came from. Null while none are
   // loaded, or while a switch is in flight and the tiles still belong to the
   // daemon we are leaving — their ids mean nothing to the one we are joining.
@@ -833,9 +851,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // order below is stored per server.
     _servers = List.of(widget.initialServers.servers);
     _selectedServerId = widget.initialServers.selectedId;
-    // Restore this server's side-rail order in the background; it's read
-    // synchronously from the cache when sessions load.
-    unawaited(_restoreSessionOrder());
+    // Prime this server's pins in the background; the load path reads the cache
+    // synchronously rather than awaiting prefs.
+    unawaited(_restorePins());
     _lastWatchdogTick = DateTime.now();
     _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
       final now = DateTime.now();
@@ -924,16 +942,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           saveServers(_servers, selectedId: originId).then((saved) {
             // Retire the stale entry's per-server state only once the swap is
             // durably stored; a failed save leaves it for the next launch to
-            // re-reconcile. The rail order follows the daemon (best-effort), then
-            // is re-restored so this session keeps it, exactly as the web-origin
-            // adoption path below does.
+            // re-reconcile. The pins follow the daemon (best-effort) and are
+            // then re-read, so this session keeps the layout it had.
             if (!saved) return;
             clearTokenFor(staleServerId);
+            // Re-read after the move: `_restorePins` has already run for this
+            // launch and found nothing under the new id, so without this the
+            // session carries empty pins and the first drag persists a
+            // one-entry list over everything just migrated.
             unawaited(
-              migrateSessionOrder(
-                staleServerId,
-                originId,
-              ).then((_) => _restoreSessionOrder()),
+              migrateRailPins(staleServerId, originId).then((_) async {
+                if (_disposed || _activeServerId != originId) return;
+                await _restorePins();
+              }),
             );
           }),
         );
@@ -968,9 +989,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           if (saved && copiedToken) clearLegacyToken();
         }),
       );
-      unawaited(
-        adoptLegacySessionOrder(origin.id).then((_) => _restoreSessionOrder()),
-      );
+      unawaited(purgeRetiredSessionOrder(origin.id));
+      // Re-read the pins under the id just adopted. `initState`'s
+      // `_restorePins` captured the pre-adopt id and bails on its own re-check,
+      // so without this the session runs with empty pins and the first drag
+      // persists a one-entry list over the stored layout, the same hazard the
+      // stale-origin reconcile path above guards against. Reachable whenever a
+      // previous launch's `saveServers` did not land, which is exactly when
+      // there are already pins stored under this id.
+      unawaited(_restorePins());
       _connectWebSocket();
     } else {
       // First run on native: no daemon yet, so ask for one instead of dialing a
@@ -1029,7 +1056,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
 
     _purgeDaemonLocalState();
-    await _restoreSessionOrder();
+    // The purge cleared the in-memory pins; reload this server's before
+    // connecting, or the first load after a switch would come up unpinned and a
+    // later drag would then overwrite the good stored pins.
+    await _restorePins();
     if (_disposed) return;
     unawaited(_connectWebSocket());
   }
@@ -1065,7 +1095,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _refreshInFlight.clear();
     _loadingSessionIds.clear();
     _sessionsServerId = null;
-    _savedSessionOrder = const [];
+    _sessionGroups = const [];
+    // Pins are per server and reload with the next session list; keeping the
+    // outgoing daemon's would briefly pin the incoming daemon's rail by paths
+    // and ids that mean nothing on that machine.
+    _pins = SessionPins.none;
   }
 
   /// Renames a daemon or re-points it at a new address.
@@ -1103,11 +1137,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _needsPairing = false;
       });
       _purgeDaemonLocalState();
-      // The purge cleared the in-memory order; reload this server's saved order
-      // (its id is unchanged) before connecting, exactly as _selectServer does —
-      // otherwise the rail reverts to the daemon's default order on an address
-      // edit, and a later drag then overwrites the good on-disk order.
-      await _restoreSessionOrder();
+      // Same reason as _selectServer: the purge cleared the in-memory pins and
+      // this server's id is unchanged, so reload them before reconnecting.
+      await _restorePins();
       if (_disposed) return;
       unawaited(_connectWebSocket());
     }
@@ -1129,7 +1161,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // snapshot when it is assigned afterwards.
     setState(() => _servers = servers);
     clearTokenFor(serverId);
-    await _clearSessionOrderFor(serverId);
+    await purgeRetiredSessionOrder(serverId);
+    await _clearPinsFor(serverId);
     await saveServers(servers, selectedId: nextId);
     if (!mounted) return;
 
@@ -1897,15 +1930,39 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final generation = _connectGeneration;
     try {
       final rawSessionIds = await _client.listSessions();
-      // Apply the per-device saved order (cached at startup) before building
-      // rows so selection, history-on-load, and rendering all flow from the
-      // displayed order. Read synchronously — never await prefs on this path.
-      final sessionIds = _applySavedOrder(rawSessionIds, _savedSessionOrder);
+      // Fetch git context + activity *before* building rows, so the rail's first
+      // paint is already grouped by repository and ordered by recency. This used
+      // to run after the rail was built, which meant every load painted in
+      // daemon order and then visibly rearranged itself once context landed.
+      // Fetched together rather than in sequence: each `await` here is a window
+      // in which a reconnect can bump the generation and a second load can
+      // interleave, so the load path keeps its number of suspension points down.
+      final contexts = await _fetchSessionContexts();
       if (_disposed || generation != _connectGeneration) return;
+      // Read from the cache primed when the server resolved; never await prefs
+      // on this path. `SharedPreferences.getInstance()` does not complete until
+      // its platform channel answers, which stalls the whole load behind it.
+      final pins = _pins;
+      final groups = _groupSessions(rawSessionIds, contexts, pins);
+      final sessionIds = flattenGroups(groups);
       final List<String> failedSessionIds = [];
-      final targetSelectedIndex = _selectedIndex >= sessionIds.length
-          ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
-          : _selectedIndex;
+      // Re-anchor the selection on the *session*, not the slot it used to
+      // occupy. The rail's order is now derived from activity, so any reconnect
+      // (a network blip, an app resume, an address edit) can legitimately
+      // re-sort it; carrying the old index across would attach and display
+      // whichever session happened to inherit that position.
+      final previouslySelected =
+          (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
+          ? _sessions[_selectedIndex].remoteSessionId
+          : null;
+      final reselected = previouslySelected == null
+          ? -1
+          : sessionIds.indexOf(previouslySelected);
+      final targetSelectedIndex = reselected != -1
+          ? reselected
+          : (_selectedIndex >= sessionIds.length
+                ? (sessionIds.isEmpty ? 0 : sessionIds.length - 1)
+                : _selectedIndex);
 
       if (_disposed || generation != _connectGeneration) return;
       // Keep a pane only when it is the *same* daemon's session of that name. A
@@ -1925,6 +1982,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
         _sessionsServerId = _activeServerId;
         _sessions.clear();
+        _sessionGroups = groups;
+        // `_pins` is deliberately *not* reassigned from the local captured above:
+        // a background `_restorePins` may have completed during the awaits since,
+        // and writing the stale capture back would silently discard it.
         for (var i = 0; i < sessionIds.length; i++) {
           // Only the selected session loads now; the rest rest as rail rows
           // until selected (see the lazy-load note below).
@@ -1932,14 +1993,28 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             sessionIds[i],
             loading: i == targetSelectedIndex,
           );
+          // Apply the context fetched above so the row renders with its final
+          // "repo · worktree" title on the first frame, rather than showing a
+          // session-id fallback that swaps out a moment later.
+          final entry = contexts[sessionIds[i]];
+          if (entry != null) {
+            session.applyContext(
+              repoRoot: entry.repositoryRoot,
+              worktreeRoot: entry.worktreeRoot,
+              branch: entry.branch,
+              // The bulk response carries no cwd; live cwd arrives via push.
+              updateCwd: false,
+            );
+            session.lastActivityMs = entry.lastActivityMs;
+          }
           _setupSessionInputListener(session);
           _sessions.add(session);
         }
-        if (_selectedIndex >= _sessions.length) {
-          _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
-        } else {
-          _selectedIndex = targetSelectedIndex;
-        }
+        // `targetSelectedIndex` already clamps for a list that shrank, so the
+        // old bounds check here is not just redundant: taking its branch
+        // discards the session-anchored reselection and leaves the rail
+        // highlighting a different row than `_loadDaemonSessionInto` attaches.
+        _selectedIndex = targetSelectedIndex;
         if (sessionIds.isEmpty) {
           _connectionStatus = 'Connected to Daemon';
           _connectionStatusColor = const Color(0xff7fd1c7);
@@ -1979,15 +2054,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         });
       }
 
-      // Seed side-rail snippets and git context for all sessions (best-effort).
-      // Context gives every session a "repo · worktree" title immediately;
-      // snippets add the one-line summary. Live updates arrive via push events.
-      // Independent best-effort requests — run concurrently to save a connect
-      // round-trip (matters on high-latency mobile links).
-      await Future.wait([
-        _seedSessionSnippets(generation),
-        _seedSessionContexts(generation),
-      ]);
+      // Git context is already applied: it was fetched before the rail was
+      // built so grouping and titles land on the first frame. Only snippets
+      // remain, and they are purely additive: a row renders fine without one.
+      await _seedSessionSnippets(generation);
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
@@ -2024,37 +2094,275 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  // Seed each session's git context on connect so the rail title reads
-  // "repo · worktree" for every session immediately, instead of waiting for a
-  // per-session load (which may never happen / may time out). Only sets the git
-  // fields — the bulk response carries no cwd; live cwd arrives via
-  // `session_context_updated`. Best-effort: an older daemon errors on the
-  // unknown request, which is swallowed here.
-  Future<void> _seedSessionContexts(int generation) async {
+  /// Every session's git context and last-output time, fetched before the rail
+  /// is built so grouping, ordering, and titles are all correct on first paint.
+  ///
+  /// Best-effort: a daemon without the request (pre-upgrade) yields an empty map,
+  /// which leaves the rail ungrouped and on the daemon's own deterministic order
+  /// rather than failing the load.
+  ///
+  /// Takes no connect generation: the caller re-checks its own on the line after
+  /// this returns, which is what makes a stale load harmless. The guard that used
+  /// to live here was needed by the `setState`-ing seeder this replaced.
+  ///
+  /// The one thing it does write is [_railGroupingDegraded], and that is
+  /// deliberately left ungenerationed. It records whether this daemon answers the
+  /// request at all, which is a property of the connection rather than of any one
+  /// load, and it drives no rebuild.
+  Future<Map<String, SessionContextRecord>> _fetchSessionContexts() async {
     try {
       final contexts = await _client.listSessionContexts();
-      if (_disposed || generation != _connectGeneration || contexts.isEmpty) {
-        return;
-      }
-      setState(() {
-        for (final session in _sessions) {
-          final sid = session.remoteSessionId;
-          final entry = sid == null ? null : contexts[sid];
-          if (entry != null) {
-            // The bulk response carries no cwd, so leave the live cwd alone.
-            session.applyContext(
-              repoRoot: entry.repositoryRoot,
-              worktreeRoot: entry.worktreeRoot,
-              branch: entry.branch,
-              updateCwd: false,
-            );
-          }
-        }
-      });
-    } catch (_) {
-      // Context is best-effort rail metadata; a daemon without the request
-      // (pre-upgrade) just leaves titles on their session-id fallback.
+      _railGroupingDegraded = false;
+      return contexts;
+    } catch (error) {
+      // Logged rather than swallowed silently: this now drives grouping and
+      // ordering, not just titles, and an unreported failure here degrades the
+      // rail to ungrouped-and-unordered with nothing to explain why. A silent
+      // catch on exactly this call is what hid the missing FlatBuffers request
+      // case until someone noticed the rail had no repository context at all.
+      debugPrint(
+        'list_session_contexts failed; rail will be ungrouped: $error',
+      );
+      // Remembered, not just logged: without repository context every session
+      // collapses into the repo-less group and the rail renders headerless,
+      // indistinguishable from a genuine single-repository rail. A drag read in
+      // that state would pin a prefix spanning sessions that really belong to
+      // different repositories, and the next successful load would hoist each of
+      // them to the top of its own group.
+      _railGroupingDegraded = true;
+      return const {};
     }
+  }
+
+  /// Primes [_pins] from this server's stored pins, in the background.
+  ///
+  /// Runs off the load path deliberately, which then reads [_pins] synchronously.
+  /// `SharedPreferences.getInstance()` completes only once its platform channel
+  /// answers, so awaiting it mid-load stalls the entire session load behind it,
+  /// including the selected session's attach.
+  ///
+  /// Best-effort like the rest of the rail's layout state: a failed read leaves
+  /// no pins, which orders everything by activity rather than failing the load.
+  Future<void> _restorePins() async {
+    // The server can change while the read is in flight; capture the one being
+    // read for so a slow read cannot apply one daemon's pins to another's rail.
+    final serverId = _activeServerId;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_disposed || serverId != _activeServerId) return;
+      final restored = SessionPins(
+        groupKeys: prefs.getStringList(pinnedGroupsPrefKeyFor(serverId)) ?? [],
+        sessionIds:
+            prefs.getStringList(pinnedSessionsPrefKeyFor(serverId)) ?? [],
+      );
+      // A load that finished while this read was in flight grouped the rail with
+      // no pins, so assigning the field alone would leave [_pins] describing a
+      // layout [_sessionGroups] does not have. `pinPrefixTo` reads the displayed
+      // order and assumes the pinned block already leads it, so the next drag
+      // would compute its prefix against the wrong list and drop pins. Re-group
+      // instead, without persisting, since this is what storage already says.
+      if (!restored.isEmpty && _sessionsServerId == serverId) {
+        _applyPins(restored, persist: false);
+      } else {
+        _pins = restored;
+      }
+    } catch (_) {
+      // Pinning is a best-effort convenience; ignore load failures.
+    }
+  }
+
+  Future<void> _persistPins(SessionPins pins) async {
+    final serverId = _activeServerId;
+    // The rail keeps accepting drags on the outgoing daemon's tiles until the
+    // new session list lands; writing those under this server's key would
+    // destroy its real pins and then apply them to sessions they don't name.
+    if (_sessionsServerId != serverId) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(
+        pinnedGroupsPrefKeyFor(serverId),
+        pins.groupKeys,
+      );
+      await prefs.setStringList(
+        pinnedSessionsPrefKeyFor(serverId),
+        pins.sessionIds,
+      );
+    } catch (_) {
+      // Pinning is a best-effort convenience; ignore persistence failures.
+    }
+  }
+
+  Future<void> _clearPinsFor(String serverId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(pinnedGroupsPrefKeyFor(serverId));
+      await prefs.remove(pinnedSessionsPrefKeyFor(serverId));
+    } catch (_) {
+      // Best-effort; ignore removal failures.
+    }
+  }
+
+  /// The rail's sessions as grouping inputs, read back off the view models so a
+  /// re-group after a drag needs no daemon round-trip.
+  List<SessionOrderingInput> _orderingInputs() => [
+    for (final session in _sessions)
+      if (session.remoteSessionId != null)
+        SessionOrderingInput(
+          sessionId: session.remoteSessionId!,
+          repoRoot: session.repoRoot,
+          lastActivityMs: session.lastActivityMs,
+        ),
+  ];
+
+  /// An activity stamp that ranks above every session currently on the rail.
+  ///
+  /// Deliberately not a wall-clock reading: these stamps come from the daemon,
+  /// and a client whose clock trails the daemon's would produce a "newest" value
+  /// that sorts below sessions idle for minutes.
+  int _nextLocalActivityStamp() {
+    var newest = 0;
+    for (final session in _sessions) {
+      if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+    }
+    return newest + 1;
+  }
+
+  /// Re-derives the rail's grouping from the sessions as they stand now,
+  /// leaving the pins alone.
+  ///
+  /// Needed wherever a session's repository can change after the rail was built:
+  /// membership follows [SessionVm.repoRoot], but the groups are a snapshot, so
+  /// assigning the field without this leaves the two disagreeing about which
+  /// header a row sits under.
+  /// Any drag in progress is cancelled first, which is what the framework asks
+  /// for: reordering the rows underneath a live drag leaves it holding an index
+  /// into a list that no longer describes them, and `ReorderableList` wraps each
+  /// child in a `GlobalKey` that a reorder mid-drag duplicates outright, which
+  /// throws. The gesture is lost, which the user can see and simply repeat.
+  ///
+  /// Holding the re-group until the drop instead would save the gesture, but it
+  /// cannot be built on the callbacks offered: `onReorderEnd` fires at
+  /// pointer-up, several frames before `onReorderItem` delivers the drop, so a
+  /// re-group released there still lands mid-drag; and neither a pointer cancel
+  /// nor the list's own `cancelReorder` raises either callback, so a flag cleared
+  /// on drag end sticks set and freezes re-grouping for the rest of the session.
+  void _regroupRail() {
+    if (_disposed || !mounted) return;
+    _railListKey.currentState?.cancelReorder();
+    _applyPins(_pins, persist: false);
+  }
+
+  /// Whether the rail has collapsed into a single contextless group, which it
+  /// renders headerless and so indistinguishable from a genuine single-repository
+  /// rail. A drag read in that state would pin a prefix spanning sessions that
+  /// really belong to different repositories, and the next successful load would
+  /// hoist each of them to the top of its own group.
+  ///
+  /// Both halves are required. [_railGroupingDegraded] alone stays set until a
+  /// context fetch succeeds, but `session_context_updated` pushes also supply
+  /// repository roots, and once they have produced a second group the rail is
+  /// showing real headers over real groups. Rejecting drags there left the user
+  /// with a visibly grouped rail whose gestures silently did nothing, which is
+  /// the opposite of what the guard is for.
+  bool get _railGroupingIsCollapsed =>
+      _railGroupingDegraded && _sessionGroups.length <= 1;
+
+  /// Re-applies [pins], reordering the rail and keeping the selection on the
+  /// same session rather than the same index.
+  ///
+  /// [persist] is false when the caller is applying pins it just read back from
+  /// storage, which has nothing to write.
+  void _applyPins(SessionPins pins, {bool persist = true}) {
+    final groups = groupSessionsByRepo(_orderingInputs(), pins: pins);
+    final order = flattenGroups(groups);
+    final byId = <String, SessionVm>{
+      for (final session in _sessions)
+        if (session.remoteSessionId != null) session.remoteSessionId!: session,
+    };
+    final selected = (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
+        ? _sessions[_selectedIndex]
+        : null;
+    final reordered = [
+      for (final id in order)
+        if (byId[id] != null) byId[id]!,
+    ];
+    // Local sessions carry no remote id and so never appear in a group; keep
+    // them rather than letting a re-group silently drop them from the rail.
+    final placed = reordered.toSet();
+    reordered.addAll(_sessions.where((s) => !placed.contains(s)));
+
+    setState(() {
+      _pins = pins;
+      _sessionGroups = groups;
+      _sessions
+        ..clear()
+        ..addAll(reordered);
+      if (selected != null) {
+        final index = _sessions.indexOf(selected);
+        if (index != -1) _selectedIndex = index;
+      }
+    });
+    if (persist) unawaited(_persistPins(pins));
+  }
+
+  /// Interprets a rail drag: the moved group or row is pinned where it was put,
+  /// and everything still unpinned keeps flowing by activity around it.
+  ///
+  /// [items] comes from the rail that produced the drag rather than being rebuilt
+  /// here. The indices only mean anything against the exact list they were
+  /// measured on, and reconstructing it is both redundant work and a way for the
+  /// two to drift. It is trustworthy because [_regroupRail] cancels a live drag
+  /// before rebuilding, so no drop can arrive measured against a list the rail
+  /// has already replaced.
+  ///
+  /// [newIndex] is in post-removal coordinates, as `onReorderItem` reports it.
+  void _reorderRail(List<RailItem> items, int oldIndex, int newIndex) {
+    // The rail is showing its degraded, contextless collapse. The drop position
+    // cannot be mapped onto anything durable, so let the row spring back rather
+    // than persist a pin that means something different once context arrives.
+    if (_railGroupingIsCollapsed) return;
+    final pins = resolveRailReorder(
+      items: items,
+      pins: _pins,
+      oldIndex: oldIndex,
+      newIndex: newIndex,
+    );
+    // A drag that resolved to no change returns the pins it was given. Applying
+    // them anyway would rebuild the rail and write prefs values identical to
+    // what is already stored, on every cancelled gesture.
+    if (identical(pins, _pins)) return;
+    _applyPins(pins);
+  }
+
+  /// Drops every pin, returning the whole rail to activity ordering.
+  void _resetRailOrder() => _applyPins(SessionPins.none);
+
+  /// Releases one group back to activity ordering, leaving other pins alone.
+  void _unpinGroup(String groupKey) =>
+      _applyPins(unpin(_pins, groupKey: groupKey));
+
+  /// Releases one session back to activity ordering within its group.
+  void _unpinSession(String sessionId) =>
+      _applyPins(unpin(_pins, sessionId: sessionId));
+
+  /// Groups [sessionIds] by repository and orders them by activity.
+  ///
+  /// Sessions missing from [contexts] still appear (as repo-less entries with
+  /// unknown activity), so a context response that omits a session can never
+  /// drop it from the rail.
+  List<SessionGroup> _groupSessions(
+    List<String> sessionIds,
+    Map<String, SessionContextRecord> contexts,
+    SessionPins pins,
+  ) {
+    return groupSessionsByRepo([
+      for (final sessionId in sessionIds)
+        SessionOrderingInput(
+          sessionId: sessionId,
+          repoRoot: contexts[sessionId]?.repositoryRoot,
+          lastActivityMs: contexts[sessionId]?.lastActivityMs ?? 0,
+        ),
+    ], pins: pins);
   }
 
   // Placeholder rail row for a daemon session. [loading] true means it is being
@@ -2113,18 +2421,47 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.dispose();
         return;
       }
+      // Set inside the `setState` below, acted on after it: the snapshot is
+      // allowed to report a repository the rail has not seen (a session that
+      // `cd`ed elsewhere since connect), and that moves the row to a different
+      // group, which the swap alone does not recompute.
+      var regrouped = false;
       setState(() {
         final existingIndex = _sessions.indexWhere(
           (s) => s.remoteSessionId == sid,
         );
         if (existingIndex == -1) return;
         final oldSession = _sessions[existingIndex];
+        // The replacement is built fresh, so its activity stamp is 0,
+        // "unknown". Carrying the old one forward matters because this runs for
+        // every session the user actually opens: without it the next re-group
+        // sinks the session, and with it its whole repository (a group is as
+        // recent as its most recent member), to the bottom of a rail that is
+        // supposed to surface exactly what is being used.
+        session.lastActivityMs = oldSession.lastActivityMs;
+        // Same reasoning for the repository, which is what decides the session's
+        // *group*: the replacement takes its context from the attach snapshot,
+        // and a snapshot that omits one (an older daemon, or a session outside
+        // the cases the daemon fills in) would move the session out of its
+        // repository and into "Other" the moment it was opened. Only filled in
+        // when the snapshot said nothing, so a genuine change still wins.
+        //
+        // Carried as a pair, keyed off the repository. The two are only
+        // meaningful together, and filling them in independently let a snapshot
+        // that reported a new repository and no worktree keep the *previous*
+        // repository's worktree, which the row then rendered as "beta / alpha".
+        if (session.repoRoot == null) {
+          session.repoRoot = oldSession.repoRoot;
+          session.worktreeRoot ??= oldSession.worktreeRoot;
+        }
+        regrouped = session.repoRoot != oldSession.repoRoot;
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);
         }
         _sessions[existingIndex] = session;
       });
+      if (regrouped) _regroupRail();
       _drainPendingEvents(sid);
     } on TriageAuthException {
       // The daemon refused the attach: this client is no longer paired. Painting
@@ -2415,9 +2752,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (index == -1) return;
       // Each push carries the full current context, so a null field genuinely
       // means "absent" (e.g. cd'd out of a repo) — assign directly, don't merge.
+      final previousRepoRoot = _sessions[index].repoRoot;
+      final nextRepoRoot = message['repository_root']?.toString();
       void apply() {
         _sessions[index].applyContext(
-          repoRoot: message['repository_root']?.toString(),
+          repoRoot: nextRepoRoot,
           worktreeRoot: message['worktree_root']?.toString(),
           branch: message['branch']?.toString(),
           cwd: message['current_working_directory']?.toString(),
@@ -2428,6 +2767,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         setState(apply);
       } else {
         apply();
+      }
+      // A `cd` across repositories changes which group the row belongs to, and
+      // the grouping is not recomputed by the assignment above. Leaving it stale
+      // shows the row under its old repository's header, and, worse, makes a
+      // drag on it incoherent: `resolveRailReorder` would resolve the drop
+      // against the old group while `_applyPins` immediately re-derives the new
+      // one, landing the row somewhere it was not dropped and pinning its former
+      // neighbours on the way.
+      if (previousRepoRoot != nextRepoRoot) {
+        _regroupRail();
       }
       return;
     }
@@ -2651,92 +3000,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         unawaited(_refreshSessionSnapshot(session, includeHistory: true));
       }
     }
-  }
-
-  /// Reorders the side rail in response to a drag, keeping the current
-  /// selection pointed at the same session, and persists the new order.
-  void _reorderSessions(int oldIndex, int newIndex) {
-    if (oldIndex < 0 || oldIndex >= _sessions.length) return;
-    setState(() {
-      // ReorderableListView reports newIndex in the pre-removal coordinate space.
-      if (newIndex > oldIndex) newIndex -= 1;
-      final selected =
-          (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
-          ? _sessions[_selectedIndex]
-          : null;
-      final moved = _sessions.removeAt(oldIndex);
-      _sessions.insert(newIndex.clamp(0, _sessions.length), moved);
-      if (selected != null) {
-        final reselected = _sessions.indexOf(selected);
-        if (reselected != -1) _selectedIndex = reselected;
-      }
-    });
-    unawaited(_persistSessionOrder());
-  }
-
-  Future<void> _restoreSessionOrder() async {
-    // The server can change while the prefs read is in flight; capture the one
-    // being read for so a slow read can't apply a stale order to a new daemon.
-    final serverId = _activeServerId;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final order = prefs.getStringList(sessionOrderPrefKeyFor(serverId));
-      if (_disposed || serverId != _activeServerId) return;
-      _savedSessionOrder = order ?? const [];
-    } catch (_) {
-      // Ordering is a best-effort convenience; ignore load failures.
-    }
-  }
-
-  Future<void> _persistSessionOrder() async {
-    final serverId = _activeServerId;
-    // The rail keeps rendering — and accepting drags on — the outgoing daemon's
-    // tiles until the new session list lands. Their ids belong to that daemon,
-    // so writing them under this one's key would destroy its real order and then
-    // be applied to its sessions.
-    if (_sessionsServerId != serverId) return;
-    final ids = _sessions
-        .map((s) => s.remoteSessionId)
-        .whereType<String>()
-        .toList();
-    _savedSessionOrder = ids;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setStringList(sessionOrderPrefKeyFor(serverId), ids);
-    } catch (_) {
-      // Ordering is a best-effort convenience; ignore persistence failures.
-    }
-  }
-
-  Future<void> _clearSessionOrderFor(String serverId) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(sessionOrderPrefKeyFor(serverId));
-    } catch (_) {
-      // Ordering is a best-effort convenience; ignore removal failures.
-    }
-  }
-
-  /// Stable-sorts daemon session ids by the saved per-device order: known ids
-  /// first in saved order, then any new ids in the daemon's original order.
-  List<String> _applySavedOrder(List<String> ids, List<String> savedOrder) {
-    if (savedOrder.isEmpty) return ids;
-    final rank = <String, int>{
-      for (var i = 0; i < savedOrder.length; i++) savedOrder[i]: i,
-    };
-    final daemonRank = <String, int>{
-      for (var i = 0; i < ids.length; i++) ids[i]: i,
-    };
-    final ordered = [...ids];
-    ordered.sort((a, b) {
-      final ra = rank[a];
-      final rb = rank[b];
-      if (ra != null && rb != null) return ra.compareTo(rb);
-      if (ra != null) return -1; // known (saved) ids sort before new ones
-      if (rb != null) return 1;
-      return (daemonRank[a] ?? 0).compareTo(daemonRank[b] ?? 0);
-    });
-    return ordered;
   }
 
   void _selectSession(int index) {
@@ -3001,12 +3264,28 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             throughOutputSeq: outputSeq,
           );
 
+          // Rank it above everything already on the rail. The daemon has no
+          // output for a session it just spawned, so it reports activity 0, and
+          // a session left at 0 sorts as "never active", sinking the one just
+          // asked for to the bottom on the next re-group. Derived from the
+          // stamps already in hand rather than from `DateTime.now()`, which
+          // would rank a local clock against daemon-issued ones: a client
+          // running behind the daemon would bury the new session, the exact
+          // outcome this is here to prevent. The real stamp arrives with the
+          // next context fetch and takes over.
+          session.lastActivityMs = _nextLocalActivityStamp();
+
           setState(() {
             _sessions.insert(0, session);
             _selectedIndex = 0;
             _connectionStatus = 'Connected to Daemon';
             _connectionStatusColor = const Color(0xff7fd1c7);
           });
+          // Insertion alone leaves it outside every group (rendered under no
+          // header, above the first one) until something else triggers a
+          // re-group. Place it in its repository now, keeping the selection that
+          // was just set on it.
+          _regroupRail();
 
           // Drain and replay any pending events that arrived during attach
           final pending = _pendingEvents.remove(sessionId);
@@ -3093,6 +3372,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       }
     });
+
+    // Drop the pin with the session. A pin naming a session that is merely not
+    // running is deliberately kept: that is the slot being held for when it
+    // comes back, but a session closed on purpose is never coming back under
+    // that id, so its pin is dead weight: it would keep the reset control
+    // showing with no indicator anywhere to explain it, and sit in this
+    // server's preferences forever.
+    if (sessionId != null && _pins.sessionIds.contains(sessionId)) {
+      _applyPins(unpin(_pins, sessionId: sessionId));
+    }
   }
 
   Future<bool?> _confirmCloseSession(SessionVm session) {
@@ -3249,6 +3538,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
     final rail = SessionRail(
       sessions: _sessions,
+      sessionGroups: _sessionGroups,
+      pins: _pins,
+      onResetOrder: _resetRailOrder,
+      onUnpinGroup: _unpinGroup,
+      onUnpinSession: _unpinSession,
       selectedIndex: _selectedIndex,
       selectedTileKey: _selectedTileKey,
       // On mobile, selecting or creating a session dismisses the overlay so the
@@ -3257,7 +3551,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _selectSession(index);
         if (isMobile) collapseRail();
       },
-      onReorderSession: _reorderSessions,
+      onReorderSession: _reorderRail,
+      railListKey: _railListKey,
       onCreateSession: (shell) {
         _createSession(shell);
         if (isMobile) collapseRail();
@@ -3397,13 +3692,41 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 }
 
+/// Lifts the row being dragged off the rail with a shadow.
+///
+/// `ReorderableListView` supplied this for free and `ReorderableList` does not,
+/// so it is reproduced here rather than lost in the swap. `Colors.transparent`
+/// keeps the row's own background: the rail paints its tiles itself, and an
+/// opaque `Material` underneath them would flash the theme's surface colour for
+/// the duration of the drag.
+Widget _railDragProxyDecorator(
+  Widget child,
+  int index,
+  Animation<double> animation,
+) => AnimatedBuilder(
+  animation: animation,
+  builder: (context, decorated) => Material(
+    color: Colors.transparent,
+    shadowColor: const Color(0xff000000),
+    elevation: Curves.easeInOut.transform(animation.value) * 6,
+    child: decorated,
+  ),
+  child: child,
+);
+
 class SessionRail extends StatelessWidget {
   const SessionRail({
     super.key,
     required this.sessions,
+    required this.sessionGroups,
+    required this.pins,
+    required this.onResetOrder,
+    required this.onUnpinGroup,
+    required this.onUnpinSession,
     required this.selectedIndex,
     required this.onSelectSession,
     required this.onReorderSession,
+    required this.railListKey,
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
@@ -3418,12 +3741,32 @@ class SessionRail extends StatelessWidget {
   });
 
   final List<SessionVm> sessions;
+  // Repository grouping for [sessions], in the same order. Empty only before the
+  // first load, or with no sessions: a daemon that reports no context at all
+  // (pre-upgrade) still yields one repo-less group, and `buildRailItems` then
+  // suppresses headers because there is only one, so the rail reads as a flat
+  // ungrouped run without this list being empty.
+  final List<SessionGroup> sessionGroups;
+  // Which rows and groups the user placed by hand. Drives the pin indicators and
+  // whether the reset action is offered at all.
+  final SessionPins pins;
+  // Drops every pin, returning the rail to activity ordering.
+  final VoidCallback onResetOrder;
+  // Release a single group or row, leaving the rest of the layout intact. Bound
+  // to the pin indicator itself rather than a context menu: on touch, the rail's
+  // long-press is already the drag trigger, so a menu would compete with it.
+  final ValueChanged<String> onUnpinGroup;
+  final ValueChanged<String> onUnpinSession;
   final int selectedIndex;
   // Attached to the selected session's tile so the host can scroll it to the
   // top when the rail (re)opens.
   final Key? selectedTileKey;
   final ValueChanged<int> onSelectSession;
-  final void Function(int oldIndex, int newIndex) onReorderSession;
+  final void Function(List<RailItem> items, int oldIndex, int newIndex)
+  onReorderSession;
+
+  /// Lets the host cancel a drag in progress before it re-groups the rail.
+  final GlobalKey<ReorderableListState> railListKey;
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
@@ -3580,6 +3923,20 @@ class SessionRail extends StatelessWidget {
     // window at the same instant.
     final now = DateTime.now();
     final indistinguishable = indistinguishableRailRows(sessions, now);
+    // Headers and rows share one list so there is a single gesture arena;
+    // `resolveRailReorder` maps a flat drop index back to the right level. Built
+    // from the rail's own sessions, so a session started since the last grouping
+    // still gets a row (ungrouped) rather than vanishing until the next load.
+    final items = buildRailItems([
+      for (final session in sessions) _rowKeyFor(session),
+    ], sessionGroups);
+    // Rows appear in `items` in the same order as `sessions`, so the nth
+    // non-header item is the nth session.
+    var rowIndex = 0;
+    final rowIndexFor = <int, int>{};
+    for (var i = 0; i < items.length; i++) {
+      if (!items[i].isHeader) rowIndexFor[i] = rowIndex++;
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -3644,37 +4001,86 @@ class SessionRail extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 18),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 20),
-          child: Text(
-            'SESSIONS',
-            style: TextStyle(
-              color: Color(0xff7f8b8d),
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0,
-            ),
+        Padding(
+          padding: const EdgeInsets.only(left: 20, right: 12),
+          child: Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  'SESSIONS',
+                  style: TextStyle(
+                    color: Color(0xff7f8b8d),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0,
+                  ),
+                ),
+              ),
+              // Only offered once something is actually pinned, so it doubles as
+              // the signal that the rail is holding a manual order at all.
+              if (!pins.isEmpty)
+                IconButton(
+                  onPressed: onResetOrder,
+                  icon: const Icon(Icons.restart_alt, size: 16),
+                  color: const Color(0xff7f8b8d),
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(
+                    minWidth: 28,
+                    minHeight: 28,
+                  ),
+                  tooltip: 'Sort by activity (clears pinned order)',
+                ),
+            ],
           ),
         ),
         const SizedBox(height: 8),
         Expanded(
-          child: ReorderableListView.builder(
+          // `ReorderableList` rather than material's `ReorderableListView`, for
+          // its state: only this one exposes `cancelReorder`, which the rail has
+          // to call before re-grouping (see `_regroupRail`). The two are
+          // otherwise the same list, and the material extras it drops are ones
+          // the rail already replaces: `buildDefaultDragHandles` was off because
+          // rows and headers install their own listeners, and the lift shadow is
+          // supplied below.
+          child: ReorderableList(
+            key: railListKey,
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-            buildDefaultDragHandles: false,
-            onReorder: onReorderSession,
-            itemCount: sessions.length,
+            proxyDecorator: _railDragProxyDecorator,
+            // `onReorderItem` rather than the deprecated `onReorder`: it reports
+            // `newIndex` already adjusted for the removal at `oldIndex`, which is
+            // the space `resolveRailReorder` works in. The pre-removal
+            // coordinates `onReorder` reports had to be converted there by hand,
+            // and every index bug this rail has had was in that conversion or
+            // downstream of it.
+            onReorderItem: (oldIndex, newIndex) =>
+                onReorderSession(items, oldIndex, newIndex),
+            itemCount: items.length,
             itemBuilder: (context, index) {
-              final session = sessions[index];
-              final key = ValueKey<String>(
-                session.remoteSessionId ?? 'local:${session.title}',
-              );
+              final item = items[index];
+              if (item.isHeader) {
+                return _SessionGroupHeader(
+                  key: ValueKey<String>('group:${item.groupKey}'),
+                  index: index,
+                  label: _groupLabelFor(item.groupKey),
+                  pinned: pins.groupKeys.contains(item.groupKey),
+                  onUnpin: () => onUnpinGroup(item.groupKey),
+                  isFirst: index == 0,
+                );
+              }
+              // `items` is built from `sessions` above, one row each, so
+              // this index is always in range.
+              final sessionIndex = rowIndexFor[index]!;
+              final session = sessions[sessionIndex];
+              final key = ValueKey<String>(_rowKeyFor(session));
               final tile = SessionListTile(
-                key: index == selectedIndex ? selectedTileKey : null,
-                selected: index == selectedIndex,
+                key: sessionIndex == selectedIndex ? selectedTileKey : null,
+                selected: sessionIndex == selectedIndex,
                 title: session.railTitleAt(now),
-                // The repo-first name for the hover card and screen-reader label,
-                // following the same lead the title shows (an inferred worktree
-                // included) so the row reads consistently everywhere.
+                // The repo-first name for the hover card and screen-reader
+                // label, following the same lead the title shows (an
+                // inferred worktree included) so the row reads consistently
+                // everywhere.
                 glanceTitle: session.glanceTitleAt(now),
                 subtitle: session.status,
                 statusColor: session.statusColor,
@@ -3686,13 +4092,18 @@ class SessionRail extends StatelessWidget {
                 snippet: session.snippet,
                 snippetDetail: session.snippetDetail,
                 activityAt: session.snippetUpdatedAt,
-                indistinguishable: indistinguishable.contains(index),
-                onTap: () => onSelectSession(index),
+                pinned: pins.sessionIds.contains(session.remoteSessionId),
+                onUnpin: session.remoteSessionId == null
+                    ? null
+                    : () => onUnpinSession(session.remoteSessionId!),
+                indistinguishable: indistinguishable.contains(sessionIndex),
+                onTap: () => onSelectSession(sessionIndex),
               );
-              // Touch: a plain drag must scroll the list, so reordering waits for
-              // a long-press (ReorderableDelayedDragStartListener). Mouse: the
-              // whole row is an immediate drag handle; a click still selects
-              // since a tap registers no movement.
+              // Touch: a plain drag must scroll the list, so reordering
+              // waits for a long-press
+              // (ReorderableDelayedDragStartListener). Mouse: the whole row
+              // is an immediate drag handle; a click still selects since a
+              // tap registers no movement.
               final isTouch = isMobilePlatform();
               return isTouch
                   ? ReorderableDelayedDragStartListener(
@@ -3709,6 +4120,116 @@ class SessionRail extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+
+  /// A group's display name: the repository's directory name, or "Other" for the
+  /// catch-all holding sessions outside any repository.
+  ///
+  /// Falls back to the key itself rather than to "Other", so that a repository
+  /// with no directory name (`/` is the only one) reads as the path it is
+  /// instead of collecting a second header identically labelled to the
+  /// genuinely repo-less group.
+  String _groupLabelFor(String groupKey) {
+    if (groupKey == otherGroupPinKey) return 'Other';
+    return leafOf(groupKey) ?? groupKey;
+  }
+}
+
+/// Names the repository whose sessions follow it, and doubles as the drag handle
+/// for moving that whole group.
+class _SessionGroupHeader extends StatelessWidget {
+  const _SessionGroupHeader({
+    super.key,
+    required this.index,
+    required this.label,
+    required this.pinned,
+    required this.onUnpin,
+    required this.isFirst,
+  });
+
+  final int index;
+  final String label;
+
+  /// Releases this group. Reached by tapping the pin indicator.
+  final VoidCallback onUnpin;
+
+  /// Whether this group holds a fixed slot. Shown because otherwise "why isn't
+  /// this moving?" has no answer on screen: the reset action alone doesn't
+  /// say *which* groups are held.
+  final bool pinned;
+
+  /// Suppresses the leading gap on the first header, which already sits directly
+  /// below the "SESSIONS" label.
+  final bool isFirst;
+
+  @override
+  Widget build(BuildContext context) {
+    final header = Padding(
+      padding: EdgeInsets.fromLTRB(8, isFirst ? 0 : 14, 8, 6),
+      child: Row(
+        children: [
+          const Icon(Icons.folder_outlined, size: 13, color: Color(0xff5c686b)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              label,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Color(0xff7f8b8d),
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.4,
+              ),
+            ),
+          ),
+          if (pinned) _UnpinButton(onUnpin: onUnpin, what: label),
+        ],
+      ),
+    );
+    // Same drag-start rule as the rows: long-press on touch so a plain drag
+    // still scrolls, immediate on mouse.
+    return isMobilePlatform()
+        ? ReorderableDelayedDragStartListener(index: index, child: header)
+        : ReorderableDragStartListener(index: index, child: header);
+  }
+}
+
+/// The pin indicator, which is also the control that releases the pin.
+///
+/// Doing both jobs with one affordance keeps the rail out of a gesture conflict:
+/// on touch, a long-press already starts a drag, so a context menu would have to
+/// compete with it. A tap target this small is acceptable because it is purely
+/// corrective: nothing is lost by missing it, and the row's own tap (select) is
+/// the far more common action.
+class _UnpinButton extends StatelessWidget {
+  const _UnpinButton({required this.onUnpin, required this.what});
+
+  final VoidCallback onUnpin;
+
+  /// Name of the thing being unpinned, for the tooltip and screen readers.
+  final String what;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Tooltip(
+        message: 'Unpin $what (return it to activity order)',
+        child: InkWell(
+          onTap: onUnpin,
+          borderRadius: BorderRadius.circular(4),
+          child: const Padding(
+            padding: EdgeInsets.all(2),
+            child: Icon(
+              Icons.push_pin,
+              size: 11,
+              color: Color(0xff7fd1c7),
+              semanticLabel: 'Pinned',
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -4227,6 +4748,8 @@ class SessionListTile extends StatefulWidget {
     this.snippet,
     this.snippetDetail,
     this.activityAt,
+    this.pinned = false,
+    this.onUnpin,
     this.indistinguishable = false,
     this.selected = false,
   });
@@ -4257,6 +4780,13 @@ class SessionListTile extends StatefulWidget {
   // time. Null when unknown, which is the normal state until the session moves
   // (see [SessionVm.snippetUpdatedAt]).
   final DateTime? activityAt;
+  // True when the user placed this row by hand, so it holds its slot instead of
+  // flowing with activity. Marked because a row sitting still while its
+  // neighbours move is otherwise unexplained.
+  final bool pinned;
+  // Releases this row's pin. Null for a local session, which has no daemon id
+  // and so can never be pinned in the first place.
+  final VoidCallback? onUnpin;
   // True when another row renders the same title and repo, so the snippet is
   // the only thing telling them apart and gets room to say it.
   final bool indistinguishable;
@@ -4380,11 +4910,24 @@ class _SessionListTileState extends State<SessionListTile> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            widget.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  widget.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              if (widget.pinned && widget.onUnpin != null)
+                                _UnpinButton(
+                                  onUnpin: widget.onUnpin!,
+                                  what: widget.title,
+                                ),
+                            ],
                           ),
                           if (gitMeta != null || hasCwdFallback) ...[
                             const SizedBox(height: 3),
@@ -4721,15 +5264,22 @@ String? formatRelativeActivity(DateTime? at, DateTime now) {
   return '${elapsed.inDays}d';
 }
 
+/// A rail row's identity: the daemon's session id, or a local-only fallback for
+/// a scratch session that has none.
+///
+/// The rail spells this out in three places (the reorder handler, the layout's
+/// row list, and the tile's `ValueKey`) and they must agree exactly: the layout
+/// maps a drop index back to a row by this key, and a `ValueKey` that disagreed
+/// with the list it was built from would reorder the wrong row.
+String _rowKeyFor(SessionVm session) =>
+    session.remoteSessionId ?? 'local:${session.title}';
+
 /// Collapses a leading local-home prefix to `~` — e.g. `/Users/me/dev` →
 /// `~/dev`. Returns null when [path] is not under the local home (e.g. a path
 /// from a remote daemon), so callers fall back to showing it in full.
 String? _homeAbbreviatedPath(String path) {
-  final home = localHomeDir();
-  if (home == null || home.isEmpty) return null;
-  final normalized = home.endsWith('/')
-      ? home.substring(0, home.length - 1)
-      : home;
+  final normalized = trimTrailingSlash(localHomeDir());
+  if (normalized == null) return null;
   if (path == normalized) return '~';
   if (path.startsWith('$normalized/')) {
     return '~${path.substring(normalized.length)}';

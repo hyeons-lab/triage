@@ -304,6 +304,11 @@ table SessionContextEntry {
     repository_root: string;
     worktree_root: string;
     branch: string;
+    // Milliseconds since the Unix epoch of the session's most recent output, so
+    // a client can order its session list by recency. 0 means unknown: either a
+    // session that has produced no output, or a daemon predating this field.
+    // Appended last to stay wire-compatible with clients built before it.
+    last_activity_ms: ulong;
 }
 
 table SessionContextsResult {

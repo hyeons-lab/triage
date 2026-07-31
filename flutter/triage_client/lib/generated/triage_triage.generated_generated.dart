@@ -9,6 +9,7 @@ import 'package:triage_client/services/flatbuffers_js_compat.dart'
     as fbjs;
 
 
+
 enum AttachMode {
   Observer(0),
   InteractiveController(1),
@@ -4196,10 +4197,11 @@ class SessionContextEntry {
   String? get repositoryRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
   String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
   String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+  int get lastActivityMs => fbjs.readUint64(_bc, _bcOffset, 14, 0);
 
   @override
   String toString() {
-    return 'SessionContextEntry{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}}';
+    return 'SessionContextEntry{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}, lastActivityMs: ${lastActivityMs}}';
   }
 }
 
@@ -4217,7 +4219,7 @@ class SessionContextEntryBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(5);
+    fbBuilder.startTable(6);
   }
 
   int addSessionIdOffset(int? offset) {
@@ -4240,6 +4242,10 @@ class SessionContextEntryBuilder {
     fbBuilder.addOffset(4, offset);
     return fbBuilder.offset;
   }
+  int addLastActivityMs(int? lastActivityMs) {
+    fbjs.addUint64(fbBuilder, 5, lastActivityMs);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -4252,6 +4258,7 @@ class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
   final String? _repositoryRoot;
   final String? _worktreeRoot;
   final String? _branch;
+  final int? _lastActivityMs;
 
   SessionContextEntryObjectBuilder({
     String? sessionId,
@@ -4259,12 +4266,14 @@ class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
     String? repositoryRoot,
     String? worktreeRoot,
     String? branch,
+    int? lastActivityMs,
   })
       : _sessionId = sessionId,
         _currentWorkingDirectory = currentWorkingDirectory,
         _repositoryRoot = repositoryRoot,
         _worktreeRoot = worktreeRoot,
-        _branch = branch;
+        _branch = branch,
+        _lastActivityMs = lastActivityMs;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -4279,12 +4288,13 @@ class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_worktreeRoot!);
     final int? branchOffset = _branch == null ? null
         : fbBuilder.writeString(_branch!);
-    fbBuilder.startTable(5);
+    fbBuilder.startTable(6);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, currentWorkingDirectoryOffset);
     fbBuilder.addOffset(2, repositoryRootOffset);
     fbBuilder.addOffset(3, worktreeRootOffset);
     fbBuilder.addOffset(4, branchOffset);
+    fbjs.addUint64(fbBuilder, 5, _lastActivityMs);
     return fbBuilder.endTable();
   }
 
