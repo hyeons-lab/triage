@@ -695,7 +695,7 @@ void main() {
         );
         expect(result['session-1']!.branch, equals('feat/x'));
         expect(result['session-2']!.repositoryRoot, isNull);
-        // Dropping this field decodes fine and orders the rail by id instead —
+        // Dropping this field decodes fine and orders the rail by id instead,
         // the failure this branch exists to prevent, and one nothing else
         // would report.
         expect(result['session-1']!.lastActivityMs, equals(1782616328232));

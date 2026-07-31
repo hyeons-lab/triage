@@ -1,7 +1,7 @@
 /// Grouping and ordering for the session rail.
 ///
 /// Kept out of `main.dart` so the ordering rules can be unit-tested against
-/// plain data instead of a pumped widget tree — this is the logic that decides
+/// plain data instead of a pumped widget tree: this is the logic that decides
 /// what the user sees first, and it has several edge cases (unknown activity,
 /// repo-less sessions, ties) that are tedious to reach through the UI.
 library;
@@ -18,7 +18,9 @@ class SessionOrderingInput {
     required this.lastActivityMs,
   });
 
-  /// Daemon-local session id. Also the tie-break, so ordering is total.
+  /// Daemon-local session id. Identity only: ties are broken on the session's
+  /// position in the input, which is the daemon's own creation order, rather
+  /// than on anything derived from this.
   final String sessionId;
 
   /// Absolute git repository root, or null when the session's working directory
@@ -28,7 +30,7 @@ class SessionOrderingInput {
   final String? repoRoot;
 
   /// Milliseconds since the Unix epoch of the session's most recent output.
-  /// 0 means unknown — no output yet, or a daemon predating activity tracking.
+  /// 0 means unknown: no output yet, or a daemon predating activity tracking.
   final int lastActivityMs;
 }
 
@@ -46,7 +48,7 @@ class SessionGroup {
   /// This group's sessions, most recently active first.
   final List<String> sessionIds;
 
-  /// The most recent activity among [sessionIds] — what the group is ordered by.
+  /// The most recent activity among [sessionIds]: what the group is ordered by.
   /// 0 when no member has known activity.
   final int lastActivityMs;
 
@@ -64,8 +66,8 @@ const otherGroupPinKey = '<other>';
 /// Pins are a *top block*, not absolute positions: pinned entries occupy the
 /// leading slots in their pinned relative order, and everything unpinned flows
 /// below them by activity. Absolute-index pinning has no well-defined answer
-/// once groups start appearing and vanishing — a repo pinned to index 2 has
-/// nowhere meaningful to sit when the repo above it closes its last session —
+/// once groups start appearing and vanishing (a repo pinned to index 2 has
+/// nowhere meaningful to sit when the repo above it closes its last session),
 /// whereas a leading block stays coherent under any change to the set.
 ///
 /// The cost is that a group cannot be pinned *below* an unpinned one. That is
@@ -74,7 +76,7 @@ const otherGroupPinKey = '<other>';
 class SessionPins {
   const SessionPins({this.groupKeys = const [], this.sessionIds = const []});
 
-  /// Empty pins — everything orders by activity.
+  /// Empty pins: everything orders by activity.
   static const none = SessionPins();
 
   /// Pinned group keys (see [SessionGroup.pinKey]), in display order.
@@ -100,7 +102,7 @@ class SessionPins {
 /// here and keep it there".
 ///
 /// Because pins are a leading block, an entry can only hold a position if
-/// everything above it is pinned too — so landing [key] at [index] means pinning
+/// everything above it is pinned too, so landing [key] at [index] means pinning
 /// the whole prefix through it, in the order the drop produces. Inserting into
 /// the pinned list alone cannot express a downward drag: with nothing yet
 /// pinned, every target clamps to 0 and the item springs back to the top, which
@@ -128,7 +130,7 @@ List<String> pinPrefixTo(
   final head = reordered.take(take.clamp(0, reordered.length)).toList();
 
   // A pin naming a group or session with no live session right now is invisible
-  // to [displayOrder], so it cannot survive a rebuild that reads from it — the
+  // to [displayOrder], so it cannot survive a rebuild that reads from it: the
   // next drag anywhere in the rail would drop it. Splice those back at the index
   // they held, which is what makes the "keeps its slot for when one starts
   // again" promise hold through a drag and not just through a re-group.
@@ -145,8 +147,8 @@ List<String> pinPrefixTo(
 /// Groups [sessions] by repository and orders both the groups and the sessions
 /// within each by most recent activity.
 ///
-/// Ordering is a *total* order: ties on activity — including the all-zero case
-/// where no session has a known stamp — fall back to the session id's creation
+/// Ordering is a *total* order: ties on activity, including the all-zero case
+/// where no session has a known stamp, fall back to the session id's creation
 /// sequence. Without that, equal timestamps would leave the order down to the
 /// input sequence, which is precisely the arbitrary ordering this replaces.
 ///
@@ -166,7 +168,7 @@ List<SessionGroup> groupSessionsByRepo(
 
   // Position in the incoming list, used to break activity ties. The daemon
   // already returns sessions in a deterministic creation order, so preserving
-  // that is both the right answer and the only one — re-deriving an order from
+  // that is both the right answer and the only one: re-deriving an order from
   // session ids here would duplicate the daemon's sort in a second language and
   // disagree with it for any id that isn't `session-N`.
   final inputIndex = <String, int>{
@@ -194,7 +196,7 @@ List<SessionGroup> groupSessionsByRepo(
         ),
         // Max, not min or mean: a group is as recent as its most recent session,
         // so one active worktree surfaces its whole repository. Computed from
-        // activity alone — pinning changes where a group sits, never how recent
+        // activity alone: pinning changes where a group sits, never how recent
         // it is, so unpinning restores its true activity position rather than
         // leaving it stranded wherever it was pinned.
         lastActivityMs: members.fold<int>(
@@ -206,7 +208,7 @@ List<SessionGroup> groupSessionsByRepo(
   }
 
   // Each group's earliest-listed session, computed once rather than inside the
-  // comparator — `sort` calls that O(n log n) times, and the fresh-daemon case
+  // comparator: `sort` calls that O(n log n) times, and the fresh-daemon case
   // where every stamp is 0 is exactly the one that reaches it every time.
   final earliestInput = {
     for (final group in groups)
@@ -220,7 +222,7 @@ List<SessionGroup> groupSessionsByRepo(
       return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
     }
     // Tie-break on the group's earliest-listed session, so group order is total
-    // and stable — the common case being a fresh daemon where every stamp is 0.
+    // and stable, the common case being a fresh daemon where every stamp is 0.
     return earliestInput[a.pinKey]!.compareTo(earliestInput[b.pinKey]!);
   });
 
@@ -232,8 +234,8 @@ List<SessionGroup> groupSessionsByRepo(
 ///
 /// One implementation for groups and sessions: they differ only in how an
 /// element yields its key. The rule that a pin naming something absent from
-/// [items] is *skipped rather than dropped* has to hold for both — a repository
-/// with no live sessions right now keeps its slot for when one starts again —
+/// [items] is *skipped rather than dropped* has to hold for both (a repository
+/// with no live sessions right now keeps its slot for when one starts again),
 /// and stating it twice is how the two would eventually disagree.
 List<T> _hoistPinned<T>(
   List<T> items,
@@ -263,8 +265,8 @@ List<String> flattenGroups(List<SessionGroup> groups) => [
 /// Drops one trailing `/`, except from the filesystem root itself.
 ///
 /// The rail derives a group key, a group header label, and a session title from
-/// the same paths. Three private copies of this rule had already drifted apart —
-/// only this one kept `/` intact — so a fix in one silently disagreed with the
+/// the same paths. Three private copies of this rule had already drifted apart
+/// (only this one kept `/` intact), so a fix in one silently disagreed with the
 /// others.
 String? trimTrailingSlash(String? path) {
   if (path == null || path.isEmpty) return null;

@@ -59,7 +59,7 @@ const jsonSubprotocol = 'triage-json';
 /// shape both transports agree on.
 ///
 /// Named because the same shape is spelled out at every hop between the socket
-/// and the rail — adding `lastActivityMs` was a five-site edit without it.
+/// and the rail; adding `lastActivityMs` was a five-site edit without it.
 typedef SessionContextRecord = ({
   String? repositoryRoot,
   String? worktreeRoot,
@@ -776,8 +776,8 @@ class TriageWebSocketClient {
                   'repository_root': entry.repositoryRoot,
                   'worktree_root': entry.worktreeRoot,
                   'branch': entry.branch,
-                  // Omitting this would not fail — `listSessionContexts`
-                  // defaults it to 0 — it would just silently flatten every
+                  // Omitting this would not fail (`listSessionContexts`
+                  // defaults it to 0) but it would silently flatten every
                   // session's activity to "unknown" and drop the rail back to
                   // id order, on the transport that is now the default.
                   'last_activity_ms': entry.lastActivityMs,

@@ -1,12 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/session_grouping.dart';
 
-SessionOrderingInput session(String id, {String? repo, int activity = 0}) =>
-    SessionOrderingInput(
-      sessionId: id,
-      repoRoot: repo,
-      lastActivityMs: activity,
-    );
+import 'ordering_fixtures.dart';
 
 void main() {
   group('groupSessionsByRepo', () {
@@ -81,7 +76,7 @@ void main() {
     test('preserves the daemon order when all activity is unknown', () {
       // The fresh-daemon case: nothing has produced output yet, so every stamp
       // is 0. The daemon already sorts by creation sequence, so the tie-break is
-      // simply to leave that order alone — re-deriving one from session ids here
+      // simply to leave that order alone: re-deriving one from session ids here
       // would duplicate the daemon's sort and disagree with it for any id that
       // isn't `session-N`.
       final groups = groupSessionsByRepo([
@@ -117,7 +112,7 @@ void main() {
     });
 
     test('an all-tied set falls back to the order the daemon listed', () {
-      // Every stamp is equal, so this is entirely decided by the tie-break —
+      // Every stamp is equal, so this is entirely decided by the tie-break,
       // the case a fresh daemon hits, where nothing has produced output yet.
       // Asserting the concrete order rather than that two identical calls agree
       // with each other: `List.sort` is deterministic for identical input
@@ -159,7 +154,7 @@ void main() {
         session('session-2', repo: '/a', activity: 5),
       ]);
 
-      // 0 means "unknown", not "the epoch" — but since any real stamp is
+      // 0 means "unknown", not "the epoch", but since any real stamp is
       // greater, unknown naturally lands last.
       expect(groups.single.sessionIds, ['session-2', 'session-1']);
     });
@@ -196,15 +191,18 @@ void main() {
       );
     });
 
-    test('dropping a new entry into the block does not release the last pin', () {
-      // Regression: the prefix was sized `max(index + 1, alreadyPinned)`, one
-      // short whenever the dragged key was not already pinned — so this dropped
-      // '/b' out of the block and back into activity order.
-      expect(
-        pinPrefixTo(const ['/a', '/b'], const ['/a', '/b', '/c'], '/c', 0),
-        equals(['/c', '/a', '/b']),
-      );
-    });
+    test(
+      'dropping a new entry into the block does not release the last pin',
+      () {
+        // Regression: the prefix was sized `max(index + 1, alreadyPinned)`, one
+        // short whenever the dragged key was not already pinned, so this dropped
+        // '/b' out of the block and back into activity order.
+        expect(
+          pinPrefixTo(const ['/a', '/b'], const ['/a', '/b', '/c'], '/c', 0),
+          equals(['/c', '/a', '/b']),
+        );
+      },
+    );
 
     test('re-dragging an already-pinned entry does not grow the block', () {
       expect(
@@ -215,7 +213,7 @@ void main() {
 
     test('a pin whose sessions are all gone survives a drag elsewhere', () {
       // `displayOrder` cannot contain a group with no live sessions, so a naive
-      // rebuild drops it — losing the slot the rail promises to hold for it.
+      // rebuild drops it, losing the slot the rail promises to hold for it.
       expect(
         pinPrefixTo(const ['/gone', '/a'], const ['/a', '/b'], '/b', 0),
         equals(['/gone', '/b', '/a']),

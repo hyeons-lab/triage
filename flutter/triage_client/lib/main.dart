@@ -342,7 +342,7 @@ class SessionVm {
   String? worktreeRoot;
   // Milliseconds since the Unix epoch of this session's most recent output, as
   // last reported by the daemon; 0 when unknown. Held here so the rail can
-  // re-group after a drag without another round-trip — the grouping needs
+  // re-group after a drag without another round-trip: the grouping needs
   // per-session activity, and a `SessionGroup` only carries the group's max.
   //
   // Deliberately *not* refreshed from live output events: the rail re-sorts only
@@ -749,20 +749,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // change it: a load or reconnect, a drag, a session created or closed, and a
   // session changing repository. Held in state rather than derived per build so
   // the rail does not rearrange under the user mid-session as background output
-  // arrives — a freshly active group surfaces on the next load, not while they
+  // arrives: a freshly active group surfaces on the next load, not while they
   // are clicking.
   List<SessionGroup> _sessionGroups = const [];
   // Groups and sessions the user placed by hand, which hold their slot instead
   // of flowing with activity. Loaded per server alongside the session list.
   SessionPins _pins = SessionPins.none;
-  // True between a rail drag's start and its drop. A re-group during that window
-  // invalidates the indices the drop will be resolved with, so re-groups defer.
-  bool _railDragInFlight = false;
-  bool _railRegroupDeferred = false;
+  // Reaches the rail list's state so a re-group can cancel a drag in progress
+  // before it reorders the rows out from under it. See [_regroupRail].
+  final GlobalKey<ReorderableListState> _railListKey =
+      GlobalKey<ReorderableListState>();
   // Set when the daemon could not supply session contexts, which leaves every
-  // session in one repo-less group. The rail then looks exactly like an ordinary
-  // single-repository rail, so a drag in that state must not be read as a
-  // statement about repositories it cannot see.
+  // session in one repo-less group. On its own that is not enough to reject a
+  // drag: see [_railGroupingIsCollapsed], which pairs it with what the rail is
+  // actually showing.
   bool _railGroupingDegraded = false;
   // The daemon the sessions currently in the rail came from. Null while none are
   // loaded, or while a switch is in flight and the tiles still belong to the
@@ -993,7 +993,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Re-read the pins under the id just adopted. `initState`'s
       // `_restorePins` captured the pre-adopt id and bails on its own re-check,
       // so without this the session runs with empty pins and the first drag
-      // persists a one-entry list over the stored layout — the same hazard the
+      // persists a one-entry list over the stored layout, the same hazard the
       // stale-origin reconcile path above guards against. Reachable whenever a
       // previous launch's `saveServers` did not land, which is exactly when
       // there are already pins stored under this id.
@@ -1939,7 +1939,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // interleave, so the load path keeps its number of suspension points down.
       final contexts = await _fetchSessionContexts();
       if (_disposed || generation != _connectGeneration) return;
-      // Read from the cache primed when the server resolved — never await prefs
+      // Read from the cache primed when the server resolved; never await prefs
       // on this path. `SharedPreferences.getInstance()` does not complete until
       // its platform channel answers, which stalls the whole load behind it.
       final pins = _pins;
@@ -1948,7 +1948,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final List<String> failedSessionIds = [];
       // Re-anchor the selection on the *session*, not the slot it used to
       // occupy. The rail's order is now derived from activity, so any reconnect
-      // — a network blip, an app resume, an address edit — can legitimately
+      // (a network blip, an app resume, an address edit) can legitimately
       // re-sort it; carrying the old index across would attach and display
       // whichever session happened to inherit that position.
       final previouslySelected =
@@ -2011,7 +2011,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _sessions.add(session);
         }
         // `targetSelectedIndex` already clamps for a list that shrank, so the
-        // old bounds check here is not just redundant — taking its branch
+        // old bounds check here is not just redundant: taking its branch
         // discards the session-anchored reselection and leaves the rail
         // highlighting a different row than `_loadDaemonSessionInto` attaches.
         _selectedIndex = targetSelectedIndex;
@@ -2054,7 +2054,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         });
       }
 
-      // Git context is already applied — it was fetched before the rail was
+      // Git context is already applied: it was fetched before the rail was
       // built so grouping and titles land on the first frame. Only snippets
       // remain, and they are purely additive: a row renders fine without one.
       await _seedSessionSnippets(generation);
@@ -2101,10 +2101,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// which leaves the rail ungrouped and on the daemon's own deterministic order
   /// rather than failing the load.
   ///
-  /// Takes no connect generation and mutates no state: the caller re-checks its
-  /// own generation on the line after this returns, which is what makes a stale
-  /// load harmless. The guard that used to live here was needed by the
-  /// `setState`-ing seeder this replaced.
+  /// Takes no connect generation: the caller re-checks its own on the line after
+  /// this returns, which is what makes a stale load harmless. The guard that used
+  /// to live here was needed by the `setState`-ing seeder this replaced.
+  ///
+  /// The one thing it does write is [_railGroupingDegraded], and that is
+  /// deliberately left ungenerationed. It records whether this daemon answers the
+  /// request at all, which is a property of the connection rather than of any one
+  /// load, and it drives no rebuild.
   Future<Map<String, SessionContextRecord>> _fetchSessionContexts() async {
     try {
       final contexts = await _client.listSessionContexts();
@@ -2120,7 +2124,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         'list_session_contexts failed; rail will be ungrouped: $error',
       );
       // Remembered, not just logged: without repository context every session
-      // collapses into the repo-less group and the rail renders headerless —
+      // collapses into the repo-less group and the rail renders headerless,
       // indistinguishable from a genuine single-repository rail. A drag read in
       // that state would pin a prefix spanning sessions that really belong to
       // different repositories, and the next successful load would hoist each of
@@ -2134,7 +2138,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   ///
   /// Runs off the load path deliberately, which then reads [_pins] synchronously.
   /// `SharedPreferences.getInstance()` completes only once its platform channel
-  /// answers, so awaiting it mid-load stalls the entire session load behind it —
+  /// answers, so awaiting it mid-load stalls the entire session load behind it,
   /// including the selected session's attach.
   ///
   /// Best-effort like the rest of the rail's layout state: a failed read leaves
@@ -2156,7 +2160,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // layout [_sessionGroups] does not have. `pinPrefixTo` reads the displayed
       // order and assumes the pinned block already leads it, so the next drag
       // would compute its prefix against the wrong list and drop pins. Re-group
-      // instead — without persisting, since this is what storage already says.
+      // instead, without persisting, since this is what storage already says.
       if (!restored.isEmpty && _sessionsServerId == serverId) {
         _applyPins(restored, persist: false);
       } else {
@@ -2230,32 +2234,38 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// membership follows [SessionVm.repoRoot], but the groups are a snapshot, so
   /// assigning the field without this leaves the two disagreeing about which
   /// header a row sits under.
+  /// Any drag in progress is cancelled first, which is what the framework asks
+  /// for: reordering the rows underneath a live drag leaves it holding an index
+  /// into a list that no longer describes them, and `ReorderableList` wraps each
+  /// child in a `GlobalKey` that a reorder mid-drag duplicates outright, which
+  /// throws. The gesture is lost, which the user can see and simply repeat.
+  ///
+  /// Holding the re-group until the drop instead would save the gesture, but it
+  /// cannot be built on the callbacks offered: `onReorderEnd` fires at
+  /// pointer-up, several frames before `onReorderItem` delivers the drop, so a
+  /// re-group released there still lands mid-drag; and neither a pointer cancel
+  /// nor the list's own `cancelReorder` raises either callback, so a flag cleared
+  /// on drag end sticks set and freezes re-grouping for the rest of the session.
   void _regroupRail() {
     if (_disposed || !mounted) return;
-    // Never reorder the rail out from under a drag in progress.
-    // `SliverReorderableList` re-syncs a live drag only when the item *count*
-    // changes; a session moving between repositories changes neither the row
-    // count nor the group count, so the drag survives with the index it captured
-    // at drag start and the drop then resolves that index against a list it no
-    // longer describes — pinning whichever row inherited the slot. Deferred
-    // rather than dropped, so the regroup still happens once the gesture ends.
-    if (_railDragInFlight) {
-      _railRegroupDeferred = true;
-      return;
-    }
+    _railListKey.currentState?.cancelReorder();
     _applyPins(_pins, persist: false);
   }
 
-  /// Tracks a rail drag between its start and drop so a background re-group
-  /// cannot reorder the list the drag is measured against.
-  void _onRailDragStart() => _railDragInFlight = true;
-
-  void _onRailDragEnd() {
-    _railDragInFlight = false;
-    if (!_railRegroupDeferred) return;
-    _railRegroupDeferred = false;
-    _regroupRail();
-  }
+  /// Whether the rail has collapsed into a single contextless group, which it
+  /// renders headerless and so indistinguishable from a genuine single-repository
+  /// rail. A drag read in that state would pin a prefix spanning sessions that
+  /// really belong to different repositories, and the next successful load would
+  /// hoist each of them to the top of its own group.
+  ///
+  /// Both halves are required. [_railGroupingDegraded] alone stays set until a
+  /// context fetch succeeds, but `session_context_updated` pushes also supply
+  /// repository roots, and once they have produced a second group the rail is
+  /// showing real headers over real groups. Rejecting drags there left the user
+  /// with a visibly grouped rail whose gestures silently did nothing, which is
+  /// the opposite of what the guard is for.
+  bool get _railGroupingIsCollapsed =>
+      _railGroupingDegraded && _sessionGroups.length <= 1;
 
   /// Re-applies [pins], reordering the rail and keeping the selection on the
   /// same session rather than the same index.
@@ -2301,13 +2311,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// [items] comes from the rail that produced the drag rather than being rebuilt
   /// here. The indices only mean anything against the exact list they were
   /// measured on, and reconstructing it is both redundant work and a way for the
-  /// two to drift.
+  /// two to drift. It is trustworthy because [_regroupRail] cancels a live drag
+  /// before rebuilding, so no drop can arrive measured against a list the rail
+  /// has already replaced.
+  ///
+  /// [newIndex] is in post-removal coordinates, as `onReorderItem` reports it.
   void _reorderRail(List<RailItem> items, int oldIndex, int newIndex) {
-    // The rail is showing its degraded, contextless grouping — see
-    // [_railGroupingDegraded]. The drop position cannot be mapped onto anything
-    // durable, so let the row spring back rather than persist a pin that means
-    // something different once context arrives.
-    if (_railGroupingDegraded) return;
+    // The rail is showing its degraded, contextless collapse. The drop position
+    // cannot be mapped onto anything durable, so let the row spring back rather
+    // than persist a pin that means something different once context arrives.
+    if (_railGroupingIsCollapsed) return;
     final pins = resolveRailReorder(
       items: items,
       pins: _pins,
@@ -2334,8 +2347,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   /// Groups [sessionIds] by repository and orders them by activity.
   ///
-  /// Sessions missing from [contexts] still appear — as repo-less entries with
-  /// unknown activity — so a context response that omits a session can never
+  /// Sessions missing from [contexts] still appear (as repo-less entries with
+  /// unknown activity), so a context response that omits a session can never
   /// drop it from the rail.
   List<SessionGroup> _groupSessions(
     List<String> sessionIds,
@@ -2409,8 +2422,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         return;
       }
       // Set inside the `setState` below, acted on after it: the snapshot is
-      // allowed to report a repository the rail has not seen — a session that
-      // `cd`ed elsewhere since connect — and that moves the row to a different
+      // allowed to report a repository the rail has not seen (a session that
+      // `cd`ed elsewhere since connect), and that moves the row to a different
       // group, which the swap alone does not recompute.
       var regrouped = false;
       setState(() {
@@ -2419,7 +2432,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         );
         if (existingIndex == -1) return;
         final oldSession = _sessions[existingIndex];
-        // The replacement is built fresh, so its activity stamp is 0 —
+        // The replacement is built fresh, so its activity stamp is 0,
         // "unknown". Carrying the old one forward matters because this runs for
         // every session the user actually opens: without it the next re-group
         // sinks the session, and with it its whole repository (a group is as
@@ -2428,12 +2441,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.lastActivityMs = oldSession.lastActivityMs;
         // Same reasoning for the repository, which is what decides the session's
         // *group*: the replacement takes its context from the attach snapshot,
-        // and a snapshot that omits one — an older daemon, or a session outside
-        // the cases the daemon fills in — would move the session out of its
+        // and a snapshot that omits one (an older daemon, or a session outside
+        // the cases the daemon fills in) would move the session out of its
         // repository and into "Other" the moment it was opened. Only filled in
         // when the snapshot said nothing, so a genuine change still wins.
-        session.repoRoot ??= oldSession.repoRoot;
-        session.worktreeRoot ??= oldSession.worktreeRoot;
+        //
+        // Carried as a pair, keyed off the repository. The two are only
+        // meaningful together, and filling them in independently let a snapshot
+        // that reported a new repository and no worktree keep the *previous*
+        // repository's worktree, which the row then rendered as "beta / alpha".
+        if (session.repoRoot == null) {
+          session.repoRoot = oldSession.repoRoot;
+          session.worktreeRoot ??= oldSession.worktreeRoot;
+        }
         regrouped = session.repoRoot != oldSession.repoRoot;
         oldSession.dispose();
         if (oldSession.title != session.title) {
@@ -2750,7 +2770,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       // A `cd` across repositories changes which group the row belongs to, and
       // the grouping is not recomputed by the assignment above. Leaving it stale
-      // shows the row under its old repository's header, and — worse — makes a
+      // shows the row under its old repository's header, and, worse, makes a
       // drag on it incoherent: `resolveRailReorder` would resolve the drop
       // against the old group while `_applyPins` immediately re-derives the new
       // one, landing the row somewhere it was not dropped and pinning its former
@@ -3245,7 +3265,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           );
 
           // Rank it above everything already on the rail. The daemon has no
-          // output for a session it just spawned, so it reports activity 0 — and
+          // output for a session it just spawned, so it reports activity 0, and
           // a session left at 0 sorts as "never active", sinking the one just
           // asked for to the bottom on the next re-group. Derived from the
           // stamps already in hand rather than from `DateTime.now()`, which
@@ -3261,8 +3281,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             _connectionStatus = 'Connected to Daemon';
             _connectionStatusColor = const Color(0xff7fd1c7);
           });
-          // Insertion alone leaves it outside every group — rendered under no
-          // header, above the first one — until something else triggers a
+          // Insertion alone leaves it outside every group (rendered under no
+          // header, above the first one) until something else triggers a
           // re-group. Place it in its repository now, keeping the selection that
           // was just set on it.
           _regroupRail();
@@ -3354,8 +3374,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
 
     // Drop the pin with the session. A pin naming a session that is merely not
-    // running is deliberately kept — that is the slot being held for when it
-    // comes back — but a session closed on purpose is never coming back under
+    // running is deliberately kept: that is the slot being held for when it
+    // comes back, but a session closed on purpose is never coming back under
     // that id, so its pin is dead weight: it would keep the reset control
     // showing with no indicator anywhere to explain it, and sit in this
     // server's preferences forever.
@@ -3532,8 +3552,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (isMobile) collapseRail();
       },
       onReorderSession: _reorderRail,
-      onReorderStart: _onRailDragStart,
-      onReorderEnd: _onRailDragEnd,
+      railListKey: _railListKey,
       onCreateSession: (shell) {
         _createSession(shell);
         if (isMobile) collapseRail();
@@ -3673,6 +3692,28 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 }
 
+/// Lifts the row being dragged off the rail with a shadow.
+///
+/// `ReorderableListView` supplied this for free and `ReorderableList` does not,
+/// so it is reproduced here rather than lost in the swap. `Colors.transparent`
+/// keeps the row's own background: the rail paints its tiles itself, and an
+/// opaque `Material` underneath them would flash the theme's surface colour for
+/// the duration of the drag.
+Widget _railDragProxyDecorator(
+  Widget child,
+  int index,
+  Animation<double> animation,
+) => AnimatedBuilder(
+  animation: animation,
+  builder: (context, decorated) => Material(
+    color: Colors.transparent,
+    shadowColor: const Color(0xff000000),
+    elevation: Curves.easeInOut.transform(animation.value) * 6,
+    child: decorated,
+  ),
+  child: child,
+);
+
 class SessionRail extends StatelessWidget {
   const SessionRail({
     super.key,
@@ -3685,8 +3726,7 @@ class SessionRail extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelectSession,
     required this.onReorderSession,
-    required this.onReorderStart,
-    required this.onReorderEnd,
+    required this.railListKey,
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
@@ -3704,7 +3744,7 @@ class SessionRail extends StatelessWidget {
   // Repository grouping for [sessions], in the same order. Empty only before the
   // first load, or with no sessions: a daemon that reports no context at all
   // (pre-upgrade) still yields one repo-less group, and `buildRailItems` then
-  // suppresses headers because there is only one — so the rail reads as a flat
+  // suppresses headers because there is only one, so the rail reads as a flat
   // ungrouped run without this list being empty.
   final List<SessionGroup> sessionGroups;
   // Which rows and groups the user placed by hand. Drives the pin indicators and
@@ -3725,10 +3765,8 @@ class SessionRail extends StatelessWidget {
   final void Function(List<RailItem> items, int oldIndex, int newIndex)
   onReorderSession;
 
-  /// Bracket a drag so a background re-group cannot reorder the list the drop
-  /// will be resolved against.
-  final VoidCallback onReorderStart;
-  final VoidCallback onReorderEnd;
+  /// Lets the host cancel a drag in progress before it re-groups the rail.
+  final GlobalKey<ReorderableListState> railListKey;
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
@@ -3998,20 +4036,25 @@ class SessionRail extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         Expanded(
-          child: ReorderableListView.builder(
+          // `ReorderableList` rather than material's `ReorderableListView`, for
+          // its state: only this one exposes `cancelReorder`, which the rail has
+          // to call before re-grouping (see `_regroupRail`). The two are
+          // otherwise the same list, and the material extras it drops are ones
+          // the rail already replaces: `buildDefaultDragHandles` was off because
+          // rows and headers install their own listeners, and the lift shadow is
+          // supplied below.
+          child: ReorderableList(
+            key: railListKey,
             padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-            buildDefaultDragHandles: false,
-            // `onReorder`, not its `onReorderItem` replacement, and the
-            // difference is load-bearing: `onReorder` reports `newIndex` in
-            // pre-removal coordinates, which is what `resolveRailReorder`
-            // documents and converts itself. `onReorderItem` has already made
-            // that adjustment, so migrating means *deleting* the conversion
-            // there, not just renaming the callback here.
-            // ignore: deprecated_member_use
-            onReorder: (oldIndex, newIndex) =>
+            proxyDecorator: _railDragProxyDecorator,
+            // `onReorderItem` rather than the deprecated `onReorder`: it reports
+            // `newIndex` already adjusted for the removal at `oldIndex`, which is
+            // the space `resolveRailReorder` works in. The pre-removal
+            // coordinates `onReorder` reports had to be converted there by hand,
+            // and every index bug this rail has had was in that conversion or
+            // downstream of it.
+            onReorderItem: (oldIndex, newIndex) =>
                 onReorderSession(items, oldIndex, newIndex),
-            onReorderStart: (_) => onReorderStart(),
-            onReorderEnd: (_) => onReorderEnd(),
             itemCount: items.length,
             itemBuilder: (context, index) {
               final item = items[index];
@@ -4084,7 +4127,7 @@ class SessionRail extends StatelessWidget {
   /// catch-all holding sessions outside any repository.
   ///
   /// Falls back to the key itself rather than to "Other", so that a repository
-  /// with no directory name — `/` is the only one — reads as the path it is
+  /// with no directory name (`/` is the only one) reads as the path it is
   /// instead of collecting a second header identically labelled to the
   /// genuinely repo-less group.
   String _groupLabelFor(String groupKey) {
@@ -4112,8 +4155,8 @@ class _SessionGroupHeader extends StatelessWidget {
   final VoidCallback onUnpin;
 
   /// Whether this group holds a fixed slot. Shown because otherwise "why isn't
-  /// this moving?" has no answer on screen — the reset action alone doesn't say
-  /// *which* groups are held.
+  /// this moving?" has no answer on screen: the reset action alone doesn't
+  /// say *which* groups are held.
   final bool pinned;
 
   /// Suppresses the leading gap on the first header, which already sits directly
@@ -4157,7 +4200,7 @@ class _SessionGroupHeader extends StatelessWidget {
 /// Doing both jobs with one affordance keeps the rail out of a gesture conflict:
 /// on touch, a long-press already starts a drag, so a context menu would have to
 /// compete with it. A tap target this small is acceptable because it is purely
-/// corrective — nothing is lost by missing it, and the row's own tap (select) is
+/// corrective: nothing is lost by missing it, and the row's own tap (select) is
 /// the far more common action.
 class _UnpinButton extends StatelessWidget {
   const _UnpinButton({required this.onUnpin, required this.what});
@@ -5224,8 +5267,8 @@ String? formatRelativeActivity(DateTime? at, DateTime now) {
 /// A rail row's identity: the daemon's session id, or a local-only fallback for
 /// a scratch session that has none.
 ///
-/// The rail spells this out in three places — the reorder handler, the layout's
-/// row list, and the tile's `ValueKey` — and they must agree exactly: the layout
+/// The rail spells this out in three places (the reorder handler, the layout's
+/// row list, and the tile's `ValueKey`) and they must agree exactly: the layout
 /// maps a drop index back to a row by this key, and a `ValueKey` that disagreed
 /// with the list it was built from would reorder the wrong row.
 String _rowKeyFor(SessionVm session) =>

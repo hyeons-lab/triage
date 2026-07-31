@@ -139,7 +139,7 @@ pub struct SessionContext {
 /// One session's rail metadata, as returned by [`SessionApi::list_session_contexts`].
 ///
 /// Carries context and activity together because a client needs both to build its
-/// session list — grouping sessions by repository and ordering them by recency.
+/// session list: grouping sessions by repository and ordering them by recency.
 /// Fetching them separately would leave the list momentarily grouped by one and
 /// ordered by the other, so it would visibly rearrange itself after first paint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +149,7 @@ pub struct SessionContextRow {
     pub context: Option<SessionContext>,
     /// Milliseconds since the Unix epoch of the session's most recent output.
     ///
-    /// 0 means unknown — a session that has produced no output, or a daemon that
+    /// 0 means unknown: a session that has produced no output, or a daemon that
     /// predates activity tracking. Consumers order unknown last rather than
     /// treating it as the epoch, which would rank it as infinitely stale.
     pub last_activity_ms: u64,
@@ -537,7 +537,7 @@ pub trait SessionApi {
     fn list_session_snippets(&self) -> Result<Vec<(SessionId, Option<String>, Option<String>)>> {
         Ok(Vec::new())
     }
-    /// Every session's rail metadata — git context plus last-output time — so a
+    /// Every session's rail metadata (git context plus last-output time), so a
     /// client can build its whole session list from one request without
     /// subscribing to each session's event stream. Default: no rows.
     fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {

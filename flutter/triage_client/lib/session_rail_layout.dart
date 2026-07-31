@@ -6,7 +6,7 @@
 /// lists. Nesting reads more naturally but puts two reorderables in one gesture
 /// arena: an inner row's drag can be captured by the outer list, and on touch a
 /// long-press on a header is ambiguous between the two levels. One list means
-/// one gesture space, at the cost of the index arithmetic here — which is
+/// one gesture space, at the cost of the index arithmetic here, which is
 /// exactly the kind of thing that belongs in tested pure functions rather than
 /// inside a widget.
 library;
@@ -35,7 +35,7 @@ class RailItem {
 /// Driven by [sessionIds] rather than by [groups] alone because the two can
 /// legitimately disagree: the grouping is recomputed at load, reconnect, and on
 /// a drag, while the session list also changes when one is started or closed. A
-/// layout read off the groups would silently omit any session added since — so
+/// layout read off the groups would silently omit any session added since, so
 /// the groups supply repository membership and order, and the session list
 /// decides what actually gets a row.
 ///
@@ -60,8 +60,8 @@ List<RailItem> buildRailItems(
   final items = <RailItem>[];
   // Tracked as a set rather than by comparing against the previous key alone:
   // an ungrouped row landing between two rows of one group would otherwise emit
-  // that group's header twice, and both headers carry `ValueKey('group:$key')`
-  // — a duplicate-key exception inside the `ReorderableListView`. Grouping keeps
+  // that group's header twice, and both headers carry `ValueKey('group:$key')`,
+  // a duplicate-key exception inside the `ReorderableListView`. Grouping keeps
   // a group's rows contiguous today, so this is a guard on the invariant rather
   // than a live fix.
   final emitted = <String>{};
@@ -81,19 +81,21 @@ List<RailItem> buildRailItems(
 /// belongs where it was put, so it stops flowing with activity from then on.
 ///
 /// Dragging a header moves its whole group. Dragging a row moves it within its
-/// own group only — repository membership follows the session's directory, so a
+/// own group only: repository membership follows the session's directory, so a
 /// row dropped over another group's rows is clamped back into its own span
 /// rather than changing repository. Clamping rather than rejecting keeps the
 /// gesture from feeling dead: the row still moves, just as far as it can go.
 ///
-/// [newIndex] is taken in `ReorderableListView`'s pre-removal coordinate space,
-/// as its `onReorder` reports it.
+/// [newIndex] is taken in post-removal coordinates, as `onReorderItem` reports
+/// it: the slot the row lands in once it has been lifted out. The deprecated
+/// `onReorder` reports it before that removal instead, and converting between
+/// the two by hand here is what every index bug in this rail came out of.
 ///
 /// A drag that resolves to the position its subject already holds pins nothing.
 /// That is not just the released-where-it-started case: the clamping above means
 /// plenty of real drags land back on themselves, and every one of them looks to
 /// the user like nothing happened. The cost is that the top group cannot be
-/// pinned by dragging it onto itself — to hold it there, drag the group below it
+/// pinned by dragging it onto itself; to hold it there, drag the group below it
 /// up past it, which pins both.
 SessionPins resolveRailReorder({
   required List<RailItem> items,
@@ -102,18 +104,16 @@ SessionPins resolveRailReorder({
   required int newIndex,
 }) {
   if (oldIndex < 0 || oldIndex >= items.length) return pins;
-  // A row with no group is a local session — it has no daemon session id, so it
+  // A row with no group is a local session: it has no daemon session id, so it
   // never appears in a group and a pin naming it could never match anything. Left
   // unpinned rather than stored, which would otherwise accumulate dead keys in
   // this server's prefs and keep the reset action permanently visible.
   if (!items[oldIndex].isHeader && items[oldIndex].groupKey.isEmpty) {
     return pins;
   }
-  // Convert to post-removal space, matching how the list itself will settle.
-  final target = newIndex > oldIndex ? newIndex - 1 : newIndex;
   final moved = items[oldIndex];
   final remaining = [...items]..removeAt(oldIndex);
-  final landing = target.clamp(0, remaining.length);
+  final landing = newIndex.clamp(0, remaining.length);
 
   if (moved.isHeader) {
     // Group move: its position among groups is the number of *other* group
@@ -132,7 +132,7 @@ SessionPins resolveRailReorder({
     // into the group above without passing that group's header, moves a real
     // distance in flat coordinates and still lands back on itself. Pinning there
     // put badges on groups the user never moved and offered a reset for a layout
-    // they never made — and because pins are a leading block, it pinned every
+    // they never made, and because pins are a leading block, it pinned every
     // group above as well.
     if (groupIndex == displayOrder.indexOf(moved.groupKey)) return pins;
     return pins.copyWith(
@@ -161,9 +161,9 @@ SessionPins resolveRailReorder({
   // index it already has.
   if (withinGroup == displayOrder.indexOf(moved.sessionId!)) return pins;
   // The whole flat list goes through `pinPrefixTo` against this group's rows.
-  // Relative order *between* groups carries no meaning — groups are positioned
+  // Relative order *between* groups carries no meaning: groups are positioned
   // by [SessionPins.groupKeys], and each group reads only its own members back
-  // out — so every pin that is not a row of this group is "absent" as far as
+  // out, so every pin that is not a row of this group is "absent" as far as
   // this call is concerned, and `pinPrefixTo` already keeps those at the index
   // they held. Splitting the list up first and re-joining it instead gave that
   // rule a second implementation, which disagreed: it collected the untouched

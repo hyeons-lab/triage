@@ -151,7 +151,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   /// grouping assume. A test that cares about grouping fills this in.
   final Map<String, SessionContextRecord> sessionContexts = {};
 
-  /// When true, `list_session_contexts` fails — a daemon predating the request,
+  /// When true, `list_session_contexts` fails, a daemon predating the request,
   /// or a request lost on a flaky link.
   bool sessionContextsFail = false;
 
@@ -1752,14 +1752,14 @@ void main() {
   group('grouped rail', () {
     // Every test above runs with no session contexts, which is the *ungrouped*
     // rail: one undifferentiated group, no headers. That left the branch's
-    // headline behaviour — headers, group drags, group unpinning — covered only
+    // headline behaviour (headers, group drags, group unpinning) covered only
     // by unit tests over pure functions, and two bugs reached the branch through
     // the gap. These tests drive the grouped rail through the widget tree.
     FakeTriageWebSocketClient clientWithRepos() {
       final client = FakeTriageWebSocketClient();
       client.sessionContexts.addAll({
-        // Two repositories, deliberately ordered so that activity — not the
-        // daemon's session order — decides which group leads.
+        // Two repositories, deliberately ordered so that activity (not the
+        // daemon's session order) decides which group leads.
         'flutter-spike': (
           repositoryRoot: '/work/alpha',
           worktreeRoot: '/work/alpha',
@@ -1809,7 +1809,7 @@ void main() {
       );
 
       // beta leads on 3000; within alpha, `main` (2000) precedes `flutter-spike`
-      // (1000) — so the rail is ordered by activity at both levels, which is the
+      // (1000), so the rail is ordered by activity at both levels, which is the
       // whole point of the grouping.
       final beta = tester.getTopLeft(header('/work/beta')).dy;
       final alpha = tester.getTopLeft(header('/work/alpha')).dy;
@@ -1942,7 +1942,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // Released, and back where activity puts it rather than stranded at the
-      // slot it was pinned to — group activity is computed from members
+      // slot it was pinned to, group activity is computed from members
       // regardless of pinning, precisely so unpinning can restore it.
       expect(indicator, findsNothing);
       expect(
@@ -1989,7 +1989,7 @@ void main() {
         lessThan(tester.getTopLeft(row('main')).dy),
       );
       // Still ahead of its less recent sibling: a dropped `lastActivityMs`
-      // reads as "never active" and would sink it below flutter-spike — and
+      // reads as "never active" and would sink it below flutter-spike, and
       // with it the whole repository, since a group takes its members' max.
       expect(
         tester.getTopLeft(row('main')).dy,
@@ -2025,7 +2025,7 @@ void main() {
 
       // Group membership follows the session's directory, so the row has to
       // move under beta's header. Assigning `repoRoot` without re-grouping left
-      // it rendered under alpha — and a drag on it would then be resolved
+      // it rendered under alpha, and a drag on it would then be resolved
       // against one group and re-derived into the other, landing the row
       // somewhere it was not dropped.
       expect(
@@ -2059,7 +2059,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(client.shutdownSessionCalls, contains('main'));
 
-      // A pin naming a session that is merely not running is kept on purpose —
+      // A pin naming a session that is merely not running is kept on purpose,
       // that slot is being held. A session closed deliberately is different: its
       // id never comes back, so leaving the pin would strand the reset control
       // on screen with no indicator anywhere to explain what is pinned.
@@ -2077,7 +2077,7 @@ void main() {
       SharedPreferences.setMockInitialValues({});
       final client = clientWithRepos();
       // Between the bulk context fetch and the open, `flutter-spike` moved from
-      // alpha to beta — the attach snapshot is the first place that shows up.
+      // alpha to beta, the attach snapshot is the first place that shows up.
       client.attachRepoRoots['flutter-spike'] = '/work/beta';
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
@@ -2100,6 +2100,23 @@ void main() {
       expect(
         tester.getTopLeft(row('flutter-spike')).dy,
         lessThan(tester.getTopLeft(header('/work/alpha')).dy),
+      );
+
+      // The worktree has to move with the repository. The snapshot names a new
+      // `repository_root` and no `worktree_root` (the daemon reports it only
+      // sometimes), so carrying the two forward independently left beta's row
+      // holding alpha's worktree and rendering itself "beta / alpha".
+      final tile = tester.widget<SessionListTile>(
+        find.descendant(
+          of: row('flutter-spike'),
+          matching: find.byType(SessionListTile),
+        ),
+      );
+      expect(tile.repoName, 'beta');
+      expect(
+        tile.worktreeName,
+        isNull,
+        reason: 'a worktree from the repository it left is worse than none',
       );
     });
 
@@ -2146,7 +2163,7 @@ void main() {
 
       // With no context every session collapses into the repo-less group and
       // headers are suppressed, so the rail is indistinguishable from an
-      // ordinary single-repository one — the user has no way to know the drag
+      // ordinary single-repository one, the user has no way to know the drag
       // means something different from usual.
       expect(header('/work/alpha'), findsNothing);
       expect(header(otherGroupPinKey), findsNothing);
@@ -2172,7 +2189,63 @@ void main() {
       );
     });
 
-    testWidgets('a re-group during a drag is deferred until the drop', (
+    testWidgets('a re-group that leaves the rail the same length still cancels '
+        'the drag', (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Rail: #beta, websocket-session-api, #alpha, main, flutter-spike.
+      // Pick `main` up, at flat index 3.
+      // Dragged to the very top, which is the one landing that tells the two
+      // readings apart. Against the rail as it was, `main` is already alpha's
+      // first row, so this resolves to the slot it holds and pins nothing;
+      // against the rebuilt rail, index 3 is alpha's header being moved above
+      // beta, which pins the group.
+      final gesture = await tester.startGesture(tester.getCenter(row('main')));
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -300));
+      await tester.pump(const Duration(milliseconds: 200));
+
+      // `flutter-spike` moves from alpha to beta mid-drag. Both groups keep at
+      // least one session, so this changes neither the row count nor the group
+      // count, and the list's own `didUpdateWidget` guard (which fires only on an
+      // item *count* change) does not notice. Left alone the drag would survive
+      // holding index 3 while the rail beneath it became #beta,
+      // websocket-session-api, flutter-spike, #alpha, main, where index 3 names
+      // alpha's *header*: the drop would pin a whole group the user never
+      // touched. This is the case `_regroupRail`'s explicit cancel exists for.
+      client.emitContextUpdated(
+        'flutter-spike',
+        repositoryRoot: '/work/beta',
+        worktreeRoot: '/work/beta',
+        branch: 'experiment/flutter-spike',
+        cwd: '/work/beta',
+      );
+      await tester.pump();
+
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getStringList(pinnedGroupsPrefKeyFor(unconfiguredServerId)),
+        anyOf(isNull, isEmpty),
+        reason: 'a row drag must never pin a group',
+      );
+      expect(
+        prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
+        anyOf(isNull, isEmpty),
+        reason: 'the cancelled gesture records nothing',
+      );
+      // The re-group itself was not held back: it ran during the drag, and the
+      // rail reflects it.
+      expect(header('/work/beta'), findsOneWidget);
+      expect(row('flutter-spike'), findsOneWidget);
+    });
+
+    testWidgets('a drag cancelled by a mid-drag re-group pins nothing', (
       WidgetTester tester,
     ) async {
       SharedPreferences.setMockInitialValues({});
@@ -2180,7 +2253,6 @@ void main() {
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
-      // Start dragging `flutter-spike` up within alpha.
       final gesture = await tester.startGesture(
         tester.getCenter(row('flutter-spike')),
       );
@@ -2188,10 +2260,17 @@ void main() {
       await gesture.moveBy(const Offset(0, -90));
       await tester.pump(const Duration(milliseconds: 200));
 
-      // A background session changes repository mid-drag. This changes neither
-      // the row count nor the group count, so `SliverReorderableList` does not
-      // cancel the drag — it would happily resolve the drop against a list that
-      // had been reordered underneath it.
+      // beta's only session joins alpha, which empties beta and drops both
+      // headers: five rail items become three. `SliverReorderableList` cancels a
+      // live drag on any item count change, so this gesture is lost.
+      //
+      // That is the accepted cost of letting re-groups run during a drag. The
+      // alternative, holding them until the drop, cannot be built on the
+      // callbacks the widget offers: `onReorderEnd` fires at pointer-up, several
+      // frames before the drop is reported, and a cancelled drag raises neither
+      // callback, so the held state would never be released. A lost drag is at
+      // least visible to the user, who can simply drag again; a drop resolved
+      // against the wrong list is silent and wrong.
       client.emitContextUpdated(
         'websocket-session-api',
         repositoryRoot: '/work/alpha',
@@ -2204,15 +2283,76 @@ void main() {
       await gesture.up();
       await tester.pumpAndSettle();
 
-      // The drop pinned the row that was actually dragged, and the deferred
-      // re-group then ran: beta has no sessions left, so its header is gone.
       final prefs = await SharedPreferences.getInstance();
       expect(
         prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
-        contains('flutter-spike'),
+        anyOf(isNull, isEmpty),
       );
+      expect(
+        find.byTooltip('Sort by activity (clears pinned order)'),
+        findsNothing,
+        reason: 'no reset offered for a layout the user never made',
+      );
+      // The re-group still happened: beta is empty, so its header is gone.
       expect(header('/work/beta'), findsNothing);
       expect(row('websocket-session-api'), findsOneWidget);
+    });
+
+    testWidgets('a drag is honoured once real headers appear despite a failed '
+        'context fetch', (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      client.sessionContextsFail = true;
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // The bulk fetch failed, so the rail collapsed to one headerless group.
+      expect(header('/work/alpha'), findsNothing);
+
+      // Pushes still arrive, and they carry the same repository roots the fetch
+      // would have. Once two groups exist the rail shows real headers over real
+      // groups, and a drag within one of them is as meaningful as any other.
+      // Refusing it left a visibly grouped rail whose gestures did nothing.
+      for (final entry in {
+        'main': '/work/alpha',
+        'flutter-spike': '/work/alpha',
+        'websocket-session-api': '/work/beta',
+      }.entries) {
+        client.emitContextUpdated(
+          entry.key,
+          repositoryRoot: entry.value,
+          worktreeRoot: entry.value,
+          branch: 'main',
+          cwd: entry.value,
+        );
+      }
+      await tester.pumpAndSettle();
+      expect(header('/work/alpha'), findsOneWidget);
+
+      // Without the bulk fetch there is no activity to order alpha's two rows,
+      // so which of them leads is the daemon's own order. Read it off the rail
+      // rather than assuming: dragging the leading row upward would clamp back
+      // onto itself and pin nothing, which would pass this test for a reason
+      // that has nothing to do with what it is checking.
+      final mainLeads =
+          tester.getTopLeft(row('main')).dy <
+          tester.getTopLeft(row('flutter-spike')).dy;
+      final trailing = mainLeads ? 'flutter-spike' : 'main';
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(row(trailing)),
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -60));
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getStringList(pinnedSessionsPrefKeyFor(unconfiguredServerId)),
+        contains(trailing),
+      );
     });
 
     testWidgets('stored pins order the rail on first paint', (

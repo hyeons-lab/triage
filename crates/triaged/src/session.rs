@@ -100,7 +100,7 @@ pub struct SessionActor {
     /// rail orders every session by activity, so listing them would otherwise
     /// cost one actor round-trip per session on a path that runs at every client
     /// connect. This is a lock-free load instead, and it stays readable while the
-    /// actor is busy serving a long output burst — exactly when a round-trip
+    /// actor is busy serving a long output burst, exactly when a round-trip
     /// would be slowest. `Relaxed` throughout: the value is a display-ordering
     /// hint that races with output by nature, and it guards no other memory.
     last_activity_ms: Arc<AtomicU64>,
@@ -154,9 +154,9 @@ fn unix_timestamp_secs() -> Result<u64> {
 /// Wall-clock milliseconds since the Unix epoch, for session activity stamps.
 ///
 /// Infallible by design, unlike [`unix_timestamp_secs`]: this runs on the actor's
-/// hot output path, where the only failure mode — a system clock set before 1970
-/// — must not cost a session its activity stamp. Such a clock yields 0, which the
-/// rail already treats as "activity unknown" and orders last.
+/// hot output path, where the only failure mode (a system clock set before
+/// 1970) must not cost a session its activity stamp. Such a clock yields 0,
+/// which the rail already treats as "activity unknown" and orders last.
 fn now_unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -415,9 +415,9 @@ struct PersistedSession {
     last_known_cwd: Option<PathBuf>,
     /// Wall-clock of the session's most recent output, as milliseconds since the
     /// Unix epoch, so a daemon restart restores each session's real recency for
-    /// the client rail's activity ordering. 0 means "unknown" — either a manifest
+    /// the client rail's activity ordering. 0 means "unknown": either a manifest
     /// written before this field existed, or a session that has never produced
-    /// output — and the rail orders those last rather than treating them as
+    /// output, and the rail orders those last rather than treating them as
     /// epoch-old.
     ///
     /// For a live session this is refreshed from the actor on every manifest
@@ -1651,7 +1651,7 @@ impl SessionApi for SessionManager {
         let sessions = self.sessions()?;
         let mut ids: Vec<SessionId> = sessions.keys().cloned().collect();
         // `sessions` is a `HashMap`, whose iteration order is arbitrary *and*
-        // reseeded per process — so returning its key order unsorted gave clients
+        // reseeded per process, so returning its key order unsorted gave clients
         // a different session order on every daemon restart. Sort by creation
         // sequence to give the rail a stable floor to fall back on whenever
         // activity ordering can't decide (equal or unknown stamps).
@@ -1951,7 +1951,7 @@ impl SessionApi for SessionManager {
         // The manifest's stamp, handed to the spawn rather than stored after it:
         // restarting the daemon must not re-stamp every restored session with the
         // restart instant, which would collapse the rail's activity order into
-        // one tie — the same corruption that ruled out log-file mtimes. A 0 means
+        // one tie, the same corruption that ruled out log-file mtimes. A 0 means
         // the manifest predates the field, so the spawn-time default stands.
         let restored_activity_ms =
             (persisted.last_activity_ms != 0).then_some(persisted.last_activity_ms);
@@ -2131,7 +2131,7 @@ impl SessionApi for SessionManager {
             .collect())
     }
 
-    /// Every session's rail metadata — git context plus last-output time — for
+    /// Every session's rail metadata (git context plus last-output time), for
     /// the `list_session_contexts` control request. Reads the already-resolved
     /// per-session context — it never re-runs git (`resolve_session_context`):
     /// live sessions return the actor's cached `SessionContext` via a brief
@@ -2311,7 +2311,7 @@ const CWD_PERSIST_SETTLE: Duration = Duration::from_millis(500);
 /// event rates: a `cd` is occasional and its value is needed exactly, whereas
 /// output is continuous and its stamp is only ever a display-ordering hint. The
 /// cost of losing up to this much recency to an ungraceful kill is that a session
-/// sorts as slightly staler than it was — invisible at rail granularity — while
+/// sorts as slightly staler than it was (invisible at rail granularity), while
 /// persisting per output would rewrite the manifest continuously under a build.
 const ACTIVITY_PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -2335,7 +2335,7 @@ fn activity_advanced(
 ///
 /// Needed because the manifest is otherwise only rewritten on structural events
 /// (start, exit, `cd`). A session that produces output without ever changing
-/// directory — a long build, a running agent — would persist no activity at all
+/// directory (a long build, a running agent) would persist no activity at all
 /// between those events, which is precisely the session the rail most needs to
 /// order correctly.
 ///
@@ -2344,8 +2344,8 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
     // Mirrors what the last write put in the manifest, so a quiet daemon settles
     // into doing no disk I/O: with every session idle the stamps stop advancing
     // and the comparison below keeps failing. Starting empty rather than seeded
-    // from the manifest means the first tick after startup always writes once —
-    // every live session reads as newly advanced — which is a fair price for not
+    // from the manifest means the first tick after startup always writes once:
+    // every live session reads as newly advanced. That is a fair price for not
     // parsing the manifest again here.
     let mut persisted: HashMap<SessionId, u64> = HashMap::new();
     loop {
@@ -3081,11 +3081,11 @@ impl SessionActor {
         )
     }
 
-    /// [initial_activity_ms] is the manifest's stamp for this session, or None
+    /// `initial_activity_ms` is the manifest's stamp for this session, or None
     /// when it predates the field. Passed in rather than stored afterwards
     /// because the reader thread starts inside this call: a restored interactive
     /// shell prints its prompt within milliseconds, and a seed applied after the
-    /// fact loses that race and re-stamps the session to "now" — which is the
+    /// fact loses that race and re-stamps the session to "now", which is the
     /// collapse the seed exists to prevent.
     fn spawn_restored(
         config: SessionConfig,
@@ -3348,7 +3348,7 @@ struct ActorState {
     dirty_tx: Option<DirtySender>,
     /// Shared with [`SessionActor::last_activity_ms`]; stamped on every output
     /// ingest. Distinct from [`Self::dirty_tx`], which is `None` whenever the
-    /// summarizer is disabled — activity ordering must not depend on that.
+    /// summarizer is disabled; activity ordering must not depend on that.
     last_activity_ms: Arc<AtomicU64>,
     /// When set (managed sessions), the actor reports working-directory changes
     /// here so the manager records the live cwd into the on-disk manifest,
@@ -7174,23 +7174,46 @@ mod tests {
         // Read after the exit, not before it: typing `exit` is itself echoed by
         // the shell, so a stamp captured earlier is legitimately stale by the
         // time the session dies. This is the value the demotion has to carry.
-        let at_exit = {
+        //
+        // Waited out rather than read straight away. `exited` flips when the
+        // child dies, but the reader thread can still be draining what the shell
+        // printed on its way out, and every chunk re-stamps activity: reading
+        // immediately made the equality below a race that only showed up under a
+        // loaded full-suite run. Settling for one quiet interval keeps the
+        // assertion exact, where relaxing it to `>=` would hold with the
+        // demotion deleted outright.
+        let read_activity = || {
             let sessions = manager.sessions().expect("sessions lock");
             match sessions.get(&session_id).expect("dead live session") {
                 ManagedSession::Live { actor, .. } => actor.last_activity_ms(),
                 _ => panic!("expected a live session"),
             }
         };
+        let at_exit = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut previous = read_activity();
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let current = read_activity();
+                if current == previous {
+                    break current;
+                }
+                assert!(Instant::now() < deadline, "activity stamp never settled");
+                previous = current;
+            }
+        };
         assert!(at_exit > 0);
 
-        // Restore is what runs `demote_dead_live_session`, which writes the
-        // manifest on its way through.
+        // Demoted directly rather than through `restore_session`, which is the
+        // only production caller. Restore demotes and then immediately revives
+        // the session, and the revived shell prints a prompt and persists the
+        // manifest again a couple of hundred milliseconds later: reading the file
+        // afterwards was reading the *restored* session's stamp, not the demoted
+        // one, and the equality below held only when the suite happened to be
+        // quiet enough for the read to win that race.
         manager
-            .restore_session(RestoreSessionRequest {
-                session_id: session_id.clone(),
-                size: SessionSize::default(),
-            })
-            .expect("restore revives dead live session");
+            .demote_dead_live_session(&session_id)
+            .expect("demote dead live session");
 
         let persisted = read_manifest(&log_dir)
             .sessions
@@ -7212,7 +7235,7 @@ mod tests {
         // A manifest written before `last_activity_ms` existed decodes as 0,
         // which the rail reads as "never active". Seeding the actor with it would
         // bury every session restored from such a manifest below every session
-        // that has one — so 0 must leave the spawn-time default alone.
+        // that has one, so 0 must leave the spawn-time default alone.
         let log_dir = unique_log_dir();
         let session_id = SessionId::new("session-3").expect("session id");
         let log_path = log_dir.join("session-3.log");
@@ -7651,7 +7674,7 @@ mod tests {
                 // `is_restorable_shell_launch` accepts it, but sleeping before
                 // the exec so the restored session writes nothing. An
                 // interactive shell prints a prompt, which re-stamps activity
-                // and would make the assertion below a race — which is how it
+                // and would make the assertion below a race, which is how it
                 // ended up as the toothless `>=` this replaces.
                 args: vec![
                     "-c".to_string(),
@@ -8066,7 +8089,7 @@ mod tests {
         // A second call must not spawn a second thread writing the same
         // manifest; the guard flag is what prevents it. Counted through the
         // `Weak` each spawned loop holds, because asserting the flag alone is
-        // true after the *first* call — that test stayed green with the guard
+        // true after the *first* call: that test stayed green with the guard
         // deleted entirely.
         manager.start_activity_persistence();
         assert_eq!(
@@ -8103,8 +8126,9 @@ mod tests {
         ids.sort_by(|left, right| session_sort_key(left).cmp(&session_sort_key(right)));
 
         let ordered: Vec<&str> = ids.iter().map(SessionId::as_str).collect();
-        // Generated ids first in sequence order, then custom ids lexicographically
-        // — a total order, so the result never depends on the input order.
+        // Generated ids first in sequence order, then custom ids
+        // lexicographically: a total order, so the result never depends on the
+        // input order.
         assert_eq!(ordered, ["session-3", "alpha", "zeta"]);
     }
 
@@ -8126,8 +8150,8 @@ mod tests {
         }
 
         // Compared against `started` directly, which *is* creation order.
-        // Deriving the expectation by sorting with `session_sort_key` — the
-        // function under test — would make this pass under the very bug it
+        // Deriving the expectation by sorting with `session_sort_key` (the
+        // function under test) would make this pass under the very bug it
         // names: a lexicographic key satisfies its own sort, and `session-10`
         // would sit before `session-2` on both sides.
         let listed = manager.list_sessions().expect("list sessions");

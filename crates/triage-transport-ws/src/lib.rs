@@ -532,7 +532,7 @@ pub struct SessionContextEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Milliseconds since the Unix epoch of the session's most recent output, so
-    /// a client can order its session list by recency. 0 means unknown — a
+    /// a client can order its session list by recency. 0 means unknown: a
     /// session that has produced no output, or a daemon predating this field.
     #[serde(default)]
     pub last_activity_ms: u64,
@@ -1512,7 +1512,7 @@ mod tests {
         // the schema and the JSON form while the FlatBuffers writer kept
         // omitting it, so the rail read 0 for every session over the default
         // transport and ordered them arbitrarily. Read straight off the buffer
-        // because the borrowed parser has no case for this result — only the
+        // because the borrowed parser has no case for this result, only the
         // Dart client decodes it, so nothing else on this side would notice.
         let msg = ServerMessage::Response {
             id: Some(json!("req-1")),

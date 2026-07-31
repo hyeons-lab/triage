@@ -2,12 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
 
-SessionOrderingInput session(String id, {String? repo, int activity = 0}) =>
-    SessionOrderingInput(
-      sessionId: id,
-      repoRoot: repo,
-      lastActivityMs: activity,
-    );
+import 'ordering_fixtures.dart';
 
 /// Compact view of the rail for assertions: headers as `#key`, rows as the id.
 List<String> render(List<RailItem> items) => [
@@ -63,7 +58,7 @@ void main() {
 
     test('pinning does not alter a group\'s activity', () {
       // Activity is what a group reverts to on unpin, so pinning must not
-      // overwrite it — otherwise unpinning would strand the group.
+      // overwrite it, otherwise unpinning would strand the group.
       final groups = groupSessionsByRepo([
         session('session-1', repo: '/a', activity: 5),
         session('session-2', repo: '/b', activity: 900),
@@ -233,12 +228,13 @@ void main() {
         'session-3',
       ]);
 
-      // Drag session-1 (index 1) below session-2 (drop index 3).
+      // Drag session-1 (index 1) below session-2, which is slot 2 once the row
+      // itself has been lifted out.
       final pins = resolveRailReorder(
         items: rail,
         pins: SessionPins.none,
         oldIndex: 1,
-        newIndex: 3,
+        newIndex: 2,
       );
 
       expect(render(railFor(sessions, pins: pins)), [
@@ -253,12 +249,13 @@ void main() {
     test('dragging a header DOWN moves that group down', () {
       final rail = railFor(sessions);
 
-      // Drag /a's header (index 0) below /b.
+      // Drag /a's header (index 0) below /b: the last slot of the four rows that
+      // remain once the header is lifted out.
       final pins = resolveRailReorder(
         items: rail,
         pins: SessionPins.none,
         oldIndex: 0,
-        newIndex: 4,
+        newIndex: 3,
       );
 
       expect(render(railFor(sessions, pins: pins)), [
@@ -287,7 +284,7 @@ void main() {
         items: rail,
         pins: pins0,
         oldIndex: 1, // session-2
-        newIndex: 3, // past session-3
+        newIndex: 2, // past session-3, which is the last slot of the other two
       );
 
       expect(pins.sessionIds, contains('session-1'));
@@ -314,7 +311,7 @@ void main() {
           items: rail,
           pins: SessionPins.none,
           oldIndex: 0,
-          newIndex: 2,
+          newIndex: 1,
         ).isEmpty,
         isTrue,
         reason: '/a dragged over its own rows stays first',
@@ -347,36 +344,23 @@ void main() {
     });
 
     test('a drag that ends where it started pins nothing', () {
-      // `ReorderableListView` reports a row dragged down past its neighbour's
-      // midpoint and released back on its own slot as `newIndex == oldIndex + 1`.
-      // That is a null gesture, and it used to pin the whole prefix above the
-      // row: badges on rows the user never moved, and a reset control offered for
-      // a layout they never made.
+      // Belt and braces: `onReorderItem` drops a drop resolving to `oldIndex`
+      // before it reaches here. Asserted anyway because the older `onReorder`
+      // did deliver it, as `newIndex == oldIndex + 1`, and it pinned the whole
+      // prefix above the row: badges on rows the user never moved, and a reset
+      // control offered for a layout they never made. Nothing about this function
+      // requires the caller to filter it, so nothing about it should assume so.
       final rail = railFor(sessions);
-      for (final oldIndex in [1, 2, 4]) {
+      for (var index = 0; index < rail.length; index++) {
         expect(
           resolveRailReorder(
             items: rail,
             pins: SessionPins.none,
-            oldIndex: oldIndex,
-            newIndex: oldIndex + 1,
+            oldIndex: index,
+            newIndex: index,
           ).isEmpty,
           isTrue,
-          reason: 'row at $oldIndex did not move',
-        );
-      }
-      // Headers report it the same way, and a group move is the more damaging
-      // one — it pins every group above as well.
-      for (final headerIndex in [0, 3]) {
-        expect(
-          resolveRailReorder(
-            items: rail,
-            pins: SessionPins.none,
-            oldIndex: headerIndex,
-            newIndex: headerIndex + 1,
-          ).isEmpty,
-          isTrue,
-          reason: 'header at $headerIndex did not move',
+          reason: '${render(rail)[index]} did not move',
         );
       }
     });
@@ -403,10 +387,10 @@ void main() {
         items: rail,
         pins: const SessionPins(groupKeys: ['/b']),
         oldIndex: 0,
-        newIndex: 3,
+        newIndex: 2,
       );
 
-      // /b lands below /a, which means /a has to be pinned too — a leading block
+      // /b lands below /a, which means /a has to be pinned too, a leading block
       // cannot hold an entry beneath an unpinned one. The invariant under test is
       // that the entry moves rather than accumulating a second time.
       expect(pins.groupKeys, ['/a', '/b']);
@@ -423,7 +407,7 @@ void main() {
 
   group('session drags and absent pins', () {
     test('a pin naming a session with no live row keeps its slot', () {
-      // `session-2` is pinned but not running right now — its repository is
+      // `session-2` is pinned but not running right now, its repository is
       // still on the rail through `session-1` and `session-3`. Its pin has to
       // survive a drag *and* stay ranked where it was, because that slot is the
       // whole promise being made: it is held for when the session comes back.

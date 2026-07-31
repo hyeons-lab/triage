@@ -1,15 +1,15 @@
-# 000111-02 — Rail pinning (Phase 2)
+# 000111-02, Rail pinning (Phase 2)
 
 Written after the fact, reconstructing the design from the work as it landed.
 Phase 2 was deferred in `000111-01` and then pulled forward into the same branch
-once it became clear the two could not ship separately — see the Decisions entry
+once it became clear the two could not ship separately, see the Decisions entry
 in the devlog.
 
 ## Thinking
 
 Phase 1 makes the rail order derived: repository grouping, then activity, with a
 deterministic tie-break. That is strictly better than the `HashMap` order it
-replaces, but it takes something away — the old rail could be reordered by hand
+replaces, but it takes something away, the old rail could be reordered by hand
 and the order persisted, and a derived order has no room for that.
 
 Worse, the two changes could not be separated. Landing group headers means the
@@ -22,14 +22,14 @@ the drag replacement is not a follow-up, it is the other half of the same change
 So the question is what "put this here" should mean when everything else is
 flowing by activity.
 
-**Absolute-index pinning** — "this repo is always third" — has no defined answer
+**Absolute-index pinning**, "this repo is always third", has no defined answer
 under a changing set. If the repo above it closes its last session, third place
 means something different; if a new repo becomes active, the pinned one has to be
 displaced or the new one has nowhere to go. Every rule for resolving that is
 arbitrary.
 
-**A leading block** — pinned entries occupy the top slots in their pinned order,
-everything unpinned flows below by activity — stays coherent under any change to
+**A leading block**, pinned entries occupy the top slots in their pinned order,
+everything unpinned flows below by activity, stays coherent under any change to
 the set. Adding, removing, or reordering unpinned entries never disturbs the
 block, and removing a pinned entry just shortens it.
 
@@ -50,14 +50,14 @@ Two consequences fall out of the block model:
 
 Pins also need an exit. Two, in fact: a global reset for "put it all back", and a
 per-item release for "just this one". The per-item control is the pin indicator
-itself rather than a context menu — on touch the rail's long-press is already the
+itself rather than a context menu, on touch the rail's long-press is already the
 drag trigger, so a menu would compete with the gesture that creates pins in the
 first place.
 
 ## Plan
 
 1. `SessionPins` (group keys + session ids, both flat and ordered) with
-   `SessionPins.none`, persisted per server — repository paths and session ids
+   `SessionPins.none`, persisted per server, repository paths and session ids
    are both daemon-local.
 2. `pinPrefixTo(pinned, displayOrder, key, index)`: the drag→pin mapping, shared
    by group and row drags since both mean the same thing. Must never release a
@@ -65,8 +65,8 @@ first place.
    session right now.
 3. Order pinned entries ahead of unpinned ones in `groupSessionsByRepo`, at both
    levels, computing group activity from members irrespective of pinning.
-4. `session_rail_layout.dart`: a flat `RailItem` list with headers interleaved —
-   one gesture arena — plus `resolveRailReorder` mapping a drop index back to a
+4. `session_rail_layout.dart`: a flat `RailItem` list with headers interleaved,
+   one gesture arena, plus `resolveRailReorder` mapping a drop index back to a
    pin change. Index arithmetic lives in pure functions, not the widget, because
    that is the part that will be wrong.
 5. Rows clamp to their own group's span: repository membership follows the
