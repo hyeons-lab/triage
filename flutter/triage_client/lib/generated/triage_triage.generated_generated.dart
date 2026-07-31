@@ -9,6 +9,7 @@ import 'package:triage_client/services/flatbuffers_js_compat.dart'
     as fbjs;
 
 
+
 enum AttachMode {
   Observer(0),
   InteractiveController(1),

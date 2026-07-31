@@ -224,6 +224,11 @@ reversal, and `devlog/plans/000111-02-rail-pinning.md` for the pinning design.
   directly rather than through `restore_session`, and waits for the activity
   stamp to settle before capturing it. `test/ordering_fixtures.dart` now owns the
   `session()` helper both ordering test files were declaring separately.
+- 2026-07-30T20:44-0700 `.github/actions/setup-flatc/action.yml` pins flatc
+  25.12.19 instead of 25.2.10, and `lib/generated/` is regenerated against it.
+  The action is the single source of truth: `generate-dart-flatbuffers.sh` reads
+  the version out of `inputs.version` rather than carrying its own copy, so the
+  one-line bump moves both CI and local runs together.
 
 ## Issues
 
@@ -495,6 +500,22 @@ reversal, and `devlog/plans/000111-02-rail-pinning.md` for the pinning design.
   pushed). A mechanical pass to commas was only the first step, it produced comma
   splices and pileups; those were re-punctuated by hand to colons, semicolons, and
   parentheses.
+- 2026-07-30T20:44-0700 Bumped the pinned flatc to 25.12.19, the current stable
+  release, because the old pin made the drift gate unrunnable on this machine:
+  the script refuses to compare against output from a version it was not
+  generated with, so the one CI gate that could not be reproduced locally was
+  the one guarding generated code. Checked the cost before committing to it by
+  generating into a scratch directory and applying the uint64 patch by hand: the
+  entire delta between 25.2.10 and 25.12.19 for this schema is a single blank
+  line, and the patch still finds every call site it guards (15 readers, 30
+  writers). v25.12.19 also publishes the same three release assets under the
+  same names, so the composite action needed nothing but the version string.
+- 2026-07-30T20:45-0700 Folded the bump into this branch rather than opening a
+  second PR. Both changes touch `lib/generated/`, and landing the bump first
+  would have let this branch's older-flatc bindings revert the blank line on
+  merge, breaking the drift gate on `main`. Sharing a branch removes the
+  ordering constraint, and it means the gate is verified locally before merge
+  rather than inferred.
 
 ## Decisions
 
@@ -598,7 +619,8 @@ Hashes below are post-rebase.
 - 3e7cee4, fix(triage_client): stop a drag that goes nowhere from pinning
 - 1d83284, fix(triage_client): pin only when a drag actually reorders something
 - 0922797, fix(triage_client): cancel a rail drag before re-grouping under it
-- HEAD, docs(devlog): record round 8 and the rewritten commit hashes
+- e74073a, docs(devlog): record round 8 and the rewritten commit hashes
+- HEAD, build: pin flatc 25.12.19 and regenerate the Dart bindings
 
 Every message above was rewritten to drop em dashes, so the hashes changed from
 the ones this file listed before. The tree at each commit is byte-identical to
