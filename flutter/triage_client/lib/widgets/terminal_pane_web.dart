@@ -264,38 +264,62 @@ class _TerminalPaneState extends State<TerminalPane> {
                   js_util.callMethod(_term, 'getSelection', []) as String? ??
                   '';
             } catch (_) {}
+            // The fallback is read through raw interop rather than
+            // `html.window.getSelection()`. That returns a Dart `Selection`
+            // wrapper, and calling `toString` on it yields Dart's own
+            // `"Instance of 'Selection'"` rather than the selected text. The
+            // old code recognised that string and blanked it, which left the
+            // fallback unable to ever produce text: whenever xterm had no
+            // selection of its own, copy silently did nothing over a selection
+            // the user could see highlighted. Going through `js_util` for both
+            // the call and the stringify keeps this on the JS `toString`, which
+            // is the one that returns the text.
             if (selection.isEmpty) {
-              final selectionObj = html.window.getSelection();
-              if (selectionObj != null) {
-                try {
+              try {
+                final rawSelection = js_util.callMethod(
+                  html.window,
+                  'getSelection',
+                  [],
+                );
+                if (rawSelection != null) {
                   selection =
-                      js_util.callMethod(selectionObj, 'toString', [])
+                      js_util.callMethod(rawSelection, 'toString', [])
                           as String? ??
                       '';
-                } catch (_) {}
-              }
-              if (selection == 'Instance of \'Selection\'') {
-                selection = '';
-              }
+                }
+              } catch (_) {}
             }
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
+              // Logged rather than swallowed: a rejected write and an empty
+              // selection both present as "the copy did nothing", and with the
+              // error dropped there was no way to tell them apart from the
+              // console. Failure is still non-fatal, so the terminal keeps its
+              // keystroke handling either way.
               html.window.navigator.clipboard
                   ?.writeText(selection)
-                  .catchError((_) {});
+                  .catchError((Object error) {
+                    debugPrint('Terminal copy failed: $error');
+                  });
             }
           } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
-            event.preventDefault();
-            event.stopPropagation();
-            html.window.navigator.clipboard
-                ?.readText()
-                .then((text) {
-                  if (text.isNotEmpty) {
-                    _sendInput(text);
-                  }
-                })
-                .catchError((_) {});
+            // Deliberately not handled here: paste is left to the browser.
+            //
+            // Calling `preventDefault` on this keydown is what suppresses the
+            // native paste action, and with it the `paste` event that
+            // `_containerPasteListener` is waiting for. What was left was
+            // `navigator.clipboard.readText()`, which needs the `clipboard-read`
+            // permission; that sits at `prompt` until the user accepts, and a
+            // single dismissal denies it for the origin from then on. The
+            // rejection was swallowed, so paste simply stopped working with
+            // nothing logged.
+            //
+            // Letting the event through costs nothing and needs no permission: a
+            // user-initiated paste hands the page its own text on the `paste`
+            // event. `_keyboardEventToInput` returns null for anything modified
+            // by ctrl/meta, so falling into the branch below is a no-op rather
+            // than a stray literal "v".
           } else {
             final input = _keyboardEventToInput(event);
             if (input != null) {
