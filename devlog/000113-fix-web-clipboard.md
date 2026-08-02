@@ -1,6 +1,6 @@
 # 000113 fix/web-clipboard
 
-**Agent:** Claude (claude-opus-5[1m]) @ triage branch fix/web-clipboard
+**Agent:** Claude (claude-opus-5, 1M context) @ triage branch fix/web-clipboard
 
 ## Intent
 
@@ -23,6 +23,12 @@ the current setup (see Research).
 
 2026-08-01T10:30-0700 same file — the clipboard `writeText` rejection is logged
 via `debugPrint` instead of being dropped by an empty `catchError`.
+
+2026-08-01T19:29-0700 `devlog/000113-fix-web-clipboard.md` — addressed both PR
+review comments: the captured selection sample now uses a `<local-path>`
+placeholder instead of a real home path, and the Agent line spells the model as
+`claude-opus-5, 1M context` rather than the bracketed `[1m]` suffix, which read
+as a stray terminal escape.
 
 ## Decisions
 
@@ -51,7 +57,7 @@ probe on `window`, registered after the app's own listener so plain
 
 | Chord | App handler ran | `term.getSelection()` | `window.getSelection()` | Native event |
 | --- | --- | --- | --- | --- |
-| `Cmd+C` in terminal | yes | `"EMSDK_NODE = /Users/..."` | `""` | suppressed |
+| `Cmd+C` in terminal | yes | `"EMSDK_NODE = <local-path>"` | `""` | suppressed |
 | `Cmd+V` in terminal | yes | n/a | `""` | **never fired** |
 | `Cmd+V` in a plain input | no | n/a | `""` | fired, text delivered |
 
@@ -136,4 +142,5 @@ diagnosis.
 ## Commits
 
 - 4ca2edf — fix(triage_client): stop swallowing paste in the web terminal
-- HEAD — docs(devlog): record the end-to-end paste verification
+- 84ae739 — docs(devlog): record the end-to-end paste verification
+- HEAD — docs(devlog): address review comments on the clipboard devlog
