@@ -1917,6 +1917,106 @@ void main() {
       expect(pinned!.first, '/work/alpha');
     });
 
+    // A row drawn as lifted: the rail dims a dragged header's own rows so the
+    // gesture reads as moving the group. `SessionListTile` wraps itself in no
+    // `Opacity` of its own, so any match here is the rail's.
+    bool lifted(WidgetTester tester, Finder rowFinder) => tester
+        .widgetList<Opacity>(
+          find.descendant(of: rowFinder, matching: find.byType(Opacity)),
+        )
+        .any((widget) => widget.opacity < 1.0);
+
+    testWidgets('a header drag lifts its own rows and no others', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(header('/work/alpha')),
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -40));
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(lifted(tester, row('main')), isTrue);
+      expect(lifted(tester, row('flutter-spike')), isTrue);
+      expect(
+        lifted(tester, row('websocket-session-api')),
+        isFalse,
+        reason: 'beta is not the group being dragged',
+      );
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      expect(
+        lifted(tester, row('main')),
+        isFalse,
+        reason: 'the treatment is released on drop',
+      );
+    });
+
+    testWidgets('a row drag lifts nothing', (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(row('flutter-spike')),
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -40));
+      await tester.pump(const Duration(milliseconds: 200));
+
+      // A row moves alone, so nothing is travelling with it. Dimming its
+      // neighbours here would claim the opposite.
+      expect(lifted(tester, row('main')), isFalse);
+      expect(lifted(tester, row('flutter-spike')), isFalse);
+
+      await gesture.up();
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('a re-group during a header drag releases the lift', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = clientWithRepos();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(header('/work/alpha')),
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -40));
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(lifted(tester, row('main')), isTrue);
+
+      // `main` moves to beta. Both groups survive and the item count is
+      // unchanged, so the list would not have cancelled on its own; `_regroupRail`
+      // cancels unconditionally, which is precisely the path that raises neither
+      // `onReorderEnd` nor `onReorderItem`. Without the clear alongside that
+      // cancel, these rows would stay dimmed for the rest of the session.
+      client.emitContextUpdated(
+        'main',
+        repositoryRoot: '/work/beta',
+        worktreeRoot: '/work/beta',
+        branch: 'main',
+        cwd: '/work/beta',
+      );
+      await tester.pump();
+
+      expect(lifted(tester, row('main')), isFalse);
+      expect(lifted(tester, row('flutter-spike')), isFalse);
+
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      expect(lifted(tester, row('flutter-spike')), isFalse);
+    });
+
     testWidgets('tapping a group\'s pin indicator releases just that group', (
       WidgetTester tester,
     ) async {

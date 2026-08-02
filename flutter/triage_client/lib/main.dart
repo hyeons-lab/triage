@@ -759,6 +759,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // before it reorders the rows out from under it. See [_regroupRail].
   final GlobalKey<ReorderableListState> _railListKey =
       GlobalKey<ReorderableListState>();
+  // The group whose header is being dragged right now, or null when no header
+  // drag is in flight. Drives the rail's "these rows are coming too" treatment.
+  //
+  // Held here rather than inside [SessionRail] because clearing it is the same
+  // invariant as cancelling the drag, and [_regroupRail] is what cancels. A copy
+  // living in the rail could not be reached from there, and re-grouping fires on
+  // ordinary session output, so it would routinely be left set over a drag the
+  // list had already dropped, dimming a group for the rest of the session.
+  String? _draggingRailGroup;
   // Set when the daemon could not supply session contexts, which leaves every
   // session in one repo-less group. On its own that is not enough to reject a
   // drag: see [_railGroupingIsCollapsed], which pairs it with what the rail is
@@ -2249,7 +2258,31 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _regroupRail() {
     if (_disposed || !mounted) return;
     _railListKey.currentState?.cancelReorder();
+    // Paired with the cancel above, and the reason [_draggingRailGroup] lives on
+    // this state: `cancelReorder` raises neither `onReorderEnd` nor
+    // `onReorderItem`, so the drag it just ended would otherwise never clear.
+    _draggingRailGroup = null;
     _applyPins(_pins, persist: false);
+  }
+
+  /// Records that a header drag has begun, so the rail can show the group's rows
+  /// travelling with it.
+  ///
+  /// Row drags set nothing: a row moves alone, and the treatment exists to say
+  /// "the rest of this group is coming too", which is only true of a header.
+  void _railDragStarted(List<RailItem> items, int index) {
+    if (index < 0 || index >= items.length) return;
+    final item = items[index];
+    final group = item.isHeader ? item.groupKey : null;
+    if (_draggingRailGroup == group) return;
+    setState(() => _draggingRailGroup = group);
+  }
+
+  /// Clears the header-drag treatment. Safe to call when nothing is set, which
+  /// it routinely is: every row drag ends here too.
+  void _railDragEnded() {
+    if (_draggingRailGroup == null) return;
+    setState(() => _draggingRailGroup = null);
   }
 
   /// Whether the rail has collapsed into a single contextless group, which it
@@ -2317,6 +2350,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   ///
   /// [newIndex] is in post-removal coordinates, as `onReorderItem` reports it.
   void _reorderRail(List<RailItem> items, int oldIndex, int newIndex) {
+    // Belt and braces. `onReorderEnd` fires at pointer-up, ahead of this, so the
+    // treatment is normally already cleared; this keeps a stuck dim from being
+    // the cost of that ordering ever changing.
+    _railDragEnded();
     // The rail is showing its degraded, contextless collapse. The drop position
     // cannot be mapped onto anything durable, so let the row spring back rather
     // than persist a pin that means something different once context arrives.
@@ -3553,6 +3590,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       },
       onReorderSession: _reorderRail,
       railListKey: _railListKey,
+      onRailDragStart: _railDragStarted,
+      onRailDragEnd: _railDragEnded,
+      draggingGroupKey: _draggingRailGroup,
       onCreateSession: (shell) {
         _createSession(shell);
         if (isMobile) collapseRail();
@@ -3727,6 +3767,9 @@ class SessionRail extends StatelessWidget {
     required this.onSelectSession,
     required this.onReorderSession,
     required this.railListKey,
+    required this.onRailDragStart,
+    required this.onRailDragEnd,
+    required this.draggingGroupKey,
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
@@ -3767,6 +3810,27 @@ class SessionRail extends StatelessWidget {
 
   /// Lets the host cancel a drag in progress before it re-groups the rail.
   final GlobalKey<ReorderableListState> railListKey;
+
+  /// Drag lifecycle, reported to the host because it owns [draggingGroupKey].
+  /// [onRailDragStart] is given the item list the drag was measured against, so
+  /// the host can tell a header from a row without rebuilding it.
+  final void Function(List<RailItem> items, int index) onRailDragStart;
+  final VoidCallback onRailDragEnd;
+
+  /// The group whose header is currently being dragged, or null. Its rows are
+  /// drawn as lifted, so that dragging a header reads as moving the whole group
+  /// rather than detaching a label from the rows it names.
+  ///
+  /// The rows are dimmed in place rather than actually moved: `ReorderableList`
+  /// lifts exactly one child, and reordering the rest mid-drag is what
+  /// duplicates its per-child `GlobalKey` and throws (see [_regroupRail]).
+  ///
+  /// The dimming is also the only feedback available. The floating proxy is
+  /// built from the child captured when the drag began, so it does not rebuild
+  /// as this changes: labelling the lifted header with what it carries was
+  /// tried and renders nothing. Anything that has to react during a drag has to
+  /// live in the list body, as this does.
+  final String? draggingGroupKey;
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
@@ -4055,6 +4119,11 @@ class SessionRail extends StatelessWidget {
             // downstream of it.
             onReorderItem: (oldIndex, newIndex) =>
                 onReorderSession(items, oldIndex, newIndex),
+            // Reported so the host knows a header drag is in flight. `onReorderEnd`
+            // fires at pointer-up; a drag killed by `cancelReorder` raises neither,
+            // which is why the host clears the state there as well.
+            onReorderStart: (index) => onRailDragStart(items, index),
+            onReorderEnd: (_) => onRailDragEnd(),
             itemCount: items.length,
             itemBuilder: (context, index) {
               final item = items[index];
@@ -4099,6 +4168,15 @@ class SessionRail extends StatelessWidget {
                 indistinguishable: indistinguishable.contains(sessionIndex),
                 onTap: () => onSelectSession(sessionIndex),
               );
+              // Its header is being dragged, so the row reads as lifted with it.
+              // Opacity rather than removing or collapsing the row: the drop
+              // targets are the row geometry, so anything that changes height
+              // here would move the landing slots out from under the gesture
+              // that is choosing between them.
+              final tileForDrag =
+                  item.groupKey.isNotEmpty && item.groupKey == draggingGroupKey
+                  ? Opacity(opacity: 0.4, child: tile)
+                  : tile;
               // Touch: a plain drag must scroll the list, so reordering
               // waits for a long-press
               // (ReorderableDelayedDragStartListener). Mouse: the whole row
@@ -4109,12 +4187,12 @@ class SessionRail extends StatelessWidget {
                   ? ReorderableDelayedDragStartListener(
                       key: key,
                       index: index,
-                      child: tile,
+                      child: tileForDrag,
                     )
                   : ReorderableDragStartListener(
                       key: key,
                       index: index,
-                      child: tile,
+                      child: tileForDrag,
                     );
             },
           ),
