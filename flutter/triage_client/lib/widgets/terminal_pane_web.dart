@@ -61,10 +61,28 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final TerminalSessionInputRouter _sessionInputRouter =
       TerminalSessionInputRouter();
   static final Set<String> _registeredViewTypes = {};
+  // The pane a session's container and cached terminal currently belong to.
+  //
+  // A container outlives the pane that built it, and a rebuild mounts the
+  // replacement before disposing the pane it replaces. For that overlap both
+  // panes hold the same element, so the incoming one takes the listeners off its
+  // predecessor as it binds: a paste landing in the gap is delivered once rather
+  // than twice, and the focus work on mousedown and click runs once. It also
+  // tells `dispose` whether it is the last pane out, and so whether the cached
+  // session is still its to discard.
+  //
+  // It does not cover `_windowKeyDownListener`, which is per pane, added to the
+  // window rather than the container, and guarded by `_eventTargetsTerminal`
+  // instead. Overlapping panes both still see keydowns.
+  static final Map<String, _TerminalPaneState> _containerEventOwners = {};
 
   static void _discardCachedSession(String sanitizedId) {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
+    // Dropped alongside the container it refers to. A pane still mounted over a
+    // destroyed session unbinds itself when it goes, so leaving the entry here
+    // would only strand a dead `State` in a static map.
+    _TerminalPaneState._containerEventOwners.remove(sanitizedId);
     _TerminalPaneState._sessionContainers.remove(sanitizedId);
     final term = _TerminalPaneState._sessionTerms.remove(sanitizedId);
     if (term != null) {
@@ -103,13 +121,17 @@ class _TerminalPaneState extends State<TerminalPane> {
   dynamic _resizeObserver;
   late Object _inputRouteToken;
   late final FocusNode _focusNode;
-  late final StreamSubscription<html.MouseEvent>
-  _containerMouseDownSubscription;
   late final void Function(html.Event) _windowKeyDownListener;
-  late final StreamSubscription<html.MouseEvent> _containerClickSubscription;
-  late final StreamSubscription<html.KeyboardEvent>
-  _containerKeyDownSubscription;
-  late final void Function(html.Event) _containerPasteListener;
+  // Bound together by [_bindContainerEvents] and taken off together by
+  // [_unbindContainerEvents]. Nullable rather than `late final` because they are
+  // not always held: a pane whose container has been taken over by its
+  // replacement gives them up while still alive, and `dispose` has to run
+  // through either state without throwing partway and abandoning the teardown
+  // below it.
+  StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
+  StreamSubscription<html.MouseEvent>? _containerClickSubscription;
+  StreamSubscription<html.KeyboardEvent>? _containerKeyDownSubscription;
+  void Function(html.Event)? _containerPasteListener;
   bool _initialized = false;
   bool _initialContentWritten = false;
   bool _styleSheetLoaded = false;
@@ -174,6 +196,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _styleSheetLoaded = true;
       _bindController();
       _bindTerminalSubscriptions();
+      _bindContainerEvents();
       if (widget.focusCursorRevision > 0) {
         _focusCursorNowAndAfterReplay();
       }
@@ -281,21 +304,35 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              html.window.navigator.clipboard
-                  ?.writeText(selection)
-                  .catchError((_) {});
+              // Logged rather than swallowed: a rejected write and an empty
+              // selection both present as "the copy did nothing", and with the
+              // error dropped there was no way to tell them apart from the
+              // console. Failure is still non-fatal, so the terminal keeps its
+              // keystroke handling either way.
+              html.window.navigator.clipboard?.writeText(selection).catchError((
+                Object error,
+              ) {
+                debugPrint('Terminal copy failed: $error');
+              });
             }
           } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
-            event.preventDefault();
-            event.stopPropagation();
-            html.window.navigator.clipboard
-                ?.readText()
-                .then((text) {
-                  if (text.isNotEmpty) {
-                    _sendInput(text);
-                  }
-                })
-                .catchError((_) {});
+            // Deliberately not handled here: paste is left to the browser.
+            //
+            // Calling `preventDefault` on this keydown is what suppresses the
+            // native paste action, and with it the `paste` event that
+            // `_containerPasteListener` is waiting for. What was left was
+            // `navigator.clipboard.readText()`, which needs the `clipboard-read`
+            // permission; that sits at `prompt` until the user accepts, and a
+            // single dismissal denies it for the origin from then on. The
+            // rejection was swallowed, so paste simply stopped working with
+            // nothing logged.
+            //
+            // Letting the event through costs nothing and needs no permission: a
+            // user-initiated paste hands the page its own text on the `paste`
+            // event. The branch is inert, and deleting it would behave exactly
+            // the same, since `_keyboardEventToInput` already returns null for a
+            // ctrl/meta-modified "v". It is kept only as the marker saying the
+            // interception was removed on purpose, sitting next to the reason.
           } else {
             final input = _keyboardEventToInput(event);
             if (input != null) {
@@ -685,7 +722,17 @@ class _TerminalPaneState extends State<TerminalPane> {
     _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
   }
 
+  /// Attaches this pane's listeners to [_container], taking off whatever the
+  /// previous owner of that container left behind.
+  ///
+  /// Called on both paths through `initState`, the one that builds a container
+  /// and the one that adopts a cached one. Binding only on the building path was
+  /// the older behaviour, and it left an adopted container with no paste, focus
+  /// or Tab handling of its own while `dispose` still tried to take those
+  /// listeners off, throwing before the rest of the teardown could run.
   void _bindContainerEvents() {
+    _containerEventOwners[_sanitizedId]?._unbindContainerEvents();
+    _containerEventOwners[_sanitizedId] = this;
     _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
       _focusNode.requestFocus();
       if (_initialized) {
@@ -711,7 +758,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
-    _containerPasteListener = (html.Event event) {
+    void pasteListener(html.Event event) {
       if (event is html.ClipboardEvent) {
         event.preventDefault();
         event.stopPropagation();
@@ -721,8 +768,27 @@ class _TerminalPaneState extends State<TerminalPane> {
           _sendInput(text);
         }
       }
-    };
-    _container.addEventListener('paste', _containerPasteListener, true);
+    }
+
+    _containerPasteListener = pasteListener;
+    _container.addEventListener('paste', pasteListener, true);
+  }
+
+  /// Releases the listeners [_bindContainerEvents] attached, and is safe to call
+  /// when there are none: an adopted container may already have been handed on
+  /// to a newer pane, which unbinds this one as it takes over.
+  void _unbindContainerEvents() {
+    _containerMouseDownSubscription?.cancel();
+    _containerMouseDownSubscription = null;
+    _containerClickSubscription?.cancel();
+    _containerClickSubscription = null;
+    _containerKeyDownSubscription?.cancel();
+    _containerKeyDownSubscription = null;
+    final pasteListener = _containerPasteListener;
+    if (pasteListener != null) {
+      _container.removeEventListener('paste', pasteListener, true);
+      _containerPasteListener = null;
+    }
   }
 
   bool _eventTargetsTerminal(html.Event event) {
@@ -1011,10 +1077,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
-    _containerMouseDownSubscription.cancel();
-    _containerClickSubscription.cancel();
-    _containerKeyDownSubscription.cancel();
-    _container.removeEventListener('paste', _containerPasteListener, true);
+    _unbindContainerEvents();
     _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
     if (_resizeObserver != null) {
       try {
@@ -1023,7 +1086,18 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     _focusNode.dispose();
     _unbindController();
-    _discardCachedSession(_sanitizedId);
+    // Everything above releases only what this pane holds. The cached session is
+    // shared, so it is torn down only by the pane that still owns it: a rebuild
+    // mounts the replacement before disposing the pane it replaces, and that
+    // successor has already adopted this container, terminal and input route.
+    // Discarding unconditionally would dispose the xterm instance out from under
+    // a pane that mounted a frame ago, leaving a live session showing a dead
+    // grid. Ending the session itself goes through `TerminalPane.destroySession`
+    // instead, which is not conditional on any pane.
+    if (identical(_containerEventOwners[_sanitizedId], this)) {
+      _containerEventOwners.remove(_sanitizedId);
+      _discardCachedSession(_sanitizedId);
+    }
     super.dispose();
   }
 
