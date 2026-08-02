@@ -109,18 +109,31 @@ usable gate.
 - `flutter test --platform chrome` — unchanged from `main` (see Issues).
 - Live measurement against the running daemon, above.
 
-The fix itself is not yet exercised against a rebuilt client: the daemon serves
-the web bundle embedded at build time, so confirming it end to end means
-rebuilding and reinstalling `triaged`. The mechanism it restores was verified
-directly, since a `Cmd+V` that the app does not intercept fires a native paste
-that delivers text.
+2026-08-01T18:35-0700 **Confirmed end to end against a rebuilt client.** Built
+the web bundle, installed via `scripts/install.sh`, and handed over: PID 34122,
+PPID 1, running inode matching the installed binary, HTTP 200 in 6.8ms. The
+daemon serves the new bundle (`main.dart.js` sha256 `96390af6d2575386`, against
+`752af328883b55d0` for the pre-fix build), so the test exercised the fix rather
+than a cached client.
+
+| Check | Before | After |
+| --- | --- | --- |
+| `Cmd+V` sets `defaultPrevented` | true | **false** |
+| native `paste` event | never fired | **fires, payload intact** |
+| paste reaches the session | no | **yes, text appeared at the prompt** |
+| copy round-trip | worked | **still works, exact text** |
+
+Delivery was verified on a scratch session and the pasted characters removed
+afterwards. The earlier probe runs used a window-capture listener that called
+`stopImmediatePropagation`, so nothing reached any live session during
+diagnosis.
 
 ## Next Steps
 
-- Rebuild and reinstall `triaged` to confirm paste end to end in the real client.
 - Fix the `_bindContainerEvents` / `dispose` asymmetry.
 - Investigate why the local chrome test suite fails wholesale.
 
 ## Commits
 
-- HEAD — fix(triage_client): stop swallowing paste in the web terminal
+- 4ca2edf — fix(triage_client): stop swallowing paste in the web terminal
+- HEAD — docs(devlog): record the end-to-end paste verification
