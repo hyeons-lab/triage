@@ -1920,11 +1920,20 @@ void main() {
     // A row drawn as lifted: the rail dims a dragged header's own rows so the
     // gesture reads as moving the group. `SessionListTile` wraps itself in no
     // `Opacity` of its own, so any match here is the rail's.
-    bool lifted(WidgetTester tester, Finder rowFinder) => tester
-        .widgetList<Opacity>(
-          find.descendant(of: rowFinder, matching: find.byType(Opacity)),
-        )
-        .any((widget) => widget.opacity < 1.0);
+    bool lifted(WidgetTester tester, Finder rowFinder) {
+      // Anchored rather than assumed. `widgetList` over a finder that matches
+      // nothing is empty, so a row that had stopped rendering would report
+      // "not lifted" and quietly satisfy every `isFalse` below, leaving those
+      // assertions guarding nothing. Exactly one holds even mid-drag: the item
+      // the list is carrying builds as a `SizedBox` in place and appears only in
+      // the floating proxy, so it is never drawn twice.
+      expect(rowFinder, findsOneWidget);
+      return tester
+          .widgetList<Opacity>(
+            find.descendant(of: rowFinder, matching: find.byType(Opacity)),
+          )
+          .any((widget) => widget.opacity < 1.0);
+    }
 
     testWidgets('a header drag lifts its own rows and no others', (
       WidgetTester tester,
@@ -1971,8 +1980,12 @@ void main() {
 
       // A row moves alone, so nothing is travelling with it. Dimming its
       // neighbours here would claim the opposite.
+      //
+      // Asserted on a neighbour rather than on the row being dragged: the list
+      // builds the carried item as a `SizedBox` and shows only the proxy, which
+      // was captured before `onReorderStart` could change anything, so the
+      // dragged row cannot report a lift either way.
       expect(lifted(tester, row('main')), isFalse);
-      expect(lifted(tester, row('flutter-spike')), isFalse);
 
       await gesture.up();
       await tester.pumpAndSettle();
@@ -2014,6 +2027,33 @@ void main() {
       await gesture.up();
       await tester.pumpAndSettle();
 
+      expect(lifted(tester, row('flutter-spike')), isFalse);
+    });
+
+    testWidgets('a cancelled pointer releases the lift', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(header('/work/alpha')),
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await gesture.moveBy(const Offset(0, -40));
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(lifted(tester, row('main')), isTrue);
+
+      // The platform taking the pointer back, which is what a system gesture
+      // over the touch rail does. The list's cancel path only resets its own
+      // state: it raises neither `onReorderEnd` nor `onReorderItem`, so this is
+      // the one drag ending that no callback reports. Without the `Listener`
+      // watching for it, these rows stay dimmed with no drag left to end them.
+      await gesture.cancel();
+      await tester.pumpAndSettle();
+
+      expect(lifted(tester, row('main')), isFalse);
       expect(lifted(tester, row('flutter-spike')), isFalse);
     });
 
