@@ -759,6 +759,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // before it reorders the rows out from under it. See [_regroupRail].
   final GlobalKey<ReorderableListState> _railListKey =
       GlobalKey<ReorderableListState>();
+  // The group whose header is being dragged right now, or null when no header
+  // drag is in flight. Drives the rail's "these rows are coming too" treatment.
+  //
+  // Held here rather than inside [SessionRail] because clearing it is the same
+  // invariant as cancelling the drag, and [_regroupRail] is what cancels. A copy
+  // living in the rail could not be reached from there, so a re-group arriving
+  // mid-drag (a session created or closed, a load or reconnect, a session
+  // changing repository) would leave it set over a drag the list had already
+  // killed, dimming a group until the next one.
+  String? _draggingRailGroup;
   // Set when the daemon could not supply session contexts, which leaves every
   // session in one repo-less group. On its own that is not enough to reject a
   // drag: see [_railGroupingIsCollapsed], which pairs it with what the rail is
@@ -2249,7 +2259,48 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _regroupRail() {
     if (_disposed || !mounted) return;
     _railListKey.currentState?.cancelReorder();
+    // Paired with the cancel above, and the reason [_draggingRailGroup] lives on
+    // this state: `cancelReorder` raises neither `onReorderEnd` nor
+    // `onReorderItem`, so the drag it just ended would otherwise never clear.
+    _draggingRailGroup = null;
     _applyPins(_pins, persist: false);
+  }
+
+  /// Records that a header drag has begun, so the rail can show the group's rows
+  /// travelling with it.
+  ///
+  /// Row drags set nothing: a row moves alone, and the treatment exists to say
+  /// "the rest of this group is coming too", which is only true of a header.
+  void _railDragStarted(List<RailItem> items, int index) {
+    if (index < 0 || index >= items.length) return;
+    final item = items[index];
+    final group = item.isHeader ? item.groupKey : null;
+    if (_draggingRailGroup == group) return;
+    setState(() => _draggingRailGroup = group);
+  }
+
+  /// Clears the header-drag treatment. Safe to call when nothing is set, which
+  /// it routinely is: every row drag ends here too.
+  ///
+  /// Only one of the ways a drag can end announces itself: `onReorderEnd`, on a
+  /// normal drop. The list's own cancel path, the `cancelReorder` in
+  /// [_regroupRail], the `cancelReorder` `didUpdateWidget` runs when the item
+  /// count changes, and the rail being unmounted under a held gesture all raise
+  /// nothing whatsoever.
+  ///
+  /// The rail covers them by watching raw pointer up and cancel, which reaches
+  /// even the unmounted case: the hit-test path is recorded at pointer-down and
+  /// dispatched to without checking that its targets are still in the tree, so
+  /// the listener hears the pointer that outlived it. Measured, not assumed; the
+  /// obvious-looking clears at the call sites that swap the rail out were
+  /// written on the opposite assumption and were dead code.
+  void _railDragEnded() {
+    // Guarded like the rest of this state's mutators, and with more reason than
+    // most: this is the one callback documented above as arriving after its
+    // widget has gone.
+    if (_disposed || !mounted) return;
+    if (_draggingRailGroup == null) return;
+    setState(() => _draggingRailGroup = null);
   }
 
   /// Whether the rail has collapsed into a single contextless group, which it
@@ -3553,6 +3604,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       },
       onReorderSession: _reorderRail,
       railListKey: _railListKey,
+      onRailDragStart: _railDragStarted,
+      onRailDragEnd: _railDragEnded,
+      draggingGroupKey: _draggingRailGroup,
       onCreateSession: (shell) {
         _createSession(shell);
         if (isMobile) collapseRail();
@@ -3727,6 +3781,9 @@ class SessionRail extends StatelessWidget {
     required this.onSelectSession,
     required this.onReorderSession,
     required this.railListKey,
+    required this.onRailDragStart,
+    required this.onRailDragEnd,
+    required this.draggingGroupKey,
     required this.onCreateSession,
     required this.selectedShell,
     required this.shellOptions,
@@ -3767,6 +3824,27 @@ class SessionRail extends StatelessWidget {
 
   /// Lets the host cancel a drag in progress before it re-groups the rail.
   final GlobalKey<ReorderableListState> railListKey;
+
+  /// Drag lifecycle, reported to the host because it owns [draggingGroupKey].
+  /// [onRailDragStart] is given the item list the drag was measured against, so
+  /// the host can tell a header from a row without rebuilding it.
+  final void Function(List<RailItem> items, int index) onRailDragStart;
+  final VoidCallback onRailDragEnd;
+
+  /// The group whose header is currently being dragged, or null. Its rows are
+  /// drawn as lifted, so that dragging a header reads as moving the whole group
+  /// rather than detaching a label from the rows it names.
+  ///
+  /// The rows are dimmed in place rather than actually moved: `ReorderableList`
+  /// lifts exactly one child, and reordering the rest mid-drag is what
+  /// duplicates its per-child `GlobalKey` and throws (see `_regroupRail`).
+  ///
+  /// The dimming is also the only feedback available. The floating proxy is
+  /// built from the child captured when the drag began, so it does not rebuild
+  /// as this changes: labelling the lifted header with what it carries was
+  /// tried and renders nothing. Anything that has to react during a drag has to
+  /// live in the list body, as this does.
+  final String? draggingGroupKey;
   final ValueChanged<NewSessionShell> onCreateSession;
   final NewSessionShell selectedShell;
   final List<NewSessionShell> shellOptions;
@@ -4036,87 +4114,132 @@ class SessionRail extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         Expanded(
-          // `ReorderableList` rather than material's `ReorderableListView`, for
-          // its state: only this one exposes `cancelReorder`, which the rail has
-          // to call before re-grouping (see `_regroupRail`). The two are
-          // otherwise the same list, and the material extras it drops are ones
-          // the rail already replaces: `buildDefaultDragHandles` was off because
-          // rows and headers install their own listeners, and the lift shadow is
-          // supplied below.
-          child: ReorderableList(
-            key: railListKey,
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-            proxyDecorator: _railDragProxyDecorator,
-            // `onReorderItem` rather than the deprecated `onReorder`: it reports
-            // `newIndex` already adjusted for the removal at `oldIndex`, which is
-            // the space `resolveRailReorder` works in. The pre-removal
-            // coordinates `onReorder` reports had to be converted there by hand,
-            // and every index bug this rail has had was in that conversion or
-            // downstream of it.
-            onReorderItem: (oldIndex, newIndex) =>
-                onReorderSession(items, oldIndex, newIndex),
-            itemCount: items.length,
-            itemBuilder: (context, index) {
-              final item = items[index];
-              if (item.isHeader) {
-                return _SessionGroupHeader(
-                  key: ValueKey<String>('group:${item.groupKey}'),
-                  index: index,
-                  label: _groupLabelFor(item.groupKey),
-                  pinned: pins.groupKeys.contains(item.groupKey),
-                  onUnpin: () => onUnpinGroup(item.groupKey),
-                  isFirst: index == 0,
+          // Wrapped so a drag that ends without a callback still ends the
+          // treatment. `onReorderEnd` covers a normal drop and `_regroupRail`
+          // covers a drag the rail kills itself, but the list has two more exits
+          // that raise neither callback: its own cancel path, which only resets
+          // its state, reached when the platform takes the pointer back; and
+          // `didUpdateWidget`, which calls `cancelReorder` whenever the item
+          // count changes. A session closing or a reconnect reloading the rail
+          // takes that second one, leaving the drag dead with the finger still
+          // down. Watching the raw pointer catches both, because the hit-test
+          // path is recorded at pointer-down and held until the pointer goes up.
+          // It survives this listener being unmounted with the rail, too; see
+          // [_railDragEnded].
+          //
+          // Not scoped to the pointer that started the drag: a second finger
+          // lifting mid-drag clears the dim early. That is a moment of missing
+          // feedback on a gesture that still drops correctly, chosen over a dim
+          // that outlives the drag behind it.
+          child: Listener(
+            onPointerUp: (_) => onRailDragEnd(),
+            onPointerCancel: (_) => onRailDragEnd(),
+            // `ReorderableList` rather than material's `ReorderableListView`, for
+            // its state: only this one exposes `cancelReorder`, which the rail has
+            // to call before re-grouping (see `_regroupRail`). The two are
+            // otherwise the same list, and the material extras it drops are ones
+            // the rail already replaces: `buildDefaultDragHandles` was off because
+            // rows and headers install their own listeners, and the lift shadow is
+            // supplied below.
+            child: ReorderableList(
+              key: railListKey,
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+              proxyDecorator: _railDragProxyDecorator,
+              // `onReorderItem` rather than the deprecated `onReorder`: it reports
+              // `newIndex` already adjusted for the removal at `oldIndex`, which is
+              // the space `resolveRailReorder` works in. The pre-removal
+              // coordinates `onReorder` reports had to be converted there by hand,
+              // and every index bug this rail has had was in that conversion or
+              // downstream of it.
+              onReorderItem: (oldIndex, newIndex) =>
+                  onReorderSession(items, oldIndex, newIndex),
+              // Reported so the host knows a header drag is in flight.
+              // `onReorderEnd` fires at pointer-up; a drag killed by
+              // `cancelReorder` raises neither it nor `onReorderItem`, which is
+              // why the host clears the state there as well.
+              onReorderStart: (index) => onRailDragStart(items, index),
+              onReorderEnd: (_) => onRailDragEnd(),
+              itemCount: items.length,
+              itemBuilder: (context, index) {
+                final item = items[index];
+                if (item.isHeader) {
+                  return _SessionGroupHeader(
+                    key: ValueKey<String>('group:${item.groupKey}'),
+                    index: index,
+                    label: _groupLabelFor(item.groupKey),
+                    pinned: pins.groupKeys.contains(item.groupKey),
+                    onUnpin: () => onUnpinGroup(item.groupKey),
+                    isFirst: index == 0,
+                  );
+                }
+                // `items` is built from `sessions` above, one row each, so
+                // this index is always in range.
+                final sessionIndex = rowIndexFor[index]!;
+                final session = sessions[sessionIndex];
+                final key = ValueKey<String>(_rowKeyFor(session));
+                final tile = SessionListTile(
+                  key: sessionIndex == selectedIndex ? selectedTileKey : null,
+                  selected: sessionIndex == selectedIndex,
+                  title: session.railTitleAt(now),
+                  // The repo-first name for the hover card and screen-reader
+                  // label, following the same lead the title shows (an
+                  // inferred worktree included) so the row reads consistently
+                  // everywhere.
+                  glanceTitle: session.glanceTitleAt(now),
+                  subtitle: session.status,
+                  statusColor: session.statusColor,
+                  icon: session.icon,
+                  branch: session.branch,
+                  repoName: session.repoName,
+                  worktreeName: session.worktreeName,
+                  cwd: session.cwd,
+                  snippet: session.snippet,
+                  snippetDetail: session.snippetDetail,
+                  activityAt: session.snippetUpdatedAt,
+                  pinned: pins.sessionIds.contains(session.remoteSessionId),
+                  onUnpin: session.remoteSessionId == null
+                      ? null
+                      : () => onUnpinSession(session.remoteSessionId!),
+                  indistinguishable: indistinguishable.contains(sessionIndex),
+                  onTap: () => onSelectSession(sessionIndex),
                 );
-              }
-              // `items` is built from `sessions` above, one row each, so
-              // this index is always in range.
-              final sessionIndex = rowIndexFor[index]!;
-              final session = sessions[sessionIndex];
-              final key = ValueKey<String>(_rowKeyFor(session));
-              final tile = SessionListTile(
-                key: sessionIndex == selectedIndex ? selectedTileKey : null,
-                selected: sessionIndex == selectedIndex,
-                title: session.railTitleAt(now),
-                // The repo-first name for the hover card and screen-reader
-                // label, following the same lead the title shows (an
-                // inferred worktree included) so the row reads consistently
-                // everywhere.
-                glanceTitle: session.glanceTitleAt(now),
-                subtitle: session.status,
-                statusColor: session.statusColor,
-                icon: session.icon,
-                branch: session.branch,
-                repoName: session.repoName,
-                worktreeName: session.worktreeName,
-                cwd: session.cwd,
-                snippet: session.snippet,
-                snippetDetail: session.snippetDetail,
-                activityAt: session.snippetUpdatedAt,
-                pinned: pins.sessionIds.contains(session.remoteSessionId),
-                onUnpin: session.remoteSessionId == null
-                    ? null
-                    : () => onUnpinSession(session.remoteSessionId!),
-                indistinguishable: indistinguishable.contains(sessionIndex),
-                onTap: () => onSelectSession(sessionIndex),
-              );
-              // Touch: a plain drag must scroll the list, so reordering
-              // waits for a long-press
-              // (ReorderableDelayedDragStartListener). Mouse: the whole row
-              // is an immediate drag handle; a click still selects since a
-              // tap registers no movement.
-              final isTouch = isMobilePlatform();
-              return isTouch
-                  ? ReorderableDelayedDragStartListener(
-                      key: key,
-                      index: index,
-                      child: tile,
-                    )
-                  : ReorderableDragStartListener(
-                      key: key,
-                      index: index,
-                      child: tile,
-                    );
-            },
+                // Its header is being dragged, so the row reads as lifted with it.
+                // Opacity rather than removing or collapsing the row: the drop
+                // targets are the row geometry, so anything that changes height
+                // here would move the landing slots out from under the gesture
+                // that is choosing between them.
+                //
+                // Wrapped unconditionally so the tree keeps its shape. Inserting
+                // the `Opacity` only while dragging puts a new element under
+                // `SessionListTile` on drag start and takes it away again on drop,
+                // remounting the tile and discarding the state it owns. At 1.0 the
+                // layer is skipped, so the ordinary case pays nothing for it.
+                final lifted =
+                    item.groupKey.isNotEmpty &&
+                    item.groupKey == draggingGroupKey;
+                final tileForDrag = Opacity(
+                  opacity: lifted ? 0.4 : 1.0,
+                  child: tile,
+                );
+                // Touch: a plain drag must scroll the list, so reordering
+                // waits for a long-press
+                // (ReorderableDelayedDragStartListener). Mouse: the whole row
+                // is an immediate drag handle; a click still selects since a
+                // tap registers no movement.
+                final isTouch = isMobilePlatform();
+                return isTouch
+                    ? ReorderableDelayedDragStartListener(
+                        key: key,
+                        index: index,
+                        child: tileForDrag,
+                      )
+                    : ReorderableDragStartListener(
+                        key: key,
+                        index: index,
+                        child: tileForDrag,
+                      );
+              },
+            ),
           ),
         ),
       ],
