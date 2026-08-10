@@ -48,8 +48,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   // `startSession` degrades to ''. Distinct from an outright throw.
   final Set<String> emptyIdStartSessionCommands;
 
-  /// Makes every snapshot this fake builds report no size, as a host that
-  /// omits one would. The shape is an empty map rather than an absent key,
+  /// Makes the builders listed on [_snapshotSize] report no size, as a host
+  /// that omits one would. The shape is an empty map rather than an absent key,
   /// because that is what the FlatBuffers decoder produces for an absent
   /// `SessionSize`, and it is the shape a null check on the container would
   /// wrongly read as a real size.

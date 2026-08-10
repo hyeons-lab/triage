@@ -283,7 +283,7 @@ the round-3 and pre-round-3 forms.
 message of the commit that carried it. Both describe a live defect; it is not
 reachable against the current daemon. `SessionSnapshot.size` is
 `SessionSize`, not an `Option`, and the single snapshot encoder
-(`triage-core/src/flatbuffers_proto.rs`) writes it as `Some(&size)`
+(`crates/triage-core/src/flatbuffers_proto.rs`) writes it as `Some(&size)`
 unconditionally for both the attach response and the resize broadcast, so the
 host always reports a size and neither the round-3 nor the round-4 guard can
 fire in production. The fix stands as defence against a host
