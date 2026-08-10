@@ -266,6 +266,17 @@ bool isMobilePlatform() =>
     (defaultTargetPlatform == TargetPlatform.iOS ||
         defaultTargetPlatform == TargetPlatform.android);
 
+/// Whether a client in [state] should be asserting its terminal size on the
+/// shared PTY.
+///
+/// Only [AppLifecycleState.resumed] counts. `inactive` in particular does not:
+/// Flutter's web engine maps a window `blur` to it and only a tab-hide to
+/// `hidden`, and a desktop window sitting behind another reports it too. Those
+/// are exactly the moments the user is looking at a different device, which is
+/// when this client should stop competing for the size.
+bool foregroundForLifecycle(AppLifecycleState state) =>
+    state == AppLifecycleState.resumed;
+
 /// The shells to attempt, in order, when creating a session.
 ///
 /// The daemon spawns the shell, but the menu order above is derived from
@@ -588,12 +599,29 @@ class SessionVm {
   // and so reclaim only when reclaiming would actually change something.
   int? ownFittedCols;
   int? ownFittedRows;
-  // The PTY size the host last reported, written only where the daemon tells us
-  // (its resize broadcast). Deliberately not written by our own fits: it is the
-  // other half of the drift comparison, and a local fit overwriting it would
-  // erase the very evidence that another device has taken the size.
+  // The PTY's actual size, as opposed to any size we would like it to be.
+  // Written only where the host's size is known: its resize broadcast, the
+  // attach snapshot, and a resize this client actually performed. Never from a
+  // fit alone, which is the other half of the drift comparison: a local fit
+  // writing here would erase the evidence that another device holds the size.
   int? hostSizeCols;
   int? hostSizeRows;
+
+  /// Whether the shared PTY has drifted from the size this device last fitted
+  /// to, meaning another client resized it while we were not asserting ours.
+  ///
+  /// False when either size is unknown: with nothing to compare, the quiet
+  /// option is to leave the PTY alone.
+  bool get hostSizeDriftedFromOwnFit {
+    final ownCols = ownFittedCols;
+    final ownRows = ownFittedRows;
+    if (ownCols == null || ownRows == null) return false;
+    final hostCols = hostSizeCols;
+    final hostRows = hostSizeRows;
+    if (hostCols == null || hostRows == null) return false;
+    return hostCols != ownCols || hostRows != ownRows;
+  }
+
   // Set once the view first reports its real fitted size after a fresh attach.
   // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
   bool hasFitted = false;
@@ -1270,15 +1298,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
+    final wasForeground = _clientForeground;
+    _clientForeground = foregroundForLifecycle(state);
     switch (state) {
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
         _wasOccluded = true;
-        _clientForeground = false;
         break;
       case AppLifecycleState.resumed:
-        final regainedFocus = !_clientForeground;
-        _clientForeground = true;
+        final regainedFocus = !wasForeground;
         if (_wasOccluded) {
           _wasOccluded = false;
           // The lifecycle event handles this wake; reset the watchdog baseline so
@@ -1300,13 +1328,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
         break;
       case AppLifecycleState.inactive:
-        // Blurred but still visible. Enough to stop asserting a size, not
-        // enough to count as occluded, so the reconnect/refocus work above
-        // stays tied to real backgrounding.
-        _clientForeground = false;
-        break;
       case AppLifecycleState.detached:
-        _clientForeground = false;
+        // `foregroundForLifecycle` has already stopped us asserting a size.
+        // Neither counts as occluded, so the reconnect/refocus work above stays
+        // tied to real backgrounding.
         break;
     }
   }
@@ -1317,18 +1342,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _reclaimTerminalSizeIfDrifted() {
     if (_disposed || _sessions.isEmpty) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
-    final session = _selectedSession;
-    final ownCols = session.ownFittedCols;
-    final ownRows = session.ownFittedRows;
-    if (ownCols == null || ownRows == null) return;
-    // Against the host's reported size, not `lastFittedCols`: that is written by
-    // our own fits too, so a fit arriving while backgrounded (a window moved
-    // behind another, a DPI change, a rebuild) would reset it to our size and
-    // hide the drift we are here to find.
-    final hostCols = session.hostSizeCols;
-    final hostRows = session.hostSizeRows;
-    if (hostCols == null || hostRows == null) return;
-    if (hostCols == ownCols && hostRows == ownRows) return;
+    if (!_selectedSession.hostSizeDriftedFromOwnFit) return;
     // Refit and refocus together, through the shared helper so this keeps its
     // carve-out: on mobile the refocus raises the soft keyboard, which insets
     // the Scaffold, shrinks the viewport and fires another fit at the smaller
@@ -2660,7 +2674,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }
         } catch (_) {}
       } else if (replayTargetSize != null &&
+          _clientForeground &&
           !_snapshotSizeMatches(preAttachSnapshot, replayTargetSize)) {
+        // Gated like the other resize-out paths. This one is the weakest claim
+        // of the three: the size is `_estimatedTerminalRestoreSize`, a
+        // MediaQuery guess this client has not fitted to, so a backgrounded
+        // reconnect taking the shared PTY here would move it to a size nobody
+        // is rendering at. What corrects it later is whichever comes first, the
+        // first fit made while foreground or the reclaim on regaining focus.
         try {
           preparedSnapshot = _snapshotFromResponse(
             await _client.resizeSession(
@@ -2791,8 +2812,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     SessionVm session,
     Map<String, dynamic>? fallbackSize,
   ) {
-    final cols = session.lastFittedCols;
-    final rows = session.lastFittedRows;
+    // This device's own fit first. `lastFittedCols` is also written by the
+    // host's resize broadcast, so on a shared PTY it can be another device's
+    // width; replaying at that would leave this client rendering at a size it
+    // never fitted to, and because the snapshot would then match, nothing
+    // would correct it. Falls back to `lastFitted*` for the case where no local
+    // fit has happened yet, where the host's size is the better guess.
+    final cols = session.ownFittedCols ?? session.lastFittedCols;
+    final rows = session.ownFittedRows ?? session.lastFittedRows;
     if (cols != null && rows != null) {
       return (rows, cols);
     }
@@ -3141,8 +3168,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.lastFittedCols = cols;
     session.lastFittedRows = rows;
     // This device's own view reporting its size. One half of the drift
-    // comparison; the other half (`hostSizeCols`) is written only by the host's
-    // broadcast, so this assignment cannot mask a resize by another device.
+    // comparison; the other half (`hostSizeCols`) is only ever written from the
+    // host's actual size, so this assignment cannot mask another device's
+    // resize.
     session.ownFittedCols = cols;
     session.ownFittedRows = rows;
     session.noteViewFit(cols, rows);
@@ -3238,6 +3266,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final replayTargetSize = includeHistory
             ? _currentReplayTerminalSize(session, sizeObj)
             : null;
+        // The size the host actually ends this call at, which is not the same
+        // as `replayTargetSize`: that is only the size we would like. When the
+        // foreground gate below declines to resize, nothing drove the host, and
+        // passing our wanted size on as `renderSize` would record "the host is
+        // at my size" immediately after deciding not to put it there, which is
+        // exactly the evidence the refocus reclaim looks for. Left null in that
+        // case so the snapshot's own size is used instead.
+        (int, int)? drivenSize;
         if (snapshot['exited'] == true) {
           debugPrint(
             'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
@@ -3252,6 +3288,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 cols: restoreSize.$2,
               ),
             );
+            // A restore re-spawns the process at this size, so the host is
+            // genuinely here now whatever the snapshot says.
+            drivenSize = restoreSize;
             if (restoredSnapshot != null) {
               finalSnapshot = restoredSnapshot;
             }
@@ -3292,20 +3331,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // Gated on foreground for the same reason the resize-out listener is:
           // a reconnect on a blurred client would otherwise re-take the shared
           // PTY from whichever device the user is actually looking at. The
-          // reclaim on refocus covers the size this skips.
+          // reclaim on refocus covers the size this skips, which is why
+          // `drivenSize` is set only once the resize has actually landed.
           try {
             await _client.resizeSession(
               sessionId: sessionId,
               rows: replayTargetSize.$1,
               cols: replayTargetSize.$2,
             );
+            drivenSize = replayTargetSize;
           } catch (_) {}
         }
         await _applySnapshotToSession(
           session,
           sessionId,
           finalSnapshot,
-          renderSize: replayTargetSize,
+          renderSize: drivenSize,
         );
       }
     } catch (_) {

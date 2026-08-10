@@ -525,10 +525,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     };
   }
 
+  /// Emits a resize-driven Snapshot broadcast. [size] is the PTY size the host
+  /// reports settling at, which is the only way another device's resize becomes
+  /// visible to this client. Ordered `(rows, cols)` to match every other size
+  /// tuple in the client.
   void emitSnapshot(
     String sessionId,
     List<String> visibleRows, {
     List<String>? styledRows,
+    (int rows, int cols)? size,
   }) {
     final snapshotStyledRows = styledRows ?? visibleRows;
     final mappedRows = snapshotStyledRows
@@ -565,6 +570,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
               'visible_rows': visibleRows,
               'styled_rows': mappedRows,
               'cursor': {'row': visibleRows.length - 1, 'col': 0},
+              if (size != null) 'size': {'rows': size.$1, 'cols': size.$2},
             },
           },
         },
@@ -1067,6 +1073,123 @@ void main() {
     await tester.pumpAndSettle();
     // Two resizes: the jiggle down to rows-1 and back to the real size.
     expect(resizesFor('flutter-spike'), baseline + 2);
+  });
+
+  testWidgets(
+    'reclaims the PTY size when another device took it while blurred',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      int resizesFor(String sid) =>
+          client.resizeSessionCalls.where((c) => c.startsWith('$sid:')).length;
+      // The pane reports its fitted grid through `onViewFit`, which is what
+      // records this device's own size. Driving it directly is the only way to
+      // fit under FLUTTER_TEST, where the fallback view lays out no real grid.
+      void fit(int cols, int rows) => tester
+          .widget<TerminalPane>(find.byType(TerminalPane))
+          .onViewFit!(cols, rows);
+
+      fit(95, 34);
+      await tester.pumpAndSettle();
+      final baseline = resizesFor('flutter-spike');
+
+      // Blurred. A grid resize here still reaches the controller (a window
+      // moved behind another, a DPI change), and must not be forwarded.
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pump();
+      tester
+          .widget<TerminalPane>(find.byType(TerminalPane))
+          .controller
+          .sendResizeOut(120, 40);
+      await tester.pumpAndSettle();
+      expect(
+        resizesFor('flutter-spike'),
+        baseline,
+        reason: 'a blurred client must not assert its size',
+      );
+
+      // Another device takes the shared PTY. The host's settled size arrives
+      // as a Snapshot broadcast, which is the only way this client sees it.
+      client.emitSnapshot('flutter-spike', ['from the phone'], size: (19, 47));
+      await tester.pumpAndSettle();
+      final beforeReclaim = List.of(client.resizeSessionCalls);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+
+      // The reclaim refits and jiggles the host one row short and back, so the
+      // program repaints over the live stream. It reads `session.terminal`,
+      // which the harness leaves at its 80x24 default because driving
+      // `onViewFit` does not resize the Dart-side terminal, so the jiggle is at
+      // that size rather than the 95x34 fitted above.
+      expect(client.resizeSessionCalls.skip(beforeReclaim.length), [
+        'flutter-spike:80:23',
+        'flutter-spike:80:24',
+      ]);
+    },
+  );
+
+  testWidgets('replays at this device\'s size, not another device\'s', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+
+    // Another device resizes the shared PTY. Its size lands in `lastFitted*`
+    // as well as `hostSize*`, so anything replaying from `lastFitted*` would
+    // now be reading the phone's width.
+    client.emitSnapshot('flutter-spike', ['from the phone'], size: (19, 47));
+    await tester.pumpAndSettle();
+
+    // Re-selecting refreshes the snapshot, which is where a replay size is
+    // chosen. Switching away leaves the flutter-spike row labelled by its
+    // worktree rather than its session id, so that is what gets tapped back.
+    await tester.tap(find.text('triage / main'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('experiment/flutter-spike').first);
+    await tester.pumpAndSettle();
+
+    expect(
+      client.resizeSessionCalls.last,
+      'flutter-spike:95:34',
+      reason: 'the replay size must come from this device\'s own fit',
+    );
+  });
+
+  testWidgets('does not reclaim when the PTY is already this device\'s size', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    int resizesFor(String sid) =>
+        client.resizeSessionCalls.where((c) => c.startsWith('$sid:')).length;
+    void fit(int cols, int rows) => tester
+        .widget<TerminalPane>(find.byType(TerminalPane))
+        .onViewFit!(cols, rows);
+
+    fit(95, 34);
+    await tester.pumpAndSettle();
+
+    // The host confirms the size this device already fitted to, so a blur and
+    // refocus has nothing to reclaim. Without the drift check the refit would
+    // jiggle the PTY on every alt-tab.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    client.emitSnapshot('flutter-spike', ['unchanged'], size: (34, 95));
+    await tester.pumpAndSettle();
+    final baseline = resizesFor('flutter-spike');
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(resizesFor('flutter-spike'), baseline);
   });
 
   testWidgets('refocuses the active session when resuming after occlusion', (
