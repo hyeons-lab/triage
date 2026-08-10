@@ -581,6 +581,13 @@ class SessionVm {
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
+  // The size *this* device last fitted to, as distinct from `lastFittedCols`,
+  // which also records sizes broadcast by the host after another device
+  // resized. Keeping them apart is what lets a client regaining focus tell
+  // "the PTY is already my size" from "another device has resized it since",
+  // and so reclaim only when reclaiming would actually change something.
+  int? ownFittedCols;
+  int? ownFittedRows;
   // Set once the view first reports its real fitted size after a fresh attach.
   // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
   bool hasFitted = false;
@@ -843,6 +850,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // the resume redraw so we only repaint after genuine occlusion, not on every
   // desktop focus change.
   bool _wasOccluded = false;
+  // Whether this client is the one the user is actually looking at, and so the
+  // one allowed to size the shared PTY. Starts true: a client that never sees a
+  // lifecycle event (tests, and any platform that does not report one) must
+  // behave exactly as it did before this existed.
+  bool _clientForeground = true;
 
   // Wall-clock watchdog for system sleep. macOS does not background a running app
   // on display/system sleep, so the lifecycle hook may never fire — but the
@@ -1256,8 +1268,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
         _wasOccluded = true;
+        _clientForeground = false;
         break;
       case AppLifecycleState.resumed:
+        final regainedFocus = !_clientForeground;
+        _clientForeground = true;
         if (_wasOccluded) {
           _wasOccluded = false;
           // The lifecycle event handles this wake; reset the watchdog baseline so
@@ -1268,12 +1283,48 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _reconnectNowOnResume();
           _refitActiveSession();
           _refocusActiveSession();
+        } else if (regainedFocus) {
+          // Focused again without having been occluded: a desktop window that
+          // was merely behind another, or a browser tab that lost focus. The
+          // occlusion path above always refits; this one only does so when the
+          // PTY has actually drifted from this device's size, since the refit
+          // deliberately jiggles the host to force a repaint and doing that on
+          // every alt-tab would be its own kind of churn.
+          _reclaimTerminalSizeIfDrifted();
         }
         break;
       case AppLifecycleState.inactive:
+        // Blurred but still visible. Enough to stop asserting a size, not
+        // enough to count as occluded, so the reconnect/refocus work above
+        // stays tied to real backgrounding.
+        _clientForeground = false;
+        break;
       case AppLifecycleState.detached:
+        _clientForeground = false;
         break;
     }
+  }
+
+  /// Re-assert this device's terminal size when another device has resized the
+  /// shared PTY since we last fitted. No-op when the PTY already matches, so
+  /// regaining focus is free in the common single-device case.
+  void _reclaimTerminalSizeIfDrifted() {
+    if (_disposed || _sessions.isEmpty) return;
+    if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
+    final session = _selectedSession;
+    final ownCols = session.ownFittedCols;
+    final ownRows = session.ownFittedRows;
+    if (ownCols == null || ownRows == null) return;
+    if (session.lastFittedCols == ownCols &&
+        session.lastFittedRows == ownRows) {
+      return;
+    }
+    _refitActiveSession();
+    // Paired with the refit, exactly as on the occlusion path above. A refit
+    // rebuilds the view and the terminal does not take the keyboard back on its
+    // own afterwards, so without this the session looks live but swallows
+    // typing until you switch away and back.
+    _refocusActiveSession();
   }
 
   // Re-fit this device's terminal to its real size and re-assert it on the
@@ -1571,6 +1622,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
 
     session.terminalController.addResizeOutListener((cols, rows) {
+      // This device's own fit, recorded whether or not it is forwarded below,
+      // so the reclaim on regaining focus knows what size to compare against.
+      session.ownFittedCols = cols;
+      session.ownFittedRows = rows;
+      // A backgrounded client does not get to resize the PTY. Several clients
+      // of different widths each asserting their own turns the shared PTY into
+      // a tug of war: every change makes a full-screen program repaint, and
+      // because the previous frame occupied a different number of rows the new
+      // one lands beside it rather than over it, so the scrollback fills with
+      // the same text at several widths. The foreground client owns the size;
+      // the rest go quiet and reclaim when focused (see the lifecycle handler).
+      if (!_clientForeground) {
+        return;
+      }
       // `_client` is `late`: on the first-run and mock paths nothing has
       // connected yet, and xterm fires this on its very first layout.
       if (_clientInitialized &&
@@ -3044,6 +3109,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onSessionViewFit(SessionVm session, int cols, int rows) {
     session.lastFittedCols = cols;
     session.lastFittedRows = rows;
+    // This device's own view reporting its size, so it is also the baseline a
+    // later reclaim compares the host against.
+    session.ownFittedCols = cols;
+    session.ownFittedRows = rows;
     session.noteViewFit(cols, rows);
     if (!session.hasFitted) {
       session.hasFitted = true;
