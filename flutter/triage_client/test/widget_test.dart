@@ -48,8 +48,18 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   // `startSession` degrades to ''. Distinct from an outright throw.
   final Set<String> emptyIdStartSessionCommands;
 
-  /// Makes the attach snapshot report no size, as a host that omits one does.
-  bool attachOmitsSize = false;
+  /// Makes every snapshot this fake builds report no size, as a host that
+  /// omits one would. The shape is an empty map rather than an absent key,
+  /// because that is what the FlatBuffers decoder produces for an absent
+  /// `SessionSize`, and it is the shape a null check on the container would
+  /// wrongly read as a real size.
+  bool snapshotsOmitSize = false;
+
+  /// The size every snapshot builder below reports. Routed through one getter
+  /// so [snapshotsOmitSize] cannot be honoured by some builders and not
+  /// others, which would let a test pass for the wrong reason.
+  Map<String, dynamic> get _snapshotSize =>
+      snapshotsOmitSize ? <String, dynamic>{} : {'rows': 24, 'cols': 80};
 
   final StreamController<Map<String, dynamic>> _testEventController =
       StreamController<Map<String, dynamic>>.broadcast(sync: true);
@@ -194,7 +204,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       return {
         'response': {
           'snapshot': {
-            'size': {'rows': 24, 'cols': 80},
+            'size': _snapshotSize,
             'exited': exitedSessionIds.contains(sessionId),
             'visible_rows': visibleRows,
             'styled_rows': visibleRows
@@ -233,13 +243,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
             if (attachRepoRoots.containsKey(sessionId))
               'repository_root': attachRepoRoots[sessionId],
           },
-          // An empty map, not an absent key, when the host reports no size:
-          // that is what the FlatBuffers decoder produces for an absent
-          // `SessionSize`, and it is the shape a null check on the container
-          // would wrongly treat as a real size.
-          'size': attachOmitsSize
-              ? <String, dynamic>{}
-              : {'rows': 24, 'cols': 80},
+          'size': _snapshotSize,
           'exited': exitedSessionIds.contains(sessionId),
           'styled_rows': [
             {
@@ -292,7 +296,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     final visibleRows = snapshotVisibleRows[sessionId];
     return {
       'snapshot': {
-        'size': {'rows': 24, 'cols': 80},
+        'size': _snapshotSize,
         'exited': exitedSessionIds.contains(sessionId),
         if (visibleRows != null) ...{
           'visible_rows': visibleRows,
@@ -504,7 +508,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
           },
-          'size': {'rows': 24, 'cols': 80},
+          'size': _snapshotSize,
           'output_seq': 0,
           'exited': exitedSessionIds.contains(sessionId),
           'visible_rows': visibleRows,
@@ -1217,7 +1221,7 @@ void main() {
   testWidgets('does not invent drift from a snapshot that reports no size', (
     WidgetTester tester,
   ) async {
-    final client = FakeTriageWebSocketClient()..attachOmitsSize = true;
+    final client = FakeTriageWebSocketClient()..snapshotsOmitSize = true;
     await tester.pumpWidget(TriageClientApp(client: client));
     await tester.pumpAndSettle();
 

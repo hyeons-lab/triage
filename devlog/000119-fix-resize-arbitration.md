@@ -56,6 +56,13 @@ case covering a backgrounded refresh, and the "does not reclaim" case now takes
 the host's size from the resize this client performed rather than from an
 emitted broadcast, which is what makes it exercise `renderSize`.
 
+2026-08-10T03:40-0700 `flutter/triage_client/lib/main.dart`,
+`test/widget_test.dart`: the host-size guard reads the reported `cols`/`rows`
+rather than the size container. A fifth widget case covers a snapshot that
+reports no size, and the fake grows `snapshotsOmitSize`, routed through a single
+`_snapshotSize` getter so every builder honours it; honouring it in one builder
+of four would have let a later test pass for the wrong reason.
+
 ## Decisions
 
 2026-08-09T19:30-0700 Foreground-owns rather than smallest-client-wins.
@@ -189,8 +196,8 @@ deciding not to put it there, and the refocus reclaim then saw no drift. Same
 failure as the `lastFittedCols` bug from 21:00, reached through a different
 door, and introduced by the fix for it. Replaced `replayTargetSize` with a
 `drivenSize` that is set only where the host was actually moved: a successful
-restore, a successful resize, or a snapshot that already matches. Otherwise it
-stays null and the snapshot's own size is used, which is the host's real size.
+restore or a successful resize. Otherwise it stays null and the snapshot's own
+size is used, which is the host's real size.
 
 Worth naming the pattern, since this is twice now: both bugs came from recording
 an intention as an observation. The fields are named for what they are (`own`
@@ -258,16 +265,24 @@ suppresses a needed reclaim or invents one. Now left alone unless the caller
 drove the host or the snapshot actually reported a size, matching what the
 resize broadcast already did.
 
-2026-08-10T03:05-0700 Round 4, and the round-3 fix was wrong on the default
-transport. The new guard tested `sizeObj == null`, but the FlatBuffers decoder
-turns an absent `SessionSize` into an empty map rather than null
-(`_parseSessionSize`), so on the transport this app actually uses the guard
-never fired and the 80x24 rendering fallback was still recorded as the host's
-account. Now guarded on the reported `cols`/`rows` themselves, which is what the
-resize broadcast always did; the comment claiming the two matched was the tell,
-since they only matched on the JSON path. Pinned by a case that makes the fake
-report an empty size map, and confirmed by reverting to both the round-3 and
-pre-round-3 forms.
+2026-08-10T03:05-0700 Round 4: the round-3 guard tested `sizeObj == null`, but
+the FlatBuffers decoder turns an absent `SessionSize` into an empty map rather
+than null (`_parseSessionSize`), so on the transport this app actually uses that
+guard could not fire. Now guarded on the reported `cols`/`rows` themselves,
+which is what the resize broadcast always did; the comment claiming the two
+matched was the tell, since they only matched on the JSON path. Pinned by a case
+that makes the fake report an empty size map, and confirmed by reverting to both
+the round-3 and pre-round-3 forms.
+
+2026-08-10T03:40-0700 Round 5, correcting the entry immediately above and the
+message of the commit that carried it. Both describe a live defect; it is not
+reachable against the current daemon. `SessionSnapshot.size` is
+`SessionSize`, not an `Option`, and every FlatBuffers site serialises it as
+`Some(&size)`, so the host always reports a size and neither the round-3 nor the
+round-4 guard can fire in production. The fix stands as defence against a host
+that stops doing that, and the guard is the correct one either way, but it did
+not fix anything users could hit. Fourth overstated claim on this branch, and
+the commit message is now wrong in the permanent record.
 
 Also worth recording: the first attempt to run those two mutations silently
 measured nothing, because `dart format` had reshaped the expression and the
@@ -291,7 +306,9 @@ running the suite.
   either field choice, passing the wanted size instead of the driven one, and
   sourcing the host's size from the snapshot instead of the resize just
   performed, and recording the rendering fallback as the host's size when the
-  snapshot reports none.
+  snapshot reports none. "The attach-refresh gate" here means the one in
+  `_refreshSessionSnapshot`; the sibling in `_loadDaemonSession` is the
+  uncovered one below.
 - Not covered, and worth naming rather than leaving implied: the lazy-load
   gate in `_loadDaemonSession`, and the `ownFitted*` write in the resize-out
   listener, which is the sole maintainer of that field on web.
@@ -363,4 +380,5 @@ running the suite.
 - 149c7e7: fix(triage_client): stop manufacturing drift on the re-attach path
 - e769f5e: test(triage_client): cover the resize arbitration decisions
 - 9d354c4: fix(triage_client): record only sizes the host actually has
-- HEAD: fix(triage_client): guard the host size on what the host reported
+- 3b118d5: fix(triage_client): guard the host size on what the host reported
+- HEAD: test(triage_client): make the fake omit sizes consistently
