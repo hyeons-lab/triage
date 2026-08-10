@@ -39,6 +39,18 @@ from under it, which takes the stale highlight with it.
 (new): five cases driving a real `ESC[3J` through the emulator rather than
 simulating a trim.
 
+2026-08-09T23:30-0700 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`:
+override repinned to `81a742e`, which adds a second fix to the fork
+(`replaceWith` resets the start index before adopting rather than after). The
+comment now describes two fixes instead of one; `lib/` still differs from the
+release by the same single file.
+
+2026-08-09T23:30-0700 `flutter/triage_client/test/terminal/scrollback_clear_test.dart`:
+a second group covering clear-then-width-change, the path the 21:10 entry below
+recorded as uncovered. Six cases at two widths: every row reports its true
+position, cleared lines are not handed back out, and neither the selection nor
+the anchor guard misfires on rows that are genuinely present.
+
 ## Decisions
 
 2026-08-09T18:40-0700 Fork rather than work around locally. Reasoning: the fix
@@ -116,6 +128,47 @@ and present in stock 4.0.0 too, so this branch does not introduce it, but the
 "negative row means cleared away" invariant is narrower than the doc comments
 claim and no test covers resize-after-clear.
 
+2026-08-09T23:30-0700 Fixed the above rather than leaving it documented.
+Reproduced it first, since it was a reviewer's claim and not yet my own
+measurement: on a buffer of 6 with 2 trimmed, `replaceWith` of 3 items reads
+back `[old0, old1, new0]`. So it is worse than "resurrects the cleared lines":
+the tail of the replacement is also unreachable, because the list is rotated
+against itself. `replaceWith` adopts through `_getCyclicIndex`, which offsets by
+`_startIndex`, and only reset `_startIndex` afterwards, so it wrote at one
+rotation and read at another. Moving the reset before the adopt loop fixes it.
+
+The reset has a consequence worth stating: adopting into a slot detaches its
+previous occupant, and after a trim those slots hold the trimmed lines, so the
+naive fix would detach them, which is exactly the release-build crash the whole
+narrow approach exists to avoid. Cleared the leftover slots without detaching
+instead, so the "trimmed stays attached, reports a negative index" contract
+holds through a reflow too. That also let the loop dropping buffer slots on an
+oversized replacement go: it indexed the list rather than the replacement, and
+could reach and detach those same trimmed lines.
+
+Five of the six new triage-side tests fail against the previous pin, including
+`terminalSelectionIsLive` returning false for a row that is genuinely present.
+So the invariant the doc comments claim is now true on the resize path, rather
+than narrowed.
+
+2026-08-09T23:55-0700 Review loop, correcting the entry above: scoping this
+defect to "after a clear" was wrong, and it understated it twice over. The
+trigger is a rotated backing array, and `push` rotates it every time it evicts
+from a full scrollback, so no clear is needed at all. Measured against stock
+4.0.0: with `maxLines: 30`, 60 lines written and then a width change, row 11
+reports index 10 and row 0 reports 29. Worse, when the reflow result is shorter
+than the rotation, the leading slots are never written and reading row 0 throws
+`Null check operator used on a null value` from `operator []`; widening a
+window whose wrapped scrollback has overflowed reproduces it. Both are present
+in the released 4.0.0 and neither needs `ESC[3J`.
+
+That makes this fix considerably more valuable than "a companion to the clear
+fix", and it is a better candidate for the original report of duplicated
+content and missing history than the clear path was, since it needs nothing but
+a full scrollback and a resize. Added four regression cases in the fork (two at
+the buffer level, two driving a real `Terminal`), all of which fail on stock.
+Commit message, pubspec comment and this entry now describe the real scope.
+
 ## Verification
 
 - `flutter analyze lib/`: no new issues (3 pre-existing, in untouched files).
@@ -125,12 +178,35 @@ claim and no test covers resize-after-clear.
   of releasing, and a cleared line reports 0 rather than a negative row, so it
   cannot even be identified. All three pass with the override in place.
 
+2026-08-09T23:30-0700, after the `replaceWith` fix:
+
+- xterm fork: 120 tests passing (113 before, plus 3 for the replace-after-trim
+  behaviour and 4 for rotation by scrollback overflow), so the fix regresses
+  nothing else in the emulator. All 7 fail against stock 4.0.0.
+- `flutter analyze lib/`: unchanged, 3 pre-existing issues in untouched files.
+- `flutter test`: 307 passing, up from 301.
+- The six new cases were run against the previous pin first: five fail there,
+  which is what says they are testing the fix rather than passing vacuously.
+  The sixth (the scroll anchor still pinning) passes either way even after
+  being strengthened to assert the offset rather than just its presence, so it
+  is a regression guard rather than evidence for the fix.
+
 ## Next Steps
 
 - Comment on upstream PR 225 confirming the analysis with a second reproduction;
-  a competing PR would not help, since 225 is already correct and unmerged.
-- Drop the override once a release contains the fix.
+  a competing PR would not help, since 225 is already correct and unmerged. The
+  `replaceWith` rotation is a separate defect that 225 does not cover and that
+  reproduces on stock 4.0.0 with no clear involved, including as a crash, so it
+  is worth its own upstream issue and probably its own PR.
+- The fork's `analysis_options.yaml` still lists `dart_code_metrics` under
+  `analyzer: plugins:` with its config block, left behind when `1a3e7c4` dropped
+  the dev dependency. Dev-only and outside `lib/`, so it does not reach this
+  app, but it means the analysis server cannot load the plugin in the fork.
+- Drop the override once a release contains both fixes.
 
 ## Commits
 
-- HEAD: fix(triage_client): keep row indices correct across a scrollback clear
+- d148cce: fix(triage_client): keep row indices correct across a scrollback clear
+- 88c9473: fix(triage_client): pin the xterm fork to the release plus one commit
+- fa1ab34: docs(triage_client): state exactly what the xterm pin carries
+- HEAD: fix(triage_client): repair the reflow that rotates the scrollback

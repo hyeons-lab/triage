@@ -110,4 +110,83 @@ void main() {
       expect(terminalSelectionIsLive(terminal.buffer, selection!), isTrue);
     });
   });
+
+  // A width change reflows, which rebuilds the line list wholesale. Doing that
+  // on a buffer a clear has already trimmed is the one path where the
+  // "negative row means cleared away" rule above can be made to lie, so it
+  // gets its own coverage.
+  group('after a scrollback clear and a width change', () {
+    xt.Terminal clearedThenResized(int newWidth) {
+      final terminal = terminalWithScrollback();
+      terminal.write('\x1b[3J');
+      terminal.resize(newWidth, 5);
+      return terminal;
+    }
+
+    for (final width in const [30, 12]) {
+      test('every row reports its true position at width $width', () {
+        final terminal = clearedThenResized(width);
+
+        for (var row = 0; row < terminal.buffer.lines.length; row++) {
+          expect(
+            terminal.buffer.lines[row].index,
+            row,
+            reason: 'row $row misreports after reflow',
+          );
+        }
+      });
+
+      test('cleared lines are not handed back out at width $width', () {
+        final terminal = terminalWithScrollback();
+        final cleared = terminal.buffer.lines[0];
+        terminal.write('\x1b[3J');
+        terminal.resize(width, 5);
+
+        // The failure this guards is a reflow rotating the line list so the
+        // rows a clear removed are readable again at the top of the buffer.
+        for (var row = 0; row < terminal.buffer.lines.length; row++) {
+          expect(identical(terminal.buffer.lines[row], cleared), isFalse);
+        }
+      });
+    }
+
+    test('a live selection survives the reflow', () {
+      final terminal = clearedThenResized(30);
+      final controller = xt.TerminalController();
+      final line = terminal.buffer.lines[1];
+      controller.setSelection(
+        xt.CellAnchor(0, owner: line),
+        xt.CellAnchor(3, owner: line),
+      );
+
+      // Rows that are genuinely present must not be mistaken for cleared ones,
+      // or a selection gets dropped out from under the user on every resize.
+      final selection = controller.selection;
+      expect(selection, isNotNull);
+      expect(terminalSelectionIsLive(terminal.buffer, selection!), isTrue);
+    });
+
+    test('a scroll anchor on a surviving line still pins', () {
+      final terminal = terminalWithScrollback();
+      terminal.write('\x1b[3J');
+      final anchor = TerminalScrollAnchor();
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: 20,
+        maxScrollExtent: 200,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+
+      terminal.resize(30, 5);
+
+      // Asserting the offset rather than just that one was returned: these
+      // lines are short enough that widening merges nothing, so the anchored
+      // row must not move at all.
+      expect(
+        anchor.desiredOffset(maxScrollExtent: 200, lineHeight: lineHeight),
+        20,
+      );
+    });
+  });
 }
