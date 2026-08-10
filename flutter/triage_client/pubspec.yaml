@@ -46,7 +46,7 @@ dependencies:
 # Pinned to a fork of the released 4.0.0. Against the release, `lib/` differs by
 # exactly one file, `src/utils/circular_buffer.dart`, carrying the fixes below
 # and nothing else. The branch's other commits are tests, comment
-# corrections to those two fixes, and a dev-dependency removal; the tests and
+# corrections to them, and a dev-dependency removal; the tests and
 # dev dependency are outside `lib/` and pub never resolves them for a non-root
 # package, so they cannot reach this app either way. Verify with:
 #
@@ -107,7 +107,7 @@ dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: 2c09f74fc9f9be4514c3aff5e7e9f8319ac61fd6
+      ref: 1ca073d34fec7f731e1523b604a82e2d45edb9a4
 
 dev_dependencies:
   flutter_test:

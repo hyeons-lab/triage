@@ -67,6 +67,10 @@ behavioural edit in `lib/` that the "two fixes" enumeration only gestured at,
 and drops the "two fixes" phrasing now that the second is described in two
 parts.
 
+2026-08-10T04:10-0700 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`:
+repinned to `1ca073d`. Covers the earlier `ca99808`, which reworded the same
+comment block and had no entry here.
+
 ## Decisions
 
 2026-08-09T18:40-0700 Fork rather than work around locally. Reasoning: the fix
@@ -211,6 +215,16 @@ the same absolute index; what differs is which line actually sits at row 2. It
 now asserts that identity too, and all six width-change cases fail against the
 previous pin rather than five.
 
+2026-08-10T04:10-0700 Round 6: the comment correction claimed at 02:32 never
+landed in `lib/`. The control run that verified the claim ended with
+`git checkout HEAD -- lib/src/utils/circular_buffer.dart`, which reverted the
+uncommitted edit in the same shell, so `2c09f74` carried only the tests while
+its message, the pubspec and this devlog all said the wording had been fixed.
+Second time on this branch that a checkout after a control run has silently
+undone the edit being verified, and the tell both times was a commit whose stat
+was smaller than expected. Now committed as `1ca073d` and confirmed present in
+the file before committing rather than after.
+
 ## Verification
 
 - `flutter analyze lib/`: no new issues (3 pre-existing, in untouched files).
@@ -234,9 +248,13 @@ previous pin rather than five.
 - Not covered, and worth naming rather than leaving implied: both
   `terminalSelectionIsLive` call sites in `terminal_pane_stub.dart` (the
   `_liveCopySelection` guard and the `clearSelection()` branch) can be removed
-  with the suite still green. They are mobile-only, so the widget harness never
-  reaches them; the emulator-level behaviour they rest on is covered, the
-  wiring is not.
+  with the suite still green. Not because they are mobile-only: the pane's
+  `_isMobile` reads `defaultTargetPlatform` without the `runningUnderFlutterTest`
+  carve-out that `isMobilePlatform()` in `main.dart` has, and the harness
+  reports android, so it does count as mobile. They are unreached because no
+  widget test creates a selection, and because the pane renders the
+  `FLUTTER_TEST` fallback rather than xterm's `TerminalView`. The
+  emulator-level behaviour they rest on is covered; the wiring is not.
 
 ## Next Steps
 
@@ -259,4 +277,5 @@ previous pin rather than five.
 - 3e863f5: fix(triage_client): repair the reflow that rotates the scrollback
 - 430e0b0: fix(triage_client): describe the reflow rotation accurately
 - ca99808: docs(triage_client): say exhaustively what the fork branch carries
-- HEAD: docs(triage_client): record the non-detaching clear in the override note
+- 1aaa162: docs(triage_client): record the non-detaching clear in the override note
+- HEAD: fix(triage_client): repin onto the corrected rotation comment
