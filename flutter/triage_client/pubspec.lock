@@ -697,8 +697,8 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: "fix/trim-start-reindex"
-      resolved-ref: "0f8373597fb1dfe1e71239d4d65c9561bd0b24c0"
+      ref: "1a3e7c46b6066f8463e0431766d3e3f078e4a603"
+      resolved-ref: "1a3e7c46b6066f8463e0431766d3e3f078e4a603"
       url: "https://github.com/hyeons-lab/xterm.dart.git"
     source: git
     version: "4.0.0"

@@ -43,9 +43,9 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   shared_preferences: ^2.3.2
 
-# Pinned to a fork carrying one fix that is not in any xterm release.
+# Pinned to a fork of the released 4.0.0 carrying one fix, and nothing else.
 #
-# `CircularList.trimStart` advances the list's start without advancing the
+# `IndexAwareCircularBuffer.trimStart` advances the list's start without advancing the
 # absolute start it measures indices from, so after `ESC[3J` (what `clear`
 # emits) every surviving scrollback line reports a row too high by the number
 # trimmed, while lines written afterwards report correctly. `BufferLine.index`
@@ -62,11 +62,19 @@ dependencies:
 # `terminal_scroll_anchor.dart` and the panes.
 #
 # Drop this override once a release contains the fix.
+# Branched from the `v4.0.0` tag rather than upstream master, so this is the
+# published release plus that single commit. Master carries three unreleased
+# commits that change colour rendering and Android enter-key handling, and
+# taking those unreviewed alongside a scrollback fix is not a trade this needs
+# to make.
+#
+# Pinned by commit, not by branch name: a branch ref would let a force-push or
+# a new commit change the terminal emulator this app ships with no diff here.
 dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: fix/trim-start-reindex
+      ref: 1a3e7c46b6066f8463e0431766d3e3f078e4a603
 
 dev_dependencies:
   flutter_test:

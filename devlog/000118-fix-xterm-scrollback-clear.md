@@ -13,12 +13,12 @@ viewport stops jumping and a selection stops reading the wrong lines after any
 ## What Changed
 
 2026-08-09T19:07-0700 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: a
-`dependency_overrides` entry pinning `xterm` to `hyeons-lab/xterm.dart` branch
-`fix/trim-start-reindex` (lock pins commit `0f83735`). That fork carries one
-commit against upstream master: `trimStart` now advances `_absoluteStartIndex`
-alongside `_startIndex`, plus a test. A second commit drops the discontinued
-`dart_code_metrics` dev dependency, whose constraint no longer resolves and so
-blocked running xterm's own suite at all.
+`dependency_overrides` entry pinning `xterm` to `hyeons-lab/xterm.dart` at
+commit `1a3e7c4`. That fork branches from the `v4.0.0` tag and carries the fix
+(`trimStart` advances `_absoluteStartIndex` alongside `_startIndex`, plus a
+test) and one dev-only commit dropping the discontinued `dart_code_metrics`
+dependency, whose constraint no longer resolves and so blocked running xterm's
+own suite at all. Against the release, `lib/` differs by one file.
 
 2026-08-09T19:07-0700 `flutter/triage_client/lib/terminal/terminal_selection.dart`:
 adds `terminalSelectionIsLive`, which reports whether a range still refers to
@@ -89,6 +89,28 @@ nothing; the tell both times was a result that agreed too neatly.
 this branch touches. Reverted. This is the second occurrence on this branch's
 parent, so it is now recorded as a standing note: format explicit file paths,
 never directories, and check `git diff --stat` before committing.
+
+2026-08-09T21:05-0700 Review loop: the fork was first branched from upstream
+master, which carries three unreleased commits beyond `v4.0.0`, two of them
+behavioural (colour 15 rendering in `palette_builder.dart`, and Android
+enter-key handling in `terminal_view.dart`). The pubspec, this devlog and the
+commit message all described the override as "one fix", so nothing signalled
+that colour and keyboard behaviour were also changing, and `pubspec.lock` still
+reports version `4.0.0`. Rebranched from the `v4.0.0` tag so `lib/` differs from
+the release by exactly one file, and repinned by commit rather than branch name:
+a branch ref would let a force-push swap the terminal emulator this app ships
+with no diff in this repo.
+
+2026-08-09T21:10-0700 Review loop, and worth recording as a limit of this fix
+rather than a defect in it: a reviewer showed empirically that a width-changing
+`resize` after a clear resurrects the cleared lines, because `replaceWith`
+computes cyclic indices from a `_startIndex` that `trimStart` left non-zero.
+Every live row then reports a negative index. Both guards added here therefore
+misfire in that path, conservatively: the anchor is dropped and the selection is
+treated as dead when both are in fact valid. The resurrection is pre-existing
+and present in stock 4.0.0 too, so this branch does not introduce it, but the
+"negative row means cleared away" invariant is narrower than the doc comments
+claim and no test covers resize-after-clear.
 
 ## Verification
 
