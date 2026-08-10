@@ -55,9 +55,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   /// wrongly read as a real size.
   bool snapshotsOmitSize = false;
 
-  /// The size every snapshot builder below reports. Routed through one getter
-  /// so [snapshotsOmitSize] cannot be honoured by some builders and not
-  /// others, which would let a test pass for the wrong reason.
+  /// The size reported by the builders that stand in for the host volunteering
+  /// its current size: the attach responses and the standalone snapshot. Routed
+  /// through one getter so [snapshotsOmitSize] cannot be honoured by some of
+  /// them and not others, which would let a test pass for the wrong reason.
+  ///
+  /// The `restoreSession` and `resizeSession` responses deliberately do not use
+  /// it: they echo back the size they were just asked for, as the daemon does,
+  /// and a response to a sizing request is the one place a size is never
+  /// absent. `emitSnapshot` takes its size from the caller for the same reason.
   Map<String, dynamic> get _snapshotSize =>
       snapshotsOmitSize ? <String, dynamic>{} : {'rows': 24, 'cols': 80};
 

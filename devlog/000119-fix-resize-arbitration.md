@@ -60,8 +60,11 @@ emitted broadcast, which is what makes it exercise `renderSize`.
 `test/widget_test.dart`: the host-size guard reads the reported `cols`/`rows`
 rather than the size container. A fifth widget case covers a snapshot that
 reports no size, and the fake grows `snapshotsOmitSize`, routed through a single
-`_snapshotSize` getter so every builder honours it; honouring it in one builder
-of four would have let a later test pass for the wrong reason.
+`_snapshotSize` getter so the builders that stand in for the host volunteering
+a size all honour it; honouring it in one of them would have let a later test
+pass for the wrong reason. The `restoreSession`/`resizeSession` responses keep
+echoing the size they were asked for, since a reply to a sizing request is the
+one place a size is never absent.
 
 ## Decisions
 
@@ -156,10 +159,12 @@ predicate taking `hostCols` as a parameter is correct whatever the caller hands
 it. So the predicate hangs off `SessionVm` and reads the fields itself, which
 puts the field choice inside the tested unit.
 
-Checked that by mutation rather than by assertion: reverting the getter to read
-`lastFittedCols`/`lastFittedRows` makes the case written for exactly this
-scenario fail (a local fit arriving while backgrounded must still leave the
-drift visible).
+Checked that by mutation rather than by assertion: pointing the *host* side of
+the comparison at `lastFittedCols`/`lastFittedRows`, which is the bug being
+guarded against, fails exactly one case, the one written for this scenario (a
+local fit arriving while backgrounded must still leave the drift visible).
+Pointing the *own* side there instead is a different mutation and fails the two
+"is true" cases, so the side matters when reading this back.
 
 2026-08-10T00:04-0700 Two corrections to the entry above, both from the review
 loop. First, the mutation evidence was overstated: three of nine failed, but two
@@ -277,9 +282,11 @@ the round-3 and pre-round-3 forms.
 2026-08-10T03:40-0700 Round 5, correcting the entry immediately above and the
 message of the commit that carried it. Both describe a live defect; it is not
 reachable against the current daemon. `SessionSnapshot.size` is
-`SessionSize`, not an `Option`, and every FlatBuffers site serialises it as
-`Some(&size)`, so the host always reports a size and neither the round-3 nor the
-round-4 guard can fire in production. The fix stands as defence against a host
+`SessionSize`, not an `Option`, and the single snapshot encoder
+(`triage-core/src/flatbuffers_proto.rs`) writes it as `Some(&size)`
+unconditionally for both the attach response and the resize broadcast, so the
+host always reports a size and neither the round-3 nor the round-4 guard can
+fire in production. The fix stands as defence against a host
 that stops doing that, and the guard is the correct one either way, but it did
 not fix anything users could hit. Fourth overstated claim on this branch, and
 the commit message is now wrong in the permanent record.
@@ -381,4 +388,5 @@ running the suite.
 - e769f5e: test(triage_client): cover the resize arbitration decisions
 - 9d354c4: fix(triage_client): record only sizes the host actually has
 - 3b118d5: fix(triage_client): guard the host size on what the host reported
-- HEAD: test(triage_client): make the fake omit sizes consistently
+- 1880dd1: test(triage_client): make the fake omit sizes consistently
+- HEAD: docs(triage_client): say which fake builders omit a size
