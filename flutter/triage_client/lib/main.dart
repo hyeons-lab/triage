@@ -1644,6 +1644,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // one lands beside it rather than over it, so the scrollback fills with
       // the same text at several widths. The foreground client owns the size;
       // the rest go quiet and reclaim when focused (see the lifecycle handler).
+      // Bookkeeping first: this is the only maintainer of `lastFitted*` for an
+      // ordinary grid resize on web, and it feeds the replay size. Skipping it
+      // with the send would leave a stale size to replay history at.
+      session.lastFittedCols = cols;
+      session.lastFittedRows = rows;
       if (!_clientForeground) {
         return;
       }
@@ -1658,8 +1663,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ++session.resizeRequestSeq;
           // Tell the host its new PTY size; the program repaints and the live
           // byte stream self-heals the view. No history replay on resize.
-          session.lastFittedCols = cols;
-          session.lastFittedRows = rows;
           unawaited(() async {
             try {
               await _client.resizeSession(
@@ -3027,13 +3030,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.statusColor = exited
           ? const Color(0xff7f8b8d)
           : const Color(0xff7fd1c7);
-      // From the snapshot's own `size`, not `fittedCols`, which prefers our
-      // render size: this half of the drift comparison must stay the host's
-      // account. Seeds it at attach, so a client that attaches while
-      // backgrounded and never sees a resize broadcast can still tell on
-      // refocus that the PTY is not at its size.
-      session.hostSizeCols = cols;
-      session.hostSizeRows = rowsVal;
+      // The host's account of its own size, seeded here so a client that
+      // attaches while backgrounded and never sees a resize broadcast can still
+      // tell on refocus that the PTY is not at its size.
+      //
+      // `renderSize` when the caller has one, because that is the size it just
+      // drove the host to; the snapshot it hands us is deliberately the
+      // pre-resize, history-bearing one, so reading `size` from it would record
+      // a value already known to be stale and manufacture drift that fires a
+      // pointless refit on the next focus regain. Never `fittedCols`, which
+      // prefers our render size and so is not the host's account at all.
+      session.hostSizeCols = renderSize?.$2 ?? cols;
+      session.hostSizeRows = renderSize?.$1 ?? rowsVal;
       session.lastFittedCols = fittedCols;
       session.lastFittedRows = fittedRows;
       session.inFlightCols = null;
@@ -3273,12 +3281,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
           }
         } else if (replayTargetSize != null &&
+            _clientForeground &&
             !_snapshotSizeMatches(snapshot, replayTargetSize)) {
           // Resize the host so its program repaints at our width, but keep the
           // history-bearing attach snapshot for rendering. The resize response
           // carries no raw_output (resize snapshots never do), so using it would
           // make applyHistory clear the terminal and blank it; history replays
           // at the fitted size client-side anyway.
+          //
+          // Gated on foreground for the same reason the resize-out listener is:
+          // a reconnect on a blurred client would otherwise re-take the shared
+          // PTY from whichever device the user is actually looking at. The
+          // reclaim on refocus covers the size this skips.
           try {
             await _client.resizeSession(
               sessionId: sessionId,
