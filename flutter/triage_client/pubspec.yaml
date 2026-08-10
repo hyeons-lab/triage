@@ -44,8 +44,8 @@ dependencies:
   shared_preferences: ^2.3.2
 
 # Pinned to a fork of the released 4.0.0. Against the release, `lib/` differs by
-# exactly one file, `src/utils/circular_buffer.dart`, carrying the two fixes
-# below and nothing else. The branch's other commits are tests, comment
+# exactly one file, `src/utils/circular_buffer.dart`, carrying the fixes below
+# and nothing else. The branch's other commits are tests, comment
 # corrections to those two fixes, and a dev-dependency removal; the tests and
 # dev dependency are outside `lib/` and pub never resolves them for a non-root
 # package, so they cannot reach this app either way. Verify with:
@@ -72,7 +72,14 @@ dependencies:
 # that assert is stripped. Retiring those anchors is left to us, in
 # `terminal_scroll_anchor.dart` and the panes.
 #
-# 2. `replaceWith` adopted the reflowed lines through the rotated start and
+# 2a. `replaceWith` clears the slots it is about to reuse without detaching
+# what they held, because after a trim those are lines fix 1 deliberately left
+# attached. Detaching them is the release-build crash fix 1 exists to avoid.
+# This also replaces a loop that dropped buffer slots on an oversized
+# replacement, which indexed the list rather than the replacement and could
+# reach those same lines.
+#
+# 2b. `replaceWith` adopted the reflowed lines through the rotated start and
 # only reset that start afterwards, so it wrote them at one rotation and read
 # them back at another, leaving the buffer rotated against itself. This is not
 # specific to a clear: `push` rotates the array every time it evicts from a

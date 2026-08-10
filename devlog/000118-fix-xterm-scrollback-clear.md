@@ -61,6 +61,12 @@ having been wrong three times.
 the scroll-anchor case additionally asserts which line sits at the anchored
 row, since the offset alone reads the same on the unfixed emulator.
 
+2026-08-10T03:40-0700 `flutter/triage_client/pubspec.yaml`: the override comment
+now also describes the non-detaching clear of reused slots, which is a
+behavioural edit in `lib/` that the "two fixes" enumeration only gestured at,
+and drops the "two fixes" phrasing now that the second is described in two
+parts.
+
 ## Decisions
 
 2026-08-09T18:40-0700 Fork rather than work around locally. Reasoning: the fix
@@ -225,6 +231,12 @@ previous pin rather than five.
 - The six new cases were run against the previous pin first, where all six now
   fail (5 pass, 6 fail of 11), which is what says they test the fix rather than
   passing vacuously.
+- Not covered, and worth naming rather than leaving implied: both
+  `terminalSelectionIsLive` call sites in `terminal_pane_stub.dart` (the
+  `_liveCopySelection` guard and the `clearSelection()` branch) can be removed
+  with the suite still green. They are mobile-only, so the widget harness never
+  reaches them; the emulator-level behaviour they rest on is covered, the
+  wiring is not.
 
 ## Next Steps
 
@@ -245,4 +257,6 @@ previous pin rather than five.
 - 88c9473: fix(triage_client): pin the xterm fork to the release plus one commit
 - fa1ab34: docs(triage_client): state exactly what the xterm pin carries
 - 3e863f5: fix(triage_client): repair the reflow that rotates the scrollback
-- HEAD: fix(triage_client): describe the reflow rotation accurately
+- 430e0b0: fix(triage_client): describe the reflow rotation accurately
+- ca99808: docs(triage_client): say exhaustively what the fork branch carries
+- HEAD: docs(triage_client): record the non-detaching clear in the override note
