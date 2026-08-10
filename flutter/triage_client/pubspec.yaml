@@ -43,7 +43,9 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   shared_preferences: ^2.3.2
 
-# Pinned to a fork of the released 4.0.0 carrying one fix, and nothing else.
+# Pinned to a fork of the released 4.0.0 whose `lib/` carries one fix and
+# nothing else. (Two commits: that fix, and a dev-dependency removal that pub
+# never resolves for a non-root package, so it cannot reach this app.)
 #
 # `IndexAwareCircularBuffer.trimStart` advances the list's start without advancing the
 # absolute start it measures indices from, so after `ESC[3J` (what `clear`
@@ -62,8 +64,8 @@ dependencies:
 # `terminal_scroll_anchor.dart` and the panes.
 #
 # Drop this override once a release contains the fix.
-# Branched from the `v4.0.0` tag rather than upstream master, so this is the
-# published release plus that single commit. Master carries three unreleased
+# Branched from the `v4.0.0` tag rather than upstream master. Master carries
+# three unreleased
 # commits that change colour rendering and Android enter-key handling, and
 # taking those unreviewed alongside a scrollback fix is not a trade this needs
 # to make.

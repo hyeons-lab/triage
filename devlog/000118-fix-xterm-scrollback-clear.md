@@ -66,6 +66,10 @@ both unambiguous and cheap to test.
 2026-08-09T19:02-0700 Pinned the override to a branch and let `pubspec.lock`
 record the commit. Reasoning: the lock is committed, so builds are reproducible
 against `0f83735` regardless, while the branch name keeps the pubspec readable.
+(Superseded at 21:05, see Issues: the pin is now the commit `1a3e7c4` on a
+branch cut from the `v4.0.0` tag. A branch ref would let a force-push change the
+emulator with no diff here, and `0f83735` sat on upstream master and so carried
+three unreleased commits beyond the release.)
 
 ## Issues
 
