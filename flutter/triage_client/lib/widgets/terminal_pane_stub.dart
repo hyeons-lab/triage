@@ -743,7 +743,16 @@ class _TerminalPaneState extends State<TerminalPane> {
         _copyTargetBuffer = null;
         _rebuildForCopyButton();
       } else if (identical(_terminal.buffer, _copyTargetBuffer)) {
-        _rebuildForCopyButton();
+        if (terminalSelectionIsLive(_terminal.buffer, selection)) {
+          _rebuildForCopyButton();
+        } else {
+          // The text was cleared out from under the selection, which xterm
+          // leaves us to notice: it drops those lines without detaching them,
+          // so the controller keeps offering a range over rows that are gone.
+          // Clearing takes the stale highlight with it, and re-enters
+          // `_syncCopyTarget`, which retires the target and rebuilds.
+          _xtermController.clearSelection();
+        }
       }
       // The remaining case is a live selection belonging to the screen that is
       // not currently shown. Nothing to draw, so no rebuild: a full-screen
@@ -859,6 +868,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!identical(_terminal.buffer, _copyTargetBuffer)) return null;
     final selection = _xtermController.selection;
     if (selection == null || selection.isCollapsed) return null;
+    if (!terminalSelectionIsLive(_terminal.buffer, selection)) return null;
     return selection;
   }
 

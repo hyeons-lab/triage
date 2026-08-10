@@ -1,5 +1,23 @@
 import 'package:xterm/xterm.dart' as xt;
 
+/// Whether [range] still refers to rows that are inside [buffer].
+///
+/// A selection normally dies with its lines: ageing out of a full buffer
+/// detaches them, and the controller then stops returning a range at all. A
+/// scrollback clear (`ESC[3J`) does not work that way. It drops lines through
+/// `trimStart`, which leaves them attached deliberately, because anchors still
+/// holding them guard access with `assert(attached)` alone and would throw in
+/// release builds if they were detached. The controller therefore goes on
+/// handing out a range for a selection whose text is gone, with rows that have
+/// gone negative now that they sit before the start of the buffer.
+///
+/// Callers use this to retire such a selection themselves, which the fix for
+/// that trim leaves as their job.
+bool terminalSelectionIsLive(xt.Buffer buffer, xt.BufferRange range) {
+  final normalized = range.normalized;
+  return normalized.begin.y >= 0 && normalized.end.y < buffer.lines.length;
+}
+
 /// Rebuilds the plain text for a terminal selection [range], preserving the
 /// spaces that xterm.dart's own `Buffer.getText` drops.
 ///

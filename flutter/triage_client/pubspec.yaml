@@ -43,6 +43,31 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   shared_preferences: ^2.3.2
 
+# Pinned to a fork carrying one fix that is not in any xterm release.
+#
+# `CircularList.trimStart` advances the list's start without advancing the
+# absolute start it measures indices from, so after `ESC[3J` (what `clear`
+# emits) every surviving scrollback line reports a row too high by the number
+# trimmed, while lines written afterwards report correctly. `BufferLine.index`
+# is what pins our scrollback viewport (see TerminalScrollAnchor) and what
+# selection anchors resolve through, so the effect is a viewport that jumps and
+# a selection that reads the wrong rows after any clear.
+#
+# It is fixed upstream only in PR 225, unmerged since 2026-05-08 against a
+# release that is two years old, so there is no published version to move to.
+# The fork is that PR's approach: advance the absolute start, and deliberately
+# do not detach the trimmed lines, because anchors still holding them guard
+# access with `assert(attached)` alone and would throw in release builds where
+# that assert is stripped. Retiring those anchors is left to us, in
+# `terminal_scroll_anchor.dart` and the panes.
+#
+# Drop this override once a release contains the fix.
+dependency_overrides:
+  xterm:
+    git:
+      url: https://github.com/hyeons-lab/xterm.dart.git
+      ref: fix/trim-start-reindex
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
