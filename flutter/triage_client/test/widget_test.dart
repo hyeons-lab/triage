@@ -1096,7 +1096,9 @@ void main() {
       final baseline = resizesFor('flutter-spike');
 
       // Blurred. A grid resize here still reaches the controller (a window
-      // moved behind another, a DPI change), and must not be forwarded.
+      // moved behind another, a DPI change), and must not be forwarded. It is
+      // recorded as this device's own size though, so 120x40 supersedes the
+      // 95x34 above as the size the reclaim below is measured against.
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
       await tester.pump();
       tester
@@ -1120,10 +1122,13 @@ void main() {
       await tester.pumpAndSettle();
 
       // The reclaim refits and jiggles the host one row short and back, so the
-      // program repaints over the live stream. It reads `session.terminal`,
-      // which the harness leaves at its 80x24 default because driving
-      // `onViewFit` does not resize the Dart-side terminal, so the jiggle is at
-      // that size rather than the 95x34 fitted above.
+      // program repaints over the live stream. What it asserts is that a
+      // reclaim happened and took the shape of a jiggle, not which size it
+      // reclaimed to: the refit reads `session.terminal`, and neither
+      // `onViewFit` nor `sendResizeOut` resizes the Dart-side terminal, so it
+      // stays at its 80x24 default throughout. That size is the harness, not
+      // the arbitration, and it will need updating if the fake's attach
+      // snapshot ever reports something else.
       expect(client.resizeSessionCalls.skip(beforeReclaim.length), [
         'flutter-spike:80:23',
         'flutter-spike:80:24',
@@ -1148,17 +1153,55 @@ void main() {
     await tester.pumpAndSettle();
 
     // Re-selecting refreshes the snapshot, which is where a replay size is
-    // chosen. Switching away leaves the flutter-spike row labelled by its
-    // worktree rather than its session id, so that is what gets tapped back.
+    // chosen. The rail labels this session by its branch, not its title, so
+    // the way back is the branch row (see the sibling test at 'reads by its
+    // branch').
+    await tester.tap(find.text('triage / main'));
+    await tester.pumpAndSettle();
+    final beforeReselect = List.of(client.resizeSessionCalls);
+    await tester.tap(find.text('experiment/flutter-spike').first);
+    await tester.pumpAndSettle();
+
+    // Only the calls the re-selection itself made. Asserting on `.last` would
+    // be satisfied by the first-fit resize emitted at the top of this test,
+    // even if re-selecting stopped resizing altogether.
+    expect(
+      client.resizeSessionCalls.skip(beforeReselect.length),
+      ['flutter-spike:95:34'],
+      reason: 'the replay size must come from this device\'s own fit',
+    );
+  });
+
+  testWidgets('a backgrounded refresh records the host size, not its own', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+
+    // Blurred, then a refresh (a re-selection here, a reconnect in the wild).
+    // The foreground gate declines to resize, so the host stays at the size the
+    // attach snapshot reports, 80x24. Recording our own 95x34 as the host's
+    // size here would mean claiming the PTY is already ours right after
+    // deciding not to make it so, and the reclaim below would find no drift.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
     await tester.tap(find.text('triage / main'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('experiment/flutter-spike').first);
     await tester.pumpAndSettle();
+    final beforeReclaim = List.of(client.resizeSessionCalls);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
 
     expect(
-      client.resizeSessionCalls.last,
-      'flutter-spike:95:34',
-      reason: 'the replay size must come from this device\'s own fit',
+      client.resizeSessionCalls.skip(beforeReclaim.length),
+      isNotEmpty,
+      reason: 'refocusing must reclaim, because the host is not at our size',
     );
   });
 
@@ -1175,16 +1218,17 @@ void main() {
         .widget<TerminalPane>(find.byType(TerminalPane))
         .onViewFit!(cols, rows);
 
+    // The first fit refreshes while foreground, which drives the host to 95x34.
+    // No broadcast is emitted on purpose: the host's size has to come from the
+    // resize this client just performed, not from the attach snapshot, which
+    // still reports the pre-resize 80x24. Recording that stale 80x24 would
+    // invent drift and jiggle the PTY on every alt-tab.
     fit(95, 34);
     await tester.pumpAndSettle();
+    expect(client.resizeSessionCalls, contains('flutter-spike:95:34'));
 
-    // The host confirms the size this device already fitted to, so a blur and
-    // refocus has nothing to reclaim. Without the drift check the refit would
-    // jiggle the PTY on every alt-tab.
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
     await tester.pump();
-    client.emitSnapshot('flutter-spike', ['unchanged'], size: (34, 95));
-    await tester.pumpAndSettle();
     final baseline = resizesFor('flutter-spike');
 
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);

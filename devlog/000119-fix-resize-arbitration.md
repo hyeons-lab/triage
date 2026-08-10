@@ -46,6 +46,16 @@ resize broadcast can be simulated at all.
 `_currentReplayTerminalSize` prefers this device's own fit over `lastFitted*`,
 which the host's broadcast overwrites with another device's size.
 
+2026-08-10T02:32-0700 `flutter/triage_client/lib/main.dart`:
+`_applySnapshotToSession` no longer writes `hostSize*` from the 80x24 fallback
+when a snapshot carries no size at all, and the `renderSize` parameter doc now
+describes what it became (a size the caller actually drove the host to).
+
+2026-08-10T02:32-0700 `flutter/triage_client/test/widget_test.dart`: a fourth
+case covering a backgrounded refresh, and the "does not reclaim" case now takes
+the host's size from the resize this client performed rather than from an
+emitted broadcast, which is what makes it exercise `renderSize`.
+
 ## Decisions
 
 2026-08-09T19:30-0700 Foreground-owns rather than smallest-client-wins.
@@ -228,16 +238,44 @@ belonged to another device, recorded where a size the host actually has was
 meant. The fields were split to make that distinction, and the assignments kept
 reaching for whatever was nearest in scope.
 
+2026-08-10T02:32-0700 Round 3, and the verification claim itself was the
+finding. The entry above said removing the foreground gate failed a test; a
+reviewer showed that held for only one of the three gates, and that the two
+fixes from the previous round (`drivenSize`, and sourcing `hostSize*` from the
+resize actually performed) could both be reverted with the whole suite still
+green. So the round-2 bugs were fixed but left unpinned, which is how they got
+in. Two widget cases now cover them: a backgrounded refresh must record the
+host's size rather than its own, and a foreground refresh must not invent drift
+from the stale attach snapshot. Both were confirmed by reverting the fix and
+watching them fail. This is the third overstated verification claim on this
+branch, and the pattern is the same each time: writing down what the tests
+ought to cover rather than what they were run against.
+
+2026-08-10T02:32-0700 Round 3: `_applySnapshotToSession` wrote `hostSizeCols`
+from `cols`/`rowsVal`, which fall back to 80x24 when a snapshot carries no
+`size` at all. That recorded a guess as the host's account, which either
+suppresses a needed reclaim or invents one. Now left alone unless the caller
+drove the host or the snapshot actually reported a size, matching what the
+resize broadcast already did.
+
 ## Verification
 
-- `flutter analyze lib/`: no new issues (3 pre-existing, in untouched files).
-- `flutter test`: 296 passing (284 before this round's tests: 9 unit cases on the
-  two extracted decisions, 3 widget cases on the end-to-end paths), including
-  the existing test that a plain focus change must not redraw the active
-  session, which this preserves.
-- Each new behaviour was mutation-checked rather than assumed: removing the
-  foreground gate, reclaiming unconditionally, never reclaiming, and reverting
-  either field choice each fail at least one test.
+- `flutter analyze lib/ test/`: no new issues. Three pre-existing warnings
+  remain, one of them in `main.dart` itself (an unnecessary `!` on
+  `verificationUri`), so "in untouched files" as recorded earlier was wrong.
+- `flutter test`: 297 passing (284 before this round's tests: 9 unit cases on
+  the two extracted decisions, 4 widget cases on the end-to-end paths),
+  including the existing test that a plain focus change must not redraw the
+  active session, which this preserves.
+- Each behaviour is mutation-checked rather than assumed. These each fail at
+  least one test: removing the resize-out foreground gate, removing the
+  attach-refresh gate, reclaiming unconditionally, never reclaiming, reverting
+  either field choice, passing the wanted size instead of the driven one, and
+  sourcing the host's size from the snapshot instead of the resize just
+  performed.
+- Not covered, and worth naming rather than leaving implied: the lazy-load
+  gate in `_loadDaemonSession`, and the `ownFitted*` write in the resize-out
+  listener, which is the sole maintainer of that field on web.
 - Verified end to end against a live daemon, with a phone and a desktop browser
   attached to one session and the PTY's every resize logged. Before, one device
   switch produced four resizes, including an 80-column intermediate from
@@ -283,6 +321,16 @@ reaching for whatever was nearest in scope.
   when the fit was measured, so a session switch inside that window can write
   `ownFitted*` onto the wrong session. A very tight window, but that field now
   decides whether to reclaim rather than only recording bookkeeping.
+- The two restore paths (`_refreshSessionSnapshot` and `_loadDaemonSession` on
+  an exited session) are the last host-sizing paths with no foreground gate,
+  and preferring `ownFitted*` for the replay size made them slightly more
+  assertive: a blurred client refreshing an exited session respawns the PTY at
+  its own width. Left alone here because a restore is respawning a dead process
+  rather than resizing a live one, so there is no other client to fight, but it
+  is the same shape as the bugs above.
+- `lastFittedCols` now has one reader and four writers, and its name is what
+  invited three separate misreadings. Worth renaming to something that says it
+  tracks the last size seen from any source, not this device's fit.
 - `_estimatedTerminalRestoreSize` is desktop-shaped on every platform: it
   subtracts a sidebar that is an overlay on mobile, assumes 44px of padding
   where mobile uses 16, and clamps cols to a minimum of 80 on a display that
@@ -294,4 +342,5 @@ reaching for whatever was nearest in scope.
 - 6161cbd: fix(triage_client): let only the focused client size the shared PTY
 - e4d765b: fix(triage_client): compare drift against the host's size, not our own
 - 149c7e7: fix(triage_client): stop manufacturing drift on the re-attach path
-- HEAD: test(triage_client): cover the resize arbitration decisions
+- e769f5e: test(triage_client): cover the resize arbitration decisions
+- HEAD: fix(triage_client): record only sizes the host actually has

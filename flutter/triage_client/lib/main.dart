@@ -3031,11 +3031,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     final cols = sizeObj?['cols'] as int? ?? 80;
     final rowsVal = sizeObj?['rows'] as int? ?? 24;
-    // The grid the content is actually rendered at: the caller's replay target
-    // (the view's fitted size) when known, else the snapshot's own size. Using
-    // the snapshot size when it carries the *host* width — e.g. the resize
-    // branch keeps the host-sized attach snapshot — would poison lastFittedCols
-    // and drive the next refresh to resize the host back and forth.
+    // `renderSize` is the size the caller actually drove the host to, or null
+    // when it drove nothing (the foreground gate declined, or the resize
+    // failed). It serves two readers below: the grid the content is rendered
+    // at, and the host's own account of its size.
+    //
+    // The grid the content is actually rendered at, falling back to the
+    // snapshot's own size. Using the snapshot size when it carries the *host*
+    // width (the resize branch keeps the host-sized attach snapshot) would
+    // poison lastFittedCols and drive the next refresh to resize the host back
+    // and forth.
     final fittedCols = renderSize?.$2 ?? cols;
     final fittedRows = renderSize?.$1 ?? rowsVal;
     final rawOutput = _rawOutputFromSnapshot(snapshot);
@@ -3061,14 +3066,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // attaches while backgrounded and never sees a resize broadcast can still
       // tell on refocus that the PTY is not at its size.
       //
-      // `renderSize` when the caller has one, because that is the size it just
-      // drove the host to; the snapshot it hands us is deliberately the
-      // pre-resize, history-bearing one, so reading `size` from it would record
-      // a value already known to be stale and manufacture drift that fires a
-      // pointless refit on the next focus regain. Never `fittedCols`, which
-      // prefers our render size and so is not the host's account at all.
-      session.hostSizeCols = renderSize?.$2 ?? cols;
-      session.hostSizeRows = renderSize?.$1 ?? rowsVal;
+      // `renderSize` when the caller has one, because that is a size it
+      // actually drove the host to; the snapshot it hands us is deliberately
+      // the pre-resize, history-bearing one, so reading `size` from it would
+      // record a value already known to be stale and manufacture drift that
+      // fires a pointless refit on the next focus regain. Never `fittedCols`,
+      // which prefers our render size and so is not the host's account at all.
+      //
+      // Left alone entirely when neither is available: `cols`/`rowsVal` fall
+      // back to 80x24 for rendering, and writing that guess here would either
+      // invent drift or hide it. The resize broadcast does the same, only
+      // recording when the host actually said something.
+      final hostSize = renderSize ?? (sizeObj == null ? null : (rowsVal, cols));
+      if (hostSize != null) {
+        session.hostSizeCols = hostSize.$2;
+        session.hostSizeRows = hostSize.$1;
+      }
       session.lastFittedCols = fittedCols;
       session.lastFittedRows = fittedRows;
       session.inFlightCols = null;
