@@ -600,10 +600,15 @@ class SessionVm {
   int? ownFittedCols;
   int? ownFittedRows;
   // The PTY's actual size, as opposed to any size we would like it to be.
-  // Written only where the host's size is known: its resize broadcast, the
-  // attach snapshot, and a resize this client actually performed. Never from a
-  // fit alone, which is the other half of the drift comparison: a local fit
-  // writing here would erase the evidence that another device holds the size.
+  // Written from the host's resize broadcast, from an attach snapshot that
+  // reports one, and from a resize performed on the attach path (where the
+  // response is not otherwise read back). Never from a fit alone, which is the
+  // other half of the drift comparison: a local fit writing here would erase
+  // the evidence that another device holds the size.
+  //
+  // The ordinary resize-out and the refit jiggle deliberately do not write
+  // here; they are healed by the broadcast the daemon sends back, so this can
+  // lag them by a round trip.
   int? hostSizeCols;
   int? hostSizeRows;
 
@@ -3029,8 +3034,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // refreshed by its own load path.
     if (_disposed || !_sessions.contains(session)) return;
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-    final cols = sizeObj?['cols'] as int? ?? 80;
-    final rowsVal = sizeObj?['rows'] as int? ?? 24;
+    // Kept separate from the rendering fallbacks below: the FlatBuffers decoder
+    // turns an absent size into an empty map rather than null, so the container
+    // being present says nothing about whether the host reported a size.
+    final reportedCols = sizeObj?['cols'] as int?;
+    final reportedRows = sizeObj?['rows'] as int?;
+    final cols = reportedCols ?? 80;
+    final rowsVal = reportedRows ?? 24;
     // `renderSize` is the size the caller actually drove the host to, or null
     // when it drove nothing (the foreground gate declined, or the resize
     // failed). It serves two readers below: the grid the content is rendered
@@ -3075,9 +3085,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       //
       // Left alone entirely when neither is available: `cols`/`rowsVal` fall
       // back to 80x24 for rendering, and writing that guess here would either
-      // invent drift or hide it. The resize broadcast does the same, only
-      // recording when the host actually said something.
-      final hostSize = renderSize ?? (sizeObj == null ? null : (rowsVal, cols));
+      // invent drift or hide it. Guarded on the reported values rather than on
+      // the size container, which the resize broadcast also does, because an
+      // absent size reaches us as an empty map over FlatBuffers.
+      final hostSize =
+          renderSize ??
+          (reportedCols == null || reportedRows == null
+              ? null
+              : (reportedRows, reportedCols));
       if (hostSize != null) {
         session.hostSizeCols = hostSize.$2;
         session.hostSizeRows = hostSize.$1;

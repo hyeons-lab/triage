@@ -48,6 +48,9 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   // `startSession` degrades to ''. Distinct from an outright throw.
   final Set<String> emptyIdStartSessionCommands;
 
+  /// Makes the attach snapshot report no size, as a host that omits one does.
+  bool attachOmitsSize = false;
+
   final StreamController<Map<String, dynamic>> _testEventController =
       StreamController<Map<String, dynamic>>.broadcast(sync: true);
 
@@ -230,7 +233,13 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
             if (attachRepoRoots.containsKey(sessionId))
               'repository_root': attachRepoRoots[sessionId],
           },
-          'size': {'rows': 24, 'cols': 80},
+          // An empty map, not an absent key, when the host reports no size:
+          // that is what the FlatBuffers decoder produces for an absent
+          // `SessionSize`, and it is the shape a null check on the container
+          // would wrongly treat as a real size.
+          'size': attachOmitsSize
+              ? <String, dynamic>{}
+              : {'rows': 24, 'cols': 80},
           'exited': exitedSessionIds.contains(sessionId),
           'styled_rows': [
             {
@@ -1203,6 +1212,33 @@ void main() {
       isNotEmpty,
       reason: 'refocusing must reclaim, because the host is not at our size',
     );
+  });
+
+  testWidgets('does not invent drift from a snapshot that reports no size', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient()..attachOmitsSize = true;
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+
+    // Blurred, so the refresh below drives nothing, and the snapshot carries no
+    // size either. With nothing to learn, the host's account must be left as it
+    // was. Recording the 80x24 rendering fallback instead would look like drift
+    // and jiggle the PTY on the next focus regain.
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    await tester.tap(find.text('triage / main'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('experiment/flutter-spike').first);
+    await tester.pumpAndSettle();
+    final baseline = client.resizeSessionCalls.length;
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(client.resizeSessionCalls.length, baseline);
   });
 
   testWidgets('does not reclaim when the PTY is already this device\'s size', (

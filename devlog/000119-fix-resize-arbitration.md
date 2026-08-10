@@ -258,13 +258,31 @@ suppresses a needed reclaim or invents one. Now left alone unless the caller
 drove the host or the snapshot actually reported a size, matching what the
 resize broadcast already did.
 
+2026-08-10T03:05-0700 Round 4, and the round-3 fix was wrong on the default
+transport. The new guard tested `sizeObj == null`, but the FlatBuffers decoder
+turns an absent `SessionSize` into an empty map rather than null
+(`_parseSessionSize`), so on the transport this app actually uses the guard
+never fired and the 80x24 rendering fallback was still recorded as the host's
+account. Now guarded on the reported `cols`/`rows` themselves, which is what the
+resize broadcast always did; the comment claiming the two matched was the tell,
+since they only matched on the JSON path. Pinned by a case that makes the fake
+report an empty size map, and confirmed by reverting to both the round-3 and
+pre-round-3 forms.
+
+Also worth recording: the first attempt to run those two mutations silently
+measured nothing, because `dart format` had reshaped the expression and the
+`perl` pattern no longer matched, so both "passed". That is the third probe on
+these branches to quietly measure nothing, and the tell was the same each time,
+a result that agreed too readily. The re-run asserts the pattern matched before
+running the suite.
+
 ## Verification
 
 - `flutter analyze lib/ test/`: no new issues. Three pre-existing warnings
   remain, one of them in `main.dart` itself (an unnecessary `!` on
   `verificationUri`), so "in untouched files" as recorded earlier was wrong.
-- `flutter test`: 297 passing (284 before this round's tests: 9 unit cases on
-  the two extracted decisions, 4 widget cases on the end-to-end paths),
+- `flutter test`: 298 passing (284 before this round's tests: 9 unit cases on
+  the two extracted decisions, 5 widget cases on the end-to-end paths),
   including the existing test that a plain focus change must not redraw the
   active session, which this preserves.
 - Each behaviour is mutation-checked rather than assumed. These each fail at
@@ -272,7 +290,8 @@ resize broadcast already did.
   attach-refresh gate, reclaiming unconditionally, never reclaiming, reverting
   either field choice, passing the wanted size instead of the driven one, and
   sourcing the host's size from the snapshot instead of the resize just
-  performed.
+  performed, and recording the rendering fallback as the host's size when the
+  snapshot reports none.
 - Not covered, and worth naming rather than leaving implied: the lazy-load
   gate in `_loadDaemonSession`, and the `ownFitted*` write in the resize-out
   listener, which is the sole maintainer of that field on web.
@@ -343,4 +362,5 @@ resize broadcast already did.
 - e4d765b: fix(triage_client): compare drift against the host's size, not our own
 - 149c7e7: fix(triage_client): stop manufacturing drift on the re-attach path
 - e769f5e: test(triage_client): cover the resize arbitration decisions
-- HEAD: fix(triage_client): record only sizes the host actually has
+- 9d354c4: fix(triage_client): record only sizes the host actually has
+- HEAD: fix(triage_client): guard the host size on what the host reported
