@@ -588,6 +588,12 @@ class SessionVm {
   // and so reclaim only when reclaiming would actually change something.
   int? ownFittedCols;
   int? ownFittedRows;
+  // The PTY size the host last reported, written only where the daemon tells us
+  // (its resize broadcast). Deliberately not written by our own fits: it is the
+  // other half of the drift comparison, and a local fit overwriting it would
+  // erase the very evidence that another device has taken the size.
+  int? hostSizeCols;
+  int? hostSizeRows;
   // Set once the view first reports its real fitted size after a fresh attach.
   // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
   bool hasFitted = false;
@@ -1315,16 +1321,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final ownCols = session.ownFittedCols;
     final ownRows = session.ownFittedRows;
     if (ownCols == null || ownRows == null) return;
-    if (session.lastFittedCols == ownCols &&
-        session.lastFittedRows == ownRows) {
-      return;
-    }
-    _refitActiveSession();
-    // Paired with the refit, exactly as on the occlusion path above. A refit
-    // rebuilds the view and the terminal does not take the keyboard back on its
-    // own afterwards, so without this the session looks live but swallows
-    // typing until you switch away and back.
-    _refocusActiveSession();
+    // Against the host's reported size, not `lastFittedCols`: that is written by
+    // our own fits too, so a fit arriving while backgrounded (a window moved
+    // behind another, a DPI change, a rebuild) would reset it to our size and
+    // hide the drift we are here to find.
+    final hostCols = session.hostSizeCols;
+    final hostRows = session.hostSizeRows;
+    if (hostCols == null || hostRows == null) return;
+    if (hostCols == ownCols && hostRows == ownRows) return;
+    // Refit and refocus together, through the shared helper so this keeps its
+    // carve-out: on mobile the refocus raises the soft keyboard, which insets
+    // the Scaffold, shrinks the viewport and fires another fit at the smaller
+    // size, which on this path would push that shrunken size onto the shared
+    // PTY. Desktop needs the refocus, since a refit alone leaves the terminal
+    // ignoring input until the session is switched away from and back.
+    _refitAndFocusActiveSession();
   }
 
   // Re-fit this device's terminal to its real size and re-assert it on the
@@ -2960,6 +2971,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (cols != null && rows != null) {
           session.lastFittedCols = cols;
           session.lastFittedRows = rows;
+          // The host's own account of the PTY's settled size. Recorded
+          // separately because this is the only place another device's resize
+          // is observable, and it is what a reclaim has to compare against.
+          session.hostSizeCols = cols;
+          session.hostSizeRows = rows;
         }
       } else if (event.containsKey('ResyncRequired')) {
         final snapshot =
@@ -3011,6 +3027,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.statusColor = exited
           ? const Color(0xff7f8b8d)
           : const Color(0xff7fd1c7);
+      // From the snapshot's own `size`, not `fittedCols`, which prefers our
+      // render size: this half of the drift comparison must stay the host's
+      // account. Seeds it at attach, so a client that attaches while
+      // backgrounded and never sees a resize broadcast can still tell on
+      // refocus that the PTY is not at its size.
+      session.hostSizeCols = cols;
+      session.hostSizeRows = rowsVal;
       session.lastFittedCols = fittedCols;
       session.lastFittedRows = fittedRows;
       session.inFlightCols = null;
@@ -3109,8 +3132,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onSessionViewFit(SessionVm session, int cols, int rows) {
     session.lastFittedCols = cols;
     session.lastFittedRows = rows;
-    // This device's own view reporting its size, so it is also the baseline a
-    // later reclaim compares the host against.
+    // This device's own view reporting its size. One half of the drift
+    // comparison; the other half (`hostSizeCols`) is written only by the host's
+    // broadcast, so this assignment cannot mask a resize by another device.
     session.ownFittedCols = cols;
     session.ownFittedRows = rows;
     session.noteViewFit(cols, rows);

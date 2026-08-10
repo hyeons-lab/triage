@@ -81,6 +81,30 @@ lands on this change too: the occlusion path pairs `_refitActiveSession` with
 so it would have reproduced it. Now paired. The pre-existing path that loses
 focus on an ordinary resize is untouched and still needs its own fix.
 
+2026-08-09T21:00-0700 Review loop, and the finding that mattered: two reviewers
+independently showed the drift comparison defeated itself. `_onSessionViewFit`
+writes `lastFittedCols` as well as `ownFittedCols`, so any fit arriving while
+backgrounded (a window moved behind another, a DPI change, a rebuild) reset the
+baseline to this device's own size and erased the evidence that another device
+had taken the PTY. On refocus the check then saw no drift and declined to
+reclaim, leaving the client stuck at the wrong size: precisely the state this
+branch exists to prevent. Fixed by adding `hostSizeCols/Rows`, written only
+where the daemon reports the size (its resize broadcast, and the attach
+snapshot's own `size` rather than the render-preferring `fittedCols`), and
+comparing against that instead.
+
+2026-08-09T21:02-0700 Review loop: the reclaim called `_refitActiveSession` and
+`_refocusActiveSession` directly, duplicating `_refitAndFocusActiveSession` and
+dropping its `isMobilePlatform()` carve-out. That carve-out exists because the
+refocus raises the soft keyboard, which insets the Scaffold, shrinks the
+viewport and fires another fit at the smaller size; on this path that shrunken
+size would then be pushed onto the shared PTY. Mobile reaches `inactive` then
+`resumed` for transient system UI (notification shade, incoming call), so this
+was reachable and would have added churn to the exact path being quieted. Now
+routed through the shared helper. Note this was introduced while fixing the
+focus-loss report above, which is a reminder that a fix aimed at one platform
+needs checking on the other.
+
 ## Verification
 
 - `flutter analyze lib/`: no new issues (3 pre-existing, in untouched files).
