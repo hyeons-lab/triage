@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/gestures.dart' show kPrimaryButton;
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
 import 'package:flutter/services.dart'
     show
         Clipboard,
@@ -15,6 +16,7 @@ import 'package:flutter/services.dart'
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
+import 'package:triage_client/terminal/copy_button_layout.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
@@ -98,6 +100,33 @@ class _TerminalPaneState extends State<TerminalPane> {
   // control code in _onTerminalOutput, then disarmed. Mirrors how a physical
   // Ctrl key would combine with the following keystroke.
   bool _ctrlArmed = false;
+
+  // The selection the floating Copy button is offering (mobile only), or null
+  // when there is none. Not a visibility flag: it stays set while the button is
+  // undrawn because its text has scrolled out of view or the alternate screen
+  // is up. What it gates is whether this pane rebuilds to reposition a button.
+  //
+  // Touch has no way to reach the copy chord `_handleTerminalKeyEvent` listens
+  // for, and xterm 4.0.0 leaves `TextInputClient.showToolbar` (the callback
+  // Android raises its own selection toolbar from) an empty stub, so without
+  // this a phone can select text and then do nothing with it.
+  //
+  // Held as the range rather than a bool so the button both tracks a selection
+  // that grows under the finger and disappears the moment one is cleared. It is
+  // only ever a trigger for rebuilding: position and text both come from the
+  // live controller, because `TerminalController.selection` recomputes its rows
+  // from buffer line indices that shift as scrollback trims, without notifying.
+  // A stored copy would silently de-anchor from its own highlight.
+  xt.BufferRange? _copyTarget;
+  // The screen buffer the offered range was taken against, mirroring the guard
+  // `_extendSelectionTo` uses: `useAltBuffer` swaps the buffer without telling
+  // the controller, so without this a selection made on the main screen would
+  // copy whatever alt-screen cells now sit at those rows.
+  Object? _copyTargetBuffer;
+  // The Stack the button is positioned inside, used to convert the selection's
+  // position out of the terminal's coordinate space and into the Stack's.
+  final GlobalKey _copyOverlayKey = GlobalKey();
+  bool _copyRebuildScheduled = false;
 
   xt.CellOffset? _selectionAnchor;
   // The screen buffer (main vs alternate) the anchor was recorded against.
@@ -185,6 +214,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _bindTerminal(_terminal);
     widget.controller.addFitListener(_onFit);
     _xtermController.addListener(_recordSelectionAnchor);
+    _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
       _scrollToCursor(requestFocus: true);
     }
@@ -220,6 +250,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       _selectionAnchorBuffer = null;
       _shiftClickPointer = null;
       _shiftClickDownPosition = null;
+      // Same reason: the offered range indexed the outgoing terminal's buffer,
+      // so copying it after the swap would read the wrong session's text. The
+      // controller is cleared too, since its anchors still point into that
+      // buffer and its next notification would otherwise re-offer the range
+      // against the incoming session.
+      _copyTarget = null;
+      _copyTargetBuffer = null;
+      _xtermController.clearSelection();
       // The scroll anchor pointed at the old terminal's buffer line; drop it so
       // the new session starts following the bottom.
       _scrollAnchor.clear();
@@ -244,6 +282,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
     _xtermController.removeListener(_recordSelectionAnchor);
+    _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
@@ -656,6 +695,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   // clear the anchor when at the bottom so xterm.dart's stick-to-bottom follows
   // new output. Ignored for our own corrections and during drag-select.
   void _onScrollChanged() {
+    // Reposition the copy button against the new scroll offset so it stays with
+    // its text; _buildCopyButton drops it once the selection leaves the
+    // viewport. Gated on a selection existing, so scrolling with none (the
+    // usual case) costs nothing.
+    if (_copyTarget != null) {
+      _rebuildForCopyButton();
+    }
     if (_suppressAnchorCapture || _dragSelecting) return;
     _captureScrollAnchor();
   }
@@ -674,6 +720,38 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalContentChanged() {
+    // Reposition the copy button as content arrives. The scroll listener alone
+    // is not enough: xterm's stick-to-bottom runs through `correctBy` during
+    // layout, which moves the viewport without notifying the ScrollController,
+    // so output growth (the common case) would otherwise never reposition the
+    // button or hide it once its text scrolled away.
+    if (_copyTarget != null) {
+      // A selection can also go away *without* notifying: trimming its anchor
+      // line out of scrollback detaches the anchor, so the controller starts
+      // returning null with no event and nothing would ever retire the target.
+      //
+      // Tested against the controller rather than `_liveCopySelection`, which
+      // is also false while the alternate screen is up. That is a temporary
+      // condition, not a dead selection: `useAltBuffer`/`useMainBuffer` swap
+      // between two fixed buffer objects, so a selection made on the main
+      // screen matches `_copyTargetBuffer` again once a full-screen program
+      // exits. Retiring on the swap would leave its highlight painted with no
+      // way to copy it, which is the failure this whole change exists to fix.
+      final selection = _xtermController.selection;
+      if (selection == null || selection.isCollapsed) {
+        _copyTarget = null;
+        _copyTargetBuffer = null;
+        _rebuildForCopyButton();
+      } else if (identical(_terminal.buffer, _copyTargetBuffer)) {
+        _rebuildForCopyButton();
+      }
+      // The remaining case is a live selection belonging to the screen that is
+      // not currently shown. Nothing to draw, so no rebuild: a full-screen
+      // program writes on every frame, and the offered selection sits on the
+      // other buffer where it can never be trimmed, so rebuilding here would
+      // run for as long as the program does. Nothing to retire either, since
+      // the selection is still live and its screen may come back.
+    }
     // Re-pin after xterm.dart's layout has applied the new content dimensions;
     // coalesce bursts of writes into one correction per frame. No anchor means
     // we're following the bottom and xterm.dart already handles it.
@@ -739,15 +817,165 @@ class _TerminalPaneState extends State<TerminalPane> {
       return KeyEventResult.ignored;
     }
     if (!_isCopyChord()) return KeyEventResult.ignored;
+    // Nothing selected (or nothing in it) leaves xterm's own handling in place.
+    if (!_copySelectionToClipboard()) return KeyEventResult.ignored;
+    return KeyEventResult.handled;
+  }
+
+  // Track what the floating Copy button should offer. The collapsed check is
+  // defensive: on touch, selections come from xterm's `selectWord`, which never
+  // produces an empty range, and a tap clears the selection outright rather
+  // than leaving a caret. It costs nothing and keeps the invariant local.
+  void _syncCopyTarget() {
+    if (!_isMobile) return;
     final selection = _xtermController.selection;
-    if (selection == null) return KeyEventResult.ignored;
+    final next = (selection == null || selection.isCollapsed)
+        ? null
+        : selection;
+    final nextBuffer = next == null ? null : _terminal.buffer;
+    // BufferRange defines ==, and a drag re-sets the selection on every pointer
+    // move, most of which stay within the same cell; skipping those rebuilds
+    // nothing. The buffer is part of the comparison so a range that happens to
+    // match one made on the other screen still refreshes the guard below.
+    if (next == _copyTarget && identical(nextBuffer, _copyTargetBuffer)) return;
+    _copyTarget = next;
+    _copyTargetBuffer = nextBuffer;
+    _rebuildForCopyButton();
+  }
+
+  /// The selection the button may act on, or null when there is none to offer.
+  ///
+  /// Read live rather than from `_copyTarget` so a trimmed scrollback moves the
+  /// button with its text, and so a selection the controller has dropped (its
+  /// anchor line trimmed away) takes the button with it instead of leaving a
+  /// button whose tap would do nothing.
+  ///
+  /// The buffer identity check is what keeps a selection to its own screen: it
+  /// is why the button disappears while a full-screen program is up and returns
+  /// when that program exits. `_onTerminalContentChanged` deliberately does not
+  /// use this getter for retirement, because "not showing" and "gone" differ.
+  xt.BufferRange? get _liveCopySelection {
+    if (_copyTarget == null) return null;
+    if (!identical(_terminal.buffer, _copyTargetBuffer)) return null;
+    final selection = _xtermController.selection;
+    if (selection == null || selection.isCollapsed) return null;
+    return selection;
+  }
+
+  // Rebuild to show, move, or drop the copy button.
+  //
+  // The known in-frame caller is this file's own `didUpdateWidget`, which
+  // clears the controller's selection on a session swap and so re-enters
+  // `_syncCopyTarget` synchronously while the tree is being rebuilt. `setState`
+  // throws in that phase, so defer to after the frame. Written as a phase check
+  // rather than a special case at that one call site because the other two
+  // triggers are notifications from xterm and from the scroll position, neither
+  // of which promises which phase it fires in.
+  void _rebuildForCopyButton() {
+    if (!mounted) return;
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      // Latched so re-entry within one frame schedules a single rebuild. In
+      // practice that is the `didUpdateWidget` path above; writes arrive from
+      // the event loop with the scheduler idle and take the direct branch.
+      if (_copyRebuildScheduled) return;
+      _copyRebuildScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _copyRebuildScheduled = false;
+        if (mounted) setState(() {});
+      });
+      return;
+    }
+    setState(() {});
+  }
+
+  // Copy the current selection, reporting whether there was anything to copy.
+  //
+  // The single copy path for both the chord and the floating button, so the
+  // text they produce cannot drift: both go through terminalSelectionText,
+  // which restores the blank cells xterm's own getText drops, and both clear
+  // the selection afterwards as the confirmation.
+  //
+  // Callers own their own preconditions. The button checks that the selection
+  // still belongs to the screen on show; the chord does not, matching what it
+  // did before this button existed.
+  bool _copySelectionToClipboard() {
+    final selection = _xtermController.selection;
+    if (selection == null) return false;
     final text = terminalSelectionText(_terminal.buffer, selection);
-    if (text.isEmpty) return KeyEventResult.ignored;
-    // Fire-and-forget: the handler is synchronous, so detach the clipboard
-    // write rather than leaving a dangling future (unawaited_futures).
+    if (text.isEmpty) return false;
+    // Fire-and-forget: the chord's handler is synchronous, so detach the
+    // clipboard write rather than leaving a dangling future.
     unawaited(Clipboard.setData(ClipboardData(text: text)));
     _xtermController.clearSelection();
-    return KeyEventResult.handled;
+    return true;
+  }
+
+  // The floating Copy button, or null when there is nothing to offer or the
+  // geometry is not yet readable. See placeCopyButton for where it lands: above
+  // the selection's first visible line where there is room, below it otherwise.
+  //
+  // Positioned from the same render object the pointer code hit-tests through:
+  // `getOffset` is the inverse of the `getCellOffset` used there and is likewise
+  // scroll-aware, so the button tracks its text as the viewport scrolls.
+  Widget? _buildCopyButton() {
+    final selection = _liveCopySelection;
+    if (selection == null) return null;
+    final viewState = _terminalViewKey.currentState;
+    final overlayBox =
+        _copyOverlayKey.currentContext?.findRenderObject() as RenderBox?;
+    if (viewState == null || overlayBox == null || !overlayBox.hasSize) {
+      return null;
+    }
+
+    final Offset anchor;
+    final double selectionBottom;
+    final double lineHeight;
+    try {
+      final render = viewState.renderTerminal;
+      final normalized = selection.normalized;
+      lineHeight = render.lineHeight;
+      anchor = overlayBox.globalToLocal(
+        render.localToGlobal(render.getOffset(normalized.begin)),
+      );
+      // The bottom of the last selected line, so a selection whose start has
+      // scrolled away is still recognised as partly on screen.
+      final end = overlayBox.globalToLocal(
+        render.localToGlobal(render.getOffset(normalized.end)),
+      );
+      selectionBottom = end.dy + lineHeight;
+    } catch (_) {
+      // Same guard as _cellAtGlobal: mid-rebuild or before layout the render
+      // object is not readable, and a frame without the button beats throwing.
+      return null;
+    }
+
+    const buttonSize = Size(104, 36);
+    final placement = placeCopyButton(
+      anchor: anchor,
+      selectionBottom: selectionBottom,
+      lineHeight: lineHeight,
+      viewport: overlayBox.size,
+      button: buttonSize,
+    );
+    if (placement == null) return null;
+
+    return Positioned(
+      left: placement.left,
+      top: placement.top,
+      child: _CopyButton(
+        width: buttonSize.width,
+        height: buttonSize.height,
+        // Re-checked at tap time, not just at placement: the button is drawn a
+        // frame before it can be pressed, and a program switching to the
+        // alternate screen in that gap would otherwise copy main-screen rows
+        // out of the alt screen.
+        onCopy: () {
+          if (_liveCopySelection == null) return;
+          _copySelectionToClipboard();
+        },
+      ),
+    );
   }
 
   // The platform copy chord, matching xterm's defaultTerminalShortcuts so plain
@@ -847,6 +1075,11 @@ class _TerminalPaneState extends State<TerminalPane> {
         ? const EdgeInsets.all(8)
         : const EdgeInsets.all(22);
 
+    // Null whenever there is nothing to offer: no selection, desktop, a
+    // selection scrolled out of view, or a terminal not yet laid out (this
+    // reads the previous frame's geometry).
+    final copyButton = _buildCopyButton();
+
     return Container(
       color: const Color(0xff0d1113),
       child: Column(
@@ -855,37 +1088,112 @@ class _TerminalPaneState extends State<TerminalPane> {
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: _focusTerminal,
-              child: Padding(
-                padding: padding,
-                child: Listener(
-                  onPointerDown: _handlePointerDown,
-                  onPointerMove: _handlePointerMove,
-                  onPointerUp: _handlePointerUp,
-                  onPointerCancel: _handlePointerCancel,
-                  child: xt.TerminalView(
-                    _terminal,
-                    key: _terminalViewKey,
-                    controller: _xtermController,
-                    theme: _theme,
-                    focusNode: _focusNode,
-                    autofocus: true,
-                    scrollController: _scrollController,
-                    onKeyEvent: _handleTerminalKeyEvent,
-                    textStyle: _textStyle,
-                    // Desktop uses the hardware-keyboard path instead of xterm's
-                    // hidden IME TextInput connection: on macOS the IME path
-                    // desyncs Flutter's HardwareKeyboard state ("physical key
-                    // already pressed") and swallows keystrokes. Mobile must use
-                    // the IME path, though — it is what raises the soft keyboard,
-                    // so disabling it leaves a phone unable to type.
-                    hardwareKeyboardOnly: !_isMobile,
+              // The copy button is a sibling of the terminal rather than an
+              // Overlay entry: it is then torn down with this pane, cannot
+              // outlive a session swap, and sits outside the Listener below, so
+              // tapping it never enters the pointer paths that drive selection.
+              child: Stack(
+                key: _copyOverlayKey,
+                // Without this the terminal would receive loose constraints and
+                // shrink-wrap; it previously sat under Expanded and filled the
+                // pane, and the grid size is derived from those pixels.
+                fit: StackFit.expand,
+                children: [
+                  Padding(
+                    padding: padding,
+                    child: Listener(
+                      onPointerDown: _handlePointerDown,
+                      onPointerMove: _handlePointerMove,
+                      onPointerUp: _handlePointerUp,
+                      onPointerCancel: _handlePointerCancel,
+                      child: xt.TerminalView(
+                        _terminal,
+                        key: _terminalViewKey,
+                        controller: _xtermController,
+                        theme: _theme,
+                        focusNode: _focusNode,
+                        autofocus: true,
+                        scrollController: _scrollController,
+                        onKeyEvent: _handleTerminalKeyEvent,
+                        textStyle: _textStyle,
+                        // Desktop uses the hardware-keyboard path instead of
+                        // xterm's hidden IME TextInput connection: on macOS the
+                        // IME path desyncs Flutter's HardwareKeyboard state
+                        // ("physical key already pressed") and swallows
+                        // keystrokes. Mobile must use the IME path, though — it
+                        // is what raises the soft keyboard, so disabling it
+                        // leaves a phone unable to type.
+                        hardwareKeyboardOnly: !_isMobile,
+                      ),
+                    ),
                   ),
-                ),
+                  if (copyButton != null) copyButton,
+                ],
               ),
             ),
           ),
           if (_isMobile) _buildAccessoryBar(),
         ],
+      ),
+    );
+  }
+}
+
+/// The floating "Copy" affordance shown over a touch selection.
+///
+/// Styled to match the accessory bar rather than the ambient Material theme, so
+/// it reads as part of the terminal chrome.
+class _CopyButton extends StatelessWidget {
+  const _CopyButton({
+    required this.width,
+    required this.height,
+    required this.onCopy,
+  });
+
+  final double width;
+  final double height;
+  final VoidCallback onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: width,
+      height: height,
+      // A raw GestureDetector, like the accessory bar's keys: no focus node, so
+      // tapping copy never takes focus from the terminal and never dismisses the
+      // soft keyboard.
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onCopy,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: const Color(0xff232c2f),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: const Color(0xff3a474b)),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x66000000),
+                blurRadius: 6,
+                offset: Offset(0, 2),
+              ),
+            ],
+          ),
+          child: const Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.copy, size: 15, color: Color(0xffd9e5e3)),
+              SizedBox(width: 7),
+              Text(
+                'Copy',
+                style: TextStyle(
+                  color: Color(0xffd9e5e3),
+                  fontSize: 13,
+                  fontFamily: 'JetBrains Mono',
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
