@@ -43,10 +43,16 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   shared_preferences: ^2.3.2
 
-# Pinned to a fork of the released 4.0.0 whose `lib/` carries two fixes, both
-# in `circular_buffer.dart`, and nothing else. (Four commits: those two, a
-# follow-up correcting the second one's comments, and a dev-dependency removal
-# that pub never resolves for a non-root package, so it cannot reach this app.)
+# Pinned to a fork of the released 4.0.0. Against the release, `lib/` differs by
+# exactly one file, `src/utils/circular_buffer.dart`, carrying the two fixes
+# below and nothing else. The branch also carries test and dev-dependency
+# commits, which pub never resolves for a non-root package, so they cannot reach
+# this app. Verify with:
+#
+#   git diff v4.0.0..<ref> -- lib/
+#
+# rather than by commit count, which has drifted from this comment more than
+# once.
 #
 # 1. `IndexAwareCircularBuffer.trimStart` advances the list's start without
 # advancing the absolute start it measures indices from, so after `ESC[3J`
@@ -71,16 +77,17 @@ dependencies:
 # specific to a clear: `push` rotates the array every time it evicts from a
 # full scrollback, so writing past `maxLines` and then changing the width is
 # enough. Every row then answers with a different row's line and reports the
-# wrong index. When the reflow result is shorter than the rotation (widening a
-# window whose lines were wrapped) the leading slots are never written at all,
-# so cleared lines reappear there, or reading row 0 throws a null check error.
-# Not in PR 225; it is ours, and it is also what makes the rule the guards here
-# rely on ("a negative row means cleared away") hold on the resize path.
+# wrong index. When the reflow result is also shorter than the buffer (widening
+# a window whose lines were wrapped) it leaves rows the reflow never wrote, so a
+# row can hand back a cleared line or throw a null check error instead. Not in
+# PR 225; it is ours, and it is also what makes the rule the guards here rely on
+# ("a negative row means cleared away") hold on the resize path.
 #
 # Branched from the `v4.0.0` tag rather than upstream master. Master carries
-# three unreleased commits that change colour rendering and Android enter-key
-# handling, and taking those unreviewed alongside a scrollback fix is not a
-# trade this needs to make.
+# unreleased commits beyond the tag, two of them behavioural (colour rendering
+# in `palette_builder.dart`, Android enter-key handling in `terminal_view.dart`),
+# and taking those unreviewed alongside a scrollback fix is not a trade this
+# needs to make.
 #
 # Pinned by commit, not by branch name: a branch ref would let a force-push or
 # a new commit change the terminal emulator this app ships with no diff here.
@@ -92,7 +99,7 @@ dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: 96377f4a22dac2280cbdaa92926fb6c2899f7b0d
+      ref: 2c09f74fc9f9be4514c3aff5e7e9f8319ac61fd6
 
 dev_dependencies:
   flutter_test:

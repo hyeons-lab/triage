@@ -177,12 +177,16 @@ void main() {
         lineHeight: lineHeight,
       );
       expect(anchor.hasAnchor, isTrue);
+      final anchored = terminal.buffer.lines[2];
 
       terminal.resize(30, 5);
 
-      // Asserting the offset rather than just that one was returned: these
-      // lines are short enough that widening merges nothing, so the anchored
-      // row must not move at all.
+      // These lines are short enough that widening merges nothing, so the
+      // anchored row must not move. The offset alone does not prove that: it
+      // reads 20 on the unfixed emulator too, because the rotation happens to
+      // give that line the same absolute index. What differs is which line
+      // actually sits at row 2, so assert both.
+      expect(identical(terminal.buffer.lines[2], anchored), isTrue);
       expect(
         anchor.desiredOffset(maxScrollExtent: 200, lineHeight: lineHeight),
         20,

@@ -40,7 +40,7 @@ from under it, which takes the stale highlight with it.
 simulating a trim.
 
 2026-08-09T23:30-0700 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`:
-override repinned to `81a742e`, which adds a second fix to the fork
+override repinned onto the fork's second fix
 (`replaceWith` resets the start index before adopting rather than after). The
 comment now describes two fixes instead of one; `lib/` still differs from the
 release by the same single file.
@@ -50,6 +50,16 @@ a second group covering clear-then-width-change, the path the 21:10 entry below
 recorded as uncovered. Six cases at two widths: every row reports its true
 position, cleared lines are not handed back out, and neither the selection nor
 the anchor guard misfires on rows that are genuinely present.
+
+2026-08-10T02:32-0700 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`:
+repinned to `2c09f74`, the fork commit that corrects the second fix's comments
+and adds a test at the shape they cite. The pubspec's commit-count
+parenthetical is replaced by a `git diff v4.0.0..<ref> -- lib/` instruction,
+having been wrong three times.
+
+2026-08-10T02:32-0700 `flutter/triage_client/test/terminal/scrollback_clear_test.dart`:
+the scroll-anchor case additionally asserts which line sits at the anchored
+row, since the offset alone reads the same on the unfixed emulator.
 
 ## Decisions
 
@@ -81,7 +91,7 @@ against `0f83735` regardless, while the branch name keeps the pubspec readable.
 (Superseded at 21:05, see Issues: the pin is now the commit `1a3e7c4` on a
 branch cut from the `v4.0.0` tag. A branch ref would let a force-push change the
 emulator with no diff here, and `0f83735` sat on upstream master and so carried
-three unreleased commits beyond the release.)
+unreleased commits beyond the release.)
 
 ## Issues
 
@@ -107,8 +117,8 @@ parent, so it is now recorded as a standing note: format explicit file paths,
 never directories, and check `git diff --stat` before committing.
 
 2026-08-09T21:05-0700 Review loop: the fork was first branched from upstream
-master, which carries three unreleased commits beyond `v4.0.0`, two of them
-behavioural (colour 15 rendering in `palette_builder.dart`, and Android
+master, which carries five commits beyond `v4.0.0` (four non-merge), two of
+them behavioural (colour 15 rendering in `palette_builder.dart`, and Android
 enter-key handling in `terminal_view.dart`). The pubspec, this devlog and the
 commit message all described the override as "one fix", so nothing signalled
 that colour and keyboard behaviour were also changing, and `pubspec.lock` still
@@ -169,6 +179,32 @@ a full scrollback and a resize. Added four regression cases in the fork (two at
 the buffer level, two driving a real `Terminal`), all of which fail on stock.
 Commit message, pubspec comment and this entry now describe the real scope.
 
+2026-08-10T02:32-0700 Round 3, and the same comment wrong a second time. The
+21:05 rewrite said that when the replacement is shorter than the rotation "the
+leading slots are never written at all". Measured on the unfixed code with a
+list of 4 rotated by 2 and a replacement of 3, it reads back as the third
+replacement element, then a null dereference, then the first: slot 0 is
+written, and it is row 1 that throws. So a row can hand back the wrong new
+element, a dropped one, or throw, and the ordering is not worth predicting.
+Reworded in the fork, the pubspec and here, and pinned with a test at that
+exact shape so the prose has something holding it to the behaviour.
+
+2026-08-10T02:32-0700 Round 3: three factual claims in this file and the
+pubspec were wrong, all of them counts. Master carries five commits beyond
+`v4.0.0` (four non-merge), not three. The fork's tests fail 9 against stock,
+not 7. The devlog recorded a pin two commits behind the one actually shipped.
+The pubspec's commit-count parenthetical has now been wrong three times, so it
+is gone: the comment describes what `lib/` contains and tells the reader to run
+`git diff v4.0.0..<ref> -- lib/` instead of trusting a number that drifts every
+time the branch gains a commit.
+
+2026-08-10T02:32-0700 Round 3: strengthened the scroll-anchor case, which was
+still passing against the old pin even after being made to assert its offset.
+The offset reads 20 either way, because the rotation happens to give that line
+the same absolute index; what differs is which line actually sits at row 2. It
+now asserts that identity too, and all six width-change cases fail against the
+previous pin rather than five.
+
 ## Verification
 
 - `flutter analyze lib/`: no new issues (3 pre-existing, in untouched files).
@@ -180,16 +216,15 @@ Commit message, pubspec comment and this entry now describe the real scope.
 
 2026-08-09T23:30-0700, after the `replaceWith` fix:
 
-- xterm fork: 120 tests passing (113 before, plus 3 for the replace-after-trim
-  behaviour and 4 for rotation by scrollback overflow), so the fix regresses
-  nothing else in the emulator. All 7 fail against stock 4.0.0.
-- `flutter analyze lib/`: unchanged, 3 pre-existing issues in untouched files.
+- xterm fork: 121 tests passing. Run against stock 4.0.0's
+  `circular_buffer.dart`, 9 of them fail, so every test this fork adds is
+  load-bearing and nothing else in the emulator regresses.
+- `flutter analyze lib/`: unchanged, 3 pre-existing issues (one of them in
+  `main.dart`, which this branch does not touch on the lines concerned).
 - `flutter test`: 307 passing, up from 301.
-- The six new cases were run against the previous pin first: five fail there,
-  which is what says they are testing the fix rather than passing vacuously.
-  The sixth (the scroll anchor still pinning) passes either way even after
-  being strengthened to assert the offset rather than just its presence, so it
-  is a regression guard rather than evidence for the fix.
+- The six new cases were run against the previous pin first, where all six now
+  fail (5 pass, 6 fail of 11), which is what says they test the fix rather than
+  passing vacuously.
 
 ## Next Steps
 
@@ -209,4 +244,5 @@ Commit message, pubspec comment and this entry now describe the real scope.
 - d148cce: fix(triage_client): keep row indices correct across a scrollback clear
 - 88c9473: fix(triage_client): pin the xterm fork to the release plus one commit
 - fa1ab34: docs(triage_client): state exactly what the xterm pin carries
-- HEAD: fix(triage_client): repair the reflow that rotates the scrollback
+- 3e863f5: fix(triage_client): repair the reflow that rotates the scrollback
+- HEAD: fix(triage_client): describe the reflow rotation accurately
