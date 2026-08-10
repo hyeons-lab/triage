@@ -45,9 +45,9 @@ dependencies:
 
 # Pinned to a fork of the released 4.0.0. Against the release, `lib/` differs by
 # exactly one file, `src/utils/circular_buffer.dart`, carrying the fixes below
-# and nothing else. The branch's other commits are tests, comment
-# corrections to them, and a dev-dependency removal; the tests and
-# dev dependency are outside `lib/` and pub never resolves them for a non-root
+# and nothing else. The branch's other commits are tests, corrections to the
+# comments on those fixes, and a dev-dependency removal; the tests and the dev
+# dependency are outside `lib/`, and pub never resolves them for a non-root
 # package, so they cannot reach this app either way. Verify with:
 #
 #   git diff v4.0.0..<ref> -- lib/
