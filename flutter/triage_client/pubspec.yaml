@@ -43,6 +43,72 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   shared_preferences: ^2.3.2
 
+# Pinned to a fork of the released 4.0.0. Against the release, `lib/` differs by
+# exactly one file, `src/utils/circular_buffer.dart`, carrying the fixes below
+# and nothing else. The branch's other commits are tests, corrections to the
+# comments on those fixes, and a dev-dependency removal; the tests and the dev
+# dependency are outside `lib/`, and pub never resolves them for a non-root
+# package, so they cannot reach this app either way. Verify with:
+#
+#   git diff v4.0.0..<ref> -- lib/
+#
+# rather than by commit count, which has drifted from this comment more than
+# once.
+#
+# 1. `IndexAwareCircularBuffer.trimStart` advances the list's start without
+# advancing the absolute start it measures indices from, so after `ESC[3J`
+# (what `clear` emits) every surviving scrollback line reports a row too high
+# by the number trimmed, while lines written afterwards report correctly.
+# `BufferLine.index` is what pins our scrollback viewport (see
+# TerminalScrollAnchor) and what selection anchors resolve through, so the
+# effect is a viewport that jumps and a selection that reads the wrong rows
+# after any clear.
+#
+# It is fixed upstream only in PR 225, unmerged since 2026-05-08 against a
+# release that is two years old, so there is no published version to move to.
+# The fork is that PR's approach: advance the absolute start, and deliberately
+# do not detach the trimmed lines, because anchors still holding them guard
+# access with `assert(attached)` alone and would throw in release builds where
+# that assert is stripped. Retiring those anchors is left to us, in
+# `terminal_scroll_anchor.dart` and the panes.
+#
+# 2a. `replaceWith` clears the slots it is about to reuse without detaching
+# what they held, because after a trim those are lines fix 1 deliberately left
+# attached. Detaching them is the release-build crash fix 1 exists to avoid.
+# This also replaces a loop that dropped buffer slots on an oversized
+# replacement, which indexed the list rather than the replacement and could
+# reach those same lines.
+#
+# 2b. `replaceWith` adopted the reflowed lines through the rotated start and
+# only reset that start afterwards, so it wrote them at one rotation and read
+# them back at another, leaving the buffer rotated against itself. This is not
+# specific to a clear: `push` rotates the array every time it evicts from a
+# full scrollback, so writing past `maxLines` and then changing the width is
+# enough. Every row then answers with a different row's line and reports the
+# wrong index. When the reflow result is also shorter than the buffer (widening
+# a window whose lines were wrapped) it leaves rows the reflow never wrote, so a
+# row can hand back a cleared line or throw a null check error instead. Not in
+# PR 225; it is ours, and it is also what makes the rule the guards here rely on
+# ("a negative row means cleared away") hold on the resize path.
+#
+# Branched from the `v4.0.0` tag rather than upstream master. Master carries
+# unreleased commits beyond the tag, two of them behavioural (colour rendering
+# in `palette_builder.dart`, Android enter-key handling in `terminal_view.dart`),
+# and taking those unreviewed alongside a scrollback fix is not a trade this
+# needs to make.
+#
+# Pinned by commit, not by branch name: a branch ref would let a force-push or
+# a new commit change the terminal emulator this app ships with no diff here.
+#
+# Fix 1 can be dropped once a release contains PR 225. Fix 2 has not been filed
+# upstream yet, so nothing will carry it until that happens; drop the override
+# only once a release contains both.
+dependency_overrides:
+  xterm:
+    git:
+      url: https://github.com/hyeons-lab/xterm.dart.git
+      ref: 1ca073d34fec7f731e1523b604a82e2d45edb9a4
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
