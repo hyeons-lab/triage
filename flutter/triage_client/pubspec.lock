@@ -696,10 +696,11 @@ packages:
   xterm:
     dependency: "direct main"
     description:
-      name: xterm
-      sha256: "168dfedca77cba33fdb6f52e2cd001e9fde216e398e89335c19b524bb22da3a2"
-      url: "https://pub.dev"
-    source: hosted
+      path: "."
+      ref: "1ca073d34fec7f731e1523b604a82e2d45edb9a4"
+      resolved-ref: "1ca073d34fec7f731e1523b604a82e2d45edb9a4"
+      url: "https://github.com/hyeons-lab/xterm.dart.git"
+    source: git
     version: "4.0.0"
   yaml:
     dependency: transitive

@@ -9,11 +9,17 @@ import 'package:xterm/xterm.dart' as xt;
 /// viewport therefore creeps upward — one line per trimmed line.
 ///
 /// We exploit xterm.dart's `BufferLine.index`, which is the line's current row
-/// in the buffer and decreases by exactly the number of lines trimmed above it
-/// (and `attached` flips to `false` once the line itself is trimmed). Pinning
-/// the viewport to `index * lineHeight` cancels the drift. This type is pure
-/// logic over the buffer + scroll metrics so it is unit-testable without a
+/// in the buffer and decreases by exactly the number of lines trimmed above it.
+/// Pinning the viewport to `index * lineHeight` cancels the drift. This type is
+/// pure logic over the buffer + scroll metrics so it is unit-testable without a
 /// laid-out render tree.
+///
+/// A line can leave the buffer two ways, and they do not look alike. Ageing out
+/// of a full buffer detaches it, so `attached` turns false. A scrollback clear
+/// (`ESC[3J`) drops it through `trimStart`, which leaves it attached on purpose:
+/// anchors still holding it would throw in release builds if it were detached.
+/// Such a line reports a negative index, since it now sits before the start of
+/// the buffer, and that is what identifies it here.
 class TerminalScrollAnchor {
   xt.BufferLine? _line;
   double _withinLine = 0;
@@ -57,6 +63,13 @@ class TerminalScrollAnchor {
     final line = _line;
     if (line == null) return null;
     if (!line.attached) {
+      _line = null;
+      return null;
+    }
+    // Cleared out of the scrollback rather than aged out. Without this the
+    // negative row would compute a negative offset, clamp to zero, and pin the
+    // viewport to the top of the buffer instead of releasing it.
+    if (line.index < 0) {
       _line = null;
       return null;
     }
