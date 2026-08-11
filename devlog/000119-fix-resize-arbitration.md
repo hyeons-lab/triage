@@ -66,6 +66,15 @@ pass for the wrong reason. The `restoreSession`/`resizeSession` responses keep
 echoing the size they were asked for, since a reply to a sizing request is the
 one place a size is never absent.
 
+2026-08-10T21:12-0700 Rebased onto `main` at 960092e, which had taken #136 and,
+through it, #137. No conflicts: the two merged branches touch the touch-selection
+path and the xterm pin, and this branch touches neither. The pin matters anyway,
+since the whole suite now builds against the forked xterm rather than 4.0.0, so
+the gates were re-run rather than assumed: `flutter analyze` reports the same
+four pre-existing warnings (all outside this diff, and CI runs it with
+`--no-fatal-warnings`), and `flutter test` passes 321, up from 298 because the
+merged branches brought their own cases.
+
 ## Decisions
 
 2026-08-09T19:30-0700 Foreground-owns rather than smallest-client-wins.
@@ -382,11 +391,16 @@ running the suite.
 
 ## Commits
 
-- 6161cbd: fix(triage_client): let only the focused client size the shared PTY
-- e4d765b: fix(triage_client): compare drift against the host's size, not our own
-- 149c7e7: fix(triage_client): stop manufacturing drift on the re-attach path
-- e769f5e: test(triage_client): cover the resize arbitration decisions
-- 9d354c4: fix(triage_client): record only sizes the host actually has
-- 3b118d5: fix(triage_client): guard the host size on what the host reported
-- 1880dd1: test(triage_client): make the fake omit sizes consistently
-- HEAD: docs(triage_client): say which fake builders omit a size
+Hashes below are the post-rebase ones. The branch was rebased onto `main` at
+960092e on 2026-08-10, so every hash recorded before that point is unreachable.
+
+- 7ef7324: fix(triage_client): let only the focused client size the shared PTY
+- 8367581: fix(triage_client): compare drift against the host's size, not our own
+- b64d025: fix(triage_client): stop manufacturing drift on the re-attach path
+- 0a0820a: test(triage_client): cover the resize arbitration decisions
+- c6f0d65: fix(triage_client): record only sizes the host actually has
+- d1bd2b7: fix(triage_client): guard the host size on what the host reported
+- d59ddc7: test(triage_client): make the fake omit sizes consistently
+- 386cb52: docs(triage_client): say which fake builders omit a size
+- 03a1306: docs(triage_client): align the fake's size-flag doc with its getter
+- HEAD: docs(triage_client): renumber the commit log after the rebase
