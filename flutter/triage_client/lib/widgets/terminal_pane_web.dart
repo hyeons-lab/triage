@@ -489,6 +489,29 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionFitAddons[sanitizedId] = _fitAddon;
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
 
+      try {
+        final unicode11Module = js_util.getProperty(
+          html.window,
+          'Unicode11Addon',
+        );
+        if (unicode11Module != null) {
+          final unicode11Constructor = js_util.getProperty(
+            unicode11Module,
+            'Unicode11Addon',
+          );
+          if (unicode11Constructor != null) {
+            final unicode11Addon = js_util.callConstructor(
+              unicode11Constructor,
+              [],
+            );
+            js_util.callMethod(_term, 'loadAddon', [unicode11Addon]);
+            js_util.setProperty(_term, 'unicodeVersion', '11');
+          }
+        }
+      } catch (e, stackTrace) {
+        debugPrint('Failed to load Unicode11Addon: $e\n$stackTrace');
+      }
+
       _bindTerminalSubscriptions();
 
       _initialized = true;
