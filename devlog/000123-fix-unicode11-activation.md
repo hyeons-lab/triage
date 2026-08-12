@@ -6,12 +6,15 @@
 ## What Changed
 
 - 2026-08-11T23:49-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Set `allowProposedApi: true` in `Terminal` options and updated active Unicode version setting to `js_util.setProperty(unicode, 'activeVersion', '11')` on `_term.unicode`.
+- 2026-08-12T00:43-0700 `AGENTS.md` — Documented strict Zero-Downtime Daemon Handover Protocol (prohibiting `launchctl kickstart -k` / SIGKILL and enforcing direct `triaged --handover` with log verification).
 
 ## Commits
 
-- HEAD — fix(triage_client): set allowProposedApi and activate unicode version 11 on xterm.js
+- c08626a — fix(triage_client): enable allowProposedApi and set unicode activeVersion 11 in xterm.js
+- HEAD — docs(agents): add zero-downtime daemon handover protocol rules
 
 ## Progress
 
 - Identified root cause of xterm.js Unicode 11 activation failure (`term.unicode` throws without `allowProposedApi: true`).
 - Initialized worktree, plan, and devlog.
+- Added explicit handover protocol rules to `AGENTS.md`.

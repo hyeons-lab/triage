@@ -139,6 +139,20 @@ so a build can't quietly ship a stale UI:
 A failing `flutter build web`, like a missing SDK with no current bundle, fails the cargo
 build rather than silently falling back.
 
+## Zero-Downtime Daemon Handover Protocol
+
+When upgrading or restarting the `triaged` daemon on Unix/macOS:
+
+1. **NEVER run `launchctl kickstart -k`, `killctl`, `killall triaged`, or `service stop` to restart the daemon.** Forcibly killing the daemon process before file descriptors (`SCM_RIGHTS`) are transferred causes the OS kernel to close all master PTY descriptors, which kills all active child shell sessions!
+2. **ALWAYS run `triaged --handover` (or `~/.cargo/bin/triaged --handover`) directly.**
+3. **Set adequate execution timeout**: When invoking `triaged --handover` via command tools, set `WaitMsBeforeAsync: 10000` so Phase 1 descriptor transfer and Phase 2 adoption sync complete synchronously.
+4. **Verify Handover Logs**: Confirm in `$HOME/.local/state/triage/triaged.log` that:
+   - `"existing daemon detected; initiating zero-downtime process handover"`
+   - `"Handover transfer completed. Waiting for client adoption sync (Phase 2)..."`
+   - `"Adopting X inherited live sessions"`
+   - `"Process handover handshake completed successfully. Exiting daemon."`
+5. **Supervision Resumption**: Because the macOS LaunchAgent (`com.hyeons-lab.triaged`) uses `KeepAlive: true`, `launchd` automatically respawns the newly installed `triaged` binary as a background LaunchAgent process upon the clean exit of the old daemon. The respawned process adopts the sessions and runs detached under `launchd` supervision.
+
 ## Versioning and releases
 
 - The repo version is a single source of truth in the top-level `VERSION` file.
