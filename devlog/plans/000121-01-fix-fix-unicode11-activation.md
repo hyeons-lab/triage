@@ -1,5 +1,3 @@
-# Plan: Fix Unicode 11 Activation in xterm.js Web Client
-
 ## Thinking
 
 In `xterm.js`, character cell width calculation defaults to Unicode 6 (where emojis like 📦, 🦀, ⚡, 🐍 are calculated as 1 cell wide instead of 2).
