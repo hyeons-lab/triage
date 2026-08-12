@@ -472,7 +472,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
       js_util.setProperty(options, 'convertEol', true);
-      js_util.setProperty(options, 'unicodeVersion', '11');
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
@@ -506,10 +505,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               [],
             );
             js_util.callMethod(_term, 'loadAddon', [unicode11Addon]);
-            final unicode = js_util.getProperty(_term, 'unicode');
-            if (unicode != null) {
-              js_util.setProperty(unicode, 'activeVersion', '11');
-            }
+            js_util.setProperty(_term, 'unicodeVersion', '11');
           }
         }
       } catch (e) {

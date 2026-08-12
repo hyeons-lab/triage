@@ -24,12 +24,14 @@ Fix terminal rendering corruption when using `antigravity` (`agy` CLI) in the Tr
 
 - 2026-08-11T21:54-0700 `flutter/triage_client/web/xterm-addon-unicode11.js` — Added bundled `@xterm/addon-unicode11` (v0.9.0 UMD bundle).
 - 2026-08-11T21:54-0700 `flutter/triage_client/web/index.html` — Loaded `<script src="xterm-addon-unicode11.js"></script>`.
-- 2026-08-11T21:54-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Initialized and loaded `Unicode11Addon` on `xterm.js` terminal instances and set active Unicode version to `'11'`.
+- 2026-08-11T22:13-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart` — Fixed premature `unicodeVersion: '11'` setting in initial `options` bag (which threw on `Terminal` construction before `Unicode11Addon` registration) and set it cleanly after `loadAddon`.
 
 ## Commits
 
-- HEAD — fix(triage_client): activate unicode11 addon for xterm.js to fix agy terminal rendering
+- 7903bac — fix(triage_client): activate unicode11 addon for xterm.js to fix agy terminal rendering
+- HEAD — fix(triage_client): fix unicodeVersion initialization timing in xterm.js
 
 ## Progress
 
 - Initialized worktree, plan file, and devlog.
+- Resolved high-effort review finding on `unicodeVersion` initialization sequence.
