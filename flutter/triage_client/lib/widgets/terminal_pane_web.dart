@@ -508,8 +508,8 @@ class _TerminalPaneState extends State<TerminalPane> {
             js_util.setProperty(_term, 'unicodeVersion', '11');
           }
         }
-      } catch (e) {
-        debugPrint('Failed to load Unicode11Addon: $e');
+      } catch (e, stackTrace) {
+        debugPrint('Failed to load Unicode11Addon: $e\n$stackTrace');
       }
 
       _bindTerminalSubscriptions();
