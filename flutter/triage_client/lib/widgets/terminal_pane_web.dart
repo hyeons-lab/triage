@@ -472,6 +472,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
       js_util.setProperty(options, 'convertEol', true);
+      js_util.setProperty(options, 'unicodeVersion', '11');
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
@@ -488,6 +489,32 @@ class _TerminalPaneState extends State<TerminalPane> {
       _fitAddon = js_util.callConstructor(fitAddonConstructor, []);
       _sessionFitAddons[sanitizedId] = _fitAddon;
       js_util.callMethod(_term, 'loadAddon', [_fitAddon]);
+
+      try {
+        final unicode11Module = js_util.getProperty(
+          html.window,
+          'Unicode11Addon',
+        );
+        if (unicode11Module != null) {
+          final unicode11Constructor = js_util.getProperty(
+            unicode11Module,
+            'Unicode11Addon',
+          );
+          if (unicode11Constructor != null) {
+            final unicode11Addon = js_util.callConstructor(
+              unicode11Constructor,
+              [],
+            );
+            js_util.callMethod(_term, 'loadAddon', [unicode11Addon]);
+            final unicode = js_util.getProperty(_term, 'unicode');
+            if (unicode != null) {
+              js_util.setProperty(unicode, 'activeVersion', '11');
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('Failed to load Unicode11Addon: $e');
+      }
 
       _bindTerminalSubscriptions();
 
