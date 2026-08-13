@@ -260,6 +260,30 @@ void main() {
     expect(hostInput, isEmpty);
   });
 
+  test('live emulator query responses are dropped even outside suppression window', () {
+    fakeAsync((async) {
+      final s = TerminalStore(FakeTerminalSink());
+      final got = <String>[];
+      s.onHostInput = got.add;
+      s.dispatch(const Attach());
+      s.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      async.elapse(kHistoryInputSuppression + const Duration(milliseconds: 1));
+
+      // Outside suppression window: emulator query responses are still dropped
+      s.dispatch(const UserInput('\x1b[24;1R')); // CPR
+      s.dispatch(const UserInput('\x1b[?1;2c')); // DA
+      s.dispatch(const UserInput('\x1b[?0u')); // Kitty query response
+      s.dispatch(const UserInput('\x1b[?2026;2\$y')); // DECRPM
+      expect(got, isEmpty);
+
+      // Legitimate user keystrokes are preserved
+      s.dispatch(const UserInput('a'));
+      s.dispatch(const UserInput('\x1b[A')); // Up arrow
+      expect(got, ['a', '\x1b[A']);
+      s.dispose();
+    });
+  });
+
   test('host-input suppression lifts after the window', () {
     fakeAsync((async) {
       final s = TerminalStore(FakeTerminalSink());

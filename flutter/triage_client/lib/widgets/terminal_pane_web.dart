@@ -471,7 +471,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(options, 'cursorStyle', 'block');
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
-      js_util.setProperty(options, 'convertEol', true);
       js_util.setProperty(options, 'allowProposedApi', true);
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');

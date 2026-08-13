@@ -17,6 +17,7 @@ import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
+import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
@@ -1608,11 +1609,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _setupSessionInputListener(SessionVm session) {
     session.terminalController.addInputListener((keys) {
-      // While the store replays history, the emulator auto-answers the
-      // program's own terminal queries (DSR/cursor reports) re-fed from the
-      // tail. Those answers surface here as emulator output; they must not be
-      // forwarded to the host as fake user input.
-      if (session.store.isSuppressingHostInput) {
+      // While the store replays history or when the emulator auto-answers terminal
+      // queries (DSR, DA, Kitty queries), those answers surface here as emulator
+      // output; they must not be forwarded to the host as fake user input.
+      if (session.store.isSuppressingHostInput || isEmulatorQueryResponse(keys)) {
         return;
       }
       if (_isRemoteSession(session)) {

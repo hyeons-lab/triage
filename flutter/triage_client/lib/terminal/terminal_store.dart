@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
+import 'emulator_query_response.dart';
 import 'terminal_intent.dart';
 import 'terminal_sink.dart';
 import 'terminal_state.dart';
@@ -77,6 +78,10 @@ class TerminalStore extends ChangeNotifier {
   // does not loop back through the reducer.
   bool _applyingResize = false;
 
+  // True while we are writing to the sink, so synchronous emulator auto-responses
+  // (DSR/DA/Kitty queries) are not forwarded back to the host as fake user input.
+  bool _isWritingSink = false;
+
   // True for a brief window after a history replay; while set, emulator output
   // (the program's own query auto-answers) is not forwarded to the host.
   bool _suppressHostInput = false;
@@ -131,7 +136,7 @@ class TerminalStore extends ChangeNotifier {
         return _reduceResize(s, cols, rows);
 
       case UserInput(:final data):
-        if (!s.exited && !_suppressHostInput) {
+        if (!s.exited && !_suppressHostInput && !isEmulatorQueryResponse(data)) {
           onHostInput?.call(data);
         }
         return s;
@@ -234,6 +239,9 @@ class TerminalStore extends ChangeNotifier {
   // ---- Sink-driven events ---------------------------------------------------
 
   void _handleSinkOutput(String data) {
+    if (_isWritingSink || isEmulatorQueryResponse(data)) {
+      return;
+    }
     dispatch(UserInput(data));
   }
 
@@ -342,7 +350,13 @@ class TerminalStore extends ChangeNotifier {
       utf8.decode(toDecode, allowMalformed: true),
     );
     if (sanitized.isNotEmpty) {
-      _sink.write(sanitized);
+      final wasWriting = _isWritingSink;
+      _isWritingSink = true;
+      try {
+        _sink.write(sanitized);
+      } finally {
+        _isWritingSink = wasWriting;
+      }
     }
   }
 
