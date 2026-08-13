@@ -138,15 +138,15 @@ void main() {
     expect(sink.written.toString(), 'é🦀');
   });
 
-  test('bare LF normalized to CRLF, existing CRLF preserved', () {
+  test('raw LF and CRLF are preserved verbatim without forced normalization', () {
     store.dispatch(const Attach());
     store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
     sink.ops.clear();
     store.dispatch(LiveBytes(b('a\nb\r\nc')));
-    expect(sink.written.toString(), 'a\r\nb\r\nc');
+    expect(sink.written.toString(), 'a\nb\r\nc');
   });
 
-  test('CRLF split across chunks is not doubled', () {
+  test('split chunks pass bytes through verbatim', () {
     store.dispatch(const Attach());
     store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
     sink.ops.clear();

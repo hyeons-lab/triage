@@ -59,7 +59,6 @@ class TerminalStore extends ChangeNotifier {
 
   // Live-stream byte carries (history is decoded as a self-contained unit).
   final List<int> _utf8Carry = <int>[];
-  bool _pendingCarriageReturn = false;
   // Holds a trailing, not-yet-terminated `CSI > …` so a private-mode sequence
   // split across live chunks is still stripped before reaching the emulator.
   String _privateCsiCarry = '';
@@ -342,9 +341,8 @@ class TerminalStore extends ChangeNotifier {
     final sanitized = _stripUnsupportedPrivateCsi(
       utf8.decode(toDecode, allowMalformed: true),
     );
-    final text = _normalizeNewlines(sanitized);
-    if (text.isNotEmpty) {
-      _sink.write(text);
+    if (sanitized.isNotEmpty) {
+      _sink.write(sanitized);
     }
   }
 
@@ -376,33 +374,8 @@ class TerminalStore extends ChangeNotifier {
     return s.replaceAll(_completePrivateCsi, '');
   }
 
-  /// Normalize bare LF to CRLF (leaving existing CRLF intact) so the emulator
-  /// does not stair-step. A trailing '\r' is held back so a CRLF split across
-  /// chunks (or the history→live boundary) is not doubled.
-  String _normalizeNewlines(String input) {
-    var s = input;
-    if (_pendingCarriageReturn) {
-      s = '\r$s';
-      _pendingCarriageReturn = false;
-    }
-    if (s.endsWith('\r')) {
-      _pendingCarriageReturn = true;
-      s = s.substring(0, s.length - 1);
-    }
-    // Fast path: no LF means nothing to normalize.
-    if (!s.contains('\n')) {
-      return s;
-    }
-    // Promote every bare LF to CRLF while leaving existing CRLF intact. Done by
-    // collapsing CRLF to LF then expanding all LF to CRLF — equivalent to a
-    // `(?<!\r)\n` lookbehind but lookbehind-free, since older Safari/iOS WebKit
-    // (Flutter Web targets) lack regex lookbehind and throw on it at runtime.
-    return s.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n');
-  }
-
   void _resetCarries() {
     _utf8Carry.clear();
-    _pendingCarriageReturn = false;
     _privateCsiCarry = '';
     _appliedLiveSeq = null;
   }
