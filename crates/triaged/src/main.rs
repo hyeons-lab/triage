@@ -26,20 +26,41 @@ fn main() -> anyhow::Result<()> {
         Invocation::Service(_) | Invocation::Daemon { .. } => {}
     }
 
-    // Before any handover work: make job control unable to stop us.
+    // Before any handover work: make job control unable to stop us, and make a
+    // terminating signal something we can answer rather than die on. Both are set up
+    // here, ahead of the long startup, because from the moment this process adopts a
+    // predecessor's sessions it owns PTYs that its death would destroy.
     #[cfg(unix)]
     ignore_terminal_job_control_signals();
+    // Daemon invocations only. `triaged service <action>` is a short-lived CLI with
+    // no rescue thread to consume the pipe, so installing the handler there would
+    // turn Ctrl-C into a signal that is caught, queued, and never acted on.
+    #[cfg(unix)]
+    if matches!(invocation, Invocation::Daemon { .. }) {
+        triaged::shutdown::install_signal_handlers();
+    }
 
     // Keep this binding alive for the lifetime of the process: dropping the
     // WorkerGuard flushes the non-blocking tracing appender thread.
     let _flush_guard = triage_core::logging::init(triage_core::logging::default_config()?)?;
+
+    // Start consuming those signals now, before the long startup work. Until
+    // `arm_rescue` hands it a manager there is nothing to hand over, so it answers a
+    // signal by exiting, exactly as the default disposition would have. That matters:
+    // a caught signal with no consumer would make the daemon unstoppable for the
+    // whole of startup.
+    #[cfg(unix)]
+    if matches!(invocation, Invocation::Daemon { .. }) {
+        triaged::shutdown::spawn_rescue_thread();
+    }
+
     run(invocation)
 }
 
 /// Stops the terminal job-control signals from ever suspending this process.
 ///
 /// Handover teardown calls `tcsetattr`, and for a process in a *background*
-/// process group that raises `SIGTTOU` unconditionally — TOSTOP does not gate it.
+/// process group that raises `SIGTTOU` unconditionally; TOSTOP does not gate it.
 /// A daemon launched from an interactive shell (including from inside a Triage
 /// session, the most natural place to test a build) is exactly such a process, so
 /// it would stop itself partway through the swap, holding every PTY master, the
@@ -54,7 +75,7 @@ fn main() -> anyhow::Result<()> {
 ///
 /// This does not detach the controlling terminal (no `setsid`), because a
 /// successor adopted through a handover must keep serving the sessions it
-/// inherited regardless of how it was launched — the goal is only that job
+/// inherited regardless of how it was launched. The goal is only that job
 /// control can never freeze the owner of live PTYs.
 #[cfg(unix)]
 fn ignore_terminal_job_control_signals() {
@@ -66,32 +87,6 @@ fn ignore_terminal_job_control_signals() {
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
-    }
-}
-
-/// Marks the TCP listener close-on-exec so it cannot leak into helper children.
-///
-/// Without this the listener is inherited by every process the daemon execs. A
-/// `git` child was observed on 2026-08-13 holding the :7777 listening socket,
-/// which means a long-lived leaked child can keep the port bound *after* the
-/// daemon that opened it exits, and the successor then fails to bind with a
-/// spurious `EADDRINUSE` even though no daemon holds the port.
-///
-/// Handover is unaffected: passing the listener to a successor uses `SCM_RIGHTS`,
-/// not `exec`, and `dup` (which `get_active_tcp_listener_fd`'s caller uses) does
-/// not carry `FD_CLOEXEC` to the new descriptor.
-#[cfg(unix)]
-fn close_listener_on_exec(listener: &std::net::TcpListener) {
-    use std::os::unix::io::AsRawFd;
-    let fd = listener.as_raw_fd();
-    // SAFETY: `fd` is owned by `listener`, which outlives this call, and
-    // FD_CLOEXEC is the only flag being set. A failure leaves the previous
-    // (leaky) behaviour, which is not worth aborting startup over.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
     }
 }
 
@@ -387,6 +382,21 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // not to move it past the commit point.
     let manager = Arc::new(SessionManager::default());
 
+    // Arm the rescue as soon as a manager exists, which is deliberately *before*
+    // adoption rather than after it. From the moment `complete_handover_adoption`
+    // returns `Adopt`, this process is the sole owner of every adopted master and the
+    // predecessor has already detached, so a stop signal in that window must not take
+    // the unarmed "exit without a rescue" path: that would close every master and
+    // SIGHUP every child, which is the loss this exists to prevent. The window is not
+    // instantaneous either, since `seed_session_snippets` round-trips to each adopted
+    // actor.
+    //
+    // Arming here costs nothing before adoption: a manager holding only restored
+    // `Historical` entries reports zero live sessions, so a signal is skipped and
+    // exits cleanly, exactly as an unarmed one would.
+    #[cfg(unix)]
+    triaged::shutdown::arm_rescue(Arc::clone(&manager));
+
     // Load configuration
     let config = if let Ok(path) = triage_core::config::Config::default_path() {
         if path.exists() {
@@ -468,10 +478,6 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
             std::net::TcpListener::bind(bind_addr)?
         }
     };
-
-    // Covers all three paths above (inherited, and both fresh binds).
-    #[cfg(unix)]
-    close_listener_on_exec(&tcp_listener);
 
     // If we have inherited sessions, adopt them!
     #[cfg(unix)]

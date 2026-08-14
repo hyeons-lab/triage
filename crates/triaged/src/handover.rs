@@ -213,6 +213,38 @@ pub const HANDOVER_ADOPTION_TIMEOUT: std::time::Duration = std::time::Duration::
 /// dark window rather than optimising for the pathological case.
 pub const HANDOVER_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a daemon that has been asked to shut down waits for the successor it
+/// spawned to take its sessions, before giving up and going back to serving them.
+///
+/// A terminating signal is the one loss vector handover cannot help with on its
+/// own: this process owns every PTY master, so its death closes all of them and
+/// SIGHUPs every child. `crate::shutdown` answers the signal by starting a
+/// detached successor and letting the ordinary handover carry the sessions across, so
+/// this budget has to cover a successor's whole cold start (log replay for every
+/// historical session, measured at ~22.6s and growing) as well as the handshake.
+///
+/// So it must exceed all three protocol deadlines together,
+/// [`HANDOVER_TRANSFER_TIMEOUT`] plus [`HANDOVER_ADOPTION_TIMEOUT`] plus
+/// [`HANDOVER_TEARDOWN_TIMEOUT`], and does, with the balance as slack for the successor
+/// to get as far as connecting at all. Note what is *not* a separate term: the cold
+/// start. That startup work happens inside the adoption window rather than alongside
+/// it, since it is what the successor is doing between Phase 1 and its adoption byte,
+/// which is precisely the wait the adoption timeout bounds.
+///
+/// It must stay *below* the supervisor's stop grace period, or the supervisor's
+/// SIGKILL arrives mid-rescue and destroys exactly what the rescue is saving;
+/// `crate::service` asserts that at compile time.
+pub const SHUTDOWN_RESCUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+const _: () = assert!(
+    SHUTDOWN_RESCUE_TIMEOUT.as_secs()
+        > HANDOVER_TRANSFER_TIMEOUT.as_secs()
+            + HANDOVER_ADOPTION_TIMEOUT.as_secs()
+            + HANDOVER_TEARDOWN_TIMEOUT.as_secs(),
+    "the rescue budget must outlast the whole handshake it waits on, or it gives up on \
+     swaps that were about to succeed"
+);
+
 #[cfg(unix)]
 pub use unix_impl::*;
 
@@ -233,6 +265,47 @@ mod unix_impl {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::time::Instant;
+
+    /// Duplicate `fd`, giving the copy `FD_CLOEXEC`.
+    ///
+    /// Always this instead of [`libc::dup`], which explicitly does *not* carry the
+    /// flag to the new descriptor. Every `dup` in this daemon copies a PTY master
+    /// or the TCP listener, and a copy without `FD_CLOEXEC` is inherited by every
+    /// process exec'd while it is open: a `git` child was found on 2026-08-13
+    /// holding the :7777 listener, which keeps the port bound after the daemon that
+    /// opened it exits and hands the successor a spurious `EADDRINUSE`. A leaked
+    /// master is worse still, since the child holding it keeps another session's
+    /// terminal alive.
+    ///
+    /// Handover is unaffected: `SCM_RIGHTS` installs a fresh descriptor in the
+    /// receiver rather than exec'ing, and the receiver's flags are its own.
+    pub(crate) fn dup_cloexec(fd: RawFd) -> io::Result<RawFd> {
+        // SAFETY: `F_DUPFD_CLOEXEC` only reads `fd` and returns a new descriptor;
+        // the caller owns what comes back.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(duplicate)
+    }
+
+    /// Mark `fd` close-on-exec, best-effort.
+    ///
+    /// For descriptors that do not already have the flag, which in this crate means
+    /// anything not opened through `std`: `std` sets it on every socket and file it
+    /// creates, whereas one received through `SCM_RIGHTS` arrives without it (macOS
+    /// has no `MSG_CMSG_CLOEXEC` to ask for it), and so does a raw `libc::pipe`.
+    pub(crate) fn set_cloexec(fd: RawFd) {
+        // SAFETY: reads and writes only `fd`'s descriptor flags. A failure leaves
+        // the descriptor as inheritable as it already was, which is not worth
+        // failing a startup over.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
 
     pub fn send_fds(socket: &UnixStream, fds: &[RawFd], data: &[u8]) -> io::Result<()> {
         let fd = socket.as_raw_fd();
@@ -340,6 +413,21 @@ mod unix_impl {
                     received_fds.set_len(fd_count);
                 }
             }
+        }
+
+        // Close-on-exec on arrival. `MSG_CMSG_CLOEXEC` would be the tidy way to ask
+        // for this, but macOS does not implement it, so set the flag by hand instead
+        // of having two behaviours to reason about per platform.
+        //
+        // This is the *largest* half of the descriptor leak, not a tidy-up: after a
+        // handover every PTY master this daemon owns is a descriptor received here,
+        // and each one it holds without the flag is inherited by every process it
+        // execs from then on. A single `git` helper or newly spawned session shell
+        // then holds a copy of every other session's master, which keeps those
+        // terminals alive past their owner. See `dup_cloexec` for the other half of
+        // this leak, and for the incident that exposed both.
+        for fd in &received_fds {
+            set_cloexec(*fd);
         }
 
         let data_len = u32::from_be_bytes(len_prefix) as usize;
@@ -629,7 +717,7 @@ mod unix_impl {
     /// Closing it under a live session does not undo the handover, because the
     /// successor is not sharing this descriptor: `SCM_RIGHTS` installs an
     /// independent one in that process, and `extract_handover_state` sends a
-    /// `libc::dup` rather than this fd itself. The child keeps its slave side
+    /// duplicate rather than this fd itself. The child keeps its slave side
     /// regardless, so the session survives on the successor's copy.
     #[derive(Debug)]
     pub struct AdoptedMasterPty {
@@ -700,19 +788,17 @@ mod unix_impl {
         }
 
         fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
-            let dup_fd = unsafe { libc::dup(self.raw()) };
-            if dup_fd < 0 {
-                return Err(anyhow::Error::new(std::io::Error::last_os_error()));
-            }
+            // `dup_cloexec`, not `dup`: this copy lives for the session's whole
+            // life, so a copy without FD_CLOEXEC would be inherited by every
+            // process the daemon execs afterwards, including every *other*
+            // session's child.
+            let dup_fd = dup_cloexec(self.raw())?;
             let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
             Ok(Box::new(file))
         }
 
         fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
-            let dup_fd = unsafe { libc::dup(self.raw()) };
-            if dup_fd < 0 {
-                return Err(anyhow::Error::new(std::io::Error::last_os_error()));
-            }
+            let dup_fd = dup_cloexec(self.raw())?;
             let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
             Ok(Box::new(file))
         }

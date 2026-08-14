@@ -6,6 +6,8 @@ pub mod http;
 pub mod ipc;
 pub mod service;
 pub mod session;
+#[cfg(unix)]
+pub mod shutdown;
 pub mod summarizer;
 pub mod update;
 pub mod ws;

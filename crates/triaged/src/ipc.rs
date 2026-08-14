@@ -334,6 +334,16 @@ impl IpcClient {
         }
     }
 
+    /// Tell the running daemon that the stop about to be requested is a real one,
+    /// so it exits on the supervisor's SIGTERM instead of handing its sessions to a
+    /// detached replacement. See `WireRequest::DisableShutdownRescue`.
+    pub fn disable_shutdown_rescue(&self) -> Result<()> {
+        match self.round_trip(WireRequest::DisableShutdownRescue)? {
+            WireSuccess::Unit => Ok(()),
+            other => bail!("unexpected disable-shutdown-rescue response: {other:?}"),
+        }
+    }
+
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
         let mut stream = transport::connect(&self.socket_path)
             .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
@@ -552,6 +562,13 @@ enum WireRequest {
     Handover,
     ReloadClientAssets,
     ServerUpdateInfo,
+    /// "The next terminating signal is a real stop; do not hand my sessions to a
+    /// replacement." Sent by `triaged service stop` / `service uninstall` before
+    /// they ask the supervisor to stop the job, because that stop arrives as a
+    /// SIGTERM and the daemon otherwise answers one by starting a detached
+    /// successor (see [`crate::shutdown`]). Without this, `uninstall` would leave a
+    /// daemon running.
+    DisableShutdownRescue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -649,6 +666,33 @@ fn sanitize_path_component(value: String) -> String {
 /// never touch anyone else's.
 #[cfg(unix)]
 static OWNED_SOCKET_ID: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+
+/// Whether *this* process has bound the owner socket and is therefore reachable by a
+/// successor's handover request.
+///
+/// A connect probe cannot answer that question: during a swap the path can be
+/// answered by a predecessor that has already detached its sessions, so a successor
+/// started on the strength of it would hand over from a daemon with nothing left to
+/// give. Set once, on a successful bind, and never cleared: the process exits rather
+/// than unbinding.
+#[cfg(unix)]
+static OWN_SOCKET_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has bound its owner socket. See [`OWN_SOCKET_BOUND`].
+#[cfg(unix)]
+pub(crate) fn own_socket_is_bound() -> bool {
+    OWN_SOCKET_BOUND.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Remove the socket this process bound, if it is still the one at the default path.
+///
+/// For any orderly exit: the handover teardown below, and the shutdown rescue's own
+/// exits (see [`crate::shutdown`]). Leaving the file behind widens the window where two
+/// concurrent starters both remove it and both bind.
+#[cfg(unix)]
+pub(crate) fn unlink_own_default_socket() {
+    unlink_own_socket(&default_socket_path());
+}
 
 /// Remove `socket_path`, but only while it still refers to the socket this
 /// process bound. A no-op if a successor has already rebound the path.
@@ -756,6 +800,7 @@ fn try_bind_owner_socket(socket_path: &Path) -> Result<Option<UnixListener>> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((meta.dev(), meta.ino()));
     }
+    OWN_SOCKET_BOUND.store(true, std::sync::atomic::Ordering::Release);
     Ok(Some(listener))
 }
 
@@ -923,13 +968,11 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
 
     let tcp_fd = get_active_tcp_listener_fd();
     if tcp_fd >= 0 {
-        let dup_tcp = unsafe { libc::dup(tcp_fd) };
-        if dup_tcp < 0 {
-            bail!(
-                "failed to dup TCP listener socket: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        // Close-on-exec, so a process exec'd during this window cannot inherit the
+        // listener and keep :7777 bound after this daemon exits. See
+        // `crate::handover::dup_cloexec`.
+        let dup_tcp = crate::handover::dup_cloexec(tcp_fd)
+            .context("duplicating the TCP listener socket for handover")?;
         // Front of the queue: the successor's `take_inherited_tcp_listener` claims
         // index 0, and the PTY masters must line up with the session list after it.
         fds_to_send.0.insert(0, dup_tcp);
@@ -1020,7 +1063,7 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     // unlink entirely is not the answer either — a file left behind on every swap
     // widens the window where two concurrent starters both remove it and both
     // bind. Identity-checked removal avoids both.
-    unlink_own_socket(&default_socket_path());
+    unlink_own_default_socket();
 
     std::process::exit(0);
 }
@@ -1128,6 +1171,11 @@ fn handle_request(
         }
         WireRequest::ServerUpdateInfo => {
             Ok(WireSuccess::ServerUpdateInfo(manager.server_update_info()))
+        }
+        WireRequest::DisableShutdownRescue => {
+            #[cfg(unix)]
+            crate::shutdown::disable_rescue();
+            Ok(WireSuccess::Unit)
         }
     }
 }

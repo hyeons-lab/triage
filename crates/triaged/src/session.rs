@@ -39,6 +39,32 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::summarizer::{SnippetResult, SummarizeJob, Summarizer, build_prompt_text};
 
+/// How long `serialize_active_sessions` will spend, in total, waiting for actors to
+/// hand over their PTY descriptors and counters.
+///
+/// The only bounded actor round-trip in this file, and deliberately so: everywhere
+/// else a deadline would turn a slow-but-healthy session into a spurious error, while
+/// here the wait is all-or-nothing for a whole handover. An actor that cannot answer
+/// within it is parked in `write_all` on a session whose child stopped reading, and
+/// waiting on it forever abandons every *other* session to this daemon's exit.
+///
+/// A single budget for the whole loop rather than one deadline per actor, because the
+/// bound that actually matters belongs to the successor: it gives up on the entire
+/// Phase-1 response after [`crate::handover::HANDOVER_TRANSFER_TIMEOUT`]. Per-actor
+/// deadlines would sum past that as soon as a second session was parked, so the swap
+/// would fail wholesale in exactly the case this bound exists to survive. Comfortably
+/// under that limit, and unreachable for a healthy daemon, where each answer is a
+/// descriptor dup and three counters.
+#[cfg(unix)]
+const HANDOVER_EXTRACT_BUDGET: Duration = Duration::from_secs(4);
+
+#[cfg(unix)]
+const _: () = assert!(
+    HANDOVER_EXTRACT_BUDGET.as_secs() * 2 < crate::handover::HANDOVER_TRANSFER_TIMEOUT.as_secs(),
+    "the extract budget must leave the successor's Phase-1 read deadline room for the transfer \
+     itself, or a parked session turns into a failed swap"
+);
+
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
@@ -513,6 +539,33 @@ impl SessionManager {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| HandoverGuard { manager: self })
+    }
+
+    /// Whether a handover is being served right now.
+    ///
+    /// Unlike [`Self::begin_handover`] this only observes the flag, so it is safe
+    /// to ask from a path that must not claim the slot. The shutdown rescue uses it
+    /// to avoid starting a second successor for a swap that is already running,
+    /// which `begin_handover` would refuse anyway.
+    pub(crate) fn handover_in_flight(&self) -> bool {
+        self.handover_in_flight.load(Ordering::Acquire)
+    }
+
+    /// How many sessions are live, or `None` if the sessions lock is held right now.
+    ///
+    /// Never waits, which is the whole point. The caller is the shutdown rescue,
+    /// and a daemon wedged on the sessions mutex is exactly when a stop signal
+    /// tends to arrive, and a blocking count there would hang the one path that can
+    /// still save the sessions. `None` means "could not tell", and the rescue
+    /// treats that as "assume there are some" rather than as zero.
+    pub(crate) fn try_live_session_count(&self) -> Option<usize> {
+        let sessions = self.sessions.try_lock().ok()?;
+        Some(
+            sessions
+                .values()
+                .filter(|session| matches!(session, ManagedSession::Live { .. }))
+                .count(),
+        )
     }
 
     fn allocate_session_id(&self) -> Result<SessionId> {
@@ -1201,68 +1254,116 @@ impl SessionManager {
         crate::handover::HandoverState,
         Vec<std::os::unix::io::RawFd>,
     )> {
-        let sessions = self.sessions()?;
+        // Snapshot what each live session needs under the lock, then do the actor
+        // round-trips off it. This is the same OFF-LOCK discipline as
+        // `request_write_input`, and it matters most here of all: this is the call a
+        // handover cannot proceed without, so holding the sessions mutex across an
+        // unbounded wait for a parked actor made the daemon un-handoverable in exactly
+        // the situation that most needs a handover. It is also what the shutdown
+        // rescue runs on, through the successor it starts.
+        let pending: Vec<(SessionId, Sender<ActorCommand>, PersistedSessionLaunch, u64)> = self
+            .sessions()?
+            .iter()
+            .filter_map(|(id, managed)| match managed {
+                ManagedSession::Live {
+                    actor,
+                    lease: _,
+                    launch,
+                    // The adopted process stays alive across a handover, so the new
+                    // daemon reads its live cwd directly (see `adopted_session_cwd`);
+                    // no need to carry `last_known_cwd` through the handover state.
+                    last_known_cwd: _,
+                } => Some((
+                    id.clone(),
+                    actor.tx.clone(),
+                    launch.clone(),
+                    actor.last_activity_ms(),
+                )),
+                _ => None,
+            })
+            .collect();
+
         let mut handover_sessions = Vec::new();
         let mut fds = Vec::new();
 
-        for (id, managed) in sessions.iter() {
-            if let ManagedSession::Live {
-                actor,
-                lease: _,
-                launch,
-                // The adopted process stays alive across a handover, so the new
-                // daemon reads its live cwd directly (see `adopted_session_cwd`);
-                // no need to carry `last_known_cwd` through the handover state.
-                last_known_cwd: _,
-            } = managed
-            {
+        // Ask everyone first, then collect. The commands go out before any waiting
+        // starts, so every actor works on its answer at the same time and the whole
+        // loop costs the *slowest* actor rather than the sum of all of them. That is
+        // what makes one shared budget workable: a healthy actor's answer is already
+        // sitting in its channel by the time this reaches it, so it is taken even if a
+        // parked session has meanwhile spent the entire budget. Sending inside the
+        // collect loop instead would give every session after the first parked one a
+        // zero-length wait against an actor that had not yet been asked, and drop them
+        // all.
+        let inflight: Vec<_> = pending
+            .into_iter()
+            .filter_map(|(id, cmd_tx, launch, last_activity_ms)| {
                 let (tx, rx) = mpsc::channel();
-                if let Err(err) = actor
-                    .tx
-                    .send(ActorCommand::ExtractHandoverState { response: tx })
-                {
-                    tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
+                match cmd_tx.send(ActorCommand::ExtractHandoverState { response: tx }) {
+                    Ok(()) => Some((id, rx, launch, last_activity_ms)),
+                    Err(err) => {
+                        tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // One budget for every actor, not one deadline each: see
+        // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
+        let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
+
+        for (id, rx, launch, last_activity_ms) in inflight {
+            // Bounded, unlike every other actor round-trip in this file. An actor that
+            // cannot answer a descriptor dup and three counters before the budget runs
+            // out is parked (a `write_all` to a session whose child stopped reading),
+            // and waiting on it forever would abandon the *other* sessions too, since
+            // this snapshot is what the whole swap is made of. Skipping loses that one
+            // session, where waiting loses all of them.
+            let remaining = extract_deadline.saturating_duration_since(Instant::now());
+            let ext = match rx.recv_timeout(remaining) {
+                Ok(Ok(ext)) => ext,
+                Ok(Err(err)) => {
+                    tracing::warn!(session_id = %id, ?err, "Actor failed to extract handover state");
                     continue;
                 }
+                Err(RecvTimeoutError::Timeout) => {
+                    tracing::error!(
+                        session_id = %id,
+                        budget_secs = HANDOVER_EXTRACT_BUDGET.as_secs(),
+                        "actor did not answer the handover extract before the budget ran out; \
+                         handing over without this session, which will not survive this daemon's \
+                         exit"
+                    );
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // The actor is gone rather than slow, so there was never an answer
+                    // coming; distinct from the timeout above because it says nothing
+                    // about a parked write.
+                    tracing::error!(
+                        session_id = %id,
+                        "actor stopped before answering the handover extract; handing over \
+                         without this session"
+                    );
+                    continue;
+                }
+            };
 
-                let ext = match rx.recv() {
-                    Ok(Ok(ext)) => ext,
-                    Ok(Err(err)) => {
-                        tracing::warn!(session_id = %id, ?err, "Actor failed to extract handover state");
-                        continue;
-                    }
-                    Err(err) => {
-                        // Aborting the whole handover here is deliberate: a
-                        // half-transferred set would silently drop the sessions we
-                        // skipped. But the daemon survives this abort and can serve
-                        // a later attempt, so the masters already duplicated for
-                        // this attempt must be closed rather than left to
-                        // accumulate across retries.
-                        for fd in fds.drain(..) {
-                            // Safety: each fd is a `dup` produced for this transfer
-                            // and owned solely by this vector; nothing has been sent
-                            // to a peer yet.
-                            unsafe { libc::close(fd) };
-                        }
-                        return Err(err).context("waiting for extract response");
-                    }
-                };
+            fds.push(std::os::unix::io::IntoRawFd::into_raw_fd(ext.fd));
 
-                fds.push(ext.fd);
-
-                handover_sessions.push(crate::handover::HandoverSession {
-                    id: id.clone(),
-                    command: launch.command.clone(),
-                    args: launch.args.clone(),
-                    cwd: launch.cwd.clone(),
-                    size: launch.size.clone(),
-                    log_path: launch.log_path.clone(),
-                    output_seq: ext.output_seq,
-                    bytes_logged: ext.bytes_logged,
-                    pid: ext.pid,
-                    last_activity_ms: actor.last_activity_ms(),
-                });
-            }
+            handover_sessions.push(crate::handover::HandoverSession {
+                id,
+                command: launch.command,
+                args: launch.args,
+                cwd: launch.cwd,
+                size: launch.size,
+                log_path: launch.log_path,
+                output_seq: ext.output_seq,
+                bytes_logged: ext.bytes_logged,
+                pid: ext.pid,
+                last_activity_ms,
+            });
         }
 
         let state = crate::handover::HandoverState {
@@ -1287,8 +1388,8 @@ impl SessionManager {
     /// neither is simply "alive until `process::exit`". They end in a chain:
     ///
     /// 1. `SessionActor::detach` takes the actor by value, dropping the stored
-    ///    `Sender<ActorCommand>`. That is not necessarily the last one: three call
-    ///    sites clone it and use the clone off-lock for a round-trip the actor
+    ///    `Sender<ActorCommand>`. That is not necessarily the last one: several
+    ///    call sites clone it and use the clone off-lock for a round-trip the actor
     ///    itself has to serve, so a clone in flight keeps the channel connected
     ///    for however long the actor takes to answer — which is not bounded by
     ///    anything this call controls. Once none is left, the worker's next poll of
@@ -1669,7 +1770,7 @@ impl SessionApi for SessionManager {
         // This early check is only a courtesy so we don't fork a PTY we are about
         // to throw away; it is NOT the one that makes this safe. The authoritative
         // re-check happens below under the `sessions` lock — see there.
-        if self.handover_in_flight.load(Ordering::Acquire) {
+        if self.handover_in_flight() {
             bail!("a handover is in progress; try again once the daemon swap completes");
         }
         request.validate()?;
@@ -1703,13 +1804,16 @@ impl SessionApi for SessionManager {
         // handover that began in the meantime would have snapshotted the session
         // set without this session, and `detach_all_live_sessions` would then drop
         // it on the floor when the outgoing daemon exits. Re-checking here closes
-        // that window, because `serialize_active_sessions` holds this same lock
-        // for the whole of its snapshot: either we insert before it starts (and
-        // are transferred), or we observe the flag it set and refuse.
+        // that window, because `begin_handover` sets the flag before
+        // `serialize_active_sessions` takes this lock at all: either we insert first,
+        // under this guard, and are transferred, or we observe the flag and refuse.
+        // (Note what the argument no longer rests on: that snapshot releases the lock
+        // before its actor round-trips, so "held across the whole snapshot" would be
+        // the wrong reason to trust this gate.)
         //
         // The forked child is killed by dropping `actor` on this path, which is
         // correct — it never became a session anyone can reach.
-        if self.handover_in_flight.load(Ordering::Acquire) {
+        if self.handover_in_flight() {
             drop(sessions);
             bail!("a handover is in progress; try again once the daemon swap completes");
         }
@@ -1755,8 +1859,14 @@ impl SessionApi for SessionManager {
                     })?;
                 }
 
-                let snapshot = actor.snapshot()?;
+                // The lease mutation and its event stay under the lock (see
+                // `broadcast_event`); the snapshot round-trip must not. Every client
+                // attach lands here, so an actor parked on a stuck PTY would freeze
+                // the whole daemon on the commonest request there is.
                 let lease = lease.clone();
+                let cmd_tx = actor.tx.clone();
+                drop(sessions);
+                let snapshot = request_snapshot(&cmd_tx)?;
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
                     lease,
@@ -1787,16 +1897,26 @@ impl SessionApi for SessionManager {
         &self,
         request: SubscribeSessionEventsRequest,
     ) -> Result<SessionEventReceiver> {
-        let sessions = self.sessions()?;
-        let session = sessions
-            .get(&request.session_id)
-            .with_context(|| format!("session {} not found", request.session_id))?;
-        match session {
-            ManagedSession::Live { actor, .. } => actor.subscribe_events(request.after_event_seq),
-            ManagedSession::Historical { .. } => Ok(closed_session_event_receiver()),
-            ManagedSession::Restoring { .. } => {
-                bail!("session {} is being restored", request.session_id)
+        // Resolve under the lock, subscribe off it. The subscription is an actor
+        // round-trip like any other, and every client that attaches makes one.
+        let resolved = {
+            let sessions = self.sessions()?;
+            let session = sessions
+                .get(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            match session {
+                ManagedSession::Live { actor, .. } => Resolved::Live(actor.tx.clone()),
+                ManagedSession::Historical { .. } => {
+                    Resolved::Ready(closed_session_event_receiver())
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
             }
+        };
+        match resolved {
+            Resolved::Ready(receiver) => Ok(receiver),
+            Resolved::Live(tx) => request_subscribe_events(&tx, request.after_event_seq),
         }
     }
 
@@ -1854,7 +1974,13 @@ impl SessionApi for SessionManager {
 
     fn write_input(&self, request: WriteInputRequest) -> Result<()> {
         // Resolve and authorize under the lock, then release it before the actor
-        // round-trip: the write can block indefinitely on a child that has stopped
+        // round-trip. One consequence worth naming: authorization and the write are no
+        // longer atomic, so a client whose lease is preempted between them still gets
+        // its bytes through, and the window is the actor's queue depth. Accepted
+        // because the lease is cooperative arbitration between clients rather than a
+        // security boundary, and the alternative is teaching the actor about leases.
+        //
+        // The write can block indefinitely on a child that has stopped
         // reading, and holding the manager mutex across it takes the whole daemon
         // down with that one session. See `request_write_input`.
         let cmd_tx = {
@@ -1888,19 +2014,23 @@ impl SessionApi for SessionManager {
     }
 
     fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
-        let sessions = self.sessions()?;
-        let session = sessions
-            .get(&request.session_id)
-            .with_context(|| format!("session {} not found", request.session_id))?;
-        let snapshot = match session {
-            ManagedSession::Live { actor, .. } => actor.resize(request.size)?,
-            ManagedSession::Historical { .. } => {
-                bail!("restored historical sessions cannot be resized")
-            }
-            ManagedSession::Restoring { .. } => {
-                bail!("session {} is being restored", request.session_id)
+        // Resolve under the lock, round-trip off it: see `request_write_input`.
+        let cmd_tx = {
+            let sessions = self.sessions()?;
+            let session = sessions
+                .get(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            match session {
+                ManagedSession::Live { actor, .. } => actor.tx.clone(),
+                ManagedSession::Historical { .. } => {
+                    bail!("restored historical sessions cannot be resized")
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
             }
         };
+        let snapshot = request_resize(&cmd_tx, request.size)?;
         Ok(self.overlay_snippet(snapshot, &request.session_id))
     }
 
@@ -1989,10 +2119,10 @@ impl SessionApi for SessionManager {
         // Same authoritative handover gate as `start_session`: this also inserts a
         // Live session, so a swap that snapshotted before we got here would leave
         // this one out of the transferred descriptors and `detach_all_live_sessions`
-        // would drop it. Checked under the `sessions` lock that
-        // `serialize_active_sessions` holds across its whole snapshot, so we either
-        // land before it starts or observe the flag it set.
-        if self.handover_in_flight.load(Ordering::Acquire) {
+        // would drop it. Same reasoning as there: the flag is set by `begin_handover`
+        // before `serialize_active_sessions` takes this lock, so we either land first
+        // under this guard or observe the flag.
+        if self.handover_in_flight() {
             drop(sessions);
             // Roll back to Historical before bailing, exactly as the spawn- and
             // snapshot-failure paths above do. Without this the entry stays
@@ -2051,27 +2181,41 @@ impl SessionApi for SessionManager {
         let session = sessions
             .get(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
-        let snapshot = match session {
-            ManagedSession::Live { actor, .. } => actor.snapshot()?,
-            ManagedSession::Historical { session, .. } => session.snapshot_with_history(),
+        let resolved = match session {
+            ManagedSession::Live { actor, .. } => Resolved::Live(actor.tx.clone()),
+            ManagedSession::Historical { session, .. } => {
+                Resolved::Ready(session.snapshot_with_history())
+            }
             ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
+        };
+        // Release before the round-trip: see `request_snapshot`.
+        drop(sessions);
+        let snapshot = match resolved {
+            Resolved::Ready(snapshot) => snapshot,
+            Resolved::Live(tx) => request_snapshot(&tx)?,
         };
         Ok(self.overlay_snippet(snapshot, &session_id))
     }
 
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
-        let sessions = self.sessions()?;
-        let session = sessions
-            .get(&request.session_id)
-            .with_context(|| format!("session {} not found", request.session_id))?;
-        match session {
-            ManagedSession::Live { actor, .. } => actor.styled_rows(request.start, request.end),
-            ManagedSession::Historical { session, .. } => {
-                session.styled_rows(request.start, request.end)
+        let resolved = {
+            let sessions = self.sessions()?;
+            let session = sessions
+                .get(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            match session {
+                ManagedSession::Live { actor, .. } => Resolved::Live(actor.tx.clone()),
+                ManagedSession::Historical { session, .. } => {
+                    Resolved::Ready(session.styled_rows(request.start, request.end)?)
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
             }
-            ManagedSession::Restoring { .. } => {
-                bail!("session {} is being restored", request.session_id)
-            }
+        };
+        match resolved {
+            Resolved::Ready(rows) => Ok(rows),
+            Resolved::Live(tx) => request_styled_rows(&tx, request.start, request.end),
         }
     }
 
@@ -3198,17 +3342,6 @@ impl SessionActor {
         self.last_activity_ms.load(Ordering::Relaxed)
     }
 
-    pub fn subscribe_events(&self, after_event_seq: Option<u64>) -> Result<SessionEventReceiver> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(ActorCommand::SubscribeEvents {
-                after_event_seq,
-                response: tx,
-            })
-            .context("sending session event subscription command")?;
-        recv_actor_result(rx, "subscribing to session events")
-    }
-
     #[cfg(test)]
     fn subscriber_count(&self) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
@@ -3218,47 +3351,37 @@ impl SessionActor {
         recv_actor_result(rx, "counting session event subscribers")
     }
 
+    /// Hand the actor an event to fan out to this session's subscribers, without
+    /// waiting for it to happen.
+    ///
+    /// Deliberately fire-and-forget. A running actor's handler answers `Ok(())`
+    /// unconditionally, so waiting told the caller nothing the `send` had not; the one
+    /// path that did answer with an error, `reject_command_during_shutdown`, reports a
+    /// session already shutting down, which a lease announcement has no use for.
+    /// Waiting cost the daemon, though: every production
+    /// caller is a lease change made *while holding the sessions mutex*, so an actor
+    /// parked in `write_all` on a session whose child stopped reading froze
+    /// `attach_session` and both lease calls with the global lock held. That is the
+    /// same wedge `request_write_input` documents, reached through the paths every
+    /// client attach and every focus change take.
+    ///
+    /// Not waiting also keeps the ordering the alternative would have broken:
+    /// resolving off-lock like the other round-trips would let two concurrent lease
+    /// changes broadcast in the opposite order to the mutations they describe, so
+    /// clients could see a stale `LeaseChange` generation last. Sending under the lock
+    /// keeps event order and mutation order identical.
     pub fn broadcast_event(&self, event: SessionEvent) -> Result<()> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel();
         self.tx
             .send(ActorCommand::BroadcastEvent {
                 event: Box::new(event),
                 response: tx,
             })
-            .context("sending session event broadcast command")?;
-        recv_actor_result(rx, "broadcasting session event")
-    }
-
-    pub fn write_input(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
-        request_write_input(&self.tx, bytes.into())
-    }
-
-    pub fn resize(&self, size: SessionSize) -> Result<SessionSnapshot> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(ActorCommand::Resize { size, response: tx })
-            .context("sending session resize command")?;
-        recv_actor_result(rx, "resizing session")
+            .context("sending session event broadcast command")
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(ActorCommand::Snapshot { response: tx })
-            .context("sending session snapshot command")?;
-        recv_actor_result(rx, "reading session snapshot")
-    }
-
-    pub fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(ActorCommand::StyledRows {
-                start,
-                end,
-                response: tx,
-            })
-            .context("sending session styled row command")?;
-        recv_actor_result(rx, "reading session styled rows")
+        request_snapshot(&self.tx)
     }
 
     pub fn shutdown(mut self) -> Result<CompletedSession> {
@@ -3480,7 +3603,16 @@ enum ActorCommand {
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct ExtractedHandover {
-    pub fd: std::os::unix::io::RawFd,
+    /// The duplicated PTY master, owned so that a response nobody receives closes it.
+    ///
+    /// This value routinely goes nowhere: `serialize_active_sessions` bounds its wait
+    /// and gives up on a parked actor, so a late answer finds its receiver dropped. A
+    /// bare `RawFd` there was leaked outright, pinning that session's pty open and
+    /// accumulating one descriptor per late answer per handover attempt. Ownership
+    /// makes the leak unrepresentable instead of relying on every discard path
+    /// remembering to close it; the one consumer that keeps the descriptor takes it
+    /// with `into_raw_fd`.
+    pub fd: std::os::unix::io::OwnedFd,
     pub pid: u32,
     pub output_seq: u64,
     pub bytes_logged: u64,
@@ -3547,13 +3679,10 @@ impl ActorState {
             .as_raw_fd()
             .ok_or_else(|| anyhow!("MasterPty has no raw fd"))?;
 
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            bail!(
-                "failed to dup PTY master: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        // Close-on-exec: this copy stays open across the whole serialize-and-send
+        // window, and any process the daemon execs meanwhile would otherwise
+        // inherit a live master. See `crate::handover::dup_cloexec`.
+        let dup_fd = crate::handover::dup_cloexec(fd).context("duplicating PTY master")?;
 
         let pid = self
             .child
@@ -3561,7 +3690,9 @@ impl ActorState {
             .ok_or_else(|| anyhow!("Child process has no process ID"))?;
 
         Ok(ExtractedHandover {
-            fd: dup_fd,
+            // Safety: `dup_cloexec` just produced this descriptor and no other owner
+            // exists, so handing it to an `OwnedFd` is the only claim on it.
+            fd: unsafe { std::os::unix::io::FromRawFd::from_raw_fd(dup_fd) },
             pid,
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
@@ -3841,6 +3972,10 @@ impl ActorState {
             }
             #[cfg(unix)]
             ActorCommand::ExtractHandoverState { response } => {
+                // A response nobody receives closes its descriptor on drop, which is
+                // routine rather than exceptional here: the caller bounds this wait
+                // (`HANDOVER_EXTRACT_BUDGET`) and gives up on a parked actor. See
+                // `ExtractedHandover::fd`.
                 let _ = response.send(self.extract_handover_state());
                 false
             }
@@ -4832,6 +4967,22 @@ fn recv_actor_result<T>(rx: Receiver<ActorResult<T>>, context: &'static str) -> 
         .with_context(|| context)
 }
 
+/// Either an answer already produced while holding the sessions lock, or the
+/// actor channel to round-trip on after releasing it.
+///
+/// Every request that can be served by a live session has this shape: look the
+/// session up under the guard, and then do the blocking part without it. A
+/// historical session needs no actor at all, so its answer is `Ready` and there is
+/// nothing left to wait for. Naming the two cases is what lets a call site compute
+/// either answer under one guard and then release it, without duplicating the lookup
+/// or leaving the historical case to a second lock acquisition.
+enum Resolved<T> {
+    /// Served under the lock; nothing further to do.
+    Ready(T),
+    /// A live session's command channel, to be used off-lock.
+    Live(Sender<ActorCommand>),
+}
+
 /// Requests a cheap visible-rows snapshot via a cloned actor command channel.
 /// The caller clones `tx` while briefly holding the sessions lock, then calls
 /// this OFF-LOCK so the actor round-trip never blocks other session operations.
@@ -4850,7 +5001,7 @@ fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<SummaryRowsResponse
 /// returns, and that write blocks indefinitely when the session's child has
 /// stopped reading and the terminal's input queue is full. With the lock held,
 /// that single stuck session froze every other session operation behind
-/// `Mutex::lock` — including `serialize_active_sessions`, so the daemon could not
+/// `Mutex::lock`, including `serialize_active_sessions`, so the daemon could not
 /// even be handed over to a new build. Off-lock, a stuck session blocks only the
 /// client writing to it.
 fn request_write_input(tx: &Sender<ActorCommand>, bytes: Vec<u8>) -> Result<()> {
@@ -4861,6 +5012,50 @@ fn request_write_input(tx: &Sender<ActorCommand>, bytes: Vec<u8>) -> Result<()> 
     })
     .context("sending session input command")?;
     recv_actor_result(resp_rx, "writing session input")
+}
+
+/// Requests a resize via a cloned actor command channel. Same OFF-LOCK contract as
+/// [`request_write_input`].
+fn request_resize(tx: &Sender<ActorCommand>, size: SessionSize) -> Result<SessionSnapshot> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::Resize {
+        size,
+        response: resp_tx,
+    })
+    .context("sending session resize command")?;
+    recv_actor_result(resp_rx, "resizing session")
+}
+
+/// Subscribes to a session's events via a cloned actor command channel. Same
+/// OFF-LOCK contract as [`request_write_input`].
+fn request_subscribe_events(
+    tx: &Sender<ActorCommand>,
+    after_event_seq: Option<u64>,
+) -> Result<SessionEventReceiver> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::SubscribeEvents {
+        after_event_seq,
+        response: resp_tx,
+    })
+    .context("sending session event subscription command")?;
+    recv_actor_result(resp_rx, "subscribing to session events")
+}
+
+/// Requests a styled row range via a cloned actor command channel. Same OFF-LOCK
+/// contract as [`request_write_input`].
+fn request_styled_rows(
+    tx: &Sender<ActorCommand>,
+    start: usize,
+    end: usize,
+) -> Result<StyledRowsResponse> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::StyledRows {
+        start,
+        end,
+        response: resp_tx,
+    })
+    .context("sending session styled row command")?;
+    recv_actor_result(resp_rx, "reading session styled rows")
 }
 
 /// Requests the session's already-resolved git context via a cloned actor
@@ -4878,6 +5073,11 @@ fn request_session_context(tx: &Sender<ActorCommand>) -> Result<Option<SessionCo
 /// Requests a full snapshot via a cloned actor command channel. Mirrors
 /// [`request_summary_rows`]: clone `tx` under a brief lock, then call this
 /// OFF-LOCK so the actor round-trip never blocks other session operations.
+///
+/// The OFF-LOCK part matters most here of all: clients poll snapshots, so an actor
+/// parked on a session whose child stopped reading would wedge the whole daemon on
+/// the very next poll, whether or not anyone is writing to that session. See
+/// [`request_write_input`] for what that failure looked like.
 fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     let (resp_tx, resp_rx) = mpsc::channel();
     tx.send(ActorCommand::Snapshot { response: resp_tx })
@@ -5186,17 +5386,17 @@ fn git_raw_output(cwd: &PathBuf, args: &[&str]) -> Option<Vec<u8>> {
 /// exactly that: the daemon had inherited a terminal and sat in a *background*
 /// process group, the child inherited both, and job control stopped it. A stopped
 /// child never closes its pipes, so the session actor blocked indefinitely and
-/// took the manager mutex's holder down with it — the whole daemon stopped
+/// took the manager mutex's holder down with it: the whole daemon stopped
 /// serving on one `git` invocation.
 ///
 /// `setsid` in the child leaves it with no controlling terminal at all, so
 /// `SIGTTIN`/`SIGTTOU` can never be raised against it. The daemon ignores those
 /// signals for itself (see `ignore_terminal_job_control_signals` in main.rs), but
-/// dispositions set to SIG_IGN are inherited across `exec` only as ignored — a
+/// dispositions set to SIG_IGN are inherited across `exec` only as ignored, so a
 /// child that resets them, or a different signal path, would reopen the hole.
 /// Removing the controlling terminal closes it structurally.
 #[cfg(unix)]
-fn detach_from_terminal(command: &mut Command) {
+pub(crate) fn detach_from_terminal(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: `setsid` is async-signal-safe and is the only call made between
     // fork and exec. It fails only when the caller is already a process-group
@@ -5211,7 +5411,7 @@ fn detach_from_terminal(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn detach_from_terminal(_command: &mut Command) {}
+pub(crate) fn detach_from_terminal(_command: &mut Command) {}
 
 /// Decodes git stdout as UTF-8. Use only for textual fields (e.g. branch
 /// names); paths can contain non-UTF-8 bytes and must use `git_path_output`.
@@ -6015,7 +6215,7 @@ mod tests {
         let actor = SessionActor::spawn(config).expect("spawn session actor");
         let snapshot = wait_for_visible_marker(&actor, "triage-ready");
         let end = snapshot.visible_rows.len().min(2);
-        let response = actor.styled_rows(0, end).expect("load styled rows");
+        let response = request_styled_rows(&actor.tx, 0, end).expect("load styled rows");
 
         assert_eq!(response.output_seq, snapshot.output_seq);
         assert_eq!(response.start, 0);
@@ -6442,9 +6642,7 @@ mod tests {
         };
 
         let actor = SessionActor::spawn(config).expect("spawn session actor");
-        actor
-            .write_input(input_that_prints_marker())
-            .expect("write PTY input");
+        request_write_input(&actor.tx, input_that_prints_marker()).expect("write PTY input");
 
         let first = wait_for_visible_marker(&actor, "actor-ready");
         assert!(
@@ -6456,15 +6654,17 @@ mod tests {
             "snapshot should include logged byte count"
         );
 
-        let resized = actor
-            .resize(SessionSize {
+        let resized = request_resize(
+            &actor.tx,
+            SessionSize {
                 rows: 8,
                 cols: 48,
                 pixel_width: 960,
                 pixel_height: 320,
                 dpi: 96,
-            })
-            .expect("resize session actor");
+            },
+        )
+        .expect("resize session actor");
         assert_eq!(resized.size.rows, 8);
         assert_eq!(resized.size.cols, 48);
         assert!(resized.output_seq >= first.output_seq);
@@ -8360,7 +8560,7 @@ mod tests {
             let ManagedSession::Live { actor, .. } = session else {
                 panic!("expected live session");
             };
-            actor.write_input(b"exit\n".to_vec()).expect("exit shell");
+            request_write_input(&actor.tx, b"exit\n".to_vec()).expect("exit shell");
         }
 
         wait_for_exit_event(&subscriber, &session_id);
@@ -8714,6 +8914,298 @@ mod tests {
             std::thread::current().id()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    /// A session whose actor never answers must not freeze every other session.
+    ///
+    /// This is the regression for the wedge of 2026-08-13: `write_input` held the
+    /// manager's sessions mutex across its actor round-trip, so one session whose
+    /// PTY child had stopped reading blocked the actor mid-`write_all` and, through
+    /// the still-held guard, blocked everything else that touches sessions:
+    /// `list_sessions`, snapshots, activity persistence, and decisively
+    /// `serialize_active_sessions`, so the daemon could not even be handed over.
+    /// HTTP accepted connections and returned zero bytes.
+    ///
+    /// The blocked actor is modelled by not running one at all: the session's
+    /// `Sender` goes to a receiver this test owns and never services, so a caller
+    /// parks in `recv_actor_result` indefinitely. That makes the test
+    /// deterministic where a real stuck PTY would not be: no tty buffer size to
+    /// out-guess, no child to keep alive, no sleeps. Receiving the command is the
+    /// synchronisation point: after it the writer is provably inside the
+    /// round-trip. On the old code `list_sessions` then deadlocks forever; on this
+    /// one it returns.
+    #[test]
+    fn write_input_releases_the_sessions_lock_before_the_actor_round_trip() {
+        let log_dir = unique_log_dir();
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let session_id = SessionId::new("session-stuck").expect("session id");
+        let client_id = ClientId::new("lease-holder").expect("client id");
+
+        let (tx, actor_rx) = mpsc::channel();
+        let mut lease = InputLeaseState::default();
+        lease.acquire(
+            client_id.clone(),
+            triage_core::session::InputControllerKind::Interactive,
+        );
+        manager.sessions().expect("sessions lock").insert(
+            session_id.clone(),
+            ManagedSession::Live {
+                actor: SessionActor {
+                    tx,
+                    worker: None,
+                    reader: None,
+                    last_activity_ms: Arc::new(AtomicU64::new(0)),
+                },
+                lease,
+                launch: PersistedSessionLaunch {
+                    command: "/bin/sh".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    size: SessionSize::default(),
+                    log_path: log_dir.join("session-stuck.log"),
+                },
+                last_known_cwd: None,
+            },
+        );
+
+        let writer_manager = Arc::clone(&manager);
+        let writer_session = session_id.clone();
+        let writer = thread::spawn(move || {
+            writer_manager.write_input(WriteInputRequest {
+                session_id: writer_session,
+                client_id,
+                bytes: b"input for a session that will never take it".to_vec(),
+            })
+        });
+
+        // Keep the command alive: dropping it drops the response `Sender`, which
+        // would disconnect the channel and release the writer early.
+        let command = actor_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the writer should reach the actor's command channel");
+        assert!(
+            matches!(command, ActorCommand::WriteInput { .. }),
+            "the writer should have sent a WriteInput command"
+        );
+
+        // Off-thread so a regression fails this test rather than hanging the suite
+        // forever: the failure mode being guarded against is an unbounded block.
+        let (listed_tx, listed_rx) = mpsc::channel();
+        let listing_manager = Arc::clone(&manager);
+        thread::spawn(move || {
+            let _ = listed_tx.send(listing_manager.list_sessions());
+        });
+        let listed = listed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect(
+                "list_sessions never returned while one session's write was parked in its actor \
+                 (the sessions lock is being held across the round-trip again)",
+            )
+            .expect("list_sessions");
+        assert!(
+            listed.contains(&session_id),
+            "expected the stuck session to still be listed, got {listed:?}"
+        );
+
+        // A lease change must also still complete. It is the other half of the fix:
+        // `broadcast_event` no longer waits for the actor, so acquiring a lease does
+        // not join the queue behind a write that will never finish. Every client
+        // attach and every focus change takes this path.
+        let (leased_tx, leased_rx) = mpsc::channel();
+        let leasing_manager = Arc::clone(&manager);
+        let leasing_session = session_id.clone();
+        thread::spawn(move || {
+            let _ = leased_tx.send(leasing_manager.acquire_input_lease(InputLeaseRequest {
+                session_id: leasing_session,
+                client_id: ClientId::new("second-client").expect("client id"),
+                kind: triage_core::session::InputControllerKind::Interactive,
+            }));
+        });
+        leased_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect(
+                "acquire_input_lease never returned while a write was parked in the same actor \
+                 (a lease change is waiting on the actor again)",
+            )
+            .expect("acquire_input_lease");
+
+        // Release the writer so no parked thread outlives the test.
+        drop(command);
+        writer
+            .join()
+            .expect("writer thread")
+            .expect_err("the write should fail once its unanswered actor channel closes");
+    }
+
+    /// One parked session must not cost the rest of the set their handover.
+    ///
+    /// `serialize_active_sessions` bounds its wait so a session whose child stopped
+    /// reading cannot block a swap forever, and the first version of that bound had a
+    /// worse failure than the one it fixed: the extract commands were sent inside the
+    /// collect loop, so once the parked actor spent the shared budget, every session
+    /// after it in iteration order got a zero-length wait against an actor that had not
+    /// yet been asked, and was dropped. A single stuck session therefore lost most of
+    /// the set on the very swap meant to save them.
+    ///
+    /// One parked session and several healthy ones, all of which must come through. The
+    /// old code only mishandles the sessions ordered *after* the parked one, and
+    /// `HashMap` order is randomised per process, so this catches the regression on the
+    /// majority of runs rather than every one: measured 7 failures in 10 with the old
+    /// shape restored. Deterministic detection would need control over iteration
+    /// order that the map does not offer.
+    #[cfg(unix)]
+    #[test]
+    fn a_parked_session_does_not_cost_the_others_their_handover() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+        const HEALTHY: usize = 5;
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let insert = |name: &str| -> Receiver<ActorCommand> {
+            let (tx, rx) = mpsc::channel();
+            let id = SessionId::new(name).expect("session id");
+            manager.sessions().expect("sessions lock").insert(
+                id,
+                ManagedSession::Live {
+                    actor: SessionActor {
+                        tx,
+                        worker: None,
+                        reader: None,
+                        last_activity_ms: Arc::new(AtomicU64::new(0)),
+                    },
+                    lease: InputLeaseState::default(),
+                    launch: PersistedSessionLaunch {
+                        command: "/bin/sh".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        size: SessionSize::default(),
+                        log_path: log_dir.join(format!("{name}.log")),
+                    },
+                    last_known_cwd: None,
+                },
+            );
+            rx
+        };
+
+        // Held and never serviced: this actor is the parked one.
+        let _parked_rx = insert("session-parked");
+
+        // Each healthy actor answers as soon as it is asked, with a real descriptor of
+        // its own so the returned fd is one the caller genuinely has to own.
+        let responders: Vec<_> = (0..HEALTHY)
+            .map(|index| {
+                let rx = insert(&format!("session-healthy-{index}"));
+                let probe = log_dir.join(format!("healthy-master-{index}"));
+                thread::spawn(move || {
+                    let Ok(ActorCommand::ExtractHandoverState { response }) =
+                        rx.recv_timeout(Duration::from_secs(10))
+                    else {
+                        return;
+                    };
+                    let file = std::fs::File::create(probe).expect("open probe");
+                    let _ = response.send(Ok(ExtractedHandover {
+                        // Safety: `file` gives up its descriptor and nothing else holds it.
+                        fd: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(file.into_raw_fd()) },
+                        pid: std::process::id(),
+                        output_seq: 7,
+                        bytes_logged: 11,
+                    }));
+                })
+            })
+            .collect();
+
+        let (state, fds) = manager
+            .serialize_active_sessions()
+            .expect("serialization survives a parked session");
+        for responder in responders {
+            responder.join().expect("responder thread");
+        }
+
+        let transferred: Vec<_> = state
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            state.sessions.len(),
+            HEALTHY,
+            "every healthy session must be transferred even though one actor never \
+             answered, got {transferred:?}"
+        );
+        assert!(
+            transferred
+                .iter()
+                .all(|id| id.starts_with("session-healthy-")),
+            "the parked session must be the only one dropped, got {transferred:?}"
+        );
+        assert_eq!(fds.len(), HEALTHY, "one descriptor per transferred session");
+
+        for fd in fds {
+            // Safety: ownership was handed to this test with the returned vector.
+            drop(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+
+    /// The two questions the shutdown rescue asks before it decides whether to hand
+    /// this daemon's sessions to a successor. Both must answer without ever waiting
+    /// on the sessions mutex, because a daemon wedged on that mutex is exactly when a
+    /// stop signal tends to arrive, and a rescue that blocked there would be the one
+    /// path unable to save anything.
+    #[test]
+    fn rescue_can_read_session_state_without_blocking() {
+        let manager = SessionManager::new(SessionManagerConfig::new(unique_log_dir()));
+
+        assert_eq!(
+            manager.try_live_session_count(),
+            Some(0),
+            "an empty manager has nothing to rescue, which is what lets a stop signal be a \
+             plain exit"
+        );
+        assert!(!manager.handover_in_flight());
+
+        // A live session is counted, so the rescue knows there is something to save.
+        let (tx, _actor_rx) = mpsc::channel();
+        let session_id = SessionId::new("session-live").expect("session id");
+        manager.sessions().expect("sessions lock").insert(
+            session_id,
+            ManagedSession::Live {
+                actor: SessionActor {
+                    tx,
+                    worker: None,
+                    reader: None,
+                    last_activity_ms: Arc::new(AtomicU64::new(0)),
+                },
+                lease: InputLeaseState::default(),
+                launch: PersistedSessionLaunch {
+                    command: "/bin/sh".to_string(),
+                    args: Vec::new(),
+                    cwd: None,
+                    size: SessionSize::default(),
+                    log_path: PathBuf::from("unused.log"),
+                },
+                last_known_cwd: None,
+            },
+        );
+        assert_eq!(manager.try_live_session_count(), Some(1));
+
+        // Held lock: "unknown", never a wait. The rescue reads that as "there may be
+        // sessions" and tries anyway, since a needless attempt costs one process
+        // spawn and a skipped one costs the sessions.
+        let held = manager.sessions().expect("sessions lock");
+        assert_eq!(manager.try_live_session_count(), None);
+        drop(held);
+
+        // The in-flight flag is what stops a rescue starting a second successor for a
+        // swap that is already running.
+        let guard = manager.begin_handover().expect("claim the handover slot");
+        assert!(manager.handover_in_flight());
+        drop(guard);
+        assert!(!manager.handover_in_flight());
     }
 
     #[test]

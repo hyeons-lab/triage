@@ -1,4 +1,4 @@
-# Plan 000123-01 — Make handover survivable: job control and lock discipline
+# Plan 000124-01: Make handover survivable through job control and lock discipline
 
 ## Thinking
 
@@ -41,7 +41,7 @@ Two defects do exactly that, and both are confirmed in code (grep for `setsid`,
    released. Everything that touches sessions then piled up on `Mutex::lock`:
    `list_sessions`, `snapshot_session`, `summary_rows`,
    `run_activity_persistence_loop`, and, decisively,
-   `serialize_active_sessions` — so the daemon could not be handed over at the
+   `serialize_active_sessions`, so the daemon could not be handed over at the
    exact moment we needed to. HTTP accepted connections and returned 0 bytes.
 
    The repo already knows the right shape: `request_summary_rows` (session.rs:4866)
@@ -71,7 +71,7 @@ decision, not a bug fix, and it deserves its own branch.
    change that retires failure mode 1, and it is what the lldb rescue did by hand.
 2. `session.rs`: make `write_input` release the sessions guard before the actor
    round-trip. Clone the `Sender`, validate the lease while holding the guard,
-   drop it, then send and await off-lock — the `request_summary_rows` pattern.
+   drop it, then send and await off-lock, the `request_summary_rows` pattern.
 3. `session.rs`: spawn the cwd-detection `git` child with `setsid` so it has no
    controlling terminal and cannot be job-control-stopped by an inherited one.
 4. `main.rs` / `ipc.rs`: set `FD_CLOEXEC` on the TCP listener and the owner unix
