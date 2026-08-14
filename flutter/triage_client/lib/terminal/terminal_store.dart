@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
+import 'emulator_query_response.dart';
 import 'terminal_intent.dart';
 import 'terminal_sink.dart';
 import 'terminal_state.dart';
@@ -59,7 +60,6 @@ class TerminalStore extends ChangeNotifier {
 
   // Live-stream byte carries (history is decoded as a self-contained unit).
   final List<int> _utf8Carry = <int>[];
-  bool _pendingCarriageReturn = false;
   // Holds a trailing, not-yet-terminated `CSI > …` so a private-mode sequence
   // split across live chunks is still stripped before reaching the emulator.
   String _privateCsiCarry = '';
@@ -77,6 +77,10 @@ class TerminalStore extends ChangeNotifier {
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
+
+  // True while we are writing to the sink, so synchronous emulator auto-responses
+  // (DSR/DA/Kitty queries) are not forwarded back to the host as fake user input.
+  bool _isWritingSink = false;
 
   // True for a brief window after a history replay; while set, emulator output
   // (the program's own query auto-answers) is not forwarded to the host.
@@ -132,7 +136,7 @@ class TerminalStore extends ChangeNotifier {
         return _reduceResize(s, cols, rows);
 
       case UserInput(:final data):
-        if (!s.exited && !_suppressHostInput) {
+        if (!s.exited && !_suppressHostInput && !isEmulatorQueryResponse(data)) {
           onHostInput?.call(data);
         }
         return s;
@@ -235,6 +239,9 @@ class TerminalStore extends ChangeNotifier {
   // ---- Sink-driven events ---------------------------------------------------
 
   void _handleSinkOutput(String data) {
+    if (_isWritingSink || isEmulatorQueryResponse(data)) {
+      return;
+    }
     dispatch(UserInput(data));
   }
 
@@ -342,9 +349,14 @@ class TerminalStore extends ChangeNotifier {
     final sanitized = _stripUnsupportedPrivateCsi(
       utf8.decode(toDecode, allowMalformed: true),
     );
-    final text = _normalizeNewlines(sanitized);
-    if (text.isNotEmpty) {
-      _sink.write(text);
+    if (sanitized.isNotEmpty) {
+      final wasWriting = _isWritingSink;
+      _isWritingSink = true;
+      try {
+        _sink.write(sanitized);
+      } finally {
+        _isWritingSink = wasWriting;
+      }
     }
   }
 
@@ -376,33 +388,8 @@ class TerminalStore extends ChangeNotifier {
     return s.replaceAll(_completePrivateCsi, '');
   }
 
-  /// Normalize bare LF to CRLF (leaving existing CRLF intact) so the emulator
-  /// does not stair-step. A trailing '\r' is held back so a CRLF split across
-  /// chunks (or the history→live boundary) is not doubled.
-  String _normalizeNewlines(String input) {
-    var s = input;
-    if (_pendingCarriageReturn) {
-      s = '\r$s';
-      _pendingCarriageReturn = false;
-    }
-    if (s.endsWith('\r')) {
-      _pendingCarriageReturn = true;
-      s = s.substring(0, s.length - 1);
-    }
-    // Fast path: no LF means nothing to normalize.
-    if (!s.contains('\n')) {
-      return s;
-    }
-    // Promote every bare LF to CRLF while leaving existing CRLF intact. Done by
-    // collapsing CRLF to LF then expanding all LF to CRLF — equivalent to a
-    // `(?<!\r)\n` lookbehind but lookbehind-free, since older Safari/iOS WebKit
-    // (Flutter Web targets) lack regex lookbehind and throw on it at runtime.
-    return s.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n');
-  }
-
   void _resetCarries() {
     _utf8Carry.clear();
-    _pendingCarriageReturn = false;
     _privateCsiCarry = '';
     _appliedLiveSeq = null;
   }

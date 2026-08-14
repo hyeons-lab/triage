@@ -334,11 +334,13 @@ class _TerminalPaneState extends State<TerminalPane> {
             // ctrl/meta-modified "v". It is kept only as the marker saying the
             // interception was removed on purpose, sitting next to the reason.
           } else {
-            final input = _keyboardEventToInput(event);
-            if (input != null) {
-              event.preventDefault();
-              event.stopPropagation();
-              _sendInput(input);
+            // Ensure the xterm textarea has focus so xterm.js natively receives and
+            // encodes all keyboard events (including Ctrl/Alt shortcuts, arrows, IME,
+            // and fast typing) through its unified onData stream without race conditions.
+            if (_initialized) {
+              try {
+                js_util.callMethod(_term, 'focus', []);
+              } catch (_) {}
             }
           }
         }
@@ -471,7 +473,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       js_util.setProperty(options, 'cursorStyle', 'block');
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
-      js_util.setProperty(options, 'convertEol', true);
       js_util.setProperty(options, 'allowProposedApi', true);
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
@@ -996,49 +997,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
   }
 
-  String? _keyboardEventToInput(html.KeyboardEvent event) {
-    final key = event.key;
-    if (key == null) return null;
 
-    if (event.ctrlKey || event.metaKey || event.altKey) {
-      if (event.ctrlKey && key.toLowerCase() == 'c') {
-        return '\x03';
-      }
-      return null;
-    }
-
-    switch (key) {
-      case 'Enter':
-        return '\r';
-      case 'Backspace':
-        return '\x7f';
-      case 'Escape':
-        return '\x1b';
-      case 'ArrowUp':
-        return '\x1b[A';
-      case 'ArrowDown':
-        return '\x1b[B';
-      case 'ArrowRight':
-        return '\x1b[C';
-      case 'ArrowLeft':
-        return '\x1b[D';
-      case 'Home':
-        return '\x1b[H';
-      case 'End':
-        return '\x1b[F';
-      case 'PageUp':
-        return '\x1b[5~';
-      case 'PageDown':
-        return '\x1b[6~';
-      case 'Delete':
-        return '\x1b[3~';
-    }
-
-    if (key.length == 1) {
-      return key;
-    }
-    return null;
-  }
 
   void _updateCursorOptions() {
     final options = js_util.getProperty(_term, 'options');
