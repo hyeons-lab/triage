@@ -1853,32 +1853,38 @@ impl SessionApi for SessionManager {
     }
 
     fn write_input(&self, request: WriteInputRequest) -> Result<()> {
-        let sessions = self.sessions()?;
-        let session = sessions
-            .get(&request.session_id)
-            .with_context(|| format!("session {} not found", request.session_id))?;
-        let ManagedSession::Live { actor, lease, .. } = session else {
-            match session {
-                ManagedSession::Historical { .. } => {
-                    bail!("restored historical sessions cannot accept input")
+        // Resolve and authorize under the lock, then release it before the actor
+        // round-trip: the write can block indefinitely on a child that has stopped
+        // reading, and holding the manager mutex across it takes the whole daemon
+        // down with that one session. See `request_write_input`.
+        let cmd_tx = {
+            let sessions = self.sessions()?;
+            let session = sessions
+                .get(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            let ManagedSession::Live { actor, lease, .. } = session else {
+                match session {
+                    ManagedSession::Historical { .. } => {
+                        bail!("restored historical sessions cannot accept input")
+                    }
+                    ManagedSession::Restoring { .. } => {
+                        bail!("session {} is being restored", request.session_id)
+                    }
+                    ManagedSession::Live { .. } => unreachable!(),
                 }
-                ManagedSession::Restoring { .. } => {
-                    bail!("session {} is being restored", request.session_id)
-                }
-                ManagedSession::Live { .. } => unreachable!(),
-            }
+            };
+            let holder = lease.holder.as_ref().with_context(|| {
+                format!("session {} has no input lease holder", request.session_id)
+            })?;
+            ensure!(
+                holder.client_id == request.client_id,
+                "client {} does not hold input lease for session {}",
+                request.client_id,
+                request.session_id
+            );
+            actor.tx.clone()
         };
-        let holder = lease
-            .holder
-            .as_ref()
-            .with_context(|| format!("session {} has no input lease holder", request.session_id))?;
-        ensure!(
-            holder.client_id == request.client_id,
-            "client {} does not hold input lease for session {}",
-            request.client_id,
-            request.session_id
-        );
-        actor.write_input(request.bytes)
+        request_write_input(&cmd_tx, request.bytes)
     }
 
     fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
@@ -3224,14 +3230,7 @@ impl SessionActor {
     }
 
     pub fn write_input(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(ActorCommand::WriteInput {
-                bytes: bytes.into(),
-                response: tx,
-            })
-            .context("sending session input command")?;
-        recv_actor_result(rx, "writing session input")
+        request_write_input(&self.tx, bytes.into())
     }
 
     pub fn resize(&self, size: SessionSize) -> Result<SessionSnapshot> {
@@ -4843,6 +4842,27 @@ fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<SummaryRowsResponse
     recv_actor_result(resp_rx, "reading session summary rows")
 }
 
+/// Writes input to a session and waits for the actor's acknowledgement. Mirrors
+/// `request_summary_rows`: clone `tx` under a brief lock, then call this OFF-LOCK.
+///
+/// Holding the sessions lock across this round-trip is what wedged the daemon on
+/// 2026-08-13. The actor answers only after its `write_all` to the PTY master
+/// returns, and that write blocks indefinitely when the session's child has
+/// stopped reading and the terminal's input queue is full. With the lock held,
+/// that single stuck session froze every other session operation behind
+/// `Mutex::lock` — including `serialize_active_sessions`, so the daemon could not
+/// even be handed over to a new build. Off-lock, a stuck session blocks only the
+/// client writing to it.
+fn request_write_input(tx: &Sender<ActorCommand>, bytes: Vec<u8>) -> Result<()> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::WriteInput {
+        bytes,
+        response: resp_tx,
+    })
+    .context("sending session input command")?;
+    recv_actor_result(resp_rx, "writing session input")
+}
+
 /// Requests the session's already-resolved git context via a cloned actor
 /// command channel. Mirrors [`request_summary_rows`]: clone `tx` under a brief
 /// lock, then call this OFF-LOCK so the round-trip never blocks other session
@@ -5152,14 +5172,46 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
 }
 
 fn git_raw_output(cwd: &PathBuf, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    detach_from_terminal(&mut command);
+    let output = command.output().ok()?;
     output.status.success().then_some(output.stdout)
 }
+
+/// Puts a helper child in its own session so no terminal can job-control it.
+///
+/// `Command::output` reads the child's pipes until EOF, so a child that never
+/// exits blocks the calling thread forever. On 2026-08-13 a `git rev-parse` did
+/// exactly that: the daemon had inherited a terminal and sat in a *background*
+/// process group, the child inherited both, and job control stopped it. A stopped
+/// child never closes its pipes, so the session actor blocked indefinitely and
+/// took the manager mutex's holder down with it — the whole daemon stopped
+/// serving on one `git` invocation.
+///
+/// `setsid` in the child leaves it with no controlling terminal at all, so
+/// `SIGTTIN`/`SIGTTOU` can never be raised against it. The daemon ignores those
+/// signals for itself (see `ignore_terminal_job_control_signals` in main.rs), but
+/// dispositions set to SIG_IGN are inherited across `exec` only as ignored — a
+/// child that resets them, or a different signal path, would reopen the hole.
+/// Removing the controlling terminal closes it structurally.
+#[cfg(unix)]
+fn detach_from_terminal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe and is the only call made between
+    // fork and exec. It fails only when the caller is already a process-group
+    // leader, which a freshly forked child never is; the result is ignored
+    // because there is no useful recovery in a pre-exec hook.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_from_terminal(_command: &mut Command) {}
 
 /// Decodes git stdout as UTF-8. Use only for textual fields (e.g. branch
 /// names); paths can contain non-UTF-8 bytes and must use `git_path_output`.

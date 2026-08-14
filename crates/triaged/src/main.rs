@@ -26,10 +26,73 @@ fn main() -> anyhow::Result<()> {
         Invocation::Service(_) | Invocation::Daemon { .. } => {}
     }
 
+    // Before any handover work: make job control unable to stop us.
+    #[cfg(unix)]
+    ignore_terminal_job_control_signals();
+
     // Keep this binding alive for the lifetime of the process: dropping the
     // WorkerGuard flushes the non-blocking tracing appender thread.
     let _flush_guard = triage_core::logging::init(triage_core::logging::default_config()?)?;
     run(invocation)
+}
+
+/// Stops the terminal job-control signals from ever suspending this process.
+///
+/// Handover teardown calls `tcsetattr`, and for a process in a *background*
+/// process group that raises `SIGTTOU` unconditionally — TOSTOP does not gate it.
+/// A daemon launched from an interactive shell (including from inside a Triage
+/// session, the most natural place to test a build) is exactly such a process, so
+/// it would stop itself partway through the swap, holding every PTY master, the
+/// control socket and the TCP listener. Those sessions are then hostage: the
+/// process cannot be killed without destroying them, and `SIGCONT` alone does not
+/// help because it re-stops on the next `tcsetattr`.
+///
+/// Ignoring the signal makes the background `tcsetattr` proceed instead of
+/// stopping us, which is what POSIX specifies for an ignored (or blocked)
+/// `SIGTTOU`. `SIGTTIN` is ignored for the same reason on the read side; a daemon
+/// has no business reading a terminal it merely inherited.
+///
+/// This does not detach the controlling terminal (no `setsid`), because a
+/// successor adopted through a handover must keep serving the sessions it
+/// inherited regardless of how it was launched — the goal is only that job
+/// control can never freeze the owner of live PTYs.
+#[cfg(unix)]
+fn ignore_terminal_job_control_signals() {
+    // SAFETY: `signal` with SIG_IGN carries no handler to run, so there is no
+    // async-signal-safety obligation; the only effect is on this process's
+    // disposition table. Errors are deliberately ignored: a failure here is not
+    // worth refusing to start over, and the daemon simply keeps the default
+    // behaviour it has always had.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+}
+
+/// Marks the TCP listener close-on-exec so it cannot leak into helper children.
+///
+/// Without this the listener is inherited by every process the daemon execs. A
+/// `git` child was observed on 2026-08-13 holding the :7777 listening socket,
+/// which means a long-lived leaked child can keep the port bound *after* the
+/// daemon that opened it exits, and the successor then fails to bind with a
+/// spurious `EADDRINUSE` even though no daemon holds the port.
+///
+/// Handover is unaffected: passing the listener to a successor uses `SCM_RIGHTS`,
+/// not `exec`, and `dup` (which `get_active_tcp_listener_fd`'s caller uses) does
+/// not carry `FD_CLOEXEC` to the new descriptor.
+#[cfg(unix)]
+fn close_listener_on_exec(listener: &std::net::TcpListener) {
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.as_raw_fd();
+    // SAFETY: `fd` is owned by `listener`, which outlives this call, and
+    // FD_CLOEXEC is the only flag being set. A failure leaves the previous
+    // (leaky) behaviour, which is not worth aborting startup over.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
 }
 
 /// Whether a daemon already owns the IPC socket, used to decide adopt-vs-fresh
@@ -405,6 +468,10 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
             std::net::TcpListener::bind(bind_addr)?
         }
     };
+
+    // Covers all three paths above (inherited, and both fresh binds).
+    #[cfg(unix)]
+    close_listener_on_exec(&tcp_listener);
 
     // If we have inherited sessions, adopt them!
     #[cfg(unix)]
