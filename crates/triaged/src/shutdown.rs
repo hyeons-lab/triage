@@ -31,10 +31,11 @@
 //!   rest of the same teardown burst, not as asking twice.
 //! - **`SIGKILL` is still fatal.** It cannot be caught, so the only defence would
 //!   be to stop keeping the masters solely in this process (a keeper process that
-//!   outlives it). That is why [`crate::handover::SHUTDOWN_RESCUE_TIMEOUT`] has to
-//!   stay under the supervisor's stop grace period: a supervisor that gives up
-//!   waiting escalates to SIGKILL, and then the rescue loses the sessions it was
-//!   in the middle of saving.
+//!   outlives it). On systemd, [`crate::handover::SHUTDOWN_RESCUE_TIMEOUT`] stays
+//!   under the stop grace period (`TimeoutStopSec=150`); on macOS launchd caps
+//!   `ExitTimeOut` at 60s, and Phase 2 adopt-on-dead-peer ensures transferred
+//!   descriptors are adopted even if launchd SIGKILLs the outgoing daemon before
+//!   the rescue finishes.
 
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -442,14 +443,53 @@ fn run_rescue_loop(read_fd: RawFd) -> ! {
             co_arrived,
             "received a stop signal; attempting to rescue live sessions"
         );
-        let Some(manager) = armed_manager() else {
-            // Nothing owns sessions yet, so there is nothing to hand over and no
-            // reason to stay: exiting is what would have happened with no handler.
+        let manager = loop {
+            let adoption_in_progress = crate::handover::adoption_in_progress();
+            match armed_manager() {
+                Some(manager) if !adoption_in_progress || manager.has_unresolved_adoptions() => {
+                    break manager;
+                }
+                Some(_) | None if adoption_in_progress => {
+                    // The handover globals own the descriptors, but main has not
+                    // yet published them into the manager's transferable queue.
+                    // This is a short startup window; exiting or rescuing now
+                    // would both omit the only PTY copies.
+                    if another_signal_queued(read_fd) {
+                        if chain_started
+                            .is_some_and(|started| started.elapsed() < SIGNAL_COALESCE_GRACE)
+                        {
+                            let drained = drain_queued_signals(read_fd);
+                            tracing::info!(
+                                drained,
+                                "more signals arrived while transferred PTYs were being published; treating them as the same teardown event"
+                            );
+                        } else {
+                            drain_queued_signals(read_fd);
+                            tracing::warn!(
+                                "another stop signal arrived before transferred PTYs became transferable; exiting now as asked"
+                            );
+                            exit_now(1);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Some(manager) => break manager,
+                None => {
+                    // Nothing owns sessions yet, so there is nothing to hand over
+                    // and no reason to stay.
+                    tracing::warn!(
+                        signum,
+                        "stop signal arrived before startup finished; exiting without a rescue"
+                    );
+                    exit_now(0);
+                }
+            }
+        };
+        if crate::handover::adoption_in_progress() {
             tracing::warn!(
                 signum,
-                "stop signal arrived before startup finished; exiting without a rescue"
+                "transferred session descriptors still await adoption; rescue will hand off both live and retained PTYs"
             );
-            exit_now(0);
         };
         match rescue(&manager, read_fd, signum) {
             RescueOutcome::Skipped => exit_now(0),
@@ -503,14 +543,20 @@ fn exit_now(code: i32) -> ! {
 /// look at the pipe again until the rescue returned, up to the full budget later,
 /// and an operator watching a stop take 90 seconds would have no way to insist.
 fn another_signal_queued(read_fd: RawFd) -> bool {
+    signal_queued_with_timeout(read_fd, Duration::ZERO)
+}
+
+/// Whether a terminating signal becomes readable within `timeout`.
+fn signal_queued_with_timeout(read_fd: RawFd, timeout: Duration) -> bool {
     let mut poll_fd = libc::pollfd {
         fd: read_fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: one `pollfd` describing a descriptor this process owns, with a zero
-    // timeout so the call cannot block.
-    let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+    let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: one `pollfd` describing a descriptor this process owns. The timeout
+    // is bounded to the range accepted by `poll`.
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
     ready > 0 && poll_fd.revents & libc::POLLIN != 0
 }
 

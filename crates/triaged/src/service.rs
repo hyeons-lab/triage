@@ -164,21 +164,36 @@ const _: () = assert!(
     "the throttle must exceed launchd's 10s default, or it slows nothing down"
 );
 
-/// Seconds a supervisor waits after SIGTERM before escalating to SIGKILL.
+/// Seconds launchd waits after SIGTERM before escalating to SIGKILL.
 ///
-/// launchd's default is 20s and systemd's is 90s, and both are too short: a
-/// SIGTERM'd daemon answers by starting a successor and handing it every live
-/// session (see `crate::shutdown`), and that takes as long as a cold start, which is
-/// dominated by replaying each historical session's log (~22.6s and growing). An
-/// escalation to SIGKILL mid-rescue destroys exactly the sessions the rescue is
-/// saving, so the grace period has to exceed the rescue's own budget.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
-const STOP_GRACE_SECS: u32 = 150;
+/// launchd silently caps `ExitTimeOut` at 60 seconds (any value above 60 is
+/// replaced with 60 by launchd). Setting 60 requests the true maximum grace
+/// period launchd will grant.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_STOP_GRACE_SECS: u32 = 60;
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 const _: () = assert!(
-    STOP_GRACE_SECS as u64 > crate::handover::SHUTDOWN_RESCUE_TIMEOUT.as_secs(),
-    "the supervisor's stop grace period must outlast the session rescue, or SIGKILL lands \
+    LAUNCHD_STOP_GRACE_SECS == 60,
+    "launchd caps ExitTimeOut at 60s, so setting any other value either requests less \
+     grace than available or claims a budget launchd silently ignores"
+);
+
+/// Seconds systemd waits after SIGTERM before escalating to SIGKILL.
+///
+/// systemd's default is 90s, and a SIGTERM'd daemon answers by starting a
+/// successor and handing it every live session (see `crate::shutdown`), which takes
+/// as long as a cold start (session log replay and warm-up). An escalation to
+/// SIGKILL mid-rescue destroys exactly the sessions the rescue is saving. Unlike
+/// launchd, systemd has no 60s cap on `TimeoutStopSec`, so 150s provides ample
+/// headroom exceeding `SHUTDOWN_RESCUE_TIMEOUT` (90s).
+#[cfg(any(target_os = "linux", test))]
+const SYSTEMD_STOP_GRACE_SECS: u32 = 150;
+
+#[cfg(any(target_os = "linux", test))]
+const _: () = assert!(
+    SYSTEMD_STOP_GRACE_SECS as u64 > crate::handover::SHUTDOWN_RESCUE_TIMEOUT.as_secs(),
+    "the systemd stop grace period must outlast the session rescue, or SIGKILL lands \
      mid-handover and takes every live session with it"
 );
 
@@ -186,8 +201,8 @@ const _: () = assert!(
 /// stdout/stderr to the given log files.
 ///
 /// `KeepAlive` stays unconditional. Making it conditional on `SuccessfulExit`
-/// looks tempting — it would stop launchd respawning the job after the clean
-/// exit that ends a handover — but that respawn is load-bearing: it is how
+/// looks tempting: it would stop launchd respawning the job after the clean
+/// exit that ends a handover, but that respawn is load-bearing: it is how
 /// supervision returns to a launchd-owned process after a manual handover (see
 /// `devlog/000085-fix-daemon-smart-start.md`), and `main`'s refused-teardown
 /// path documents that it relies on being respawned regardless of exit status.
@@ -224,13 +239,13 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
         throttle = THROTTLE_INTERVAL_SECS,
-        stop_grace = STOP_GRACE_SECS,
+        stop_grace = LAUNCHD_STOP_GRACE_SECS,
         stdout = xml_escape(&stdout_log.display().to_string()),
         stderr = xml_escape(&stderr_log.display().to_string()),
     )
 }
 
-/// systemd `--user` unit that runs `exe` and restarts it on failure. `ExecStart`
+/// systemd `--user` unit that runs `exe` and restarts it after every exit. `ExecStart`
 /// is quoted so a home directory with spaces still parses.
 ///
 /// `KillMode=process` is load-bearing, not a preference. systemd's default
@@ -250,7 +265,7 @@ fn systemd_unit_contents(exe: &Path) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart=\"{exe}\"\n\
-         Restart=on-failure\n\
+         Restart=always\n\
          RestartSec=2\n\
          TimeoutStopSec={stop_grace}\n\
          KillMode=process\n\
@@ -258,7 +273,7 @@ fn systemd_unit_contents(exe: &Path) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         exe = exe.display(),
-        stop_grace = STOP_GRACE_SECS,
+        stop_grace = SYSTEMD_STOP_GRACE_SECS,
     )
 }
 
@@ -712,10 +727,11 @@ mod tests {
     /// The daemon answers SIGTERM by handing its live sessions to a successor
     /// rather than dying (`crate::shutdown`), and that takes as long as a cold
     /// start. launchd's 20s default and systemd's 90s default both escalate to
-    /// SIGKILL partway through, which destroys the sessions the rescue is saving,
-    /// so both units must declare a grace period longer than the rescue budget.
-    /// (The relation between the two constants is pinned by a compile-time
-    /// assertion; these check the value actually reaches the unit files.)
+    /// SIGKILL partway through.
+    ///
+    /// macOS launchd silently caps ExitTimeOut at 60s (values above 60 are
+    /// replaced by 60 outright), while systemd TimeoutStopSec has no such cap and
+    /// is set to 150s to provide headroom exceeding the rescue budget.
     #[test]
     fn units_grant_the_session_rescue_time_to_finish() {
         let plist = plist_contents(
@@ -730,13 +746,13 @@ mod tests {
         assert!(
             exit_timeout
                 .trim_start()
-                .starts_with(&format!("<integer>{STOP_GRACE_SECS}</integer>")),
+                .starts_with(&format!("<integer>{LAUNCHD_STOP_GRACE_SECS}</integer>")),
             "ExitTimeOut must be followed by its value: {exit_timeout}"
         );
 
         let unit = systemd_unit_contents(Path::new("/home/me/.cargo/bin/triaged"));
         assert!(
-            unit.contains(&format!("TimeoutStopSec={STOP_GRACE_SECS}")),
+            unit.contains(&format!("TimeoutStopSec={SYSTEMD_STOP_GRACE_SECS}")),
             "the systemd unit must extend the stop timeout: {unit}"
         );
         // A longer timeout is useless on its own under systemd: the default kill mode
@@ -763,7 +779,7 @@ mod tests {
     fn systemd_unit_quotes_execstart_and_restarts() {
         let unit = systemd_unit_contents(Path::new("/home/me/.cargo/bin/triaged"));
         assert!(unit.contains("ExecStart=\"/home/me/.cargo/bin/triaged\""));
-        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 

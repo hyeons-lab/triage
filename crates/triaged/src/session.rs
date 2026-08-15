@@ -69,6 +69,23 @@ const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
 
+/// Internal argv marker used by the daemon executable as a child-side exec
+/// shim. The daemon itself ignores TTIN/TTOU so handover terminal changes cannot
+/// stop it; the shim resets those inherited dispositions after portable-pty's
+/// fork and before the configured session program is exec'd.
+#[cfg(unix)]
+pub const PTY_CHILD_EXEC_ARG: &str = "--triage-pty-child-exec";
+
+#[cfg(unix)]
+static PTY_CHILD_NEEDS_JOB_CONTROL_RESET: AtomicBool = AtomicBool::new(false);
+
+/// Records that this process installed ignored TTIN/TTOU dispositions which a
+/// subsequently exec'd PTY child must reset. Called once during daemon startup.
+#[cfg(unix)]
+pub fn mark_job_control_signals_ignored() {
+    PTY_CHILD_NEEDS_JOB_CONTROL_RESET.store(true, Ordering::Release);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
     pub command: String,
@@ -298,6 +315,32 @@ pub struct SessionManager {
     /// descriptors and would be lost when that daemon detaches and exits. Set and
     /// cleared through [`SessionManager::begin_handover`].
     handover_in_flight: AtomicBool,
+    /// Session metadata and the sole inherited PTY descriptor retained when a
+    /// post-commit adoption attempt fails. The predecessor has already detached
+    /// at that point, so closing either the failed descriptor or the unattempted
+    /// tail would destroy those sessions.
+    #[cfg(unix)]
+    pending_adoptions: Mutex<Vec<(crate::handover::HandoverSession, std::os::unix::io::RawFd)>>,
+    /// IDs whose live PTYs are retained in `pending_adoptions` or are currently
+    /// being installed by an adoption attempt. The session map can still carry
+    /// a historical placeholder for the same ID, so restore/shutdown must check
+    /// this set instead of trusting the map alone.
+    #[cfg(unix)]
+    pending_adoption_ids: Mutex<HashSet<SessionId>>,
+    /// Guards the background retry loop for [`Self::pending_adoptions`].
+    #[cfg(unix)]
+    adoption_retry_started: AtomicBool,
+    /// Closes the handover snapshot race while a retry owns descriptors outside
+    /// `pending_adoptions` and may still install their actors.
+    #[cfg(unix)]
+    adoption_attempts_in_flight: AtomicU64,
+    /// Prevents a handover snapshot from racing a session that has been removed
+    /// from the map while its child termination is still fallible.
+    session_shutdowns_in_flight: AtomicU64,
+    /// Session IDs undergoing restore or shutdown. Both transitions release the
+    /// sessions lock for fallible actor work, so this per-ID guard prevents them
+    /// from interleaving and committing contradictory manifest state.
+    session_lifecycle_ids: Mutex<HashSet<SessionId>>,
     /// Guards [`Self::start_activity_persistence`] so a second call cannot spawn a
     /// second flush thread, both racing to rewrite the same manifest.
     activity_persistence_started: AtomicBool,
@@ -423,6 +466,23 @@ struct SessionManifest {
     sessions: Vec<PersistedSession>,
 }
 
+fn encode_manifest(
+    sessions: &HashMap<SessionId, ManagedSession>,
+    excluded: Option<&SessionId>,
+) -> Result<Vec<u8>> {
+    let mut persisted_sessions = sessions
+        .iter()
+        .filter(|(session_id, _)| excluded != Some(*session_id))
+        .map(|(session_id, session)| session.persisted(session_id.clone()))
+        .collect::<Vec<_>>();
+    persisted_sessions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    serde_json::to_vec_pretty(&SessionManifest {
+        version: 1,
+        sessions: persisted_sessions,
+    })
+    .context("encoding session manifest")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSession {
     id: SessionId,
@@ -525,6 +585,16 @@ impl SessionManager {
             update_status: Arc::new(RwLock::new(crate::update::UpdateStatus::current())),
             cwd_update_tx: Mutex::new(None),
             handover_in_flight: AtomicBool::new(false),
+            #[cfg(unix)]
+            pending_adoptions: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            pending_adoption_ids: Mutex::new(HashSet::new()),
+            #[cfg(unix)]
+            adoption_retry_started: AtomicBool::new(false),
+            #[cfg(unix)]
+            adoption_attempts_in_flight: AtomicU64::new(0),
+            session_shutdowns_in_flight: AtomicU64::new(0),
+            session_lifecycle_ids: Mutex::new(HashSet::new()),
             activity_persistence_started: AtomicBool::new(false),
         }
     }
@@ -535,10 +605,98 @@ impl SessionManager {
     /// drop — a handover that fails before committing leaves the daemon able to
     /// serve a later one and to start sessions again.
     pub fn begin_handover(&self) -> Option<HandoverGuard<'_>> {
-        self.handover_in_flight
+        if self.handover_operation_in_flight() {
+            return None;
+        }
+        let guard = self
+            .handover_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| HandoverGuard { manager: self })
+            .map(|_| HandoverGuard { manager: self })?;
+        if self.handover_operation_in_flight() {
+            drop(guard);
+            return None;
+        }
+        Some(guard)
+    }
+
+    fn handover_operation_in_flight(&self) -> bool {
+        if self.session_shutdowns_in_flight.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        #[cfg(unix)]
+        if self.adoption_attempts_in_flight.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        false
+    }
+
+    fn begin_session_shutdown(&self, session_id: &SessionId) -> Result<SessionShutdownGuard<'_>> {
+        {
+            let mut shutting_down = self
+                .session_lifecycle_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ensure!(
+                shutting_down.insert(session_id.clone()),
+                "session {session_id} is already shutting down"
+            );
+        }
+        self.session_shutdowns_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        if self.handover_in_flight() {
+            self.session_shutdowns_in_flight
+                .fetch_sub(1, Ordering::AcqRel);
+            self.session_lifecycle_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(session_id);
+            bail!("a handover is in progress; try again once the daemon swap completes");
+        }
+        Ok(SessionShutdownGuard {
+            manager: self,
+            session_id: session_id.clone(),
+        })
+    }
+
+    fn begin_session_restore(&self, session_id: &SessionId) -> Result<SessionRestoreGuard<'_>> {
+        let mut changing = self
+            .session_lifecycle_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure!(
+            changing.insert(session_id.clone()),
+            "session {session_id} is already being restored or shut down"
+        );
+        Ok(SessionRestoreGuard {
+            manager: self,
+            session_id: session_id.clone(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn session_awaits_adoption(&self, session_id: &SessionId) -> bool {
+        self.pending_adoption_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session_id)
+    }
+
+    #[cfg(not(unix))]
+    fn session_awaits_adoption(&self, _session_id: &SessionId) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn begin_adoption_attempt(&self) -> Option<AdoptionAttemptGuard<'_>> {
+        self.adoption_attempts_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        if self.handover_in_flight() {
+            self.adoption_attempts_in_flight
+                .fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(AdoptionAttemptGuard { manager: self })
     }
 
     /// Whether a handover is being served right now.
@@ -559,13 +717,22 @@ impl SessionManager {
     /// still save the sessions. `None` means "could not tell", and the rescue
     /// treats that as "assume there are some" rather than as zero.
     pub(crate) fn try_live_session_count(&self) -> Option<usize> {
+        if self.handover_operation_in_flight() {
+            return None;
+        }
         let sessions = self.sessions.try_lock().ok()?;
-        Some(
-            sessions
-                .values()
-                .filter(|session| matches!(session, ManagedSession::Live { .. }))
-                .count(),
-        )
+        #[cfg(unix)]
+        let pending = self.pending_adoptions.try_lock().ok()?;
+        if self.handover_operation_in_flight() {
+            return None;
+        }
+        let live = sessions
+            .values()
+            .filter(|session| matches!(session, ManagedSession::Live { .. }))
+            .count();
+        #[cfg(unix)]
+        let live = live.saturating_add(pending.len());
+        Some(live)
     }
 
     fn allocate_session_id(&self) -> Result<SessionId> {
@@ -958,6 +1125,11 @@ impl SessionManager {
     /// [`Self::purge_orphaned_logs`] with an explicit grace period, so tests can
     /// drive the real union without backdating file mtimes.
     fn purge_orphaned_logs_with_retention(&self, retention: std::time::Duration) {
+        #[cfg(unix)]
+        if self.has_unresolved_adoptions() {
+            tracing::info!("inherited sessions still await adoption; skipping orphaned log purge");
+            return;
+        }
         let Ok(sessions) = self.sessions() else {
             tracing::warn!("session lock poisoned; skipping orphaned log purge");
             return;
@@ -1021,25 +1193,37 @@ impl SessionManager {
     }
 
     fn persist_manifest(&self, sessions: &HashMap<SessionId, ManagedSession>) -> Result<()> {
+        let json = encode_manifest(sessions, None)?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
-        let mut persisted_sessions = sessions
-            .iter()
-            .map(|(session_id, session)| session.persisted(session_id.clone()))
-            .collect::<Vec<_>>();
-        persisted_sessions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        let manifest = SessionManifest {
-            version: 1,
-            sessions: persisted_sessions,
-        };
         let manifest_path = self.config.manifest_path();
         let temp_path = manifest_path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(&manifest).context("encoding session manifest")?;
         fs::write(&temp_path, json)
             .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
         replace_manifest(&temp_path, &manifest_path)?;
         Ok(())
+    }
+
+    fn prepare_shutdown_manifest(
+        &self,
+        sessions: &HashMap<SessionId, ManagedSession>,
+        session_id: &SessionId,
+    ) -> Result<PathBuf> {
+        let json = encode_manifest(sessions, Some(session_id))?;
+        fs::create_dir_all(&self.config.log_dir).with_context(|| {
+            format!("creating session log dir {}", self.config.log_dir.display())
+        })?;
+        let temp_path = self.shutdown_manifest_temp_path(session_id);
+        fs::write(&temp_path, json)
+            .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
+        Ok(temp_path)
+    }
+
+    fn shutdown_manifest_temp_path(&self, session_id: &SessionId) -> PathBuf {
+        self.config
+            .log_dir
+            .join(format!(".sessions-{session_id}-shutdown.tmp"))
     }
 
     fn rollback_restoring_session(&self, session_id: SessionId) -> Result<()> {
@@ -1362,8 +1546,37 @@ impl SessionManager {
                 output_seq: ext.output_seq,
                 bytes_logged: ext.bytes_logged,
                 pid: ext.pid,
+                process_identity: ext.process_identity,
                 last_activity_ms,
             });
+        }
+
+        // A failed post-commit adoption has no actor yet, but its retained raw
+        // descriptor is still a live session and must be part of any later
+        // handover. `begin_handover` excludes retry attempts before setting its
+        // flag, and retry attempts refuse while that flag is set, so this queue is
+        // stable for the authoritative snapshot.
+        let retained = self
+            .pending_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (session, fd) in retained.iter() {
+            let duplicate = match crate::handover::dup_cloexec(*fd) {
+                Ok(duplicate) => duplicate,
+                Err(error) => {
+                    for fd in fds.drain(..) {
+                        // SAFETY: every entry was created for this snapshot and
+                        // has not been transferred to any other owner.
+                        unsafe { libc::close(fd) };
+                    }
+                    return Err(error).context(format!(
+                        "duplicating retained PTY for handover session {}",
+                        session.id
+                    ));
+                }
+            };
+            handover_sessions.push(session.clone());
+            fds.push(duplicate);
         }
 
         let state = crate::handover::HandoverState {
@@ -1372,6 +1585,8 @@ impl SessionManager {
             // handle_handover_server sets this true once it takes over the wire
             // protocol; the manager itself makes no protocol promise.
             sends_teardown_commit: false,
+            handover_owner_token: None,
+            handover_lineage_token: None,
         };
 
         Ok((state, fds))
@@ -1446,143 +1661,388 @@ impl SessionManager {
     }
 
     #[cfg(unix)]
+    pub fn queue_handover_adoptions(
+        &self,
+        state: crate::handover::HandoverState,
+        fds: Vec<std::os::unix::io::RawFd>,
+    ) -> Result<()> {
+        let mut pending = UnadoptedFds::new(fds);
+        let expected = state.sessions.len();
+        let retained: Vec<_> = state
+            .sessions
+            .into_iter()
+            .filter_map(|session| pending.take_next().map(|fd| (session, fd)))
+            .collect();
+        let retained_count = retained.len();
+        self.retain_pending_adoptions(retained);
+        ensure!(
+            retained_count == expected,
+            "received {retained_count} PTY descriptors for {expected} inherited sessions"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
     pub fn adopt_sessions(
         &self,
         state: crate::handover::HandoverState,
         fds: Vec<std::os::unix::io::RawFd>,
     ) -> Result<()> {
-        let mut sessions = self.sessions()?;
         let mut pending = UnadoptedFds::new(fds);
+        let mut sessions = match self.sessions() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                let retained = state
+                    .sessions
+                    .into_iter()
+                    .filter_map(|session| pending.take_next().map(|fd| (session, fd)))
+                    .collect();
+                self.retain_pending_adoptions(retained);
+                return Err(error.context(
+                    "locking the session manager for handover adoption; descriptors retained",
+                ));
+            }
+        };
+        let mut failures = Vec::new();
+        let mut failure_messages = Vec::new();
 
-        for h_sess in state.sessions {
+        for mut h_sess in state.sessions {
             let Some(fd) = pending.take_next() else {
-                bail!("No inherited FDs left for session {}", h_sess.id);
+                failure_messages.push(format!("{}: no inherited descriptor", h_sess.id));
+                continue;
             };
 
-            let runtime = spawn_adopted_pty_runtime(&h_sess, fd)?;
-
-            let launch = PersistedSessionLaunch {
-                command: h_sess.command.clone(),
-                args: h_sess.args.clone(),
-                cwd: h_sess.cwd.clone(),
-                size: h_sess.size.clone(),
-                log_path: h_sess.log_path.clone(),
+            // Keep the transferred descriptor idle until the new actor is fully
+            // installed. The actor receives a duplicate; success closes this
+            // reserve, while failure retains it for another attempt. This makes
+            // every fallible step after the predecessor's commit lossless.
+            let attempt_fd = match crate::handover::dup_cloexec(fd) {
+                Ok(attempt_fd) => attempt_fd,
+                Err(error) => {
+                    failure_messages.push(format!("{}: duplicating PTY: {error}", h_sess.id));
+                    failures.push((h_sess, fd));
+                    continue;
+                }
             };
 
-            let event_session_id = Some(h_sess.id.clone());
-            let dirty_tx = self.dirty_tx();
-            let cwd_update_tx = self.cwd_update_tx();
-            let global_senders = Some(self.global_senders());
-
-            let PtyRuntime {
-                master,
-                child,
-                reader,
-                writer,
-                output,
-                size,
-                log_path,
-                current_working_directory,
-            } = runtime;
-
-            let initial_working_directory = current_working_directory
-                .or_else(|| h_sess.cwd.clone())
-                .or_else(|| std::env::current_dir().ok());
-            let initial_context = resolve_session_context(initial_working_directory.as_ref());
-            let last_known_cwd = initial_working_directory.clone();
-
-            let (command_tx, command_rx) = mpsc::channel();
-            let (output_tx, output_rx) = mpsc::sync_channel(64);
-            // Carry the outgoing daemon's stamp through the swap. A zero means
-            // that daemon predates the field; fall back to "now" so the session
-            // sorts as recent rather than as epoch-old, which would bury a
-            // genuinely busy session at the bottom of the rail.
-            let adopted_activity_ms = if h_sess.last_activity_ms == 0 {
-                now_unix_millis()
-            } else {
-                h_sess.last_activity_ms
-            };
-            let last_activity_ms = Arc::new(AtomicU64::new(adopted_activity_ms));
-            let actor_last_activity_ms = Arc::clone(&last_activity_ms);
-
-            let reader = thread::Builder::new()
-                .name("session-actor-reader".into())
-                .spawn(move || read_pty_output(reader, output_tx))
-                .context("spawning session actor reader thread")?;
-
-            let worker = thread::Builder::new()
-                .name("session-actor-worker".into())
-                .spawn(move || {
-                    let state = ActorState {
-                        master,
-                        child,
-                        writer,
-                        output,
-                        size,
-                        log_path,
-                        exited: false,
-                        output_closed: false,
-                        exit_broadcasted: false,
-                        current_working_directory: initial_working_directory,
-                        context: initial_context,
-                        event_session_id,
-                        dirty_tx,
-                        last_activity_ms: actor_last_activity_ms,
-                        cwd_update_tx,
-                        global_senders,
-                        context_resend_pending: false,
-                        shell_reports_cwd: false,
-                        // Throttle the cwd poll from spawn so the idle refresh
-                        // doesn't fire before the session has settled (and races
-                        // the initial snapshot); the first poll runs one interval
-                        // in. Output-driven polling is gated by the same field.
-                        last_cwd_poll: Some(Instant::now()),
-                        subscribers: Vec::new(),
-                        event_log: VecDeque::new(),
-                        next_event_seq: 1,
-                    };
-                    run_actor(state, command_rx, output_rx);
-                })
-                // If this spawn fails the closure is dropped, which drops `master`
-                // (closing the adopted fd — see AdoptedMasterPty's Drop) and
-                // `output_rx`. The reader thread started just above outlives that
-                // by design: it is blocked in `read`, and only notices on its next
-                // send, which fails against the dropped receiver and ends it. So an
-                // idle session leaves one thread and its dup'd fd parked until the
-                // child next writes. Bounded and self-clearing, but not immediate —
-                // making it deterministic means teaching the actor to tear down a
-                // half-built session, which is tracked as a follow-up.
-                .context("spawning session actor worker thread")?;
-
-            let actor = SessionActor {
-                tx: command_tx,
-                worker: Some(worker),
-                reader: Some(reader),
-                last_activity_ms,
-            };
-
-            sessions.insert(
-                h_sess.id.clone(),
-                ManagedSession::Live {
-                    actor,
-                    lease: InputLeaseState::default(),
-                    launch,
-                    last_known_cwd,
-                },
-            );
-
-            // Per session, so a shell that later turns out to be dead can be
-            // identified from the log rather than inferred from a total.
-            tracing::info!(
-                session_id = %h_sess.id,
-                pid = h_sess.pid,
-                command = %h_sess.command,
-                "adopted inherited live session"
-            );
+            match self.adopt_one_session(&mut sessions, &mut h_sess, attempt_fd) {
+                Ok(()) => {
+                    // SAFETY: `pending.take_next` transferred sole ownership of
+                    // the reserve descriptor to this iteration. The live actor
+                    // owns `attempt_fd`, so the reserve is no longer needed.
+                    unsafe { libc::close(fd) };
+                }
+                Err(error) => {
+                    failure_messages.push(format!("{}: {error:#}", h_sess.id));
+                    failures.push((h_sess, fd));
+                }
+            }
         }
 
-        self.persist_manifest(&sessions)?;
+        self.retain_pending_adoptions(failures);
+        let persist_result = self.persist_manifest(&sessions);
+        if !failure_messages.is_empty() {
+            if let Err(error) = &persist_result {
+                failure_messages.push(format!("persisting adopted sessions: {error:#}"));
+            }
+            bail!(
+                "failed to adopt {} inherited session(s); descriptors retained for retry: {}",
+                failure_messages.len(),
+                failure_messages.join("; ")
+            );
+        }
+        persist_result
+    }
+
+    #[cfg(unix)]
+    fn adopt_one_session(
+        &self,
+        sessions: &mut HashMap<SessionId, ManagedSession>,
+        h_sess: &mut crate::handover::HandoverSession,
+        fd: std::os::unix::io::RawFd,
+    ) -> Result<()> {
+        let conflicts_with_existing =
+            sessions
+                .get(&h_sess.id)
+                .is_some_and(|existing| match existing {
+                    ManagedSession::Live { .. } | ManagedSession::Restoring { .. } => true,
+                    ManagedSession::Historical { session, .. } => {
+                        session.persisted.log_path != h_sess.log_path
+                    }
+                });
+        if conflicts_with_existing {
+            crate::handover::rename_recovered_session(h_sess, |candidate| {
+                sessions.contains_key(candidate)
+            })
+            .with_context(|| format!("reserving a distinct log for session {}", h_sess.id))?;
+        }
+
+        let runtime = spawn_adopted_pty_runtime(h_sess, fd)?;
+
+        if let Some(sequence) = generated_session_sequence(&h_sess.id) {
+            self.next_session
+                .fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
+        }
+
+        let launch = PersistedSessionLaunch {
+            command: h_sess.command.clone(),
+            args: h_sess.args.clone(),
+            cwd: h_sess.cwd.clone(),
+            size: h_sess.size.clone(),
+            log_path: h_sess.log_path.clone(),
+        };
+
+        let event_session_id = Some(h_sess.id.clone());
+        let dirty_tx = self.dirty_tx();
+        let cwd_update_tx = self.cwd_update_tx();
+        let global_senders = Some(self.global_senders());
+
+        let PtyRuntime {
+            master,
+            child,
+            process_identity,
+            reader,
+            writer,
+            output,
+            size,
+            log_path,
+            current_working_directory,
+        } = runtime;
+
+        let initial_working_directory = current_working_directory
+            .or_else(|| h_sess.cwd.clone())
+            .or_else(|| std::env::current_dir().ok());
+        let initial_context = resolve_session_context(initial_working_directory.as_ref());
+        let last_known_cwd = initial_working_directory.clone();
+
+        let (command_tx, command_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::sync_channel(64);
+        let adopted_activity_ms = if h_sess.last_activity_ms == 0 {
+            now_unix_millis()
+        } else {
+            h_sess.last_activity_ms
+        };
+        let last_activity_ms = Arc::new(AtomicU64::new(adopted_activity_ms));
+        let actor_last_activity_ms = Arc::clone(&last_activity_ms);
+
+        let (reader_start_tx, reader_start_rx) = mpsc::channel();
+        let reader = thread::Builder::new()
+            .name("session-actor-reader".into())
+            .spawn(move || {
+                if reader_start_rx.recv().is_ok() {
+                    read_pty_output(reader, output_tx);
+                }
+            })
+            .context("spawning session actor reader thread")?;
+
+        let worker = thread::Builder::new()
+            .name("session-actor-worker".into())
+            .spawn(move || {
+                let state = ActorState {
+                    master,
+                    child,
+                    process_identity,
+                    writer,
+                    output,
+                    size,
+                    log_path,
+                    exited: false,
+                    output_closed: false,
+                    exit_broadcasted: false,
+                    current_working_directory: initial_working_directory,
+                    context: initial_context,
+                    event_session_id,
+                    dirty_tx,
+                    last_activity_ms: actor_last_activity_ms,
+                    cwd_update_tx,
+                    global_senders,
+                    context_resend_pending: false,
+                    shell_reports_cwd: false,
+                    last_cwd_poll: Some(Instant::now()),
+                    subscribers: Vec::new(),
+                    event_log: VecDeque::new(),
+                    next_event_seq: 1,
+                };
+                run_actor(state, command_rx, output_rx);
+            })
+            .context("spawning session actor worker thread")?;
+
+        reader_start_tx
+            .send(())
+            .context("starting adopted session reader thread")?;
+
+        let actor = SessionActor {
+            tx: command_tx,
+            worker: Some(worker),
+            reader: Some(reader),
+            last_activity_ms,
+        };
+
+        sessions.insert(
+            h_sess.id.clone(),
+            ManagedSession::Live {
+                actor,
+                lease: InputLeaseState::default(),
+                launch,
+                last_known_cwd,
+            },
+        );
+
+        tracing::info!(
+            session_id = %h_sess.id,
+            pid = h_sess.pid,
+            command = %h_sess.command,
+            "adopted inherited live session"
+        );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn retain_pending_adoptions(
+        &self,
+        retained: Vec<(crate::handover::HandoverSession, std::os::unix::io::RawFd)>,
+    ) {
+        for (session, _) in &retained {
+            if let Some(sequence) = generated_session_sequence(&session.id) {
+                self.next_session
+                    .fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
+            }
+        }
+        let ids = {
+            let mut pending = self
+                .pending_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.extend(retained);
+            pending
+                .iter()
+                .map(|(session, _)| session.id.clone())
+                .collect()
+        };
+        *self
+            .pending_adoption_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ids;
+    }
+
+    #[cfg(unix)]
+    fn refresh_pending_adoption_ids(&self) {
+        let ids = self
+            .pending_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(session, _)| session.id.clone())
+            .collect();
+        *self
+            .pending_adoption_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ids;
+    }
+
+    #[cfg(unix)]
+    fn has_pending_adoptions(&self) -> bool {
+        !self
+            .pending_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    #[cfg(unix)]
+    pub fn has_unresolved_adoptions(&self) -> bool {
+        self.adoption_retry_started.load(Ordering::Acquire) || self.has_pending_adoptions()
+    }
+
+    #[cfg(unix)]
+    pub fn retry_pending_adoptions(self: &Arc<Self>) {
+        if self
+            .adoption_retry_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let manager = Arc::clone(self);
+        if let Err(error) = thread::Builder::new()
+            .name("triage-handover-adoption-retry".into())
+            .spawn(move || manager.run_pending_adoption_retries())
+        {
+            self.adoption_retry_started.store(false, Ordering::Release);
+            tracing::error!(
+                %error,
+                "could not start inherited session adoption retry thread; retained PTYs remain transferable to another daemon"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_pending_adoption_retries(&self) {
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            let Some(attempt) = self.begin_adoption_attempt() else {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            let retained = {
+                let mut pending = self
+                    .pending_adoptions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *pending)
+            };
+
+            if retained.is_empty() {
+                drop(attempt);
+                self.adoption_retry_started.store(false, Ordering::Release);
+                crate::handover::finish_handover_adoption();
+                return;
+            }
+
+            let (sessions, fds): (Vec<_>, Vec<_>) = retained.into_iter().unzip();
+            let state = crate::handover::HandoverState {
+                sessions,
+                has_tcp_listener: false,
+                sends_teardown_commit: true,
+                handover_owner_token: None,
+                handover_lineage_token: None,
+            };
+            if let Err(error) = self.adopt_sessions(state, fds) {
+                tracing::warn!(
+                    %error,
+                    retry_delay_ms = retry_delay.as_millis(),
+                    "inherited session adoption is still incomplete; retaining PTYs"
+                );
+            }
+            self.refresh_pending_adoption_ids();
+
+            if !self.has_pending_adoptions() {
+                drop(attempt);
+                self.adoption_retry_started.store(false, Ordering::Release);
+                crate::handover::finish_handover_adoption();
+                return;
+            }
+            drop(attempt);
+            thread::sleep(retry_delay);
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(all(unix, test))]
+    pub(crate) fn take_pending_adoption_fds_for_test(&self) -> Vec<std::os::unix::io::RawFd> {
+        let fds = self
+            .pending_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .map(|(_, fd)| fd)
+            .collect();
+        self.pending_adoption_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        fds
     }
 }
 
@@ -1594,13 +2054,11 @@ impl SessionManager {
 /// guard therefore never holds one a session might also be holding, which is
 /// what makes closing its remainder in `Drop` sound.
 ///
-/// A `RawFd` is a bare integer with no ownership, so nothing closes one on the
-/// way out of [`SessionManager::adopt_sessions`]. That was harmless while a
-/// failed adoption propagated into a `process::exit` and the OS reclaimed every
-/// descriptor. Now that a partial adoption is logged and the daemon keeps
-/// running, a descriptor that never reached a session would stay open for the
-/// life of the process — the tail left when adoption gives up partway, and any
-/// surplus the handover state does not account for.
+/// A `RawFd` is a bare integer with no ownership, so nothing closes an unmatched
+/// descriptor on the way out of [`SessionManager::adopt_sessions`]. Every
+/// descriptor paired with session metadata is either adopted or moved to
+/// `pending_adoptions`; this guard closes only surplus descriptors the metadata
+/// does not account for.
 #[cfg(unix)]
 struct UnadoptedFds {
     fds: std::collections::VecDeque<std::os::unix::io::RawFd>,
@@ -1614,13 +2072,10 @@ impl UnadoptedFds {
 
     /// Hand the next descriptor to the session about to adopt it.
     ///
-    /// Ownership transfers here, to the `AdoptedMasterPty` that
-    /// `spawn_adopted_pty_runtime` wraps it in as its very first act. That type
-    /// closes on drop, so every early return after the wrap — a rotated log, a
-    /// thread spawn hitting EAGAIN — still closes it, as does the actor loop
-    /// returning later (see [`crate::handover::AdoptedMasterPty`]; a session merely
-    /// *ending* does not). Holding it in the guard past this point instead would
-    /// put it under two owners at once and close it twice on the failure path.
+    /// Ownership transfers here to one adoption iteration. That iteration keeps
+    /// this descriptor as its reserve and gives a duplicate to
+    /// `AdoptedMasterPty`: success closes the reserve, while failure moves it to
+    /// `pending_adoptions` for retry.
     fn take_next(&mut self) -> Option<std::os::unix::io::RawFd> {
         self.fds.pop_front()
     }
@@ -1630,11 +2085,9 @@ impl UnadoptedFds {
 impl Drop for UnadoptedFds {
     fn drop(&mut self) {
         for fd in self.fds.drain(..) {
-            // SAFETY: these are the descriptors `take_next` never handed out — a
-            // surplus the handover state does not account for, or the tail left
-            // when adoption gave up partway. Ownership of everything else moved to
-            // its `AdoptedMasterPty`, so this cannot close a descriptor another
-            // owner still holds.
+            // SAFETY: these are surplus descriptors `take_next` never handed out
+            // and the handover metadata does not account for. Every matched
+            // descriptor moved to either a live actor or `pending_adoptions`.
             unsafe {
                 libc::close(fd);
             }
@@ -1652,9 +2105,14 @@ fn spawn_adopted_pty_runtime(
     // SAFETY: `UnadoptedFds::take_next` gave up its claim on this descriptor so
     // the master can own it; nothing else holds or will close it.
     let master = Box::new(unsafe { AdoptedMasterPty::from_raw_fd(fd) });
-    let child = Box::new(AdoptedChild { pid: h_sess.pid });
+    let (reader, reader_cancel) = master
+        .try_clone_cancelable_reader()
+        .context("cloning cancellable PTY reader")?;
+    let child = AdoptedChild::new(h_sess.pid, h_sess.process_identity, &master, reader_cancel)
+        .context("preparing adopted PTY signal target")?;
+    let process_identity = child.process_identity();
+    let child = Box::new(child);
 
-    let reader = master.try_clone_reader().context("cloning PTY reader")?;
     let writer = shared_pty_writer(master.take_writer().context("taking PTY writer")?);
 
     let terminal = terminal_with_writer(&h_sess.size, writer.clone());
@@ -1694,6 +2152,7 @@ fn spawn_adopted_pty_runtime(
     Ok(PtyRuntime {
         master,
         child,
+        process_identity,
         reader,
         writer,
         output,
@@ -1730,6 +2189,53 @@ impl ManagedSession {
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new(SessionManagerConfig::new(default_log_dir()))
+    }
+}
+
+struct SessionShutdownGuard<'a> {
+    manager: &'a SessionManager,
+    session_id: SessionId,
+}
+
+impl Drop for SessionShutdownGuard<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .session_shutdowns_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+        self.manager
+            .session_lifecycle_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+struct SessionRestoreGuard<'a> {
+    manager: &'a SessionManager,
+    session_id: SessionId,
+}
+
+impl Drop for SessionRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .session_lifecycle_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+#[cfg(unix)]
+struct AdoptionAttemptGuard<'a> {
+    manager: &'a SessionManager,
+}
+
+#[cfg(unix)]
+impl Drop for AdoptionAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .adoption_attempts_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2036,6 +2542,12 @@ impl SessionApi for SessionManager {
 
     fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
         request.size.validate()?;
+        ensure!(
+            !self.session_awaits_adoption(&request.session_id),
+            "session {} is awaiting inherited PTY adoption",
+            request.session_id
+        );
+        let _restore_guard = self.begin_session_restore(&request.session_id)?;
         // A session whose child process dies while `Live` is never demoted to
         // `Historical` on its own, so the block below would reject it as "already
         // live" and it would stay stuck/uninputtable until a daemon restart —
@@ -2220,46 +2732,150 @@ impl SessionApi for SessionManager {
     }
 
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
-        let session = {
+        let _shutdown_guard = self.begin_session_shutdown(&session_id)?;
+        ensure!(
+            !self.session_awaits_adoption(&session_id),
+            "session {session_id} is awaiting inherited PTY adoption"
+        );
+
+        enum ShutdownTarget {
+            Live {
+                tx: Sender<ActorCommand>,
+                launch: PersistedSessionLaunch,
+                last_known_cwd: Option<PathBuf>,
+                last_activity_ms: u64,
+                prepared_manifest: PathBuf,
+            },
+            Historical {
+                completed: CompletedSession,
+                log_path: PathBuf,
+            },
+        }
+
+        let target = {
             let mut sessions = self.sessions()?;
             let session = sessions
-                .remove(&session_id)
+                .get(&session_id)
                 .with_context(|| format!("session {session_id} not found"))?;
-            if let Err(error) = self.persist_manifest(&sessions) {
-                sessions.insert(session_id, session);
-                return Err(error);
+            match session {
+                ManagedSession::Live {
+                    actor,
+                    launch,
+                    last_known_cwd,
+                    ..
+                } => ShutdownTarget::Live {
+                    tx: actor.tx.clone(),
+                    launch: launch.clone(),
+                    last_known_cwd: last_known_cwd.clone(),
+                    last_activity_ms: actor.last_activity_ms(),
+                    // Validate that the removal manifest can be encoded and
+                    // written before doing anything irreversible to the child.
+                    // It is rewritten from the current map after termination,
+                    // so unrelated session changes made meanwhile are retained.
+                    prepared_manifest: self.prepare_shutdown_manifest(&sessions, &session_id)?,
+                },
+                ManagedSession::Historical { session, .. } => {
+                    let completed = session.completed_session();
+                    let log_path = session.persisted.log_path.clone();
+                    let removed = sessions
+                        .remove(&session_id)
+                        .expect("the historical session was just resolved");
+                    if let Err(error) = self.persist_manifest(&sessions) {
+                        sessions.insert(session_id.clone(), removed);
+                        return Err(error);
+                    }
+                    ShutdownTarget::Historical {
+                        completed,
+                        log_path,
+                    }
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {session_id} is being restored")
+                }
             }
-            session
         };
+
+        let (completed, log_path) = match target {
+            ShutdownTarget::Historical {
+                completed,
+                log_path,
+            } => (completed, log_path),
+            ShutdownTarget::Live {
+                tx,
+                launch,
+                last_known_cwd,
+                last_activity_ms,
+                prepared_manifest,
+            } => {
+                let completed = match request_actor_shutdown(&tx) {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        let _ = fs::remove_file(&prepared_manifest);
+                        return Err(error);
+                    }
+                };
+
+                let mut persisted = launch.clone().into_persisted(session_id.clone(), true);
+                persisted.last_known_cwd = last_known_cwd;
+                persisted.last_activity_ms = last_activity_ms;
+                let historical_fallback = HistoricalSession::restore(persisted).map(Box::new);
+
+                let (mut actor, commit_result) = {
+                    // Termination already succeeded, so a poisoned manager lock
+                    // cannot be allowed to leave a dead actor registered as live.
+                    let mut sessions = self
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let rewrite_result = self
+                        .prepare_shutdown_manifest(&sessions, &session_id)
+                        .and_then(|temp_path| {
+                            replace_manifest(&temp_path, &self.config.manifest_path())
+                        });
+                    let removed = sessions.remove(&session_id).with_context(|| {
+                        format!("session {session_id} disappeared during shutdown")
+                    })?;
+                    let ManagedSession::Live { actor, .. } = removed else {
+                        sessions.insert(session_id.clone(), removed);
+                        bail!("session {session_id} changed state during shutdown");
+                    };
+                    if let Err(error) = &rewrite_result {
+                        match historical_fallback {
+                            Ok(session) => {
+                                sessions.insert(
+                                    session_id.clone(),
+                                    ManagedSession::Historical {
+                                        session,
+                                        lease: InputLeaseState::default(),
+                                    },
+                                );
+                            }
+                            Err(ref fallback_error) => tracing::error!(
+                                session_id = %session_id,
+                                error = ?fallback_error,
+                                "could not rebuild a historical view after shutdown manifest commit failed"
+                            ),
+                        }
+                        tracing::error!(
+                            session_id = %session_id,
+                            error = ?error,
+                            "session stopped, but committing its manifest removal failed"
+                        );
+                    }
+                    (actor, rewrite_result)
+                };
+                actor.join_threads();
+                commit_result?;
+                (completed, launch.log_path)
+            }
+        };
+
         self.forget_snippet(&session_id);
-        // Each session's own recorded path, never a re-derived name: a session
-        // adopted across a handover carries the log path from the handover
-        // payload, which need not match `log_dir/{id}.log`. Deleting a derived
-        // path would unlink nothing and leak the real log — the very leak this
-        // fixes.
-        //
-        // `Restoring` is deliberately absent. `restore_session` inserts that
-        // state, releases the sessions lock, and only then spawns the actor that
-        // opens the log, so a shutdown landing in that window would delete a log
-        // an in-flight spawn is about to write to. Leaving it is the safe side of
-        // the trade: the startup purge reclaims it later.
-        let log_path = match &session {
-            ManagedSession::Live { launch, .. } => Some(launch.log_path.clone()),
-            ManagedSession::Historical { session, .. } => Some(session.persisted.log_path.clone()),
-            ManagedSession::Restoring { .. } => None,
-        };
-        let completed = match session {
-            ManagedSession::Live { actor, .. } => actor.shutdown(),
-            ManagedSession::Historical { session, .. } => Ok(session.completed_session()),
-            ManagedSession::Restoring { session, .. } => Ok(session.completed_session()),
-        };
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
-        if let Some(log_path) = log_path {
-            remove_session_log(&session_id, &log_path);
-        }
-        completed
+        remove_session_log(&session_id, &log_path);
+        Ok(completed)
     }
 
     #[allow(clippy::type_complexity)]
@@ -3270,6 +3886,7 @@ impl SessionActor {
         let PtyRuntime {
             master,
             child,
+            process_identity,
             reader,
             writer,
             output,
@@ -3301,6 +3918,7 @@ impl SessionActor {
                 let state = ActorState {
                     master,
                     child,
+                    process_identity,
                     writer,
                     output,
                     size,
@@ -3384,15 +4002,16 @@ impl SessionActor {
         request_snapshot(&self.tx)
     }
 
-    pub fn shutdown(mut self) -> Result<CompletedSession> {
-        let (tx, rx) = mpsc::channel();
-        let result = self
-            .tx
-            .send(ActorCommand::Shutdown { response: tx })
-            .context("sending session shutdown command")
-            .and_then(|_| recv_actor_result(rx, "shutting down session"));
-        self.join_threads();
+    fn try_shutdown(&mut self) -> Result<CompletedSession> {
+        let result = request_actor_shutdown(&self.tx);
+        if result.is_ok() {
+            self.join_threads();
+        }
         result
+    }
+
+    pub fn shutdown(mut self) -> Result<CompletedSession> {
+        self.try_shutdown()
     }
 
     fn join_threads(&mut self) {
@@ -3455,6 +4074,7 @@ pub(crate) type DirtySender = std::sync::mpsc::Sender<DirtyTick>;
 struct ActorState {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    process_identity: Option<crate::handover::HandoverProcessIdentity>,
     writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
@@ -3509,6 +4129,7 @@ struct EventSubscriber {
 struct PtyRuntime {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    process_identity: Option<crate::handover::HandoverProcessIdentity>,
     reader: Box<dyn Read + Send>,
     writer: SharedPtyWriter,
     output: OutputState,
@@ -3614,6 +4235,7 @@ pub struct ExtractedHandover {
     /// with `into_raw_fd`.
     pub fd: std::os::unix::io::OwnedFd,
     pub pid: u32,
+    pub process_identity: Option<crate::handover::HandoverProcessIdentity>,
     pub output_seq: u64,
     pub bytes_logged: u64,
 }
@@ -3685,8 +4307,9 @@ impl ActorState {
         let dup_fd = crate::handover::dup_cloexec(fd).context("duplicating PTY master")?;
 
         let pid = self
-            .child
-            .process_id()
+            .process_identity
+            .map(|identity| identity.pid)
+            .or_else(|| self.child.process_id())
             .ok_or_else(|| anyhow!("Child process has no process ID"))?;
 
         Ok(ExtractedHandover {
@@ -3694,6 +4317,7 @@ impl ActorState {
             // exists, so handing it to an `OwnedFd` is the only claim on it.
             fd: unsafe { std::os::unix::io::FromRawFd::from_raw_fd(dup_fd) },
             pid,
+            process_identity: self.process_identity,
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
         })
@@ -3967,8 +4591,10 @@ impl ActorState {
                 false
             }
             ActorCommand::Shutdown { response } => {
-                let _ = response.send(self.shutdown(command_rx, output_rx));
-                true
+                let result = self.shutdown(command_rx, output_rx);
+                let stopped = result.is_ok();
+                let _ = response.send(result);
+                stopped
             }
             #[cfg(unix)]
             ActorCommand::ExtractHandoverState { response } => {
@@ -4063,7 +4689,13 @@ impl ActorState {
         }
         self.drain_shutdown_output(command_rx, output_rx);
         self.reap_child();
-        self.output.log.flush().context("flushing session log")?;
+        if let Err(error) = self.output.log.flush() {
+            // The child is already terminated. Reporting an error here would
+            // make the manager retain this actor as live even though retrying
+            // can never revive it; preserve the completed state and leave the
+            // log cleanup path best-effort instead.
+            tracing::warn!(?error, "failed to flush session log after termination");
+        }
 
         let completed = self.completed_session();
         self.broadcast_completed(completed.clone());
@@ -4532,10 +5164,20 @@ fn spawn_pty_runtime(
         .openpty(pty_size(&config.size))
         .context("opening PTY")?;
 
-    let mut command = CommandBuilder::new(&config.command);
-    for arg in &config.args {
-        command.arg(arg);
-    }
+    #[cfg(unix)]
+    let mut command = build_pty_command(
+        &config,
+        PTY_CHILD_NEEDS_JOB_CONTROL_RESET.load(Ordering::Acquire),
+        std::env::current_exe().ok().as_deref(),
+    )?;
+    #[cfg(not(unix))]
+    let mut command = {
+        let mut command = CommandBuilder::new(&config.command);
+        for arg in &config.args {
+            command.arg(arg);
+        }
+        command
+    };
     if let Some(cwd) = &config.cwd {
         command.cwd(cwd);
     }
@@ -4557,6 +5199,12 @@ fn spawn_pty_runtime(
         .slave
         .spawn_command(command)
         .context("spawning PTY child")?;
+    // Capture while the child object still owns an unreaped process. Even if the
+    // command exits immediately, its PID cannot be reused until this object
+    // reaps it, so the birth identity cannot be assigned to another process.
+    let process_identity = child
+        .process_id()
+        .and_then(crate::handover::handover_process_identity);
     drop(pair.slave);
 
     let reader = pair
@@ -4576,6 +5224,7 @@ fn spawn_pty_runtime(
             Ok(PtyRuntime {
                 master: pair.master,
                 child,
+                process_identity,
                 reader,
                 writer,
                 output: OutputState {
@@ -4632,6 +5281,7 @@ fn spawn_pty_runtime(
             Ok(PtyRuntime {
                 master: pair.master,
                 child,
+                process_identity,
                 reader,
                 writer,
                 output,
@@ -4641,6 +5291,28 @@ fn spawn_pty_runtime(
             })
         }
     }
+}
+
+#[cfg(unix)]
+fn build_pty_command(
+    config: &SessionConfig,
+    reset_job_control: bool,
+    current_exe: Option<&Path>,
+) -> Result<CommandBuilder> {
+    let mut command = if reset_job_control {
+        let current_exe = current_exe
+            .context("resolving the triaged executable for the PTY child job-control reset shim")?;
+        let mut command = CommandBuilder::new(current_exe);
+        command.arg(PTY_CHILD_EXEC_ARG);
+        command.arg(&config.command);
+        command
+    } else {
+        CommandBuilder::new(&config.command)
+    };
+    for arg in &config.args {
+        command.arg(arg);
+    }
+    Ok(command)
 }
 
 fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputState> {
@@ -5083,6 +5755,15 @@ fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     tx.send(ActorCommand::Snapshot { response: resp_tx })
         .context("sending session snapshot command")?;
     recv_actor_result(resp_rx, "reading session snapshot")
+}
+
+fn request_actor_shutdown(tx: &Sender<ActorCommand>) -> Result<CompletedSession> {
+    let (response_tx, response_rx) = mpsc::channel();
+    tx.send(ActorCommand::Shutdown {
+        response: response_tx,
+    })
+    .context("sending session shutdown command")?;
+    recv_actor_result(response_rx, "shutting down session")
 }
 
 fn reject_command_during_shutdown(command: ActorCommand) {
@@ -5768,6 +6449,101 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_child_reset_shim_preserves_the_configured_argv() {
+        let config = SessionConfig {
+            command: "/bin/example shell".to_string(),
+            args: vec!["--flag".to_string(), "value with spaces".to_string()],
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: PathBuf::from("unused.log"),
+        };
+        let command = build_pty_command(&config, true, Some(Path::new("/bin/triaged")))
+            .expect("build reset shim command");
+
+        assert_eq!(
+            command.get_argv(),
+            &vec![
+                OsString::from("/bin/triaged"),
+                OsString::from(PTY_CHILD_EXEC_ARG),
+                OsString::from("/bin/example shell"),
+                OsString::from("--flag"),
+                OsString::from("value with spaces"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_adoption_reserves_its_generated_session_id_and_log() {
+        use std::os::fd::IntoRawFd;
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-7").expect("session id");
+        let log_path = log_dir.join("session-7.log");
+        std::fs::write(&log_path, b"retained history").expect("write retained log");
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open descriptor probe")
+            .into_raw_fd();
+        manager
+            .queue_handover_adoptions(
+                crate::handover::HandoverState {
+                    sessions: vec![crate::handover::HandoverSession {
+                        id: session_id,
+                        command: "/bin/sh".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        size: SessionSize::default(),
+                        log_path: log_path.clone(),
+                        output_seq: 0,
+                        bytes_logged: 0,
+                        pid: 1,
+                        process_identity: None,
+                        last_activity_ms: 0,
+                    }],
+                    has_tcp_listener: false,
+                    sends_teardown_commit: true,
+                    handover_owner_token: None,
+                    handover_lineage_token: None,
+                },
+                vec![fd],
+            )
+            .expect("queue inherited session");
+
+        assert_eq!(
+            manager
+                .allocate_session_id()
+                .expect("allocate after pending"),
+            SessionId::new("session-8").expect("next session id")
+        );
+        manager.purge_orphaned_logs_with_retention(Duration::ZERO);
+        assert_eq!(
+            std::fs::read(&log_path).expect("pending log survived purge"),
+            b"retained history"
+        );
+
+        for fd in manager.take_pending_adoption_fds_for_test() {
+            // SAFETY: the test helper transfers each retained descriptor here.
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    fn concurrent_session_shutdowns_use_distinct_manifest_paths() {
+        let manager = SessionManager::new(SessionManagerConfig::new(unique_log_dir()));
+        let first = SessionId::new("session-1").expect("first session id");
+        let second = SessionId::new("session-2").expect("second session id");
+
+        assert_ne!(
+            manager.shutdown_manifest_temp_path(&first),
+            manager.shutdown_manifest_temp_path(&second)
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -9112,6 +9888,7 @@ mod tests {
                         // Safety: `file` gives up its descriptor and nothing else holds it.
                         fd: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(file.into_raw_fd()) },
                         pid: std::process::id(),
+                        process_identity: None,
                         output_seq: 7,
                         bytes_logged: 11,
                     }));
@@ -9206,6 +9983,57 @@ mod tests {
         assert!(manager.handover_in_flight());
         drop(guard);
         assert!(!manager.handover_in_flight());
+    }
+
+    #[test]
+    fn handover_and_fallible_session_shutdown_are_mutually_exclusive() {
+        let manager = SessionManager::new(SessionManagerConfig::new(unique_log_dir()));
+        let session_id = SessionId::new("session-1").expect("session id");
+
+        let shutdown = manager
+            .begin_session_shutdown(&session_id)
+            .expect("claim session shutdown slot");
+        assert_eq!(
+            manager.try_live_session_count(),
+            None,
+            "shutdown rescue treated a temporarily removed session as absent"
+        );
+        assert!(
+            manager.begin_handover().is_none(),
+            "handover started while shutdown temporarily owned a session"
+        );
+        drop(shutdown);
+
+        let handover = manager.begin_handover().expect("claim handover slot");
+        assert!(
+            manager.begin_session_shutdown(&session_id).is_err(),
+            "session shutdown started after a handover snapshot became authoritative"
+        );
+        drop(handover);
+    }
+
+    #[test]
+    fn restore_and_shutdown_of_one_session_are_mutually_exclusive() {
+        let manager = SessionManager::new(SessionManagerConfig::new(unique_log_dir()));
+        let session_id = SessionId::new("session-1").expect("session id");
+
+        let restore = manager
+            .begin_session_restore(&session_id)
+            .expect("claim restore lifecycle slot");
+        assert!(
+            manager.begin_session_shutdown(&session_id).is_err(),
+            "shutdown overlapped an in-flight restore"
+        );
+        drop(restore);
+
+        let shutdown = manager
+            .begin_session_shutdown(&session_id)
+            .expect("claim shutdown lifecycle slot");
+        assert!(
+            manager.begin_session_restore(&session_id).is_err(),
+            "restore overlapped an in-flight shutdown"
+        );
+        drop(shutdown);
     }
 
     #[test]

@@ -6,14 +6,20 @@ use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
@@ -25,6 +31,38 @@ use triage_core::session::{
 use crate::session::SessionManager;
 
 const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Random identity for this daemon instance. Unlike a PID, launchd cannot reuse it
+/// for the process it starts after a handover owner is killed.
+#[cfg(unix)]
+static DAEMON_INSTANCE_TOKEN: OnceLock<[u8; 16]> = OnceLock::new();
+
+#[cfg(unix)]
+static DAEMON_LINEAGE_TOKEN: std::sync::Mutex<Option<[u8; 16]>> = std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+pub(crate) fn daemon_instance_token() -> [u8; 16] {
+    *DAEMON_INSTANCE_TOKEN.get_or_init(|| {
+        let mut token = [0u8; 16];
+        rand::thread_rng().fill(&mut token);
+        token
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn inherit_daemon_lineage(token: [u8; 16]) {
+    *DAEMON_LINEAGE_TOKEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
+}
+
+#[cfg(unix)]
+fn daemon_lineage_token() -> [u8; 16] {
+    DAEMON_LINEAGE_TOKEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(daemon_instance_token)
+}
 
 /// Local IPC transport seam.
 ///
@@ -244,7 +282,19 @@ impl IpcServer {
 
     #[cfg(unix)]
     pub fn serve(self) -> Result<()> {
-        let listener = bind_owner_socket(&self.config.socket_path, self.config.bind_grace)?;
+        let listener = match PREBOUND_OWNER_SOCKET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            Some((path, listener)) if path == self.config.socket_path => listener,
+            Some((path, _)) => bail!(
+                "pre-bound Unix socket {} does not match configured path {}",
+                path.display(),
+                self.config.socket_path.display()
+            ),
+            None => bind_owner_socket(&self.config.socket_path, self.config.bind_grace)?,
+        };
 
         loop {
             match listener.accept() {
@@ -560,6 +610,16 @@ enum WireRequest {
         session_id: SessionId,
     },
     Handover,
+    /// Metadata-first handover framing. Descriptors follow only after the whole
+    /// state document has arrived, so an interrupted first frame cannot strand
+    /// anonymous PTY masters in the successor.
+    HandoverV2,
+    /// Check whether this connection reached the daemon that supplied a particular
+    /// handover. Used only by the successor after its handover stream closes
+    /// unexpectedly.
+    HandoverProbe {
+        owner_token: [u8; 16],
+    },
     ReloadClientAssets,
     ServerUpdateInfo,
     /// "The next terminating signal is a real stop; do not hand my sessions to a
@@ -655,7 +715,39 @@ fn sanitize_path_component(value: String) -> String {
         .collect()
 }
 
-/// `(device, inode)` of the socket this daemon bound.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+pub(crate) fn socket_path_identity(path: &Path) -> Option<SocketIdentity> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // libc's dev_t/ino_t widths differ by Unix target.
+pub(crate) fn socket_fd_identity(fd: std::os::unix::io::RawFd) -> Option<SocketIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `stat` points to enough writable storage and `fd` is only queried.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: a successful `fstat` initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    Some(SocketIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
+
+/// Identity of the socket this daemon bound.
 ///
 /// Recorded so teardown can tell its own socket from one a successor has since
 /// bound at the same path. Without that check the choice is between never
@@ -665,7 +757,28 @@ fn sanitize_path_component(value: String) -> String {
 /// before we exit). Comparing identity gets both: we clean up after ourselves and
 /// never touch anyone else's.
 #[cfg(unix)]
-static OWNED_SOCKET_ID: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+static OWNED_SOCKET_ID: std::sync::Mutex<Option<SocketIdentity>> = std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+static PREBOUND_OWNER_SOCKET: std::sync::Mutex<Option<(PathBuf, UnixListener)>> =
+    std::sync::Mutex::new(None);
+
+/// Try to reserve the owner socket before adopted PTY readers start. Once this
+/// succeeds, `IpcServer::serve` consumes the listener, so a KeepAlive respawn
+/// cannot bind the pathname during session adoption.
+#[cfg(unix)]
+pub fn try_prebind_owner_socket(socket_path: &Path) -> Result<bool> {
+    match try_bind_owner_socket(socket_path)? {
+        Some(listener) => {
+            *PREBOUND_OWNER_SOCKET
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((socket_path.to_path_buf(), listener));
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
 
 /// Whether *this* process has bound the owner socket and is therefore reachable by a
 /// successor's handover request.
@@ -704,9 +817,7 @@ fn unlink_own_socket(socket_path: &Path) {
     let Some(owned) = owned else {
         return;
     };
-    if let Ok(meta) = fs::metadata(socket_path)
-        && (meta.dev(), meta.ino()) == owned
-    {
+    if socket_path_identity(socket_path) == Some(owned) {
         let _ = fs::remove_file(socket_path);
     }
 }
@@ -767,7 +878,23 @@ fn try_bind_owner_socket(socket_path: &Path) -> Result<Option<UnixListener>> {
             .with_context(|| format!("securing socket directory {}", parent.display()))?;
     }
 
+    let lock_path = socket_path.with_extension("bind.lock");
+    let bind_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening socket bind lock {}", lock_path.display()))?;
+    // SAFETY: `bind_lock` owns this descriptor for the duration of the critical
+    // connect/remove/bind sequence. All current triaged starters use this lock.
+    if unsafe { libc::flock(bind_lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("locking socket bind lock {}", lock_path.display()));
+    }
+
     if socket_path.exists() {
+        let observed_identity = socket_path_identity(socket_path);
         match UnixStream::connect(socket_path) {
             // Someone is answering: retryable, since during a handover that
             // someone is a predecessor on its way out.
@@ -778,8 +905,16 @@ fn try_bind_owner_socket(socket_path: &Path) -> Result<Option<UnixListener>> {
                     ErrorKind::ConnectionRefused | ErrorKind::NotFound
                 ) =>
             {
-                fs::remove_file(socket_path)
-                    .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+                match (observed_identity, socket_path_identity(socket_path)) {
+                    (Some(observed), Some(current)) if observed == current => {
+                        fs::remove_file(socket_path).with_context(|| {
+                            format!("removing stale socket {}", socket_path.display())
+                        })?;
+                    }
+                    (Some(_), Some(_)) => return Ok(None),
+                    (_, None) => {}
+                    (None, Some(_)) => return Ok(None),
+                }
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -795,13 +930,381 @@ fn try_bind_owner_socket(socket_path: &Path) -> Result<Option<UnixListener>> {
         .with_context(|| format!("securing Unix socket {}", socket_path.display()))?;
     // Remember which socket is ours so teardown never unlinks a successor's. A
     // failure here only costs the cleanup, so it must not fail the bind.
-    if let Ok(meta) = fs::metadata(socket_path) {
+    if let Some(identity) = socket_path_identity(socket_path) {
         *OWNED_SOCKET_ID
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((meta.dev(), meta.ino()));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
     }
     OWN_SOCKET_BOUND.store(true, std::sync::atomic::Ordering::Release);
     Ok(Some(listener))
+}
+
+/// Result of checking the daemon reached by a Phase-2 recovery probe.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoverPeerStatus {
+    Original,
+    Replacement,
+    Indeterminate,
+    Unreachable,
+}
+
+#[cfg(unix)]
+fn classify_process_identity(
+    expected: Option<PeerProcessIdentity>,
+    observed: Option<PeerProcessIdentity>,
+) -> HandoverPeerStatus {
+    match (expected, observed) {
+        (Some(expected), Some(observed)) if expected == observed => HandoverPeerStatus::Original,
+        (Some(_), Some(_)) => HandoverPeerStatus::Replacement,
+        _ => HandoverPeerStatus::Indeterminate,
+    }
+}
+
+/// Ask the daemon reached by `socket_path` whether it is still the process that
+/// supplied a handover. The request and response use one connection, so
+/// another daemon rebinding the path cannot pass a check meant for its predecessor.
+#[cfg(unix)]
+pub(crate) fn probe_handover_peer(
+    socket_path: &Path,
+    owner_token: [u8; 16],
+    owner_process_identity: Option<PeerProcessIdentity>,
+) -> HandoverPeerStatus {
+    let Ok(stream) = UnixStream::connect(socket_path) else {
+        return HandoverPeerStatus::Unreachable;
+    };
+    let observed_process_identity = peer_process_identity(&stream);
+    if stream
+        .set_read_timeout(Some(crate::handover::HANDOVER_TEARDOWN_TIMEOUT))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(crate::handover::HANDOVER_TEARDOWN_TIMEOUT))
+            .is_err()
+    {
+        return classify_process_identity(owner_process_identity, observed_process_identity);
+    }
+    {
+        let mut writer = BufWriter::new(&stream);
+        if write_json_line(&mut writer, &WireRequest::HandoverProbe { owner_token }).is_err()
+            || writer.flush().is_err()
+        {
+            return classify_process_identity(owner_process_identity, observed_process_identity);
+        }
+    }
+    let mut reader = BufReader::new(stream);
+    match read_json_line::<WireResponse>(&mut reader) {
+        Ok(Some(WireResponse::Ok(success))) if matches!(*success, WireSuccess::Unit) => {
+            HandoverPeerStatus::Original
+        }
+        Ok(Some(WireResponse::Err { .. })) => HandoverPeerStatus::Replacement,
+        Ok(Some(WireResponse::Ok(_))) | Ok(None) | Err(_) => {
+            classify_process_identity(owner_process_identity, observed_process_identity)
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn handover_peer_is_reachable(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).is_ok()
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerProcessIdentity([u8; 56]);
+
+#[cfg(unix)]
+pub(crate) fn peer_process_identity_is_alive(identity: PeerProcessIdentity) -> Option<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if identity.0[0] != 1 {
+            return None;
+        }
+        let pid = u32::from_ne_bytes(identity.0[8..12].try_into().ok()?);
+        if linux_process_is_zombie(pid as libc::pid_t) == Some(true) {
+            return Some(false);
+        }
+        return match linux_peer_process_identity(pid as libc::pid_t) {
+            Some(current) => Some(current == identity),
+            None if !Path::new(&format!("/proc/{pid}")).exists() => Some(false),
+            None => None,
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if identity.0[0] != 2 {
+            return None;
+        }
+        let pid = u32::from_ne_bytes(identity.0[28..32].try_into().ok()?);
+        let Some((started_at, zombie)) = mac_process_birth_and_zombie(pid) else {
+            // proc_pidinfo returns no structure for a process that no longer
+            // exists. Confirm that case without reducing a live process to its
+            // reusable PID.
+            // SAFETY: signal 0 performs only an existence/permission check.
+            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            return match (result, std::io::Error::last_os_error().raw_os_error()) {
+                (-1, Some(libc::ESRCH)) => Some(false),
+                _ => None,
+            };
+        };
+        if zombie {
+            return Some(false);
+        }
+        let expected = [
+            u64::from_ne_bytes(identity.0[40..48].try_into().ok()?),
+            u64::from_ne_bytes(identity.0[48..56].try_into().ok()?),
+        ];
+        Some(started_at == expected)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    {
+        let _ = identity;
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate_handover_peer(identity: PeerProcessIdentity) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if identity.0[0] != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid Linux handover peer identity",
+            ));
+        }
+        let pid = u32::from_ne_bytes(
+            identity.0[8..12]
+                .try_into()
+                .expect("peer identity PID slice has fixed length"),
+        );
+        // SAFETY: pidfd_open returns a new descriptor or -1. The identity check
+        // after the open rejects a process that reused this PID in between.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        let pidfd = pidfd as libc::c_int;
+        if linux_peer_process_identity(pid as libc::pid_t) != Some(identity) {
+            // SAFETY: pidfd_open returned this descriptor to this call.
+            unsafe { libc::close(pidfd) };
+            return Ok(());
+        }
+        // SAFETY: pidfd_send_signal targets the process object referenced by the
+        // open handle, so PID reuse after the identity check is irrelevant.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        let signal_error = (result < 0).then(std::io::Error::last_os_error);
+        // SAFETY: this call owns the pidfd.
+        unsafe { libc::close(pidfd) };
+        if let Some(error) = signal_error
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if identity.0[0] != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid macOS handover peer identity",
+            ));
+        }
+        #[repr(C)]
+        struct AuditToken {
+            val: [libc::c_uint; 8],
+        }
+        unsafe extern "C" {
+            fn proc_signal_with_audittoken(
+                token: *mut AuditToken,
+                signal: libc::c_int,
+            ) -> libc::c_int;
+        }
+        let mut token = AuditToken { val: [0; 8] };
+        // SAFETY: both source and destination are exactly 32 bytes and do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                identity.0[8..40].as_ptr(),
+                token.val.as_mut_ptr().cast(),
+                32,
+            );
+        }
+        // SAFETY: the token came from LOCAL_PEERTOKEN on the authenticated
+        // handover connection and identifies one process incarnation.
+        if unsafe { proc_signal_with_audittoken(&mut token, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    {
+        let _ = identity;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "safe committed-peer termination is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn definitely_dead_peer_process_identity_for_test() -> PeerProcessIdentity {
+    let mut identity = PeerProcessIdentity([0; 56]);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        identity.0[0] = 1;
+        identity.0[8..12].copy_from_slice(&(i32::MAX as u32).to_ne_bytes());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        identity.0[0] = 2;
+        identity.0[28..32].copy_from_slice(&(i32::MAX as u32).to_ne_bytes());
+    }
+    identity
+}
+
+/// Return a non-reusable process identity authenticated by a Unix-domain socket.
+/// macOS provides an audit token containing its PID version; Linux combines the
+/// kernel-authenticated PID with `/proc`'s process start time.
+#[cfg(unix)]
+pub(crate) fn peer_process_identity(stream: &UnixStream) -> Option<PeerProcessIdentity> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut identity = PeerProcessIdentity([0; 56]);
+        identity.0[0] = 2;
+        let mut len = 32 as libc::socklen_t;
+        // SAFETY: the socket fd is valid and the output buffer has the supplied size.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERTOKEN,
+                identity.0[8..40].as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if result != 0 || len != 32 {
+            return None;
+        }
+        let pid = u32::from_ne_bytes(identity.0[28..32].try_into().ok()?);
+        let (started_at, zombie) = mac_process_birth_and_zombie(pid)?;
+        if zombie {
+            return None;
+        }
+        identity.0[40..48].copy_from_slice(&started_at[0].to_ne_bytes());
+        identity.0[48..56].copy_from_slice(&started_at[1].to_ne_bytes());
+        Some(identity)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the socket fd is valid and the output buffer has the supplied size.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if result == 0 && len == std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+            // SAFETY: a zero result initializes the credentials buffer.
+            let pid = unsafe { credentials.assume_init().pid };
+            if pid > 0 {
+                return linux_peer_process_identity(pid);
+            }
+        }
+        return None;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn probe_handover_peer_process_identity(
+    socket_path: &Path,
+    owner_process_identity: PeerProcessIdentity,
+) -> HandoverPeerStatus {
+    let Ok(stream) = UnixStream::connect(socket_path) else {
+        return HandoverPeerStatus::Unreachable;
+    };
+    match peer_process_identity(&stream) {
+        Some(identity) if identity == owner_process_identity => HandoverPeerStatus::Original,
+        Some(_) => HandoverPeerStatus::Replacement,
+        None => HandoverPeerStatus::Indeterminate,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_peer_process_identity(pid: libc::pid_t) -> Option<PeerProcessIdentity> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let start_time = fields.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+    let mut identity = PeerProcessIdentity([0; 56]);
+    identity.0[0] = 1;
+    identity.0[8..12].copy_from_slice(&(pid as u32).to_ne_bytes());
+    identity.0[16..24].copy_from_slice(&start_time.to_ne_bytes());
+    Some(identity)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_is_zombie(pid: libc::pid_t) -> Option<bool> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    Some(fields.split_whitespace().next()? == "Z")
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_birth_and_zombie(pid: u32) -> Option<([u64; 2], bool)> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` points to `size` bytes of writable storage.
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if result != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo returned the full structure size.
+    let info = unsafe { info.assume_init() };
+    Some((
+        [info.pbi_start_tvsec, info.pbi_start_tvusec],
+        info.pbi_status == libc::SZOMB,
+    ))
 }
 
 #[cfg(unix)]
@@ -819,8 +1322,9 @@ fn handle_connection(
     };
     // Handover needs the raw stream for SCM_RIGHTS FD passing, so it branches
     // before the shared dispatch (which only deals with the JSON wire protocol).
-    if let WireRequest::Handover = request {
-        return handle_handover_server(&manager, reader.into_inner());
+    if matches!(request, WireRequest::Handover | WireRequest::HandoverV2) {
+        let metadata_first = matches!(request, WireRequest::HandoverV2);
+        return handle_handover_server(&manager, reader.into_inner(), metadata_first);
     }
 
     let mut writer = BufWriter::new(stream);
@@ -844,7 +1348,7 @@ fn handle_connection(
     let Some(request) = read_json_line::<WireRequest>(&mut reader)? else {
         return Ok(());
     };
-    if let WireRequest::Handover = request {
+    if matches!(request, WireRequest::Handover | WireRequest::HandoverV2) {
         bail!("Handover request not supported on Windows");
     }
 
@@ -913,10 +1417,15 @@ impl Drop for StagedFds {
 /// This function does not return on success: it ends in `process::exit(0)` once
 /// the sessions are detached.
 #[cfg(unix)]
-fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Result<()> {
+fn handle_handover_server(
+    manager: &SessionManager,
+    stream: UnixStream,
+    metadata_first: bool,
+) -> Result<()> {
     use crate::handover::{
-        HANDOVER_BUSY_MESSAGE, HANDOVER_COMMIT_BYTE, HANDOVER_DONE_BYTE,
-        get_active_tcp_listener_fd, send_fds,
+        HANDOVER_BUSY_MESSAGE, HANDOVER_COMMIT_BYTE, HANDOVER_DONE_BYTE, HANDOVER_FDS_READY_BYTE,
+        MAX_FDS_PER_SEND, get_active_tcp_listener_fd, send_data_frame, send_fd_chunks, send_fds,
+        send_handover_fds,
     };
     use std::io::{Read, Write};
 
@@ -942,7 +1451,11 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
             message: HANDOVER_BUSY_MESSAGE.to_string(),
         };
         if let Ok(bytes) = serde_json::to_vec(&response) {
-            let _ = send_fds(&stream, &[], &bytes);
+            let _ = if metadata_first {
+                send_data_frame(&stream, &bytes)
+            } else {
+                send_fds(&stream, &[], &bytes)
+            };
         }
         tracing::info!("Refused a concurrent handover; a swap is already in flight.");
         return Ok(());
@@ -958,6 +1471,8 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     // so it can read a pre-commit EOF as "aborted, sessions kept" and refuse
     // rather than adopt into a split-brain. An older successor ignores the field.
     state.sends_teardown_commit = true;
+    state.handover_owner_token = Some(daemon_instance_token());
+    state.handover_lineage_token = Some(daemon_lineage_token());
 
     // Take ownership of the PTY dups immediately. Everything between here and the
     // send can fail (the TCP dup, serializing the response), and an aborted
@@ -985,7 +1500,13 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
     let response_bytes =
         serde_json::to_vec(&response).context("serializing handover response JSON")?;
 
-    let send_res = send_fds(&stream, &fds_to_send.0, &response_bytes);
+    let sent_fd_count = fds_to_send.0.len();
+    let send_res = if metadata_first {
+        send_data_frame(&stream, &response_bytes)
+            .and_then(|()| send_fd_chunks(&stream, &fds_to_send.0))
+    } else {
+        send_handover_fds(&stream, &fds_to_send.0, &response_bytes)
+    };
 
     // Close our copies now that the kernel has installed the receiver's: keeping
     // them open across the Phase 2/3 wait would hold every master for the whole
@@ -998,10 +1519,21 @@ fn handle_handover_server(manager: &SessionManager, stream: UnixStream) -> Resul
 
     stream
         .set_read_timeout(Some(crate::handover::HANDOVER_ADOPTION_TIMEOUT))
-        .context("setting read timeout on handover socket")?;
+        .context("setting handover adoption timeout")?;
     let mut sync_byte = [0u8; 1];
-    if let Err(err) = stream.try_clone()?.read_exact(&mut sync_byte) {
+    let mut sync_reader = stream.try_clone()?;
+    if let Err(err) = sync_reader.read_exact(&mut sync_byte) {
         bail!("Failed to receive sync byte from client: {err}");
+    }
+    if sync_byte[0] == HANDOVER_FDS_READY_BYTE {
+        sync_reader
+            .read_exact(&mut sync_byte)
+            .context("receiving adoption byte after descriptor readiness")?;
+    } else if metadata_first || sent_fd_count > MAX_FDS_PER_SEND {
+        bail!(
+            "successor used the legacy one-message handover protocol for {sent_fd_count} \
+             descriptors; keeping sessions because it cannot have received the complete set"
+        );
     }
     if sync_byte[0] != crate::handover::HANDOVER_ADOPT_BYTE {
         bail!(
@@ -1162,8 +1694,23 @@ fn handle_request(
         WireRequest::ShutdownSession { session_id } => manager
             .shutdown_session(session_id)
             .map(WireSuccess::CompletedSession),
-        WireRequest::Handover => {
+        WireRequest::Handover | WireRequest::HandoverV2 => {
             bail!("handover requests require direct socket handler")
+        }
+        WireRequest::HandoverProbe { owner_token } => {
+            #[cfg(unix)]
+            {
+                if owner_token == daemon_instance_token() {
+                    Ok(WireSuccess::Unit)
+                } else {
+                    bail!("requested handover belongs to a different daemon")
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = owner_token;
+                bail!("handover probes are only supported on Unix-like operating systems")
+            }
         }
         WireRequest::ReloadClientAssets => {
             web_cache.reload();
@@ -1280,6 +1827,64 @@ mod tests {
         releaser.join().expect("releaser thread");
         drop(listener);
         let _ = fs::remove_dir_all(socket_path.parent().expect("socket parent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handover_probe_only_accepts_the_handover_owner() {
+        // Keep the path well below `sockaddr_un.sun_path` on macOS, where the
+        // test runner's temporary-directory prefix is already long.
+        let socket_path = unique_socket_path("hp");
+        let log_dir = unique_dir("hp-logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
+        let server = IpcServer::new(
+            Arc::clone(&manager),
+            cache,
+            IpcConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+
+        let handover = manager.begin_handover().expect("claim handover slot");
+        let owner_token = daemon_instance_token();
+        assert_eq!(
+            probe_handover_peer(&socket_path, owner_token, None),
+            HandoverPeerStatus::Original
+        );
+        drop(handover);
+        // An aborted handover drops this guard but keeps the original daemon's
+        // masters alive, so the successor must still recognize it and refuse.
+        assert_eq!(
+            probe_handover_peer(&socket_path, owner_token, None),
+            HandoverPeerStatus::Original
+        );
+        assert_eq!(
+            probe_handover_peer(&socket_path, [0; 16], None),
+            HandoverPeerStatus::Replacement
+        );
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        {
+            let identity_stream = UnixStream::connect(&socket_path).expect("connect for identity");
+            let owner_identity = peer_process_identity(&identity_stream)
+                .expect("platform should expose the connected peer identity");
+            assert_eq!(peer_process_identity_is_alive(owner_identity), Some(true));
+            drop(identity_stream);
+            assert_eq!(
+                probe_handover_peer_process_identity(&socket_path, owner_identity),
+                HandoverPeerStatus::Original
+            );
+            let mut replacement_identity = owner_identity;
+            replacement_identity.0[0] ^= 1;
+            assert_eq!(
+                probe_handover_peer_process_identity(&socket_path, replacement_identity),
+                HandoverPeerStatus::Replacement
+            );
+        }
+
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_dir_all(log_dir);
     }
 
     #[test]

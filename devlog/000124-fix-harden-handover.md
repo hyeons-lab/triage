@@ -2,6 +2,8 @@
 
 **Agent:** Claude (claude-opus-5[1m]) @ triage branch fix/harden-handover
 (worktree: worktrees/harden-handover)
+**Agent:** Codex (gpt-5.6-sol) @ triage branch fix/harden-handover —
+2026-08-15T09:13-0700
 
 ## Intent
 
@@ -204,6 +206,234 @@ that produced spurious bind failures.
   the budget too, so calling the 20s above adoption-plus-teardown "slack" attributed a
   bounded protocol phase to slack. Same class of arithmetic slip as the one this file
   already records auditing out of that comment, in the same comment.
+- 2026-08-14T07:35-0700 `crates/triaged/src/service.rs`: split `STOP_GRACE_SECS` into
+  `LAUNCHD_STOP_GRACE_SECS` (60) and `SYSTEMD_STOP_GRACE_SECS` (150). macOS launchd
+  silently caps ExitTimeOut at 60s (values above 60 are replaced with 60 by launchd),
+  while systemd TimeoutStopSec has no such cap. Updated assertions and unit generation
+  tests to reflect each platform's invariant.
+- 2026-08-14T07:35-0700 `crates/triaged/src/handover.rs`: `complete_handover_adoption`
+  now handles Phase 2 write and timeout errors with peer liveness probing. If sending
+  the 0x01 adoption byte fails because the outgoing daemon died (SIGKILLed by launchd
+  during Phase 2 warm-up), the successor adopts what was transferred instead of
+  aborting. If the peer is still alive, it refuses adoption so the living peer keeps
+  serving. Added unit tests in `handover_tests.rs` verifying both dead-peer adoption and
+  alive-peer refusal during Phase 2 write failure and Phase 3 EOF.
+- 2026-08-14T10:55-0700 `crates/triaged/src/{handover,handover_tests}.rs`: record the
+  Phase 1 peer socket's device and inode, then require the same socket identity before
+  treating a later listener as the daemon that transferred the descriptors. A launchd
+  respawn at the same pathname is now classified as a dead peer, so the successor adopts
+  the transferred PTY masters. Added a regression test that replaces the original
+  listener before the Phase 2 write fails.
+- 2026-08-14T13:23-0700 `crates/triaged/src/{handover,ipc,session,handover_tests}.rs`:
+  **Supersedes the 10:55 socket-identity check.** The state now carries the Phase 1
+  daemon PID, and a failed Phase 2 or Phase 3 connection sends an IPC probe that only
+  that daemon can answer while its handover guard is active. The probe and response use
+  one connection, so a launchd respawn cannot win a pathname check between metadata and
+  connect. Added a test for the active-owner probe and serialized the tests that mutate
+  process-global handover state.
+- 2026-08-14T13:26-0700 `crates/triaged/src/ipc.rs`: **Supersedes the 13:23
+  active-handover predicate.** A matching Phase 1 owner PID now answers the probe even
+  after its handover guard has dropped. An aborted owner retains every PTY master and
+  must be recognized as alive so the late successor refuses rather than creating a
+  second reader. The probe regression now verifies both the in-flight and post-abort
+  states, plus rejection of a different PID.
+- 2026-08-14T16:35-0700 `crates/triaged/src/{handover,ipc,session,handover_tests}.rs`:
+  **Supersedes PID-based peer identity.** The handover state and probe now carry a
+  random 128-bit daemon-instance token, which launchd cannot reuse after a SIGKILL.
+  A pre-token peer is ambiguous by definition, so its error path adopts rather than
+  dropping the only transferred descriptors. Added coverage for a token-confirming
+  peer, a replacement peer, and the identity-less legacy policy.
+- 2026-08-14T18:26-0700 `crates/triaged/src/{handover,handover_tests,ipc}.rs`:
+  **Supersedes the 16:35 identity-less adopt policy.** A tokenless peer that
+  announces the teardown-commit protocol is treated as still live after a Phase 2
+  write failure or Phase 3 EOF, so the successor refuses instead of risking a
+  second reader. Peers that predate the commit protocol retain their historical
+  adopt-on-EOF behavior. Gated Unix-only token imports and the probe handler so
+  non-Unix builds remain warning-free.
+- 2026-08-14T18:43-0700 `crates/triaged/src/{handover,handover_tests,ipc}.rs`:
+  **Supersedes the 18:26 tokenless fallback.** The successor records the original
+  Unix peer PID during Phase 1 and authenticates it on a fresh Phase 2 connection
+  for the immediately preceding commit-capable protocol. A mismatched token or PID
+  unlinks only the replacement daemon's IPC pathname before adoption, letting the
+  successor bind and retain the transferred PTYs. Added coverage for token and PID
+  mismatch fencing.
+- 2026-08-14T19:03-0700 `crates/triaged/src/{handover,ipc,main}.rs`:
+  **Supersedes pathname fencing.** A failed token probe is now classified as a
+  replacement after any successful connection, including a daemon too old to parse
+  the probe. The successor never unlinks another process's socket; after adopting,
+  it keeps the inherited PTYs and waits without expiry to claim the IPC pathname.
+  The legacy fallback now uses a non-reusable process identity: macOS audit token
+  (including PID version) or Linux kernel peer credentials plus process start time.
+- 2026-08-14T19:43-0700 `crates/triaged/src/{handover,ipc}.rs`:
+  A connected but non-confirming probe is now indeterminate and refuses adoption.
+  A definitive identity mismatch invokes a bounded, ordinary empty-session handover
+  against the replacement, so it releases its own listener before this successor
+  adopts; failure to arbitrate refuses safely rather than creating duplicate readers.
+- 2026-08-14T19:47-0700 `crates/triaged/src/{ipc,main}.rs`: **Supersedes the
+  19:03 no-expiry wait.** Successful replacement arbitration releases the socket
+  before adoption, so the normal bounded bind grace remains sufficient. A failed
+  arbitration refuses before descriptors are adopted rather than leaving a daemon
+  alive but unreachable over local IPC.
+- 2026-08-14T19:56-0700 `crates/triaged/src/{handover,ipc,main}.rs`:
+  **Supersedes the 19:47 refusal after failed arbitration.** A confirmed token or
+  process-identity mismatch proves the original owner is gone, so the successor
+  adopts even if the replacement cannot complete its own empty handover. It retains
+  the recovered masters while IPC binding waits for that replacement to release the
+  pathname; normal replacements still exit through bounded arbitration.
+- 2026-08-14T20:31-0700 `crates/triaged/src/{handover,ipc}.rs`: Replacement
+  arbitration now distinguishes an empty launchd respawn from a successor that
+  already owns sessions, refusing the latter to prevent overlapping destructive
+  readers. Indeterminate token responses fall back to the Phase 1 process-birth
+  identity on the same connection, identity-less legacy recovery checks whether
+  any peer is reachable, and received SCM_RIGHTS descriptors are guarded by RAII
+  until the complete response body arrives.
+- 2026-08-15T00:26-0700 `crates/triaged/src/{handover,handover_tests,ipc,main}.rs`:
+  **Supersedes the 20:31 refusal model.** Recovery now transfers and merges every
+  reachable owner before readers start. A lineage token survives clean successor
+  hops, with TCP-listener, process-birth, and socket-file identities as compatibility
+  fallbacks, so the newest committed snapshot replaces stale sessions without
+  conflating an independent respawn. Descriptor receipt arms shutdown deferral before
+  `recvmsg`; teardown waits for process EOF rather than the pre-exit 0x02 byte; socket
+  claiming serializes and identity-checks the stale-node removal; and Phase 2 again
+  has a 60-second timeout now that late successors recover through the current owner.
+  When 253 sessions consume Linux's full SCM_RIGHTS allowance, the listener stays
+  with the old daemon and the successor rebinds it after teardown instead of failing
+  the entire session transfer.
+- 2026-08-15T01:19-0700 `crates/triaged/src/{handover,handover_tests,ipc,main,service,session}.rs`:
+  **Supersedes the 00:26 snapshot replacement and descriptor-ceiling behavior.**
+  Recovery snapshots are additive because bounded actor extraction can omit a live
+  session. Children carry PID plus process birth time, so repeated recovery passes
+  replace the same master without trusting a reused PID or duplicating a session after
+  its display ID is renamed. Renamed sessions receive distinct log paths, adopted
+  numeric IDs advance the allocator, optional snippet seeding runs off the IPC startup
+  path, and TCP bind contention is retried without exiting the sole PTY owner. Handover
+  state is sent before descriptors, then SCM_RIGHTS descriptors are sent in portable
+  64-FD chunks; the receiver raises its soft descriptor limit and accepts transfers
+  larger than one kernel control message. macOS and Linux liveness now reject PID
+  reuse and zombies, legacy 0x02 waits for peer teardown, and systemd restarts after a
+  successful handover as well as a failure.
+- 2026-08-15T01:49-0700 `crates/triaged/src/{handover,handover_tests,ipc,session}.rs`:
+  **Supersedes the 01:19 metadata-first framing.** The first sendmsg now carries
+  the complete JSON state and up to 64 descriptors, preserving rollback to the
+  prior one-message receiver. Lineage-capable successors acknowledge all chunks
+  with 0x04 before 0x01; a legacy successor may commit only when the complete
+  transfer fits in its first message. If a sender dies between later chunks, the
+  mapped descriptor prefix and matching state prefix remain protected and socket
+  arbitration recovers the current owner before readers start. File-limit growth
+  counts descriptors already open, process identity is captured while a newly
+  spawned child is still unreaped, and adopted children are stopped by closing the
+  PTY rather than a check-then-SIGKILL race on a reusable PID. The public
+  `recv_fds` and `complete_handover_adoption` signatures remain compatible.
+
+- 2026-08-15T06:49-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/ipc.rs` — Added negotiated metadata-first `HandoverV2`
+  framing. New peers receive and parse the complete state before any SCM_RIGHTS
+  message can install descriptors; older peers remain reachable through a fresh
+  legacy connection. Descriptor capacity is raised and verified before either the
+  initial or recovery request is sent.
+- 2026-08-15T06:49-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/session.rs` — Restored deterministic adopted-session shutdown
+  with `TIOCSIG` through a duplicated PTY master. Kernel resolution through the
+  terminal avoids the process-birth-check/`kill(2)` PID-reuse window, while the
+  adopted-child test now verifies the original process identity disappears.
+- 2026-08-15T06:49-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/session.rs`, `crates/triaged/src/handover_tests.rs` — Recovery
+  renames reserve log destinations with `create_new`, skip occupied file names,
+  and avoid replacing a different manager session that happens to have the same
+  display ID. Token-authenticated handovers without a supported process identity
+  now use socket reachability instead of waiting forever on an absent owner.
+- 2026-08-15T06:49-0700 `VERSION`, `Cargo.toml`, `Cargo.lock`,
+  `flutter/triage_client/pubspec.yaml` — Raised the workspace to 0.3.0 with
+  `scripts/bump-version.sh`; the wire/session structs gained required public fields,
+  so publishing the change as another 0.2.x release would misstate source
+  compatibility.
+
+- 2026-08-15T07:24-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/session.rs` — Made adopted PTY readers cancellable and added
+  a Linux/Android pidfd signal target for the serialized shell process. Apple and
+  BSD builds retain PTY-bound signaling, repeated across a foreground job handoff;
+  all supported paths cancel the reader so the actor can close every master copy.
+- 2026-08-15T07:24-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/ipc.rs` — Restored the public single-message
+  `send_fds`/`recv_fds` contract and moved daemon-only chunking behind
+  `send_handover_fds`. Handover state and descriptors are now committed to the
+  inherited globals before the fallible descriptor-readiness acknowledgement.
+- 2026-08-15T07:24-0700 `crates/triaged/src/handover_tests.rs` — Added public FD
+  helper, readiness-write failure, and foreground-job shutdown regressions. The
+  zero-downtime test now proves both the adopted shell and a separate foreground
+  process group disappear after explicit shutdown.
+
+- 2026-08-15T08:53-0700 `crates/triaged/src/handover.rs` — Legacy FD frames
+  now attach SCM_RIGHTS only to the four-byte length prefix, then complete any
+  short prefix write and the JSON body with `write_all`. The receiver likewise
+  completes a short prefix after extracting ancillary descriptors, so stream
+  backpressure cannot turn a healthy large state document into an aborted handover.
+- 2026-08-15T08:53-0700 `crates/triaged/src/handover.rs` — Recovery snapshots from
+  the same owner are compacted immediately by session identity: duplicate listener
+  and PTY descriptors are replaced and closed, earlier partial-only sessions stay
+  in the union, and definitively dead process/PTY entries are pruned. Retries no
+  longer retain one full duplicate set every 250 milliseconds.
+- 2026-08-15T08:53-0700 `crates/triaged/src/ipc.rs`,
+  `crates/triaged/src/handover.rs` — A committed peer that exceeds the teardown
+  grace is terminated through its authenticated process identity. Linux uses a
+  checked pidfd and macOS uses the kernel audit token captured from
+  `LOCAL_PEERTOKEN`; the successor still waits for the committed connection to
+  close before starting readers.
+- 2026-08-15T08:53-0700 `crates/triaged/src/handover_tests.rs` — The adopted
+  foreground job now ignores SIGHUP, and new tests pin duplicate-snapshot
+  compaction plus timeout-triggered committed-peer termination.
+- 2026-08-15T09:13-0700 `crates/triaged/src/session.rs`,
+  `crates/triaged/src/main.rs` — Post-commit session adoption now keeps the
+  transferred PTY descriptor idle while attempting initialization on a duplicate.
+  Failed and later sessions stay retained in the manager and retry with bounded
+  backoff; shutdown adoption protection remains armed until every retained session
+  is installed.
+- 2026-08-15T09:13-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/handover_tests.rs` — Both handover metadata receivers reject
+  frames above 16 MiB before allocating. The failure regression now proves the
+  failed descriptor and the queued descriptor remain open, and the framing
+  regression exercises both metadata-only and descriptor-bearing receivers.
+- 2026-08-15T09:26-0700 `crates/triaged/src/session.rs`,
+  `crates/triaged/src/main.rs` — Unresolved adoption now includes both queued and
+  in-flight retries. It keeps shutdown protection armed and makes
+  `begin_handover` return busy until every inherited actor is installed, so a
+  second handover cannot omit the retained PTYs. Adopted readers wait behind a
+  startup gate until the worker thread exists, preventing an unsuccessful setup
+  from consuming output.
+- 2026-08-15T09:26-0700 `crates/triaged/src/session.rs` — A retry-thread creation
+  failure falls back to the already-running startup thread instead of parking the
+  only PTY copies indefinitely. Failed explicit session termination now restores
+  the live manager entry and manifest; the actor loop stays active rather than
+  treating a failed kill as completed shutdown.
+- 2026-08-15T09:26-0700 `crates/triaged/src/handover.rs` — Linux/Android without a
+  checked pidfd and Unix targets without a PTY-safe termination primitive return
+  an unsupported error instead of reporting that an adopted process was killed.
+- 2026-08-15T11:47-0700 `crates/triaged/src/session.rs`,
+  `crates/triaged/src/main.rs`, `crates/triaged/tests/pty_child_exec.rs` — Session
+  children now pass through an internal exec shim that resets the daemon's ignored
+  TTIN/TTOU dispositions before the configured program starts. The integration
+  test begins with both dispositions ignored and verifies that the exec target sees
+  `SIG_DFL`.
+- 2026-08-15T11:47-0700 `crates/triaged/src/session.rs`,
+  `crates/triaged/src/shutdown.rs` — Pending-adoption IDs block restore and explicit
+  shutdown while their live PTYs lack actors. Session shutdown validates the
+  removal manifest before termination, keeps the live actor and manifest unchanged
+  on termination failure, and commits removal only after termination succeeds.
+  Closely spaced stop signals retain the normal three-second coalescing window while
+  inherited descriptors are being published.
+- 2026-08-15T11:47-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/handover_tests.rs` — Tokenless recovery now treats Darwin's
+  zero foreground process group as a stale PTY, while preserving genuinely
+  indeterminate non-EIO errors. Retained-adoption tests also pin restore/shutdown
+  refusal until an actor owns the descriptor.
+- 2026-08-15T13:35-0700 `crates/triaged/src/session.rs`,
+  `crates/triaged/src/handover.rs`, `crates/triaged/src/main.rs` — Restore and
+  shutdown now hold one per-session lifecycle slot through all off-lock work and
+  persistence. Successful adopted-process termination no longer reports failure
+  when reader cancellation fails. Pending IDs reserve allocator slots immediately,
+  unresolved adoption defers orphan-log purge, shutdown temp manifests are unique
+  per session, V2 reserves only its declared descriptor count, and cold Unix starts
+  again fail synchronously when the configured TCP address cannot bind.
 
 ## Decisions
 
@@ -316,7 +546,139 @@ that produced spurious bind failures.
   `HANDOVER_ADOPTION_TIMEOUT` already bounds. Left as a decision because a future
   reader recomputing it from the old wording would have changed the wrong term.
 
+- 2026-08-15T00:26-0700 Treat a committed, same-lineage recovery snapshot as
+  authoritative only when it advertises the 0x03 commit protocol. Current daemons
+  cannot roll back after that byte, so absences mean sessions exited; legacy daemons
+  can fail after their pre-exit 0x02 and remain alive with a drained map, so an empty
+  legacy snapshot is not evidence that the retained Phase 1 masters are stale.
+- 2026-08-15T00:26-0700 Restore the bounded Phase 2 wait. The earlier removal avoided
+  admitting a second successor but let a live wedged client hold the handover gate
+  forever. The recovery path now serializes later successors, carries a stable lineage,
+  and hands over whichever process currently owns it, making timeout both live and
+  exclusive.
+- 2026-08-15T01:19-0700 Never use absence from a recovery snapshot as a tombstone.
+  **This supersedes the 00:26 authoritative-snapshot decision.** Actor extraction is
+  intentionally bounded, and a successor may also continue after adopting only a
+  subset. Neither snapshot can prove an omitted session exited. Retaining the union is
+  loss-safe; process-birth identities prevent the retained state from later signaling
+  an unrelated process after PID reuse.
+- 2026-08-15T01:19-0700 Send metadata before SCM_RIGHTS chunks. A sender that dies
+  while streaming the JSON has installed no descriptors in the successor; once any
+  descriptor arrives, the receiver already knows its session mapping. Predecessors
+  that attach descriptors to the length prefix remain readable. An older successor
+  safely refuses a new chunked transfer before sending the adoption byte, so the owner
+  keeps its sessions.
+- 2026-08-15T01:49-0700 Preserve the legacy first frame and negotiate commitment,
+  rather than changing the request enum. Old predecessors must continue accepting a
+  new successor's `{"Handover":null}` request, so a new request variant cannot be the
+  negotiation point. Presence of the lineage token marks a chunk-capable response;
+  its successor sends 0x04 only after receiving the declared descriptor count. The
+  server refuses a direct legacy 0x01 when more than 64 descriptors were sent.
+
+- 2026-08-15T06:49-0700 Metadata-first framing is version-negotiated rather than
+  replacing the old request. A current successor first asks for `HandoverV2`; an
+  older daemon rejects the unknown request without transferring descriptors, after
+  which the successor reconnects with `Handover`. A current daemon still accepts
+  the legacy request so rolling upgrades work in either direction.
+- 2026-08-15T06:49-0700 Adopted processes are signaled through the inherited PTY,
+  not by serialized PID. `TIOCSIG` binds the signal target to the actual terminal
+  descriptor in the kernel and therefore remains safe if the original numeric PID
+  has been recycled.
+
+- 2026-08-15T07:24-0700 Linux uses pidfd signaling instead of `TIOCSIG` for hard
+  termination. Linux PTYs accept only a narrow interactive-signal set through
+  `TIOCSIG`; pidfd binds SIGKILL to the opened process object and closes the same
+  PID-reuse race without that restriction. A birth-identity check both before and
+  after `pidfd_open` prevents an intervening reuse from changing the target.
+
+- 2026-08-15T08:53-0700 A post-commit timeout is no longer treated like an
+  ordinary pre-commit ambiguity. Once 0x03 lands, rollback is impossible and a
+  wedged owner blocks all output indefinitely; terminating that exact authenticated
+  process after the grace is safer than either starting competing readers or
+  waiting forever.
+- 2026-08-15T11:47-0700 Reset job-control signals in the forked PTY child through
+  the daemon executable, not an intermediate shell. POSIX shells preserve signals
+  that were ignored on entry, so `trap - TTIN TTOU` cannot reliably restore the
+  default dispositions inherited from the daemon.
+- 2026-08-15T11:47-0700 A shutdown error must remain retry-safe. The manager leaves
+  a live actor and the existing manifest authoritative until child termination
+  succeeds; a later manifest-commit error retains a historical in-memory view and
+  the previous on-disk entry rather than labeling a dead actor live.
+- 2026-08-15T13:35-0700 Restore and shutdown share a lifecycle exclusion keyed by
+  session ID. A one-time state check cannot protect either operation because both
+  release the manager lock for actor work; holding the key through rollback and
+  persistence makes their manifest transitions serial without blocking unrelated
+  sessions.
+- 2026-08-15T13:35-0700 Descriptor headroom follows the framing contract. A legacy
+  first frame can install the maximum ancillary payload immediately and therefore
+  needs preflight capacity; V2 sends metadata first, so reserving its exact declared
+  count is both safe and compatible with lower hard descriptor limits.
+
 ## Issues
+
+- 2026-08-14T10:55-0700 The review found that the Phase 2 rescue probe only checked
+  whether any daemon accepted at the shared IPC path. If launchd SIGKILLed the outgoing
+  daemon at its 60-second cap and immediately respawned it, the replacement listener
+  made the successor refuse and close the only transferred PTY masters. The probe now
+  compares the Phase 1 socket identity before it connects, so a replacement listener
+  cannot be mistaken for the original owner.
+- 2026-08-14T13:23-0700 The first repair still had a time-of-check/time-of-use gap:
+  launchd could replace the socket after its device/inode was read and before the probe
+  connected. Replaced the pathname check with an active-owner IPC probe. The focused
+  handover tests also shared mutable process-global stream state without a lock; they
+  now serialize setup through one test mutex.
+- 2026-08-14T13:26-0700 The initial active-owner probe treated a dropped handover guard
+  as a dead peer. That is false after a Phase 2 timeout or failed 0x01 write: the
+  original daemon aborts the swap, drops its guard, and keeps serving its session
+  masters. The probe now confirms the original process identity independently of the
+  guard, preventing a late successor from becoming a second reader.
+- 2026-08-14T16:35-0700 A PID is not a durable daemon identity because launchd can reuse
+  it after the owner dies. Replaced it with a random per-daemon token. A legacy owner
+  that omits the token remains impossible to distinguish from a replacement daemon;
+  that path now adopts to preserve sessions instead of refusing into certain descriptor
+  loss when launchd has already killed the owner.
+- 2026-08-14T18:26-0700 Review found the preceding identity-less policy was unsafe for
+  the immediately preceding commit-capable daemon: it can abort before committing,
+  retain its masters, and close the handover connection. The successor cannot prove
+  that an identity-less listener is that owner rather than a launchd respawn. Commit-
+  capable tokenless handovers therefore refuse conservatively; only pre-commit
+  protocol peers keep the legacy adopt behavior. Also gated Unix-only token imports
+  and probe code after review identified a Windows unused-import warning.
+- 2026-08-14T18:43-0700 The conservative tokenless refusal still discarded the only
+  PTY copies when launchd had already replaced a preceding commit-capable daemon.
+  Capture the original peer PID from the Phase 1 Unix connection and compare it on
+  the Phase 2 probe connection; unlike a pathname check, this is authenticated by
+  the connected socket. A confirmed replacement also has to be displaced from the
+  IPC pathname before adopting, otherwise the successor could later fail its own
+  bind and close every recovered master.
+- 2026-08-14T19:03-0700 Review found the initial replacement fencing step could unlink
+  a different daemon that bound between probe and deletion. Removing a shared socket
+  pathname cannot be made atomic with a prior connection-level identity check. The
+  successor instead holds its adopted masters and retries IPC binding indefinitely;
+  it can continue serving remote clients through the inherited TCP listener while a
+  replacement exits or releases the pathname. Also replaced the legacy PID fallback
+  with a process-birth identity so PID reuse cannot impersonate the original owner.
+- 2026-08-14T19:43-0700 A connected peer can time out or close while the original
+  owner is still alive, so treating any probe failure as a replacement was unsafe.
+  Only an explicit identity mismatch authorizes recovery. That recovery cannot unlink
+  a shared pathname: it uses the established empty-session handover protocol to make
+  the confirmed replacement exit; if that bounded arbitration fails, the successor
+  refuses and leaves the current owner untouched.
+- 2026-08-14T19:47-0700 Keeping a recovered daemon in an unbounded IPC-bind loop
+  avoids descriptor loss but leaves local clients attached to an empty replacement.
+  The replacement handover is bounded and identity-triggered, so after it succeeds
+  normal bind recovery is enough; after it fails, refusing is the only safe state.
+- 2026-08-14T19:56-0700 A confirmed replacement is not an original owner merely
+  because it cannot cooperate with the optional cleanup handover. Refusing there
+  drops the successor's only PTY copies after the original has died, recreating the
+  loss this repair addresses. Keep those masters and wait for the replacement's IPC
+  pathname in the exceptional cleanup-failure case.
+- 2026-08-14T20:31-0700 Final review found that a different daemon may already own
+  the same sessions after a later handover, so identity mismatch alone is not enough
+  to adopt. The cleanup handover now reports session ownership separately from
+  unavailability. It also found that an accepted but ambiguous token probe can be
+  resolved by the captured process-birth identity, and that `recv_fds` leaked received
+  descriptors if the response body was truncated; both paths are now explicit.
 
 - 2026-08-13T19:20-0700 Three separate `triaged --handover` invocations from a
   single `agy` session (ttys015) stopped themselves mid-swap within one hour, each
@@ -377,6 +739,88 @@ that produced spurious bind failures.
   rebasing and renumbering. The rebase itself was clean despite #142 also touching
   `session.rs`; every gate and both smoke tests were re-run against the rebased tree
   rather than assumed from the clean merge.
+- 2026-08-14T07:35-0700 macOS launchd caps ExitTimeOut at 60s, silently substituting
+  60 for any requested value above 60. Confirmed by loading throwaway LaunchAgents with
+  values from 45 to 3000 and reading `launchctl print gui/$UID/<label> | grep "exit timeout"`.
+  Because launchd escalates to SIGKILL after 60s, a long Phase 2 warm-up outlives the
+  outgoing daemon. Closing the Phase 2 adoption gap (adopting transferred descriptors
+  when the peer dies before the 0x01 write) makes the rescue immune to supervisor
+  SIGKILL.
+- 2026-08-15T00:26-0700 Max review round 1 found that several individually safe
+  fallbacks did not compose: pathname absence was not proof of process death, 0x02
+  preceded process exit, a different-token successor could still be the same session
+  lineage, and the stale-socket removal could race another binder. Plan 000124-04's
+  device/inode-only identity was therefore expanded to a wire lineage token plus
+  authenticated process and socket identities. The two user-supplied findings were
+  fixed in the same pass: adoption is armed before descriptor receipt, and tokenless
+  snapshots use a stable socket identity rather than their changing session set.
+- 2026-08-15T01:19-0700 Max review round 2 found that the recovery model still
+  assumed complete snapshots, durable raw PIDs, and a one-message descriptor transfer.
+  Those assumptions each produced a session-loss path: partial snapshots pruned live
+  masters, a later `StartSession` could reuse an adopted ID, a delayed stop could signal
+  a recycled PID, and 254 sessions exceeded SCM_RIGHTS. The first chunking regression
+  failed with `EMSGSIZE` on macOS at both 253 and 128 descriptors; 64 descriptors per
+  send passes after raising the successor's 256-file soft limit.
+- 2026-08-15T01:49-0700 Max review round 3 found two flaws in the first chunking
+  design: a killed sender made `ReceivedFds` drop a valid prefix, and an old successor
+  received metadata without descriptors and could commit an unusable transfer. It
+  also found that retained recovery snapshots were omitted from the file-limit
+  calculation and that process-birth verification followed by raw `kill(2)` was still
+  racy. The framing/readiness protocol, partial-prefix recovery, dynamic limit, and
+  PTY-close shutdown above address those paths.
+
+- 2026-08-15T06:49-0700 Max review round 4 found that the PID-safe no-op child
+  killer left idle adopted shells and their reader-owned masters alive, initial FD
+  capacity was raised too late, partial initial stream framing could install
+  descriptors without a complete state document, and recovery renames could
+  truncate an unrelated log. The first metadata-first fixture initially failed
+  because it still emitted the legacy combined frame; updating it to the negotiated
+  response made the intended interrupted-chunk path pass.
+
+- 2026-08-15T07:24-0700 Max review round 5 found the Linux `TIOCSIG` contract,
+  foreground-job shutdown, public FD helper asymmetry, non-Unix identity stub, and
+  readiness-write ownership gap. The first cancellable-reader run surfaced a benign
+  `BrokenPipe` when PTY signaling killed the child before cancellation reached its
+  already-closed reader; cancellation now treats that as completed teardown.
+- 2026-08-15T07:24-0700 A Linux cross-target `cargo check` could not reach Rust
+  type-checking because this macOS host has the Rust target but no
+  `x86_64-linux-gnu-gcc`; `ring` and `zstd-sys` failed in their C build scripts.
+  The target-specific source is retained for CI validation rather than presenting
+  that environmental failure as a code result.
+
+- 2026-08-15T08:53-0700 Max review round 6 found a partial legacy stream write,
+  unbounded duplicate recovery snapshots, Linux foreground jobs surviving a
+  shell-only pidfd signal, and an infinite post-commit wait. The fixes use
+  prefix-only ancillary framing, per-owner union compaction, PTY SIGQUIT before
+  the Linux shell pidfd signal, and authenticated committed-peer termination.
+- 2026-08-15T09:13-0700 Max review round 7 found that a fallible post-commit
+  adoption closed the failed descriptor and every unattempted descriptor, and that
+  both metadata receivers trusted an unbounded length prefix. Both were fixed. A
+  separate claim that Linux `TIOCSIG` requires an `int *` was rejected against the
+  upstream kernel implementation in `drivers/tty/pty.c`, which casts the ioctl
+  argument directly to `int`; the existing by-value call is the Linux ABI.
+- 2026-08-15T09:26-0700 Max review round 8 found that a second handover could omit
+  retained sessions, the retry queue looked empty while its worker owned the PTYs,
+  a reader could drain output before the actor worker existed, and thread creation
+  failure left no retry path. It also found unsupported adopted-session termination
+  paths reporting success. Handover gating, an unresolved-retry flag, reader startup
+  gating, synchronous retry fallback, and reversible shutdown address those cases.
+- 2026-08-15T11:47-0700 Max review round 9 found an ordinary SIGHUP/SIGTERM burst
+  could bypass adoption publication protection, pending PTYs could be restored or
+  shut down through historical placeholders, a shell stage could not undo inherited
+  ignored job-control signals, and shutdown could fail after irreversibly killing a
+  child. It also found Darwin's zero foreground group kept dead tokenless snapshots.
+  The coalescing gate, pending-ID registry, child exec shim, transactional shutdown
+  ordering, and stricter PTY liveness predicate address those cases.
+- 2026-08-15T13:35-0700 Max review round 10 found a restore/shutdown manifest race,
+  post-termination reader-cancel errors, pending ID/log collisions, overbroad V2
+  descriptor reservation, cold-start TCP retry, and a shared shutdown temp file.
+  The targeted fixes were rechecked by the same final-round reviewers; all three
+  reported no remaining findings.
+- 2026-08-15T13:35-0700 The first full workspace test attempt exhausted the local
+  volume while linking the all-feature daemon binary (`errno=28`). Linker cleanup
+  released its temporary output; the unchanged command then built and completed
+  successfully, so the failure was environmental rather than a test regression.
 
 ## Verification
 
@@ -384,11 +828,10 @@ that produced spurious bind failures.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
   --locked` clean.
-- `cargo test -p triaged -- --test-threads=1`: 165 passed, 0 failed, 1 ignored, plus
-  11 in the binary target, on the rebased tree. It was 167 before the rebase; #142
-  removed two `session.rs` tests, which accounts for the difference exactly. All six
-  tests this branch adds are present and passing. Single-threaded per the known parallel flakiness of
-  `session_context_*`.
+- `cargo test -p triaged -- --test-threads=1`: 170 passed, 0 failed, 1 ignored, plus
+  11 in the binary target, on the rebased tree. All eleven tests this branch adds (six
+  earlier plus five new `complete_handover_adoption` unit tests) are present and passing.
+  Single-threaded per the known parallel flakiness of `session_context_*`.
 - The lock-scope regression test was confirmed to actually catch the regression,
   both halves of it. Re-adding a `self.sessions()?` guard around `write_input`'s
   round-trip makes it fail with "list_sessions never returned" after its 10s
@@ -404,10 +847,10 @@ that produced spurious bind failures.
   swap itself took ~30ms because that daemon had no historical sessions to replay;
   a real daemon spends ~20s there, which is what the budget and `ExitTimeOut` are
   sized for.
-- **Stop still means stop**, same harness, four cases: no live sessions → plain
-  exit, no replacement; `TRIAGE_NO_RESCUE=1` with a live session → plain exit, no
-  replacement; `DisableShutdownRescue` over IPC with a live session → plain exit,
-  no replacement; SIGINT with a live session → rescued into a successor. This is
+- **Stop still means stop**, same harness, four cases: no live sessions -> plain
+  exit, no replacement; `TRIAGE_NO_RESCUE=1` with a live session -> plain exit, no
+  replacement; `DisableShutdownRescue` over IPC with a live session -> plain exit,
+  no replacement; SIGINT with a live session -> rescued into a successor. This is
   the half worth testing hardest, because the risk this change introduces is a
   daemon that cannot be stopped. Not covered by the harness: the second-signal
   override, which only fires after a rescue has already failed and so needs an
@@ -422,11 +865,68 @@ that produced spurious bind failures.
   ordered *after* the parked one, and `HashMap` iteration order is randomised per
   process. Measured rather than assumed, and stated in the test's own doc, because a
   probabilistic guard that reads as a proof is worse than one that admits it.
+- 2026-08-15T00:26-0700 **Supersedes the earlier test counts for the current
+  working tree:** `cargo check -p triaged --all-features --locked` and
+  `cargo clippy -p triaged --all-targets --all-features --locked -- -D warnings`
+  are clean. `cargo test -p triaged handover --lib --locked -- --test-threads=1`
+  passes 25 handover-focused tests, including stable tokenless snapshot identity,
+  cross-process lineage replacement, legacy non-pruning, process-liveness fallback,
+  and the TCP-listener descriptor reservation. Full workspace gates remain to be
+  rerun after the review loop reaches a stop condition.
+- 2026-08-15T01:19-0700 `cargo clippy -p triaged --all-targets --all-features
+  --locked -- -D warnings` is clean. `cargo test -p triaged handover --lib --locked
+  -- --test-threads=1` passes 25 focused tests, including the new 254-descriptor
+  chunking case, additive partial snapshots, cross-merge process identity, distinct
+  recovered log paths, and allocator advancement. Full workspace gates remain for the
+  final clean review head.
+- 2026-08-15T01:49-0700 `cargo check -p triaged --all-features --locked` and
+  `cargo clippy -p triaged --all-targets --all-features --locked -- -D warnings`
+  are clean. The focused handover suite passes 26 tests, adding a killed-between-
+  chunks case that retains all 64 mapped descriptors and an assertion that the first
+  recvmsg remains legacy-compatible. Full workspace gates remain for the final clean
+  review head.
+- 2026-08-15T06:49-0700 `cargo check -p triaged --all-features --locked` and
+  `cargo clippy -p triaged --all-targets --all-features --locked -- -D warnings`
+  are clean. The focused handover suite passes 27 tests, including metadata-first
+  partial transfer, unsupported process-identity arbitration, non-overwriting log
+  collision recovery, and an end assertion that explicit adopted-session shutdown
+  removes the captured process identity. Full workspace gates remain for the final
+  clean review head.
+- 2026-08-15T07:24-0700 `cargo clippy -p triaged --all-targets --all-features
+  --locked -- -D warnings` is clean. The public 65-descriptor round trip, a fully
+  received transfer whose readiness write hits a closed peer, and the adopted
+  shell/foreground-job shutdown regression each pass independently on macOS.
+- 2026-08-15T08:53-0700 Formatter, triaged all-target/all-feature clippy with
+  warnings denied, and `git diff --check` are clean. The focused handover suite
+  passes 31 tests, including a SIGHUP-ignoring foreground job, immediate duplicate
+  descriptor compaction, and a committed peer that remains connected past its
+  teardown deadline.
+- 2026-08-15T09:13-0700 Formatter and triaged all-target/all-feature clippy with
+  warnings denied are clean. The focused handover suite passes 32 tests, including
+  retained post-commit adoption failures and both oversized metadata receive paths.
+- 2026-08-15T09:26-0700 Formatter, triaged all-feature check and all-target clippy
+  with warnings denied, `git diff --check`, and the version synchronization check
+  are clean. The focused handover suite remains 32/32 after unresolved-adoption
+  gating, reader startup gating, retry fallback, and reversible shutdown.
+- 2026-08-15T11:47-0700 Formatter, triaged all-feature check and all-target clippy
+  with warnings denied, and `git diff --check` are clean. The handover-focused suite
+  passes 34/34 after pending-ID operation guards and zero-foreground-group
+  compaction. The shutdown manifest preflight regression passes, and the new PTY
+  child integration target passes 2/2 while verifying ignored TTIN/TTOU become
+  default dispositions across the internal exec shim.
+- 2026-08-15T13:35-0700 Final gates are clean: workspace all-feature check,
+  workspace all-target/all-feature clippy with warnings denied, workspace
+  all-feature rustdoc with warnings denied, formatter, version synchronization,
+  and `git diff --check`. The all-feature workspace suite passes: triaged library
+  192 passed and 1 model-download test ignored, triaged binary 11 passed, PTY child
+  integration 2 passed, and every other workspace unit/integration/doc-test target
+  passed. The final focused handover suite passes 35/35.
 
 ## Commits
 
-- HEAD~1 fix(triaged): stop job control and the sessions lock from wedging a handover
-- HEAD fix(triaged): hand live sessions to a successor instead of dying on SIGTERM
+- de409d8 fix(triaged): stop job control and the sessions lock from wedging a handover
+- fdde81d fix(triaged): hand live sessions to a successor instead of dying on SIGTERM
+- HEAD fix(triaged): harden handover ownership recovery
 
 (Both hashes changed when the branch was rebased onto `origin/main` at
 2026-08-13T23:45-0700; recorded by position rather than by a hash that a further
@@ -439,8 +939,10 @@ rebase would invalidate again.)
   descriptors never live in the daemon alone and no signal to the daemon can close
   them. Costs a deposit/reclaim protocol, registration on the session-create path,
   and a reaper for entries whose child has exited. Worth doing only if a SIGKILL
-  loss actually happens: with the rescue in place, launchd escalates to SIGKILL
-  only after 150s, which a rescue does not reach.
+  loss actually happens: **Superseded 2026-08-14T07:35-0700**: launchd caps ExitTimeOut
+  at 60s rather than 150s, but Phase 2 adopt-on-dead-peer ensures sessions survive
+  launchd's SIGKILL regardless. A keeper remains relevant only for a SIGKILL of the
+  daemon outside a handover.
 - Consider making `--handover` refuse to run when it has a controlling terminal
   unless forced, so the trap is unreachable rather than merely survivable.
 - `recv_actor_result` is still unbounded everywhere except
