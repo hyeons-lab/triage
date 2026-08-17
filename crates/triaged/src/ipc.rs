@@ -1023,11 +1023,11 @@ pub(crate) fn peer_process_identity_is_alive(identity: PeerProcessIdentity) -> O
         if linux_process_is_zombie(pid as libc::pid_t) == Some(true) {
             return Some(false);
         }
-        return match linux_peer_process_identity(pid as libc::pid_t) {
+        match linux_peer_process_identity(pid as libc::pid_t) {
             Some(current) => Some(current == identity),
             None if !Path::new(&format!("/proc/{pid}")).exists() => Some(false),
             None => None,
-        };
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1077,7 +1077,7 @@ pub(crate) fn terminate_handover_peer(identity: PeerProcessIdentity) -> std::io:
         let pid = u32::from_ne_bytes(
             identity.0[8..12]
                 .try_into()
-                .expect("peer identity PID slice has fixed length"),
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
         );
         // SAFETY: pidfd_open returns a new descriptor or -1. The identity check
         // after the open rejects a process that reused this PID in between.
@@ -1238,7 +1238,7 @@ pub(crate) fn peer_process_identity(stream: &UnixStream) -> Option<PeerProcessId
                 return linux_peer_process_identity(pid);
             }
         }
-        return None;
+        None
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
@@ -1521,7 +1521,7 @@ fn handle_handover_server(
         .set_read_timeout(Some(crate::handover::HANDOVER_ADOPTION_TIMEOUT))
         .context("setting handover adoption timeout")?;
     let mut sync_byte = [0u8; 1];
-    let mut sync_reader = stream.try_clone()?;
+    let mut sync_reader = &stream;
     if let Err(err) = sync_reader.read_exact(&mut sync_byte) {
         bail!("Failed to receive sync byte from client: {err}");
     }

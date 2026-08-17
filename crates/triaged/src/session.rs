@@ -1305,34 +1305,42 @@ impl SessionManager {
         // Phase 3 (brief lock): swap only if it is still a `Live` entry — a
         // concurrent restore may already have replaced it. A confirmed-exited
         // process cannot revive, so no second round-trip is needed here.
-        let mut sessions = self.sessions()?;
-        if !matches!(sessions.get(session_id), Some(ManagedSession::Live { .. })) {
-            return Ok(());
-        }
-        if let Some(ManagedSession::Live { actor, lease, .. }) = sessions.remove(session_id) {
-            if let Err(error) = actor.shutdown() {
-                tracing::warn!(
-                    session_id = %session_id,
-                    ?error,
-                    "failed to reap exited actor while demoting to historical"
-                );
+        let dead_actor = {
+            let mut sessions = self.sessions()?;
+            if !matches!(sessions.get(session_id), Some(ManagedSession::Live { .. })) {
+                return Ok(());
             }
-            // The `Live` -> `Historical` transition is otherwise invisible: it
-            // happens lazily on a restore request, so without this the map can
-            // change shape with nothing in the log to explain it.
-            tracing::info!(session_id = %session_id, "demoting exited live session for restore");
+            if let Some(ManagedSession::Live { actor, lease, .. }) = sessions.remove(session_id) {
+                // The `Live` -> `Historical` transition is otherwise invisible: it
+                // happens lazily on a restore request, so without this the map can
+                // change shape with nothing in the log to explain it.
+                tracing::info!(session_id = %session_id, "demoting exited live session for restore");
 
-            sessions.insert(
-                session_id.clone(),
-                ManagedSession::Historical {
-                    session: Box::new(historical),
-                    lease,
-                },
+                sessions.insert(
+                    session_id.clone(),
+                    ManagedSession::Historical {
+                        session: Box::new(historical),
+                        lease,
+                    },
+                );
+                // Keep the on-disk manifest consistent with the in-memory swap, as
+                // every other map-mutating path does.
+                self.persist_manifest(&sessions)
+                    .with_context(|| format!("persisting manifest after demoting {session_id}"))?;
+                Some(actor)
+            } else {
+                None
+            }
+        };
+
+        if let Some(actor) = dead_actor
+            && let Err(error) = actor.shutdown()
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                ?error,
+                "failed to reap exited actor while demoting to historical"
             );
-            // Keep the on-disk manifest consistent with the in-memory swap, as
-            // every other map-mutating path does.
-            self.persist_manifest(&sessions)
-                .with_context(|| format!("persisting manifest after demoting {session_id}"))?;
         }
         Ok(())
     }
@@ -1908,17 +1916,15 @@ impl SessionManager {
                     .fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
             }
         }
-        let ids = {
-            let mut pending = self
-                .pending_adoptions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.extend(retained);
-            pending
-                .iter()
-                .map(|(session, _)| session.id.clone())
-                .collect()
-        };
+        let mut guard = self
+            .pending_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.extend(retained);
+        let ids = guard
+            .iter()
+            .map(|(session, _)| session.id.clone())
+            .collect();
         *self
             .pending_adoption_ids
             .lock()
@@ -2777,9 +2783,9 @@ impl SessionApi for SessionManager {
                 ManagedSession::Historical { session, .. } => {
                     let completed = session.completed_session();
                     let log_path = session.persisted.log_path.clone();
-                    let removed = sessions
-                        .remove(&session_id)
-                        .expect("the historical session was just resolved");
+                    let Some(removed) = sessions.remove(&session_id) else {
+                        bail!("historical session {session_id} disappeared during shutdown");
+                    };
                     if let Err(error) = self.persist_manifest(&sessions) {
                         sessions.insert(session_id.clone(), removed);
                         return Err(error);

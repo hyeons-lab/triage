@@ -434,6 +434,21 @@ that produced spurious bind failures.
   unresolved adoption defers orphan-log purge, shutdown temp manifests are unique
   per session, V2 reserves only its declared descriptor count, and cold Unix starts
   again fail synchronously when the configured TCP address cannot bind.
+- 2026-08-17T07:21-0700 `crates/triaged/src/handover.rs`,
+  `crates/triaged/src/ipc.rs`, `crates/triaged/src/main.rs`,
+  `crates/triaged/src/session.rs`, `crates/triaged/src/shutdown.rs` — Addressed
+  CI lint warnings and completed max-effort review loop:
+  - Eliminated Linux-specific `needless_return` statements in `ipc.rs`.
+  - Replaced raw `.expect()` invocations in non-test paths with error propagation.
+  - Handled poisoned mutex states on handover and session globals (`INHERITED_STATE`,
+    `INHERITED_FDS`, `HANDOVER_STREAM`, `RECOVERED_HANDOVERS`, `PHASE1_COMPLETED_AT`).
+  - Guaranteed `cmsghdr` alignment for `SCM_RIGHTS` control buffers using `Vec<usize>`
+    and added saturating arithmetic on truncated control message lengths.
+  - Released sessions mutex before joining dead actor threads during live-to-historical demotion.
+  - Reaped successor child processes during emergency shutdown rescues even if kill fails.
+  - Closed unconsumed file descriptors when compacting additive recovery snapshots in `handover.rs`.
+  - Cleared `has_tcp_listener` in inherited state upon TCP listener adoption.
+  - Simplified and deduplicated pending adoption ID maintenance and match arms.
 
 ## Decisions
 
@@ -926,7 +941,8 @@ that produced spurious bind failures.
 
 - de409d8 fix(triaged): stop job control and the sessions lock from wedging a handover
 - fdde81d fix(triaged): hand live sessions to a successor instead of dying on SIGTERM
-- HEAD fix(triaged): harden handover ownership recovery
+- f98341b fix(triaged): harden handover ownership recovery
+- HEAD fix(triaged): address review findings across handover, IPC, and session cleanup
 
 (Both hashes changed when the branch was rebased onto `origin/main` at
 2026-08-13T23:45-0700; recorded by position rather than by a hash that a further

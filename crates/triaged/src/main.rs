@@ -508,10 +508,16 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     {
         let mut adopted_sessions = false;
         if has_inherited_sessions {
-            let state_str = triaged::handover::INHERITED_STATE.lock().unwrap().take();
+            let state_str = triaged::handover::INHERITED_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             if let Some(state_str) = state_str {
                 let mut state: triaged::handover::HandoverState = serde_json::from_str(&state_str)?;
-                let fds = triaged::handover::INHERITED_FDS.lock().unwrap().take();
+                let fds = triaged::handover::INHERITED_FDS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
                 if let Some(mut fds) = fds {
                     // Complete the Phase 2/3 sync FIRST, before starting any PTY
                     // readers, so our readers start as late as possible relative to
@@ -525,7 +531,6 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                         &default_socket_path(),
                         state.sends_teardown_commit,
                     )?;
-                    triaged::handover::merge_recovered_handovers(&mut state, &mut fds);
                     triaged::handover::claim_handover_socket(
                         &default_socket_path(),
                         &mut state,

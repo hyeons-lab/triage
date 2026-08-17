@@ -423,6 +423,11 @@ mod unix_impl {
         Ok(())
     }
 
+    fn allocate_control_buffer(cmsg_space: usize) -> Vec<usize> {
+        let count = cmsg_space.div_ceil(std::mem::size_of::<usize>());
+        vec![0usize; count]
+    }
+
     pub(crate) fn send_initial_frame(
         socket: &UnixStream,
         fds: &[RawFd],
@@ -439,18 +444,18 @@ mod unix_impl {
         } else {
             (unsafe { libc::CMSG_SPACE(fds_size as u32) }) as usize
         };
-        let mut control_buf = vec![0u8; cmsg_space];
+        let mut control_buf = allocate_control_buffer(cmsg_space);
         let mut msg = msghdr {
             msg_name: std::ptr::null_mut(),
             msg_namelen: 0,
             msg_iov: &mut iov,
             msg_iovlen: 1,
-            msg_control: if control_buf.is_empty() {
+            msg_control: if cmsg_space == 0 {
                 std::ptr::null_mut()
             } else {
                 control_buf.as_mut_ptr().cast()
             },
-            msg_controllen: control_buf.len() as _,
+            msg_controllen: cmsg_space as _,
             msg_flags: 0,
         };
         if !fds.is_empty() {
@@ -500,15 +505,15 @@ mod unix_impl {
         };
         let fds_size = std::mem::size_of_val(fds);
         let cmsg_space = unsafe { libc::CMSG_SPACE(fds_size as u32) } as usize;
-        let mut control_buf = vec![0u8; cmsg_space];
+        let mut control_buf = allocate_control_buffer(cmsg_space);
 
         let mut msg = msghdr {
             msg_name: std::ptr::null_mut(),
             msg_namelen: 0,
             msg_iov: &mut iov as *mut iovec,
             msg_iovlen: 1,
-            msg_control: control_buf.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: control_buf.len() as _,
+            msg_control: control_buf.as_mut_ptr().cast(),
+            msg_controllen: cmsg_space as _,
             msg_flags: 0,
         };
 
@@ -550,6 +555,10 @@ mod unix_impl {
         pub(crate) fn len(&self) -> usize {
             self.0.len()
         }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
     }
 
     impl Drop for ReceivedFds {
@@ -579,15 +588,15 @@ mod unix_impl {
 
         let fds_size = max_fds * std::mem::size_of::<RawFd>();
         let cmsg_space = unsafe { libc::CMSG_SPACE(fds_size as u32) } as usize;
-        let mut control_buf = vec![0u8; cmsg_space];
+        let mut control_buf = allocate_control_buffer(cmsg_space);
 
         let mut msg = msghdr {
             msg_name: std::ptr::null_mut(),
             msg_namelen: 0,
             msg_iov: &mut iov as *mut iovec,
             msg_iovlen: 1,
-            msg_control: control_buf.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: control_buf.len() as _,
+            msg_control: control_buf.as_mut_ptr().cast(),
+            msg_controllen: cmsg_space as _,
             msg_flags: 0,
         };
 
@@ -603,7 +612,7 @@ mod unix_impl {
                 && (*cmsg).cmsg_level == SOL_SOCKET
                 && (*cmsg).cmsg_type == SCM_RIGHTS
             {
-                let len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let len = ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
                 let fd_count = len / std::mem::size_of::<RawFd>();
                 if fd_count > 0 {
                     received_fds.0.reserve(fd_count);
@@ -632,7 +641,7 @@ mod unix_impl {
             ));
         }
 
-        let mut reader = socket.try_clone()?;
+        let mut reader = socket;
         reader.read_exact(&mut len_prefix[bytes_received as usize..])?;
 
         // Close-on-exec on arrival. `MSG_CMSG_CLOEXEC` would be the tidy way to ask
@@ -681,14 +690,14 @@ mod unix_impl {
             };
             let fds_size = max_fds * std::mem::size_of::<RawFd>();
             let cmsg_space = unsafe { libc::CMSG_SPACE(fds_size as u32) } as usize;
-            let mut control_buf = vec![0u8; cmsg_space];
+            let mut control_buf = allocate_control_buffer(cmsg_space);
             let mut msg = msghdr {
                 msg_name: std::ptr::null_mut(),
                 msg_namelen: 0,
                 msg_iov: &mut iov,
                 msg_iovlen: 1,
                 msg_control: control_buf.as_mut_ptr().cast(),
-                msg_controllen: control_buf.len() as _,
+                msg_controllen: cmsg_space as _,
                 msg_flags: 0,
             };
             // SAFETY: every pointer in `msg` refers to live writable storage.
@@ -705,7 +714,8 @@ mod unix_impl {
                     && (*cmsg).cmsg_level == SOL_SOCKET
                     && (*cmsg).cmsg_type == SCM_RIGHTS
                 {
-                    let len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                    let len =
+                        ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
                     let fd_count = len / std::mem::size_of::<RawFd>();
                     let data_ptr = CMSG_DATA(cmsg) as *const RawFd;
                     received.0.reserve(fd_count);
@@ -743,7 +753,8 @@ mod unix_impl {
         let mut limit = unsafe { limit.assume_init() };
         let open_fds = std::fs::read_dir("/dev/fd")
             .or_else(|_| std::fs::read_dir("/proc/self/fd"))
-            .map(|entries| entries.filter_map(Result::ok).count())?;
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(32);
         let required = (open_fds as libc::rlim_t).saturating_add(additional as libc::rlim_t);
         if required > limit.rlim_max {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));
@@ -824,13 +835,13 @@ mod unix_impl {
                 format!("{base}-{suffix}")
             };
             suffix += 1;
-            let candidate_id =
-                SessionId::new(candidate).expect("generated recovery session id is non-empty");
+            let candidate_id = SessionId::new(candidate)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             if id_unavailable(&candidate_id) {
                 continue;
             }
             let candidate_log = original_log.with_file_name(format!("{candidate_id}.log"));
-            let destination = match std::fs::OpenOptions::new()
+            let mut destination = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&candidate_log)
@@ -843,7 +854,6 @@ mod unix_impl {
             };
             match std::fs::File::open(&original_log) {
                 Ok(mut source) => {
-                    let mut destination = destination;
                     if let Err(error) = io::copy(&mut source, &mut destination) {
                         tracing::warn!(
                             %error,
@@ -939,16 +949,24 @@ mod unix_impl {
     }
 
     pub fn take_inherited_tcp_listener() -> Option<TcpListener> {
-        let state_guard = INHERITED_STATE.lock().unwrap();
+        let mut state_guard = INHERITED_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(ref state_str) = *state_guard
-            && let Ok(state) = serde_json::from_str::<HandoverState>(state_str)
+            && let Ok(mut state) = serde_json::from_str::<HandoverState>(state_str)
             && state.has_tcp_listener
         {
-            let mut fds_guard = INHERITED_FDS.lock().unwrap();
+            let mut fds_guard = INHERITED_FDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(fds) = fds_guard.as_mut()
                 && !fds.is_empty()
             {
                 let fd = fds.remove(0);
+                state.has_tcp_listener = false;
+                if let Ok(updated) = serde_json::to_string(&state) {
+                    *state_guard = Some(updated);
+                }
                 tracing::info!(fd = fd, "Adopting inherited TCP listener");
                 return Some(unsafe { TcpListener::from_raw_fd(fd) });
             }
@@ -1051,7 +1069,7 @@ mod unix_impl {
             debug_assert_eq!(fds.len(), 0);
         }
         if let Err(error) = recv_remaining_fds(&stream, expected_fd_count, &mut fds) {
-            if fds.len() == 0 {
+            if fds.is_empty() {
                 return Err(error).context("receiving remaining handover descriptor chunks");
             }
             truncate_state_to_received_fds(&mut handover_state, fds.len());
@@ -1061,9 +1079,16 @@ mod unix_impl {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
-            *INHERITED_STATE.lock().unwrap() = Some(serde_json::to_string(&handover_state)?);
-            *INHERITED_FDS.lock().unwrap() = Some(fds.into_raw());
-            *HANDOVER_STREAM.lock().unwrap() = None;
+            *INHERITED_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(serde_json::to_string(&handover_state)?);
+            *INHERITED_FDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fds.into_raw());
+            *HANDOVER_STREAM
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             *PHASE1_COMPLETED_AT
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
@@ -1100,9 +1125,15 @@ mod unix_impl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        *INHERITED_FDS.lock().unwrap() = Some(fds.into_raw());
-        *INHERITED_STATE.lock().unwrap() = Some(state_str);
-        *HANDOVER_STREAM.lock().unwrap() = Some(stream);
+        *INHERITED_FDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fds.into_raw());
+        *INHERITED_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state_str);
+        *HANDOVER_STREAM
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stream);
         *PHASE1_COMPLETED_AT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
@@ -1139,7 +1170,6 @@ mod unix_impl {
         socket_path: &Path,
         expected_token: Option<[u8; 16]>,
         expected_process_identity: Option<crate::ipc::PeerProcessIdentity>,
-        _peer_sends_commit: bool,
     ) -> bool {
         let unreachable_owner_may_live = || {
             expected_process_identity
@@ -1224,6 +1254,7 @@ mod unix_impl {
         stream: &mut UnixStream,
         mut on_timeout: impl FnMut(),
     ) {
+        let mut timed_out = false;
         loop {
             let mut byte = [0; 1];
             match stream.read_exact(&mut byte) {
@@ -1240,6 +1271,13 @@ mod unix_impl {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
+                    if timed_out {
+                        tracing::warn!(
+                            "Committed handover peer stream remained quiet after termination attempt; proceeding with adoption."
+                        );
+                        return;
+                    }
+                    timed_out = true;
                     tracing::warn!(
                         %error,
                         "Committed handover peer exceeded its teardown grace; terminating the authenticated process."
@@ -1312,7 +1350,7 @@ mod unix_impl {
             let mut state: HandoverState = serde_json::from_value(state)?;
             let expected_fd_count = state.sessions.len() + usize::from(state.has_tcp_listener);
             if let Err(error) = recv_remaining_fds(&stream, expected_fd_count, &mut received_fds) {
-                if received_fds.len() == 0 {
+                if received_fds.is_empty() {
                     return Err(error.into());
                 }
                 truncate_state_to_received_fds(&mut state, received_fds.len());
@@ -1343,11 +1381,7 @@ mod unix_impl {
             let mut commit = [0; 1];
             stream.read_exact(&mut commit)?;
             match commit[0] {
-                HANDOVER_COMMIT_BYTE => {
-                    wait_for_committed_peer_teardown(&mut stream, process_identity);
-                    Ok(ReplacementRelease::Released)
-                }
-                HANDOVER_DONE_BYTE => {
+                HANDOVER_COMMIT_BYTE | HANDOVER_DONE_BYTE => {
                     wait_for_committed_peer_teardown(&mut stream, process_identity);
                     Ok(ReplacementRelease::Released)
                 }
@@ -1451,11 +1485,11 @@ mod unix_impl {
                 .map(|(index, session)| (recovery_session_key(session), index))
                 .collect();
         let offset = usize::from(retained_state.has_tcp_listener);
-        for (fresh_session, fresh_fd) in fresh_state
-            .sessions
-            .drain(..)
-            .zip(std::mem::take(&mut fresh_fds.0))
-        {
+        let mut fresh_fds_iter = fresh_fds.into_raw().into_iter();
+        for fresh_session in fresh_state.sessions.drain(..) {
+            let Some(fresh_fd) = fresh_fds_iter.next() else {
+                break;
+            };
             let identity = recovery_session_key(&fresh_session);
             if let Some(&index) = retained_indices.get(&identity) {
                 let stale_fd = std::mem::replace(&mut retained_fds.0[offset + index], fresh_fd);
@@ -1468,6 +1502,10 @@ mod unix_impl {
                 retained_fds.0.push(fresh_fd);
                 retained_indices.insert(identity, index);
             }
+        }
+        for extra_fd in fresh_fds_iter {
+            // SAFETY: any unconsumed descriptors from the fresh recovery snapshot must be closed.
+            unsafe { libc::close(extra_fd) };
         }
         retained_state.sends_teardown_commit = fresh_state.sends_teardown_commit;
         retained_state.handover_owner_token = fresh_state.handover_owner_token;
@@ -1528,20 +1566,27 @@ mod unix_impl {
             .map(|(index, session)| (recovery_session_key(session), index))
             .collect();
         for (_, mut recovered_state, recovered_fds) in recovered {
-            let mut recovered_fds = recovered_fds;
-            if recovered_state.has_tcp_listener {
-                let listener_fd = recovered_fds.0.remove(0);
+            let mut raw_fds = recovered_fds.into_raw();
+            if recovered_state.has_tcp_listener && !raw_fds.is_empty() {
+                let listener_fd = raw_fds.remove(0);
                 // SAFETY: the recovery snapshot installed this independent fd in
                 // our process. `main` already retained the original listener.
                 unsafe { libc::close(listener_fd) };
                 recovered_state.has_tcp_listener = false;
             }
+            let mut fds_iter = raw_fds.into_iter();
             for mut recovered_session in recovered_state.sessions {
+                let Some(recovered_fd) = fds_iter.next() else {
+                    tracing::error!(
+                        session_id = %recovered_session.id,
+                        "recovered handover state contains more sessions than descriptors"
+                    );
+                    break;
+                };
                 let identity = recovery_session_key(&recovered_session);
                 if let Some(&index) = identity_indices.get(&identity)
                     && index < fds.len()
                 {
-                    let recovered_fd = recovered_fds.0.remove(0);
                     let old_fd = std::mem::replace(&mut fds[index], recovered_fd);
                     // SAFETY: this fd came from the original SCM_RIGHTS transfer
                     // and the fresh recovery snapshot now replaces its ownership.
@@ -1569,11 +1614,14 @@ mod unix_impl {
                         "could not reserve a distinct recovery log; deferring the rename to adoption"
                     );
                 }
-                let recovered_fd = recovered_fds.0.remove(0);
                 let index = state.sessions.len();
                 state.sessions.push(recovered_session);
                 fds.push(recovered_fd);
                 identity_indices.insert(identity, index);
+            }
+            for extra_fd in fds_iter {
+                // SAFETY: any unconsumed descriptors from the recovery snapshot must be closed.
+                unsafe { libc::close(extra_fd) };
             }
         }
     }
@@ -1612,7 +1660,6 @@ mod unix_impl {
         socket_path: &Path,
         expected_token: Option<[u8; 16]>,
         expected_process_identity: Option<crate::ipc::PeerProcessIdentity>,
-        peer_sends_commit: bool,
     ) {
         tracing::warn!(
             "Retaining transferred sessions while the current socket owner still blocks safe adoption."
@@ -1623,7 +1670,6 @@ mod unix_impl {
                 socket_path,
                 expected_token,
                 expected_process_identity,
-                peer_sends_commit,
             ) {
                 tracing::info!(
                     "The prior socket owner released or disappeared; adopting retained sessions."
@@ -1647,7 +1693,10 @@ mod unix_impl {
         socket_path: &Path,
         peer_sends_commit: bool,
     ) -> Result<TeardownOutcome> {
-        let stream = HANDOVER_STREAM.lock().unwrap().take();
+        let stream = HANDOVER_STREAM
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         let peer_token = *HANDOVER_PEER_TOKEN
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1706,12 +1755,8 @@ mod unix_impl {
 
         if let Err(err) = write_res {
             drop(stream);
-            let peer_alive = handover_owner_blocks_adoption(
-                socket_path,
-                peer_token,
-                peer_process_identity,
-                peer_sends_commit,
-            );
+            let peer_alive =
+                handover_owner_blocks_adoption(socket_path, peer_token, peer_process_identity);
             tracing::warn!(
                 peer_alive,
                 gap_ms,
@@ -1724,12 +1769,7 @@ mod unix_impl {
                 );
                 return Ok(TeardownOutcome::Adopt);
             }
-            wait_for_handover_owner_release(
-                socket_path,
-                peer_token,
-                peer_process_identity,
-                peer_sends_commit,
-            );
+            wait_for_handover_owner_release(socket_path, peer_token, peer_process_identity);
             return Ok(TeardownOutcome::Adopt);
         }
 
@@ -1765,12 +1805,8 @@ mod unix_impl {
                 // The peer closed on us. Whether it aborted (and kept serving) or
                 // died decides adopt-vs-refuse, and only a liveness probe can tell
                 // them apart: see `handover_owner_blocks_adoption`.
-                let peer_alive = handover_owner_blocks_adoption(
-                    socket_path,
-                    peer_token,
-                    peer_process_identity,
-                    peer_sends_commit,
-                );
+                let peer_alive =
+                    handover_owner_blocks_adoption(socket_path, peer_token, peer_process_identity);
                 tracing::warn!(
                     peer_alive,
                     "Failed to read teardown byte from old daemon: {err}"
@@ -1793,12 +1829,7 @@ mod unix_impl {
                      descriptors until its ownership can be resolved."
                 );
                 drop(stream);
-                wait_for_handover_owner_release(
-                    socket_path,
-                    peer_token,
-                    peer_process_identity,
-                    peer_sends_commit,
-                );
+                wait_for_handover_owner_release(socket_path, peer_token, peer_process_identity);
                 return Ok(TeardownOutcome::Adopt);
             }
             (TeardownOutcome::Adopt, TeardownSignal::Eof { peer_alive: false }) => {
@@ -1825,12 +1856,7 @@ mod unix_impl {
                      aborted the handover and may still own its sessions."
                 );
                 drop(stream);
-                wait_for_handover_owner_release(
-                    socket_path,
-                    peer_token,
-                    peer_process_identity,
-                    peer_sends_commit,
-                );
+                wait_for_handover_owner_release(socket_path, peer_token, peer_process_identity);
                 return Ok(TeardownOutcome::Adopt);
             }
         }

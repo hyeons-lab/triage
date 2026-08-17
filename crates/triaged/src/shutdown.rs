@@ -490,7 +490,7 @@ fn run_rescue_loop(read_fd: RawFd) -> ! {
                 signum,
                 "transferred session descriptors still await adoption; rescue will hand off both live and retained PTYs"
             );
-        };
+        }
         match rescue(&manager, read_fd, signum) {
             RescueOutcome::Skipped => exit_now(0),
             RescueOutcome::Insisted => {
@@ -886,15 +886,17 @@ fn wait_for_handover(
                  own the sessions"
             );
         } else {
-            match successor.kill().and_then(|()| successor.wait()) {
-                Ok(_) => tracing::warn!(
+            let _ = successor.kill();
+            match successor.wait() {
+                Ok(status) => tracing::warn!(
                     successor_pid = pid,
-                    "stopped the successor that did not complete the handover"
+                    ?status,
+                    "reaped the successor that did not complete the handover"
                 ),
                 Err(error) => tracing::warn!(
                     %error,
                     successor_pid = pid,
-                    "could not stop the successor that did not complete the handover"
+                    "could not reap the successor that did not complete the handover"
                 ),
             }
         }
