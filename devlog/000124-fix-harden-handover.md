@@ -449,6 +449,14 @@ that produced spurious bind failures.
   - Closed unconsumed file descriptors when compacting additive recovery snapshots in `handover.rs`.
   - Cleared `has_tcp_listener` in inherited state upon TCP listener adoption.
   - Simplified and deduplicated pending adoption ID maintenance and match arms.
+- 2026-08-17T07:28-0700 `.github/workflows/antigravity-review.yml`,
+  `scripts/antigravity_review.py`, `crates/triaged/src/handover.rs` — Added
+  Antigravity automated code review workflow powered by Gemini 3.7 Flash,
+  replacing the legacy Junie review setup. The Python runner fetches PR diffs,
+  excludes generated files, checks `AGENTS.md` and `GEMINI.md` conventions,
+  and updates structured review comments in-place. Also increased Linux PTY
+  foreground process group termination polling in `AdoptedSignalTarget::terminate`
+  with early-exit checks to prevent spurious `WouldBlock` errors under CI runner load.
 
 ## Decisions
 
@@ -942,7 +950,8 @@ that produced spurious bind failures.
 - de409d8 fix(triaged): stop job control and the sessions lock from wedging a handover
 - fdde81d fix(triaged): hand live sessions to a successor instead of dying on SIGTERM
 - f98341b fix(triaged): harden handover ownership recovery
-- HEAD fix(triaged): address review findings across handover, IPC, and session cleanup
+- 5408384 fix(triaged): address review findings across handover, IPC, and session cleanup
+- HEAD ci: add Antigravity automated code review workflow and harden Linux PTY termination
 
 (Both hashes changed when the branch was rebased onto `origin/main` at
 2026-08-13T23:45-0700; recorded by position rather than by a hash that a further

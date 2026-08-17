@@ -2159,7 +2159,7 @@ mod unix_impl {
     impl AdoptedSignalTarget {
         fn terminate(&self, process_identity: Option<HandoverProcessIdentity>) -> io::Result<()> {
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            for _ in 0..3 {
+            for _ in 0..10 {
                 // Linux TIOCSIG accepts the interactive signal set only. SIGQUIT
                 // terminates the foreground job through the PTY-bound process
                 // group before pidfd targets the serialized shell itself.
@@ -2172,7 +2172,13 @@ mod unix_impl {
                     }
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                if let Some(identity) = process_identity {
+                    let foreground = unsafe { libc::tcgetpgrp(self.pty.as_raw_fd()) };
+                    if foreground <= 0 || foreground == identity.pid as libc::pid_t {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
 
             #[cfg(any(target_os = "linux", target_os = "android"))]
