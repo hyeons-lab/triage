@@ -159,6 +159,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   int _refitGeneration = 0;
   int? _lastRefitCols;
   int? _lastRefitRows;
+  html.TextAreaElement? _cachedTextarea;
 
   @override
   void initState() {
@@ -264,6 +265,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindContainerEvents();
     }
 
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _activateTerminal();
+      }
+    });
+
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         if (!widget.isExited && _eventTargetsTerminal(event)) {
@@ -334,13 +341,19 @@ class _TerminalPaneState extends State<TerminalPane> {
             // ctrl/meta-modified "v". It is kept only as the marker saying the
             // interception was removed on purpose, sitting next to the reason.
           } else {
-            // Ensure the xterm textarea has focus so xterm.js natively receives and
-            // encodes all keyboard events (including Ctrl/Alt shortcuts, arrows, IME,
-            // and fast typing) through its unified onData stream without race conditions.
-            if (_initialized) {
-              try {
-                js_util.callMethod(_term, 'focus', []);
-              } catch (_) {}
+            // When the xterm.js helper textarea is NOT yet the active element in the DOM
+            // (e.g. after clicking outside or on initial interaction), the browser fires
+            // keydown on body and does NOT deliver text input to a textarea focused in-flight.
+            // We immediately forward this first keystroke to the session and focus the textarea
+            // with preventDefault so subsequent keystrokes flow natively through xterm.onData.
+            if (!_isActiveElementInTerminal()) {
+              final input = _keyboardEventToInput(event);
+              if (input != null && input.isNotEmpty) {
+                event.preventDefault();
+                event.stopPropagation();
+                _sendInput(input);
+              }
+              _activateTerminal();
             }
           }
         }
@@ -367,8 +380,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _focusTerminal() {
     if (_initialized && !widget.isExited) {
       try {
-        _focusNode.requestFocus();
-        js_util.callMethod(_term, 'focus', []);
+        final textarea = _cachedTextarea ??=
+            _container.querySelector('textarea') as html.TextAreaElement?;
+        if (textarea != null) {
+          final opts = js_util.newObject();
+          js_util.setProperty(opts, 'preventScroll', true);
+          js_util.callMethod(textarea, 'focus', [opts]);
+        } else {
+          js_util.callMethod(_term, 'focus', []);
+        }
       } catch (_) {}
     }
   }
@@ -413,25 +433,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       defaultTargetPlatform == TargetPlatform.android;
 
   void _activateTerminal() {
-    if (!_initialized) return;
-    _focusNode.requestFocus();
+    if (!_initialized || widget.isExited) return;
     try {
-      js_util.callMethod(_term, 'focus', []);
+      final textarea = _cachedTextarea ??=
+          _container.querySelector('textarea') as html.TextAreaElement?;
+      if (textarea != null) {
+        final opts = js_util.newObject();
+        js_util.setProperty(opts, 'preventScroll', true);
+        js_util.callMethod(textarea, 'focus', [opts]);
+      } else {
+        js_util.callMethod(_term, 'focus', []);
+      }
+      js_util.callMethod(_term, 'scrollToBottom', []);
     } catch (_) {}
-    Future.delayed(const Duration(milliseconds: 0), () {
-      if (!mounted) return;
-      _focusNode.requestFocus();
-      try {
-        js_util.callMethod(_term, 'focus', []);
-      } catch (_) {}
-    });
-    Future.delayed(const Duration(milliseconds: 75), () {
-      if (!mounted) return;
-      _focusNode.requestFocus();
-      try {
-        js_util.callMethod(_term, 'focus', []);
-      } catch (_) {}
-    });
   }
 
   void _initTerminal(String sanitizedId) {
@@ -762,7 +776,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerEventOwners[_sanitizedId]?._unbindContainerEvents();
     _containerEventOwners[_sanitizedId] = this;
     _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
-      _focusNode.requestFocus();
       if (_initialized) {
         try {
           _activateTerminal();
@@ -771,11 +784,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     });
 
     _containerClickSubscription = _container.onClick.listen((event) {
-      _focusNode.requestFocus();
       if (_initialized) {
         try {
           _activateTerminal();
-          _triggerFitWithDelayedRetries();
         } catch (_) {}
       }
     });
@@ -819,11 +830,87 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  String? _keyboardEventToInput(html.KeyboardEvent event) {
+    if (event.metaKey || event.altKey) {
+      return null;
+    }
+
+    if (event.ctrlKey) {
+      final key = event.key?.toLowerCase();
+      if (key != null && key.length == 1) {
+        final code = key.codeUnitAt(0);
+        if (code >= 97 && code <= 122) {
+          // Ctrl+a through Ctrl+z -> 0x01 through 0x1A
+          return String.fromCharCode(code - 96);
+        }
+        switch (key) {
+          case '@':
+          case ' ':
+            return '\x00';
+          case '[':
+            return '\x1b';
+          case '\\':
+            return '\x1c';
+          case ']':
+            return '\x1d';
+          case '^':
+            return '\x1e';
+          case '_':
+            return '\x1f';
+        }
+      }
+      return null;
+    }
+
+    final key = event.key;
+    if (key == null) return null;
+
+    switch (key) {
+      case 'Enter':
+        return '\r';
+      case 'Backspace':
+        return '\x7f';
+      case 'Tab':
+        return event.shiftKey ? '\x1b[Z' : '\t';
+      case 'Escape':
+        return '\x1b';
+      case 'ArrowUp':
+        return '\x1b[A';
+      case 'ArrowDown':
+        return '\x1b[B';
+      case 'ArrowRight':
+        return '\x1b[C';
+      case 'ArrowLeft':
+        return '\x1b[D';
+      case 'Home':
+        return '\x1b[H';
+      case 'End':
+        return '\x1b[F';
+      case 'PageUp':
+        return '\x1b[5~';
+      case 'PageDown':
+        return '\x1b[6~';
+      case 'Delete':
+        return '\x1b[3~';
+      default:
+        if (key.length == 1) {
+          return key;
+        }
+        return null;
+    }
+  }
+
   bool _eventTargetsTerminal(html.Event event) {
+    if (!mounted || widget.isExited) {
+      return false;
+    }
+
+    // If this pane's FocusNode has Flutter focus, it owns the input.
     if (_focusNode.hasFocus) {
       return true;
     }
 
+    // Otherwise, check if the event target or composed path originates from this container.
     try {
       final path = js_util.callMethod(event, 'composedPath', []) as List?;
       if (path != null && path.contains(_container)) {
@@ -832,12 +919,25 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {}
 
     final target = event.target;
-    if (target is html.Node) {
-      try {
-        return _container.contains(target);
-      } catch (_) {}
+    if (target is html.Node && _container.contains(target)) {
+      return true;
     }
+
+    // If focus is currently on an HTML input or textarea outside this terminal
+    // (such as a modal search box or pairing input), do not intercept.
+    final active = html.document.activeElement;
+    if (active is html.InputElement ||
+        (active is html.TextAreaElement && !_container.contains(active))) {
+      return false;
+    }
+
     return false;
+  }
+
+  bool _isActiveElementInTerminal() {
+    final active = html.document.activeElement;
+    if (active == null) return false;
+    return _container.contains(active);
   }
 
   void _onWrite(String data) {
@@ -888,6 +988,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
         js_util.callMethod(_fitAddon, 'fit', []);
+        js_util.callMethod(_term, 'scrollToBottom', []);
         _activateTerminal();
         final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
         final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
@@ -925,14 +1026,17 @@ class _TerminalPaneState extends State<TerminalPane> {
             // layout keeps nudging the size it may never fire within the
             // one-shot retry ladder — leaving staged history unflushed until a
             // resize/tab-switch. This deadline force-finalizes regardless.
-            _forceFinalizeTimer ??= Timer(const Duration(milliseconds: 800), () {
-              if (mounted &&
-                  !_initialContentWritten &&
-                  (_lastFittedRows ?? 0) >= 5 &&
-                  (_lastFittedCols ?? 0) >= 10) {
-                _finishInitialContent(_lastFittedCols!, _lastFittedRows!);
-              }
-            });
+            _forceFinalizeTimer ??= Timer(
+              const Duration(milliseconds: 800),
+              () {
+                if (mounted &&
+                    !_initialContentWritten &&
+                    (_lastFittedRows ?? 0) >= 5 &&
+                    (_lastFittedCols ?? 0) >= 10) {
+                  _finishInitialContent(_lastFittedCols!, _lastFittedRows!);
+                }
+              },
+            );
             final dWidth = width.toDouble();
             final dHeight = height.toDouble();
             if (_stableWidth != dWidth || _stableHeight != dHeight) {
@@ -996,8 +1100,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer?.cancel();
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
   }
-
-
 
   void _updateCursorOptions() {
     final options = js_util.getProperty(_term, 'options');
@@ -1091,6 +1193,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   Widget build(BuildContext context) {
     return Focus(
       focusNode: _focusNode,
+      autofocus: true,
+      onFocusChange: (hasFocus) {
+        if (hasFocus && _initialized) {
+          _activateTerminal();
+        }
+      },
       onKeyEvent: (node, event) {
         if (event.logicalKey == LogicalKeyboardKey.tab) {
           return KeyEventResult.handled;
@@ -1107,9 +1215,13 @@ class _TerminalPaneState extends State<TerminalPane> {
               widget.controller.fit();
             });
           }
-          final terminal = Container(
-            color: const Color(0xff0d1113),
-            child: HtmlElementView(viewType: _viewType),
+          final terminal = GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (_) => _activateTerminal(),
+            child: Container(
+              color: const Color(0xff0d1113),
+              child: HtmlElementView(viewType: _viewType),
+            ),
           );
           // Desktop browsers keep the full-height terminal; only a mobile-OS
           // browser gets the on-screen key row (the soft keyboard lacks Esc, Tab,
