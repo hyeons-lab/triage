@@ -29,6 +29,21 @@ const SERVICE_NAME: &str = "triaged";
 
 /// Dispatch a `triaged service <action>` invocation.
 pub fn run_cli(action: &str) -> Result<()> {
+    // Both stopping actions tell the running daemon first that the stop it is about
+    // to receive is a real one. Done here, in the one place both pass through,
+    // rather than in each platform module: the supervisor call below arrives at the
+    // daemon as a SIGTERM, and a SIGTERM is otherwise answered by handing every
+    // live session to a detached successor. See `disable_daemon_shutdown_rescue`.
+    //
+    // `install` is deliberately *not* on this list even though it unloads a running
+    // job first. That unload is a restart, not a stop, so letting the rescue run is
+    // what carries live sessions across it: the replacement takes them, and the
+    // freshly loaded job then hands over from the replacement. It costs a slow
+    // `install` (see the note it prints) and preserves the sessions, where suppressing
+    // the rescue would be fast and destroy every one of them.
+    if matches!(action, "stop" | "uninstall") {
+        disable_daemon_shutdown_rescue();
+    }
     match action {
         "install" => platform::install(&ServiceContext::detect()?),
         "uninstall" => platform::uninstall(&ServiceContext::detect()?),
@@ -149,12 +164,45 @@ const _: () = assert!(
     "the throttle must exceed launchd's 10s default, or it slows nothing down"
 );
 
+/// Seconds launchd waits after SIGTERM before escalating to SIGKILL.
+///
+/// launchd silently caps `ExitTimeOut` at 60 seconds (any value above 60 is
+/// replaced with 60 by launchd). Setting 60 requests the true maximum grace
+/// period launchd will grant.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_STOP_GRACE_SECS: u32 = 60;
+
+#[cfg(any(target_os = "macos", test))]
+const _: () = assert!(
+    LAUNCHD_STOP_GRACE_SECS == 60,
+    "launchd caps ExitTimeOut at 60s, so setting any other value either requests less \
+     grace than available or claims a budget launchd silently ignores"
+);
+
+/// Seconds systemd waits after SIGTERM before escalating to SIGKILL.
+///
+/// systemd's default is 90s, and a SIGTERM'd daemon answers by starting a
+/// successor and handing it every live session (see `crate::shutdown`), which takes
+/// as long as a cold start (session log replay and warm-up). An escalation to
+/// SIGKILL mid-rescue destroys exactly the sessions the rescue is saving. Unlike
+/// launchd, systemd has no 60s cap on `TimeoutStopSec`, so 150s provides ample
+/// headroom exceeding `SHUTDOWN_RESCUE_TIMEOUT` (90s).
+#[cfg(any(target_os = "linux", test))]
+const SYSTEMD_STOP_GRACE_SECS: u32 = 150;
+
+#[cfg(any(target_os = "linux", test))]
+const _: () = assert!(
+    SYSTEMD_STOP_GRACE_SECS as u64 > crate::handover::SHUTDOWN_RESCUE_TIMEOUT.as_secs(),
+    "the systemd stop grace period must outlast the session rescue, or SIGKILL lands \
+     mid-handover and takes every live session with it"
+);
+
 /// macOS LaunchAgent plist that runs `exe` at load, keeps it alive, and captures
 /// stdout/stderr to the given log files.
 ///
 /// `KeepAlive` stays unconditional. Making it conditional on `SuccessfulExit`
-/// looks tempting — it would stop launchd respawning the job after the clean
-/// exit that ends a handover — but that respawn is load-bearing: it is how
+/// looks tempting: it would stop launchd respawning the job after the clean
+/// exit that ends a handover, but that respawn is load-bearing: it is how
 /// supervision returns to a launchd-owned process after a manual handover (see
 /// `devlog/000085-fix-daemon-smart-start.md`), and `main`'s refused-teardown
 /// path documents that it relies on being respawned regardless of exit status.
@@ -177,6 +225,8 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
     <true/>
     <key>ThrottleInterval</key>
     <integer>{throttle}</integer>
+    <key>ExitTimeOut</key>
+    <integer>{stop_grace}</integer>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
@@ -189,13 +239,22 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
         throttle = THROTTLE_INTERVAL_SECS,
+        stop_grace = LAUNCHD_STOP_GRACE_SECS,
         stdout = xml_escape(&stdout_log.display().to_string()),
         stderr = xml_escape(&stderr_log.display().to_string()),
     )
 }
 
-/// systemd `--user` unit that runs `exe` and restarts it on failure. `ExecStart`
+/// systemd `--user` unit that runs `exe` and restarts it after every exit. `ExecStart`
 /// is quoted so a home directory with spaces still parses.
+///
+/// `KillMode=process` is load-bearing, not a preference. systemd's default
+/// (`control-group`) signals *every* process left in the unit's cgroup on stop, and
+/// `setsid` does not move a process out of a cgroup, so the successor the daemon starts
+/// to carry its live sessions across a stop (see `crate::shutdown`) would be killed
+/// along with the daemon that started it, and every session child with it. With
+/// `process`, systemd signals only the main process and lets the rescue work, which is
+/// the same relationship launchd already has with a `setsid`-detached child.
 #[cfg(any(target_os = "linux", test))]
 fn systemd_unit_contents(exe: &Path) -> String {
     format!(
@@ -206,12 +265,15 @@ fn systemd_unit_contents(exe: &Path) -> String {
          [Service]\n\
          Type=simple\n\
          ExecStart=\"{exe}\"\n\
-         Restart=on-failure\n\
+         Restart=always\n\
          RestartSec=2\n\
+         TimeoutStopSec={stop_grace}\n\
+         KillMode=process\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
         exe = exe.display(),
+        stop_grace = SYSTEMD_STOP_GRACE_SECS,
     )
 }
 
@@ -233,6 +295,35 @@ fn schtasks_create_args(exe: &Path) -> Vec<String> {
         "/F".to_string(),
     ]
 }
+
+/// Tell a running daemon that the stop we are about to request is a real one.
+///
+/// `stop` and `uninstall` work by asking the supervisor to stop the job, which
+/// arrives at the daemon as a SIGTERM, and a SIGTERM is answered by handing every
+/// live session to a detached successor rather than dying (see
+/// [`crate::shutdown`]). That is right for a bootout, a logout, or a stray `kill`,
+/// and wrong here: the operator asked for a stop, and `uninstall` in particular
+/// must not leave a daemon running.
+///
+/// Best-effort by design. No daemon running, an older daemon that does not know
+/// the request, a socket that has gone stale: none of those should stop an
+/// uninstall, and all of them mean there is nothing that would resurrect itself.
+///
+/// The suppression it asks for expires on its own (see
+/// `crate::shutdown::disable_rescue`), which matters because this runs *before* the
+/// stop is attempted: a stop that then fails must not leave a still-running daemon
+/// permanently unable to save its sessions.
+#[cfg(unix)]
+fn disable_daemon_shutdown_rescue() {
+    let socket_path = crate::ipc::default_socket_path();
+    if let Err(error) = crate::ipc::IpcClient::new(socket_path).disable_shutdown_rescue() {
+        tracing::debug!(%error, "could not disable the daemon's shutdown rescue before stopping");
+    }
+}
+
+/// Windows has no handover and so no shutdown rescue to disable.
+#[cfg(not(unix))]
+fn disable_daemon_shutdown_rescue() {}
 
 // ---------------------------------------------------------------------------
 // Platform side effects
@@ -284,6 +375,12 @@ mod platform {
             "Installed and started triaged LaunchAgent ({SERVICE_LABEL}).\n  plist: {}\n  logs:  {}",
             plist.display(),
             log_dir.display()
+        );
+        println!(
+            "Note: a daemon that was already running hands its live sessions to a replacement \
+             before restarting, so this can take up to a minute with many sessions open. On the \
+             first install after upgrading, the job being replaced is still governed by the old \
+             plist's shorter stop timeout, so that one handover can be cut short."
         );
         Ok(())
     }
@@ -627,6 +724,46 @@ mod tests {
         );
     }
 
+    /// The daemon answers SIGTERM by handing its live sessions to a successor
+    /// rather than dying (`crate::shutdown`), and that takes as long as a cold
+    /// start. launchd's 20s default and systemd's 90s default both escalate to
+    /// SIGKILL partway through.
+    ///
+    /// macOS launchd silently caps ExitTimeOut at 60s (values above 60 are
+    /// replaced by 60 outright), while systemd TimeoutStopSec has no such cap and
+    /// is set to 150s to provide headroom exceeding the rescue budget.
+    #[test]
+    fn units_grant_the_session_rescue_time_to_finish() {
+        let plist = plist_contents(
+            Path::new("/usr/local/bin/triaged"),
+            Path::new("/tmp/out.log"),
+            Path::new("/tmp/err.log"),
+        );
+        let exit_timeout = plist
+            .split_once("<key>ExitTimeOut</key>")
+            .expect("plist declares ExitTimeOut")
+            .1;
+        assert!(
+            exit_timeout
+                .trim_start()
+                .starts_with(&format!("<integer>{LAUNCHD_STOP_GRACE_SECS}</integer>")),
+            "ExitTimeOut must be followed by its value: {exit_timeout}"
+        );
+
+        let unit = systemd_unit_contents(Path::new("/home/me/.cargo/bin/triaged"));
+        assert!(
+            unit.contains(&format!("TimeoutStopSec={SYSTEMD_STOP_GRACE_SECS}")),
+            "the systemd unit must extend the stop timeout: {unit}"
+        );
+        // A longer timeout is useless on its own under systemd: the default kill mode
+        // takes the whole cgroup, including the successor the rescue just handed the
+        // sessions to.
+        assert!(
+            unit.contains("KillMode=process"),
+            "the systemd unit must not let a stop reap the rescue's successor: {unit}"
+        );
+    }
+
     #[test]
     fn plist_escapes_xml_metacharacters() {
         let body = plist_contents(
@@ -642,7 +779,7 @@ mod tests {
     fn systemd_unit_quotes_execstart_and_restarts() {
         let unit = systemd_unit_contents(Path::new("/home/me/.cargo/bin/triaged"));
         assert!(unit.contains("ExecStart=\"/home/me/.cargo/bin/triaged\""));
-        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 

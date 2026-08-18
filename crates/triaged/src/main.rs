@@ -9,6 +9,13 @@ use triaged::ws;
 use triaged::ipc::{IpcConfig, IpcServer, default_socket_path};
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(triaged::session::PTY_CHILD_EXEC_ARG))
+    {
+        return exec_pty_child(std::env::args_os().skip(2));
+    }
+
     // Arguments are parsed, and help/version answered, *before* logging is
     // initialized: `logging::init` resolves a state directory and fails when
     // neither HOME nor USERPROFILE is set, and `triaged --help` failing because
@@ -26,10 +33,93 @@ fn main() -> anyhow::Result<()> {
         Invocation::Service(_) | Invocation::Daemon { .. } => {}
     }
 
+    // Before any handover work: make job control unable to stop us, and make a
+    // terminating signal something we can answer rather than die on. Both are set up
+    // here, ahead of the long startup, because from the moment this process adopts a
+    // predecessor's sessions it owns PTYs that its death would destroy.
+    #[cfg(unix)]
+    ignore_terminal_job_control_signals();
+    // Daemon invocations only. `triaged service <action>` is a short-lived CLI with
+    // no rescue thread to consume the pipe, so installing the handler there would
+    // turn Ctrl-C into a signal that is caught, queued, and never acted on.
+    #[cfg(unix)]
+    if matches!(invocation, Invocation::Daemon { .. }) {
+        triaged::shutdown::install_signal_handlers();
+    }
+
     // Keep this binding alive for the lifetime of the process: dropping the
     // WorkerGuard flushes the non-blocking tracing appender thread.
     let _flush_guard = triage_core::logging::init(triage_core::logging::default_config()?)?;
+
+    // Start consuming those signals now, before the long startup work. Until
+    // `arm_rescue` hands it a manager there is nothing to hand over, so it answers a
+    // signal by exiting, exactly as the default disposition would have. That matters:
+    // a caught signal with no consumer would make the daemon unstoppable for the
+    // whole of startup.
+    #[cfg(unix)]
+    if matches!(invocation, Invocation::Daemon { .. }) {
+        triaged::shutdown::spawn_rescue_thread();
+    }
+
     run(invocation)
+}
+
+/// Stops the terminal job-control signals from ever suspending this process.
+///
+/// Handover teardown calls `tcsetattr`, and for a process in a *background*
+/// process group that raises `SIGTTOU` unconditionally; TOSTOP does not gate it.
+/// A daemon launched from an interactive shell (including from inside a Triage
+/// session, the most natural place to test a build) is exactly such a process, so
+/// it would stop itself partway through the swap, holding every PTY master, the
+/// control socket and the TCP listener. Those sessions are then hostage: the
+/// process cannot be killed without destroying them, and `SIGCONT` alone does not
+/// help because it re-stops on the next `tcsetattr`.
+///
+/// Ignoring the signal makes the background `tcsetattr` proceed instead of
+/// stopping us, which is what POSIX specifies for an ignored (or blocked)
+/// `SIGTTOU`. `SIGTTIN` is ignored for the same reason on the read side; a daemon
+/// has no business reading a terminal it merely inherited.
+///
+/// This does not detach the controlling terminal (no `setsid`), because a
+/// successor adopted through a handover must keep serving the sessions it
+/// inherited regardless of how it was launched. The goal is only that job
+/// control can never freeze the owner of live PTYs.
+#[cfg(unix)]
+fn ignore_terminal_job_control_signals() {
+    // SAFETY: `signal` with SIG_IGN carries no handler to run, so there is no
+    // async-signal-safety obligation; the only effect is on this process's
+    // disposition table. Errors are deliberately ignored: a failure here is not
+    // worth refusing to start over, and the daemon simply keeps the default
+    // behaviour it has always had.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+    triaged::session::mark_job_control_signals_ignored();
+}
+
+/// Resets the daemon-only ignored job-control dispositions in the forked PTY
+/// child, then replaces the shim with the configured session program.
+#[cfg(unix)]
+fn exec_pty_child(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = args.into_iter();
+    let program = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing program after internal PTY child marker"))?;
+    // SAFETY: this is the single-threaded child produced by portable-pty's fork,
+    // immediately before exec. Restoring default dispositions here prevents the
+    // configured shell/job from inheriting the daemon's process-wide ignores.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+    }
+    let error = std::process::Command::new(&program).args(args).exec();
+    Err(anyhow::anyhow!(
+        "executing PTY child program {}: {error}",
+        program.to_string_lossy()
+    ))
 }
 
 /// Whether a daemon already owns the IPC socket, used to decide adopt-vs-fresh
@@ -309,7 +399,9 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // emulator and shells out to git per session — measured at ~9s in June 2026
     // and ~22.6s a month later, growing with accumulated logs. On a handover
     // that time is spent while the outgoing daemon is parked waiting for our
-    // adoption byte, which is why `HANDOVER_ADOPTION_TIMEOUT` has to cover it.
+    // adoption byte. The outgoing daemon now waits for the live successor rather
+    // than timing it out and admitting a second reader; the coordination budget
+    // still reflects the expected warm-up window for other starters.
     //
     // It belongs here, *above* the sync, and moving it below to shrink that wait
     // is a trap worth naming: until the adoption byte goes out the outgoing
@@ -323,6 +415,21 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // The way to shrink the wait is to make the restore itself cheaper or lazy,
     // not to move it past the commit point.
     let manager = Arc::new(SessionManager::default());
+
+    // Arm the rescue as soon as a manager exists, which is deliberately *before*
+    // adoption rather than after it. From the moment `complete_handover_adoption`
+    // returns `Adopt`, this process is the sole owner of every adopted master and the
+    // predecessor has already detached, so a stop signal in that window must not take
+    // the unarmed "exit without a rescue" path: that would close every master and
+    // SIGHUP every child, which is the loss this exists to prevent. The window is not
+    // instantaneous either, since `seed_session_snippets` round-trips to each adopted
+    // actor.
+    //
+    // Arming here costs nothing before adoption: a manager holding only restored
+    // `Historical` entries reports zero live sessions, so a signal is skipped and
+    // exits cleanly, exactly as an unarmed one would.
+    #[cfg(unix)]
+    triaged::shutdown::arm_rescue(Arc::clone(&manager));
 
     // Load configuration
     let config = if let Ok(path) = triage_core::config::Config::default_path() {
@@ -377,118 +484,104 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
         }
     }
 
-    // Bind TCP listener (either inherited or brand new)
-    let tcp_listener = {
-        #[cfg(unix)]
-        {
-            if has_inherited_sessions {
-                if let Some(listener) = triaged::handover::take_inherited_tcp_listener() {
-                    tracing::info!("Successfully adopted inherited TCP listener socket");
-                    use std::os::unix::io::AsRawFd;
-                    triaged::handover::set_active_tcp_listener_fd(listener.as_raw_fd());
-                    listener
-                } else {
-                    let listener = std::net::TcpListener::bind(bind_addr)?;
-                    use std::os::unix::io::AsRawFd;
-                    triaged::handover::set_active_tcp_listener_fd(listener.as_raw_fd());
-                    listener
-                }
-            } else {
-                let listener = std::net::TcpListener::bind(bind_addr)?;
-                use std::os::unix::io::AsRawFd;
-                triaged::handover::set_active_tcp_listener_fd(listener.as_raw_fd());
-                listener
-            }
+    // Take the inherited TCP listener early so recovery snapshots can identify
+    // the same ownership lineage. If the descriptor ceiling left it behind, bind
+    // a replacement only after the outgoing daemon has actually exited.
+    #[cfg(unix)]
+    let inherited_tcp_listener = if has_inherited_sessions {
+        let listener = triaged::handover::take_inherited_tcp_listener();
+        if let Some(listener) = listener.as_ref() {
+            tracing::info!("Successfully adopted inherited TCP listener socket");
+            use std::os::unix::io::AsRawFd;
+            triaged::handover::set_active_tcp_listener_fd(listener.as_raw_fd());
         }
-        #[cfg(not(unix))]
-        {
-            std::net::TcpListener::bind(bind_addr)?
-        }
+        listener
+    } else {
+        None
     };
+
+    #[cfg(not(unix))]
+    let tcp_listener = Some(std::net::TcpListener::bind(bind_addr)?);
 
     // If we have inherited sessions, adopt them!
     #[cfg(unix)]
     {
+        let mut adopted_sessions = false;
         if has_inherited_sessions {
-            let state_str = triaged::handover::INHERITED_STATE.lock().unwrap().take();
+            let state_str = triaged::handover::INHERITED_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
             if let Some(state_str) = state_str {
-                let state: triaged::handover::HandoverState = serde_json::from_str(&state_str)?;
-                let fds = triaged::handover::INHERITED_FDS.lock().unwrap().take();
-                if let Some(fds) = fds {
-                    use triaged::handover::TeardownOutcome;
-
+                let mut state: triaged::handover::HandoverState = serde_json::from_str(&state_str)?;
+                let fds = triaged::handover::INHERITED_FDS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(mut fds) = fds {
                     // Complete the Phase 2/3 sync FIRST, before starting any PTY
                     // readers, so our readers start as late as possible relative to
                     // the outgoing daemon's exit. (That exit — not this handshake —
                     // is what makes the handoff exclusive; see
                     // HANDOVER_TEARDOWN_TIMEOUT.)
-                    // The outcome says whether the old daemon actually committed to
-                    // teardown (Adopt) or aborted while still owning its sessions
-                    // (Refuse) — see complete_handover_adoption / teardown_outcome.
-                    match triaged::handover::complete_handover_adoption(
+                    // If the first handshake aborted, completion keeps these
+                    // descriptors idle while it atomically hands over whichever
+                    // daemon currently owns the socket.
+                    triaged::handover::complete_handover_adoption(
                         &default_socket_path(),
                         state.sends_teardown_commit,
-                    )? {
-                        TeardownOutcome::Refuse => {
-                            // The old daemon aborted and kept its sessions, so it is
-                            // still serving them on its own copies of the masters and
-                            // listener. Adopting our dup'd copies would put a second
-                            // destructive reader on each. Exit and let the OS close
-                            // our copies; the old daemon is unaffected, and launchd
-                            // respawns us to retry a clean handover. Exit here is
-                            // before the WS/IPC servers start, so nothing is torn
-                            // down that the old daemon isn't already running.
-                            //
-                            // Return rather than `process::exit`: exiting here would
-                            // skip main's WorkerGuard drop, which is the only thing
-                            // that flushes the non-blocking tracing appender — so
-                            // the very message explaining this exit would likely
-                            // never reach the log. Returning unwinds normally, the
-                            // guard flushes, and `main`'s `Result` still yields a
-                            // non-zero status so a manual deploy can tell a refused
-                            // swap from a clean one. launchd respawns us either way
-                            // (KeepAlive: true, not SuccessfulExit), so the retry
-                            // path is unaffected. Our dup'd listener and masters
-                            // close as their owners drop; the old daemon keeps its
-                            // own copies and keeps serving.
-                            tracing::error!(
-                                "outgoing daemon did not commit its teardown; it still owns its \
-                                 sessions. Exiting without adopting so a retry can hand over \
-                                 cleanly (the daemon keeps serving in the meantime)."
-                            );
-                            return Err(anyhow::anyhow!(
-                                "handover refused: outgoing daemon did not commit its teardown \
-                                 and still owns its sessions"
-                            ));
-                        }
-                        TeardownOutcome::Adopt => {}
-                    }
+                    )?;
+                    triaged::handover::claim_handover_socket(
+                        &default_socket_path(),
+                        &mut state,
+                        &mut fds,
+                    );
 
                     tracing::info!("Adopting {} inherited live sessions", state.sessions.len());
-                    // complete_handover_adoption() above sent the 0x01 commit
-                    // byte and the old daemon committed, so it has detached and
-                    // no longer owns these sessions. adopt_sessions inserts each
-                    // session as it goes, so a mid-loop failure (a rotated log
-                    // file, thread-spawn EAGAIN under fd pressure) still leaves
-                    // the ones already adopted live in this manager. Propagating
-                    // with `?` here would exit the successor too and close *every*
-                    // adopted master, orphaning the sessions that did adopt
-                    // cleanly — the exact loss handover exists to avoid. Keep the
-                    // daemon up and owning what it got instead.
-                    if let Err(error) = manager.adopt_sessions(state, fds) {
+                    // Publish ownership in the manager before any fallible actor
+                    // setup. A stop signal in the next instruction can then
+                    // transfer these retained PTYs through another handover
+                    // instead of observing an empty manager and exiting.
+                    if let Err(error) = manager.queue_handover_adoptions(state, fds) {
                         tracing::error!(
                             %error,
-                            "failed to fully adopt inherited sessions after the handover commit; \
-                             continuing with those already adopted so the daemon still owns them"
+                            "the inherited session state and PTY count did not match; retrying the mapped sessions"
                         );
                     }
-                    // Seed snippets now that adopted sessions are live, so the
-                    // rail shows a description for each immediately after handover.
-                    manager.seed_session_snippets();
+                    if manager.has_unresolved_adoptions() {
+                        manager.retry_pending_adoptions();
+                    }
+                    adopted_sessions = true;
+                }
+            }
+            if !manager.has_unresolved_adoptions() {
+                triaged::handover::finish_handover_adoption();
+            }
+            if adopted_sessions {
+                // Snippet extraction can block on a parked actor. It is optional
+                // warm-up, so never delay the IPC accept loop after publishing
+                // the prebound owner socket.
+                let snippet_manager = Arc::clone(&manager);
+                if let Err(error) = std::thread::Builder::new()
+                    .name("triage-snippet-seed".into())
+                    .spawn(move || snippet_manager.seed_session_snippets())
+                {
+                    tracing::warn!(%error, "could not spawn session snippet seeding");
                 }
             }
         }
     }
+
+    #[cfg(unix)]
+    let tcp_listener = match inherited_tcp_listener {
+        Some(listener) => Some(listener),
+        // Only a handover can have a live predecessor still holding the address
+        // after Phase 1 omitted its listener. Preserve the background bind retry
+        // for that availability gap; a cold start must report configuration or
+        // address errors synchronously.
+        None if has_inherited_sessions => None,
+        None => Some(std::net::TcpListener::bind(bind_addr)?),
+    };
 
     // Startup has settled: whichever path got us here (cold start, session
     // restore, or handover adoption), every session this daemon owns is now in
@@ -527,19 +620,72 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     let ws_cache = Arc::clone(&web_cache);
     let pair_approval_tailnet_users = config.remote.pair_approval_tailnet_users.clone();
     let pair_approval_trust_local_peers = config.remote.pair_approval_trust_local_peers;
-    std::thread::Builder::new()
-        .name("triage-websocket-server".to_string())
-        .spawn(move || {
-            if let Err(error) = ws::start_websocket_server(
-                ws_manager,
-                tcp_listener,
-                ws_cache,
-                pair_approval_tailnet_users,
-                pair_approval_trust_local_peers,
-            ) {
-                tracing::error!(error = ?error, "Multiplexed HTTP + WebSocket server failed");
+    match tcp_listener
+        .as_ref()
+        .map(std::net::TcpListener::try_clone)
+        .transpose()
+    {
+        Ok(websocket_listener) => {
+            if let Err(error) = std::thread::Builder::new()
+                .name("triage-websocket-server".to_string())
+                .spawn(move || {
+                    #[cfg(unix)]
+                    let tcp_listener = match websocket_listener {
+                        Some(listener) => listener,
+                        None => loop {
+                            match std::net::TcpListener::bind(bind_addr) {
+                                Ok(listener) => {
+                                    use std::os::unix::io::AsRawFd;
+                                    triaged::handover::set_active_tcp_listener_fd(
+                                        listener.as_raw_fd(),
+                                    );
+                                    break listener;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        %bind_addr,
+                                        "TCP listener is still occupied after handover; retrying while IPC remains available."
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(250));
+                                }
+                            }
+                        },
+                    };
+                    #[cfg(not(unix))]
+                    let tcp_listener = websocket_listener
+                        .expect("non-Unix listener was bound before spawn");
+                    if let Err(error) = ws::start_websocket_server(
+                        ws_manager,
+                        tcp_listener,
+                        ws_cache,
+                        pair_approval_tailnet_users,
+                        pair_approval_trust_local_peers,
+                    ) {
+                        tracing::error!(error = ?error, "Multiplexed HTTP + WebSocket server failed");
+                    }
+                })
+            {
+                tracing::error!(
+                    %error,
+                    "could not start the WebSocket server thread; continuing with local IPC so inherited sessions remain owned"
+                );
             }
-        })?;
+        }
+        Err(error) => tracing::error!(
+            %error,
+            "could not duplicate the TCP listener for the WebSocket server; continuing with local IPC"
+        ),
+    }
+
+    #[cfg(unix)]
+    if manager.has_unresolved_adoptions() {
+        // A first retry-thread spawn can fail under the same transient resource
+        // pressure as actor setup. The WebSocket spawn above is a second point at
+        // which thread capacity may have recovered; if not, local IPC still lets
+        // a later handover transfer the retained PTYs.
+        manager.retry_pending_adoptions();
+    }
 
     // Run the local IPC control server. This is a Unix domain socket on Unix and
     // a named pipe on Windows; both speak the same protocol. The call blocks the
@@ -548,18 +694,10 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     {
         let socket_path = default_socket_path();
         tracing::info!(socket_path = %socket_path.display(), "triaged starting Unix socket server");
-        // Having adopted sessions, this process owns live PTY masters, so failing
-        // the bind would take them all down. The predecessor can still be finishing
-        // its teardown here — it releases us at the commit byte and only then
-        // detaches and exits — so wait that out rather than die holding everything.
-        // A fresh start keeps the zero grace: a socket genuinely owned by another
-        // daemon should fail immediately and loudly.
+        // A handover start reserved this pathname before starting PTY readers;
+        // `serve` consumes that listener. A fresh start binds here and fails
+        // immediately if another daemon already owns it.
         let config = IpcConfig::new(socket_path);
-        let config = if has_inherited_sessions {
-            config.with_bind_grace(triaged::handover::HANDOVER_TEARDOWN_TIMEOUT)
-        } else {
-            config
-        };
         IpcServer::new(manager, web_cache, config).serve()?;
         Ok(())
     }
