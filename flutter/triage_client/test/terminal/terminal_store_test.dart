@@ -138,13 +138,16 @@ void main() {
     expect(sink.written.toString(), 'é🦀');
   });
 
-  test('raw LF and CRLF are preserved verbatim without forced normalization', () {
-    store.dispatch(const Attach());
-    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
-    sink.ops.clear();
-    store.dispatch(LiveBytes(b('a\nb\r\nc')));
-    expect(sink.written.toString(), 'a\nb\r\nc');
-  });
+  test(
+    'raw LF and CRLF are preserved verbatim without forced normalization',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('a\nb\r\nc')));
+      expect(sink.written.toString(), 'a\nb\r\nc');
+    },
+  );
 
   test('split chunks pass bytes through verbatim', () {
     store.dispatch(const Attach());
@@ -260,29 +263,34 @@ void main() {
     expect(hostInput, isEmpty);
   });
 
-  test('live emulator query responses are dropped even outside suppression window', () {
-    fakeAsync((async) {
-      final s = TerminalStore(FakeTerminalSink());
-      final got = <String>[];
-      s.onHostInput = got.add;
-      s.dispatch(const Attach());
-      s.dispatch(const HistoryBytes([], cols: 80, rows: 24));
-      async.elapse(kHistoryInputSuppression + const Duration(milliseconds: 1));
+  test(
+    'live emulator query responses are dropped even outside suppression window',
+    () {
+      fakeAsync((async) {
+        final s = TerminalStore(FakeTerminalSink());
+        final got = <String>[];
+        s.onHostInput = got.add;
+        s.dispatch(const Attach());
+        s.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        async.elapse(
+          kHistoryInputSuppression + const Duration(milliseconds: 1),
+        );
 
-      // Outside suppression window: emulator query responses are still dropped
-      s.dispatch(const UserInput('\x1b[24;1R')); // CPR
-      s.dispatch(const UserInput('\x1b[?1;2c')); // DA
-      s.dispatch(const UserInput('\x1b[?0u')); // Kitty query response
-      s.dispatch(const UserInput('\x1b[?2026;2\$y')); // DECRPM
-      expect(got, isEmpty);
+        // Outside suppression window: emulator query responses are still dropped
+        s.dispatch(const UserInput('\x1b[24;1R')); // CPR
+        s.dispatch(const UserInput('\x1b[?1;2c')); // DA
+        s.dispatch(const UserInput('\x1b[?0u')); // Kitty query response
+        s.dispatch(const UserInput('\x1b[?2026;2\$y')); // DECRPM
+        expect(got, isEmpty);
 
-      // Legitimate user keystrokes are preserved
-      s.dispatch(const UserInput('a'));
-      s.dispatch(const UserInput('\x1b[A')); // Up arrow
-      expect(got, ['a', '\x1b[A']);
-      s.dispose();
-    });
-  });
+        // Legitimate user keystrokes are preserved
+        s.dispatch(const UserInput('a'));
+        s.dispatch(const UserInput('\x1b[A')); // Up arrow
+        expect(got, ['a', '\x1b[A']);
+        s.dispose();
+      });
+    },
+  );
 
   test('host-input suppression lifts after the window', () {
     fakeAsync((async) {
@@ -327,4 +335,192 @@ void main() {
     expect(sink.written.length, lessThanOrEqualTo(kPendingLiveByteCap));
     expect(sink.written.length, greaterThan(0));
   });
+
+  test(
+    'Synchronized Output Mode 2026 batches writes into a single atomic sink.write',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Chunk 1 opens mode 2026 and draws partial frame.
+      store.dispatch(
+        LiveBytes(b('\x1b[?2026h\r\x1b[3A● \n Runn'), outputSeq: 1),
+      );
+      // While synchronized, no write operations reach the sink yet.
+      expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+      // Chunk 2 continues the frame.
+      store.dispatch(LiveBytes(b('\n\n\x1b[5D'), outputSeq: 2));
+      expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+      // Chunk 3 closes mode 2026.
+      store.dispatch(LiveBytes(b('\x1b[?2026l'), outputSeq: 3));
+
+      // Entire frame is delivered in one single atomic write call.
+      final writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+      expect(writes.length, 1);
+      expect(
+        writes.first,
+        'write:\x1b[?2026h\r\x1b[3A● \n Runn\n\n\x1b[5D\x1b[?2026l',
+      );
+    },
+  );
+
+  test(
+    'Mode 2026 start and end escape markers split across chunks are carried and matched',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Chunk 1 ends mid-escape for \x1b[?2026h
+      store.dispatch(LiveBytes(b('prefix\x1b[?20'), outputSeq: 1));
+      // Prefix before the escape marker was written directly.
+      expect(sink.written.toString(), 'prefix');
+      expect(sink.ops, ['write:prefix']);
+      sink.ops.clear();
+
+      // Chunk 2 completes \x1b[?2026h and writes body
+      store.dispatch(LiveBytes(b('26hbody text'), outputSeq: 2));
+      // Synchronized mode entered; body is buffered.
+      expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+      // Chunk 3 ends mid-escape for \x1b[?2026l
+      store.dispatch(LiveBytes(b(' more\x1b[?'), outputSeq: 3));
+      expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+      // Chunk 4 completes \x1b[?2026l and adds trailing text
+      store.dispatch(LiveBytes(b('2026lsuffix'), outputSeq: 4));
+
+      final writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+      expect(writes.length, 2);
+      expect(writes[0], 'write:\x1b[?2026hbody text more\x1b[?2026l');
+      expect(writes[1], 'write:suffix');
+    },
+  );
+
+  test(
+    'Synchronized Output watchdog timer behaves as an idle timeout on active streams',
+    () {
+      fakeAsync((async) {
+        store.dispatch(const Attach());
+        store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        sink.ops.clear();
+
+        // Stream begins sync mode.
+        store.dispatch(
+          LiveBytes(b('\x1b[?2026h\r\x1b[3A○ Frame 1'), outputSeq: 1),
+        );
+        expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+        // Advance 30ms (<50ms). Next chunk arrives, resetting the idle timer.
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('\n\x1b[2K○ Frame 2'), outputSeq: 2));
+        expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+        // Advance another 30ms (total 60ms since start, but only 30ms idle).
+        async.elapse(const Duration(milliseconds: 30));
+        expect(
+          sink.ops.where((op) => op.startsWith('write:')),
+          isEmpty,
+          reason:
+              'idle timer did not prematurely flush active multi-chunk frame',
+        );
+
+        // Advance 55ms with no further incoming chunks -> idle timeout fires.
+        async.elapse(const Duration(milliseconds: 55));
+        final writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+        expect(writes.length, 1);
+        expect(
+          writes.first,
+          'write:\x1b[?2026h\r\x1b[3A○ Frame 1\n\x1b[2K○ Frame 2',
+        );
+      });
+    },
+  );
+
+  test(
+    'Synchronized Output buffer capacity cap forces a flush when exceeded',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      store.dispatch(LiveBytes(b('\x1b[?2026h'), outputSeq: 1));
+      // Send 1.5 MiB of data in sync mode without sending \x1b[?2026l.
+      final largeChunk = List<int>.filled(512 * 1024, 0x61);
+      store.dispatch(LiveBytes(largeChunk, outputSeq: 2));
+      store.dispatch(LiveBytes(largeChunk, outputSeq: 3));
+      store.dispatch(LiveBytes(largeChunk, outputSeq: 4));
+
+      // Buffer cap (1 MiB) triggered a safety flush.
+      expect(sink.written.length, greaterThanOrEqualTo(1024 * 1024));
+    },
+  );
+
+  test('trailing incomplete escape carry is flushed on idle timeout', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Dispatch a chunk ending with a partial escape sequence.
+      store.dispatch(LiveBytes(b('prompt: \x1b[?20'), outputSeq: 1));
+      expect(sink.written.toString(), 'prompt: ');
+      sink.ops.clear();
+
+      // Idle timeout elapses without subsequent chunks.
+      async.elapse(
+        kSyncOutputWatchdogTimeout + const Duration(milliseconds: 10),
+      );
+      expect(sink.ops, ['write:\x1b[?20']);
+    });
+  });
+
+  test(
+    'interleaved start markers within a synchronized frame do not duplicate batch opens',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Chunk with nested/repeated \x1b[?2026h before closing with \x1b[?2026l
+      store.dispatch(
+        LiveBytes(
+          b('\x1b[?2026hfirst \x1b[?2026hsecond\x1b[?2026l'),
+          outputSeq: 1,
+        ),
+      );
+
+      final writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+      expect(writes.length, 1);
+      expect(
+        writes.first,
+        'write:\x1b[?2026hfirst \x1b[?2026hsecond\x1b[?2026l',
+      );
+    },
+  );
+
+  test(
+    're-Attach or Clear mid-synchronization cleans up sync buffer and cancels watchdog',
+    () {
+      fakeAsync((async) {
+        store.dispatch(const Attach());
+        store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        sink.ops.clear();
+
+        // Begin sync section
+        store.dispatch(LiveBytes(b('\x1b[?2026hpartial frame'), outputSeq: 1));
+        expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+        // Re-attach drops live buffering and cancels watchdog
+        store.dispatch(const Attach());
+        async.elapse(const Duration(milliseconds: 100));
+
+        // No delayed write fired after detach/re-attach
+        expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+      });
+    },
+  );
 }
