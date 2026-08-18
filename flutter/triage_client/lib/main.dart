@@ -1612,7 +1612,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // While the store replays history or when the emulator auto-answers terminal
       // queries (DSR, DA, Kitty queries), those answers surface here as emulator
       // output; they must not be forwarded to the host as fake user input.
-      if (session.store.isSuppressingHostInput || isEmulatorQueryResponse(keys)) {
+      if (session.store.isSuppressingHostInput ||
+          session.store.isWritingSink ||
+          isEmulatorQueryResponse(keys)) {
         return;
       }
       if (_isRemoteSession(session)) {
@@ -6099,7 +6101,7 @@ class _PairingViewState extends State<_PairingView> {
               child: SizedBox(
                 width: double.infinity,
                 child: OutlinedButton.icon(
-                  onPressed: () => _openVerificationUri(verificationUri!),
+                  onPressed: () => _openVerificationUri(verificationUri),
                   icon: const Icon(Icons.open_in_new, size: 18),
                   label: Align(
                     alignment: Alignment.centerLeft,

@@ -7,7 +7,10 @@ const _viewHeight = 5;
 /// Fills the terminal until its buffer is full (every further write trims a line
 /// off the top), then writes a few extra lines so the buffer is firmly capped
 /// and the trim path has actually run before the test inspects it.
-xt.Terminal _fullTerminal({required int maxLines, int viewHeight = _viewHeight}) {
+xt.Terminal _fullTerminal({
+  required int maxLines,
+  int viewHeight = _viewHeight,
+}) {
   final terminal = xt.Terminal(maxLines: maxLines);
   terminal.resize(40, viewHeight);
   var i = 0;
@@ -69,7 +72,10 @@ void main() {
 
       expect(anchor.hasAnchor, isTrue);
       expect(
-        anchor.desiredOffset(maxScrollExtent: maxExtent, lineHeight: lineHeight),
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
         pixels,
       );
     });
@@ -106,7 +112,10 @@ void main() {
       // position — i.e. it cancels the trim drift instead of staying at the old
       // pixel offset.
       expect(
-        anchor.desiredOffset(maxScrollExtent: maxExtent, lineHeight: lineHeight),
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
         pinnedLine.index * lineHeight,
       );
     });
@@ -132,7 +141,10 @@ void main() {
       }
 
       expect(
-        anchor.desiredOffset(maxScrollExtent: maxExtent, lineHeight: lineHeight),
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
         isNull,
       );
       expect(anchor.hasAnchor, isFalse);

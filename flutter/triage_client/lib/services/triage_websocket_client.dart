@@ -896,10 +896,7 @@ class TriageWebSocketClient {
 
   Map<String, dynamic>? _parseLeaseHolder(fbs.InputLeaseHolder? holder) {
     if (holder == null) return null;
-    return {
-      'client_id': holder.clientId,
-      'kind': holder.kind?.name ?? 'Interactive',
-    };
+    return {'client_id': holder.clientId, 'kind': holder.kind.name};
   }
 
   Map<String, dynamic> _parseLeaseChange(fbs.LeaseChange? change) {
@@ -908,7 +905,7 @@ class TriageWebSocketClient {
       'generation': change.generation,
       'previous': _parseLeaseHolder(change.previous),
       'current': _parseLeaseHolder(change.current),
-      'action': change.action?.name ?? 'Acquired',
+      'action': change.action.name,
     };
   }
 

@@ -289,6 +289,10 @@ where
 
     let headers = res.headers_mut();
     headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, must-revalidate"),
+    );
+    headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(file.content_type),
     );

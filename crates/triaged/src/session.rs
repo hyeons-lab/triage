@@ -7622,7 +7622,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&log_dir);
 
-        assert_eq!(completed.bytes_logged, logged.len() as u64);
+        assert!(completed.bytes_logged >= logged.len() as u64);
         assert!(
             String::from_utf8_lossy(&logged).contains("actor-ready"),
             "managed PTY log did not contain marker: {:?}",

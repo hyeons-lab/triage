@@ -94,16 +94,16 @@ class TerminalState {
 
   @override
   int get hashCode => Object.hash(
-        cols,
-        rows,
-        sized,
-        phase,
-        exited,
-        scrollbackReady,
-        lastSentCols,
-        lastSentRows,
-        historyHighWaterSeq,
-      );
+    cols,
+    rows,
+    sized,
+    phase,
+    exited,
+    scrollbackReady,
+    lastSentCols,
+    lastSentRows,
+    historyHighWaterSeq,
+  );
 
   @override
   String toString() =>

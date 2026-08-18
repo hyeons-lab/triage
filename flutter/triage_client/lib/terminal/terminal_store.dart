@@ -26,12 +26,19 @@ const int kPendingLiveByteCap = 1024 * 1024;
 /// host as fake user input. xterm.dart answers synchronously inside `write`,
 /// xterm.js a tick later — this window covers both.
 const Duration kHistoryInputSuppression = Duration(milliseconds: 50);
+const Duration kSyncOutputWatchdogTimeout = Duration(milliseconds: 50);
+
+const String _kSyncPrefix = '\x1b[?2026';
+const String _kSyncStart = '\x1b[?2026h';
+const String _kSyncEnd = '\x1b[?2026l';
+const int _kSyncBufferCap = 1024 * 1024; // 1 MiB
+
+const int _kSyncMarkerLength = 8; // length of '\x1b[?2026h' and '\x1b[?2026l'
 
 // Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
-// `Output`): a trailing not-yet-terminated `CSI > …` and a complete
-// `CSI > … m` private sequence. (Newline normalization deliberately avoids a
-// regex — see `_normalizeNewlines`.)
-final RegExp _partialPrivateCsi = RegExp(r'\x1b\[>[0-9;]*$');
+// `Output`): a trailing not-yet-terminated `CSI > …` / `CSI ? 2026 …` and a complete
+// `CSI > … m` private sequence.
+final RegExp _partialEscapeSequence = RegExp(r'\x1b(?:\[(?:[>?]?[0-9;]*)?)?$');
 final RegExp _completePrivateCsi = RegExp(r'\x1b\[>[0-9;]*m');
 
 /// The single reducer for the terminal pipeline.
@@ -60,9 +67,16 @@ class TerminalStore extends ChangeNotifier {
 
   // Live-stream byte carries (history is decoded as a self-contained unit).
   final List<int> _utf8Carry = <int>[];
-  // Holds a trailing, not-yet-terminated `CSI > …` so a private-mode sequence
-  // split across live chunks is still stripped before reaching the emulator.
-  String _privateCsiCarry = '';
+  // Holds a trailing, not-yet-terminated escape prefix (e.g. `CSI > …` or
+  // `CSI ? 2026 …`) so a sequence split across live chunks is joined.
+  String _escapeCarry = '';
+
+  // Synchronized Output (DEC Mode 2026): buffers redraws between `\x1b[?2026h`
+  // and `\x1b[?2026l` so multi-line frames, spinner updates, and cursor moves
+  // are delivered atomically in one `write` call without intermediate cursor jitter.
+  final StringBuffer _syncBuffer = StringBuffer();
+  bool _inSynchronizedOutput = false;
+  Timer? _syncTimer;
 
   // Live chunks received before we are sized / while awaiting history, plus a
   // running byte total so the buffer can be bounded (see [kPendingLiveByteCap]).
@@ -91,6 +105,10 @@ class TerminalStore extends ChangeNotifier {
   /// (during and just after a history replay). The view's input forwarding
   /// consults this so replayed cursor/device reports are not echoed back.
   bool get isSuppressingHostInput => _suppressHostInput;
+
+  /// True while writing to the sink (i.e. decoding host bytes). Synchronous
+  /// query responses produced by the emulator must not reach the host.
+  bool get isWritingSink => _isWritingSink;
 
   // ---- Public API -----------------------------------------------------------
 
@@ -136,7 +154,9 @@ class TerminalStore extends ChangeNotifier {
         return _reduceResize(s, cols, rows);
 
       case UserInput(:final data):
-        if (!s.exited && !_suppressHostInput && !isEmulatorQueryResponse(data)) {
+        if (!s.exited &&
+            !_suppressHostInput &&
+            !isEmulatorQueryResponse(data)) {
           onHostInput?.call(data);
         }
         return s;
@@ -350,13 +370,98 @@ class TerminalStore extends ChangeNotifier {
       utf8.decode(toDecode, allowMalformed: true),
     );
     if (sanitized.isNotEmpty) {
-      final wasWriting = _isWritingSink;
-      _isWritingSink = true;
-      try {
-        _sink.write(sanitized);
-      } finally {
-        _isWritingSink = wasWriting;
+      _processSynchronizedOutput(sanitized);
+    }
+  }
+
+  /// Processes Synchronized Output (DEC Mode 2026, `\x1b[?2026h` / `\x1b[?2026l`).
+  ///
+  /// CLI tools (such as `agy`) wrap animated redraws in Mode 2026 so all intermediate
+  /// cursor repositions and status updates are delivered in one atomic frame rather
+  /// than jittering across multiple network chunks.
+  void _processSynchronizedOutput(String input) {
+    if (!_inSynchronizedOutput && !input.contains(_kSyncPrefix)) {
+      _writeDirect(input);
+      return;
+    }
+    var cursor = 0;
+    while (cursor < input.length) {
+      if (_inSynchronizedOutput) {
+        final endIdx = input.indexOf(_kSyncEnd, cursor);
+        if (endIdx != -1) {
+          final chunkEnd = endIdx + _kSyncMarkerLength;
+          _syncBuffer.write(input.substring(cursor, chunkEnd));
+          cursor = chunkEnd;
+          _inSynchronizedOutput = false;
+          _syncTimer?.cancel();
+          _syncTimer = null;
+          _flushSyncBuffer();
+        } else {
+          _syncBuffer.write(input.substring(cursor));
+          cursor = input.length;
+          if (_syncBuffer.length >= _kSyncBufferCap) {
+            debugPrint(
+              'TerminalStore: synchronized output buffer exceeded $_kSyncBufferCap bytes; force-flushing',
+            );
+            _inSynchronizedOutput = false;
+            _syncTimer?.cancel();
+            _syncTimer = null;
+            _flushSyncBuffer();
+          } else {
+            _rearmSyncWatchdog();
+          }
+        }
+      } else {
+        final startIdx = input.indexOf(_kSyncStart, cursor);
+        if (startIdx != -1) {
+          if (startIdx > cursor) {
+            _writeDirect(input.substring(cursor, startIdx));
+          }
+          _inSynchronizedOutput = true;
+          _syncBuffer.write(_kSyncStart);
+          cursor = startIdx + _kSyncMarkerLength;
+          _rearmSyncWatchdog();
+        } else {
+          final text = cursor == 0 ? input : input.substring(cursor);
+          _writeDirect(text);
+          cursor = input.length;
+        }
       }
+    }
+  }
+
+  void _rearmSyncWatchdog() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer(kSyncOutputWatchdogTimeout, () {
+      if (_escapeCarry.isNotEmpty) {
+        final carried = _escapeCarry;
+        _escapeCarry = '';
+        _processSynchronizedOutput(carried);
+      }
+      if (_inSynchronizedOutput || _syncBuffer.isNotEmpty) {
+        _inSynchronizedOutput = false;
+        _syncTimer?.cancel();
+        _syncTimer = null;
+        _flushSyncBuffer();
+      }
+    });
+  }
+
+  void _flushSyncBuffer() {
+    if (_syncBuffer.isEmpty) return;
+    final toFlush = _syncBuffer.toString();
+    _syncBuffer.clear();
+    _writeDirect(toFlush);
+  }
+
+  void _writeDirect(String text) {
+    if (text.isEmpty) return;
+    final wasWriting = _isWritingSink;
+    _isWritingSink = true;
+    try {
+      _sink.write(text);
+    } finally {
+      _isWritingSink = wasWriting;
     }
   }
 
@@ -365,38 +470,46 @@ class TerminalStore extends ChangeNotifier {
   /// and misparses them as plain SGR — e.g. `CSI > 4 ; 2 m` becomes SGR 4
   /// (underline), which poisons every subsequent cell and erase with a spurious
   /// underline. The emulator does not support these sequences anyway. A
-  /// trailing, not-yet-terminated `CSI > …` is held back so a sequence split
-  /// across chunks (or the history→live boundary) is still caught.
+  /// trailing, not-yet-terminated escape sequence (e.g. `CSI > …` or `CSI ? 2026 …`)
+  /// is held back so a sequence split across chunks (or the history→live boundary)
+  /// is still caught.
   String _stripUnsupportedPrivateCsi(String input) {
     var s = input;
-    if (_privateCsiCarry.isNotEmpty) {
-      s = _privateCsiCarry + s;
-      _privateCsiCarry = '';
+    if (_escapeCarry.isNotEmpty) {
+      s = _escapeCarry + s;
+      _escapeCarry = '';
     }
     // Fast path: no ESC (and no carry, which always begins with ESC) -> nothing
-    // to strip, so skip the partial scan and the full-string regex replace.
+    // to strip or carry, so skip the partial scan and the regex replace.
     if (!s.contains('\x1b')) {
       return s;
     }
-    final partial = _partialPrivateCsi.firstMatch(s);
+    final partial = _partialEscapeSequence.firstMatch(s);
     // Only hold a bounded partial; otherwise let it flush to avoid unbounded
     // growth on a stream that never completes the sequence.
     if (partial != null && (s.length - partial.start) <= 24) {
-      _privateCsiCarry = s.substring(partial.start);
+      _escapeCarry = s.substring(partial.start);
       s = s.substring(0, partial.start);
+      _rearmSyncWatchdog();
     }
     return s.replaceAll(_completePrivateCsi, '');
   }
 
   void _resetCarries() {
     _utf8Carry.clear();
-    _privateCsiCarry = '';
+    _escapeCarry = '';
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    _inSynchronizedOutput = false;
+    _syncBuffer.clear();
     _appliedLiveSeq = null;
   }
 
   @override
   void dispose() {
     _suppressTimer?.cancel();
+    _syncTimer?.cancel();
+    _syncBuffer.clear();
     _sink.onOutput = null;
     _sink.onResize = null;
     _sink.dispose();

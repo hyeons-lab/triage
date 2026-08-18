@@ -11,7 +11,10 @@ void main() {
 
     test('matches Device Attributes (DA1, DA2, DA3, DSR)', () {
       expect(isEmulatorQueryResponse('\x1b[?1;2c'), isTrue);
-      expect(isEmulatorQueryResponse('\x1b[?62;1;2;4;6;7;8;9;15;18;21;22;28;29c'), isTrue);
+      expect(
+        isEmulatorQueryResponse('\x1b[?62;1;2;4;6;7;8;9;15;18;21;22;28;29c'),
+        isTrue,
+      );
       expect(isEmulatorQueryResponse('\x1b[>0;276;0c'), isTrue);
       expect(isEmulatorQueryResponse('\x1b[>1;10;0c'), isTrue);
       expect(isEmulatorQueryResponse('\x1b[0n'), isTrue);
@@ -27,11 +30,17 @@ void main() {
     test('matches DECRPM mode reports', () {
       expect(isEmulatorQueryResponse('\x1b[?2026;2\$y'), isTrue);
       expect(isEmulatorQueryResponse('\x1b[?2027;1\$y'), isTrue);
+      expect(isEmulatorQueryResponse('\x1b[2026;2\$y'), isTrue);
+      expect(isEmulatorQueryResponse('\x072026;2\$y\x072027;3\$y'), isTrue);
+      expect(isEmulatorQueryResponse('2026;2\$y'), isFalse);
     });
 
     test('matches OSC color query responses', () {
       expect(isEmulatorQueryResponse('\x1b]10;rgb:ffff/ffff/ffff\x07'), isTrue);
-      expect(isEmulatorQueryResponse('\x1b]11;rgb:0000/0000/0000\x1b\\'), isTrue);
+      expect(
+        isEmulatorQueryResponse('\x1b]11;rgb:0000/0000/0000\x1b\\'),
+        isTrue,
+      );
     });
 
     test('matches window size reports', () {
@@ -41,7 +50,10 @@ void main() {
 
     test('matches concatenated query responses', () {
       expect(isEmulatorQueryResponse('\x1b[?1;2c\x1b[24;1R'), isTrue);
-      expect(isEmulatorQueryResponse('\x1b[?0u\x1b[?2026;2\$y\x1b[1;1R'), isTrue);
+      expect(
+        isEmulatorQueryResponse('\x1b[?0u\x1b[?2026;2\$y\x1b[1;1R'),
+        isTrue,
+      );
     });
 
     test('does NOT match user keystrokes or editing keys', () {
