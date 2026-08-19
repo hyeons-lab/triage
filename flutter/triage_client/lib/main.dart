@@ -3028,12 +3028,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (sessionId == null) return;
       final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
       if (index == -1) return;
-      final hasPinned = message['has_pinned'] as bool? ?? (message.containsKey('explicit') && message['explicit'] != null);
-      final pinned = message['pinned'] as bool? ?? (message['explicit'] as bool? ?? false);
-      final effective = message['effective'] as bool? ?? false;
+      final policy = message['policy'] as Map<String, dynamic>?;
+      final bool hasExplicit;
+      final bool? explicitVal;
+      final bool effective;
+      if (policy != null) {
+        hasExplicit = policy.containsKey('explicit') && policy['explicit'] != null;
+        explicitVal = policy['explicit'] as bool?;
+        effective = policy['effective'] as bool? ?? false;
+      } else {
+        hasExplicit = message['has_pinned'] as bool? ?? (message.containsKey('explicit') && message['explicit'] != null);
+        explicitVal = message['pinned'] as bool? ?? (message['explicit'] as bool?);
+        effective = message['effective'] as bool? ?? false;
+      }
       void apply() {
         _sessions[index].applyJudgePolicy(
-          explicit: hasPinned ? pinned : null,
+          explicit: hasExplicit ? explicitVal : null,
           effective: effective,
         );
       }

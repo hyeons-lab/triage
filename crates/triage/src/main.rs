@@ -25,8 +25,8 @@ use triage::{
 };
 use triage_core::judge::SessionJudgePolicy;
 use triage_core::session::{
-    InputControllerKind, SessionId, SessionSize, StyledRow, TerminalColor, TerminalCursor,
-    TerminalStyle, path_leaf_name,
+    InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
+    path_leaf_name,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -792,9 +792,8 @@ fn draw_sidebar(
 ) {
     let content_width = sidebar_content_width(area);
     let rows = sidebar_visible_rows(
-        app.sessions(),
+        app.session_entries(),
         app.selected_index(),
-        |id| app.session_judge_policy(id),
         content_width,
         scroll_offset,
         usize::from(area.height),
@@ -807,9 +806,8 @@ fn draw_sidebar(
 }
 
 fn sidebar_visible_rows<'a>(
-    sessions: impl Iterator<Item = &'a SessionView>,
+    sessions: impl Iterator<Item = (&'a SessionView, Option<SessionJudgePolicy>)>,
     selected: usize,
-    judge_policy_fn: impl Fn(&SessionId) -> Option<SessionJudgePolicy>,
     width: usize,
     scroll_offset: usize,
     visible_height: usize,
@@ -820,11 +818,10 @@ fn sidebar_visible_rows<'a>(
 
     let mut selected_start = 0usize;
     let mut selected_end = 0usize;
-    let rows = sessions
-        .enumerate()
-        .fold(Vec::<Line<'static>>::new(), |mut rows, (index, view)| {
+    let rows = sessions.enumerate().fold(
+        Vec::<Line<'static>>::new(),
+        |mut rows, (index, (view, judge_policy))| {
             let start = rows.len();
-            let judge_policy = judge_policy_fn(&view.session_id);
             rows.extend(session_sidebar_rows(
                 index,
                 selected,
@@ -838,7 +835,8 @@ fn sidebar_visible_rows<'a>(
                 selected_end = rows.len();
             }
             rows
-        });
+        },
+    );
 
     let start = sidebar_viewport_start(rows.len(), selected_start, selected_end, visible_height);
     rows.into_iter().skip(start).take(visible_height).collect()
@@ -2358,7 +2356,7 @@ mod tests {
             .map(|index| sidebar_test_view(&format!("session-{index}")))
             .collect::<Vec<_>>();
 
-        let rows = sidebar_visible_rows(sessions.iter(), 3, |_| None, 20, 0, 5);
+        let rows = sidebar_visible_rows(sessions.iter().map(|s| (s, None)), 3, 20, 0, 5);
 
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].spans[0].content.as_ref(), "> session-4  running");

@@ -995,6 +995,12 @@ impl SessionManager {
     /// Records a freshly generated snippet (newest `output_seq` wins) and pushes
     /// the update to all connected clients. Called on the summarizer worker thread.
     fn apply_snippet(&self, result: SnippetResult) {
+        // If the session exited while summarization was in flight, do not resurrect it.
+        if let Ok(sessions) = self.sessions.lock()
+            && !sessions.contains_key(&result.session_id)
+        {
+            return;
+        }
         {
             let Ok(mut snippets) = self.snippets.lock() else {
                 return;
@@ -1122,6 +1128,29 @@ impl SessionManager {
         let overrides = self.judge_overrides.lock().ok()?;
         let explicit = overrides.get(session_id).copied();
         Some((explicit, explicit.unwrap_or(default_enabled)))
+    }
+
+    fn mutate_judge_config<F>(&self, mutate: F) -> Result<triage_core::judge::JudgeRulesInfo>
+    where
+        F: FnOnce(&mut triage_core::config::JudgeConfig) -> Result<()>,
+    {
+        let mut guard = self
+            .judge
+            .lock()
+            .map_err(|_| anyhow!("judge lock poisoned"))?;
+        let current_state = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("judge not initialized"))?;
+        let mut new_config = current_state.config.clone();
+        mutate(&mut new_config)?;
+        let new_rules = crate::judge::JudgeRules::new(&new_config);
+        crate::judge::persist_judge_config(&new_config)?;
+        *guard = Some(Arc::new(JudgeState {
+            config: new_config,
+            rules: new_rules,
+        }));
+        drop(guard);
+        self.get_judge_rules()
     }
 
     /// The decision itself, split out so [`Self::judge_tool_call`] can log every
@@ -3191,16 +3220,7 @@ impl SessionApi for SessionManager {
         &self,
         workspace_path: Option<String>,
     ) -> Result<triage_core::judge::JudgeHookStatus> {
-        let ws = workspace_path.or_else(|| {
-            if let Ok(contexts) = self.list_session_contexts() {
-                for ctx in contexts {
-                    if let Some(repo) = ctx.context.and_then(|c| c.repository_root) {
-                        return Some(repo.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            None
-        });
+        let ws = workspace_path.or_else(|| first_active_repository_root(self));
         Ok(crate::judge::get_hook_status(ws.as_deref()))
     }
 
@@ -3209,16 +3229,7 @@ impl SessionApi for SessionManager {
         workspace_path: Option<String>,
         enabled: bool,
     ) -> Result<triage_core::judge::JudgeHookStatus> {
-        let ws = workspace_path.or_else(|| {
-            if let Ok(contexts) = self.list_session_contexts() {
-                for ctx in contexts {
-                    if let Some(repo) = ctx.context.and_then(|c| c.repository_root) {
-                        return Some(repo.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            None
-        });
+        let ws = workspace_path.or_else(|| first_active_repository_root(self));
         crate::judge::configure_hook(ws.as_deref(), enabled)
     }
 
@@ -3260,49 +3271,23 @@ impl SessionApi for SessionManager {
         if cmd.is_empty() {
             bail!("cannot add empty allow command");
         }
-        let mut guard = self
-            .judge
-            .lock()
-            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
-        let current_state = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
-        let mut new_config = current_state.config.clone();
-        if !new_config.allow_commands.contains(&cmd) {
-            new_config.allow_commands.push(cmd);
-        }
-        let new_rules = crate::judge::JudgeRules::new(&new_config);
-        crate::judge::persist_judge_config(&new_config)?;
-        *guard = Some(Arc::new(JudgeState {
-            config: new_config.clone(),
-            rules: new_rules,
-        }));
-        drop(guard);
-        self.get_judge_rules()
+        self.mutate_judge_config(|config| {
+            if !config.allow_commands.contains(&cmd) {
+                config.allow_commands.push(cmd);
+            }
+            Ok(())
+        })
     }
 
     fn remove_judge_allow_command(
         &self,
         command: String,
     ) -> Result<triage_core::judge::JudgeRulesInfo> {
-        let cmd = command.trim();
-        let mut guard = self
-            .judge
-            .lock()
-            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
-        let current_state = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
-        let mut new_config = current_state.config.clone();
-        new_config.allow_commands.retain(|c| c != cmd);
-        let new_rules = crate::judge::JudgeRules::new(&new_config);
-        crate::judge::persist_judge_config(&new_config)?;
-        *guard = Some(Arc::new(JudgeState {
-            config: new_config.clone(),
-            rules: new_rules,
-        }));
-        drop(guard);
-        self.get_judge_rules()
+        let cmd = command.trim().to_string();
+        self.mutate_judge_config(|config| {
+            config.allow_commands.retain(|c| c != &cmd);
+            Ok(())
+        })
     }
 
     fn add_judge_deny_substring(
@@ -3313,49 +3298,23 @@ impl SessionApi for SessionManager {
         if sub.is_empty() {
             bail!("cannot add empty deny substring");
         }
-        let mut guard = self
-            .judge
-            .lock()
-            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
-        let current_state = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
-        let mut new_config = current_state.config.clone();
-        if !new_config.deny_substrings.contains(&sub) {
-            new_config.deny_substrings.push(sub);
-        }
-        let new_rules = crate::judge::JudgeRules::new(&new_config);
-        crate::judge::persist_judge_config(&new_config)?;
-        *guard = Some(Arc::new(JudgeState {
-            config: new_config.clone(),
-            rules: new_rules,
-        }));
-        drop(guard);
-        self.get_judge_rules()
+        self.mutate_judge_config(|config| {
+            if !config.deny_substrings.contains(&sub) {
+                config.deny_substrings.push(sub);
+            }
+            Ok(())
+        })
     }
 
     fn remove_judge_deny_substring(
         &self,
         substring: String,
     ) -> Result<triage_core::judge::JudgeRulesInfo> {
-        let sub = substring.trim();
-        let mut guard = self
-            .judge
-            .lock()
-            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
-        let current_state = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
-        let mut new_config = current_state.config.clone();
-        new_config.deny_substrings.retain(|s| s != sub);
-        let new_rules = crate::judge::JudgeRules::new(&new_config);
-        crate::judge::persist_judge_config(&new_config)?;
-        *guard = Some(Arc::new(JudgeState {
-            config: new_config.clone(),
-            rules: new_rules,
-        }));
-        drop(guard);
-        self.get_judge_rules()
+        let sub = substring.trim().to_string();
+        self.mutate_judge_config(|config| {
+            config.deny_substrings.retain(|s| s != &sub);
+            Ok(())
+        })
     }
 
     fn server_update_info(&self) -> triage_core::session::ServerUpdateInfo {
@@ -3366,6 +3325,18 @@ impl SessionApi for SessionManager {
             latest_version: status.latest,
         }
     }
+}
+
+fn first_active_repository_root(manager: &SessionManager) -> Option<String> {
+    manager
+        .list_session_contexts()
+        .ok()?
+        .into_iter()
+        .find_map(|ctx| {
+            ctx.context
+                .and_then(|c| c.repository_root)
+                .map(|r| r.to_string_lossy().into_owned())
+        })
 }
 
 fn current_iso8601_timestamp() -> String {

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -420,7 +420,7 @@ impl ApprovalConfig {
 /// them. `allow_commands` is additive to the built-in allowlist, and entries
 /// only ever match a command with no shell metacharacters, so an allowlisted
 /// prefix cannot be used to smuggle a second command past the judge.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JudgeConfig {
     /// Master switch. When false the daemon answers every query `ask`, which is

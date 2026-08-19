@@ -93,10 +93,11 @@ The hook configuration lives in `.agents/hooks.json` (or `~/.agents/hooks.json` 
 }
 ```
 
-Restart `triaged` so it picks up the config, and start the agent from inside a
-Triage session. Sessions started outside Triage have no `TRIAGE_SESSION_ID`, so
-the shim answers `ask` without opening the socket, and the agent behaves exactly
-as it does today.
+Restart `triaged` so it picks up the config, or run `triaged reload`. When started
+inside a Triage session, judging honors that session's policy override (toggleable via
+**F5**). Agent sessions running outside a Triage PTY follow the daemon's configured
+`default_enabled_per_session` policy, with safe in-process fallback to `ask` if the daemon
+is not running.
 
 ## Reading the audit log
 

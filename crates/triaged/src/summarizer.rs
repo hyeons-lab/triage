@@ -178,15 +178,18 @@ impl JobQueue {
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
-        match inner.summarize.get(&job.session_id) {
-            Some(existing) if existing.output_seq >= job.output_seq => {}
+        let pushed = match inner.summarize.get(&job.session_id) {
+            Some(existing) if existing.output_seq >= job.output_seq => false,
             _ => {
                 inner.summarize.insert(job.session_id.clone(), job);
+                true
             }
-        }
+        };
         drop(inner);
-        self.signal.notify_all();
-        true
+        if pushed {
+            self.signal.notify_all();
+        }
+        pushed
     }
 
     /// Blocks until a job is available, judge jobs first. Returns `None` once
@@ -575,7 +578,7 @@ fn generate_detail(
 ///
 /// The judge's decision decode deliberately does not use this and stays greedy
 /// whatever the manifest says; `judge_with_model` explains why, and
-/// `devlog/000124-feat-approval-judge.md` has the measurement behind it.
+/// `devlog/000126-feat-approval-judge.md` has the measurement behind it.
 ///
 /// Both the `GenerationDefaults` match and the `Text` destructure are
 /// exhaustive (no wildcard arm, no `..`) on purpose: if cera grows another

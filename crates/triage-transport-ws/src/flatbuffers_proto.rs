@@ -1256,8 +1256,8 @@ pub fn build_server_message<'a>(
                             .command_line
                             .as_ref()
                             .map(|s| builder.create_string(s));
-                        let dec = builder.create_string(&record.decision.to_string());
-                        let src = builder.create_string(&record.source.to_string());
+                        let dec = builder.create_string(record.decision.as_hook_str());
+                        let src = builder.create_string(record.source.as_str());
                         let rsn = builder.create_string(&record.reason);
                         record_offsets.push(fb::JudgeRecordEntry::create(
                             builder,
@@ -1609,6 +1609,21 @@ pub enum ServerResultBorrowed<'a> {
     Subscribed {
         subscription_id: &'a str,
     },
+    SessionJudgePolicy {
+        session_id: &'a str,
+        has_pinned: bool,
+        pinned: bool,
+        effective: bool,
+    },
+    SessionJudgePolicies,
+    JudgeHookStatus {
+        path: &'a str,
+        exists: bool,
+        enabled: bool,
+        shim_installed: bool,
+    },
+    JudgeHistory,
+    JudgeRules,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1745,7 +1760,44 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         subscription_id: sub_res.subscription_id().unwrap_or(""),
                     }
                 }
-                fb::ServerResultPayload::NONE => ServerResultBorrowed::Unit,
+                fb::ServerResultPayload::SessionJudgePolicyResult => {
+                    let pol_res =
+                        resp.result_as_session_judge_policy_result()
+                            .ok_or_else(|| {
+                                crate::ProtocolError::new(
+                                    "invalid_flatbuffer",
+                                    "missing session judge policy result",
+                                )
+                            })?;
+                    ServerResultBorrowed::SessionJudgePolicy {
+                        session_id: pol_res.session_id().unwrap_or(""),
+                        has_pinned: pol_res.has_pinned(),
+                        pinned: pol_res.pinned(),
+                        effective: pol_res.effective(),
+                    }
+                }
+                fb::ServerResultPayload::SessionJudgePoliciesResult => {
+                    ServerResultBorrowed::SessionJudgePolicies
+                }
+                fb::ServerResultPayload::JudgeHookStatusResult => {
+                    let hook_res = resp.result_as_judge_hook_status_result().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing judge hook status result",
+                        )
+                    })?;
+                    ServerResultBorrowed::JudgeHookStatus {
+                        path: hook_res.path().unwrap_or(""),
+                        exists: hook_res.exists(),
+                        enabled: hook_res.enabled(),
+                        shim_installed: hook_res.shim_installed(),
+                    }
+                }
+                fb::ServerResultPayload::JudgeHistoryResult => ServerResultBorrowed::JudgeHistory,
+                fb::ServerResultPayload::JudgeRulesResult => ServerResultBorrowed::JudgeRules,
+                fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {
+                    ServerResultBorrowed::Unit
+                }
                 _ => {
                     return Err(crate::ProtocolError::new(
                         "invalid_flatbuffer",

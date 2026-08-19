@@ -142,18 +142,27 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "absolutePath",
         "path",
         "Path",
+        "file",
+        "File",
+        "filename",
+        "fileName",
+        "FileName",
         "FilePath",
         "file_path",
         "filePath",
         "TargetFile",
         "target_file",
         "targetFile",
+        "target",
+        "Target",
         "DirectoryPath",
         "directory_path",
         "directoryPath",
         "SearchPath",
         "search_path",
         "searchPath",
+        "document_path",
+        "DocumentPath",
         "Url",
         "url",
     ] {
@@ -209,7 +218,17 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
         if let Some(rest) = trimmed.strip_prefix("env ") {
             let mut inner = rest.trim_start();
             while inner.starts_with('-') {
-                if let Some(space_idx) = inner.find(char::is_whitespace) {
+                let token = inner.split_whitespace().next().unwrap_or("");
+                if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
+                    let mut parts = inner.split_whitespace();
+                    let _flag = parts.next();
+                    let _val = parts.next();
+                    inner = inner
+                        .split_once(char::is_whitespace)
+                        .and_then(|(_, r)| r.trim_start().split_once(char::is_whitespace))
+                        .map(|(_, r)| r.trim_start())
+                        .unwrap_or("");
+                } else if let Some(space_idx) = inner.find(char::is_whitespace) {
                     inner = inner[space_idx..].trim_start();
                 } else {
                     return "";
@@ -416,6 +435,9 @@ fn evaluate_in_process(request: &JudgeRequest) -> Option<JudgeVerdict> {
         .and_then(|path| triage_core::config::Config::load_from_path(path).ok())
         .map(|c| c.judge)
         .unwrap_or_default();
+    if !config.enabled || !config.default_enabled_per_session {
+        return None;
+    }
     let rules = triaged::judge::JudgeRules::new(&config);
     rules.evaluate(request)
 }
@@ -429,7 +451,10 @@ fn ask_daemon(request: JudgeRequest) -> JudgeVerdict {
     let spawned = std::thread::Builder::new()
         .name("triage-hook-judge".to_string())
         .spawn(move || {
-            let client = triaged::ipc::IpcClient::new(triaged::ipc::default_socket_path());
+            let socket_path = std::env::var_os("TRIAGE_IPC_SOCKET")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(triaged::ipc::default_socket_path);
+            let client = triaged::ipc::IpcClient::new(socket_path);
             let _ = tx.send(client.judge_tool_call_result(req_clone));
         });
     if let Err(error) = spawned {
@@ -627,6 +652,10 @@ mod tests {
         assert_eq!(
             strip_leading_env_vars("env --ignore-environment VAR=1 git diff"),
             "git diff"
+        );
+        assert_eq!(
+            strip_leading_env_vars("env -u FOO cargo test"),
+            "cargo test"
         );
         assert_eq!(strip_leading_env_vars("1=2 foo_cmd"), "1=2 foo_cmd");
         assert_eq!(

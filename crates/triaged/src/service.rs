@@ -88,12 +88,15 @@ impl ServiceContext {
             .context("resolving the triaged executable path for service registration")?;
         // If triaged was run via `cargo run` (inside target/debug or target/release),
         // prefer the globally installed ~/.cargo/bin/triaged release binary if it exists.
-        let exe = if current.to_string_lossy().contains("/target/") {
-            if let Ok(home) = std::env::var("HOME") {
+        let current_str = current.to_string_lossy();
+        let exe = if current_str.contains("/target/") || current_str.contains("\\target\\") {
+            let home_opt = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            if let Some(home) = home_opt {
+                let bin_name = format!("triaged{}", std::env::consts::EXE_SUFFIX);
                 let cargo_bin = PathBuf::from(home)
                     .join(".cargo")
                     .join("bin")
-                    .join("triaged");
+                    .join(bin_name);
                 if cargo_bin.exists() {
                     cargo_bin
                 } else {
@@ -180,7 +183,8 @@ fn home_dir() -> Result<PathBuf> {
 /// Provisions global agent lifecycle hooks (in `~/.gemini/config/hooks.json` and `~/.agents/hooks.json`) if not already present.
 fn install_global_agent_hooks() {
     if let Ok(home) = home_dir() {
-        let cargo_hook = home.join(".cargo").join("bin").join("triage-hook");
+        let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+        let cargo_hook = home.join(".cargo").join("bin").join(&hook_name);
         let hook_cmd = if cargo_hook.exists() {
             cargo_hook.to_string_lossy().to_string()
         } else {
@@ -234,9 +238,32 @@ fn install_global_agent_hooks() {
             if claude_settings.exists()
                 && let Ok(file_content) = std::fs::read_to_string(&claude_settings)
                 && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&file_content)
+                && let Some(claude_map) = val.as_object_mut()
             {
-                val["hooks"]["PreToolUse"] = serde_json::json!([
-                    {
+                let mut hooks_obj = claude_map
+                    .get("hooks")
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let mut pre_arr = hooks_obj
+                    .get("PreToolUse")
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                let already_has = pre_arr.iter().any(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|cmd| {
+                                cmd.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.contains("triage-hook"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                if !already_has {
+                    pre_arr.push(serde_json::json!({
                         "matcher": ".*",
                         "hooks": [
                             {
@@ -245,125 +272,15 @@ fn install_global_agent_hooks() {
                                 "timeout": 15
                             }
                         ]
-                    }
-                ]);
-                if let Ok(updated) = serde_json::to_string_pretty(&val) {
-                    let _ = std::fs::write(&claude_settings, updated);
-                    println!(
-                        "Configured Claude Code hooks in {}.",
-                        claude_settings.display()
-                    );
-                }
-            }
-
-            // Also ensure ~/.gemini/antigravity-cli/settings.json permissions allow standard safe tools
-            let agy_settings = home
-                .join(".gemini")
-                .join("antigravity-cli")
-                .join("settings.json");
-            if agy_settings.exists()
-                && let Ok(file_content) = std::fs::read_to_string(&agy_settings)
-                && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&file_content)
-            {
-                let allow_grants = [
-                    "command(awk)",
-                    "command(basename)",
-                    "command(cargo)",
-                    "command(cat)",
-                    "command(cd)",
-                    "command(chmod)",
-                    "command(codesign)",
-                    "command(cp)",
-                    "command(cut)",
-                    "command(dart)",
-                    "command(date)",
-                    "command(diff)",
-                    "command(dirname)",
-                    "command(echo)",
-                    "command(export)",
-                    "command(fd)",
-                    "command(find)",
-                    "command(flutter)",
-                    "command(gh)",
-                    "command(git)",
-                    "command(grep)",
-                    "command(head)",
-                    "command(hostname)",
-                    "command(jq)",
-                    "command(just)",
-                    "command(ls)",
-                    "command(lsof)",
-                    "command(mkdir)",
-                    "command(ps)",
-                    "command(pwd)",
-                    "command(realpath)",
-                    "command(rg)",
-                    "command(sed)",
-                    "command(sort)",
-                    "command(source)",
-                    "command(sw_vers)",
-                    "command(tail)",
-                    "command(touch)",
-                    "command(tr)",
-                    "command(triaged)",
-                    "command(uname)",
-                    "command(uniq)",
-                    "command(wc)",
-                    "command(which)",
-                    "command(whoami)",
-                ];
-                let mut current: Vec<String> = val["permissions"]["allow"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for grant in allow_grants {
-                    if !current.iter().any(|s| s == grant) {
-                        current.push(grant.to_string());
-                    }
-                }
-                current.sort();
-                val["permissions"]["allow"] = serde_json::json!(current);
-                if let Ok(updated) = serde_json::to_string_pretty(&val) {
-                    let _ = std::fs::write(&agy_settings, updated);
-                    println!(
-                        "Configured Antigravity permissions in {}.",
-                        agy_settings.display()
-                    );
-                }
-            }
-            // Also provision hooks.json in active workspaces / worktrees under ~/development
-            let dev_dir = home.join("development");
-            if dev_dir.is_dir()
-                && let Ok(repos) = std::fs::read_dir(&dev_dir)
-            {
-                for repo_entry in repos.flatten() {
-                    let repo_path = repo_entry.path();
-                    if repo_path.is_dir() {
-                        let repo_hook = repo_path.join(".agents").join("hooks.json");
-                        if !repo_hook.exists() {
-                            let _ = std::fs::create_dir_all(repo_path.join(".agents"));
-                            let _ = std::fs::write(&repo_hook, &json_str);
-                        }
-                        let wt_dir = repo_path.join("worktrees");
-                        if wt_dir.is_dir()
-                            && let Ok(worktrees) = std::fs::read_dir(&wt_dir)
-                        {
-                            for wt in worktrees.flatten() {
-                                let wt_path = wt.path();
-                                if wt_path.is_dir() {
-                                    let wt_agents = wt_path.join(".agents");
-                                    let wt_hook = wt_agents.join("hooks.json");
-                                    if !wt_hook.exists() {
-                                        let _ = std::fs::create_dir_all(&wt_agents);
-                                        let _ = std::fs::write(&wt_hook, &json_str);
-                                    }
-                                }
-                            }
-                        }
+                    }));
+                    hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
+                    claude_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
+                    if let Ok(updated) = serde_json::to_string_pretty(&val) {
+                        let _ = std::fs::write(&claude_settings, updated);
+                        println!(
+                            "Configured Claude Code hooks in {}.",
+                            claude_settings.display()
+                        );
                     }
                 }
             }

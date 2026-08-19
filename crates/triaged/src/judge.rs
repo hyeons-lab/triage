@@ -50,10 +50,9 @@ use triage_core::config::JudgeConfig;
 use triage_core::judge::{JudgeDecision, JudgeHookStatus, JudgeRequest, JudgeSource, JudgeVerdict};
 
 /// True if `tool_name` is a read-only inspection, search, web, or agent coordination tool.
-fn is_read_only_tool(tool_name: &str) -> bool {
-    let lower = tool_name.to_lowercase();
+fn is_read_only_tool(lower: &str) -> bool {
     matches!(
-        lower.as_str(),
+        lower,
         "read"
             | "view_file"
             | "read_file"
@@ -94,32 +93,27 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             | "query_graph"
             | "semantic_search_nodes"
             | "get_architecture_overview"
-            | "refactor_tool"
+            | "list_communities"
     )
 }
 
 /// True if `tool_name` is an editing or writing tool.
-fn is_edit_tool(tool_name: &str) -> bool {
-    let lower = tool_name.to_lowercase();
+fn is_edit_tool(lower: &str) -> bool {
     matches!(
-        lower.as_str(),
+        lower,
         "write_to_file"
             | "replace_file_content"
             | "edit_file"
-            | "writefile"
-            | "replacefilecontent"
-            | "write"
-            | "edit"
+            | "write_file"
             | "patch_file"
             | "create_file"
     )
 }
 
 /// True if `tool_name` is a shell command execution tool.
-fn is_command_tool(tool_name: &str) -> bool {
-    let lower = tool_name.to_lowercase();
+fn is_command_tool(lower: &str) -> bool {
     matches!(
-        lower.as_str(),
+        lower,
         "run_command"
             | "runcommand"
             | "bash"
@@ -222,7 +216,6 @@ const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "cd",
     "pushd",
     "popd",
-    "source",
     "id",
     "ps",
     "pgrep",
@@ -232,7 +225,7 @@ const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "codesign",
     "triaged reload",
     "triaged --handover",
-    // Read-only git operations.
+    // Read-only and routine git operations.
     "git status",
     "git diff",
     "git log",
@@ -257,8 +250,6 @@ const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "git blame",
     "git ls-files",
     "git worktree list",
-    "git worktree add",
-    "git worktree remove",
     "git check-ignore",
     "git describe",
     "git --version",
@@ -298,8 +289,6 @@ const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "gh run view",
     "gh run list",
     "gh run watch",
-    "gh api",
-    "gh auth",
     "gh status",
     "gh issue view",
     "gh issue list",
@@ -314,12 +303,6 @@ const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "gh auth status",
     "gh stack view",
     "gh --version",
-    // Navigation and environment.
-    "cd",
-    "pwd",
-    "pushd",
-    "popd",
-    "source",
     // Utilities & Task runners.
     "sleep",
     "just",
@@ -458,17 +441,14 @@ impl JudgeRules {
     /// command is ambiguous and should go to the model.
     pub fn evaluate(&self, request: &JudgeRequest) -> Option<JudgeVerdict> {
         let tool_name = request.tool_name.trim();
+        let lower_tool_name = tool_name.to_ascii_lowercase();
 
-        // 1. Read-only inspection and informational tools.
-        if is_read_only_tool(tool_name) {
-            if let Some(target_path) = request.path.as_deref().or(request.command_line.as_deref()) {
-                let unquoted = unquote_segment(target_path);
-                let lowered_path = normalize_lowered(&unquoted);
-                if let Some(secret) = matching_credential_path(&lowered_path) {
-                    return Some(JudgeVerdict::fallback(format!(
-                        "requires manual approval for credential path: {secret}"
-                    )));
-                }
+        // 1. Read-only inspection tools.
+        if is_read_only_tool(&lower_tool_name) {
+            if let Some(secret) = check_target_credential_path(request) {
+                return Some(JudgeVerdict::fallback(format!(
+                    "requires manual approval for credential path: {secret}"
+                )));
             }
             return Some(JudgeVerdict {
                 decision: JudgeDecision::Allow,
@@ -478,15 +458,11 @@ impl JudgeRules {
         }
 
         // 2. File editing / writing tools.
-        if is_edit_tool(tool_name) {
-            if let Some(target_path) = request.path.as_deref().or(request.command_line.as_deref()) {
-                let unquoted = unquote_segment(target_path);
-                let lowered_path = normalize_lowered(&unquoted);
-                if let Some(secret) = matching_credential_path(&lowered_path) {
-                    return Some(JudgeVerdict::fallback(format!(
-                        "requires manual approval for credential path: {secret}"
-                    )));
-                }
+        if is_edit_tool(&lower_tool_name) {
+            if let Some(secret) = check_target_credential_path(request) {
+                return Some(JudgeVerdict::fallback(format!(
+                    "requires manual approval for credential path: {secret}"
+                )));
             }
             return Some(JudgeVerdict {
                 decision: JudgeDecision::Allow,
@@ -496,7 +472,7 @@ impl JudgeRules {
         }
 
         // 3. Command execution tools.
-        if !is_command_tool(tool_name) {
+        if !is_command_tool(&lower_tool_name) {
             return Some(JudgeVerdict::fallback(format!(
                 "tool {tool_name} is not judged"
             )));
@@ -530,7 +506,9 @@ impl JudgeRules {
             )));
         }
         if let Some(rule) = command_segments(&unquoted).find_map(|segment| {
-            denied_segment_rule(&segment.split_whitespace().collect::<Vec<_>>())
+            let tokens = segment.split_whitespace().collect::<Vec<_>>();
+            let stripped = strip_leading_assignments_and_keywords(&tokens);
+            denied_segment_rule(stripped)
         }) {
             return Some(JudgeVerdict::fallback(format!(
                 "requires manual approval: {rule}"
@@ -605,7 +583,14 @@ impl JudgeRules {
     /// Token-wise rather than string-wise so `git status` cannot match
     /// `git statusfoo`.
     fn matching_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
-        if let Some(rule) = self.matching_git_allow_rule(tokens) {
+        let first = tokens.first()?;
+        let prog = program_name(first);
+        if prog == "git" {
+            return self.matching_git_allow_rule(tokens);
+        }
+        if prog == "gh"
+            && let Some(rule) = self.matching_gh_allow_rule(tokens)
+        {
             return Some(rule);
         }
         self.allow_commands
@@ -620,6 +605,55 @@ impl JudgeRules {
             .map(|(text, _)| text.as_str())
     }
 
+    /// Matches safe, read-only `gh` CLI subcommands like `gh api` (GET only, without mutating flags)
+    /// and `gh auth status` (excluding `gh auth token` / `gh auth logout`).
+    fn matching_gh_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        if program_name(first) != "gh" {
+            return None;
+        }
+        let after = &tokens[1..];
+        let subcommand = *after.first()?;
+        match subcommand {
+            "api" => {
+                const GH_MUTATING_FLAGS: &[&str] = &[
+                    "-X",
+                    "--method",
+                    "-f",
+                    "--field",
+                    "-F",
+                    "--raw-field",
+                    "--input",
+                ];
+                let sub_args = &after[1..];
+                // If it uses any mutating flag or non-GET method, refuse Layer 2 auto-approval
+                if sub_args.iter().any(|arg| {
+                    GH_MUTATING_FLAGS.contains(arg)
+                        || arg.starts_with("--method")
+                        || arg.starts_with("-X")
+                        || arg.starts_with("--field")
+                        || arg.starts_with("-f")
+                        || arg.starts_with("--raw-field")
+                        || arg.starts_with("-F")
+                        || arg.starts_with("--input")
+                }) {
+                    None
+                } else {
+                    Some("gh api")
+                }
+            }
+            "auth" => {
+                let sub_args = &after[1..];
+                if sub_args.first() == Some(&"status") {
+                    Some("gh auth status")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Matches a read-only or safe local `git` command even when preceded by git global flags
     /// like `--no-pager`, `-C <dir>`, `--no-optional-locks`, etc.
     fn matching_git_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
@@ -627,29 +661,7 @@ impl JudgeRules {
         if program_name(first) != "git" {
             return None;
         }
-        let after = &tokens[1..];
-        const GIT_VALUE_TAKING_GLOBALS: &[&str] = &[
-            "-C",
-            "-c",
-            "--git-dir",
-            "--work-tree",
-            "--namespace",
-            "--exec-path",
-            "--config-env",
-        ];
-        let mut index = 0;
-        while let Some(token) = after.get(index) {
-            if !token.starts_with('-') {
-                break;
-            }
-            index += if GIT_VALUE_TAKING_GLOBALS.contains(token) {
-                2
-            } else {
-                1
-            };
-        }
-        let subcommand = *after.get(index)?;
-        let sub_args = &after[index + 1..];
+        let (subcommand, sub_args) = parse_git_subcommand(&tokens[1..])?;
 
         match subcommand {
             "diff" => Some("git diff"),
@@ -672,12 +684,43 @@ impl JudgeRules {
             "stash" if sub_args.first() == Some(&"list") || sub_args.first() == Some(&"show") => {
                 Some("git stash")
             }
-            "tag"
-                if sub_args.is_empty()
+            "tag" => {
+                const GIT_TAG_MUTATING_FLAGS: &[&str] = &[
+                    "-d",
+                    "-D",
+                    "--delete",
+                    "-a",
+                    "--annotate",
+                    "-s",
+                    "--sign",
+                    "-u",
+                    "--local-user",
+                    "-f",
+                    "--force",
+                    "-m",
+                    "--message",
+                    "-F",
+                    "--file",
+                ];
+                if sub_args.iter().any(|arg| {
+                    GIT_TAG_MUTATING_FLAGS.contains(arg)
+                        || arg.starts_with("-m")
+                        || arg.starts_with("--message=")
+                        || arg.starts_with("-F")
+                        || arg.starts_with("--file=")
+                }) {
+                    None
+                } else if sub_args.is_empty()
                     || sub_args.contains(&"--list")
-                    || sub_args.contains(&"-l") =>
-            {
-                Some("git tag")
+                    || sub_args.contains(&"-l")
+                    || sub_args
+                        .iter()
+                        .all(|a| a.starts_with('-') || a.contains('*'))
+                {
+                    Some("git tag")
+                } else {
+                    None
+                }
             }
             "branch"
                 if sub_args.contains(&"--show-current")
@@ -726,7 +769,8 @@ pub fn persist_judge_config(config: &triage_core::config::JudgeConfig) -> anyhow
     }
     let mut table: toml::Table = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
-        toml::from_str(&content).unwrap_or_default()
+        toml::from_str(&content)
+            .map_err(|err| anyhow::anyhow!("failed to parse existing {}: {err}", path.display()))?
     } else {
         toml::Table::new()
     };
@@ -762,7 +806,9 @@ pub fn persist_judge_config(config: &triage_core::config::JudgeConfig) -> anyhow
 
     table.insert("judge".into(), toml::Value::Table(judge_table));
     let toml_str = toml::to_string_pretty(&table)?;
-    std::fs::write(&path, toml_str)?;
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, toml_str)?;
+    std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
@@ -785,37 +831,76 @@ fn normalize_lowered(command: &str) -> String {
     result
 }
 
-/// Strips harmless standard null-redirections (`2>/dev/null`, `>/dev/null`, `&>/dev/null`, `2>&1`).
-fn strip_null_redirections(command: &str) -> String {
-    let mut s = command.to_string();
-    for pattern in [
+/// Checks whether a tool call request targets a sensitive credential file.
+fn check_target_credential_path(request: &JudgeRequest) -> Option<String> {
+    if let Some(target_path) = request.path.as_deref().or(request.command_line.as_deref()) {
+        let unquoted = unquote_segment(target_path);
+        let lowered_path = normalize_lowered(&unquoted);
+        return matching_credential_path(&lowered_path).map(str::to_string);
+    }
+    None
+}
+
+/// Strips harmless standard null-redirections (`2>/dev/null`, `>/dev/null`, `&>/dev/null`, `2>&1`, `>nul`).
+/// Only strips when the redirection target is followed by a boundary (whitespace, separator, or end of string),
+/// preventing unintended matches against file prefixes like `> /dev/null.txt`.
+fn strip_null_redirections(command: &str) -> std::borrow::Cow<'_, str> {
+    if !command.contains('>') && !command.contains("2>&1") && !command.contains("nul") {
+        return std::borrow::Cow::Borrowed(command);
+    }
+
+    let patterns = [
         "2>/dev/null",
         "1>/dev/null",
         ">/dev/null",
         "&>/dev/null",
-        "2>&1",
         "2> /dev/null",
         "1> /dev/null",
         "> /dev/null",
         "&> /dev/null",
-    ] {
-        s = s.replace(pattern, " ");
+        "2>&1",
+        ">nul",
+        "> nul",
+        "2>nul",
+        "2> nul",
+    ];
+
+    let mut result = String::with_capacity(command.len());
+    let mut rest = command;
+
+    'outer: while !rest.is_empty() {
+        for pattern in &patterns {
+            if let Some(after) = rest.strip_prefix(pattern) {
+                let is_bounded = after.is_empty()
+                    || after.starts_with(|c: char| {
+                        c.is_whitespace() || c == ';' || c == '&' || c == '|' || c == '\n'
+                    });
+                if is_bounded {
+                    result.push(' ');
+                    rest = after;
+                    continue 'outer;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        result.push(ch);
+        rest = &rest[ch.len_utf8()..];
     }
-    s
+
+    std::borrow::Cow::Owned(result)
 }
 
 /// True if the command contains complex characters that could redirect to arbitrary files,
 /// invoke subshells, or evaluate backticks. Simple sequence separators like `&&`, `;`, and
 /// pipelines `|` are evaluated segment by segment.
 fn has_complex_shell_metacharacters(command: &str) -> bool {
-    let cleaned = strip_null_redirections(command);
-    if cleaned.contains('`') || cleaned.contains("$(") {
+    if command.contains('`') || command.contains("$(") {
         return true;
     }
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
-    for &b in cleaned.as_bytes() {
+    for &b in command.as_bytes() {
         if escaped {
             escaped = false;
             continue;
@@ -965,37 +1050,8 @@ const WRAPPER_PROGRAMS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh",
 ];
 
-/// The program a segment actually runs, stepping over any wrappers along with
-/// their flags, their `NAME=value` assignments, and their numeric arguments.
-///
-/// Without this, `env shutdown` and `timeout 5 reboot` read as `env` and
-/// `timeout` and slip past every program-level rule.
-fn effective_program<'a>(tokens: &[&'a str]) -> Option<&'a str> {
-    let mut rest = tokens;
-    loop {
-        let (first, tail) = rest.split_first()?;
-        let program = program_name(first);
-        if !WRAPPER_PROGRAMS.contains(&program) {
-            return Some(program);
-        }
-        rest = tail;
-        // The wrapper's own arguments: flags, assignments, and bare numbers
-        // (`timeout 5`). The next plain word is the program it runs.
-        while let Some((next, remainder)) = rest.split_first() {
-            let is_wrapper_argument = next.starts_with('-')
-                || next.contains('=')
-                || next.chars().all(|c| c.is_ascii_digit() || c == '.');
-            if !is_wrapper_argument {
-                break;
-            }
-            rest = remainder;
-        }
-    }
-}
-
-/// Returns the effective command tokens by stepping over leading `KEY=val` environment
-/// variable assignments and transparent wrapper programs (`env`, `time`, `nice`, `timeout`).
-fn effective_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+/// Steps over leading `KEY=val` variable assignments and shell control keywords (`do`, `then`, `&&`, `;`).
+fn strip_leading_assignments_and_keywords<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
     let mut rest = tokens;
     while let Some((first, tail)) = rest.split_first() {
         if matches!(
@@ -1010,6 +1066,52 @@ fn effective_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
             rest = tail;
             continue;
         }
+        break;
+    }
+    rest
+}
+
+/// The program a segment actually runs, stepping over any wrappers along with
+/// their flags, their `NAME=value` assignments, and their numeric arguments.
+///
+/// Without this, `env shutdown` and `timeout 5 reboot` read as `env` and
+/// `timeout` and slip past every program-level rule.
+fn effective_program<'a>(tokens: &'a [&'a str]) -> Option<&'a str> {
+    let mut rest = strip_leading_assignments_and_keywords(tokens);
+    loop {
+        let (first, tail) = rest.split_first()?;
+        let program = program_name(first);
+        if !WRAPPER_PROGRAMS.contains(&program) {
+            return Some(program);
+        }
+        rest = tail;
+        // The wrapper's own arguments: flags, assignments, and bare numbers
+        // (`timeout 5`). The next plain word is the program it runs.
+        while let Some((next, remainder)) = rest.split_first() {
+            let takes_arg = matches!(
+                *next,
+                "-u" | "--unset" | "-C" | "--chdir" | "-s" | "--signal"
+            );
+            let is_wrapper_argument = next.starts_with('-')
+                || next.contains('=')
+                || next.chars().all(|c| c.is_ascii_digit() || c == '.');
+            if takes_arg {
+                rest = remainder.get(1..).unwrap_or(&[]);
+                continue;
+            }
+            if !is_wrapper_argument {
+                break;
+            }
+            rest = remainder;
+        }
+    }
+}
+
+/// Returns the effective command tokens by stepping over leading `KEY=val` environment
+/// variable assignments and transparent wrapper programs (`env`, `time`, `nice`, `timeout`).
+fn effective_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut rest = strip_leading_assignments_and_keywords(tokens);
+    while let Some((first, tail)) = rest.split_first() {
         let prog = program_name(first);
         if WRAPPER_PROGRAMS.contains(&prog)
             && !matches!(
@@ -1019,9 +1121,17 @@ fn effective_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
         {
             rest = tail;
             while let Some((next, remainder)) = rest.split_first() {
+                let takes_arg = matches!(
+                    *next,
+                    "-u" | "--unset" | "-C" | "--chdir" | "-s" | "--signal"
+                );
                 let is_wrapper_arg = next.starts_with('-')
                     || next.contains('=')
                     || next.chars().all(|c| c.is_ascii_digit() || c == '.');
+                if takes_arg {
+                    rest = remainder.get(1..).unwrap_or(&[]);
+                    continue;
+                }
                 if !is_wrapper_arg {
                     break;
                 }
@@ -1097,6 +1207,44 @@ fn denied_segment_rule(tokens: &[&str]) -> Option<&'static str> {
 /// Structural rather than substring-matched: git accepts global flags before the
 /// subcommand, so `git --no-pager push` and `git -C . reset --hard` sailed past
 /// rules that assumed the subcommand came first.
+/// Git global options that take their value as a separate argument. Miss one
+/// and its value is read as the subcommand, so `git --git-dir /tmp/x push`
+/// looks like a `git /tmp/x`. The attached `--flag=value` spellings are one
+/// token and need no entry.
+const GIT_VALUE_TAKING_GLOBALS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+];
+
+/// Steps over git global flags in `after` (the tokens following the `git` token)
+/// and returns the subcommand name alongside its following arguments.
+fn parse_git_subcommand<'a>(after: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
+    let mut index = 0;
+    while let Some(token) = after.get(index) {
+        if !token.starts_with('-') {
+            break;
+        }
+        index += if GIT_VALUE_TAKING_GLOBALS.contains(token) {
+            2
+        } else {
+            1
+        };
+    }
+    let subcommand = *after.get(index)?;
+    let sub_args = &after[index + 1..];
+    Some((subcommand, sub_args))
+}
+
+/// Git operations that are refused outright.
+///
+/// Structural rather than substring-matched: git accepts global flags before the
+/// subcommand, so `git --no-pager push` and `git -C . reset --hard` sailed past
+/// rules that assumed the subcommand came first.
 fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
     if !names_program(tokens, "git") {
         return None;
@@ -1104,44 +1252,16 @@ fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
     let git_index = tokens
         .iter()
         .position(|token| program_name(token) == "git")?;
-    let after = &tokens[git_index + 1..];
-
-    /// Git global options that take their value as a separate argument. Miss one
-    /// and its value is read as the subcommand, so `git --git-dir /tmp/x push`
-    /// looks like a `git /tmp/x`. The attached `--flag=value` spellings are one
-    /// token and need no entry.
-    const VALUE_TAKING_GLOBALS: &[&str] = &[
-        "-C",
-        "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--exec-path",
-        "--config-env",
-    ];
-
-    // Step over global flags to reach the subcommand.
-    let mut index = 0;
-    while let Some(token) = after.get(index) {
-        if !token.starts_with('-') {
-            break;
-        }
-        index += if VALUE_TAKING_GLOBALS.contains(token) {
-            2
-        } else {
-            1
-        };
-    }
-    let subcommand = after.get(index)?;
+    let (subcommand, sub_args) = parse_git_subcommand(&tokens[git_index + 1..])?;
 
     let has = |long: &[&str], short: &[char]| {
-        after
+        sub_args
             .iter()
             .filter(|token| token.starts_with('-'))
             .any(|flag| long.contains(flag) || is_short_flag_bundle_containing(flag, short))
     };
 
-    match *subcommand {
+    match subcommand {
         "push" => Some("git push"),
         "filter-branch" => Some("git filter-branch"),
         "reset" if has(&["--hard"], &[]) => Some("git reset --hard"),
@@ -1173,11 +1293,17 @@ fn matching_credential_path(cleaned: &str) -> Option<&'static str> {
     /// outright rather than prompting, so a false positive costs more here.
     const TEMPLATE_SUFFIXES: &[&str] = &["example", "sample", "template", "dist", "defaults"];
 
+    let normalized: std::borrow::Cow<'_, str> = if cleaned.contains('\\') {
+        std::borrow::Cow::Owned(cleaned.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(cleaned)
+    };
+
     CREDENTIAL_PATHS.iter().copied().find(|path| {
-        cleaned.match_indices(path).any(|(index, matched)| {
+        normalized.match_indices(path).any(|(index, matched)| {
             // `=` and `:` count as boundaries so `--file=.npmrc` is caught
             // alongside `--file .npmrc`.
-            let opens = match cleaned[..index].chars().next_back() {
+            let opens = match normalized[..index].chars().next_back() {
                 None => true,
                 Some(previous) => {
                     previous == '/'
@@ -1194,7 +1320,7 @@ fn matching_credential_path(cleaned: &str) -> Option<&'static str> {
             if !opens {
                 return false;
             }
-            let rest = &cleaned[index + matched.len()..];
+            let rest = &normalized[index + matched.len()..];
             match rest.chars().next() {
                 // The bare name at the end of the command.
                 None => true,
@@ -1499,7 +1625,7 @@ pub fn judge_with_model(
         // therefore has no upside here and one downside: measured against a
         // bundle manifest it flipped an install command to `allow` on one run in
         // six. The run-by-run numbers are in
-        // `devlog/000124-feat-approval-judge.md`.
+        // `devlog/000126-feat-approval-judge.md`.
         temperature: 0.0,
         grammar: Some(grammar),
         ..Default::default()
@@ -1735,42 +1861,37 @@ pub fn configure_hook(
     })
 }
 
-fn resolve_hooks_json_path(workspace_path: Option<&str>) -> std::path::PathBuf {
+fn resolve_workspace_config_path(
+    workspace_path: Option<&str>,
+    rel_path: &str,
+) -> std::path::PathBuf {
     if let Some(ws) = workspace_path.filter(|s| !s.trim().is_empty()) {
         let p = std::path::PathBuf::from(ws);
         let root = find_git_root(&p).unwrap_or(p);
-        return root.join(".agents").join("hooks.json");
+        return root.join(rel_path);
     }
 
     if let Ok(cwd) = std::env::current_dir() {
         let root = find_git_root(&cwd).unwrap_or(cwd);
-        return root.join(".agents").join("hooks.json");
+        return root.join(rel_path);
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        return home.join(".agents").join("hooks.json");
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        return home.join(rel_path);
     }
 
-    std::path::PathBuf::from(".agents/hooks.json")
+    std::path::PathBuf::from(rel_path)
+}
+
+fn resolve_hooks_json_path(workspace_path: Option<&str>) -> std::path::PathBuf {
+    resolve_workspace_config_path(workspace_path, ".agents/hooks.json")
 }
 
 fn resolve_claude_settings_path(workspace_path: Option<&str>) -> std::path::PathBuf {
-    if let Some(ws) = workspace_path.filter(|s| !s.trim().is_empty()) {
-        let p = std::path::PathBuf::from(ws);
-        let root = find_git_root(&p).unwrap_or(p);
-        return root.join(".claude").join("settings.json");
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let root = find_git_root(&cwd).unwrap_or(cwd);
-        return root.join(".claude").join("settings.json");
-    }
-
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        return home.join(".claude").join("settings.json");
-    }
-
-    std::path::PathBuf::from(".claude/settings.json")
+    resolve_workspace_config_path(workspace_path, ".claude/settings.json")
 }
 
 fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1790,12 +1911,21 @@ fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 fn check_shim_installed() -> bool {
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from)
-        && home.join(".cargo/bin/triage-hook").exists()
+    let bin_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+    let home_opt = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(home) = home_opt
+        && home.join(".cargo").join("bin").join(&bin_name).exists()
     {
         return true;
     }
-    std::process::Command::new("which")
+    #[cfg(unix)]
+    let which_cmd = "which";
+    #[cfg(windows)]
+    let which_cmd = "where";
+
+    std::process::Command::new(which_cmd)
         .arg("triage-hook")
         .output()
         .map(|o| o.status.success())
@@ -1970,6 +2100,12 @@ mod tests {
         assert_eq!(decide("find /tmp -delete"), None);
         assert_eq!(decide("find . -exec rm {} +"), None);
         assert_eq!(decide("git --no-pager push"), Some(JudgeDecision::Ask));
+        assert_eq!(decide("git tag -d v1.0"), None);
+        assert_eq!(decide("git tag -a v1.0 -m 'release'"), None);
+        assert_eq!(decide("gh api --field=title=bug /repos/x/y/issues"), None);
+        assert_eq!(decide("gh api -X POST /repos/x/y/issues"), None);
+        assert_eq!(decide("gh auth token"), None);
+        assert_eq!(decide("VAR=1 rm -rf /"), Some(JudgeDecision::Ask));
     }
 
     #[test]

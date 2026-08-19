@@ -1,4 +1,4 @@
-# 000124 feat/approval-judge
+# 000126 feat/approval-judge
 
 **Agent:** Claude (claude-opus-5[1m]) @ triage branch feat/approval-judge
 
@@ -16,7 +16,7 @@ drive it. The Flutter client settings sheet is deliberately left for a follow-up
 
 ## What Changed
 
-2026-08-11T22:47-0700 `devlog/plans/000124-01-approval-judge.md` — plan covering
+2026-08-11T22:47-0700 `devlog/plans/000126-01-approval-judge.md` — plan covering
 the judge core, worker priority, IPC variant, hook shim, per-session policy, TUI
 settings overlay, and the LFM2.5-2.6B bump.
 
@@ -219,14 +219,10 @@ per-session auto-approval toggle controls in the Flutter web/mobile client (`Ses
 `triage-hook` and `triaged` to judge external agents and inherited shells with absent `TRIAGE_SESSION_ID`
 against the daemon default policy.
 
-2026-08-18T14:20-0700 `devlog/plans/000124-03-settings-panel.md`, `crates/triage-core`,
-`crates/triage-transport-ws`, `crates/triaged`, `flutter/triage_client` — added `GetJudgeHookStatus`
-and `ConfigureJudgeHook` daemon RPC endpoints to read and modify `.agents/hooks.json` in the
-workspace/git root directly. Built multi-tab `SettingsDialog` (`Daemons`, `Approval Judge`, `Preferences`)
-in the Flutter client with a live toggle switch that writes/enables the agent hook in workspace JSON
-with 1-click execution and immediate UI feedback, eliminating manual copy-pasting.
+2026-08-18T14:20-0700 `devlog/plans/000126-03-settings-panel.md`, `crates/triage-core`,
+`crates/triaged`, `crates/triage`, `crates/triage-transport-ws`, `flutter/triage_client` — added tabbed settings dialog in Flutter client, per-session auto-approval toggle in session menu and rail context popup, and guide tab with live hook installation status and toggle.
 
-2026-08-18T17:15-0700 `devlog/plans/000124-04-judge-rules-and-history-ui.md`, `crates/triage-core`,
+2026-08-18T17:15-0700 `devlog/plans/000126-04-judge-rules-and-history-ui.md`, `crates/triage-core`,
 `crates/triaged`, `crates/triage-transport-ws`, `flutter/triage_client` — added approval judge decision
 history ring buffer (`JudgeRecord`), rule queries and mutations (`get_judge_history`, `get_judge_rules`,
 `add_judge_allow_command`, `remove_judge_allow_command`, `add_judge_deny_substring`, `remove_judge_deny_substring`),
@@ -276,6 +272,8 @@ FlatBuffers `JudgeRules` string vector serialization.
 2026-08-19T10:19-0700 `crates/triage-hook/src/main.rs` — added documentation clarifying that offline in-process
 rule fallback evaluates static configuration rules from `config.toml`, and added unit tests for escaped backslashes
 and single quotes in environment variable prefix stripping.
+
+2026-08-19T11:08-0700 `crates/triaged/src/judge.rs`, `crates/triaged/src/session.rs`, `crates/triaged/src/service.rs`, `crates/triage-hook/src/main.rs`, `crates/triage/src/lib.rs`, `crates/triage/src/main.rs`, `flutter/triage_client` — addressed multi-round review audit findings: removed `source` from built-in allow table, hardened `matching_git_allow_rule` and `matching_gh_allow_rule` to prevent bypasses on mutating tag/API commands, normalized Windows backslashes in credential path checking, preserved existing Claude Code hooks in `install_global_agent_hooks`, added `TRIAGE_IPC_SOCKET` environment variable support in `triage-hook`, extracted `mutate_judge_config` helper to deduplicate rule mutations, added O(1) single-pass sidebar rendering in TUI, wired real-time WebSocket push synchronization and JSON payload parsing for `session_judge_policy_updated` in Flutter, optimized string allocations across tool classification and null redirection strippers, and renumbered devlog and plan files to `000126` to resolve upstream merge collisions.
 
 ## Decisions
 
@@ -855,7 +853,8 @@ a0c56f0 — docs: document approval judge architecture, handover protocol, and u
 6b4e653 — fix(hook,service): address PR review comments on permission overrides, env escaping, and fallback config
 c0eefbf — fix(hook,ipc): address review comments on hook portability, IPC timeouts, and subshell tests
 66d99d5 — fix(hook,ipc): preserve session policy in fallback and validate POSIX env identifiers
-HEAD — docs(hook): document static in-process rule evaluation and add escaped quote tests
+87f0153 — docs(hook): document static in-process rule evaluation and add escaped quote tests
+HEAD — fix(judge,hook): harden allow/deny rules, sync devlogs, and enhance fallback reliability
 
 ## Next Steps
 

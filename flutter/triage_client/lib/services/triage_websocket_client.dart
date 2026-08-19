@@ -273,6 +273,10 @@ class TriageWebSocketClient {
         // changed. Forward so the rail's repo·branch·worktree (or cwd) line
         // stays fresh without re-attaching.
         _eventController.add(message);
+      } else if (type == 'session_judge_policy_updated') {
+        // Connection-wide push: a session's tool-call judge policy changed.
+        // Forward so the rail / sidebar badge updates in real-time.
+        _eventController.add(message);
       }
       // No branch for `update_available`: this client has never forwarded that
       // push, on JSON any more than on FlatBuffers, and nothing subscribes to

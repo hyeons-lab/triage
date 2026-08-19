@@ -60,6 +60,7 @@ pub enum CloseSessionOutcome {
 struct SessionRuntime {
     events: SessionEventReceiver,
     view: SessionView,
+    judge_policy: Option<SessionJudgePolicy>,
 }
 
 impl LocalSessionApp {
@@ -220,6 +221,14 @@ impl LocalSessionApp {
         self.sessions.iter().map(|session| &session.view)
     }
 
+    pub fn session_entries(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&SessionView, Option<SessionJudgePolicy>)> {
+        self.sessions
+            .iter()
+            .map(|session| (&session.view, session.judge_policy))
+    }
+
     pub fn selected_index(&self) -> usize {
         self.selected
     }
@@ -240,27 +249,42 @@ impl LocalSessionApp {
     /// "unavailable" rather than as "off", so a missing answer is never mistaken
     /// for a definite one.
     pub fn selected_judge_policy(&self) -> Option<SessionJudgePolicy> {
-        let session_id = self.sessions.get(self.selected)?.view.session_id.clone();
-        self.manager.session_judge_policy(session_id).ok()
+        self.sessions
+            .get(self.selected)
+            .and_then(|s| s.judge_policy)
     }
 
     /// The given session's judge policy, as both its override and the resolved
-    /// answer.
+    /// answer. Reads from the local in-memory session cache to avoid I/O during rendering.
     pub fn session_judge_policy(&self, session_id: &SessionId) -> Option<SessionJudgePolicy> {
-        self.manager.session_judge_policy(session_id.clone()).ok()
+        self.sessions
+            .iter()
+            .find(|s| &s.view.session_id == session_id)
+            .and_then(|s| s.judge_policy)
     }
 
     /// Sets the selected session's judge policy, or clears the override with
     /// `None` so it follows the configured default. Surfaces failures through
     /// `last_error` like the other actions rather than panicking the UI.
     pub fn set_selected_judge_policy(&mut self, enabled: Option<bool>) {
-        let Some(session) = self.sessions.get(self.selected) else {
+        let Some(session) = self.sessions.get_mut(self.selected) else {
             return;
         };
         let session_id = session.view.session_id.clone();
-        match self.manager.set_session_judge_policy(session_id, enabled) {
-            Ok(()) => self.last_error = None,
-            Err(error) => self.last_error = Some(error.to_string()),
+        match self
+            .manager
+            .set_session_judge_policy(session_id.clone(), enabled)
+        {
+            Ok(()) => {
+                let fresh = self.manager.session_judge_policy(session_id).ok();
+                if let Some(session) = self.sessions.get_mut(self.selected) {
+                    session.judge_policy = fresh;
+                }
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.last_error = Some(format!("updating session judge policy: {error}"));
+            }
         }
     }
 
@@ -608,6 +632,7 @@ fn attach_existing_session(
         mode: AttachMode::Observer,
     })?;
 
+    let judge_policy = manager.session_judge_policy(session_id.clone()).ok();
     if attached.snapshot.exited
         && let Ok(snapshot) = manager.restore_session(RestoreSessionRequest {
             session_id: session_id.clone(),
@@ -625,6 +650,7 @@ fn attach_existing_session(
                 last_completed: None,
                 scroll_offset: 0,
             },
+            judge_policy,
         });
     }
 
@@ -637,6 +663,7 @@ fn attach_existing_session(
             last_completed: None,
             scroll_offset: 0,
         },
+        judge_policy,
     })
 }
 
@@ -670,6 +697,7 @@ fn start_local_session(
         }
     };
 
+    let judge_policy = manager.session_judge_policy(session_id.clone()).ok();
     Ok(SessionRuntime {
         events,
         view: SessionView {
@@ -679,6 +707,7 @@ fn start_local_session(
             last_completed: None,
             scroll_offset: 0,
         },
+        judge_policy,
     })
 }
 
@@ -1177,6 +1206,7 @@ mod tests {
                     last_completed: None,
                     scroll_offset: 2,
                 },
+                judge_policy: None,
             }],
             selected: 0,
             current_size: SessionSize::default(),
@@ -1224,6 +1254,7 @@ mod tests {
                     last_completed: None,
                     scroll_offset: 2,
                 },
+                judge_policy: None,
             }],
             selected: 0,
             current_size: SessionSize::default(),
@@ -1271,6 +1302,7 @@ mod tests {
                     last_completed: None,
                     scroll_offset: 2,
                 },
+                judge_policy: None,
             }],
             selected: 0,
             current_size: SessionSize::default(),
@@ -1569,10 +1601,12 @@ mod tests {
                 SessionRuntime {
                     events: closed_event_receiver(),
                     view: test_view(first_id.clone()),
+                    judge_policy: None,
                 },
                 SessionRuntime {
                     events: closed_event_receiver(),
                     view: test_view(second_id.clone()),
+                    judge_policy: None,
                 },
             ],
             selected: 0,

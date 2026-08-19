@@ -100,12 +100,14 @@ mod transport {
     #[cfg(windows)]
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+    const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[cfg(unix)]
     pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
         let stream = UnixStream::connect(path)?;
-        let timeout = Some(Duration::from_millis(500));
-        let _ = stream.set_read_timeout(timeout);
-        let _ = stream.set_write_timeout(timeout);
+        let _ = stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
         Ok(stream)
     }
 

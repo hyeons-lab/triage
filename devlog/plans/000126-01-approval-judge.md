@@ -1,4 +1,4 @@
-# Plan 000124-01: local-model approval judge for agent tool calls
+# Plan 000126-01: local-model approval judge for agent tool calls
 
 ## Thinking
 
