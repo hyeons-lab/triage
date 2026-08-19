@@ -1,0 +1,25 @@
+[package]
+name = "triage-hook"
+description = "Agent lifecycle-hook shim that asks Triage whether a tool call may run."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+# Not in the release pipeline yet: publish.yml's crate list and its prebuilt
+# binary matrix do not mention this crate, so a published version would be one
+# nothing installs or updates. Install from source until that is wired up.
+publish = false
+
+[dependencies]
+triage-core.workspace = true
+triaged.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
