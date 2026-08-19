@@ -67,6 +67,39 @@ typedef SessionContextRecord = ({
   int lastActivityMs,
 });
 
+/// One session's tool-call auto-approval judge policy.
+typedef SessionJudgePolicyRecord = ({
+  bool? explicit,
+  bool effective,
+});
+
+/// Status of the agent tool-call approval hook on disk.
+typedef JudgeHookStatusRecord = ({
+  String path,
+  bool exists,
+  bool enabled,
+  bool shimInstalled,
+});
+
+/// A single past decision record from the approval judge.
+typedef JudgeRecordItem = ({
+  String timestamp,
+  String sessionId,
+  String toolName,
+  String? commandLine,
+  String decision,
+  String source,
+  String reason,
+});
+
+/// Active approval judge rules.
+typedef JudgeRulesRecord = ({
+  List<String> builtinAllowCommands,
+  List<String> customAllowCommands,
+  List<String> builtinDenySubstrings,
+  List<String> customDenySubstrings,
+});
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
@@ -301,15 +334,19 @@ class TriageWebSocketClient {
 
     try {
       if (isFlatBuffersNegotiated) {
-        final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
-        _channel!.sink.add(bytes);
-      } else {
-        final payload = <String, dynamic>{'id': id, 'type': type};
-        if (extra != null) {
-          payload.addAll(extra);
+        try {
+          final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
+          _channel!.sink.add(bytes);
+          return completer.future;
+        } on UnimplementedError {
+          // Fall through to JSON text frame for request types without FlatBuffers builders.
         }
-        _channel!.sink.add(jsonEncode(payload));
       }
+      final payload = <String, dynamic>{'id': id, 'type': type};
+      if (extra != null) {
+        payload.addAll(extra);
+      }
+      _channel!.sink.add(jsonEncode(payload));
     } catch (e) {
       _pendingRequests.remove(id);
       _pendingRequestTypes.remove(id);
@@ -416,6 +453,273 @@ class TriageWebSocketClient {
       }
     }
     return result;
+  }
+
+  Future<SessionJudgePolicyRecord?> getSessionJudgePolicy(
+    String sessionId,
+  ) async {
+    try {
+      final response = await _send('get_session_judge_policy', {
+        'session_id': sessionId,
+      });
+      final hasPinned = response['has_pinned'] as bool? ?? false;
+      final pinned = response['pinned'] as bool? ?? false;
+      final effective = response['effective'] as bool? ?? false;
+      return (explicit: hasPinned ? pinned : null, effective: effective);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<SessionJudgePolicyRecord?> setSessionJudgePolicy(
+    String sessionId,
+    bool? enabled,
+  ) async {
+    try {
+      final response = await _send('set_session_judge_policy', {
+        'session_id': sessionId,
+        'has_enabled': enabled != null,
+        'enabled': enabled ?? false,
+      });
+      final hasPinned = response['has_pinned'] as bool? ?? false;
+      final pinned = response['pinned'] as bool? ?? false;
+      final effective = response['effective'] as bool? ?? false;
+      return (explicit: hasPinned ? pinned : null, effective: effective);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, SessionJudgePolicyRecord>>
+  listSessionJudgePolicies() async {
+    try {
+      final response = await _send('list_session_judge_policies');
+      final entries = response['entries'] as List<dynamic>?;
+      final result = <String, SessionJudgePolicyRecord>{};
+      for (final entry in entries ?? const []) {
+        final map = entry as Map<String, dynamic>;
+        final sessionId = map['session_id'] as String?;
+        if (sessionId != null) {
+          final hasPinned = map['has_pinned'] as bool? ?? false;
+          final pinned = map['pinned'] as bool? ?? false;
+          final effective = map['effective'] as bool? ?? false;
+          result[sessionId] = (
+            explicit: hasPinned ? pinned : null,
+            effective: effective,
+          );
+        }
+      }
+      return result;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<JudgeHookStatusRecord?> getJudgeHookStatus({
+    String? workspacePath,
+  }) async {
+    try {
+      final response = await _send('get_judge_hook_status', {
+        // ignore: use_null_aware_elements
+        if (workspacePath != null) 'workspace_path': workspacePath,
+      });
+      final status = (response['status'] as Map<String, dynamic>?) ?? response;
+      return (
+        path: status['path']?.toString() ?? '',
+        exists: status['exists'] as bool? ?? false,
+        enabled: status['enabled'] as bool? ?? false,
+        shimInstalled: status['shim_installed'] as bool? ?? false,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<JudgeHookStatusRecord?> configureJudgeHook({
+    String? workspacePath,
+    required bool enabled,
+  }) async {
+    try {
+      final response = await _send('configure_judge_hook', {
+        // ignore: use_null_aware_elements
+        if (workspacePath != null) 'workspace_path': workspacePath,
+        'enabled': enabled,
+      });
+      final status = (response['status'] as Map<String, dynamic>?) ?? response;
+      return (
+        path: status['path']?.toString() ?? '',
+        exists: status['exists'] as bool? ?? false,
+        enabled: status['enabled'] as bool? ?? false,
+        shimInstalled: status['shim_installed'] as bool? ?? false,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<JudgeRecordItem>> getJudgeHistory() async {
+    try {
+      final response = await _send('get_judge_history');
+      final records = response['records'] as List<dynamic>?;
+      if (records == null) return [];
+      return records.map((e) {
+        final m = e as Map<String, dynamic>;
+        return (
+          timestamp: m['timestamp']?.toString() ?? '',
+          sessionId: m['session_id']?.toString() ?? '',
+          toolName: m['tool_name']?.toString() ?? '',
+          commandLine: m['command_line'] as String?,
+          decision: m['decision']?.toString() ?? 'ask',
+          source: m['source']?.toString() ?? 'fallback',
+          reason: m['reason']?.toString() ?? '',
+        );
+      }).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<JudgeRulesRecord?> getJudgeRules() async {
+    try {
+      final response = await _send('get_judge_rules');
+      final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
+      return (
+        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<JudgeRulesRecord?> addJudgeAllowCommand(String command) async {
+    try {
+      final response = await _send('add_judge_allow_command', {
+        'command': command,
+      });
+      final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
+      return (
+        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<JudgeRulesRecord?> removeJudgeAllowCommand(String command) async {
+    try {
+      final response = await _send('remove_judge_allow_command', {
+        'command': command,
+      });
+      final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
+      return (
+        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<JudgeRulesRecord?> addJudgeDenySubstring(String substring) async {
+    try {
+      final response = await _send('add_judge_deny_substring', {
+        'substring': substring,
+      });
+      final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
+      return (
+        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<JudgeRulesRecord?> removeJudgeDenySubstring(String substring) async {
+    try {
+      final response = await _send('remove_judge_deny_substring', {
+        'substring': substring,
+      });
+      final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
+      return (
+        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [],
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<Map<String, dynamic>> attachSession({
@@ -649,6 +953,16 @@ class TriageWebSocketClient {
         'current_version': update.currentVersion,
         'latest_version': update.latestVersion,
       };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.SessionJudgePolicyUpdatedPayload) {
+      final updated = payload as fbs.SessionJudgePolicyUpdatedPayload;
+      return {
+        'type': 'session_judge_policy_updated',
+        'session_id': updated.sessionId,
+        'has_pinned': updated.hasPinned,
+        'pinned': updated.pinned,
+        'effective': updated.effective,
+      };
     }
     // Reached for `NONE`, or for a union member the bindings know but the
     // branches above have not been taught — which is exactly how the missing
@@ -784,6 +1098,68 @@ class TriageWebSocketClient {
                 },
               )
               .toList(),
+        };
+      case 15: // SessionJudgePolicyResult
+        final policy = result as fbs.SessionJudgePolicyResult;
+        return {
+          'result': 'session_judge_policy',
+          'session_id': policy.sessionId,
+          'has_pinned': policy.hasPinned,
+          'pinned': policy.pinned,
+          'effective': policy.effective,
+        };
+      case 16: // SessionJudgePoliciesResult
+        final policies = result as fbs.SessionJudgePoliciesResult;
+        return {
+          'result': 'session_judge_policies',
+          'entries': (policies.entries ?? [])
+              .map(
+                (entry) => {
+                  'session_id': entry.sessionId,
+                  'has_pinned': entry.hasPinned,
+                  'pinned': entry.pinned,
+                  'effective': entry.effective,
+                },
+              )
+              .toList(),
+        };
+      case 17: // JudgeHookStatusResult
+        final hook = result as fbs.JudgeHookStatusResult;
+        return {
+          'result': 'judge_hook_status',
+          'path': hook.path ?? '',
+          'exists': hook.exists,
+          'enabled': hook.enabled,
+          'shim_installed': hook.shimInstalled,
+        };
+      case 18: // JudgeHistoryResult
+        final history = result as fbs.JudgeHistoryResult;
+        return {
+          'result': 'judge_history',
+          'records': (history.records ?? [])
+              .map(
+                (r) => {
+                  'timestamp': r.timestamp,
+                  'session_id': r.sessionId,
+                  'tool_name': r.toolName,
+                  'command_line': r.commandLine,
+                  'decision': r.decision,
+                  'source': r.source,
+                  'reason': r.reason,
+                },
+              )
+              .toList(),
+        };
+      case 19: // JudgeRulesResult
+        final rules = result as fbs.JudgeRulesResult;
+        return {
+          'result': 'judge_rules',
+          'rules': {
+            'builtin_allow_commands': rules.builtinAllowCommands ?? [],
+            'custom_allow_commands': rules.customAllowCommands ?? [],
+            'builtin_deny_substrings': rules.builtinDenySubstrings ?? [],
+            'custom_deny_substrings': rules.customDenySubstrings ?? [],
+          },
         };
       default:
         return _unhandled('server result', type.value);
@@ -1137,6 +1513,87 @@ class TriageWebSocketClient {
       case 'list_session_contexts':
         payloadType = fbs.ClientRequestPayloadTypeId.ListSessionContextsRequest;
         payload = fbs.ListSessionContextsRequestObjectBuilder();
+        break;
+
+      case 'get_session_judge_policy':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.GetSessionJudgePolicyRequest;
+        payload = fbs.GetSessionJudgePolicyRequestObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+        );
+        break;
+
+      case 'set_session_judge_policy':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.SetSessionJudgePolicyRequest;
+        payload = fbs.SetSessionJudgePolicyRequestObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+          hasEnabled: extra?['has_enabled'] as bool? ?? false,
+          enabled: extra?['enabled'] as bool? ?? false,
+        );
+        break;
+
+      case 'list_session_judge_policies':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.ListSessionJudgePoliciesRequest;
+        payload = fbs.ListSessionJudgePoliciesRequestObjectBuilder();
+        break;
+
+      case 'get_judge_hook_status':
+        payloadType = fbs.ClientRequestPayloadTypeId.GetJudgeHookStatusRequest;
+        payload = fbs.GetJudgeHookStatusRequestObjectBuilder(
+          workspacePath: extra?['workspace_path'] as String?,
+        );
+        break;
+
+      case 'configure_judge_hook':
+        payloadType = fbs.ClientRequestPayloadTypeId.ConfigureJudgeHookRequest;
+        payload = fbs.ConfigureJudgeHookRequestObjectBuilder(
+          workspacePath: extra?['workspace_path'] as String?,
+          enabled: extra?['enabled'] as bool? ?? false,
+        );
+        break;
+
+      case 'get_judge_history':
+        payloadType = fbs.ClientRequestPayloadTypeId.GetJudgeHistoryRequest;
+        payload = fbs.GetJudgeHistoryRequestObjectBuilder();
+        break;
+
+      case 'get_judge_rules':
+        payloadType = fbs.ClientRequestPayloadTypeId.GetJudgeRulesRequest;
+        payload = fbs.GetJudgeRulesRequestObjectBuilder();
+        break;
+
+      case 'add_judge_allow_command':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.AddJudgeAllowCommandRequest;
+        payload = fbs.AddJudgeAllowCommandRequestObjectBuilder(
+          command: extra?['command'] as String?,
+        );
+        break;
+
+      case 'remove_judge_allow_command':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.RemoveJudgeAllowCommandRequest;
+        payload = fbs.RemoveJudgeAllowCommandRequestObjectBuilder(
+          command: extra?['command'] as String?,
+        );
+        break;
+
+      case 'add_judge_deny_substring':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.AddJudgeDenySubstringRequest;
+        payload = fbs.AddJudgeDenySubstringRequestObjectBuilder(
+          substring: extra?['substring'] as String?,
+        );
+        break;
+
+      case 'remove_judge_deny_substring':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.RemoveJudgeDenySubstringRequest;
+        payload = fbs.RemoveJudgeDenySubstringRequestObjectBuilder(
+          substring: extra?['substring'] as String?,
+        );
         break;
 
       default:

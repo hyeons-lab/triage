@@ -389,7 +389,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Touch: let the terminal's own gestures handle scrolling (a swipe) and
     // selection (long-press). The pointer-driven drag-select below is for a
     // mouse — on touch it would hijack a swipe-to-scroll into a text selection.
-    if (_isMobile) return;
+    if (_isMobile || ModalRoute.of(context)?.isCurrent == false) return;
     if (HardwareKeyboard.instance.isShiftPressed) {
       // Shift+primary: a click extends the existing selection on pointer-up.
       _shiftClickPointer = event.pointer;
@@ -821,6 +821,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // with the gap spaces restored. Returning `ignored` for everything else
   // leaves xterm's normal key handling — including Ctrl+C -> SIGINT — untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
+    if (ModalRoute.of(context)?.isCurrent == false) return KeyEventResult.ignored;
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     if (event.logicalKey != LogicalKeyboardKey.keyC) {
       return KeyEventResult.ignored;
