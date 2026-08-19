@@ -206,6 +206,47 @@ table ListSessionSnippetsRequest {}
 
 table ListSessionContextsRequest {}
 
+table GetSessionJudgePolicyRequest {
+    session_id: string;
+}
+
+table SetSessionJudgePolicyRequest {
+    session_id: string;
+    has_enabled: bool;
+    enabled: bool;
+}
+
+table ListSessionJudgePoliciesRequest {}
+
+table GetJudgeHookStatusRequest {
+    workspace_path: string;
+}
+
+table ConfigureJudgeHookRequest {
+    workspace_path: string;
+    enabled: bool;
+}
+
+table GetJudgeHistoryRequest {}
+
+table GetJudgeRulesRequest {}
+
+table AddJudgeAllowCommandRequest {
+    command: string;
+}
+
+table RemoveJudgeAllowCommandRequest {
+    command: string;
+}
+
+table AddJudgeDenySubstringRequest {
+    substring: string;
+}
+
+table RemoveJudgeDenySubstringRequest {
+    substring: string;
+}
+
 union ClientRequestPayload {
     HelloRequest,
     PairRequest,
@@ -223,7 +264,18 @@ union ClientRequestPayload {
     ShutdownSessionRequest,
     PairingChallengeRequest,
     ListSessionSnippetsRequest,
-    ListSessionContextsRequest
+    ListSessionContextsRequest,
+    GetSessionJudgePolicyRequest,
+    SetSessionJudgePolicyRequest,
+    ListSessionJudgePoliciesRequest,
+    GetJudgeHookStatusRequest,
+    ConfigureJudgeHookRequest,
+    GetJudgeHistoryRequest,
+    GetJudgeRulesRequest,
+    AddJudgeAllowCommandRequest,
+    RemoveJudgeAllowCommandRequest,
+    AddJudgeDenySubstringRequest,
+    RemoveJudgeDenySubstringRequest
 }
 
 table ClientMessage {
@@ -315,6 +367,45 @@ table SessionContextsResult {
     entries: [SessionContextEntry];
 }
 
+table SessionJudgePolicyResult {
+    session_id: string;
+    has_pinned: bool;
+    pinned: bool;
+    effective: bool;
+}
+
+table SessionJudgePoliciesResult {
+    entries: [SessionJudgePolicyResult];
+}
+
+table JudgeHookStatusResult {
+    path: string;
+    exists: bool;
+    enabled: bool;
+    shim_installed: bool;
+}
+
+table JudgeRecordEntry {
+    timestamp: string;
+    session_id: string;
+    tool_name: string;
+    command_line: string;
+    decision: string;
+    source: string;
+    reason: string;
+}
+
+table JudgeHistoryResult {
+    records: [JudgeRecordEntry];
+}
+
+table JudgeRulesResult {
+    builtin_allow_commands: [string];
+    custom_allow_commands: [string];
+    builtin_deny_substrings: [string];
+    custom_deny_substrings: [string];
+}
+
 union ServerResultPayload {
     UnitResult,
     HelloResult,
@@ -329,7 +420,12 @@ union ServerResultPayload {
     CompletedSessionResult,
     PairingChallengeResult,
     SessionSnippetsResult,
-    SessionContextsResult
+    SessionContextsResult,
+    SessionJudgePolicyResult,
+    SessionJudgePoliciesResult,
+    JudgeHookStatusResult,
+    JudgeHistoryResult,
+    JudgeRulesResult
 }
 
 table ResponsePayload {
@@ -421,6 +517,16 @@ table UpdateAvailablePayload {
     latest_version: string;
 }
 
+// Connection-wide push (not tied to a session subscription): a session's
+// tool-call approval judge policy changed. Broadcast to every connected client
+// so the UI stays synchronized in real-time.
+table SessionJudgePolicyUpdatedPayload {
+    session_id: string;
+    has_pinned: bool;
+    pinned: bool;
+    effective: bool;
+}
+
 union ServerMessagePayload {
     ResponsePayload,
     ErrorPayload,
@@ -428,7 +534,8 @@ union ServerMessagePayload {
     SubscriptionClosedPayload,
     SessionSnippetUpdatedPayload,
     SessionContextUpdatedPayload,
-    UpdateAvailablePayload
+    UpdateAvailablePayload,
+    SessionJudgePolicyUpdatedPayload
 }
 
 table ServerMessage {

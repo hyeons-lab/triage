@@ -26,6 +26,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use serde::{Deserialize, Serialize};
 use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
+use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi,
@@ -68,6 +69,9 @@ const _: () = assert!(
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
 const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
+/// Maximum number of recent judge decisions retained in memory for the settings
+/// audit trail (e.g. ~24 hours of active agent tool traffic).
+const JUDGE_HISTORY_CAPACITY: usize = 2000;
 
 /// Internal argv marker used by the daemon executable as a child-side exec
 /// shim. The daemon itself ignores TTIN/TTOU so handover terminal changes cannot
@@ -93,6 +97,11 @@ pub struct SessionConfig {
     pub cwd: Option<PathBuf>,
     pub size: SessionSize,
     pub log_path: PathBuf,
+    /// Published to the child as `TRIAGE_SESSION_ID` so processes inside the
+    /// PTY can identify which session they belong to. `None` for PTYs spawned
+    /// outside session management (tests, ad-hoc `PtySession::spawn`), which
+    /// simply get no such variable.
+    pub session_id: Option<SessionId>,
 }
 
 impl SessionConfig {
@@ -103,6 +112,7 @@ impl SessionConfig {
             cwd: None,
             size: SessionSize::default(),
             log_path: log_path.into(),
+            session_id: None,
         }
     }
 
@@ -277,6 +287,13 @@ fn evict_oldest_unapproved_pairing_challenge(
     false
 }
 
+/// Resolved approval-judge state: the settings plus the rule tables built from
+/// them. Held together so a query reads one lock rather than two.
+struct JudgeState {
+    config: triage_core::config::JudgeConfig,
+    rules: crate::judge::JudgeRules,
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
@@ -288,6 +305,23 @@ pub struct SessionManager {
     snippets: Mutex<HashMap<SessionId, SessionSnippet>>,
     /// The local-LLM summarizer worker. Disabled until `start_summarizer` runs.
     summarizer: Mutex<crate::summarizer::Summarizer>,
+    /// Tool-call approval judge. `None` until `start_judge` runs, and while it
+    /// is `None` every query is answered `ask`.
+    ///
+    /// Behind an `Arc` because every tool call clones it out of the lock rather
+    /// than judging under it, and the rule tables are around a hundred strings.
+    /// A refcount bump per `ls` is the right cost; a hundred allocations is not.
+    judge: Mutex<Option<Arc<JudgeState>>>,
+    /// Per-session judge overrides. A session absent from this map follows
+    /// `judge.default_enabled_per_session`.
+    ///
+    /// In memory only, deliberately. A daemon restart or handover drops every
+    /// override and each session reverts to the configured default, which errs
+    /// towards prompting rather than towards silently auto-approving in a
+    /// session whose owner has forgotten they enabled it.
+    judge_overrides: Mutex<HashMap<SessionId, bool>>,
+    /// Ring buffer of recent judged tool calls and verdicts.
+    judge_history: Mutex<std::collections::VecDeque<triage_core::judge::JudgeRecord>>,
     /// Sender handed to session actors so they report output activity to the
     /// debounce loop. `None` until `start_summarizer` runs.
     dirty_tx: Mutex<Option<DirtySender>>,
@@ -580,6 +614,11 @@ impl SessionManager {
             require_pairing,
             snippets: Mutex::new(HashMap::new()),
             summarizer: Mutex::new(Summarizer::disabled()),
+            judge: Mutex::new(None),
+            judge_overrides: Mutex::new(HashMap::new()),
+            judge_history: Mutex::new(std::collections::VecDeque::with_capacity(
+                JUDGE_HISTORY_CAPACITY,
+            )),
             dirty_tx: Mutex::new(None),
             global_senders: Arc::new(Mutex::new(Vec::new())),
             update_status: Arc::new(RwLock::new(crate::update::UpdateStatus::current())),
@@ -996,6 +1035,137 @@ impl SessionManager {
         }
     }
 
+    /// Installs the tool-call approval judge. Cheap: the rule tables are pure
+    /// data and the model is the summarizer's, already resident. No-op when
+    /// `judge.enabled` is false, which leaves every query answering `ask`.
+    pub fn start_judge(&self, config: triage_core::config::JudgeConfig) {
+        if !config.enabled {
+            tracing::info!("tool-call approval judge disabled by config");
+            return;
+        }
+        let state = JudgeState {
+            rules: crate::judge::JudgeRules::new(&config),
+            config,
+        };
+        if let Ok(mut guard) = self.judge.lock() {
+            *guard = Some(Arc::new(state));
+            tracing::info!("tool-call approval judge enabled");
+        }
+    }
+
+    /// Decides whether an agent's tool call may run without prompting the user.
+    ///
+    /// Never returns an error. Every failure resolves to
+    /// [`JudgeDecision::Ask`](triage_core::judge::JudgeDecision::Ask), which is
+    /// exactly what the agent does with no judge installed, so a broken judge
+    /// degrades to the status quo rather than to a broken agent.
+    ///
+    /// Emits one structured event per decision. That log is the audit trail for
+    /// everything auto-approved on the user's behalf, so it is deliberately at
+    /// `info` and carries the command verbatim.
+    pub fn judge_tool_call(&self, request: triage_core::judge::JudgeRequest) -> JudgeVerdict {
+        let verdict = self.decide_tool_call(&request);
+        let record = triage_core::judge::JudgeRecord {
+            timestamp: current_iso8601_timestamp(),
+            session_id: request.session_id.clone(),
+            tool_name: request.tool_name.clone(),
+            command_line: request.command_line.clone(),
+            decision: verdict.decision,
+            source: verdict.source,
+            reason: verdict.reason.clone(),
+        };
+        if let Ok(mut history) = self.judge_history.lock() {
+            if history.len() >= JUDGE_HISTORY_CAPACITY {
+                history.pop_front();
+            }
+            history.push_back(record);
+        }
+        tracing::info!(
+            session_id = %request.session_id,
+            tool = %request.tool_name,
+            command = %request.command_line.as_deref().unwrap_or("<none>"),
+            decision = %verdict.decision,
+            source = %verdict.source,
+            reason = %verdict.reason,
+            "judged agent tool call"
+        );
+        verdict
+    }
+
+    /// Drops a session's judge override when the session goes away.
+    ///
+    /// Without this the map grows for the daemon's lifetime, and worse: a
+    /// restored session reuses its persisted id, so it would silently inherit an
+    /// auto-approve pin its owner set on an earlier incarnation.
+    fn forget_judge_override(&self, session_id: &SessionId) {
+        if let Ok(mut overrides) = self.judge_overrides.lock() {
+            overrides.remove(session_id);
+        }
+    }
+
+    /// One session's judge policy: its override, and the resolved answer.
+    ///
+    /// `None` means judging is disabled outright, which the caller turns into an
+    /// error rather than into "off": a client that cannot reach a policy should
+    /// say so instead of showing a definite-looking answer.
+    ///
+    /// Reads the single key under the lock rather than cloning the override map
+    /// and the config, which is the point of asking about one session.
+    fn judge_policy_snapshot(&self, session_id: &SessionId) -> Option<(Option<bool>, bool)> {
+        let default_enabled = self
+            .judge
+            .lock()
+            .ok()?
+            .as_ref()?
+            .config
+            .default_enabled_per_session;
+        let overrides = self.judge_overrides.lock().ok()?;
+        let explicit = overrides.get(session_id).copied();
+        Some((explicit, explicit.unwrap_or(default_enabled)))
+    }
+
+    /// The decision itself, split out so [`Self::judge_tool_call`] can log every
+    /// return path in one place.
+    fn decide_tool_call(&self, request: &triage_core::judge::JudgeRequest) -> JudgeVerdict {
+        // Take a handle out rather than judging under the lock: the model call
+        // below blocks for as long as a decode takes, and holding the judge lock
+        // across it would serialize every other query behind it.
+        let state = match self.judge.lock() {
+            Ok(guard) => guard.as_ref().map(Arc::clone),
+            Err(_) => return JudgeVerdict::fallback("judge state is poisoned"),
+        };
+        let Some(state) = state else {
+            return JudgeVerdict::fallback("judging is disabled");
+        };
+
+        // Resolve the session's policy: an explicit per-session override if set,
+        // otherwise the configured daemon default. External sessions (agents running
+        // outside a Triage PTY) follow the daemon default policy.
+        let explicit = match self.judge_overrides.lock() {
+            Ok(overrides) => overrides.get(&request.session_id).copied(),
+            Err(_) => return JudgeVerdict::fallback("judge override state is poisoned"),
+        };
+        let enabled = explicit.unwrap_or(state.config.default_enabled_per_session);
+        if !enabled {
+            return JudgeVerdict::fallback("judging is off for this session");
+        }
+
+        // Deterministic layers first: they settle the overwhelming majority of
+        // traffic and keep the model off the blocking path entirely.
+        if let Some(verdict) = state.rules.evaluate(request) {
+            return verdict;
+        }
+
+        let summarizer = match self.summarizer.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return JudgeVerdict::fallback("summarizer state is poisoned"),
+        };
+        summarizer.judge(
+            request.clone(),
+            Duration::from_millis(state.config.timeout_ms),
+        )
+    }
+
     /// Starts the local-LLM summarizer: loads the model lazily on a worker
     /// thread, wires session activity into a debounce loop, and pushes generated
     /// snippets to clients. No-op when disabled. Safe to call once at startup.
@@ -1015,7 +1185,7 @@ impl SessionManager {
             max_tokens: config.max_tokens,
             detail_max_tokens: config.detail_max_tokens,
             cache_dir,
-            queue_depth: 8,
+            judge_queue_depth: 8,
         };
 
         let on_result = {
@@ -2298,6 +2468,7 @@ impl SessionApi for SessionManager {
             cwd: request.cwd,
             size: request.size,
             log_path,
+            session_id: Some(session_id.clone()),
         };
         let launch = PersistedSessionLaunch::from(&config);
         let last_known_cwd = launch.cwd.clone();
@@ -2599,6 +2770,7 @@ impl SessionApi for SessionManager {
             cwd,
             size: request.size,
             log_path: persisted.log_path.clone(),
+            session_id: Some(request.session_id.clone()),
         };
         let launch = PersistedSessionLaunch::from(&config);
         let last_known_cwd = launch.cwd.clone();
@@ -2877,6 +3049,7 @@ impl SessionApi for SessionManager {
         };
 
         self.forget_snippet(&session_id);
+        self.forget_judge_override(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -2964,6 +3137,227 @@ impl SessionApi for SessionManager {
             .collect())
     }
 
+    fn session_judge_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<triage_core::judge::SessionJudgePolicy> {
+        ensure!(
+            self.sessions()?.contains_key(&session_id),
+            "unknown session {session_id}"
+        );
+        let (explicit, effective) = self
+            .judge_policy_snapshot(&session_id)
+            .ok_or_else(|| anyhow!("judging is disabled"))?;
+        Ok(triage_core::judge::SessionJudgePolicy {
+            explicit,
+            effective,
+        })
+    }
+
+    fn set_session_judge_policy(&self, session_id: SessionId, enabled: Option<bool>) -> Result<()> {
+        // Refuse unknown sessions rather than accumulating overrides for ids
+        // that never existed, which would otherwise leak on every typo.
+        ensure!(
+            self.sessions()?.contains_key(&session_id),
+            "unknown session {session_id}"
+        );
+        tracing::info!(
+            %session_id,
+            ?enabled,
+            "set per-session tool-call judge policy"
+        );
+        {
+            let mut overrides = self
+                .judge_overrides
+                .lock()
+                .map_err(|_| anyhow!("judge override state is poisoned"))?;
+            match enabled {
+                Some(enabled) => overrides.insert(session_id.clone(), enabled),
+                None => overrides.remove(&session_id),
+            };
+        }
+        if let Ok(policy) = self.session_judge_policy(session_id.clone()) {
+            self.broadcast_global(
+                triage_transport_ws::ServerMessage::SessionJudgePolicyUpdated {
+                    session_id,
+                    policy,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn get_judge_hook_status(
+        &self,
+        workspace_path: Option<String>,
+    ) -> Result<triage_core::judge::JudgeHookStatus> {
+        let ws = workspace_path.or_else(|| {
+            if let Ok(contexts) = self.list_session_contexts() {
+                for ctx in contexts {
+                    if let Some(repo) = ctx.context.and_then(|c| c.repository_root) {
+                        return Some(repo.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            None
+        });
+        Ok(crate::judge::get_hook_status(ws.as_deref()))
+    }
+
+    fn configure_judge_hook(
+        &self,
+        workspace_path: Option<String>,
+        enabled: bool,
+    ) -> Result<triage_core::judge::JudgeHookStatus> {
+        let ws = workspace_path.or_else(|| {
+            if let Ok(contexts) = self.list_session_contexts() {
+                for ctx in contexts {
+                    if let Some(repo) = ctx.context.and_then(|c| c.repository_root) {
+                        return Some(repo.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            None
+        });
+        crate::judge::configure_hook(ws.as_deref(), enabled)
+    }
+
+    fn get_judge_history(&self) -> Result<Vec<triage_core::judge::JudgeRecord>> {
+        Ok(self
+            .judge_history
+            .lock()
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn get_judge_rules(&self) -> Result<triage_core::judge::JudgeRulesInfo> {
+        let (custom_allows, custom_denies) = if let Ok(guard) = self.judge.lock() {
+            if let Some(state) = guard.as_ref() {
+                (
+                    state.config.allow_commands.clone(),
+                    state.config.deny_substrings.clone(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        Ok(triage_core::judge::JudgeRulesInfo {
+            builtin_allow_commands: crate::judge::builtin_allow_commands(),
+            custom_allow_commands: custom_allows,
+            builtin_deny_substrings: crate::judge::builtin_deny_substrings(),
+            custom_deny_substrings: custom_denies,
+        })
+    }
+
+    fn add_judge_allow_command(
+        &self,
+        command: String,
+    ) -> Result<triage_core::judge::JudgeRulesInfo> {
+        let cmd = command.trim().to_string();
+        if cmd.is_empty() {
+            bail!("cannot add empty allow command");
+        }
+        let mut guard = self
+            .judge
+            .lock()
+            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
+        let current_state = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
+        let mut new_config = current_state.config.clone();
+        if !new_config.allow_commands.contains(&cmd) {
+            new_config.allow_commands.push(cmd);
+        }
+        let new_rules = crate::judge::JudgeRules::new(&new_config);
+        crate::judge::persist_judge_config(&new_config)?;
+        *guard = Some(Arc::new(JudgeState {
+            config: new_config.clone(),
+            rules: new_rules,
+        }));
+        drop(guard);
+        self.get_judge_rules()
+    }
+
+    fn remove_judge_allow_command(
+        &self,
+        command: String,
+    ) -> Result<triage_core::judge::JudgeRulesInfo> {
+        let cmd = command.trim();
+        let mut guard = self
+            .judge
+            .lock()
+            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
+        let current_state = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
+        let mut new_config = current_state.config.clone();
+        new_config.allow_commands.retain(|c| c != cmd);
+        let new_rules = crate::judge::JudgeRules::new(&new_config);
+        crate::judge::persist_judge_config(&new_config)?;
+        *guard = Some(Arc::new(JudgeState {
+            config: new_config.clone(),
+            rules: new_rules,
+        }));
+        drop(guard);
+        self.get_judge_rules()
+    }
+
+    fn add_judge_deny_substring(
+        &self,
+        substring: String,
+    ) -> Result<triage_core::judge::JudgeRulesInfo> {
+        let sub = substring.trim().to_string();
+        if sub.is_empty() {
+            bail!("cannot add empty deny substring");
+        }
+        let mut guard = self
+            .judge
+            .lock()
+            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
+        let current_state = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
+        let mut new_config = current_state.config.clone();
+        if !new_config.deny_substrings.contains(&sub) {
+            new_config.deny_substrings.push(sub);
+        }
+        let new_rules = crate::judge::JudgeRules::new(&new_config);
+        crate::judge::persist_judge_config(&new_config)?;
+        *guard = Some(Arc::new(JudgeState {
+            config: new_config.clone(),
+            rules: new_rules,
+        }));
+        drop(guard);
+        self.get_judge_rules()
+    }
+
+    fn remove_judge_deny_substring(
+        &self,
+        substring: String,
+    ) -> Result<triage_core::judge::JudgeRulesInfo> {
+        let sub = substring.trim();
+        let mut guard = self
+            .judge
+            .lock()
+            .map_err(|_| anyhow::anyhow!("judge lock poisoned"))?;
+        let current_state = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("judge not initialized"))?;
+        let mut new_config = current_state.config.clone();
+        new_config.deny_substrings.retain(|s| s != sub);
+        let new_rules = crate::judge::JudgeRules::new(&new_config);
+        crate::judge::persist_judge_config(&new_config)?;
+        *guard = Some(Arc::new(JudgeState {
+            config: new_config.clone(),
+            rules: new_rules,
+        }));
+        drop(guard);
+        self.get_judge_rules()
+    }
+
     fn server_update_info(&self) -> triage_core::session::ServerUpdateInfo {
         let status = self.update_status();
         triage_core::session::ServerUpdateInfo {
@@ -2972,6 +3366,31 @@ impl SessionApi for SessionManager {
             latest_version: status.latest,
         }
     }
+}
+
+fn current_iso8601_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let rem_secs = secs % 86400;
+    let hours = rem_secs / 3600;
+    let minutes = (rem_secs % 3600) / 60;
+    let seconds = rem_secs % 60;
+
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 impl PtySession {
@@ -5200,6 +5619,15 @@ fn spawn_pty_runtime(
     // so these are authoritative.
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    // Identity for processes running inside this PTY. The approval-judge hook
+    // shim reads it to name the session it is asking about; without it the shim
+    // answers `ask` and never opens the socket, so an agent run outside Triage
+    // behaves exactly as it does today. Set after the scrub, alongside the other
+    // authoritative variables, and fixed at spawn so it survives handover
+    // adoption (adopted PTYs keep their environment; they are not respawned).
+    if let Some(session_id) = &config.session_id {
+        command.env("TRIAGE_SESSION_ID", session_id.as_str());
+    }
 
     let child = pair
         .slave
@@ -6465,6 +6893,7 @@ mod tests {
             cwd: None,
             size: SessionSize::default(),
             log_path: PathBuf::from("unused.log"),
+            session_id: None,
         };
         let command = build_pty_command(&config, true, Some(Path::new("/bin/triaged")))
             .expect("build reset shim command");
@@ -7512,6 +7941,186 @@ mod tests {
                 .any(|row| row.contains("triage-ready")),
             "completed visible rows did not contain marker: {:?}",
             completed.visible_rows
+        );
+    }
+
+    /// Builds a manager with one live session and the judge installed, with
+    /// `default_enabled_per_session` set as given.
+    #[cfg(unix)]
+    fn manager_with_judge(default_on: bool) -> (SessionManager, SessionId) {
+        let manager = SessionManager::new(SessionManagerConfig::new(unique_log_dir()));
+        manager.start_judge(triage_core::config::JudgeConfig {
+            default_enabled_per_session: default_on,
+            ..triage_core::config::JudgeConfig::default()
+        });
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        (manager, session_id)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_without_an_override_follows_the_configured_default() {
+        // Two managers rather than two configs: the policy is resolved against
+        // the config the daemon actually installed, so that is what to vary.
+        let (manager, session_id) = manager_with_judge(true);
+        let policy = manager.session_judge_policy(session_id).expect("policy");
+        assert_eq!(policy.explicit, None);
+        assert!(policy.effective);
+
+        let (manager, session_id) = manager_with_judge(false);
+        let policy = manager.session_judge_policy(session_id).expect("policy");
+        assert_eq!(policy.explicit, None);
+        assert!(
+            !policy.effective,
+            "an untouched session must track the default, not latch a value"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_override_wins_over_the_default_and_can_be_cleared() {
+        let (manager, session_id) = manager_with_judge(true);
+        let effective = |manager: &SessionManager, session_id: &SessionId| {
+            manager
+                .session_judge_policy(session_id.clone())
+                .expect("policy")
+                .effective
+        };
+
+        manager
+            .set_session_judge_policy(session_id.clone(), Some(false))
+            .expect("set override");
+        assert!(
+            !effective(&manager, &session_id),
+            "override beats the default"
+        );
+
+        manager
+            .set_session_judge_policy(session_id.clone(), Some(true))
+            .expect("flip override");
+        assert!(effective(&manager, &session_id));
+
+        // Clearing returns the session to following the default rather than
+        // freezing it at its last explicit value.
+        manager
+            .set_session_judge_policy(session_id.clone(), None)
+            .expect("clear override");
+        let policy = manager.session_judge_policy(session_id).expect("policy");
+        assert_eq!(policy.explicit, None);
+        assert!(
+            policy.effective,
+            "back to following the default, which is on"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn judge_policy_is_refused_for_an_unknown_session() {
+        let (manager, _session_id) = manager_with_judge(true);
+        let unknown = SessionId::new("does-not-exist").expect("valid id");
+        assert!(
+            manager
+                .set_session_judge_policy(unknown, Some(true))
+                .is_err(),
+            "an unknown session must be refused rather than accumulating an override"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn closing_a_session_drops_its_judge_override() {
+        // Otherwise the map grows for the daemon's lifetime, and because
+        // `restore_session` reuses the persisted id, a restored session would
+        // silently inherit an auto-approve pin set on an earlier incarnation.
+        let (manager, session_id) = manager_with_judge(false);
+        manager
+            .set_session_judge_policy(session_id.clone(), Some(true))
+            .expect("set override");
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown");
+        let remaining = manager
+            .judge_overrides
+            .lock()
+            .expect("override lock")
+            .contains_key(&session_id);
+        assert!(
+            !remaining,
+            "a closed session must not leave its override behind"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_enabled_session_auto_approves_an_allowlisted_command() {
+        // The positive path. Without this, `decide_tool_call` could return a
+        // fallback unconditionally and every other judge test would still pass,
+        // since they all assert on `Ask`.
+        let (manager, session_id) = manager_with_judge(true);
+        let verdict = manager.judge_tool_call(triage_core::judge::JudgeRequest {
+            session_id,
+            tool_name: "run_command".to_string(),
+            command_line: Some("ls -la".to_string()),
+            path: None,
+            cwd: None,
+        });
+        assert_eq!(verdict.decision, triage_core::judge::JudgeDecision::Allow);
+        assert_eq!(verdict.source, triage_core::judge::JudgeSource::AllowRule);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn judge_policy_reports_the_override_separately_from_the_resolved_answer() {
+        // A pinned session and one following an identical default must be
+        // distinguishable, or the settings screen cannot tell `n` from `r`.
+        let (manager, session_id) = manager_with_judge(true);
+        manager
+            .set_session_judge_policy(session_id.clone(), Some(true))
+            .expect("pin on");
+        let policy = manager
+            .session_judge_policy(session_id.clone())
+            .expect("policy");
+        assert_eq!(policy.explicit, Some(true));
+        assert!(policy.effective);
+
+        manager
+            .set_session_judge_policy(session_id.clone(), None)
+            .expect("clear");
+        let policy = manager.session_judge_policy(session_id).expect("policy");
+        assert_eq!(policy.explicit, None);
+        assert!(policy.effective, "still on, but by default rather than pin");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unknown_session_uses_default_policy() {
+        let (manager_on, _session_id) = manager_with_judge(true);
+        let verdict_on = manager_on.judge_tool_call(triage_core::judge::JudgeRequest {
+            session_id: SessionId::new("external").expect("valid id"),
+            tool_name: "run_command".to_string(),
+            command_line: Some("ls".to_string()),
+            path: None,
+            cwd: None,
+        });
+        assert_eq!(
+            verdict_on.decision,
+            triage_core::judge::JudgeDecision::Allow
+        );
+
+        let (manager_off, _session_id) = manager_with_judge(false);
+        let verdict_off = manager_off.judge_tool_call(triage_core::judge::JudgeRequest {
+            session_id: SessionId::new("external").expect("valid id"),
+            tool_name: "run_command".to_string(),
+            command_line: Some("ls".to_string()),
+            path: None,
+            cwd: None,
+        });
+        assert_eq!(verdict_off.decision, triage_core::judge::JudgeDecision::Ask);
+        assert_eq!(
+            verdict_off.source,
+            triage_core::judge::JudgeSource::Fallback
         );
     }
 
@@ -9689,11 +10298,21 @@ mod tests {
         }
     }
 
+    /// A directory no other test shares.
+    ///
+    /// The counter is what makes that true. Keying on the thread id alone looks
+    /// unique but is not: the test harness reuses threads, so two tests that run
+    /// one after another on the same thread get the same path. That is harmless
+    /// for a log directory and fatal for the tests that `git init` there, which
+    /// then find a repository the previous test left behind. It surfaces only
+    /// when scheduling happens to pair those tests, so it can sit latent for a
+    /// long time and then look like an unrelated change broke them.
     fn unique_log_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = format!(
-            "triage-session-manager-{}-{:?}",
+            "triage-session-manager-{}-{}",
             std::process::id(),
-            std::thread::current().id()
+            NEXT.fetch_add(1, Ordering::Relaxed)
         );
         std::env::temp_dir().join(unique)
     }

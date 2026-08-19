@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(unix)]
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use triage_core::judge::{JudgeRequest, JudgeVerdict, SessionJudgePolicy};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     LeaseChange, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi,
@@ -394,6 +395,20 @@ impl IpcClient {
         }
     }
 
+    /// Asks the daemon to judge one agent tool call.
+    ///
+    /// Infallible by construction: an unreachable daemon, a refused connection,
+    /// or an unexpected reply all produce a fallback `ask`, which is the same
+    /// prompt the user would have seen with no judge installed. The hook shim
+    /// depends on this, since it must never be the reason an agent breaks.
+    pub fn judge_tool_call(&self, request: JudgeRequest) -> JudgeVerdict {
+        match self.round_trip(WireRequest::JudgeToolCall(request)) {
+            Ok(WireSuccess::JudgeVerdict(verdict)) => verdict,
+            Ok(other) => JudgeVerdict::fallback(format!("unexpected judge response: {other:?}")),
+            Err(error) => JudgeVerdict::fallback(format!("daemon unreachable: {error}")),
+        }
+    }
+
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
         let mut stream = transport::connect(&self.socket_path)
             .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
@@ -569,6 +584,23 @@ impl SessionApi for IpcClient {
         }
     }
 
+    fn session_judge_policy(&self, session_id: SessionId) -> Result<SessionJudgePolicy> {
+        match self.round_trip(WireRequest::SessionJudgePolicy { session_id })? {
+            WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
+            other => bail!("unexpected session_judge_policy response: {other:?}"),
+        }
+    }
+
+    fn set_session_judge_policy(&self, session_id: SessionId, enabled: Option<bool>) -> Result<()> {
+        match self.round_trip(WireRequest::SetSessionJudgePolicy {
+            session_id,
+            enabled,
+        })? {
+            WireSuccess::Unit => Ok(()),
+            other => bail!("unexpected set_session_judge_policy response: {other:?}"),
+        }
+    }
+
     /// Ask the daemon for its update status (Phase 4, the TUI banner). This is a
     /// best-effort, read-only query: any IPC failure (daemon mid-restart,
     /// unexpected reply) falls back to "this build, nothing newer" so the banner
@@ -629,6 +661,14 @@ enum WireRequest {
     /// successor (see [`crate::shutdown`]). Without this, `uninstall` would leave a
     /// daemon running.
     DisableShutdownRescue,
+    JudgeToolCall(JudgeRequest),
+    SessionJudgePolicy {
+        session_id: SessionId,
+    },
+    SetSessionJudgePolicy {
+        session_id: SessionId,
+        enabled: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,6 +710,8 @@ enum WireSuccess {
     Heartbeat,
     HandoverState(crate::handover::HandoverState),
     ServerUpdateInfo(ServerUpdateInfo),
+    JudgeVerdict(JudgeVerdict),
+    SessionJudgePolicy(SessionJudgePolicy),
 }
 
 fn fallback_user_component() -> String {
@@ -1724,6 +1766,22 @@ fn handle_request(
             crate::shutdown::disable_rescue();
             Ok(WireSuccess::Unit)
         }
+        // Deliberately infallible: `judge_tool_call` resolves every failure to
+        // `ask`, so the shim never has to interpret an error string to stay
+        // safe. An `Err` here would reach the hook as a message it would have to
+        // guess the meaning of.
+        WireRequest::JudgeToolCall(request) => {
+            Ok(WireSuccess::JudgeVerdict(manager.judge_tool_call(request)))
+        }
+        WireRequest::SessionJudgePolicy { session_id } => manager
+            .session_judge_policy(session_id)
+            .map(WireSuccess::SessionJudgePolicy),
+        WireRequest::SetSessionJudgePolicy {
+            session_id,
+            enabled,
+        } => manager
+            .set_session_judge_policy(session_id, enabled)
+            .map(|()| WireSuccess::Unit),
     }
 }
 

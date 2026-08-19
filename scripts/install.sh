@@ -23,7 +23,7 @@
 set -euo pipefail
 
 BIN_DIR="${TRIAGE_BIN_DIR:-$HOME/.cargo/bin}"
-BINARIES=(triaged triage triage-mcp)
+BINARIES=(triaged triage triage-mcp triage-hook)
 
 usage() {
     cat <<'EOF'
@@ -90,6 +90,36 @@ echo "==> Verifying the installed daemon launches"
     || die "$BIN_DIR/triaged failed to run — check 'codesign -v' and Console for a CODESIGNING kill"
 
 echo
+echo "==> Configuring agent lifecycle hooks"
+mkdir -p "$HOME/.agents"
+AGENTS_HOOKS="$HOME/.agents/hooks.json"
+if [[ ! -f "$AGENTS_HOOKS" ]]; then
+    cat > "$AGENTS_HOOKS" <<'EOF'
+{
+  "triage-approval-judge": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "triage-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+    echo "==> Created $AGENTS_HOOKS"
+else
+    echo "==> Existing $AGENTS_HOOKS found (preserved)"
+fi
+
+echo
 echo "The running daemon still holds the previous binary. To adopt this build"
 echo "without dropping sessions, hand over explicitly:"
 echo "    $BIN_DIR/triaged --handover"
+

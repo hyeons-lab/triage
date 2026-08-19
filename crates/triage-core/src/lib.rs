@@ -1,4 +1,5 @@
 pub mod config;
+pub mod judge;
 pub mod logging;
 pub mod session;
 
