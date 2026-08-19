@@ -273,6 +273,10 @@ transport error from policy `Ask` in `ask_daemon` via `judge_tool_call_result`, 
 grammar in `strip_leading_env_vars`, pre-allocated session policy entries in WebSocket transport, and simplified
 FlatBuffers `JudgeRules` string vector serialization.
 
+2026-08-19T10:19-0700 `crates/triage-hook/src/main.rs` — added documentation clarifying that offline in-process
+rule fallback evaluates static configuration rules from `config.toml`, and added unit tests for escaped backslashes
+and single quotes in environment variable prefix stripping.
+
 ## Decisions
 
 2026-08-17T00:41-0700 Read-only gh and flutter/dart tools belong on deterministic
@@ -850,7 +854,8 @@ f223064 — feat(triage_client): add tabbed settings dialog, approval traffic da
 a0c56f0 — docs: document approval judge architecture, handover protocol, and update devlogs
 6b4e653 — fix(hook,service): address PR review comments on permission overrides, env escaping, and fallback config
 c0eefbf — fix(hook,ipc): address review comments on hook portability, IPC timeouts, and subshell tests
-HEAD — fix(hook,ipc): preserve session policy in fallback and validate POSIX env identifiers
+66d99d5 — fix(hook,ipc): preserve session policy in fallback and validate POSIX env identifiers
+HEAD — docs(hook): document static in-process rule evaluation and add escaped quote tests
 
 ## Next Steps
 

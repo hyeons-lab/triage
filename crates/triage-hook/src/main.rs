@@ -407,6 +407,9 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     (verdict, format, Some(request))
 }
 
+/// Evaluates deterministic Layer 1 deny and Layer 2 allow rules in-process using
+/// the static configuration file (`config.toml`). This provides offline resilience
+/// when the daemon is stopped, unreachable, or restarting.
 fn evaluate_in_process(request: &JudgeRequest) -> Option<JudgeVerdict> {
     let config = triage_core::config::Config::default_path()
         .ok()
@@ -629,6 +632,14 @@ mod tests {
         assert_eq!(
             strip_leading_env_vars("389_server start"),
             "389_server start"
+        );
+        assert_eq!(
+            strip_leading_env_vars(r#"VAR="foo\"bar" cargo test"#),
+            "cargo test"
+        );
+        assert_eq!(
+            strip_leading_env_vars(r#"VAR='escaped single quote' git status"#),
+            "git status"
         );
     }
 
