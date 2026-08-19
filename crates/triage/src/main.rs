@@ -18,14 +18,15 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use triage::{
     CloseSessionOutcome, LocalSessionApp, SessionView, session_size_from_terminal,
     styled_rows_match_visible_text,
 };
+use triage_core::judge::SessionJudgePolicy;
 use triage_core::session::{
-    InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
-    path_leaf_name,
+    InputControllerKind, SessionId, SessionSize, StyledRow, TerminalColor, TerminalCursor,
+    TerminalStyle, path_leaf_name,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -403,6 +404,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut needs_draw = true;
     let mut sidebar_scroll_offset = 0usize;
     let mut last_sidebar_scroll_tick = Instant::now();
+    let mut settings: Option<SettingsOverlay> = None;
 
     loop {
         // Cheap non-blocking drain of the background poller's channel; the
@@ -431,6 +433,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     pending_confirmation,
                     selection,
                     sidebar_scroll_offset,
+                    settings,
                 );
             })?;
             needs_draw = false;
@@ -455,6 +458,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     continue;
                 }
                 return Ok(());
+            }
+            // Placed after the exit arm so Ctrl-Q still works, and before every
+            // other arm so no keystroke reaches the PTY behind the overlay.
+            Event::Key(key) if settings.is_some() => {
+                needs_draw = true;
+                match settings_key(key) {
+                    SettingsAction::None => {}
+                    SettingsAction::Close => settings = None,
+                    SettingsAction::Policy(policy) => {
+                        app.set_selected_judge_policy(policy);
+                        settings = Some(SettingsOverlay {
+                            judge: app.selected_judge_policy(),
+                        });
+                    }
+                }
             }
             Event::Key(key) => match key_to_command(key) {
                 Some(AppCommand::New) => {
@@ -505,6 +523,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                     sidebar_visible = !sidebar_visible;
                     app.resize(current_session_size(sidebar_visible)?);
                 }
+                Some(AppCommand::OpenSettings) => {
+                    needs_draw = true;
+                    pending_confirmation = None;
+                    selection = None;
+                    // Read the policy once here, on open, rather than per frame:
+                    // it is a blocking round trip to the daemon.
+                    settings = Some(SettingsOverlay {
+                        judge: app.selected_judge_policy(),
+                    });
+                }
                 Some(AppCommand::ScrollUp) => {
                     needs_draw = true;
                     pending_confirmation = None;
@@ -541,6 +569,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                 selection = None;
                 app.resize(session_size_from_app_terminal(rows, cols, sidebar_visible));
             }
+            // A paste or a click must not reach the session behind the overlay
+            // either. Mouse events additionally change the selection, which
+            // would leave the overlay describing a session it is no longer
+            // showing the policy for.
+            Event::Paste(_) | Event::Mouse(_) if settings.is_some() => {}
             Event::Paste(text) => {
                 needs_draw = true;
                 pending_confirmation = None;
@@ -575,6 +608,7 @@ fn draw(
     pending_confirmation: Option<Confirmation>,
     selection: Option<TerminalSelection>,
     sidebar_scroll_offset: usize,
+    settings: Option<SettingsOverlay>,
 ) -> Rect {
     // An optional one-row update banner sits above the content; the status line
     // stays pinned to the bottom.
@@ -613,6 +647,11 @@ fn draw(
         content_area
     };
 
+    // Drawn last so it sits above the terminal pane.
+    if let Some(settings) = settings {
+        draw_settings(frame, terminal_area, app, settings);
+    }
+
     draw_status(
         frame,
         status_area,
@@ -621,6 +660,110 @@ fn draw(
         pending_confirmation,
     );
     terminal_area
+}
+
+/// What a keystroke did to the settings overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsAction {
+    /// Consumed, nothing to do.
+    None,
+    /// Close the overlay.
+    Close,
+    /// Apply a policy: `Some` pins the session on or off, `None` clears the
+    /// override so it follows the configured default. Mirrors the three-state
+    /// `set_session_judge_policy` shape used everywhere else.
+    Policy(Option<bool>),
+}
+
+/// Routes a keystroke inside the settings overlay.
+///
+/// Every key is consumed while the overlay is open, including ones with no
+/// meaning here. That is the point: a keystroke must never fall through to the
+/// PTY while a modal is up, or typing `q` at the settings screen would land in
+/// the shell behind it.
+fn settings_key(key: KeyEvent) -> SettingsAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::F(5) => SettingsAction::Close,
+        KeyCode::Char('q') | KeyCode::Char('Q') => SettingsAction::Close,
+        KeyCode::Char('y') | KeyCode::Char('Y') => SettingsAction::Policy(Some(true)),
+        KeyCode::Char('n') | KeyCode::Char('N') => SettingsAction::Policy(Some(false)),
+        KeyCode::Char('r') | KeyCode::Char('R') => SettingsAction::Policy(None),
+        _ => SettingsAction::None,
+    }
+}
+
+/// Centers a fixed-size box inside `area`, shrinking to fit a small terminal.
+fn centered_overlay(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+/// Draws the per-session settings overlay over the terminal pane.
+fn draw_settings(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &LocalSessionApp,
+    overlay: SettingsOverlay,
+) {
+    const WIDTH: u16 = 62;
+    const HEIGHT: u16 = 11;
+    let popup = centered_overlay(area, WIDTH, HEIGHT);
+
+    // Clear first: without it the terminal contents behind the popup bleed
+    // through wherever our own spans don't paint a cell.
+    frame.render_widget(Clear, popup);
+
+    let session_label = app.view().session_id.as_str();
+    let state_style = match overlay.judge {
+        Some(policy) if policy.effective => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        Some(_) => Style::default().fg(Color::Yellow),
+        None => Style::default().fg(Color::DarkGray),
+    };
+    let state_text = overlay.judge_label();
+
+    let body = vec![
+        Line::from(vec![
+            Span::styled("Session  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(session_label),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Auto-approve agent tool calls  "),
+            Span::styled(state_text, state_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  y  turn on for this session",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  n  turn off for this session",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  r  follow the configured default",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Esc  close",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Settings ")
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(Paragraph::new(body).block(block), popup);
 }
 
 /// A single-row "update available" banner. Read-only for now: it names the
@@ -651,6 +794,7 @@ fn draw_sidebar(
     let rows = sidebar_visible_rows(
         app.sessions(),
         app.selected_index(),
+        |id| app.session_judge_policy(id),
         content_width,
         scroll_offset,
         usize::from(area.height),
@@ -665,6 +809,7 @@ fn draw_sidebar(
 fn sidebar_visible_rows<'a>(
     sessions: impl Iterator<Item = &'a SessionView>,
     selected: usize,
+    judge_policy_fn: impl Fn(&SessionId) -> Option<SessionJudgePolicy>,
     width: usize,
     scroll_offset: usize,
     visible_height: usize,
@@ -679,10 +824,12 @@ fn sidebar_visible_rows<'a>(
         .enumerate()
         .fold(Vec::<Line<'static>>::new(), |mut rows, (index, view)| {
             let start = rows.len();
+            let judge_policy = judge_policy_fn(&view.session_id);
             rows.extend(session_sidebar_rows(
                 index,
                 selected,
                 view,
+                judge_policy,
                 width,
                 scroll_offset,
             ));
@@ -722,6 +869,7 @@ fn session_sidebar_rows(
     index: usize,
     selected: usize,
     view: &SessionView,
+    judge_policy: Option<SessionJudgePolicy>,
     width: usize,
     scroll_offset: usize,
 ) -> Vec<Line<'static>> {
@@ -747,10 +895,18 @@ fn session_sidebar_rows(
     } else {
         Style::default()
     };
+    let judge_badge = match judge_policy {
+        Some(p) if p.effective => " 🤖",
+        Some(_) => " 👤",
+        None => "",
+    };
 
     let mut rows = vec![
         Line::from(Span::styled(
-            truncate_to_width(format!("{marker} {}  {state}", view.session_id), width),
+            truncate_to_width(
+                format!("{marker} {}{judge_badge}  {state}", view.session_id),
+                width,
+            ),
             style,
         )),
         Line::from(truncate_to_width(
@@ -1545,7 +1701,7 @@ fn draw_status(
         ))
     } else {
         Line::from(format!(
-            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt/Ctrl-Alt arrows, F3/F4 switch  Ctrl-Q exit",
+            "seq {}  bytes {}  PgUp/PgDn scroll  Ctrl-N new  Ctrl-W close  F2 tabs  Alt/Ctrl-Alt arrows, F3/F4 switch  F5 settings  Ctrl-Q exit",
             view.snapshot.output_seq, view.snapshot.bytes_logged
         ))
     };
@@ -1567,6 +1723,50 @@ impl Confirmation {
     }
 }
 
+/// Per-session settings overlay.
+///
+/// Holds the policy it last read rather than querying every frame: reading it is
+/// a blocking IPC round trip, and the draw path runs on every keystroke. The
+/// value is refreshed when the overlay opens and after each toggle, which are
+/// the only moments it can change from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsOverlay {
+    /// `None` when the daemon reported no policy: an older daemon, a backend
+    /// with no judge, or judging switched off entirely. Rendered as
+    /// "unavailable", never as "off".
+    judge: Option<SessionJudgePolicy>,
+}
+
+impl SettingsOverlay {
+    /// How the judge state reads on screen.
+    ///
+    /// Distinguishes a pinned session from one following the default, because
+    /// `r` and `n` are different actions: a session following the default keeps
+    /// tracking it if it changes, a pinned one does not. Collapsing both to
+    /// "off" would make the two keys look interchangeable.
+    fn judge_label(self) -> &'static str {
+        match self.judge {
+            Some(SessionJudgePolicy {
+                explicit: Some(true),
+                ..
+            }) => "on for this session",
+            Some(SessionJudgePolicy {
+                explicit: Some(false),
+                ..
+            }) => "off for this session",
+            Some(SessionJudgePolicy {
+                explicit: None,
+                effective: true,
+            }) => "on (following the default)",
+            Some(SessionJudgePolicy {
+                explicit: None,
+                effective: false,
+            }) => "off (following the default)",
+            None => "unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppCommand {
     New,
@@ -1576,6 +1776,7 @@ enum AppCommand {
     ToggleSidebar,
     ScrollUp,
     ScrollDown,
+    OpenSettings,
 }
 
 fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
@@ -1599,6 +1800,10 @@ fn key_to_command(key: KeyEvent) -> Option<AppCommand> {
         KeyCode::F(2) => Some(AppCommand::ToggleSidebar),
         KeyCode::F(3) => Some(AppCommand::Next),
         KeyCode::F(4) => Some(AppCommand::Previous),
+        // F5 rather than a `keybindings.settings` entry: the TUI reads none of
+        // `[keybindings]` today (every binding here is hardcoded), so adding a
+        // config key would be another setting that parses and does nothing.
+        KeyCode::F(5) => Some(AppCommand::OpenSettings),
         KeyCode::PageUp => Some(AppCommand::ScrollUp),
         KeyCode::PageDown => Some(AppCommand::ScrollDown),
         _ => None,
@@ -1829,6 +2034,90 @@ mod tests {
     }
 
     #[test]
+    fn f5_opens_the_settings_overlay() {
+        assert_eq!(
+            key_to_command(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
+            Some(AppCommand::OpenSettings)
+        );
+    }
+
+    #[test]
+    fn settings_keys_map_to_their_actions() {
+        let press = |code| settings_key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(press(KeyCode::Esc), SettingsAction::Close);
+        assert_eq!(press(KeyCode::F(5)), SettingsAction::Close);
+        assert_eq!(press(KeyCode::Char('q')), SettingsAction::Close);
+        assert_eq!(
+            press(KeyCode::Char('y')),
+            SettingsAction::Policy(Some(true))
+        );
+        assert_eq!(
+            press(KeyCode::Char('Y')),
+            SettingsAction::Policy(Some(true))
+        );
+        assert_eq!(
+            press(KeyCode::Char('n')),
+            SettingsAction::Policy(Some(false))
+        );
+        // Follow-default is distinct from off: it clears the override rather
+        // than pinning the session to `false`.
+        assert_eq!(press(KeyCode::Char('r')), SettingsAction::Policy(None));
+    }
+
+    #[test]
+    fn the_settings_overlay_swallows_every_other_key() {
+        // The safety property: while the overlay is up, nothing reaches the PTY.
+        // A key with no meaning here must be consumed, not passed through.
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('z'),
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::F(2),
+            KeyCode::F(3),
+        ] {
+            assert_eq!(
+                settings_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                SettingsAction::None,
+                "{code:?} must be consumed by the overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overlay_is_centered_and_shrinks_to_fit() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let popup = centered_overlay(area, 62, 11);
+        assert_eq!(popup.width, 62);
+        assert_eq!(popup.height, 11);
+        assert_eq!(popup.x, 19);
+        assert_eq!(popup.y, 14);
+
+        // A terminal smaller than the overlay must clamp rather than produce a
+        // rect that runs off the screen (ratatui panics on out-of-bounds areas).
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 5,
+        };
+        let clamped = centered_overlay(tiny, 62, 11);
+        assert_eq!(clamped.width, 20);
+        assert_eq!(clamped.height, 5);
+        assert_eq!(clamped.x, 0);
+        assert_eq!(clamped.y, 0);
+    }
+
+    #[test]
     fn reserved_control_keys_become_app_commands() {
         assert_eq!(
             key_to_command(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
@@ -1962,8 +2251,14 @@ mod tests {
             scroll_offset: 0,
         };
 
-        let rows =
-            session_sidebar_rows(0, 1, &view, usize::from(SIDEBAR_COLS.saturating_sub(1)), 0);
+        let rows = session_sidebar_rows(
+            0,
+            1,
+            &view,
+            None,
+            usize::from(SIDEBAR_COLS.saturating_sub(1)),
+            0,
+        );
 
         assert_eq!(rows[2].spans[0].content.as_ref(), "  r triage");
         assert_eq!(
@@ -2007,8 +2302,8 @@ mod tests {
             scroll_offset: 0,
         };
 
-        let first = session_sidebar_rows(0, 0, &view, 20, 0);
-        let later = session_sidebar_rows(0, 0, &view, 20, 5);
+        let first = session_sidebar_rows(0, 0, &view, None, 20, 0);
+        let later = session_sidebar_rows(0, 0, &view, None, 20, 5);
 
         assert_ne!(first[3].spans[0].content, later[3].spans[0].content);
         assert!(first[3].spans[0].content.starts_with("  b "));
@@ -2063,11 +2358,34 @@ mod tests {
             .map(|index| sidebar_test_view(&format!("session-{index}")))
             .collect::<Vec<_>>();
 
-        let rows = sidebar_visible_rows(sessions.iter(), 3, 20, 0, 5);
+        let rows = sidebar_visible_rows(sessions.iter(), 3, |_| None, 20, 0, 5);
 
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].spans[0].content.as_ref(), "> session-4  running");
         assert_eq!(rows[1].spans[0].content.as_ref(), "  observer  80x24");
+    }
+
+    #[test]
+    fn sidebar_renders_judge_robot_and_user_badges() {
+        let view = sidebar_test_view("session-1");
+        let auto_policy = Some(SessionJudgePolicy {
+            explicit: Some(true),
+            effective: true,
+        });
+        let manual_policy = Some(SessionJudgePolicy {
+            explicit: Some(false),
+            effective: false,
+        });
+
+        let auto_rows = session_sidebar_rows(0, 0, &view, auto_policy, 30, 0);
+        assert!(auto_rows[0].spans[0].content.contains("🤖"));
+
+        let manual_rows = session_sidebar_rows(0, 0, &view, manual_policy, 30, 0);
+        assert!(manual_rows[0].spans[0].content.contains("👤"));
+
+        let unconfigured_rows = session_sidebar_rows(0, 0, &view, None, 30, 0);
+        assert!(!unconfigured_rows[0].spans[0].content.contains("🤖"));
+        assert!(!unconfigured_rows[0].spans[0].content.contains("👤"));
     }
 
     #[test]

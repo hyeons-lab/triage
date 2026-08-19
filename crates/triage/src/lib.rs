@@ -4,6 +4,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use anyhow::Result;
+use triage_core::judge::SessionJudgePolicy;
 use triage_core::session::{
     AttachMode, AttachSessionRequest, ClientId, CompletedSession, InputLeaseState,
     ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi, SessionEvent,
@@ -229,6 +230,38 @@ impl LocalSessionApp {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// The selected session's judge policy, as both its override and the
+    /// resolved answer.
+    ///
+    /// `None` when the daemon reports no policy: an older daemon, a backend with
+    /// no judge, or judging switched off entirely. Callers render `None` as
+    /// "unavailable" rather than as "off", so a missing answer is never mistaken
+    /// for a definite one.
+    pub fn selected_judge_policy(&self) -> Option<SessionJudgePolicy> {
+        let session_id = self.sessions.get(self.selected)?.view.session_id.clone();
+        self.manager.session_judge_policy(session_id).ok()
+    }
+
+    /// The given session's judge policy, as both its override and the resolved
+    /// answer.
+    pub fn session_judge_policy(&self, session_id: &SessionId) -> Option<SessionJudgePolicy> {
+        self.manager.session_judge_policy(session_id.clone()).ok()
+    }
+
+    /// Sets the selected session's judge policy, or clears the override with
+    /// `None` so it follows the configured default. Surfaces failures through
+    /// `last_error` like the other actions rather than panicking the UI.
+    pub fn set_selected_judge_policy(&mut self, enabled: Option<bool>) {
+        let Some(session) = self.sessions.get(self.selected) else {
+            return;
+        };
+        let session_id = session.view.session_id.clone();
+        match self.manager.set_session_judge_policy(session_id, enabled) {
+            Ok(()) => self.last_error = None,
+            Err(error) => self.last_error = Some(error.to_string()),
+        }
     }
 
     pub fn exits_by_shutting_down_sessions(&self) -> bool {
