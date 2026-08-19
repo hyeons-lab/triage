@@ -100,10 +100,13 @@ mod transport {
     #[cfg(windows)]
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Connect a client to the daemon's local IPC endpoint.
     #[cfg(unix)]
     pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
-        UnixStream::connect(path)
+        let stream = UnixStream::connect(path)?;
+        let timeout = Some(Duration::from_millis(500));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
+        Ok(stream)
     }
 
     #[cfg(windows)]

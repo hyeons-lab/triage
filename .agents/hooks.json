@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/dberrios/.cargo/bin/triage-hook",
+            "command": "triage-hook",
             "timeout": 15
           }
         ]

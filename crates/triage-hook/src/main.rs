@@ -207,7 +207,15 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     loop {
         let trimmed = cmd.trim_start();
         if let Some(rest) = trimmed.strip_prefix("env ") {
-            cmd = rest;
+            let mut inner = rest.trim_start();
+            while inner.starts_with('-') {
+                if let Some(space_idx) = inner.find(char::is_whitespace) {
+                    inner = inner[space_idx..].trim_start();
+                } else {
+                    return "";
+                }
+            }
+            cmd = inner;
             continue;
         }
         let Some((var, rest)) = trimmed.split_once('=') else {
@@ -600,6 +608,22 @@ mod tests {
         assert_eq!(
             strip_leading_env_vars("INVALID-VAR=123 ls"),
             "INVALID-VAR=123 ls"
+        );
+        assert_eq!(
+            strip_leading_env_vars("VAR=\"unclosed cargo test"),
+            "VAR=\"unclosed cargo test"
+        );
+        assert_eq!(
+            strip_leading_env_vars("FOO=1 BAR=\"baz qux\" BAZ='abc' cargo test"),
+            "cargo test"
+        );
+        assert_eq!(
+            strip_leading_env_vars("env -i FOO=BAR cargo check"),
+            "cargo check"
+        );
+        assert_eq!(
+            strip_leading_env_vars("env --ignore-environment VAR=1 git diff"),
+            "git diff"
         );
     }
 

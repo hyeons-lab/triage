@@ -261,6 +261,12 @@ comments: tightened `permissionOverrides` to avoid broad base-executable grants,
 sequences in env var stripping, loaded user configuration in offline in-process rule fallback, clarified service
 restart usage text across Unix/Windows, and added unit tests for escaped env vars.
 
+2026-08-19T09:30-0700 `.agents/hooks.json`, `crates/triage-hook/src/main.rs`, `crates/triaged/src/ipc.rs`, `crates/triaged/src/judge.rs` —
+addressed second-round PR review comments: switched checked-in `.agents/hooks.json` to portable binary name,
+configured 500ms read/write timeouts on `UnixStream` IPC client connections to eliminate thread hang risks,
+supported `env -i` and flag arguments in env var stripping, and added edge-case unit tests for subshell/process
+substitution rejections and destructive pipeline sequences.
+
 ## Decisions
 
 2026-08-17T00:41-0700 Read-only gh and flutter/dart tools belong on deterministic
@@ -836,7 +842,8 @@ after daemon upgrades to load updated UI assets.
 21765a1 — feat(triage): add per-session approval judge controls, status badges, and settings screen in TUI
 f223064 — feat(triage_client): add tabbed settings dialog, approval traffic dashboard, and rule editor in Flutter
 a0c56f0 — docs: document approval judge architecture, handover protocol, and update devlogs
-HEAD — fix(hook,service): address PR review comments on permission overrides, env escaping, and fallback config
+6b4e653 — fix(hook,service): address PR review comments on permission overrides, env escaping, and fallback config
+HEAD — fix(hook,ipc): address review comments on hook portability, IPC timeouts, and subshell tests
 
 ## Next Steps
 
