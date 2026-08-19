@@ -398,6 +398,16 @@ impl IpcClient {
         }
     }
 
+    /// Asks the daemon to judge one agent tool call, returning an explicit `Result`
+    /// so callers can distinguish between an authoritative policy verdict (even if `Ask`)
+    /// and an IPC transport failure.
+    pub fn judge_tool_call_result(&self, request: JudgeRequest) -> Result<JudgeVerdict> {
+        match self.round_trip(WireRequest::JudgeToolCall(request))? {
+            WireSuccess::JudgeVerdict(verdict) => Ok(verdict),
+            other => bail!("unexpected judge response: {other:?}"),
+        }
+    }
+
     /// Asks the daemon to judge one agent tool call.
     ///
     /// Infallible by construction: an unreachable daemon, a refused connection,
@@ -405,11 +415,8 @@ impl IpcClient {
     /// prompt the user would have seen with no judge installed. The hook shim
     /// depends on this, since it must never be the reason an agent breaks.
     pub fn judge_tool_call(&self, request: JudgeRequest) -> JudgeVerdict {
-        match self.round_trip(WireRequest::JudgeToolCall(request)) {
-            Ok(WireSuccess::JudgeVerdict(verdict)) => verdict,
-            Ok(other) => JudgeVerdict::fallback(format!("unexpected judge response: {other:?}")),
-            Err(error) => JudgeVerdict::fallback(format!("daemon unreachable: {error}")),
-        }
+        self.judge_tool_call_result(request)
+            .unwrap_or_else(|error| JudgeVerdict::fallback(format!("daemon unreachable: {error}")))
     }
 
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {

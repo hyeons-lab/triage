@@ -1285,30 +1285,25 @@ pub fn build_server_message<'a>(
                     )
                 }
                 ServerResult::JudgeRules { rules } => {
-                    let mut builtin_allows = Vec::with_capacity(rules.builtin_allow_commands.len());
-                    for s in &rules.builtin_allow_commands {
-                        builtin_allows.push(builder.create_string(s));
+                    fn create_fb_string_vec<'b>(
+                        strings: &[String],
+                        builder: &mut FlatBufferBuilder<'b>,
+                    ) -> flatbuffers::WIPOffset<
+                        flatbuffers::Vector<'b, flatbuffers::ForwardsUOffset<&'b str>>,
+                    > {
+                        let offsets: Vec<flatbuffers::WIPOffset<&str>> =
+                            strings.iter().map(|s| builder.create_string(s)).collect();
+                        builder.create_vector(&offsets)
                     }
-                    let builtin_allows_vec = builder.create_vector(&builtin_allows);
 
-                    let mut custom_allows = Vec::with_capacity(rules.custom_allow_commands.len());
-                    for s in &rules.custom_allow_commands {
-                        custom_allows.push(builder.create_string(s));
-                    }
-                    let custom_allows_vec = builder.create_vector(&custom_allows);
-
-                    let mut builtin_denies =
-                        Vec::with_capacity(rules.builtin_deny_substrings.len());
-                    for s in &rules.builtin_deny_substrings {
-                        builtin_denies.push(builder.create_string(s));
-                    }
-                    let builtin_denies_vec = builder.create_vector(&builtin_denies);
-
-                    let mut custom_denies = Vec::with_capacity(rules.custom_deny_substrings.len());
-                    for s in &rules.custom_deny_substrings {
-                        custom_denies.push(builder.create_string(s));
-                    }
-                    let custom_denies_vec = builder.create_vector(&custom_denies);
+                    let builtin_allows_vec =
+                        create_fb_string_vec(&rules.builtin_allow_commands, builder);
+                    let custom_allows_vec =
+                        create_fb_string_vec(&rules.custom_allow_commands, builder);
+                    let builtin_denies_vec =
+                        create_fb_string_vec(&rules.builtin_deny_substrings, builder);
+                    let custom_denies_vec =
+                        create_fb_string_vec(&rules.custom_deny_substrings, builder);
 
                     let r = fb::JudgeRulesResult::create(
                         builder,

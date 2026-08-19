@@ -224,7 +224,9 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
         if var.contains(char::is_whitespace) {
             return trimmed;
         }
-        if !var.is_empty() && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        let is_valid_ident = var.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if is_valid_ident {
             if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
                 let mut escaped = false;
                 let mut matched_closing = None;
@@ -419,13 +421,13 @@ fn evaluate_in_process(request: &JudgeRequest) -> Option<JudgeVerdict> {
 /// [`JUDGE_TIMEOUT`]. If the daemon is unreachable or does not answer in time,
 /// deterministic Layer 1/2 rules are evaluated in-process as a resilient fallback.
 fn ask_daemon(request: JudgeRequest) -> JudgeVerdict {
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = mpsc::channel();
     let req_clone = request.clone();
     let spawned = std::thread::Builder::new()
         .name("triage-hook-judge".to_string())
         .spawn(move || {
             let client = triaged::ipc::IpcClient::new(triaged::ipc::default_socket_path());
-            let _ = tx.send(client.judge_tool_call(req_clone));
+            let _ = tx.send(client.judge_tool_call_result(req_clone));
         });
     if let Err(error) = spawned {
         return evaluate_in_process(&request).unwrap_or_else(|| {
@@ -433,14 +435,12 @@ fn ask_daemon(request: JudgeRequest) -> JudgeVerdict {
         });
     }
     match rx.recv_timeout(JUDGE_TIMEOUT) {
-        Ok(verdict) => {
-            if verdict.decision == triage_core::judge::JudgeDecision::Ask
-                && verdict.source == triage_core::judge::JudgeSource::Fallback
-            {
-                return evaluate_in_process(&request).unwrap_or(verdict);
-            }
-            verdict
-        }
+        // IPC succeeded: the daemon is authoritative, even if it answered Ask
+        // (e.g. auto-approval explicitly disabled for the session).
+        Ok(Ok(verdict)) => verdict,
+        // IPC transport error (daemon not running, socket unreachable): fallback to in-process rules.
+        Ok(Err(_)) => evaluate_in_process(&request)
+            .unwrap_or_else(|| JudgeVerdict::fallback("the Triage daemon is unreachable")),
         Err(_) => evaluate_in_process(&request)
             .unwrap_or_else(|| JudgeVerdict::fallback("the Triage daemon did not answer in time")),
     }
@@ -624,6 +624,11 @@ mod tests {
         assert_eq!(
             strip_leading_env_vars("env --ignore-environment VAR=1 git diff"),
             "git diff"
+        );
+        assert_eq!(strip_leading_env_vars("1=2 foo_cmd"), "1=2 foo_cmd");
+        assert_eq!(
+            strip_leading_env_vars("389_server start"),
+            "389_server start"
         );
     }
 

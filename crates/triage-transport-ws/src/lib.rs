@@ -430,7 +430,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             }
             ClientRequest::ListSessionJudgePolicies => {
                 let session_ids = self.api.list_sessions()?;
-                let mut entries = Vec::new();
+                let mut entries = Vec::with_capacity(session_ids.len());
                 for session_id in session_ids {
                     if let Ok(policy) = self.api.session_judge_policy(session_id.clone()) {
                         entries.push(SessionJudgePolicyEntry { session_id, policy });

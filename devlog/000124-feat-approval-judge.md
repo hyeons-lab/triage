@@ -267,6 +267,12 @@ configured 500ms read/write timeouts on `UnixStream` IPC client connections to e
 supported `env -i` and flag arguments in env var stripping, and added edge-case unit tests for subshell/process
 substitution rejections and destructive pipeline sequences.
 
+2026-08-19T09:51-0700 `crates/triage-hook/src/main.rs`, `crates/triaged/src/ipc.rs`, `crates/triage-transport-ws/src/flatbuffers_proto.rs`, `crates/triage-transport-ws/src/lib.rs` —
+addressed third-round PR review comments: preserved authoritative disabled session policy by distinguishing
+transport error from policy `Ask` in `ask_daemon` via `judge_tool_call_result`, enforced POSIX variable identifier
+grammar in `strip_leading_env_vars`, pre-allocated session policy entries in WebSocket transport, and simplified
+FlatBuffers `JudgeRules` string vector serialization.
+
 ## Decisions
 
 2026-08-17T00:41-0700 Read-only gh and flutter/dart tools belong on deterministic
@@ -843,7 +849,8 @@ after daemon upgrades to load updated UI assets.
 f223064 — feat(triage_client): add tabbed settings dialog, approval traffic dashboard, and rule editor in Flutter
 a0c56f0 — docs: document approval judge architecture, handover protocol, and update devlogs
 6b4e653 — fix(hook,service): address PR review comments on permission overrides, env escaping, and fallback config
-HEAD — fix(hook,ipc): address review comments on hook portability, IPC timeouts, and subshell tests
+c0eefbf — fix(hook,ipc): address review comments on hook portability, IPC timeouts, and subshell tests
+HEAD — fix(hook,ipc): preserve session policy in fallback and validate POSIX env identifiers
 
 ## Next Steps
 
