@@ -70,7 +70,7 @@ fn print_usage() {
          uninstall  stop triaged and remove the login registration\n\
          start      start the installed service\n\
          stop       stop the installed service\n\
-         restart    restart the service (on Unix, gracefully reloads with zero downtime; also `reload`)\n\
+         restart    restart the service (on Unix, gracefully reloads with zero downtime; on Windows, restarts the task; also `reload`)\n\
          status     show whether the service is installed and running"
     );
 }

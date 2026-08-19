@@ -256,6 +256,11 @@ utilities into `~/.gemini/antigravity-cli/settings.json` permissions allowlist.
 installed `~/.cargo/bin/triaged` release binary over `target/` binaries when registering LaunchAgent/systemd
 services, preventing unoptimized debug builds from running as the background supervisor.
 
+2026-08-19T08:04-0700 `crates/triage-hook/src/main.rs`, `crates/triaged/src/service.rs` — addressed PR review
+comments: tightened `permissionOverrides` to avoid broad base-executable grants, supported escaped quote
+sequences in env var stripping, loaded user configuration in offline in-process rule fallback, clarified service
+restart usage text across Unix/Windows, and added unit tests for escaped env vars.
+
 ## Decisions
 
 2026-08-17T00:41-0700 Read-only gh and flutter/dart tools belong on deterministic
@@ -830,7 +835,8 @@ after daemon upgrades to load updated UI assets.
 7f2c486 — feat(service): add triaged reload and automated multi-agent hook provisioning
 21765a1 — feat(triage): add per-session approval judge controls, status badges, and settings screen in TUI
 f223064 — feat(triage_client): add tabbed settings dialog, approval traffic dashboard, and rule editor in Flutter
-HEAD — docs: document approval judge architecture, handover protocol, and update devlogs
+a0c56f0 — docs: document approval judge architecture, handover protocol, and update devlogs
+HEAD — fix(hook,service): address PR review comments on permission overrides, env escaping, and fallback config
 
 ## Next Steps
 

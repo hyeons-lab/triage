@@ -218,8 +218,20 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
         }
         if !var.is_empty() && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
-                if let Some(closing_idx) = rest[1..].find(quote) {
-                    cmd = &rest[1 + closing_idx + 1..];
+                let mut escaped = false;
+                let mut matched_closing = None;
+                for (idx, ch) in rest[1..].char_indices() {
+                    if ch == '\\' && !escaped {
+                        escaped = true;
+                    } else if ch == quote && !escaped {
+                        matched_closing = Some(idx);
+                        break;
+                    } else {
+                        escaped = false;
+                    }
+                }
+                if let Some(closing_idx) = matched_closing {
+                    cmd = &rest[1 + closing_idx + quote.len_utf8()..];
                     continue;
                 }
                 return trimmed;
@@ -273,12 +285,6 @@ fn encode_response(
                         {
                             permission_overrides
                                 .push(format!("command({} {})", words[0], words[1]));
-                        }
-                        if let Some(first) = words.first() {
-                            let prog = first.trim_matches(|c| c == '"' || c == '\'');
-                            if !prog.is_empty() && !prog.contains('=') && !prog.starts_with('-') {
-                                permission_overrides.push(format!("command({prog})"));
-                            }
                         }
                     }
                 }
@@ -392,7 +398,11 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
 }
 
 fn evaluate_in_process(request: &JudgeRequest) -> Option<JudgeVerdict> {
-    let config = triage_core::config::JudgeConfig::default();
+    let config = triage_core::config::Config::default_path()
+        .ok()
+        .and_then(|path| triage_core::config::Config::load_from_path(path).ok())
+        .map(|c| c.judge)
+        .unwrap_or_default();
     let rules = triaged::judge::JudgeRules::new(&config);
     rules.evaluate(request)
 }
@@ -523,7 +533,7 @@ mod tests {
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         assert_eq!(
             encoded,
-            r#"{"decision":"allow","reason":"matched allow rule: ls","permissionOverrides":["command(VAR=1 ls -la)","command(ls -la)","command(ls)","tool(run_command)"]}"#
+            r#"{"decision":"allow","reason":"matched allow rule: ls","permissionOverrides":["command(VAR=1 ls -la)","command(ls -la)","tool(run_command)"]}"#
         );
     }
 
@@ -579,6 +589,18 @@ mod tests {
             "cargo check"
         );
         assert_eq!(strip_leading_env_vars("echo foo=bar"), "echo foo=bar");
+        assert_eq!(
+            strip_leading_env_vars("VAR=\"val\\\"with_quote\" cargo test"),
+            "cargo test"
+        );
+        assert_eq!(
+            strip_leading_env_vars("A=1 B=2 C=\"text with spaces\" git status"),
+            "git status"
+        );
+        assert_eq!(
+            strip_leading_env_vars("INVALID-VAR=123 ls"),
+            "INVALID-VAR=123 ls"
+        );
     }
 
     #[test]
@@ -611,9 +633,10 @@ mod tests {
         assert!(override_strs.contains(&"command(echo \"In origin but not local:\")"));
         assert!(override_strs.contains(&"command(git log 1a1ab03..origin/main --oneline)"));
         assert!(override_strs.contains(&"command(git log)"));
-        assert!(override_strs.contains(&"command(git)"));
-        assert!(override_strs.contains(&"command(echo)"));
         assert!(override_strs.contains(&"tool(run_command)"));
+        // Ensure no broad single-word base executable overrides are emitted
+        assert!(!override_strs.contains(&"command(git)"));
+        assert!(!override_strs.contains(&"command(echo)"));
         // Ensure no malformed unbalanced quotes exist
         assert!(!override_strs.iter().any(|s| s.contains("echo \"In)")));
     }
