@@ -1,0 +1,17 @@
+{
+  "triage-approval-judge": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/dberrios/.cargo/bin/triage-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

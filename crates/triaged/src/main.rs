@@ -30,6 +30,7 @@ fn main() -> anyhow::Result<()> {
             println!("triaged {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Invocation::Reload => return triaged::service::reload_daemon(),
         Invocation::Service(_) | Invocation::Daemon { .. } => {}
     }
 
@@ -171,10 +172,12 @@ fn probe_daemon_socket(socket_path: &std::path::Path) -> DaemonSocketState {
 
 const HELP: &str = "\
 usage: triaged [--handover]
+       triaged reload
        triaged service <action>
        triaged --help | --version
 
 Options:
+  reload            Gracefully reload a running daemon with zero downtime
   --handover, -U    Take over sessions from a running daemon. Optional: a live
                     daemon is always handed over from, flag or not.
   service <action>  Manage the per-user login service and exit
@@ -193,6 +196,7 @@ argument is rejected rather than silently displacing the running daemon.";
 enum Invocation {
     Help,
     Version,
+    Reload,
     /// `triaged service <action>` — action is validated by `service::run_cli`.
     Service(String),
     /// Start the daemon. `handover` records whether `--handover`/`-U` was
@@ -239,6 +243,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Invoca
         ));
     }
 
+    if rest.first().map(String::as_str) == Some("reload")
+        || rest.iter().any(|arg| arg == "--reload" || arg == "-r")
+    {
+        if let Some(extra) = rest.get(1) {
+            anyhow::bail!("unexpected argument `{extra}` after `reload`\n\n{HELP}");
+        }
+        return Ok(Invocation::Reload);
+    }
+
     // The flag forms are position-independent, but the bare words are only a
     // request as the first token — anywhere else they are a stray word, and
     // treating one as a request would mask a typo.
@@ -268,6 +281,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Invoca
 /// in `main` before logging is initialized, so they never reach here.
 fn run(invocation: Invocation) -> anyhow::Result<()> {
     let is_handover = match invocation {
+        Invocation::Reload => return triaged::service::reload_daemon(),
         Invocation::Service(action) => return triaged::service::run_cli(&action),
         Invocation::Daemon { handover } => handover,
         // Answered in `main`; reachable only if that guard is refactored away.
@@ -445,6 +459,10 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // Start the local-LLM session summarizer (on by default; model loads lazily
     // on first activity, so this never blocks startup). No-op when disabled.
     manager.start_summarizer(config.summarizer.clone());
+
+    // Install the tool-call approval judge. It shares the summarizer's resident
+    // model, so this only builds the rule tables and never loads anything.
+    manager.start_judge(config.judge.clone());
 
     // Start recording each live session's working directory into the manifest as
     // it changes, so a daemon kill restores sessions where they left off rather
@@ -881,5 +899,12 @@ mod tests {
             parse_args(args(&["--handover", "-h"])).unwrap(),
             Invocation::Help
         );
+    }
+
+    #[test]
+    fn reload_arguments_are_parsed() {
+        assert_eq!(parse_args(args(&["reload"])).unwrap(), Invocation::Reload);
+        assert_eq!(parse_args(args(&["--reload"])).unwrap(), Invocation::Reload);
+        assert_eq!(parse_args(args(&["-r"])).unwrap(), Invocation::Reload);
     }
 }
