@@ -131,7 +131,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
   StreamSubscription<html.KeyboardEvent>? _containerKeyDownSubscription;
+  StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   void Function(html.Event)? _containerPasteListener;
+  ModalRoute<dynamic>? _currentRoute;
   bool _initialized = false;
   bool _initialContentWritten = false;
   bool _styleSheetLoaded = false;
@@ -273,7 +275,8 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
-        if (!widget.isExited && _eventTargetsTerminal(event)) {
+        final isCurrent = _currentRoute?.isCurrent ?? true;
+        if (!widget.isExited && isCurrent && _eventTargetsTerminal(event)) {
           if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
             event.preventDefault();
             event.stopPropagation();
@@ -367,6 +370,23 @@ class _TerminalPaneState extends State<TerminalPane> {
         (int viewId) => _sessionContainers[sanitizedId] ?? html.DivElement(),
       );
       _registeredViewTypes.add(_viewType);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _currentRoute = ModalRoute.of(context);
+    _syncPointerEvents();
+  }
+
+  void _syncPointerEvents() {
+    final isCurrent = _currentRoute?.isCurrent ?? true;
+    final target = isCurrent ? 'auto' : 'none';
+    if (_initialized || _sessionContainers.containsKey(_sanitizedId)) {
+      if (_container.style.pointerEvents != target) {
+        _container.style.pointerEvents = target;
+      }
     }
   }
 
@@ -797,6 +817,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
+    _containerWheelSubscription = _container.onWheel.listen((event) {
+      if (_currentRoute?.isCurrent == false) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+
     void pasteListener(html.Event event) {
       if (event is html.ClipboardEvent) {
         event.preventDefault();
@@ -823,6 +850,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = null;
     _containerKeyDownSubscription?.cancel();
     _containerKeyDownSubscription = null;
+    _containerWheelSubscription?.cancel();
+    _containerWheelSubscription = null;
     final pasteListener = _containerPasteListener;
     if (pasteListener != null) {
       _container.removeEventListener('paste', pasteListener, true);
@@ -901,7 +930,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   bool _eventTargetsTerminal(html.Event event) {
-    if (!mounted || widget.isExited) {
+    final isCurrent = _currentRoute?.isCurrent ?? true;
+    if (!mounted || widget.isExited || !isCurrent) {
       return false;
     }
 
@@ -1191,6 +1221,9 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   Widget build(BuildContext context) {
+    _currentRoute = ModalRoute.of(context);
+    _syncPointerEvents();
+
     return Focus(
       focusNode: _focusNode,
       autofocus: true,

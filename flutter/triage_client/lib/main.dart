@@ -26,7 +26,33 @@ import 'package:triage_client/terminal/terminal_controller_sink.dart';
 import 'package:triage_client/platform_env_io.dart'
     if (dart.library.js_util) 'package:triage_client/platform_env_web.dart';
 
+// Retain icons for Flutter's font tree-shaker in release web builds.
+const List<IconData> _kRequiredIcons = <IconData>[
+  Icons.auto_awesome,
+  Icons.person_outline,
+  Icons.dns_outlined,
+  Icons.tune,
+  Icons.content_copy,
+  Icons.check,
+  Icons.info_outline,
+  Icons.shield_outlined,
+  Icons.radio_button_checked,
+  Icons.radio_button_unchecked,
+  Icons.edit_outlined,
+  Icons.delete_outline,
+  Icons.add,
+  Icons.settings,
+  Icons.terminal,
+  Icons.close,
+  Icons.bolt,
+  Icons.lock_outline,
+  Icons.integration_instructions_outlined,
+  Icons.warning_amber_rounded,
+  Icons.check_circle_outline,
+];
+
 void main() async {
+  assert(_kRequiredIcons.isNotEmpty);
   WidgetsFlutterBinding.ensureInitialized();
   // Restore the persisted client id / per-server pairing tokens from secure
   // storage before the first frame so the app can reconnect without re-pairing
@@ -307,6 +333,7 @@ class SessionVm {
     required this.statusColor,
     required this.icon,
     required this.rows,
+    this.sessionId,
     this.branch,
     this.repoRoot,
     this.worktreeRoot,
@@ -397,6 +424,19 @@ class SessionVm {
   // `bytes_logged`, no timestamp), so a freshly connected row stays null until
   // it next moves, and the rail renders nothing rather than inventing a time.
   DateTime? snippetUpdatedAt;
+
+  /// Explicit user override for tool-call auto-approval judging (null = inherit daemon default).
+  bool? judgePolicyExplicit;
+  /// Effective auto-approval judge policy (true = auto-approval enabled, false = manual approval).
+  bool judgePolicyEffective = true;
+
+  void applyJudgePolicy({
+    required bool? explicit,
+    required bool effective,
+  }) {
+    judgePolicyExplicit = explicit;
+    judgePolicyEffective = effective;
+  }
 
   /// Apply a freshly observed git context, updating the live fields and, when the
   /// context names a distinct linked worktree, refreshing the inferred-worktree
@@ -580,6 +620,7 @@ class SessionVm {
     return leafOf(root);
   }
 
+  final String? sessionId;
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
   // real rendering goes through [store]/[terminal] from raw bytes.
@@ -651,6 +692,7 @@ class SessionVm {
   int _viewRows = 24;
 
   String? get remoteSessionId {
+    if (sessionId != null) return sessionId;
     if (!isRemote) return null;
     final parts = title.split(' / ');
     return parts.length > 1 ? parts[1] : null;
@@ -1281,12 +1323,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Opens the server manager (gear icon / connect-failure action).
-  Future<void> _openConnectionSettings() async {
+  Future<void> _openConnectionSettings({SettingsTab initialTab = SettingsTab.daemons}) async {
+    final selected = (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
+        ? _sessions[_selectedIndex]
+        : null;
+    final workspacePath = selected?.repoRoot ?? selected?.worktreeRoot ?? selected?.cwd;
     await showDialog<void>(
       context: context,
-      builder: (context) => ServerManagerDialog(
+      builder: (context) => SettingsDialog(
+        client: _client,
+        workspacePath: workspacePath,
         servers: _servers,
         selectedId: _selectedServerId,
+        clientId: _clientId,
+        initialTab: initialTab,
         onSelect: _selectServer,
         onAdd: (address, label) => _addServer(address, label: label),
         onUpdate: _updateServer,
@@ -2166,8 +2216,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       // Git context is already applied: it was fetched before the rail was
       // built so grouping and titles land on the first frame. Only snippets
-      // remain, and they are purely additive: a row renders fine without one.
-      await _seedSessionSnippets(generation);
+      // and judge policies remain, and they are purely additive: a row renders fine without one.
+      await Future.wait([
+        _seedSessionSnippets(generation),
+        _seedSessionJudgePolicies(generation),
+      ]);
 
       // The active session re-syncs to its real width on its first view fit
       // (_onSessionViewFit). Doing it here would use an estimated size, since
@@ -2201,6 +2254,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       });
     } catch (_) {
       // Snippets are best-effort metadata; ignore failures.
+    }
+  }
+
+  Future<void> _seedSessionJudgePolicies(int generation) async {
+    try {
+      final policies = await _client.listSessionJudgePolicies();
+      if (_disposed || generation != _connectGeneration) {
+        return;
+      }
+      setState(() {
+        for (final session in _sessions) {
+          final sid = session.remoteSessionId;
+          final entry = sid == null ? null : policies[sid];
+          if (entry != null) {
+            session.applyJudgePolicy(
+              explicit: entry.explicit,
+              effective: entry.effective,
+            );
+          }
+        }
+      });
+    } catch (_) {
+      // Judge policies are best-effort metadata; ignore failures.
     }
   }
 
@@ -2523,6 +2599,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   SessionVm _loadingDaemonSession(String sessionId, {bool loading = true}) {
     return SessionVm(
       title: 'triage / $sessionId',
+      sessionId: sessionId,
       status: loading ? 'loading' : 'idle',
       statusColor: loading ? const Color(0xffffc857) : const Color(0xff7f8b8d),
       icon: Icons.terminal,
@@ -2738,6 +2815,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       final session = SessionVm(
         title: 'triage / $sid',
+        sessionId: sid,
         branch: branch,
         repoRoot: repoRoot,
         worktreeRoot: worktreeRoot,
@@ -2941,6 +3019,39 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // neighbours on the way.
       if (previousRepoRoot != nextRepoRoot) {
         _regroupRail();
+      }
+      return;
+    }
+
+    if (type == 'session_judge_policy_updated') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null) return;
+      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (index == -1) return;
+      final policy = message['policy'] as Map<String, dynamic>?;
+      final bool hasExplicit;
+      final bool? explicitVal;
+      final bool effective;
+      if (policy != null) {
+        hasExplicit = policy.containsKey('explicit') && policy['explicit'] != null;
+        explicitVal = policy['explicit'] as bool?;
+        effective = policy['effective'] as bool? ?? false;
+      } else {
+        hasExplicit = message['has_pinned'] as bool? ?? (message.containsKey('explicit') && message['explicit'] != null);
+        explicitVal = message['pinned'] as bool? ?? (message['explicit'] as bool?);
+        effective = message['effective'] as bool? ?? false;
+      }
+      void apply() {
+        _sessions[index].applyJudgePolicy(
+          explicit: hasExplicit ? explicitVal : null,
+          effective: effective,
+        );
+      }
+
+      if (mounted) {
+        setState(apply);
+      } else {
+        apply();
       }
       return;
     }
@@ -3613,6 +3724,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _toggleSessionJudgePolicy(SessionVm session) async {
+    final sessionId = session.remoteSessionId;
+    if (!_client.isConnected || sessionId == null) return;
+    final nextState = !session.judgePolicyEffective;
+    try {
+      final updated = await _client.setSessionJudgePolicy(sessionId, nextState);
+      if (updated != null && mounted) {
+        setState(() {
+          session.applyJudgePolicy(
+            explicit: updated.explicit,
+            effective: updated.effective,
+          );
+        });
+      }
+    } catch (e) {
+      debugPrint('Failed to set judge policy for $sessionId: $e');
+    }
+  }
+
   Future<bool?> _confirmCloseSession(SessionVm session) {
     return showDialog<bool>(
       context: context,
@@ -3796,6 +3926,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       connectionStatusColor: _connectionStatusColor,
       serverLabel: _activeServer?.label,
       onOpenSettings: _openConnectionSettings,
+      onToggleJudgePolicy: _toggleSessionJudgePolicy,
       // Mobile: the rail always shows full content (the overlay slide handles
       // show/hide) and its collapse button closes the overlay. Desktop: the
       // button shrinks the rail to its icon strip in place.
@@ -3839,6 +3970,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             onCloseSession: () => _closeSession(_selectedSession),
             onViewFit: (cols, rows) =>
                 _onSessionViewFit(_selectedSession, cols, rows),
+            onToggleJudge: () => _toggleSessionJudgePolicy(_selectedSession),
             // The header's menu button reopens the overlay on mobile only.
             onOpenRail: isMobile ? openRail : null,
             // Manual escape hatch for reclaiming the shared PTY size when
@@ -3971,6 +4103,7 @@ class SessionRail extends StatelessWidget {
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
+    this.onToggleJudgePolicy,
     this.serverLabel,
     this.selectedTileKey,
   });
@@ -3997,6 +4130,7 @@ class SessionRail extends StatelessWidget {
   // top when the rail (re)opens.
   final Key? selectedTileKey;
   final ValueChanged<int> onSelectSession;
+  final ValueChanged<SessionVm>? onToggleJudgePolicy;
   final void Function(List<RailItem> items, int oldIndex, int newIndex)
   onReorderSession;
 
@@ -4379,6 +4513,11 @@ class SessionRail extends StatelessWidget {
                       ? null
                       : () => onUnpinSession(session.remoteSessionId!),
                   indistinguishable: indistinguishable.contains(sessionIndex),
+                  judgeEffective: session.judgePolicyEffective,
+                  judgeExplicit: session.judgePolicyExplicit,
+                  onToggleJudge: onToggleJudgePolicy != null
+                      ? () => onToggleJudgePolicy!(session)
+                      : null,
                   onTap: () => onSelectSession(sessionIndex),
                 );
                 // Its header is being dragged, so the row reads as lifted with it.
@@ -4535,6 +4674,65 @@ class _UnpinButton extends StatelessWidget {
   }
 }
 
+class _JudgeToggleButton extends StatelessWidget {
+  const _JudgeToggleButton({
+    required this.effective,
+    this.explicit,
+    required this.onToggle,
+  });
+
+  final bool effective;
+  final bool? explicit;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final tooltip = effective
+        ? (explicit == true
+            ? 'Auto-Approval: ON (click to disable)'
+            : 'Auto-Approval: Default ON (click to disable)')
+        : (explicit == false
+            ? 'Auto-Approval: OFF (click to enable)'
+            : 'Auto-Approval: Default OFF (click to enable)');
+
+    final color = effective
+        ? const Color(0xff7fd1c7)
+        : const Color(0xffffc857);
+
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: Tooltip(
+        message: tooltip,
+        child: InkWell(
+          onTap: onToggle,
+          borderRadius: BorderRadius.circular(4),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: color.withValues(alpha: 0.3)),
+            ),
+            child: effective
+                ? Icon(
+                    Icons.auto_awesome,
+                    size: 13,
+                    color: color,
+                    semanticLabel: 'Auto-Approval ON',
+                  )
+                : Icon(
+                    Icons.person_outline,
+                    size: 13,
+                    color: color,
+                    semanticLabel: 'Auto-Approval OFF',
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// The connection pill: which daemon we are on, and how that connection is
 /// doing. Doubles as the switcher's entry point, so it names the daemon even
 /// when only one is configured — otherwise there is nothing to tell you *which*
@@ -4593,13 +4791,94 @@ class _ConnectionStatus extends StatelessWidget {
   }
 }
 
-/// Add, rename, re-point, remove, and switch between daemons.
-///
-/// Keeps its own copy of the list: a dialog sits on its own route and does not
-/// rebuild when the host's state changes, so it applies each edit locally as
-/// well as handing it to the host to persist.
-class ServerManagerDialog extends StatefulWidget {
-  const ServerManagerDialog({
+enum SettingsTab {
+  daemons,
+  judge,
+  preferences,
+}
+
+class _CodeSnippetBox extends StatefulWidget {
+  const _CodeSnippetBox({
+    required this.code,
+  });
+
+  final String code;
+
+  @override
+  State<_CodeSnippetBox> createState() => _CodeSnippetBoxState();
+}
+
+class _CodeSnippetBoxState extends State<_CodeSnippetBox> {
+  bool _copied = false;
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: widget.code));
+    if (!mounted) return;
+    setState(() => _copied = true);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _copied = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: const Color(0xff101416),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xff263033)),
+      ),
+      child: Stack(
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(12, 12, 44, 12),
+            child: SelectableText(
+              widget.code,
+              style: const TextStyle(
+                fontFamily: 'JetBrains Mono',
+                fontSize: 12,
+                color: Color(0xffcdd7d6),
+                height: 1.45,
+              ),
+            ),
+          ),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: Tooltip(
+              message: _copied ? 'Copied!' : 'Copy to clipboard',
+              child: InkWell(
+                onTap: _copy,
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xff1e272a),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xff334246)),
+                  ),
+                  child: Icon(
+                    _copied ? Icons.check : Icons.content_copy,
+                    size: 14,
+                    color: _copied
+                        ? const Color(0xff7fd1c7)
+                        : const Color(0xff9aa6a8),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Settings and server manager dialog: daemons, approval judge guide, and client preferences.
+class SettingsDialog extends StatefulWidget {
+  const SettingsDialog({
     super.key,
     required this.servers,
     required this.selectedId,
@@ -4607,6 +4886,10 @@ class ServerManagerDialog extends StatefulWidget {
     required this.onAdd,
     required this.onUpdate,
     required this.onRemove,
+    this.client,
+    this.workspacePath,
+    this.clientId,
+    this.initialTab = SettingsTab.daemons,
   });
 
   final List<DaemonServer> servers;
@@ -4615,14 +4898,143 @@ class ServerManagerDialog extends StatefulWidget {
   final void Function(String address, String? label) onAdd;
   final ValueChanged<DaemonServer> onUpdate;
   final ValueChanged<String> onRemove;
+  final TriageWebSocketClient? client;
+  final String? workspacePath;
+  final String? clientId;
+  final SettingsTab initialTab;
 
   @override
-  State<ServerManagerDialog> createState() => _ServerManagerDialogState();
+  State<SettingsDialog> createState() => _SettingsDialogState();
 }
 
-class _ServerManagerDialogState extends State<ServerManagerDialog> {
+typedef ServerManagerDialog = SettingsDialog;
+
+class _SettingsDialogState extends State<SettingsDialog> {
+  late SettingsTab _currentTab = widget.initialTab;
   late final List<DaemonServer> _servers = List.of(widget.servers);
   late String? _selectedId = widget.selectedId;
+
+  JudgeHookStatusRecord? _hookStatus;
+  bool _loadingHookStatus = false;
+  bool _savingHookStatus = false;
+
+  JudgeRulesRecord? _judgeRules;
+  List<JudgeRecordItem> _judgeHistory = [];
+  bool _loadingJudgeData = false;
+  bool _showBuiltinAllows = false;
+  bool _showBuiltinDenies = false;
+
+  final TextEditingController _allowRuleController = TextEditingController();
+  final TextEditingController _denyRuleController = TextEditingController();
+  final TextEditingController _historySearchController = TextEditingController();
+  String _historyFilter = 'all';
+  String _historySearchQuery = '';
+  int _historyDisplayLimit = 50;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHookStatus();
+    _loadJudgeData();
+  }
+
+  @override
+  void dispose() {
+    _allowRuleController.dispose();
+    _denyRuleController.dispose();
+    _historySearchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadJudgeData() async {
+    final client = widget.client;
+    if (client == null) return;
+    setState(() => _loadingJudgeData = true);
+    final rules = await client.getJudgeRules();
+    final history = await client.getJudgeHistory();
+    if (mounted) {
+      setState(() {
+        _judgeRules = rules;
+        _judgeHistory = history;
+        _loadingJudgeData = false;
+      });
+    }
+  }
+
+  Future<void> _addAllowRule(String command) async {
+    final client = widget.client;
+    final cmd = command.trim();
+    if (client == null || cmd.isEmpty) return;
+    final updated = await client.addJudgeAllowCommand(cmd);
+    if (mounted && updated != null) {
+      setState(() {
+        _judgeRules = updated;
+        _allowRuleController.clear();
+      });
+    }
+  }
+
+  Future<void> _removeAllowRule(String command) async {
+    final client = widget.client;
+    if (client == null) return;
+    final updated = await client.removeJudgeAllowCommand(command);
+    if (mounted && updated != null) {
+      setState(() => _judgeRules = updated);
+    }
+  }
+
+  Future<void> _addDenyRule(String substring) async {
+    final client = widget.client;
+    final sub = substring.trim();
+    if (client == null || sub.isEmpty) return;
+    final updated = await client.addJudgeDenySubstring(sub);
+    if (mounted && updated != null) {
+      setState(() {
+        _judgeRules = updated;
+        _denyRuleController.clear();
+      });
+    }
+  }
+
+  Future<void> _removeDenyRule(String substring) async {
+    final client = widget.client;
+    if (client == null) return;
+    final updated = await client.removeJudgeDenySubstring(substring);
+    if (mounted && updated != null) {
+      setState(() => _judgeRules = updated);
+    }
+  }
+
+  Future<void> _loadHookStatus() async {
+    final client = widget.client;
+    if (client == null) return;
+    setState(() => _loadingHookStatus = true);
+    final status = await client.getJudgeHookStatus(workspacePath: widget.workspacePath);
+    if (mounted) {
+      setState(() {
+        _hookStatus = status;
+        _loadingHookStatus = false;
+      });
+    }
+  }
+
+  Future<void> _toggleHookConfig(bool enabled) async {
+    final client = widget.client;
+    if (client == null) return;
+    setState(() => _savingHookStatus = true);
+    final updated = await client.configureJudgeHook(
+      workspacePath: widget.workspacePath,
+      enabled: enabled,
+    );
+    if (mounted) {
+      setState(() {
+        if (updated != null) {
+          _hookStatus = updated;
+        }
+        _savingHookStatus = false;
+      });
+    }
+  }
 
   // The server being edited. Null with [_adding] false shows the list.
   DaemonServer? _editing;
@@ -4648,9 +5060,6 @@ class _ServerManagerDialogState extends State<ServerManagerDialog> {
   void _submitForm(String address, String? label) {
     final editing = _editing;
     if (editing == null) {
-      // Adding: the host mints the id, so close rather than render a row we
-      // have no key for. Adding also selects and connects — which is what you
-      // want the moment you finish typing a new daemon's address.
       widget.onAdd(address, label);
       Navigator.of(context).pop();
       return;
@@ -4701,70 +5110,191 @@ class _ServerManagerDialogState extends State<ServerManagerDialog> {
       }
     });
     widget.onRemove(server.id);
-    // Forgetting the last daemon drops the app back to the connection screen,
-    // so there is no list left to stand on.
     if (_servers.isEmpty && mounted) Navigator.of(context).pop();
   }
 
   @override
   Widget build(BuildContext context) {
-    final editing = _editing;
-    final showForm = _adding || editing != null;
-
     return Dialog(
       backgroundColor: const Color(0xff161b1d),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 480),
+        constraints: const BoxConstraints(maxWidth: 640, maxHeight: 720),
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: showForm
-              ? ConnectionSettingsForm(
-                  // The form seeds its fields in initState, so switching which
-                  // server is being edited has to rebuild it, not update it.
-                  key: ValueKey<String>(editing?.id ?? '@add'),
-                  initialAddress: editing?.address,
-                  initialLabel: editing?.label,
-                  submitLabel: editing == null ? 'Add' : 'Save',
-                  title: editing == null ? 'Add a daemon' : 'Edit daemon',
-                  subtitle:
-                      'Host, IP, or URL of the device running triaged '
-                      '(e.g. my-mac.tailnet:7777).',
-                  // With no servers there is no list to go back to.
-                  onCancel: _servers.isEmpty
-                      ? () => Navigator.of(context).pop()
-                      : _backToList,
-                  onSubmit: _submitForm,
-                )
-              : _buildList(),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.settings, color: Color(0xff7fd1c7), size: 22),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Settings',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    tooltip: 'Close',
+                    icon: const Icon(Icons.close, color: Color(0xff7f8b8d), size: 20),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              _buildTabBar(),
+              const SizedBox(height: 16),
+              Flexible(
+                child: switch (_currentTab) {
+                  SettingsTab.daemons => _buildDaemonsTab(),
+                  SettingsTab.judge => _buildJudgeTab(),
+                  SettingsTab.preferences => _buildPreferencesTab(),
+                },
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildList() {
+  Widget _buildTabBar() {
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: const Color(0xff121618),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xff263033)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: _tabButton(
+              tab: SettingsTab.daemons,
+              icon: Icons.dns_outlined,
+              label: 'Daemons',
+            ),
+          ),
+          Expanded(
+            child: _tabButton(
+              tab: SettingsTab.judge,
+              icon: Icons.auto_awesome,
+              label: 'Approval Judge',
+            ),
+          ),
+          Expanded(
+            child: _tabButton(
+              tab: SettingsTab.preferences,
+              icon: Icons.tune,
+              label: 'Preferences',
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tabButton({
+    required SettingsTab tab,
+    required IconData icon,
+    required String label,
+  }) {
+    final isSelected = _currentTab == tab;
+    return InkWell(
+      onTap: () => setState(() {
+        _currentTab = tab;
+        _editing = null;
+        _adding = false;
+      }),
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        decoration: BoxDecoration(
+          color: isSelected ? const Color(0xff233033) : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: isSelected
+              ? Border.all(color: const Color(0xff3b5356))
+              : Border.all(color: Colors.transparent),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 15,
+              color: isSelected
+                  ? const Color(0xff7fd1c7)
+                  : const Color(0xff7f8b8d),
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400,
+                  color: isSelected
+                      ? const Color(0xffcdd7d6)
+                      : const Color(0xff7f8b8d),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDaemonsTab() {
+    final editing = _editing;
+    if (_adding || editing != null) {
+      return ConnectionSettingsForm(
+        key: ValueKey<String>(editing?.id ?? '@add'),
+        initialAddress: editing?.address,
+        initialLabel: editing?.label,
+        submitLabel: editing == null ? 'Add' : 'Save',
+        title: editing == null ? 'Add a daemon' : 'Edit daemon',
+        subtitle:
+            'Host, IP, or URL of the device running triaged '
+            '(e.g. my-mac.tailnet:7777).',
+        onCancel: _backToList,
+        onSubmit: _submitForm,
+      );
+    }
+
     return Column(
       mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Row(
           children: [
-            const Icon(Icons.dns_outlined, color: Color(0xff7fd1c7), size: 22),
-            const SizedBox(width: 10),
             const Expanded(
               child: Text(
-                'Daemons',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                'Connected & Known Daemons',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xff9aa6a8),
+                ),
               ),
             ),
             IconButton(
               onPressed: _startAdd,
               tooltip: 'Add a daemon',
-              icon: const Icon(Icons.add, color: Color(0xff7fd1c7), size: 22),
+              icon: const Icon(Icons.add, color: Color(0xff7fd1c7), size: 20),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
             ),
           ],
         ),
-        const SizedBox(height: 4),
+        const SizedBox(height: 8),
         Flexible(
           child: ListView.builder(
             shrinkWrap: true,
@@ -4772,72 +5302,1591 @@ class _ServerManagerDialogState extends State<ServerManagerDialog> {
             itemBuilder: (context, index) {
               final server = _servers[index];
               final isSelected = server.id == _selectedId;
-              return ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(
-                  isSelected
-                      ? Icons.radio_button_checked
-                      : Icons.radio_button_unchecked,
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Material(
                   color: isSelected
-                      ? const Color(0xff7fd1c7)
-                      : const Color(0xff7f8b8d),
-                  size: 20,
-                ),
-                title: Text(
-                  server.label,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w400,
+                      ? const Color(0xff1b2426)
+                      : const Color(0xff121618),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: BorderSide(
+                      color: isSelected
+                          ? const Color(0xff3b5356)
+                          : const Color(0xff222a2d),
+                    ),
                   ),
-                ),
-                subtitle: Text(
-                  server.address,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Color(0xff7f8b8d),
-                    fontSize: 12,
-                  ),
-                ),
-                onTap: () {
-                  if (!isSelected) widget.onSelect(server.id);
-                  Navigator.of(context).pop();
-                },
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      onPressed: () => _startEdit(server),
-                      tooltip: 'Edit',
-                      icon: const Icon(
-                        Icons.edit_outlined,
-                        size: 18,
-                        color: Color(0xff7f8b8d),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                    leading: Icon(
+                      isSelected
+                          ? Icons.radio_button_checked
+                          : Icons.radio_button_unchecked,
+                      color: isSelected
+                          ? const Color(0xff7fd1c7)
+                          : const Color(0xff7f8b8d),
+                      size: 18,
+                    ),
+                    title: Text(
+                      server.label,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
                       ),
                     ),
-                    IconButton(
-                      onPressed: () => _confirmRemove(server),
-                      tooltip: 'Forget',
-                      icon: const Icon(
-                        Icons.delete_outline,
-                        size: 18,
+                    subtitle: Text(
+                      server.address,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
                         color: Color(0xff7f8b8d),
+                        fontSize: 12,
                       ),
                     ),
-                  ],
+                    onTap: () {
+                      if (!isSelected) widget.onSelect(server.id);
+                      Navigator.of(context).pop();
+                    },
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          onPressed: () => _startEdit(server),
+                          tooltip: 'Edit',
+                          icon: const Icon(
+                            Icons.edit_outlined,
+                            size: 16,
+                            color: Color(0xff7f8b8d),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => _confirmRemove(server),
+                          tooltip: 'Forget',
+                          icon: const Icon(
+                            Icons.delete_outline,
+                            size: 16,
+                            color: Color(0xff7f8b8d),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               );
             },
           ),
         ),
-        const SizedBox(height: 8),
-        Align(
-          alignment: Alignment.centerRight,
-          child: TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Close'),
+      ],
+    );
+  }
+
+  Widget _buildJudgeTab() {
+    final history = _judgeHistory;
+    final rules = _judgeRules;
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xff121618),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xff263033)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.auto_awesome, color: Color(0xff7fd1c7), size: 18),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Tool-Call Approval Judge',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: const Color(0xff7fd1c7).withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: const Color(0xff7fd1c7).withValues(alpha: 0.3)),
+                      ),
+                      child: const Text(
+                        'Local AI · LFM2-2.6B',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xff7fd1c7),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Auto-approves routine agent commands (reads, checks, tests) while stopping dangerous ones for manual confirmation. All decisions are evaluated locally in daemon memory with zero cloud telemetry.',
+                  style: TextStyle(fontSize: 13, color: Color(0xff9aa6a8), height: 1.4),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          // Workspace hook card
+          const Text(
+            'WORKSPACE HOOK INTEGRATION',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.8,
+              color: Color(0xff7f8b8d),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Material(
+            color: const Color(0xff121618),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+              side: BorderSide(
+                color: _hookStatus?.enabled == true
+                    ? const Color(0xff3b5356)
+                    : const Color(0xff222a2d),
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        _hookStatus?.enabled == true
+                            ? Icons.check_circle_outline
+                            : Icons.integration_instructions_outlined,
+                        color: _hookStatus?.enabled == true
+                            ? const Color(0xff7fd1c7)
+                            : const Color(0xff9aa6a8),
+                        size: 20,
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Agent PreToolUse Hook',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xffcdd7d6),
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              _hookStatus != null && _hookStatus!.path.isNotEmpty
+                                  ? _hookStatus!.path
+                                  : '.agents/hooks.json',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontFamily: 'JetBrains Mono',
+                                color: Color(0xff7f8b8d),
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      if (_loadingHookStatus || _savingHookStatus)
+                        const SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation(Color(0xff7fd1c7)),
+                          ),
+                        )
+                      else
+                        Switch(
+                          value: _hookStatus?.enabled ?? false,
+                          // ignore: deprecated_member_use
+                          activeColor: const Color(0xff7fd1c7),
+                          activeTrackColor: const Color(0xff233c3e),
+                          inactiveThumbColor: const Color(0xff7f8b8d),
+                          inactiveTrackColor: const Color(0xff1b2426),
+                          onChanged: widget.client != null ? _toggleHookConfig : null,
+                        ),
+                    ],
+                  ),
+                  if (_hookStatus?.enabled == true) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: const Color(0xff7fd1c7).withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(Icons.check, size: 13, color: Color(0xff7fd1c7)),
+                          SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              'Hook enabled in .agents/hooks.json (auto-approved commands execute immediately).',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w500,
+                                color: Color(0xff7fd1c7),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (_hookStatus != null && !_hookStatus!.shimInstalled) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: const Color(0xffffc857).withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded, size: 14, color: Color(0xffffc857)),
+                          SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              'triage-hook CLI not detected on PATH. Run the installation command below.',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: Color(0xffffc857),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Approval Traffic & Layer Analytics Dashboard
+          _buildJudgeDashboard(history),
+          const SizedBox(height: 16),
+
+          // Recent Decision History / Traffic Audit
+          Builder(
+            builder: (context) {
+              final filteredHistory = history.reversed.where((item) {
+                if (_historyFilter != 'all') {
+                  if (item.decision.toLowerCase() != _historyFilter) return false;
+                }
+                if (_historySearchQuery.isNotEmpty) {
+                  final q = _historySearchQuery.toLowerCase();
+                  final cmd = (item.commandLine ?? '').toLowerCase();
+                  final tool = item.toolName.toLowerCase();
+                  final rsn = item.reason.toLowerCase();
+                  final src = item.source.toLowerCase();
+                  if (!cmd.contains(q) &&
+                      !tool.contains(q) &&
+                      !rsn.contains(q) &&
+                      !src.contains(q)) {
+                    return false;
+                  }
+                }
+                return true;
+              }).toList();
+
+              final allowTotal =
+                  history.where((i) => i.decision.toLowerCase() == 'allow').length;
+              final askTotal =
+                  history.where((i) => i.decision.toLowerCase() == 'ask').length;
+              final denyTotal =
+                  history.where((i) => i.decision.toLowerCase() == 'deny').length;
+
+              final displayedItems =
+                  filteredHistory.take(_historyDisplayLimit).toList();
+
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'RECENT DECISION HISTORY',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.8,
+                            color: Color(0xff7f8b8d),
+                          ),
+                        ),
+                      ),
+                      if (_loadingJudgeData)
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 1.5,
+                            valueColor: AlwaysStoppedAnimation(Color(0xff7fd1c7)),
+                          ),
+                        )
+                      else
+                        IconButton(
+                          onPressed: _loadJudgeData,
+                          icon: const Icon(Icons.refresh, size: 16, color: Color(0xff7fd1c7)),
+                          tooltip: 'Refresh History & Rules',
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Filter & search toolbar
+                  Row(
+                    children: [
+                      Expanded(
+                        child: SizedBox(
+                          height: 32,
+                          child: TextField(
+                            controller: _historySearchController,
+                            onChanged: (val) =>
+                                setState(() => _historySearchQuery = val.trim()),
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontFamily: 'JetBrains Mono',
+                              color: Color(0xffcdd7d6),
+                            ),
+                            decoration: InputDecoration(
+                              hintText: 'Filter decisions by command, tool, or reason...',
+                              hintStyle:
+                                  const TextStyle(fontSize: 11, color: Color(0xff5a686b)),
+                              prefixIcon:
+                                  const Icon(Icons.search, size: 14, color: Color(0xff7f8b8d)),
+                              prefixIconConstraints:
+                                  const BoxConstraints(minWidth: 28, minHeight: 28),
+                              suffixIcon: _historySearchQuery.isNotEmpty
+                                  ? IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          size: 14, color: Color(0xff7f8b8d)),
+                                      onPressed: () {
+                                        _historySearchController.clear();
+                                        setState(() => _historySearchQuery = '');
+                                      },
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(),
+                                    )
+                                  : null,
+                              isDense: true,
+                              contentPadding:
+                                  const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+                              filled: true,
+                              fillColor: const Color(0xff0d1113),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(6),
+                                borderSide: const BorderSide(color: Color(0xff222a2d)),
+                              ),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(6),
+                                borderSide: const BorderSide(color: Color(0xff222a2d)),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(6),
+                                borderSide: const BorderSide(color: Color(0xff7fd1c7)),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      // Filter pills
+                      _buildHistoryFilterPill('all', 'All (${history.length})'),
+                      const SizedBox(width: 4),
+                      _buildHistoryFilterPill('allow', 'Allow ($allowTotal)'),
+                      const SizedBox(width: 4),
+                      _buildHistoryFilterPill('ask', 'Ask ($askTotal)'),
+                      const SizedBox(width: 4),
+                      _buildHistoryFilterPill('deny', 'Deny ($denyTotal)'),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  // History list container
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xff121618),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xff222a2d)),
+                    ),
+                    child: history.isEmpty
+                        ? const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 8),
+                            child: Text(
+                              'No tool calls judged yet. Live decisions evaluated while coding agents run will appear here.',
+                              style: TextStyle(fontSize: 12, color: Color(0xff7f8b8d)),
+                            ),
+                          )
+                        : filteredHistory.isEmpty
+                            ? const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 8),
+                                child: Text(
+                                  'No decisions match the current filter or search query.',
+                                  style: TextStyle(fontSize: 12, color: Color(0xff7f8b8d)),
+                                ),
+                              )
+                            : Column(
+                                children: [
+                                  for (int i = 0; i < displayedItems.length; i++) ...[
+                                    _buildHistoryRow(displayedItems[i]),
+                                    if (i < displayedItems.length - 1)
+                                      const Divider(color: Color(0xff1e2628), height: 16),
+                                  ],
+                                  if (filteredHistory.length > displayedItems.length) ...[
+                                    const Divider(color: Color(0xff1e2628), height: 16),
+                                    Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        TextButton(
+                                          onPressed: () {
+                                            setState(() {
+                                              _historyDisplayLimit += 50;
+                                            });
+                                          },
+                                          child: Text(
+                                            'Show 50 more (${filteredHistory.length - displayedItems.length} remaining)',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                              color: Color(0xff7fd1c7),
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        TextButton(
+                                          onPressed: () {
+                                            setState(() {
+                                              _historyDisplayLimit = filteredHistory.length;
+                                            });
+                                          },
+                                          child: Text(
+                                            'Show all (${filteredHistory.length})',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                              color: Color(0xff9aa6a8),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ],
+                              ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 16),
+
+          // Custom & Built-in Allow Rules
+          const Text(
+            'AUTO-APPROVED COMMANDS (ALLOWLIST)',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.8,
+              color: Color(0xff7f8b8d),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xff121618),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xff222a2d)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Commands matching these prefixes execute immediately without prompting:',
+                  style: TextStyle(fontSize: 12, color: Color(0xff9aa6a8)),
+                ),
+                const SizedBox(height: 8),
+
+                // Custom allow rules chips
+                if (rules != null && rules.customAllowCommands.isNotEmpty) ...[
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final cmd in rules.customAllowCommands)
+                        Chip(
+                          backgroundColor: const Color(0xff1b2b2b),
+                          side: const BorderSide(color: Color(0xff3b5356)),
+                          label: Text(
+                            cmd,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontFamily: 'JetBrains Mono',
+                              color: Color(0xff7fd1c7),
+                            ),
+                          ),
+                          deleteIcon: const Icon(Icons.close, size: 14, color: Color(0xff7fd1c7)),
+                          onDeleted: () => _removeAllowRule(cmd),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                ],
+
+                // Add custom allow rule field
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _allowRuleController,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontFamily: 'JetBrains Mono',
+                          color: Color(0xffcdd7d6),
+                        ),
+                        decoration: InputDecoration(
+                          hintText: 'Add allow prefix (e.g. "pnpm test", "make check")',
+                          hintStyle: const TextStyle(fontSize: 11, color: Color(0xff5a686b)),
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          filled: true,
+                          fillColor: const Color(0xff0d1113),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: const BorderSide(color: Color(0xff7fd1c7)),
+                          ),
+                        ),
+                        onSubmitted: _addAllowRule,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: () => _addAllowRule(_allowRuleController.text),
+                      icon: const Icon(Icons.add, size: 14),
+                      label: const Text('Add', style: TextStyle(fontSize: 12)),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xff233c3e),
+                        foregroundColor: const Color(0xff7fd1c7),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+
+                // Collapsible built-in allow rules
+                InkWell(
+                  onTap: () => setState(() => _showBuiltinAllows = !_showBuiltinAllows),
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _showBuiltinAllows ? Icons.expand_less : Icons.expand_more,
+                          size: 16,
+                          color: const Color(0xff7fd1c7),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${_showBuiltinAllows ? "Hide" : "Show"} Built-in Allow Rules (${rules?.builtinAllowCommands.length ?? 0})',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xff7fd1c7),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (_showBuiltinAllows && rules != null) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xff0d1113),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: const Color(0xff1b2426)),
+                    ),
+                    child: Wrap(
+                      spacing: 4,
+                      runSpacing: 4,
+                      children: [
+                        for (final cmd in rules.builtinAllowCommands)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xff161e20),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              cmd,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontFamily: 'JetBrains Mono',
+                                color: Color(0xff9aa6a8),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Custom & Built-in Deny Rules
+          const Text(
+            'HARD DENY RULES (BLOCKED IMMEDIATELY)',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.8,
+              color: Color(0xff7f8b8d),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xff121618),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xff222a2d)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Commands or target paths containing these substrings are blocked immediately:',
+                  style: TextStyle(fontSize: 12, color: Color(0xff9aa6a8)),
+                ),
+                const SizedBox(height: 8),
+
+                // Custom deny rules chips
+                if (rules != null && rules.customDenySubstrings.isNotEmpty) ...[
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final sub in rules.customDenySubstrings)
+                        Chip(
+                          backgroundColor: const Color(0xff2d1717),
+                          side: const BorderSide(color: Color(0xff5c2626)),
+                          label: Text(
+                            sub,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontFamily: 'JetBrains Mono',
+                              color: Color(0xffff6b6b),
+                            ),
+                          ),
+                          deleteIcon: const Icon(Icons.close, size: 14, color: Color(0xffff6b6b)),
+                          onDeleted: () => _removeDenyRule(sub),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                ],
+
+                // Add custom deny rule field
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _denyRuleController,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontFamily: 'JetBrains Mono',
+                          color: Color(0xffcdd7d6),
+                        ),
+                        decoration: InputDecoration(
+                          hintText: 'Add deny pattern (e.g. "terraform apply", "drop database")',
+                          hintStyle: const TextStyle(fontSize: 11, color: Color(0xff5a686b)),
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          filled: true,
+                          fillColor: const Color(0xff0d1113),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: const BorderSide(color: Color(0xffff6b6b)),
+                          ),
+                        ),
+                        onSubmitted: _addDenyRule,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: () => _addDenyRule(_denyRuleController.text),
+                      icon: const Icon(Icons.add, size: 14),
+                      label: const Text('Add', style: TextStyle(fontSize: 12)),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xff3e1b1b),
+                        foregroundColor: const Color(0xffff6b6b),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+
+                // Collapsible built-in deny rules
+                InkWell(
+                  onTap: () => setState(() => _showBuiltinDenies = !_showBuiltinDenies),
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _showBuiltinDenies ? Icons.expand_less : Icons.expand_more,
+                          size: 16,
+                          color: const Color(0xffff6b6b),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${_showBuiltinDenies ? "Hide" : "Show"} Built-in Deny Rules (${rules?.builtinDenySubstrings.length ?? 0})',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xffff6b6b),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (_showBuiltinDenies && rules != null) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xff0d1113),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: const Color(0xff1b2426)),
+                    ),
+                    child: Wrap(
+                      spacing: 4,
+                      runSpacing: 4,
+                      children: [
+                        for (final sub in rules.builtinDenySubstrings)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xff1e1616),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              sub,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontFamily: 'JetBrains Mono',
+                                color: Color(0xffd89696),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // 3-Layer Decision Engine
+          const Text(
+            '3-LAYER DECISION ENGINE',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.8,
+              color: Color(0xff7f8b8d),
+            ),
+          ),
+          const SizedBox(height: 8),
+          _buildLayerRow(
+            icon: Icons.shield_outlined,
+            iconColor: const Color(0xffff6b6b),
+            title: 'Layer 1: Deterministic Deny',
+            description: 'Destructive commands (rm -rf, git push --force) and credential files (.ssh, .env) are blocked instantly.',
+          ),
+          const SizedBox(height: 6),
+          _buildLayerRow(
+            icon: Icons.bolt,
+            iconColor: const Color(0xff7fd1c7),
+            title: 'Layer 2: Deterministic Allow',
+            description: 'Safe read-only commands (git status/diff/log, cargo test, flutter test) auto-approve in <10ms.',
+          ),
+          const SizedBox(height: 6),
+          _buildLayerRow(
+            icon: Icons.auto_awesome,
+            iconColor: const Color(0xffffc857),
+            title: 'Layer 3: Local Model',
+            description: 'Ambiguous commands are evaluated by resident model using GBNF grammar constraints (allow/ask).',
+          ),
+          const SizedBox(height: 16),
+
+          // Agent setup guide
+          const Text(
+            'AGENT SETUP GUIDE',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.8,
+              color: Color(0xff7f8b8d),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '1. Install the hook shim on PATH:',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+          ),
+          const SizedBox(height: 6),
+          const _CodeSnippetBox(
+            code: 'TRIAGE_SKIP_FLUTTER_BUILD=1 cargo install --path crates/triage-hook',
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '2. Generated workspace .agents/hooks.json (managed by switch above):',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+          ),
+          const SizedBox(height: 6),
+          const _CodeSnippetBox(
+            code: '{\n'
+                '  "triage-approval-judge": {\n'
+                '    "enabled": true,\n'
+                '    "PreToolUse": [\n'
+                '      {\n'
+                '        "matcher": ".*",\n'
+                '        "hooks": [\n'
+                '          {\n'
+                '            "type": "command",\n'
+                '            "command": "triage-hook",\n'
+                '            "timeout": 15\n'
+                '          }\n'
+                '        ]\n'
+                '      }\n'
+                '    ]\n'
+                '  }\n'
+                '}',
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '3. Run agent inside Triage:',
+            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Start your agent (agy, claude, etc.) inside any Triage terminal session. Triage automatically injects TRIAGE_SESSION_ID so tool calls associate with your active session.',
+            style: TextStyle(fontSize: 12, color: Color(0xff9aa6a8), height: 1.4),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryFilterPill(String filterKey, String label) {
+    final isSelected = _historyFilter == filterKey;
+    return InkWell(
+      onTap: () => setState(() => _historyFilter = filterKey),
+      borderRadius: BorderRadius.circular(5),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          color: isSelected ? const Color(0xff1b2b2b) : const Color(0xff0d1113),
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(
+            color: isSelected ? const Color(0xff7fd1c7) : const Color(0xff222a2d),
           ),
         ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+            color: isSelected ? const Color(0xff7fd1c7) : const Color(0xff9aa6a8),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHistoryRow(JudgeRecordItem item) {
+    final (badgeBg, badgeBorder, badgeText, badgeLabel) = switch (item.decision.toLowerCase()) {
+      'deny' => (
+          const Color(0xffff6b6b).withValues(alpha: 0.15),
+          const Color(0xffff6b6b).withValues(alpha: 0.4),
+          const Color(0xffff6b6b),
+          'DENY',
+        ),
+      'allow' => (
+          const Color(0xff7fd1c7).withValues(alpha: 0.15),
+          const Color(0xff7fd1c7).withValues(alpha: 0.4),
+          const Color(0xff7fd1c7),
+          'ALLOW',
+        ),
+      _ => (
+          const Color(0xffffc857).withValues(alpha: 0.15),
+          const Color(0xffffc857).withValues(alpha: 0.4),
+          const Color(0xffffc857),
+          'ASK',
+        ),
+    };
+
+    final command = item.commandLine?.trim();
+    String? suggestedPrefix;
+    if (item.decision.toLowerCase() != 'allow') {
+      if (command != null && command.isNotEmpty) {
+        final tokens = command.split(' ');
+        suggestedPrefix = tokens.take(2).join(' ');
+      } else if (item.toolName.isNotEmpty && item.toolName != 'run_command') {
+        suggestedPrefix = item.toolName;
+      }
+    }
+
+    final isAlreadyAllowed = suggestedPrefix != null &&
+        (_judgeRules?.customAllowCommands.contains(suggestedPrefix) ?? false);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: badgeBg,
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(color: badgeBorder),
+              ),
+              child: Text(
+                badgeLabel,
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: badgeText,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              item.toolName,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Color(0xffcdd7d6),
+              ),
+            ),
+            const Spacer(),
+            Text(
+              item.timestamp.contains('T')
+                  ? item.timestamp.split('T').last.replaceAll('Z', '')
+                  : item.timestamp,
+              style: const TextStyle(fontSize: 10, color: Color(0xff5a686b)),
+            ),
+          ],
+        ),
+        if (command != null && command.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xff0d1113),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              command,
+              style: const TextStyle(
+                fontSize: 11,
+                fontFamily: 'JetBrains Mono',
+                color: Color(0xffcdd7d6),
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+        const SizedBox(height: 4),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(
+              child: Text(
+                item.reason.isNotEmpty ? item.reason : 'Source: ${item.source}',
+                style: const TextStyle(fontSize: 11, color: Color(0xff7f8b8d)),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        if (suggestedPrefix != null && suggestedPrefix.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              if (isAlreadyAllowed) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: const Color(0xff7fd1c7).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: const Color(0xff7fd1c7).withValues(alpha: 0.35),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.check, size: 12, color: Color(0xff7fd1c7)),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Allowed via "$suggestedPrefix"',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xff7fd1c7),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ] else ...[
+                OutlinedButton.icon(
+                  onPressed: () => _addAllowRule(suggestedPrefix!),
+                  icon: const Icon(Icons.add, size: 13, color: Color(0xff7fd1c7)),
+                  label: Text(
+                    'Always Allow "$suggestedPrefix"',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xff7fd1c7),
+                    ),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    minimumSize: Size.zero,
+                    side: BorderSide(
+                      color: const Color(0xff7fd1c7).withValues(alpha: 0.45),
+                    ),
+                    backgroundColor: const Color(0xff7fd1c7).withValues(alpha: 0.08),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(5),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
       ],
+    );
+  }
+
+  Widget _buildJudgeDashboard(List<JudgeRecordItem> history) {
+    final total = history.length;
+    final allowCount =
+        history.where((i) => i.decision.toLowerCase() == 'allow').length;
+    final askCount =
+        history.where((i) => i.decision.toLowerCase() == 'ask').length;
+    final denyCount =
+        history.where((i) => i.decision.toLowerCase() == 'deny').length;
+
+    final allowPct = total == 0 ? 0.0 : (allowCount / total) * 100;
+    final askPct = total == 0 ? 0.0 : (askCount / total) * 100;
+    final denyPct = total == 0 ? 0.0 : (denyCount / total) * 100;
+
+    int l1Count = 0; // Deterministic allowlist & safe tools
+    int l2Count = 0; // Local model decisions
+    int l2Allow = 0;
+    int l2Ask = 0;
+    int l3Count = 0; // Sensitive / guardrails / fallback
+    int hardDenyCount = 0;
+
+    for (final item in history) {
+      final dec = item.decision.toLowerCase();
+      final src = item.source.toLowerCase();
+      final rsn = item.reason.toLowerCase();
+
+      if (dec == 'deny' || src.contains('deny')) {
+        hardDenyCount++;
+      } else if (src.contains('model') || rsn.contains('model')) {
+        l2Count++;
+        if (dec == 'allow') l2Allow++;
+        if (dec == 'ask') l2Ask++;
+      } else if (src == 'fallback' ||
+          src.contains('sensitive') ||
+          rsn.contains('manual approval') ||
+          rsn.contains('credential')) {
+        l3Count++;
+      } else if (src.contains('allow') ||
+          rsn.contains('allow') ||
+          rsn.contains('read-only') ||
+          rsn.contains('edit tool')) {
+        l1Count++;
+      } else {
+        if (dec == 'allow') {
+          l1Count++;
+        } else {
+          l3Count++;
+        }
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xff121618),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xff222a2d)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.analytics_outlined,
+                size: 16,
+                color: Color(0xff7fd1c7),
+              ),
+              const SizedBox(width: 6),
+              const Text(
+                'APPROVAL TRAFFIC DASHBOARD',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                  color: Color(0xff7f8b8d),
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '$total total evaluated',
+                style: const TextStyle(fontSize: 11, color: Color(0xff9aa6a8)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          // 3 Metric Cards Row
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final cardWidth = (constraints.maxWidth - 16) / 3;
+              return Row(
+                children: [
+                  _buildStatCard(
+                    title: 'Auto-Approved',
+                    count: allowCount,
+                    percentage: allowPct,
+                    color: const Color(0xff7fd1c7),
+                    icon: Icons.check_circle_outline,
+                    subtitle: '0 prompts needed',
+                    width: cardWidth,
+                  ),
+                  const SizedBox(width: 8),
+                  _buildStatCard(
+                    title: 'Prompted (Ask)',
+                    count: askCount,
+                    percentage: askPct,
+                    color: const Color(0xffffc857),
+                    icon: Icons.help_outline,
+                    subtitle: 'Passed to AI / user',
+                    width: cardWidth,
+                  ),
+                  const SizedBox(width: 8),
+                  _buildStatCard(
+                    title: 'Hard Denied',
+                    count: denyCount,
+                    percentage: denyPct,
+                    color: const Color(0xffff6b6b),
+                    icon: Icons.block,
+                    subtitle: 'Blocked by rules',
+                    width: cardWidth,
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 12),
+
+          // Multi-color Ratio Distribution Bar
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: SizedBox(
+              height: 6,
+              child: Row(
+                children: [
+                  if (total == 0)
+                    Expanded(child: Container(color: const Color(0xff222a2d)))
+                  else ...[
+                    if (allowCount > 0)
+                      Expanded(
+                        flex: allowCount,
+                        child: Container(color: const Color(0xff7fd1c7)),
+                      ),
+                    if (askCount > 0)
+                      Expanded(
+                        flex: askCount,
+                        child: Container(color: const Color(0xffffc857)),
+                      ),
+                    if (denyCount > 0)
+                      Expanded(
+                        flex: denyCount,
+                        child: Container(color: const Color(0xffff6b6b)),
+                      ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          // Layer Breakdown Section
+          const Text(
+            'DECISION LAYERS BREAKDOWN',
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.6,
+              color: Color(0xff5a686b),
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          _buildLayerMetricRow(
+            icon: Icons.bolt,
+            iconColor: const Color(0xff7fd1c7),
+            title: 'Layer 1: Deterministic Allowlist',
+            description:
+                'Safe reads, diffs, formatting, tests, status & custom prefixes',
+            countText: '$l1Count calls approved',
+            statusColor: const Color(0xff7fd1c7),
+          ),
+          const SizedBox(height: 6),
+          _buildLayerMetricRow(
+            icon: Icons.psychology,
+            iconColor: const Color(0xffb39ddb),
+            title: 'Layer 2: Local AI Neural Model',
+            description:
+                'Evaluated unclassified shell commands ($l2Allow allowed, $l2Ask escalated)',
+            countText: '$l2Count calls evaluated',
+            statusColor: const Color(0xffb39ddb),
+          ),
+          const SizedBox(height: 6),
+          _buildLayerMetricRow(
+            icon: Icons.shield_outlined,
+            iconColor: const Color(0xffffc857),
+            title: 'Layer 3: Security & Sensitivity Guardrails',
+            description:
+                'Credential paths, network pipes, destructive flags & remote pushes',
+            countText: '$l3Count calls escalated to Ask',
+            statusColor: const Color(0xffffc857),
+          ),
+          if (hardDenyCount > 0) ...[
+            const SizedBox(height: 6),
+            _buildLayerMetricRow(
+              icon: Icons.block,
+              iconColor: const Color(0xffff6b6b),
+              title: 'Hard Deny Substrings',
+              description: 'Blocked immediately via user deny rules',
+              countText: '$hardDenyCount calls blocked',
+              statusColor: const Color(0xffff6b6b),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatCard({
+    required String title,
+    required int count,
+    required double percentage,
+    required Color color,
+    required IconData icon,
+    required String subtitle,
+    required double width,
+  }) {
+    return Container(
+      width: width,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xff0d1113),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 14, color: color),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: color,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.baseline,
+            textBaseline: TextBaseline.alphabetic,
+            children: [
+              Text(
+                '$count',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xffcdd7d6),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Text(
+                '(${percentage.toStringAsFixed(0)}%)',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          Text(
+            subtitle,
+            style: const TextStyle(fontSize: 10, color: Color(0xff5a686b)),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLayerMetricRow({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String description,
+    required String countText,
+    required Color statusColor,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xff0d1113),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xff1b2426)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Icon(icon, size: 16, color: iconColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xffcdd7d6),
+                  ),
+                ),
+                Text(
+                  description,
+                  style: const TextStyle(fontSize: 10, color: Color(0xff7f8b8d)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: statusColor.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: statusColor.withValues(alpha: 0.3)),
+            ),
+            child: Text(
+              countText,
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: statusColor,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLayerRow({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String description,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xff101416),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xff222a2d)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 16, color: iconColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: iconColor,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  description,
+                  style: const TextStyle(fontSize: 11, color: Color(0xff9aa6a8), height: 1.35),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPreferencesTab() {
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xff121618),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xff263033)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Terminal Settings',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 10),
+                const Row(
+                  children: [
+                    Icon(Icons.terminal, size: 16, color: Color(0xff7fd1c7)),
+                    SizedBox(width: 8),
+                    Text(
+                      'Font Family: JetBrains Mono',
+                      style: TextStyle(fontSize: 13, color: Color(0xffcdd7d6)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Customized with full unicode symbol support, italic & bold variants.',
+                  style: TextStyle(fontSize: 12, color: Color(0xff7f8b8d)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xff121618),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xff263033)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Client Identity & Pairing',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'This client authenticates against daemons using a persistent cryptographic token stored in secure storage.',
+                  style: TextStyle(fontSize: 12, color: Color(0xff9aa6a8), height: 1.4),
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'Client ID:',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+                ),
+                const SizedBox(height: 4),
+                _CodeSnippetBox(
+                  code: widget.clientId ?? retrieveClientId() ?? 'Initializing...',
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -5052,6 +7101,9 @@ class SessionListTile extends StatefulWidget {
     this.pinned = false,
     this.onUnpin,
     this.indistinguishable = false,
+    this.judgeEffective = false,
+    this.judgeExplicit,
+    this.onToggleJudge,
     this.selected = false,
   });
 
@@ -5091,6 +7143,9 @@ class SessionListTile extends StatefulWidget {
   // True when another row renders the same title and repo, so the snippet is
   // the only thing telling them apart and gets room to say it.
   final bool indistinguishable;
+  final bool judgeEffective;
+  final bool? judgeExplicit;
+  final VoidCallback? onToggleJudge;
   final bool selected;
 
   @override
@@ -5227,6 +7282,12 @@ class _SessionListTileState extends State<SessionListTile> {
                                 _UnpinButton(
                                   onUnpin: widget.onUnpin!,
                                   what: widget.title,
+                                ),
+                              if (widget.onToggleJudge != null)
+                                _JudgeToggleButton(
+                                  effective: widget.judgeEffective,
+                                  explicit: widget.judgeExplicit,
+                                  onToggle: widget.onToggleJudge!,
                                 ),
                             ],
                           ),
@@ -5794,6 +7855,7 @@ class SessionWorkspace extends StatelessWidget {
     this.onViewFit,
     this.onOpenRail,
     this.onRefit,
+    this.onToggleJudge,
   });
 
   final SessionVm session;
@@ -5803,6 +7865,7 @@ class SessionWorkspace extends StatelessWidget {
   final VoidCallback? onOpenRail;
   // Re-asserts this device's terminal size on the shared PTY.
   final VoidCallback? onRefit;
+  final VoidCallback? onToggleJudge;
 
   @override
   Widget build(BuildContext context) {
@@ -5813,6 +7876,7 @@ class SessionWorkspace extends StatelessWidget {
           onClose: onCloseSession,
           onOpenRail: onOpenRail,
           onRefit: onRefit,
+          onToggleJudge: onToggleJudge,
         ),
         Expanded(
           child: TerminalPane(
@@ -5842,6 +7906,7 @@ class WorkspaceHeader extends StatelessWidget {
     this.onClose,
     this.onOpenRail,
     this.onRefit,
+    this.onToggleJudge,
   });
 
   final SessionVm session;
@@ -5852,6 +7917,7 @@ class WorkspaceHeader extends StatelessWidget {
   // Re-asserts this device's terminal size on the shared PTY, so switching back
   // to this device reclaims the size from whichever device resized it last.
   final VoidCallback? onRefit;
+  final VoidCallback? onToggleJudge;
 
   @override
   Widget build(BuildContext context) {
@@ -5909,6 +7975,30 @@ class WorkspaceHeader extends StatelessWidget {
               ],
             ),
           ),
+          if (onToggleJudge != null) ...[
+            IconButton(
+              icon: session.judgePolicyEffective
+                  ? const Icon(
+                      Icons.auto_awesome,
+                      size: 20,
+                      color: Color(0xff7fd1c7),
+                    )
+                  : const Icon(
+                      Icons.person_outline,
+                      size: 20,
+                      color: Color(0xffffc857),
+                    ),
+              tooltip: session.judgePolicyEffective
+                  ? (session.judgePolicyExplicit == true
+                      ? 'Auto-Approval: ON (click to disable)'
+                      : 'Auto-Approval: Default ON (click to disable)')
+                  : (session.judgePolicyExplicit == false
+                      ? 'Auto-Approval: OFF (click to enable)'
+                      : 'Auto-Approval: Default OFF (click to enable)'),
+              onPressed: onToggleJudge,
+            ),
+            const SizedBox(width: 4),
+          ],
           Icon(Icons.circle, size: 12, color: session.statusColor),
           const SizedBox(width: 8),
           Text(

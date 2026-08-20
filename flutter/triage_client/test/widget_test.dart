@@ -4,7 +4,7 @@ import 'package:flutter/foundation.dart'
     show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/material.dart'
-    show CheckedPopupMenuItem, Icons, MaterialApp, Scaffold, TextField;
+    show CheckedPopupMenuItem, FilledButton, Icons, MaterialApp, Scaffold, Switch, TextField;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -444,6 +444,153 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   }
 
   final List<String> shutdownSessionCalls = [];
+  final Map<String, SessionJudgePolicyRecord> sessionJudgePolicies = {};
+  final List<(String, bool?)> setJudgePolicyCalls = [];
+
+  @override
+  Future<Map<String, SessionJudgePolicyRecord>> listSessionJudgePolicies() async {
+    return sessionJudgePolicies;
+  }
+
+  @override
+  Future<SessionJudgePolicyRecord> getSessionJudgePolicy(String sessionId) async {
+    return sessionJudgePolicies[sessionId] ?? (explicit: null, effective: true);
+  }
+
+  @override
+  Future<SessionJudgePolicyRecord> setSessionJudgePolicy(
+    String sessionId,
+    bool? enabled,
+  ) async {
+    setJudgePolicyCalls.add((sessionId, enabled));
+    final record = (explicit: enabled, effective: enabled ?? true);
+    sessionJudgePolicies[sessionId] = record;
+    emitJudgePolicyUpdated(sessionId, explicit: enabled, effective: record.effective);
+    return record;
+  }
+
+  void emitJudgePolicyUpdated(
+    String sessionId, {
+    bool? explicit,
+    required bool effective,
+  }) {
+    _testEventController.add({
+      'type': 'session_judge_policy_updated',
+      'session_id': sessionId,
+      'has_pinned': explicit != null,
+      'pinned': explicit ?? false,
+      'explicit': explicit,
+      'effective': effective,
+    });
+  }
+
+  JudgeHookStatusRecord fakeHookStatus = (
+    path: '/path/to/.agents/hooks.json',
+    exists: true,
+    enabled: true,
+    shimInstalled: true,
+  );
+
+  @override
+  Future<JudgeHookStatusRecord?> getJudgeHookStatus({String? workspacePath}) async {
+    return fakeHookStatus;
+  }
+
+  @override
+  Future<JudgeHookStatusRecord?> configureJudgeHook({
+    String? workspacePath,
+    required bool enabled,
+  }) async {
+    fakeHookStatus = (
+      path: fakeHookStatus.path,
+      exists: true,
+      enabled: enabled,
+      shimInstalled: fakeHookStatus.shimInstalled,
+    );
+    return fakeHookStatus;
+  }
+
+  List<JudgeRecordItem> fakeJudgeHistory = [
+    (
+      timestamp: '2026-08-18T17:00:00Z',
+      sessionId: 'flutter-spike',
+      toolName: 'run_command',
+      commandLine: 'rm -rf build',
+      decision: 'deny',
+      source: 'deny_rule',
+      reason: 'blocked by deny rule: recursive forced delete',
+    ),
+    (
+      timestamp: '2026-08-18T17:01:00Z',
+      sessionId: 'flutter-spike',
+      toolName: 'run_command',
+      commandLine: 'git status',
+      decision: 'allow',
+      source: 'allow_rule',
+      reason: 'matched allow rule: git status',
+    ),
+  ];
+
+  JudgeRulesRecord fakeJudgeRules = (
+    builtinAllowCommands: ['git status', 'cargo test', 'flutter test'],
+    customAllowCommands: ['pnpm test'],
+    builtinDenySubstrings: ['sudo ', 'rm -rf', 'git push'],
+    customDenySubstrings: ['terraform apply'],
+  );
+
+  @override
+  Future<List<JudgeRecordItem>> getJudgeHistory() async => fakeJudgeHistory;
+
+  @override
+  Future<JudgeRulesRecord?> getJudgeRules() async => fakeJudgeRules;
+
+  @override
+  Future<JudgeRulesRecord?> addJudgeAllowCommand(String command) async {
+    final list = List<String>.from(fakeJudgeRules.customAllowCommands)..add(command);
+    fakeJudgeRules = (
+      builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
+      customAllowCommands: list,
+      builtinDenySubstrings: fakeJudgeRules.builtinDenySubstrings,
+      customDenySubstrings: fakeJudgeRules.customDenySubstrings,
+    );
+    return fakeJudgeRules;
+  }
+
+  @override
+  Future<JudgeRulesRecord?> removeJudgeAllowCommand(String command) async {
+    final list = List<String>.from(fakeJudgeRules.customAllowCommands)..remove(command);
+    fakeJudgeRules = (
+      builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
+      customAllowCommands: list,
+      builtinDenySubstrings: fakeJudgeRules.builtinDenySubstrings,
+      customDenySubstrings: fakeJudgeRules.customDenySubstrings,
+    );
+    return fakeJudgeRules;
+  }
+
+  @override
+  Future<JudgeRulesRecord?> addJudgeDenySubstring(String substring) async {
+    final list = List<String>.from(fakeJudgeRules.customDenySubstrings)..add(substring);
+    fakeJudgeRules = (
+      builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
+      customAllowCommands: fakeJudgeRules.customAllowCommands,
+      builtinDenySubstrings: fakeJudgeRules.builtinDenySubstrings,
+      customDenySubstrings: list,
+    );
+    return fakeJudgeRules;
+  }
+
+  @override
+  Future<JudgeRulesRecord?> removeJudgeDenySubstring(String substring) async {
+    final list = List<String>.from(fakeJudgeRules.customDenySubstrings)..remove(substring);
+    fakeJudgeRules = (
+      builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
+      customAllowCommands: fakeJudgeRules.customAllowCommands,
+      builtinDenySubstrings: fakeJudgeRules.builtinDenySubstrings,
+      customDenySubstrings: list,
+    );
+    return fakeJudgeRules;
+  }
 
   @override
   Future<void> shutdownSession({required String sessionId}) async {
@@ -3167,6 +3314,172 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       final saved = DaemonServer.decodeList(prefs.getString(serversPrefKey));
       expect(saved.map((s) => s.id), [workLaptop.id]);
+    });
+
+    testWidgets('auto-approval toggle switches policy and reacts to push updates', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      final client = FakeTriageWebSocketClient();
+      client.sessionJudgePolicies['flutter-spike'] = (explicit: null, effective: true);
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Starts with effective=true (auto_awesome icon)
+      expect(find.byIcon(Icons.auto_awesome), findsWidgets);
+
+      // Tap toggle button in workspace header or session tile
+      await tester.tap(
+        find.byTooltip('Auto-Approval: Default ON (click to disable)').first,
+      );
+      await tester.pumpAndSettle();
+
+      expect(client.setJudgePolicyCalls, [('flutter-spike', false)]);
+
+      // Now effective=false (person_outline icon)
+      expect(
+        find.byTooltip('Auto-Approval: OFF (click to enable)'),
+        findsWidgets,
+      );
+
+      // When daemon pushes an update turning it back on
+      client.emitJudgePolicyUpdated('flutter-spike', explicit: true, effective: true);
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byTooltip('Auto-Approval: ON (click to disable)'),
+        findsWidgets,
+      );
+    });
+
+    testWidgets('settings dialog supports tabs and renders approval judge guide', (
+      WidgetTester tester,
+    ) async {
+      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      // Open settings via side rail gear icon
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Settings'), findsOneWidget);
+      expect(find.text('Daemons'), findsWidgets);
+      expect(find.text('Approval Judge'), findsOneWidget);
+      expect(find.text('Preferences'), findsOneWidget);
+
+      // Tap Approval Judge tab
+      await tester.tap(find.text('Approval Judge'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Tool-Call Approval Judge'), findsOneWidget);
+      expect(find.text('WORKSPACE HOOK INTEGRATION'), findsOneWidget);
+      expect(find.text('Agent PreToolUse Hook'), findsOneWidget);
+      expect(find.text('/path/to/.agents/hooks.json'), findsOneWidget);
+      expect(find.text('Layer 1: Deterministic Deny'), findsOneWidget);
+      expect(find.text('Layer 2: Deterministic Allow'), findsOneWidget);
+      expect(find.text('Layer 3: Local Model'), findsOneWidget);
+      expect(find.text('AGENT SETUP GUIDE'), findsOneWidget);
+      expect(find.byIcon(Icons.content_copy), findsWidgets);
+
+      // Toggle hook switch to disable
+      final hookSwitch = find.byType(Switch);
+      expect(hookSwitch, findsOneWidget);
+      await tester.ensureVisible(hookSwitch);
+      await tester.pumpAndSettle();
+      await tester.tap(hookSwitch);
+      await tester.pumpAndSettle();
+      expect(client.fakeHookStatus.enabled, isFalse);
+
+      // Tap Preferences tab
+      await tester.tap(find.text('Preferences'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Terminal Settings'), findsOneWidget);
+      expect(find.text('Font Family: JetBrains Mono'), findsOneWidget);
+      expect(find.text('Client Identity & Pairing'), findsOneWidget);
+
+      // Close settings
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Settings'), findsNothing);
+    });
+
+    testWidgets('approval judge tab renders decision history and allows adding/removing custom rules', (
+      WidgetTester tester,
+    ) async {
+      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      // Open settings and go to Approval Judge tab
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Approval Judge'));
+      await tester.pumpAndSettle();
+
+      // Verify recent decision history feed
+      expect(find.text('RECENT DECISION HISTORY'), findsOneWidget);
+      expect(find.text('DENY'), findsOneWidget);
+      expect(find.text('ALLOW'), findsOneWidget);
+      expect(find.text('rm -rf build'), findsOneWidget);
+      expect(find.text('git status'), findsOneWidget);
+      expect(find.text('blocked by deny rule: recursive forced delete'), findsOneWidget);
+
+      // Verify quick allow button on the denied row
+      final allowButton = find.text('Always Allow "rm -rf"');
+      expect(allowButton, findsOneWidget);
+      await tester.ensureVisible(allowButton);
+      await tester.pumpAndSettle();
+
+      // Tap quick allow button
+      await tester.tap(allowButton);
+      await tester.pumpAndSettle();
+      expect(client.fakeJudgeRules.customAllowCommands, contains('rm -rf'));
+
+      // Verify custom allow rules editor
+      final allowHeader = find.text('AUTO-APPROVED COMMANDS (ALLOWLIST)');
+      expect(allowHeader, findsOneWidget);
+      await tester.ensureVisible(allowHeader);
+      await tester.pumpAndSettle();
+      expect(find.text('pnpm test'), findsOneWidget);
+      expect(find.text('rm -rf'), findsOneWidget);
+
+      // Add a new custom allow prefix
+      final allowField = find.widgetWithText(
+        TextField,
+        'Add allow prefix (e.g. "pnpm test", "make check")',
+      );
+      await tester.ensureVisible(allowField);
+      await tester.pumpAndSettle();
+      await tester.enterText(allowField, 'cargo check');
+      await tester.pumpAndSettle();
+      final addAllowBtn = find.widgetWithText(FilledButton, 'Add').first;
+      await tester.ensureVisible(addAllowBtn);
+      await tester.pumpAndSettle();
+      await tester.tap(addAllowBtn);
+      await tester.pumpAndSettle();
+      expect(client.fakeJudgeRules.customAllowCommands, contains('cargo check'));
+
+      // Verify custom deny rules editor
+      final denyHeader = find.text('HARD DENY RULES (BLOCKED IMMEDIATELY)');
+      expect(denyHeader, findsOneWidget);
+      await tester.ensureVisible(denyHeader);
+      await tester.pumpAndSettle();
+      expect(find.text('terraform apply'), findsOneWidget);
+
+      // Add a new custom deny pattern
+      final denyField = find.widgetWithText(
+        TextField,
+        'Add deny pattern (e.g. "terraform apply", "drop database")',
+      );
+      await tester.ensureVisible(denyField);
+      await tester.pumpAndSettle();
+      await tester.enterText(denyField, 'drop database');
+      await tester.pumpAndSettle();
+      final addDenyBtn = find.widgetWithText(FilledButton, 'Add').last;
+      await tester.ensureVisible(addDenyBtn);
+      await tester.pumpAndSettle();
+      await tester.tap(addDenyBtn);
+      await tester.pumpAndSettle();
+      expect(client.fakeJudgeRules.customDenySubstrings, contains('drop database'));
     });
   });
 }
