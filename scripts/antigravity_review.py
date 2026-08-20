@@ -17,7 +17,7 @@ import urllib.request
 
 # Files to exclude from LLM diff review to save context and avoid reviewing generated code
 IGNORED_PATTERNS = [
-    "flutter/triage_client/lib/src/generated/",
+    "flutter/triage_client/lib/generated/",
     "crates/triaged/dist/",
     "Cargo.lock",
     "pubspec.lock",
@@ -216,6 +216,7 @@ def post_comment(
 
 
 def main():
+    is_local = "--local" in sys.argv or "--stdout" in sys.argv
     api_key = os.getenv("ANTIGRAVITY_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("ANTIGRAVITY_API_KEY or GEMINI_API_KEY not set; skipping automated code review.", file=sys.stderr)
@@ -230,11 +231,13 @@ def main():
     pr_title = os.getenv("PR_TITLE", "")
     pr_body = os.getenv("PR_BODY", "")
 
-    if not (github_token and repo and pr_number):
-        print("Missing GitHub environment context (GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER).", file=sys.stderr)
-        sys.exit(0)
+    if not is_local and not (github_token and repo and pr_number):
+        is_local = True
 
     diff = get_pr_diff(base_ref, base_sha)
+    if not diff:
+        # Fall back to working tree diff if branch diff is clean
+        diff = run_cmd(["git", "diff", "HEAD"])
     if not diff:
         print("No reviewable diff found.")
         sys.exit(0)
@@ -316,8 +319,14 @@ Be direct, highly technical, actionable, and precise.
         print("Failed to get review from API.", file=sys.stderr)
         sys.exit(1)
 
-    print("Posting review comment to GitHub...")
-    post_comment(github_token, repo, pr_number, review, head_sha=head_sha)
+    if is_local:
+        print("\n" + "=" * 80)
+        print("## 🪐 Antigravity Code Review (Local)")
+        print("=" * 80 + "\n")
+        print(review)
+    else:
+        print("Posting review comment to GitHub...")
+        post_comment(github_token, repo, pr_number, review, head_sha=head_sha)
 
 
 if __name__ == "__main__":

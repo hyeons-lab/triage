@@ -141,7 +141,7 @@ mod tests {
                 .headers()
                 .get(hyper::header::CACHE_CONTROL)
                 .unwrap(),
-            "no-cache, no-store, must-revalidate"
+            "no-cache, must-revalidate"
         );
 
         // Verify body content
@@ -182,21 +182,21 @@ mod tests {
                 .headers()
                 .get(hyper::header::CACHE_CONTROL)
                 .unwrap(),
-            "no-cache, no-store, must-revalidate"
-        );
-        assert_eq!(
-            response.headers().get("clear-site-data").unwrap(),
-            "\"cache\""
+            "no-cache, must-revalidate"
         );
     }
 
     #[tokio::test]
-    async fn test_serve_http_stale_service_worker_cleanup() {
+    async fn test_serve_http_service_worker_serving() {
         let temp_dir = TempDir::new().unwrap();
         let cache = Arc::new(WebAssetCache::new(Some(temp_dir.path.clone())));
 
         let config = SessionManagerConfig::new(temp_dir.path.clone());
         let manager = Arc::new(SessionManager::new(config));
+
+        let sw_file = temp_dir.path.join("flutter_service_worker.js");
+        let content_bytes = b"// standard flutter service worker";
+        std::fs::write(&sw_file, content_bytes).unwrap();
 
         let req = Request::builder()
             .method("GET")
@@ -220,18 +220,12 @@ mod tests {
                 .headers()
                 .get(hyper::header::CACHE_CONTROL)
                 .unwrap(),
-            "no-cache, no-store, must-revalidate"
-        );
-        assert_eq!(
-            response.headers().get("clear-site-data").unwrap(),
-            "\"cache\""
+            "no-cache, must-revalidate"
         );
 
         use http_body_util::BodyExt;
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
-        assert!(body.contains("registration.unregister"));
-        assert!(body.contains("caches.delete"));
+        assert_eq!(body_bytes.as_ref(), content_bytes);
     }
 
     #[tokio::test]

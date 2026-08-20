@@ -134,7 +134,18 @@ enum ClientRequestPayloadTypeId {
   ShutdownSessionRequest(14),
   PairingChallengeRequest(15),
   ListSessionSnippetsRequest(16),
-  ListSessionContextsRequest(17);
+  ListSessionContextsRequest(17),
+  GetSessionJudgePolicyRequest(18),
+  SetSessionJudgePolicyRequest(19),
+  ListSessionJudgePoliciesRequest(20),
+  GetJudgeHookStatusRequest(21),
+  ConfigureJudgeHookRequest(22),
+  GetJudgeHistoryRequest(23),
+  GetJudgeRulesRequest(24),
+  AddJudgeAllowCommandRequest(25),
+  RemoveJudgeAllowCommandRequest(26),
+  AddJudgeDenySubstringRequest(27),
+  RemoveJudgeDenySubstringRequest(28);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -159,6 +170,17 @@ enum ClientRequestPayloadTypeId {
       case 15: return ClientRequestPayloadTypeId.PairingChallengeRequest;
       case 16: return ClientRequestPayloadTypeId.ListSessionSnippetsRequest;
       case 17: return ClientRequestPayloadTypeId.ListSessionContextsRequest;
+      case 18: return ClientRequestPayloadTypeId.GetSessionJudgePolicyRequest;
+      case 19: return ClientRequestPayloadTypeId.SetSessionJudgePolicyRequest;
+      case 20: return ClientRequestPayloadTypeId.ListSessionJudgePoliciesRequest;
+      case 21: return ClientRequestPayloadTypeId.GetJudgeHookStatusRequest;
+      case 22: return ClientRequestPayloadTypeId.ConfigureJudgeHookRequest;
+      case 23: return ClientRequestPayloadTypeId.GetJudgeHistoryRequest;
+      case 24: return ClientRequestPayloadTypeId.GetJudgeRulesRequest;
+      case 25: return ClientRequestPayloadTypeId.AddJudgeAllowCommandRequest;
+      case 26: return ClientRequestPayloadTypeId.RemoveJudgeAllowCommandRequest;
+      case 27: return ClientRequestPayloadTypeId.AddJudgeDenySubstringRequest;
+      case 28: return ClientRequestPayloadTypeId.RemoveJudgeDenySubstringRequest;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -167,7 +189,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 17;
+  static const int maxValue = 28;
   static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
@@ -197,7 +219,12 @@ enum ServerResultPayloadTypeId {
   CompletedSessionResult(11),
   PairingChallengeResult(12),
   SessionSnippetsResult(13),
-  SessionContextsResult(14);
+  SessionContextsResult(14),
+  SessionJudgePolicyResult(15),
+  SessionJudgePoliciesResult(16),
+  JudgeHookStatusResult(17),
+  JudgeHistoryResult(18),
+  JudgeRulesResult(19);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
@@ -219,6 +246,11 @@ enum ServerResultPayloadTypeId {
       case 12: return ServerResultPayloadTypeId.PairingChallengeResult;
       case 13: return ServerResultPayloadTypeId.SessionSnippetsResult;
       case 14: return ServerResultPayloadTypeId.SessionContextsResult;
+      case 15: return ServerResultPayloadTypeId.SessionJudgePolicyResult;
+      case 16: return ServerResultPayloadTypeId.SessionJudgePoliciesResult;
+      case 17: return ServerResultPayloadTypeId.JudgeHookStatusResult;
+      case 18: return ServerResultPayloadTypeId.JudgeHistoryResult;
+      case 19: return ServerResultPayloadTypeId.JudgeRulesResult;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -227,7 +259,7 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 14;
+  static const int maxValue = 19;
   static const fb.Reader<ServerResultPayloadTypeId> reader = _ServerResultPayloadTypeIdReader();
 }
 
@@ -292,7 +324,8 @@ enum ServerMessagePayloadTypeId {
   SubscriptionClosedPayload(4),
   SessionSnippetUpdatedPayload(5),
   SessionContextUpdatedPayload(6),
-  UpdateAvailablePayload(7);
+  UpdateAvailablePayload(7),
+  SessionJudgePolicyUpdatedPayload(8);
 
   final int value;
   const ServerMessagePayloadTypeId(this.value);
@@ -307,6 +340,7 @@ enum ServerMessagePayloadTypeId {
       case 5: return ServerMessagePayloadTypeId.SessionSnippetUpdatedPayload;
       case 6: return ServerMessagePayloadTypeId.SessionContextUpdatedPayload;
       case 7: return ServerMessagePayloadTypeId.UpdateAvailablePayload;
+      case 8: return ServerMessagePayloadTypeId.SessionJudgePolicyUpdatedPayload;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -315,7 +349,7 @@ enum ServerMessagePayloadTypeId {
       value == null ? null : ServerMessagePayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 7;
+  static const int maxValue = 8;
   static const fb.Reader<ServerMessagePayloadTypeId> reader = _ServerMessagePayloadTypeIdReader();
 }
 
@@ -3006,6 +3040,755 @@ class ListSessionContextsRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class GetSessionJudgePolicyRequest {
+  GetSessionJudgePolicyRequest._(this._bc, this._bcOffset);
+  factory GetSessionJudgePolicyRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<GetSessionJudgePolicyRequest> reader = _GetSessionJudgePolicyRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'GetSessionJudgePolicyRequest{sessionId: ${sessionId}}';
+  }
+}
+
+class _GetSessionJudgePolicyRequestReader extends fb.TableReader<GetSessionJudgePolicyRequest> {
+  const _GetSessionJudgePolicyRequestReader();
+
+  @override
+  GetSessionJudgePolicyRequest createObject(fb.BufferContext bc, int offset) => 
+    GetSessionJudgePolicyRequest._(bc, offset);
+}
+
+class GetSessionJudgePolicyRequestBuilder {
+  GetSessionJudgePolicyRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class GetSessionJudgePolicyRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+
+  GetSessionJudgePolicyRequestObjectBuilder({
+    String? sessionId,
+  })
+      : _sessionId = sessionId;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SetSessionJudgePolicyRequest {
+  SetSessionJudgePolicyRequest._(this._bc, this._bcOffset);
+  factory SetSessionJudgePolicyRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SetSessionJudgePolicyRequest> reader = _SetSessionJudgePolicyRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  bool get hasEnabled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+  bool get enabled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 8, false);
+
+  @override
+  String toString() {
+    return 'SetSessionJudgePolicyRequest{sessionId: ${sessionId}, hasEnabled: ${hasEnabled}, enabled: ${enabled}}';
+  }
+}
+
+class _SetSessionJudgePolicyRequestReader extends fb.TableReader<SetSessionJudgePolicyRequest> {
+  const _SetSessionJudgePolicyRequestReader();
+
+  @override
+  SetSessionJudgePolicyRequest createObject(fb.BufferContext bc, int offset) => 
+    SetSessionJudgePolicyRequest._(bc, offset);
+}
+
+class SetSessionJudgePolicyRequestBuilder {
+  SetSessionJudgePolicyRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(3);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addHasEnabled(bool? hasEnabled) {
+    fbBuilder.addBool(1, hasEnabled);
+    return fbBuilder.offset;
+  }
+  int addEnabled(bool? enabled) {
+    fbBuilder.addBool(2, enabled);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SetSessionJudgePolicyRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final bool? _hasEnabled;
+  final bool? _enabled;
+
+  SetSessionJudgePolicyRequestObjectBuilder({
+    String? sessionId,
+    bool? hasEnabled,
+    bool? enabled,
+  })
+      : _sessionId = sessionId,
+        _hasEnabled = hasEnabled,
+        _enabled = enabled;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addBool(1, _hasEnabled);
+    fbBuilder.addBool(2, _enabled);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class ListSessionJudgePoliciesRequest {
+  ListSessionJudgePoliciesRequest._(this._bc, this._bcOffset);
+  factory ListSessionJudgePoliciesRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<ListSessionJudgePoliciesRequest> reader = _ListSessionJudgePoliciesRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'ListSessionJudgePoliciesRequest{}';
+  }
+}
+
+class _ListSessionJudgePoliciesRequestReader extends fb.TableReader<ListSessionJudgePoliciesRequest> {
+  const _ListSessionJudgePoliciesRequestReader();
+
+  @override
+  ListSessionJudgePoliciesRequest createObject(fb.BufferContext bc, int offset) => 
+    ListSessionJudgePoliciesRequest._(bc, offset);
+}
+
+class ListSessionJudgePoliciesRequestObjectBuilder extends fb.ObjectBuilder {
+
+  ListSessionJudgePoliciesRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class GetJudgeHookStatusRequest {
+  GetJudgeHookStatusRequest._(this._bc, this._bcOffset);
+  factory GetJudgeHookStatusRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<GetJudgeHookStatusRequest> reader = _GetJudgeHookStatusRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get workspacePath => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'GetJudgeHookStatusRequest{workspacePath: ${workspacePath}}';
+  }
+}
+
+class _GetJudgeHookStatusRequestReader extends fb.TableReader<GetJudgeHookStatusRequest> {
+  const _GetJudgeHookStatusRequestReader();
+
+  @override
+  GetJudgeHookStatusRequest createObject(fb.BufferContext bc, int offset) => 
+    GetJudgeHookStatusRequest._(bc, offset);
+}
+
+class GetJudgeHookStatusRequestBuilder {
+  GetJudgeHookStatusRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addWorkspacePathOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class GetJudgeHookStatusRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _workspacePath;
+
+  GetJudgeHookStatusRequestObjectBuilder({
+    String? workspacePath,
+  })
+      : _workspacePath = workspacePath;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? workspacePathOffset = _workspacePath == null ? null
+        : fbBuilder.writeString(_workspacePath!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, workspacePathOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class ConfigureJudgeHookRequest {
+  ConfigureJudgeHookRequest._(this._bc, this._bcOffset);
+  factory ConfigureJudgeHookRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<ConfigureJudgeHookRequest> reader = _ConfigureJudgeHookRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get workspacePath => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  bool get enabled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+
+  @override
+  String toString() {
+    return 'ConfigureJudgeHookRequest{workspacePath: ${workspacePath}, enabled: ${enabled}}';
+  }
+}
+
+class _ConfigureJudgeHookRequestReader extends fb.TableReader<ConfigureJudgeHookRequest> {
+  const _ConfigureJudgeHookRequestReader();
+
+  @override
+  ConfigureJudgeHookRequest createObject(fb.BufferContext bc, int offset) => 
+    ConfigureJudgeHookRequest._(bc, offset);
+}
+
+class ConfigureJudgeHookRequestBuilder {
+  ConfigureJudgeHookRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addWorkspacePathOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addEnabled(bool? enabled) {
+    fbBuilder.addBool(1, enabled);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class ConfigureJudgeHookRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _workspacePath;
+  final bool? _enabled;
+
+  ConfigureJudgeHookRequestObjectBuilder({
+    String? workspacePath,
+    bool? enabled,
+  })
+      : _workspacePath = workspacePath,
+        _enabled = enabled;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? workspacePathOffset = _workspacePath == null ? null
+        : fbBuilder.writeString(_workspacePath!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, workspacePathOffset);
+    fbBuilder.addBool(1, _enabled);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class GetJudgeHistoryRequest {
+  GetJudgeHistoryRequest._(this._bc, this._bcOffset);
+  factory GetJudgeHistoryRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<GetJudgeHistoryRequest> reader = _GetJudgeHistoryRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'GetJudgeHistoryRequest{}';
+  }
+}
+
+class _GetJudgeHistoryRequestReader extends fb.TableReader<GetJudgeHistoryRequest> {
+  const _GetJudgeHistoryRequestReader();
+
+  @override
+  GetJudgeHistoryRequest createObject(fb.BufferContext bc, int offset) => 
+    GetJudgeHistoryRequest._(bc, offset);
+}
+
+class GetJudgeHistoryRequestObjectBuilder extends fb.ObjectBuilder {
+
+  GetJudgeHistoryRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class GetJudgeRulesRequest {
+  GetJudgeRulesRequest._(this._bc, this._bcOffset);
+  factory GetJudgeRulesRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<GetJudgeRulesRequest> reader = _GetJudgeRulesRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'GetJudgeRulesRequest{}';
+  }
+}
+
+class _GetJudgeRulesRequestReader extends fb.TableReader<GetJudgeRulesRequest> {
+  const _GetJudgeRulesRequestReader();
+
+  @override
+  GetJudgeRulesRequest createObject(fb.BufferContext bc, int offset) => 
+    GetJudgeRulesRequest._(bc, offset);
+}
+
+class GetJudgeRulesRequestObjectBuilder extends fb.ObjectBuilder {
+
+  GetJudgeRulesRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class AddJudgeAllowCommandRequest {
+  AddJudgeAllowCommandRequest._(this._bc, this._bcOffset);
+  factory AddJudgeAllowCommandRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<AddJudgeAllowCommandRequest> reader = _AddJudgeAllowCommandRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get command => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'AddJudgeAllowCommandRequest{command: ${command}}';
+  }
+}
+
+class _AddJudgeAllowCommandRequestReader extends fb.TableReader<AddJudgeAllowCommandRequest> {
+  const _AddJudgeAllowCommandRequestReader();
+
+  @override
+  AddJudgeAllowCommandRequest createObject(fb.BufferContext bc, int offset) => 
+    AddJudgeAllowCommandRequest._(bc, offset);
+}
+
+class AddJudgeAllowCommandRequestBuilder {
+  AddJudgeAllowCommandRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addCommandOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class AddJudgeAllowCommandRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _command;
+
+  AddJudgeAllowCommandRequestObjectBuilder({
+    String? command,
+  })
+      : _command = command;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? commandOffset = _command == null ? null
+        : fbBuilder.writeString(_command!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, commandOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class RemoveJudgeAllowCommandRequest {
+  RemoveJudgeAllowCommandRequest._(this._bc, this._bcOffset);
+  factory RemoveJudgeAllowCommandRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<RemoveJudgeAllowCommandRequest> reader = _RemoveJudgeAllowCommandRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get command => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'RemoveJudgeAllowCommandRequest{command: ${command}}';
+  }
+}
+
+class _RemoveJudgeAllowCommandRequestReader extends fb.TableReader<RemoveJudgeAllowCommandRequest> {
+  const _RemoveJudgeAllowCommandRequestReader();
+
+  @override
+  RemoveJudgeAllowCommandRequest createObject(fb.BufferContext bc, int offset) => 
+    RemoveJudgeAllowCommandRequest._(bc, offset);
+}
+
+class RemoveJudgeAllowCommandRequestBuilder {
+  RemoveJudgeAllowCommandRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addCommandOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class RemoveJudgeAllowCommandRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _command;
+
+  RemoveJudgeAllowCommandRequestObjectBuilder({
+    String? command,
+  })
+      : _command = command;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? commandOffset = _command == null ? null
+        : fbBuilder.writeString(_command!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, commandOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class AddJudgeDenySubstringRequest {
+  AddJudgeDenySubstringRequest._(this._bc, this._bcOffset);
+  factory AddJudgeDenySubstringRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<AddJudgeDenySubstringRequest> reader = _AddJudgeDenySubstringRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get substring => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'AddJudgeDenySubstringRequest{substring: ${substring}}';
+  }
+}
+
+class _AddJudgeDenySubstringRequestReader extends fb.TableReader<AddJudgeDenySubstringRequest> {
+  const _AddJudgeDenySubstringRequestReader();
+
+  @override
+  AddJudgeDenySubstringRequest createObject(fb.BufferContext bc, int offset) => 
+    AddJudgeDenySubstringRequest._(bc, offset);
+}
+
+class AddJudgeDenySubstringRequestBuilder {
+  AddJudgeDenySubstringRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addSubstringOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class AddJudgeDenySubstringRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _substring;
+
+  AddJudgeDenySubstringRequestObjectBuilder({
+    String? substring,
+  })
+      : _substring = substring;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? substringOffset = _substring == null ? null
+        : fbBuilder.writeString(_substring!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, substringOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class RemoveJudgeDenySubstringRequest {
+  RemoveJudgeDenySubstringRequest._(this._bc, this._bcOffset);
+  factory RemoveJudgeDenySubstringRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<RemoveJudgeDenySubstringRequest> reader = _RemoveJudgeDenySubstringRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get substring => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'RemoveJudgeDenySubstringRequest{substring: ${substring}}';
+  }
+}
+
+class _RemoveJudgeDenySubstringRequestReader extends fb.TableReader<RemoveJudgeDenySubstringRequest> {
+  const _RemoveJudgeDenySubstringRequestReader();
+
+  @override
+  RemoveJudgeDenySubstringRequest createObject(fb.BufferContext bc, int offset) => 
+    RemoveJudgeDenySubstringRequest._(bc, offset);
+}
+
+class RemoveJudgeDenySubstringRequestBuilder {
+  RemoveJudgeDenySubstringRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addSubstringOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class RemoveJudgeDenySubstringRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _substring;
+
+  RemoveJudgeDenySubstringRequestObjectBuilder({
+    String? substring,
+  })
+      : _substring = substring;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? substringOffset = _substring == null ? null
+        : fbBuilder.writeString(_substring!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, substringOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ClientMessage {
   ClientMessage._(this._bc, this._bcOffset);
   factory ClientMessage(List<int> bytes) {
@@ -3039,6 +3822,17 @@ class ClientMessage {
       case 15: return PairingChallengeRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 16: return ListSessionSnippetsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 17: return ListSessionContextsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 18: return GetSessionJudgePolicyRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 19: return SetSessionJudgePolicyRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 20: return ListSessionJudgePoliciesRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 21: return GetJudgeHookStatusRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 22: return ConfigureJudgeHookRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 23: return GetJudgeHistoryRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 24: return GetJudgeRulesRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 25: return AddJudgeAllowCommandRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 26: return RemoveJudgeAllowCommandRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 27: return AddJudgeDenySubstringRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 28: return RemoveJudgeDenySubstringRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -4379,6 +5173,597 @@ class SessionContextsResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionJudgePolicyResult {
+  SessionJudgePolicyResult._(this._bc, this._bcOffset);
+  factory SessionJudgePolicyResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionJudgePolicyResult> reader = _SessionJudgePolicyResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  bool get hasPinned => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+  bool get pinned => const fb.BoolReader().vTableGet(_bc, _bcOffset, 8, false);
+  bool get effective => const fb.BoolReader().vTableGet(_bc, _bcOffset, 10, false);
+
+  @override
+  String toString() {
+    return 'SessionJudgePolicyResult{sessionId: ${sessionId}, hasPinned: ${hasPinned}, pinned: ${pinned}, effective: ${effective}}';
+  }
+}
+
+class _SessionJudgePolicyResultReader extends fb.TableReader<SessionJudgePolicyResult> {
+  const _SessionJudgePolicyResultReader();
+
+  @override
+  SessionJudgePolicyResult createObject(fb.BufferContext bc, int offset) => 
+    SessionJudgePolicyResult._(bc, offset);
+}
+
+class SessionJudgePolicyResultBuilder {
+  SessionJudgePolicyResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(4);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addHasPinned(bool? hasPinned) {
+    fbBuilder.addBool(1, hasPinned);
+    return fbBuilder.offset;
+  }
+  int addPinned(bool? pinned) {
+    fbBuilder.addBool(2, pinned);
+    return fbBuilder.offset;
+  }
+  int addEffective(bool? effective) {
+    fbBuilder.addBool(3, effective);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionJudgePolicyResultObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final bool? _hasPinned;
+  final bool? _pinned;
+  final bool? _effective;
+
+  SessionJudgePolicyResultObjectBuilder({
+    String? sessionId,
+    bool? hasPinned,
+    bool? pinned,
+    bool? effective,
+  })
+      : _sessionId = sessionId,
+        _hasPinned = hasPinned,
+        _pinned = pinned,
+        _effective = effective;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addBool(1, _hasPinned);
+    fbBuilder.addBool(2, _pinned);
+    fbBuilder.addBool(3, _effective);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SessionJudgePoliciesResult {
+  SessionJudgePoliciesResult._(this._bc, this._bcOffset);
+  factory SessionJudgePoliciesResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionJudgePoliciesResult> reader = _SessionJudgePoliciesResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<SessionJudgePolicyResult>? get entries => const fb.ListReader<SessionJudgePolicyResult>(SessionJudgePolicyResult.reader).vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'SessionJudgePoliciesResult{entries: ${entries}}';
+  }
+}
+
+class _SessionJudgePoliciesResultReader extends fb.TableReader<SessionJudgePoliciesResult> {
+  const _SessionJudgePoliciesResultReader();
+
+  @override
+  SessionJudgePoliciesResult createObject(fb.BufferContext bc, int offset) => 
+    SessionJudgePoliciesResult._(bc, offset);
+}
+
+class SessionJudgePoliciesResultBuilder {
+  SessionJudgePoliciesResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addEntriesOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionJudgePoliciesResultObjectBuilder extends fb.ObjectBuilder {
+  final List<SessionJudgePolicyResultObjectBuilder>? _entries;
+
+  SessionJudgePoliciesResultObjectBuilder({
+    List<SessionJudgePolicyResultObjectBuilder>? entries,
+  })
+      : _entries = entries;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? entriesOffset = _entries == null ? null
+        : fbBuilder.writeList(_entries!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, entriesOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class JudgeHookStatusResult {
+  JudgeHookStatusResult._(this._bc, this._bcOffset);
+  factory JudgeHookStatusResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<JudgeHookStatusResult> reader = _JudgeHookStatusResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get path => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  bool get exists => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+  bool get enabled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 8, false);
+  bool get shimInstalled => const fb.BoolReader().vTableGet(_bc, _bcOffset, 10, false);
+
+  @override
+  String toString() {
+    return 'JudgeHookStatusResult{path: ${path}, exists: ${exists}, enabled: ${enabled}, shimInstalled: ${shimInstalled}}';
+  }
+}
+
+class _JudgeHookStatusResultReader extends fb.TableReader<JudgeHookStatusResult> {
+  const _JudgeHookStatusResultReader();
+
+  @override
+  JudgeHookStatusResult createObject(fb.BufferContext bc, int offset) => 
+    JudgeHookStatusResult._(bc, offset);
+}
+
+class JudgeHookStatusResultBuilder {
+  JudgeHookStatusResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(4);
+  }
+
+  int addPathOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addExists(bool? exists) {
+    fbBuilder.addBool(1, exists);
+    return fbBuilder.offset;
+  }
+  int addEnabled(bool? enabled) {
+    fbBuilder.addBool(2, enabled);
+    return fbBuilder.offset;
+  }
+  int addShimInstalled(bool? shimInstalled) {
+    fbBuilder.addBool(3, shimInstalled);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class JudgeHookStatusResultObjectBuilder extends fb.ObjectBuilder {
+  final String? _path;
+  final bool? _exists;
+  final bool? _enabled;
+  final bool? _shimInstalled;
+
+  JudgeHookStatusResultObjectBuilder({
+    String? path,
+    bool? exists,
+    bool? enabled,
+    bool? shimInstalled,
+  })
+      : _path = path,
+        _exists = exists,
+        _enabled = enabled,
+        _shimInstalled = shimInstalled;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? pathOffset = _path == null ? null
+        : fbBuilder.writeString(_path!);
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, pathOffset);
+    fbBuilder.addBool(1, _exists);
+    fbBuilder.addBool(2, _enabled);
+    fbBuilder.addBool(3, _shimInstalled);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class JudgeRecordEntry {
+  JudgeRecordEntry._(this._bc, this._bcOffset);
+  factory JudgeRecordEntry(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<JudgeRecordEntry> reader = _JudgeRecordEntryReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get timestamp => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get toolName => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get commandLine => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
+  String? get decision => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+  String? get source => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 14);
+  String? get reason => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 16);
+
+  @override
+  String toString() {
+    return 'JudgeRecordEntry{timestamp: ${timestamp}, sessionId: ${sessionId}, toolName: ${toolName}, commandLine: ${commandLine}, decision: ${decision}, source: ${source}, reason: ${reason}}';
+  }
+}
+
+class _JudgeRecordEntryReader extends fb.TableReader<JudgeRecordEntry> {
+  const _JudgeRecordEntryReader();
+
+  @override
+  JudgeRecordEntry createObject(fb.BufferContext bc, int offset) => 
+    JudgeRecordEntry._(bc, offset);
+}
+
+class JudgeRecordEntryBuilder {
+  JudgeRecordEntryBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(7);
+  }
+
+  int addTimestampOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addToolNameOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addCommandLineOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+  int addDecisionOffset(int? offset) {
+    fbBuilder.addOffset(4, offset);
+    return fbBuilder.offset;
+  }
+  int addSourceOffset(int? offset) {
+    fbBuilder.addOffset(5, offset);
+    return fbBuilder.offset;
+  }
+  int addReasonOffset(int? offset) {
+    fbBuilder.addOffset(6, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class JudgeRecordEntryObjectBuilder extends fb.ObjectBuilder {
+  final String? _timestamp;
+  final String? _sessionId;
+  final String? _toolName;
+  final String? _commandLine;
+  final String? _decision;
+  final String? _source;
+  final String? _reason;
+
+  JudgeRecordEntryObjectBuilder({
+    String? timestamp,
+    String? sessionId,
+    String? toolName,
+    String? commandLine,
+    String? decision,
+    String? source,
+    String? reason,
+  })
+      : _timestamp = timestamp,
+        _sessionId = sessionId,
+        _toolName = toolName,
+        _commandLine = commandLine,
+        _decision = decision,
+        _source = source,
+        _reason = reason;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? timestampOffset = _timestamp == null ? null
+        : fbBuilder.writeString(_timestamp!);
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? toolNameOffset = _toolName == null ? null
+        : fbBuilder.writeString(_toolName!);
+    final int? commandLineOffset = _commandLine == null ? null
+        : fbBuilder.writeString(_commandLine!);
+    final int? decisionOffset = _decision == null ? null
+        : fbBuilder.writeString(_decision!);
+    final int? sourceOffset = _source == null ? null
+        : fbBuilder.writeString(_source!);
+    final int? reasonOffset = _reason == null ? null
+        : fbBuilder.writeString(_reason!);
+    fbBuilder.startTable(7);
+    fbBuilder.addOffset(0, timestampOffset);
+    fbBuilder.addOffset(1, sessionIdOffset);
+    fbBuilder.addOffset(2, toolNameOffset);
+    fbBuilder.addOffset(3, commandLineOffset);
+    fbBuilder.addOffset(4, decisionOffset);
+    fbBuilder.addOffset(5, sourceOffset);
+    fbBuilder.addOffset(6, reasonOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class JudgeHistoryResult {
+  JudgeHistoryResult._(this._bc, this._bcOffset);
+  factory JudgeHistoryResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<JudgeHistoryResult> reader = _JudgeHistoryResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<JudgeRecordEntry>? get records => const fb.ListReader<JudgeRecordEntry>(JudgeRecordEntry.reader).vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'JudgeHistoryResult{records: ${records}}';
+  }
+}
+
+class _JudgeHistoryResultReader extends fb.TableReader<JudgeHistoryResult> {
+  const _JudgeHistoryResultReader();
+
+  @override
+  JudgeHistoryResult createObject(fb.BufferContext bc, int offset) => 
+    JudgeHistoryResult._(bc, offset);
+}
+
+class JudgeHistoryResultBuilder {
+  JudgeHistoryResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addRecordsOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class JudgeHistoryResultObjectBuilder extends fb.ObjectBuilder {
+  final List<JudgeRecordEntryObjectBuilder>? _records;
+
+  JudgeHistoryResultObjectBuilder({
+    List<JudgeRecordEntryObjectBuilder>? records,
+  })
+      : _records = records;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? recordsOffset = _records == null ? null
+        : fbBuilder.writeList(_records!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, recordsOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class JudgeRulesResult {
+  JudgeRulesResult._(this._bc, this._bcOffset);
+  factory JudgeRulesResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<JudgeRulesResult> reader = _JudgeRulesResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<String>? get builtinAllowCommands => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 4);
+  List<String>? get customAllowCommands => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 6);
+  List<String>? get builtinDenySubstrings => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 8);
+  List<String>? get customDenySubstrings => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 10);
+
+  @override
+  String toString() {
+    return 'JudgeRulesResult{builtinAllowCommands: ${builtinAllowCommands}, customAllowCommands: ${customAllowCommands}, builtinDenySubstrings: ${builtinDenySubstrings}, customDenySubstrings: ${customDenySubstrings}}';
+  }
+}
+
+class _JudgeRulesResultReader extends fb.TableReader<JudgeRulesResult> {
+  const _JudgeRulesResultReader();
+
+  @override
+  JudgeRulesResult createObject(fb.BufferContext bc, int offset) => 
+    JudgeRulesResult._(bc, offset);
+}
+
+class JudgeRulesResultBuilder {
+  JudgeRulesResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(4);
+  }
+
+  int addBuiltinAllowCommandsOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addCustomAllowCommandsOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addBuiltinDenySubstringsOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addCustomDenySubstringsOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class JudgeRulesResultObjectBuilder extends fb.ObjectBuilder {
+  final List<String>? _builtinAllowCommands;
+  final List<String>? _customAllowCommands;
+  final List<String>? _builtinDenySubstrings;
+  final List<String>? _customDenySubstrings;
+
+  JudgeRulesResultObjectBuilder({
+    List<String>? builtinAllowCommands,
+    List<String>? customAllowCommands,
+    List<String>? builtinDenySubstrings,
+    List<String>? customDenySubstrings,
+  })
+      : _builtinAllowCommands = builtinAllowCommands,
+        _customAllowCommands = customAllowCommands,
+        _builtinDenySubstrings = builtinDenySubstrings,
+        _customDenySubstrings = customDenySubstrings;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? builtinAllowCommandsOffset = _builtinAllowCommands == null ? null
+        : fbBuilder.writeList(_builtinAllowCommands!.map(fbBuilder.writeString).toList());
+    final int? customAllowCommandsOffset = _customAllowCommands == null ? null
+        : fbBuilder.writeList(_customAllowCommands!.map(fbBuilder.writeString).toList());
+    final int? builtinDenySubstringsOffset = _builtinDenySubstrings == null ? null
+        : fbBuilder.writeList(_builtinDenySubstrings!.map(fbBuilder.writeString).toList());
+    final int? customDenySubstringsOffset = _customDenySubstrings == null ? null
+        : fbBuilder.writeList(_customDenySubstrings!.map(fbBuilder.writeString).toList());
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, builtinAllowCommandsOffset);
+    fbBuilder.addOffset(1, customAllowCommandsOffset);
+    fbBuilder.addOffset(2, builtinDenySubstringsOffset);
+    fbBuilder.addOffset(3, customDenySubstringsOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ResponsePayload {
   ResponsePayload._(this._bc, this._bcOffset);
   factory ResponsePayload(List<int> bytes) {
@@ -4409,6 +5794,11 @@ class ResponsePayload {
       case 12: return PairingChallengeResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 13: return SessionSnippetsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 14: return SessionContextsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 15: return SessionJudgePolicyResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 16: return SessionJudgePoliciesResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 17: return JudgeHookStatusResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 18: return JudgeHistoryResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 19: return JudgeRulesResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -5506,6 +6896,106 @@ class UpdateAvailablePayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionJudgePolicyUpdatedPayload {
+  SessionJudgePolicyUpdatedPayload._(this._bc, this._bcOffset);
+  factory SessionJudgePolicyUpdatedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionJudgePolicyUpdatedPayload> reader = _SessionJudgePolicyUpdatedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  bool get hasPinned => const fb.BoolReader().vTableGet(_bc, _bcOffset, 6, false);
+  bool get pinned => const fb.BoolReader().vTableGet(_bc, _bcOffset, 8, false);
+  bool get effective => const fb.BoolReader().vTableGet(_bc, _bcOffset, 10, false);
+
+  @override
+  String toString() {
+    return 'SessionJudgePolicyUpdatedPayload{sessionId: ${sessionId}, hasPinned: ${hasPinned}, pinned: ${pinned}, effective: ${effective}}';
+  }
+}
+
+class _SessionJudgePolicyUpdatedPayloadReader extends fb.TableReader<SessionJudgePolicyUpdatedPayload> {
+  const _SessionJudgePolicyUpdatedPayloadReader();
+
+  @override
+  SessionJudgePolicyUpdatedPayload createObject(fb.BufferContext bc, int offset) => 
+    SessionJudgePolicyUpdatedPayload._(bc, offset);
+}
+
+class SessionJudgePolicyUpdatedPayloadBuilder {
+  SessionJudgePolicyUpdatedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(4);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addHasPinned(bool? hasPinned) {
+    fbBuilder.addBool(1, hasPinned);
+    return fbBuilder.offset;
+  }
+  int addPinned(bool? pinned) {
+    fbBuilder.addBool(2, pinned);
+    return fbBuilder.offset;
+  }
+  int addEffective(bool? effective) {
+    fbBuilder.addBool(3, effective);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionJudgePolicyUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final bool? _hasPinned;
+  final bool? _pinned;
+  final bool? _effective;
+
+  SessionJudgePolicyUpdatedPayloadObjectBuilder({
+    String? sessionId,
+    bool? hasPinned,
+    bool? pinned,
+    bool? effective,
+  })
+      : _sessionId = sessionId,
+        _hasPinned = hasPinned,
+        _pinned = pinned,
+        _effective = effective;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addBool(1, _hasPinned);
+    fbBuilder.addBool(2, _pinned);
+    fbBuilder.addBool(3, _effective);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ServerMessage {
   ServerMessage._(this._bc, this._bcOffset);
   factory ServerMessage(List<int> bytes) {
@@ -5528,6 +7018,7 @@ class ServerMessage {
       case 5: return SessionSnippetUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 6: return SessionContextUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 7: return UpdateAvailablePayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 8: return SessionJudgePolicyUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       default: return null;
     }
   }

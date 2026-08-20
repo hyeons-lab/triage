@@ -358,6 +358,139 @@ pub fn parse_client_message(
         }
         fb::ClientRequestPayload::ListSessionSnippetsRequest => ClientRequest::ListSessionSnippets,
         fb::ClientRequestPayload::ListSessionContextsRequest => ClientRequest::ListSessionContexts,
+        fb::ClientRequestPayload::GetSessionJudgePolicyRequest => {
+            let req = msg
+                .payload_as_get_session_judge_policy_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "GetSessionJudgePolicyRequest payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            ClientRequest::GetSessionJudgePolicy { session_id }
+        }
+        fb::ClientRequestPayload::SetSessionJudgePolicyRequest => {
+            let req = msg
+                .payload_as_set_session_judge_policy_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "SetSessionJudgePolicyRequest payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let enabled = if req.has_enabled() {
+                Some(req.enabled())
+            } else {
+                None
+            };
+            ClientRequest::SetSessionJudgePolicy {
+                session_id,
+                enabled,
+            }
+        }
+        fb::ClientRequestPayload::ListSessionJudgePoliciesRequest => {
+            ClientRequest::ListSessionJudgePolicies
+        }
+        fb::ClientRequestPayload::GetJudgeHookStatusRequest => {
+            let req = msg
+                .payload_as_get_judge_hook_status_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "GetJudgeHookStatusRequest payload is missing",
+                    )
+                })?;
+            let workspace_path = req.workspace_path().map(str::to_string);
+            ClientRequest::GetJudgeHookStatus { workspace_path }
+        }
+        fb::ClientRequestPayload::ConfigureJudgeHookRequest => {
+            let req = msg
+                .payload_as_configure_judge_hook_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "ConfigureJudgeHookRequest payload is missing",
+                    )
+                })?;
+            let workspace_path = req.workspace_path().map(str::to_string);
+            let enabled = req.enabled();
+            ClientRequest::ConfigureJudgeHook {
+                workspace_path,
+                enabled,
+            }
+        }
+        fb::ClientRequestPayload::GetJudgeHistoryRequest => ClientRequest::GetJudgeHistory,
+        fb::ClientRequestPayload::GetJudgeRulesRequest => ClientRequest::GetJudgeRules,
+        fb::ClientRequestPayload::AddJudgeAllowCommandRequest => {
+            let req = msg
+                .payload_as_add_judge_allow_command_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "AddJudgeAllowCommandRequest payload is missing",
+                    )
+                })?;
+            let command = req
+                .command()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "command is missing"))?
+                .to_string();
+            ClientRequest::AddJudgeAllowCommand { command }
+        }
+        fb::ClientRequestPayload::RemoveJudgeAllowCommandRequest => {
+            let req = msg
+                .payload_as_remove_judge_allow_command_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "RemoveJudgeAllowCommandRequest payload is missing",
+                    )
+                })?;
+            let command = req
+                .command()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "command is missing"))?
+                .to_string();
+            ClientRequest::RemoveJudgeAllowCommand { command }
+        }
+        fb::ClientRequestPayload::AddJudgeDenySubstringRequest => {
+            let req = msg
+                .payload_as_add_judge_deny_substring_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "AddJudgeDenySubstringRequest payload is missing",
+                    )
+                })?;
+            let substring = req
+                .substring()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "substring is missing"))?
+                .to_string();
+            ClientRequest::AddJudgeDenySubstring { substring }
+        }
+        fb::ClientRequestPayload::RemoveJudgeDenySubstringRequest => {
+            let req = msg
+                .payload_as_remove_judge_deny_substring_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "RemoveJudgeDenySubstringRequest payload is missing",
+                    )
+                })?;
+            let substring = req
+                .substring()
+                .ok_or_else(|| crate::ProtocolError::new("missing_field", "substring is missing"))?
+                .to_string();
+            ClientRequest::RemoveJudgeDenySubstring { substring }
+        }
         _ => {
             return Err(crate::ProtocolError::new(
                 "unsupported_payload",
@@ -657,6 +790,144 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::GetSessionJudgePolicy { session_id } => {
+            let sess_id_str = builder.create_string(session_id.as_str());
+            let req = fb::GetSessionJudgePolicyRequest::create(
+                builder,
+                &fb::GetSessionJudgePolicyRequestArgs {
+                    session_id: Some(sess_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::GetSessionJudgePolicyRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::SetSessionJudgePolicy {
+            session_id,
+            enabled,
+        } => {
+            let sess_id_str = builder.create_string(session_id.as_str());
+            let req = fb::SetSessionJudgePolicyRequest::create(
+                builder,
+                &fb::SetSessionJudgePolicyRequestArgs {
+                    session_id: Some(sess_id_str),
+                    has_enabled: enabled.is_some(),
+                    enabled: enabled.unwrap_or(false),
+                },
+            );
+            (
+                fb::ClientRequestPayload::SetSessionJudgePolicyRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::ListSessionJudgePolicies => {
+            let req = fb::ListSessionJudgePoliciesRequest::create(
+                builder,
+                &fb::ListSessionJudgePoliciesRequestArgs {},
+            );
+            (
+                fb::ClientRequestPayload::ListSessionJudgePoliciesRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::GetJudgeHookStatus { workspace_path } => {
+            let ws_str = workspace_path.as_ref().map(|s| builder.create_string(s));
+            let req = fb::GetJudgeHookStatusRequest::create(
+                builder,
+                &fb::GetJudgeHookStatusRequestArgs {
+                    workspace_path: ws_str,
+                },
+            );
+            (
+                fb::ClientRequestPayload::GetJudgeHookStatusRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::ConfigureJudgeHook {
+            workspace_path,
+            enabled,
+        } => {
+            let ws_str = workspace_path.as_ref().map(|s| builder.create_string(s));
+            let req = fb::ConfigureJudgeHookRequest::create(
+                builder,
+                &fb::ConfigureJudgeHookRequestArgs {
+                    workspace_path: ws_str,
+                    enabled: *enabled,
+                },
+            );
+            (
+                fb::ClientRequestPayload::ConfigureJudgeHookRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::GetJudgeHistory => {
+            let req =
+                fb::GetJudgeHistoryRequest::create(builder, &fb::GetJudgeHistoryRequestArgs {});
+            (
+                fb::ClientRequestPayload::GetJudgeHistoryRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::GetJudgeRules => {
+            let req = fb::GetJudgeRulesRequest::create(builder, &fb::GetJudgeRulesRequestArgs {});
+            (
+                fb::ClientRequestPayload::GetJudgeRulesRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::AddJudgeAllowCommand { command } => {
+            let cmd_str = builder.create_string(command);
+            let req = fb::AddJudgeAllowCommandRequest::create(
+                builder,
+                &fb::AddJudgeAllowCommandRequestArgs {
+                    command: Some(cmd_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::AddJudgeAllowCommandRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::RemoveJudgeAllowCommand { command } => {
+            let cmd_str = builder.create_string(command);
+            let req = fb::RemoveJudgeAllowCommandRequest::create(
+                builder,
+                &fb::RemoveJudgeAllowCommandRequestArgs {
+                    command: Some(cmd_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::RemoveJudgeAllowCommandRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::AddJudgeDenySubstring { substring } => {
+            let sub_str = builder.create_string(substring);
+            let req = fb::AddJudgeDenySubstringRequest::create(
+                builder,
+                &fb::AddJudgeDenySubstringRequestArgs {
+                    substring: Some(sub_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::AddJudgeDenySubstringRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::RemoveJudgeDenySubstring { substring } => {
+            let sub_str = builder.create_string(substring);
+            let req = fb::RemoveJudgeDenySubstringRequest::create(
+                builder,
+                &fb::RemoveJudgeDenySubstringRequestArgs {
+                    substring: Some(sub_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::RemoveJudgeDenySubstringRequest,
+                req.as_union_value(),
+            )
+        }
     };
 
     fb::ClientMessage::create(
@@ -917,6 +1188,137 @@ pub fn build_server_message<'a>(
                         r.as_union_value(),
                     )
                 }
+                ServerResult::SessionJudgePolicy { session_id, policy } => {
+                    let sid = builder.create_string(session_id.as_str());
+                    let r = fb::SessionJudgePolicyResult::create(
+                        builder,
+                        &fb::SessionJudgePolicyResultArgs {
+                            session_id: Some(sid),
+                            has_pinned: policy.explicit.is_some(),
+                            pinned: policy.explicit.unwrap_or(false),
+                            effective: policy.effective,
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::SessionJudgePolicyResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::SessionJudgePolicies { entries } => {
+                    let mut entry_offsets = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let sid = builder.create_string(entry.session_id.as_str());
+                        entry_offsets.push(fb::SessionJudgePolicyResult::create(
+                            builder,
+                            &fb::SessionJudgePolicyResultArgs {
+                                session_id: Some(sid),
+                                has_pinned: entry.policy.explicit.is_some(),
+                                pinned: entry.policy.explicit.unwrap_or(false),
+                                effective: entry.policy.effective,
+                            },
+                        ));
+                    }
+                    let entries_vec = builder.create_vector(&entry_offsets);
+                    let r = fb::SessionJudgePoliciesResult::create(
+                        builder,
+                        &fb::SessionJudgePoliciesResultArgs {
+                            entries: Some(entries_vec),
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::SessionJudgePoliciesResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::JudgeHookStatus { status } => {
+                    let path_str = builder.create_string(&status.path);
+                    let r = fb::JudgeHookStatusResult::create(
+                        builder,
+                        &fb::JudgeHookStatusResultArgs {
+                            path: Some(path_str),
+                            exists: status.exists,
+                            enabled: status.enabled,
+                            shim_installed: status.shim_installed,
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::JudgeHookStatusResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::JudgeHistory { records } => {
+                    let mut record_offsets = Vec::with_capacity(records.len());
+                    for record in records {
+                        let ts = builder.create_string(&record.timestamp);
+                        let sid = builder.create_string(record.session_id.as_str());
+                        let tool = builder.create_string(&record.tool_name);
+                        let cmd = record
+                            .command_line
+                            .as_ref()
+                            .map(|s| builder.create_string(s));
+                        let dec = builder.create_string(record.decision.as_hook_str());
+                        let src = builder.create_string(record.source.as_str());
+                        let rsn = builder.create_string(&record.reason);
+                        record_offsets.push(fb::JudgeRecordEntry::create(
+                            builder,
+                            &fb::JudgeRecordEntryArgs {
+                                timestamp: Some(ts),
+                                session_id: Some(sid),
+                                tool_name: Some(tool),
+                                command_line: cmd,
+                                decision: Some(dec),
+                                source: Some(src),
+                                reason: Some(rsn),
+                            },
+                        ));
+                    }
+                    let records_vec = builder.create_vector(&record_offsets);
+                    let r = fb::JudgeHistoryResult::create(
+                        builder,
+                        &fb::JudgeHistoryResultArgs {
+                            records: Some(records_vec),
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::JudgeHistoryResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::JudgeRules { rules } => {
+                    fn create_fb_string_vec<'b>(
+                        strings: &[String],
+                        builder: &mut FlatBufferBuilder<'b>,
+                    ) -> flatbuffers::WIPOffset<
+                        flatbuffers::Vector<'b, flatbuffers::ForwardsUOffset<&'b str>>,
+                    > {
+                        let offsets: Vec<flatbuffers::WIPOffset<&str>> =
+                            strings.iter().map(|s| builder.create_string(s)).collect();
+                        builder.create_vector(&offsets)
+                    }
+
+                    let builtin_allows_vec =
+                        create_fb_string_vec(&rules.builtin_allow_commands, builder);
+                    let custom_allows_vec =
+                        create_fb_string_vec(&rules.custom_allow_commands, builder);
+                    let builtin_denies_vec =
+                        create_fb_string_vec(&rules.builtin_deny_substrings, builder);
+                    let custom_denies_vec =
+                        create_fb_string_vec(&rules.custom_deny_substrings, builder);
+
+                    let r = fb::JudgeRulesResult::create(
+                        builder,
+                        &fb::JudgeRulesResultArgs {
+                            builtin_allow_commands: Some(builtin_allows_vec),
+                            custom_allow_commands: Some(custom_allows_vec),
+                            builtin_deny_substrings: Some(builtin_denies_vec),
+                            custom_deny_substrings: Some(custom_denies_vec),
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::JudgeRulesResult,
+                        r.as_union_value(),
+                    )
+                }
             };
 
             let res_payload = fb::ResponsePayload::create(
@@ -1145,6 +1547,22 @@ pub fn build_server_message<'a>(
                 payload.as_union_value(),
             )
         }
+        ServerMessage::SessionJudgePolicyUpdated { session_id, policy } => {
+            let sid = builder.create_string(session_id.as_str());
+            let payload = fb::SessionJudgePolicyUpdatedPayload::create(
+                builder,
+                &fb::SessionJudgePolicyUpdatedPayloadArgs {
+                    session_id: Some(sid),
+                    has_pinned: policy.explicit.is_some(),
+                    pinned: policy.explicit.unwrap_or(false),
+                    effective: policy.effective,
+                },
+            );
+            (
+                fb::ServerMessagePayload::SessionJudgePolicyUpdatedPayload,
+                payload.as_union_value(),
+            )
+        }
     };
 
     fb::ServerMessage::create(
@@ -1191,6 +1609,21 @@ pub enum ServerResultBorrowed<'a> {
     Subscribed {
         subscription_id: &'a str,
     },
+    SessionJudgePolicy {
+        session_id: &'a str,
+        has_pinned: bool,
+        pinned: bool,
+        effective: bool,
+    },
+    SessionJudgePolicies,
+    JudgeHookStatus {
+        path: &'a str,
+        exists: bool,
+        enabled: bool,
+        shim_installed: bool,
+    },
+    JudgeHistory,
+    JudgeRules,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1249,6 +1682,12 @@ pub enum ServerMessageBorrowed<'a> {
     UpdateAvailable {
         current_version: &'a str,
         latest_version: &'a str,
+    },
+    SessionJudgePolicyUpdated {
+        session_id: &'a str,
+        has_pinned: bool,
+        pinned: bool,
+        effective: bool,
     },
 }
 
@@ -1321,7 +1760,44 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         subscription_id: sub_res.subscription_id().unwrap_or(""),
                     }
                 }
-                fb::ServerResultPayload::NONE => ServerResultBorrowed::Unit,
+                fb::ServerResultPayload::SessionJudgePolicyResult => {
+                    let pol_res =
+                        resp.result_as_session_judge_policy_result()
+                            .ok_or_else(|| {
+                                crate::ProtocolError::new(
+                                    "invalid_flatbuffer",
+                                    "missing session judge policy result",
+                                )
+                            })?;
+                    ServerResultBorrowed::SessionJudgePolicy {
+                        session_id: pol_res.session_id().unwrap_or(""),
+                        has_pinned: pol_res.has_pinned(),
+                        pinned: pol_res.pinned(),
+                        effective: pol_res.effective(),
+                    }
+                }
+                fb::ServerResultPayload::SessionJudgePoliciesResult => {
+                    ServerResultBorrowed::SessionJudgePolicies
+                }
+                fb::ServerResultPayload::JudgeHookStatusResult => {
+                    let hook_res = resp.result_as_judge_hook_status_result().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing judge hook status result",
+                        )
+                    })?;
+                    ServerResultBorrowed::JudgeHookStatus {
+                        path: hook_res.path().unwrap_or(""),
+                        exists: hook_res.exists(),
+                        enabled: hook_res.enabled(),
+                        shim_installed: hook_res.shim_installed(),
+                    }
+                }
+                fb::ServerResultPayload::JudgeHistoryResult => ServerResultBorrowed::JudgeHistory,
+                fb::ServerResultPayload::JudgeRulesResult => ServerResultBorrowed::JudgeRules,
+                fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {
+                    ServerResultBorrowed::Unit
+                }
                 _ => {
                     return Err(crate::ProtocolError::new(
                         "invalid_flatbuffer",
@@ -1461,6 +1937,22 @@ pub fn parse_fb_server_message_borrowed<'a>(
             Ok(ServerMessageBorrowed::UpdateAvailable {
                 current_version: payload.current_version().unwrap_or(""),
                 latest_version: payload.latest_version().unwrap_or(""),
+            })
+        }
+        fb::ServerMessagePayload::SessionJudgePolicyUpdatedPayload => {
+            let payload = root
+                .payload_as_session_judge_policy_updated_payload()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "missing session judge policy updated payload",
+                    )
+                })?;
+            Ok(ServerMessageBorrowed::SessionJudgePolicyUpdated {
+                session_id: payload.session_id().unwrap_or(""),
+                has_pinned: payload.has_pinned(),
+                pinned: payload.pinned(),
+                effective: payload.effective(),
             })
         }
         _ => Err(crate::ProtocolError::new(

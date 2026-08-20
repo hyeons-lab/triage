@@ -124,6 +124,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            judge_override: None,
         };
         let original = session.clone();
 
@@ -159,6 +160,7 @@ mod tests {
                 pid: 10_000 + index as u32,
                 process_identity: None,
                 last_activity_ms: 0,
+                judge_override: None,
             })
             .collect();
         let state = crate::handover::HandoverState {
@@ -231,6 +233,7 @@ mod tests {
                 pid: 10_000,
                 process_identity: None,
                 last_activity_ms: 0,
+                judge_override: None,
             }],
             has_tcp_listener: false,
             sends_teardown_commit: true,
@@ -595,6 +598,7 @@ mod tests {
             pid: 1,
             process_identity: None,
             last_activity_ms: 0,
+            judge_override: None,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],
@@ -683,6 +687,7 @@ mod tests {
                     started_at: [u64::from(pid), 0],
                 }),
                 last_activity_ms: 0,
+                judge_override: None,
             })
         };
 
@@ -804,6 +809,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            judge_override: None,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -853,6 +859,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            judge_override: None,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -908,6 +915,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            judge_override: None,
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
             socket_identity,
@@ -970,6 +978,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            judge_override: None,
         };
         let snapshot = |owner_token, fd| {
             crate::handover::remember_recovered_handover_for_test(

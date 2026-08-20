@@ -241,15 +241,11 @@ where
         clean_path = "index.html";
     }
 
-    if clean_path == "flutter_service_worker.js" {
-        return Ok(stale_service_worker_response());
-    }
-
     // 3. Retrieve from cache with fallback to index.html (SPA routing)
-    let (file, served_path) = match cache.get(clean_path) {
-        Some(file) => (file, clean_path),
+    let file = match cache.get(clean_path) {
+        Some(file) => file,
         None => match cache.get("index.html") {
-            Some(file) => (file, "index.html"),
+            Some(file) => file,
             None => {
                 let mut res = Response::new(Full::new(Bytes::from("Not Found")));
                 *res.status_mut() = StatusCode::NOT_FOUND;
@@ -303,59 +299,7 @@ where
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
     }
 
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-    );
-    if should_clear_site_cache(served_path) {
-        headers.insert("clear-site-data", HeaderValue::from_static("\"cache\""));
-    }
-
     Ok(res)
-}
-
-const STALE_SERVICE_WORKER_CLEANUP_JS: &str = r#"self.addEventListener('install', function(event) {
-  event.waitUntil(self.skipWaiting());
-});
-
-self.addEventListener('activate', function(event) {
-  event.waitUntil(
-    caches.keys()
-      .then(function(keys) {
-        return Promise.all(keys.map(function(key) {
-          return caches.delete(key);
-        }));
-      })
-      .then(function() {
-        return self.registration.unregister();
-      })
-  );
-});
-"#;
-
-fn stale_service_worker_response() -> Response<Full<Bytes>> {
-    let body = Bytes::from_static(STALE_SERVICE_WORKER_CLEANUP_JS.as_bytes());
-    let mut res = Response::new(Full::new(body.clone()));
-    *res.status_mut() = StatusCode::OK;
-    let headers = res.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/javascript; charset=utf-8"),
-    );
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-    );
-    headers.insert("clear-site-data", HeaderValue::from_static("\"cache\""));
-    res
-}
-
-fn should_clear_site_cache(path: &str) -> bool {
-    matches!(
-        path,
-        "index.html" | "flutter_bootstrap.js" | "flutter_service_worker.js"
-    )
 }
 
 fn pairing_page_response(
@@ -641,4 +585,19 @@ where
     });
 
     res
+}
+
+#[cfg(all(test, any(embed_real_client, embed_packaged_client)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_web_assets_contain_main_dart_js() {
+        let file = WebAsset::get("main.dart.js").expect("main.dart.js must be embedded");
+        eprintln!("main.dart.js length: {}", file.data.len());
+        eprintln!("main.dart.js etag sha256: {}", sha2_hash(&file.data));
+        let font =
+            WebAsset::get("assets/fonts/MaterialIcons-Regular.otf").expect("font must be embedded");
+        eprintln!("MaterialIcons length: {}", font.data.len());
+    }
 }

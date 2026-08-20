@@ -78,11 +78,15 @@ half of the product is still being built.
 **Working today:** the daemon and its session core; local IPC; the TUI (sidebar,
 navigation, attach); the MCP server (read-only tools); remote access with PIN
 pairing; the web client; Flutter desktop and Android builds; session persistence
-across restarts; and zero-downtime handover on Unix.
+across restarts; zero-downtime handover on Unix; and the local-model
+[tool-call approval judge](docs/approval-judge.md), which lets an agent CLI
+auto-approve its own routine commands while anything risky still prompts.
 
 **Not there yet:** the features Triage is ultimately *named* for — needs-response
 detection, attention-routing hotkeys, the overview grid, log search, and
-notifications — plus TLS termination, iOS/Android push, and approval gates. The
+notifications — plus TLS termination, iOS/Android push, and cross-client approval
+modals (the judge answers an agent's own hook; it does not yet surface a prompt
+on your phone). The
 full roadmap, with honest per-item status, lives in
 [`devlog/triage-design-doc.md`](devlog/triage-design-doc.md#-implementation-roadmap).
 

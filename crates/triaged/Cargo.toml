@@ -31,6 +31,7 @@ anyhow.workspace = true
 portable-pty.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+toml.workspace = true
 tracing.workspace = true
 unicode-width.workspace = true
 tattoy-wezterm-term.workspace = true
@@ -56,6 +57,14 @@ workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Native Metal inference for the summarizer and the approval judge. The engine
+# already asks for `BackendPreference::Auto`, which probes metal, then wgpu, then
+# CPU; without this feature the Metal arm is compiled out and every decode runs
+# on the CPU. Kept target-scoped because the feature pulls in `metal` and `objc`,
+# which only build on Apple platforms.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+cera = { workspace = true, features = ["metal"] }
 
 [target.'cfg(windows)'.dependencies]
 # Cross-platform local IPC: maps the daemon's control socket to a Windows named

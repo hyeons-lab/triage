@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -17,6 +17,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub grpc: GrpcConfig,
     pub approval: ApprovalConfig,
+    pub judge: JudgeConfig,
     pub keybindings: KeybindingsConfig,
     pub summarizer: SummarizerConfig,
     pub update: UpdateConfig,
@@ -52,6 +53,7 @@ impl Config {
         self.mcp.validate()?;
         self.grpc.validate()?;
         self.approval.validate()?;
+        self.judge.validate()?;
         self.keybindings.validate()?;
         self.summarizer.validate()?;
         self.update.validate()?;
@@ -380,6 +382,14 @@ impl GrpcConfig {
     }
 }
 
+/// Legacy, unconsumed approval-pattern list.
+///
+/// This key has never had a consumer anywhere in the workspace. It is kept so
+/// that configs already carrying it still load (the top-level table uses
+/// `deny_unknown_fields`, so removing it would turn an inert key into a hard
+/// startup error), but it does not gate anything. The tool-call approval path is
+/// [`JudgeConfig`]; see `judge.deny_substrings` / `judge.allow_commands` for the
+/// rules that actually run.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApprovalConfig {
@@ -388,7 +398,82 @@ pub struct ApprovalConfig {
 
 impl ApprovalConfig {
     fn validate(&self) -> Result<()> {
-        ensure_non_empty_items("approval.patterns", &self.patterns)
+        ensure_non_empty_items("approval.patterns", &self.patterns)?;
+        if !self.patterns.is_empty() {
+            tracing::warn!(
+                count = self.patterns.len(),
+                "[approval] patterns is not implemented and gates nothing; \
+                 use [judge] deny_substrings / allow_commands instead"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Settings for the local-model tool-call approval judge.
+///
+/// The judge answers `PreToolUse` hook queries from agent CLIs running inside
+/// Triage sessions. Its layering is deliberate and is documented in full on
+/// `triaged::judge`; the parts that are configurable are here.
+///
+/// `deny_substrings` is additive to the built-in deny rules and cannot weaken
+/// them. `allow_commands` is additive to the built-in allowlist, and entries
+/// only ever match a command with no shell metacharacters, so an allowlisted
+/// prefix cannot be used to smuggle a second command past the judge.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JudgeConfig {
+    /// Master switch. When false the daemon answers every query `ask`, which is
+    /// the same behavior as having no hook installed.
+    pub enabled: bool,
+    /// Whether a session judges tool calls unless told otherwise. Sessions carry
+    /// a per-session override on top of this; see the settings screen.
+    ///
+    /// Defaults to `true`: auto-approval is enabled out-of-the-box for all sessions.
+    /// Set to `false` to make judging opt-in per session.
+    pub default_enabled_per_session: bool,
+    /// How long the daemon may spend on one decision before falling back to
+    /// `ask`. Must stay comfortably under the hook's own timeout, since the hook
+    /// blocks the agent's loop for this entire window.
+    pub timeout_ms: u64,
+    /// Extra deny substrings, matched against the whitespace-normalized command.
+    /// Additive to the built-in deny rules.
+    pub deny_substrings: Vec<String>,
+    /// Extra always-safe commands, matched as a leading token sequence (e.g.
+    /// `"npm test"`). Additive to the built-in allowlist.
+    pub allow_commands: Vec<String>,
+}
+
+impl JudgeConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure_non_empty_items("judge.deny_substrings", &self.deny_substrings)?;
+        ensure_non_empty_items("judge.allow_commands", &self.allow_commands)?;
+        for cmd in &self.allow_commands {
+            ensure!(
+                !cmd.chars().any(|c| matches!(
+                    c,
+                    ';' | '&' | '|' | '\n' | '\r' | '$' | '`' | '>' | '<' | '(' | ')'
+                )),
+                "judge.allow_commands entry cannot contain shell control characters: '{cmd}'"
+            );
+        }
+        ensure!(
+            self.timeout_ms > 0,
+            "judge.timeout_ms must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
+impl Default for JudgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_enabled_per_session: true,
+            timeout_ms: 8_000,
+            deny_substrings: Vec::new(),
+            allow_commands: Vec::new(),
+        }
     }
 }
 
@@ -434,7 +519,7 @@ impl Default for KeybindingsConfig {
 pub struct SummarizerConfig {
     /// Master switch. When false, no model is loaded and no snippets are produced.
     pub enabled: bool,
-    /// LeapBundles bundle id, e.g. `LFM2.5-1.2B-Instruct-GGUF`.
+    /// LeapBundles bundle id, e.g. `LFM2-2.6B-GGUF`.
     pub bundle_id: String,
     /// Quantization tag, e.g. `Q4_0`.
     pub quant: String,
@@ -483,8 +568,20 @@ impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            bundle_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
-            quant: "Q4_0".to_string(),
+            // LFM2-2.6B rather than LFM2.5-1.2B, and specifically at Q4_K_M.
+            // The judge's model layer is only worth its place if the model can
+            // actually read the criteria it is given, and on a 20-command
+            // labeled set this is the smallest local model that does: 19/20 with
+            // no false allows, against 10/20 for the 1.2B, which answered `ask`
+            // to all twenty including `true`. It costs 0.20s per decision
+            // against 0.10s, and 1.46 GB resident against 664 MB.
+            //
+            // The quantization is part of the choice, not an afterthought: the
+            // same model at Q4_0 scores 15/20. Note this is LFM2, not LFM2.5;
+            // the LFM2.5 2.6B is a forced reasoning model whose template opens a
+            // `<think>` block, which a one-token grammar cannot work with.
+            bundle_id: "LFM2-2.6B-GGUF".to_string(),
+            quant: "Q4_K_M".to_string(),
             context_size: 1024,
             max_tokens: 24,
             detail_max_tokens: 180,
@@ -562,6 +659,13 @@ bind = "127.0.0.1:50051"
 [approval]
 patterns = ["^rm -rf"]
 
+[judge]
+enabled = true
+default_enabled_per_session = true
+timeout_ms = 5000
+deny_substrings = ["terraform apply"]
+allow_commands = ["npm test"]
+
 [keybindings]
 overview = "ctrl+o"
 search = "ctrl+s"
@@ -594,8 +698,8 @@ pause_all = "ctrl+p"
         assert!(!config.grpc.enabled);
         assert_eq!(config.keybindings.next_attention, "g w");
         assert!(config.summarizer.enabled);
-        assert_eq!(config.summarizer.bundle_id, "LFM2.5-1.2B-Instruct-GGUF");
-        assert_eq!(config.summarizer.quant, "Q4_0");
+        assert_eq!(config.summarizer.bundle_id, "LFM2-2.6B-GGUF");
+        assert_eq!(config.summarizer.quant, "Q4_K_M");
         assert_eq!(config.summarizer.context_size, 1024);
     }
 
@@ -639,6 +743,14 @@ notify_sound = false
         assert_eq!(config.mcp.tcp_bind_addr().unwrap().port(), 8889);
         assert_eq!(config.grpc.bind_addr().unwrap().unwrap().port(), 50051);
         assert_eq!(config.approval.patterns, ["^rm -rf"]);
+        // The exact `[judge]` key names are published in docs/approval-judge.md,
+        // and the table uses `deny_unknown_fields`, so a rename would otherwise
+        // surface as a user's startup error rather than a failing test.
+        assert!(config.judge.enabled);
+        assert!(config.judge.default_enabled_per_session);
+        assert_eq!(config.judge.timeout_ms, 5_000);
+        assert_eq!(config.judge.deny_substrings, ["terraform apply"]);
+        assert_eq!(config.judge.allow_commands, ["npm test"]);
         assert_eq!(config.keybindings.overview, "ctrl+o");
     }
 
@@ -897,6 +1009,24 @@ interval_hours = 0
             error
                 .to_string()
                 .contains("update.interval_hours must be greater than zero"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn judge_config_rejects_allow_commands_with_control_characters() {
+        let error = Config::from_toml_str(
+            r#"
+[judge]
+allow_commands = ["git status; rm -rf /"]
+"#,
+        )
+        .expect_err("control characters in allow_commands should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot contain shell control characters"),
             "unexpected error: {error}"
         );
     }

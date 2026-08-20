@@ -34,6 +34,8 @@ pub struct HandoverSession {
     /// blob written before this field existed.
     #[serde(default)]
     pub last_activity_ms: u64,
+    #[serde(default)]
+    pub judge_override: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
