@@ -21,6 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(unix)]
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use triage_core::judge::{JudgeRequest, JudgeVerdict, SessionJudgePolicy};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     LeaseChange, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi,
@@ -99,10 +100,15 @@ mod transport {
     #[cfg(windows)]
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Connect a client to the daemon's local IPC endpoint.
+    const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+    const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[cfg(unix)]
     pub fn connect(path: &Path) -> std::io::Result<ClientStream> {
-        UnixStream::connect(path)
+        let stream = UnixStream::connect(path)?;
+        let _ = stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+        Ok(stream)
     }
 
     #[cfg(windows)]
@@ -394,6 +400,27 @@ impl IpcClient {
         }
     }
 
+    /// Asks the daemon to judge one agent tool call, returning an explicit `Result`
+    /// so callers can distinguish between an authoritative policy verdict (even if `Ask`)
+    /// and an IPC transport failure.
+    pub fn judge_tool_call_result(&self, request: JudgeRequest) -> Result<JudgeVerdict> {
+        match self.round_trip(WireRequest::JudgeToolCall(request))? {
+            WireSuccess::JudgeVerdict(verdict) => Ok(verdict),
+            other => bail!("unexpected judge response: {other:?}"),
+        }
+    }
+
+    /// Asks the daemon to judge one agent tool call.
+    ///
+    /// Infallible by construction: an unreachable daemon, a refused connection,
+    /// or an unexpected reply all produce a fallback `ask`, which is the same
+    /// prompt the user would have seen with no judge installed. The hook shim
+    /// depends on this, since it must never be the reason an agent breaks.
+    pub fn judge_tool_call(&self, request: JudgeRequest) -> JudgeVerdict {
+        self.judge_tool_call_result(request)
+            .unwrap_or_else(|error| JudgeVerdict::fallback(format!("daemon unreachable: {error}")))
+    }
+
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
         let mut stream = transport::connect(&self.socket_path)
             .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
@@ -406,24 +433,7 @@ impl IpcClient {
     }
 }
 
-#[cfg(unix)]
-pub fn default_socket_path() -> PathBuf {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("triage/triage.sock");
-    }
-
-    std::env::temp_dir()
-        .join(format!("triage-{}", fallback_user_component()))
-        .join("triage.sock")
-}
-
-/// On Windows the "socket path" is the bare name of a named pipe; the transport
-/// layer expands it to `\\.\pipe\triage-<user>`. Per-user in the name keeps
-/// concurrent users on a shared machine from colliding.
-#[cfg(windows)]
-pub fn default_socket_path() -> PathBuf {
-    PathBuf::from(format!("triage-{}", fallback_user_component()))
-}
+pub use triage_core::ipc::default_socket_path;
 
 impl SessionApi for IpcClient {
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
@@ -569,6 +579,27 @@ impl SessionApi for IpcClient {
         }
     }
 
+    fn session_judge_policy(&self, session_id: SessionId) -> Result<SessionJudgePolicy> {
+        match self.round_trip(WireRequest::SessionJudgePolicy { session_id })? {
+            WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
+            other => bail!("unexpected session_judge_policy response: {other:?}"),
+        }
+    }
+
+    fn set_session_judge_policy(
+        &self,
+        session_id: SessionId,
+        enabled: Option<bool>,
+    ) -> Result<triage_core::judge::SessionJudgePolicy> {
+        match self.round_trip(WireRequest::SetSessionJudgePolicy {
+            session_id,
+            enabled,
+        })? {
+            WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
+            other => bail!("unexpected set_session_judge_policy response: {other:?}"),
+        }
+    }
+
     /// Ask the daemon for its update status (Phase 4, the TUI banner). This is a
     /// best-effort, read-only query: any IPC failure (daemon mid-restart,
     /// unexpected reply) falls back to "this build, nothing newer" so the banner
@@ -629,6 +660,14 @@ enum WireRequest {
     /// successor (see [`crate::shutdown`]). Without this, `uninstall` would leave a
     /// daemon running.
     DisableShutdownRescue,
+    JudgeToolCall(JudgeRequest),
+    SessionJudgePolicy {
+        session_id: SessionId,
+    },
+    SetSessionJudgePolicy {
+        session_id: SessionId,
+        enabled: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,49 +709,8 @@ enum WireSuccess {
     Heartbeat,
     HandoverState(crate::handover::HandoverState),
     ServerUpdateInfo(ServerUpdateInfo),
-}
-
-fn fallback_user_component() -> String {
-    user_identifier()
-        .filter(|value| !value.trim().is_empty())
-        .map(sanitize_path_component)
-        .unwrap_or_else(|| format!("pid-{}", std::process::id()))
-}
-
-#[cfg(unix)]
-fn user_identifier() -> Option<String> {
-    std::env::var("UID")
-        .or_else(|_| {
-            current_user_uid()
-                .map(|uid| uid.to_string())
-                .ok_or(std::env::VarError::NotPresent)
-        })
-        .or_else(|_| std::env::var("USER"))
-        .ok()
-}
-
-#[cfg(unix)]
-fn current_user_uid() -> Option<u32> {
-    let home = std::env::var_os("HOME")?;
-    fs::metadata(home).map(|metadata| metadata.uid()).ok()
-}
-
-#[cfg(windows)]
-fn user_identifier() -> Option<String> {
-    std::env::var("USERNAME").ok()
-}
-
-fn sanitize_path_component(value: String) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    JudgeVerdict(JudgeVerdict),
+    SessionJudgePolicy(SessionJudgePolicy),
 }
 
 #[cfg(unix)]
@@ -1724,6 +1722,22 @@ fn handle_request(
             crate::shutdown::disable_rescue();
             Ok(WireSuccess::Unit)
         }
+        // Deliberately infallible: `judge_tool_call` resolves every failure to
+        // `ask`, so the shim never has to interpret an error string to stay
+        // safe. An `Err` here would reach the hook as a message it would have to
+        // guess the meaning of.
+        WireRequest::JudgeToolCall(request) => {
+            Ok(WireSuccess::JudgeVerdict(manager.judge_tool_call(request)))
+        }
+        WireRequest::SessionJudgePolicy { session_id } => manager
+            .session_judge_policy(session_id)
+            .map(WireSuccess::SessionJudgePolicy),
+        WireRequest::SetSessionJudgePolicy {
+            session_id,
+            enabled,
+        } => manager
+            .set_session_judge_policy(session_id, enabled)
+            .map(WireSuccess::SessionJudgePolicy),
     }
 }
 

@@ -1,4 +1,7 @@
 pub mod config;
+pub mod ipc;
+pub mod judge;
+pub mod judge_rules;
 pub mod logging;
 pub mod session;
 

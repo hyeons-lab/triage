@@ -1,0 +1,2239 @@
+use crate::config::JudgeConfig;
+use crate::judge::{JudgeDecision, JudgeRequest, JudgeSource, JudgeVerdict};
+
+/// True if `tool_name` is a read-only inspection, search, web, or agent coordination tool.
+pub fn is_read_only_tool(lower: &str) -> bool {
+    matches!(
+        lower,
+        "read"
+            | "view_file"
+            | "read_file"
+            | "viewfile"
+            | "readfile"
+            | "view_file_outline"
+            | "get_file_info"
+            | "read_symbol"
+            | "inspect_file"
+            | "list_dir"
+            | "listdir"
+            | "ls"
+            | "list_directory"
+            | "find_by_name"
+            | "findbyname"
+            | "list_permissions"
+            | "listpermissions"
+            | "grep_search"
+            | "grep"
+            | "grepsearch"
+            | "search_files"
+            | "search_web"
+            | "web_search"
+            | "read_url_content"
+            | "read_browser_page"
+            | "ask_question"
+            | "invoke_subagent"
+            | "send_message"
+            | "manage_subagents"
+            | "define_subagent"
+            | "generate_image"
+            | "detect_changes"
+            | "get_review_context"
+            | "get_impact_radius"
+            | "get_affected_flows"
+            | "query_graph"
+            | "semantic_search_nodes"
+            | "get_architecture_overview"
+            | "list_communities"
+    )
+}
+
+/// True if `tool_name` is an editing or writing tool.
+pub fn is_edit_tool(lower: &str) -> bool {
+    matches!(
+        lower,
+        "write_to_file"
+            | "replace_file_content"
+            | "edit_file"
+            | "write_file"
+            | "patch_file"
+            | "create_file"
+    )
+}
+
+/// True if `tool_name` is a shell command execution tool.
+pub fn is_command_tool(lower: &str) -> bool {
+    matches!(
+        lower,
+        "run_command"
+            | "runcommand"
+            | "bash"
+            | "execute"
+            | "execute_command"
+            | "executecommand"
+            | "sh"
+            | "terminal"
+            | "exec"
+    )
+}
+
+pub const MAX_COMMAND_CHARS: usize = 800;
+
+pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
+    // Read-only filesystem and content inspection.
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "file",
+    "stat",
+    "du",
+    "df",
+    "tree",
+    "realpath",
+    "dirname",
+    "basename",
+    "diff",
+    "colordiff",
+    "sort",
+    "uniq",
+    "awk",
+    "sed",
+    "cut",
+    "tr",
+    "jq",
+    "column",
+    "md5",
+    "shasum",
+    "sha256sum",
+    // Safe filesystem mutation.
+    "mkdir",
+    "cp",
+    "touch",
+    "chmod +x",
+    // Search.
+    "rg",
+    "grep",
+    "egrep",
+    "fgrep",
+    "fd",
+    "find",
+    // Environment, machine, and process inspection.
+    "which",
+    "type",
+    "date",
+    "uname",
+    "whoami",
+    "hostname",
+    "echo",
+    "printf",
+    "true",
+    "false",
+    "read",
+    "pwd",
+    "cd",
+    "pushd",
+    "popd",
+    "id",
+    "ps",
+    "pgrep",
+    "lsof",
+    "sw_vers",
+    "export",
+    "codesign -v",
+    "codesign --verify",
+    "codesign -d",
+    "codesign --display",
+    "triaged reload",
+    "triaged --handover",
+    // Read-only and routine git operations.
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "git checkout",
+    "git switch",
+    "git restore",
+    "git branch",
+    "git tag",
+    "git stash",
+    "git remote -v",
+    "git rev-parse",
+    "git rev-list",
+    "git merge-base",
+    "git blame",
+    "git ls-files",
+    "git worktree list",
+    "git check-ignore",
+    "git describe",
+    "git --version",
+    // Rust build, check, test, lint, and formatting.
+    "cargo check",
+    "cargo build",
+    "cargo fmt",
+    "cargo clippy",
+    "cargo test",
+    "cargo doc",
+    "cargo tree",
+    "cargo metadata",
+    "cargo install",
+    "cargo init",
+    "cargo new",
+    "cargo --version",
+    "rustc --version",
+    // Flutter and Dart build, test, lint, and formatting.
+    "flutter analyze",
+    "flutter test",
+    "flutter doctor",
+    "flutter build",
+    "flutter pub get",
+    "flutter devices",
+    "flutter --version",
+    "dart analyze",
+    "dart test",
+    "dart format",
+    "dart --version",
+    // Read-only GitHub CLI queries.
+    "gh pr view",
+    "gh pr list",
+    "gh pr checks",
+    "gh pr diff",
+    "gh pr status",
+    "gh pr ready",
+    "gh run view",
+    "gh run list",
+    "gh run watch",
+    "gh status",
+    "gh issue view",
+    "gh issue list",
+    "gh issue status",
+    "gh repo view",
+    "gh repo list",
+    "gh release view",
+    "gh release list",
+    "gh workflow view",
+    "gh workflow list",
+    "gh secret list",
+    "gh auth status",
+    "gh stack view",
+    "gh --version",
+    // Utilities & Task runners.
+    "sleep",
+    "just",
+    "make",
+    "dart pub get",
+    "dart pub",
+    "dart run",
+    "pnpm test",
+    "pnpm run",
+    "pnpm build",
+    "pnpm check",
+    "yarn test",
+    "yarn run",
+    "yarn build",
+    "yarn check",
+    "bun test",
+    "bun run",
+    "bun build",
+    "bun check",
+    "npm test",
+    "npm run",
+    "npm build",
+    "npm ci",
+];
+
+pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
+    // Privilege escalation.
+    "sudo ",
+    "doas ",
+    "pkexec ",
+    "antigravity-oauth-token",
+    "security find-generic-password",
+    "security find-internet-password",
+    "/etc/shadow",
+    // Disk and device writes.
+    "diskutil erase",
+    "of=/dev/",
+    // Machine state.
+    "launchctl bootout",
+    // Outward-facing publishing / releases.
+    "cargo publish",
+    "npm publish",
+    "gh release",
+    "gh pr create",
+    // Permission blanket-opening.
+    "chmod 777",
+    "chmod -r 777",
+];
+
+pub const CREDENTIAL_PATHS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".netrc",
+    ".aws/credentials",
+    ".aws/config",
+    ".git-credentials",
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+    ".dockercfg",
+    ".docker/config.json",
+    ".npmrc",
+    ".pypirc",
+    ".kube/config",
+    ".vault-token",
+    ".config/op",
+    ".config/gh/hosts.yml",
+    ".config/gcloud",
+    ".claude.json",
+    ".claude/settings.json",
+    ".env",
+    ".envrc",
+    ".bashrc",
+    ".zshrc",
+    ".bash_profile",
+    ".zprofile",
+    ".profile",
+    "etc/passwd",
+    "/etc/passwd",
+    "etc/shadow",
+    "/etc/shadow",
+    "etc/sudoers",
+    "/etc/sudoers",
+    "etc/hosts",
+    "/etc/hosts",
+];
+
+pub const DESTRUCTIVE_PROGRAMS: &[&str] = &[
+    "shutdown", "reboot", "halt", "poweroff", "mkfs", "fdisk", "dd",
+];
+
+pub const PIPE_TARGETS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "python", "python3", "ruby", "perl",
+];
+
+pub const NETWORK_FETCHERS: &[&str] = &["curl", "wget", "http ", "https://"];
+
+#[derive(Debug, Clone)]
+pub struct JudgeRules {
+    custom_deny_substrings: Vec<String>,
+    custom_allow_commands: Vec<(String, Vec<String>)>,
+    builtin_allow_commands: &'static [(String, Vec<String>)],
+}
+
+fn builtin_parsed_allow_commands() -> &'static [(String, Vec<String>)] {
+    static BUILTIN: std::sync::OnceLock<Vec<(String, Vec<String>)>> = std::sync::OnceLock::new();
+    BUILTIN.get_or_init(|| {
+        BUILTIN_ALLOW_COMMANDS
+            .iter()
+            .map(|entry| {
+                let tokens = tokenize_words(entry);
+                ((*entry).to_string(), tokens)
+            })
+            .filter(|(_, tokens)| !tokens.is_empty())
+            .collect()
+    })
+}
+
+impl JudgeRules {
+    pub fn new(config: &JudgeConfig) -> Self {
+        let custom_deny_substrings: Vec<String> = config
+            .deny_substrings
+            .iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let parse_entries = |entries: &[String]| -> Vec<(String, Vec<String>)> {
+            entries
+                .iter()
+                .map(|entry| {
+                    let tokens = tokenize_words(entry);
+                    (entry.clone(), tokens)
+                })
+                .filter(|(_, tokens)| !tokens.is_empty())
+                .collect()
+        };
+        let custom_allow_commands = parse_entries(&config.allow_commands);
+        let builtin_allow_commands = builtin_parsed_allow_commands();
+        Self {
+            custom_deny_substrings,
+            custom_allow_commands,
+            builtin_allow_commands,
+        }
+    }
+
+    pub fn evaluate(&self, request: &JudgeRequest) -> Option<JudgeVerdict> {
+        let tool_name = request.tool_name.trim();
+        let lower_tool_name = tool_name.to_ascii_lowercase();
+
+        // 1. Read-only inspection tools.
+        if is_read_only_tool(&lower_tool_name) {
+            if let Some(secret) = check_target_credential_path(request) {
+                return Some(JudgeVerdict::fallback(format!(
+                    "requires manual approval for credential path: {secret}"
+                )));
+            }
+            return Some(JudgeVerdict {
+                decision: JudgeDecision::Allow,
+                source: JudgeSource::AllowRule,
+                reason: format!("read-only tool call: {tool_name}"),
+            });
+        }
+
+        // 2. File editing / writing tools.
+        if is_edit_tool(&lower_tool_name) {
+            if let Some(secret) = check_target_credential_path(request) {
+                return Some(JudgeVerdict::fallback(format!(
+                    "requires manual approval for credential path: {secret}"
+                )));
+            }
+            return Some(JudgeVerdict {
+                decision: JudgeDecision::Allow,
+                source: JudgeSource::AllowRule,
+                reason: format!("edit tool call: {tool_name}"),
+            });
+        }
+
+        // 3. Command execution tools.
+        if !is_command_tool(&lower_tool_name) {
+            return Some(JudgeVerdict::fallback(format!(
+                "tool {tool_name} is not judged"
+            )));
+        }
+
+        let command = request.command_line.as_deref().unwrap_or("").trim();
+        if command.is_empty() {
+            return Some(JudgeVerdict::fallback("tool call carried no command"));
+        }
+        if command.chars().take(MAX_COMMAND_CHARS + 1).count() > MAX_COMMAND_CHARS {
+            return Some(JudgeVerdict::fallback("command is too long to judge"));
+        }
+        let unquoted = unquote_segment(command);
+        let lowered = normalize_lowered(&unquoted);
+
+        // 3a. Custom hard deny rules explicitly configured by the user.
+        if let Some(rule) = self.matching_custom_deny_rule(&lowered) {
+            return Some(JudgeVerdict::deny_rule(rule));
+        }
+
+        // 3b. Built-in sensitive patterns.
+        if let Some(rule) = matching_builtin_sensitive_substring(&lowered) {
+            return Some(JudgeVerdict::fallback(format!(
+                "requires manual approval: {rule}"
+            )));
+        }
+        if let Some(rule) = command_segments(&unquoted).find_map(|segment| {
+            let tokens = segment.split_whitespace().collect::<Vec<_>>();
+            let stripped = strip_leading_assignments_and_keywords(&tokens);
+            denied_segment_rule(stripped)
+        }) {
+            return Some(JudgeVerdict::fallback(format!(
+                "requires manual approval: {rule}"
+            )));
+        }
+        if let Some(path) = matching_credential_path(&lowered) {
+            return Some(JudgeVerdict::fallback(format!(
+                "requires manual approval for credential path: {path}"
+            )));
+        }
+        if is_network_pipe_to_interpreter(&lowered) {
+            return Some(JudgeVerdict::fallback(
+                "requires manual approval: downloaded script piped to an interpreter",
+            ));
+        }
+
+        let cleaned_cmd = strip_null_redirections(command);
+        if !has_complex_shell_metacharacters(&cleaned_cmd) {
+            let segments = pipeline_and_chain_segments(&cleaned_cmd);
+            if !segments.is_empty() {
+                let mut all_allowed = true;
+                let mut matched_rules = Vec::new();
+
+                for segment in &segments {
+                    let trimmed_seg = segment.trim();
+                    if trimmed_seg.is_empty() {
+                        continue;
+                    }
+                    let word_strings = tokenize_words(trimmed_seg);
+                    let word_slices: Vec<&str> = word_strings.iter().map(String::as_str).collect();
+                    let tokens = effective_tokens(&word_slices);
+                    if tokens.is_empty() {
+                        continue;
+                    }
+                    if is_shell_syntax_segment(tokens) {
+                        continue;
+                    }
+                    if has_disqualifying_argument(tokens) {
+                        all_allowed = false;
+                        break;
+                    }
+                    if let Some(rule) = self.matching_allow_rule(tokens) {
+                        matched_rules.push(rule);
+                    } else {
+                        all_allowed = false;
+                        break;
+                    }
+                }
+
+                if all_allowed && !matched_rules.is_empty() {
+                    let summary = if matched_rules.len() == 1 {
+                        format!("matched allow rule: {}", matched_rules[0])
+                    } else {
+                        format!("matched allow rules: {}", matched_rules.join(" && "))
+                    };
+                    return Some(JudgeVerdict {
+                        decision: JudgeDecision::Allow,
+                        source: JudgeSource::AllowRule,
+                        reason: summary,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    fn matching_custom_deny_rule(&self, lowered_command: &str) -> Option<&str> {
+        self.custom_deny_substrings
+            .iter()
+            .find(|needle| lowered_command.contains(needle.as_str()))
+            .map(String::as_str)
+    }
+
+    fn matching_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        let prog = program_name(first);
+        if prog == "git" {
+            if let Some(rule) = self.matching_git_allow_rule(tokens) {
+                return Some(rule);
+            }
+            return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
+        }
+        if prog == "gh"
+            && let Some(rule) = self.matching_gh_allow_rule(tokens)
+        {
+            return Some(rule);
+        }
+        self.matching_token_allow_rule(&self.custom_allow_commands, tokens)
+            .or_else(|| self.matching_token_allow_rule(self.builtin_allow_commands, tokens))
+    }
+
+    fn matching_token_allow_rule<'a>(
+        &'a self,
+        rules: &'a [(String, Vec<String>)],
+        tokens: &[&str],
+    ) -> Option<&'a str> {
+        rules
+            .iter()
+            .find(|(_, rule)| {
+                rule.len() <= tokens.len()
+                    && rule
+                        .iter()
+                        .zip(tokens)
+                        .all(|(expected, actual)| expected == actual)
+            })
+            .map(|(text, _)| text.as_str())
+    }
+
+    fn matching_gh_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        if program_name(first) != "gh" {
+            return None;
+        }
+        let after = &tokens[1..];
+        let subcommand = *after.first()?;
+        match subcommand {
+            "api" => {
+                let sub_args = &after[1..];
+                // Disallow `gh api graphql` since GraphQL requests default to HTTP POST mutations
+                if sub_args
+                    .iter()
+                    .any(|arg| arg.to_ascii_lowercase().contains("graphql"))
+                {
+                    return None;
+                }
+                const GH_MUTATING_FLAGS: &[&str] = &[
+                    "-x",
+                    "--method",
+                    "-f",
+                    "--field",
+                    "-F",
+                    "--raw-field",
+                    "--input",
+                    "-p",
+                    "--preview",
+                ];
+                if sub_args.iter().any(|arg| {
+                    let lower = arg.to_ascii_lowercase();
+                    GH_MUTATING_FLAGS.iter().any(|flag| {
+                        lower == *flag
+                            || lower.starts_with(&format!("{flag}="))
+                            || (flag.starts_with('-')
+                                && !flag.starts_with("--")
+                                && lower.starts_with(flag))
+                    })
+                }) {
+                    None
+                } else {
+                    Some("gh api")
+                }
+            }
+            "auth" => {
+                let sub_args = &after[1..];
+                if sub_args.first() == Some(&"status") {
+                    Some("gh auth status")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn matching_git_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        if program_name(first) != "git" {
+            return None;
+        }
+        let (subcommand, sub_args) = parse_git_subcommand(&tokens[1..])?;
+
+        match subcommand {
+            "diff" => Some("git diff"),
+            "status" => Some("git status"),
+            "log" => Some("git log"),
+            "show" => Some("git show"),
+            "add" => Some("git add"),
+            "commit" => Some("git commit"),
+            "checkout" => Some("git checkout"),
+            "switch" => Some("git switch"),
+            "restore" => Some("git restore"),
+            "rev-parse" => Some("git rev-parse"),
+            "rev-list" => Some("git rev-list"),
+            "merge-base" => Some("git merge-base"),
+            "describe" => Some("git describe"),
+            "check-ignore" => Some("git check-ignore"),
+            "blame" => Some("git blame"),
+            "ls-files" => Some("git ls-files"),
+            "worktree" if sub_args.first() == Some(&"list") => Some("git worktree list"),
+            "stash" if sub_args.first() == Some(&"list") || sub_args.first() == Some(&"show") => {
+                Some("git stash")
+            }
+            "tag" => {
+                const GIT_TAG_MUTATING_FLAGS: &[&str] = &[
+                    "-d",
+                    "-D",
+                    "--delete",
+                    "-a",
+                    "--annotate",
+                    "-s",
+                    "--sign",
+                    "-u",
+                    "--local-user",
+                    "-f",
+                    "--force",
+                    "-m",
+                    "--message",
+                    "-F",
+                    "--file",
+                ];
+                const GIT_TAG_READ_ONLY_FLAGS: &[&str] = &[
+                    "-l",
+                    "--list",
+                    "-n",
+                    "--sort",
+                    "--points-at",
+                    "--merged",
+                    "--no-merged",
+                    "--contains",
+                    "--no-contains",
+                    "--column",
+                    "--no-column",
+                    "--color",
+                    "--no-color",
+                ];
+                let has_mutating_flag = sub_args.iter().any(|arg| {
+                    GIT_TAG_MUTATING_FLAGS.contains(arg)
+                        || arg.starts_with("-d")
+                        || arg.starts_with("-D")
+                        || arg.starts_with("-f")
+                        || arg.starts_with("-a")
+                        || arg.starts_with("-s")
+                        || arg.starts_with("-u")
+                        || arg.starts_with("-m")
+                        || arg.starts_with("--message=")
+                        || arg.starts_with("-F")
+                        || arg.starts_with("--file=")
+                });
+                if has_mutating_flag {
+                    None
+                } else if sub_args.is_empty()
+                    || (sub_args.iter().all(|a| {
+                        GIT_TAG_READ_ONLY_FLAGS.contains(a)
+                            || a.starts_with("--sort=")
+                            || a.starts_with("--points-at=")
+                            || a.starts_with("--merged=")
+                            || a.starts_with("--no-merged=")
+                            || a.starts_with("--contains=")
+                            || a.starts_with("--no-contains=")
+                            || a.contains('*')
+                    }) && (sub_args.contains(&"--list")
+                        || sub_args.contains(&"-l")
+                        || sub_args.iter().any(|a| a.contains('*'))))
+                {
+                    Some("git tag")
+                } else {
+                    None
+                }
+            }
+            "branch" => {
+                const GIT_BRANCH_MUTATING_FLAGS: &[&str] = &[
+                    "-d",
+                    "-D",
+                    "--delete",
+                    "-m",
+                    "-M",
+                    "--move",
+                    "-c",
+                    "-C",
+                    "--copy",
+                    "-u",
+                    "--set-upstream-to",
+                    "--unset-upstream",
+                    "--edit-description",
+                ];
+                let has_mutating_flag = sub_args.iter().any(|arg| {
+                    GIT_BRANCH_MUTATING_FLAGS.contains(arg)
+                        || arg.starts_with("-d")
+                        || arg.starts_with("-D")
+                        || arg.starts_with("-m")
+                        || arg.starts_with("-M")
+                        || arg.starts_with("-c")
+                        || arg.starts_with("-C")
+                        || arg.starts_with("--set-upstream-to=")
+                        || (arg.starts_with("-u") && *arg != "-u")
+                });
+                const GIT_BRANCH_READ_ONLY_FLAGS: &[&str] = &[
+                    "-r",
+                    "--remotes",
+                    "-a",
+                    "--all",
+                    "-v",
+                    "-vv",
+                    "--verbose",
+                    "--show-current",
+                    "--list",
+                    "-l",
+                    "--merged",
+                    "--no-merged",
+                    "--contains",
+                    "--no-contains",
+                    "--points-at",
+                    "--sort",
+                    "--column",
+                    "--no-column",
+                    "--color",
+                    "--no-color",
+                ];
+                if has_mutating_flag {
+                    None
+                } else if sub_args.is_empty()
+                    || sub_args.contains(&"--show-current")
+                    || (sub_args.iter().all(|a| {
+                        GIT_BRANCH_READ_ONLY_FLAGS.contains(a)
+                            || a.starts_with("--sort=")
+                            || a.starts_with("--points-at=")
+                            || a.starts_with("--merged=")
+                            || a.starts_with("--no-merged=")
+                            || a.starts_with("--contains=")
+                            || a.starts_with("--no-contains=")
+                            || a.contains('*')
+                    }) && (sub_args.contains(&"-r")
+                        || sub_args.contains(&"--remotes")
+                        || sub_args.contains(&"-a")
+                        || sub_args.contains(&"--all")
+                        || sub_args.contains(&"-v")
+                        || sub_args.contains(&"-vv")
+                        || sub_args.contains(&"--verbose")
+                        || sub_args.contains(&"--list")
+                        || sub_args.contains(&"-l")))
+                {
+                    Some("git branch")
+                } else {
+                    None
+                }
+            }
+            "remote" if sub_args.contains(&"-v") || sub_args.contains(&"--verbose") => {
+                Some("git remote -v")
+            }
+            _ => None,
+        }
+    }
+}
+
+pub fn builtin_allow_commands() -> Vec<String> {
+    static BUILTIN_ALLOW: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    BUILTIN_ALLOW
+        .get_or_init(|| {
+            BUILTIN_ALLOW_COMMANDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        })
+        .clone()
+}
+
+pub fn builtin_deny_substrings() -> Vec<String> {
+    static BUILTIN_DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    BUILTIN_DENY
+        .get_or_init(|| {
+            BUILTIN_SENSITIVE_SUBSTRINGS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        })
+        .clone()
+}
+
+pub fn persist_judge_config(config: &crate::config::JudgeConfig) -> anyhow::Result<()> {
+    let target_path = crate::config::Config::default_path()?;
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path = std::fs::canonicalize(&target_path).unwrap_or(target_path);
+    let mut table: toml::Table = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        toml::from_str(&content)
+            .map_err(|err| anyhow::anyhow!("failed to parse existing {}: {err}", path.display()))?
+    } else {
+        toml::Table::new()
+    };
+
+    let mut judge_table = table
+        .get("judge")
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    judge_table.insert("enabled".into(), toml::Value::Boolean(config.enabled));
+    judge_table.insert(
+        "default_enabled_per_session".into(),
+        toml::Value::Boolean(config.default_enabled_per_session),
+    );
+    judge_table.insert(
+        "timeout_ms".into(),
+        toml::Value::Integer(config.timeout_ms as i64),
+    );
+
+    let allow_arr = config
+        .allow_commands
+        .iter()
+        .map(|s| toml::Value::String(s.clone()))
+        .collect();
+    judge_table.insert("allow_commands".into(), toml::Value::Array(allow_arr));
+
+    let deny_arr = config
+        .deny_substrings
+        .iter()
+        .map(|s| toml::Value::String(s.clone()))
+        .collect();
+    judge_table.insert("deny_substrings".into(), toml::Value::Array(deny_arr));
+
+    table.insert("judge".into(), toml::Value::Table(judge_table));
+    let toml_str = toml::to_string_pretty(&table)?;
+    let tmp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(toml_str.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(err) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+pub fn normalize_lowered(command: &str) -> String {
+    let mut result = String::with_capacity(command.len());
+    let mut first = true;
+    for word in command.split_whitespace() {
+        if !first {
+            result.push(' ');
+        }
+        first = false;
+        for c in word.chars().flat_map(char::to_lowercase) {
+            result.push(c);
+        }
+    }
+    result
+}
+
+pub fn check_target_credential_path(request: &JudgeRequest) -> Option<String> {
+    if let Some(target_path) = request.path.as_deref().or(request.command_line.as_deref()) {
+        let unquoted = unquote_segment(target_path);
+        let lowered_path = normalize_lowered(&unquoted);
+        if let Some(matched) = matching_credential_path(&lowered_path) {
+            return Some(matched.to_string());
+        }
+        let mut normalized = lowered_path.replace('\\', "/");
+        if normalized.starts_with("//?/") || normalized.starts_with("//./") {
+            normalized = normalized[4..].to_string();
+        }
+        if normalized.len() >= 2
+            && normalized.as_bytes()[1] == b':'
+            && normalized.as_bytes()[0].is_ascii_alphabetic()
+        {
+            normalized = normalized[2..].to_string();
+        }
+        let mut stack: Vec<&str> = Vec::with_capacity(8);
+        for comp in std::path::Path::new(&normalized).components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    stack.pop();
+                }
+                std::path::Component::Normal(c) => {
+                    if let Some(s) = c.to_str() {
+                        stack.push(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let clean_str = stack.join("/");
+        if let Some(matched) = matching_credential_path(&clean_str) {
+            return Some(matched.to_string());
+        }
+        if !clean_str.is_empty() {
+            let root_prefixed = format!("/{clean_str}");
+            if let Some(matched) = matching_credential_path(&root_prefixed) {
+                return Some(matched.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn strip_null_redirections(command: &str) -> std::borrow::Cow<'_, str> {
+    if !command.contains('>') && !command.contains("2>&1") && !command.contains("nul") {
+        return std::borrow::Cow::Borrowed(command);
+    }
+
+    let patterns = [
+        "2>/dev/null",
+        "1>/dev/null",
+        ">/dev/null",
+        "&>/dev/null",
+        "2> /dev/null",
+        "1> /dev/null",
+        "> /dev/null",
+        "&> /dev/null",
+        "2>&1",
+        ">nul",
+        "> nul",
+        "2>nul",
+        "2> nul",
+    ];
+
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut result = String::with_capacity(command.len());
+    let mut rest = command;
+
+    'outer: while !rest.is_empty() {
+        let first_byte = rest.as_bytes()[0];
+        if escaped {
+            escaped = false;
+            let ch = rest.chars().next().unwrap();
+            result.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        }
+        if first_byte == b'\\' && !in_single {
+            escaped = true;
+            result.push('\\');
+            rest = &rest[1..];
+            continue;
+        }
+        if first_byte == b'\'' && !in_double {
+            in_single = !in_single;
+            result.push('\'');
+            rest = &rest[1..];
+            continue;
+        }
+        if first_byte == b'"' && !in_single {
+            in_double = !in_double;
+            result.push('"');
+            rest = &rest[1..];
+            continue;
+        }
+
+        if !in_single && !in_double {
+            for pattern in &patterns {
+                if let Some(after) = rest.strip_prefix(pattern) {
+                    let is_bounded = after.is_empty()
+                        || after.starts_with(|c: char| {
+                            c.is_whitespace() || c == ';' || c == '&' || c == '|' || c == '\n'
+                        });
+                    if is_bounded {
+                        result.push(' ');
+                        rest = after;
+                        continue 'outer;
+                    }
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        result.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    std::borrow::Cow::Owned(result)
+}
+
+pub fn has_complex_shell_metacharacters(command: &str) -> bool {
+    if command.contains('`')
+        || command.contains("$(")
+        || command.contains("<(")
+        || command.contains(">(")
+    {
+        return true;
+    }
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for &b in command.as_bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double && (b == b'>' || b == b'<') {
+            return true;
+        }
+    }
+    in_single || in_double || escaped
+}
+
+pub fn is_shell_syntax_segment(tokens: &[&str]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    match tokens[0] {
+        "do" | "done" | "then" | "else" | "elif" | "fi" | "{" | "}" | "(" | ")" => {
+            tokens.len() == 1
+        }
+        "for" => {
+            tokens.len() >= 3 && tokens[2] == "in"
+                || tokens.len() >= 2 && (tokens[1] == "in" || tokens[1].starts_with("(("))
+        }
+        _ => false,
+    }
+}
+
+pub fn command_segments(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(|character: char| {
+            matches!(
+                character,
+                ';' | '|' | '&' | '\n' | '\r' | '`' | '(' | ')' | '{' | '}'
+            )
+        })
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+}
+
+pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::with_capacity(4);
+    let mut start = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    let bytes = command.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        if b == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if !in_single_quote
+            && !in_double_quote
+            && matches!(
+                b,
+                b';' | b'|' | b'&' | b'\n' | b'\r' | b'(' | b')' | b'{' | b'}'
+            )
+        {
+            let segment = command[start..i].trim();
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+            start = i + 1;
+        }
+    }
+    let tail = command[start..].trim();
+    if !tail.is_empty() {
+        segments.push(tail);
+    }
+    segments
+}
+
+pub fn tokenize_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in segment.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+pub fn is_recursive_force_remove(tokens: &[&str]) -> bool {
+    let removes = names_program(tokens, "rm");
+    if !removes {
+        return false;
+    }
+    let has = |long: &str, shorts: &[char]| {
+        tokens
+            .iter()
+            .filter(|token| token.starts_with('-'))
+            .any(|flag| {
+                if let Some(name) = flag.strip_prefix("--") {
+                    name == long
+                } else {
+                    flag.strip_prefix('-')
+                        .is_some_and(|bundle| bundle.chars().any(|c| shorts.contains(&c)))
+                }
+            })
+    };
+    has("recursive", &['r', 'R']) && has("force", &['f'])
+}
+
+pub const WRAPPER_PROGRAMS: &[&str] = &[
+    "env", "nice", "nohup", "timeout", "time", "command", "builtin", "stdbuf", "ionice", "xargs",
+    "sudo", "doas", "sh", "bash", "zsh", "fish", "dash", "ksh",
+];
+
+pub fn strip_leading_assignments_and_keywords<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut rest = tokens;
+    while let Some((first, tail)) = rest.split_first() {
+        if matches!(
+            first,
+            &"do" | &"then" | &"else" | &"elif" | &"&&" | &"||" | &";" | &"|" | &"&"
+        ) && !tail.is_empty()
+        {
+            rest = tail;
+            continue;
+        }
+        if first.contains('=') && !first.starts_with('-') {
+            rest = tail;
+            continue;
+        }
+        break;
+    }
+    rest
+}
+
+pub fn effective_program<'a>(tokens: &'a [&'a str]) -> Option<&'a str> {
+    let mut rest = strip_leading_assignments_and_keywords(tokens);
+    loop {
+        let (first, tail) = rest.split_first()?;
+        let program = program_name(first);
+        if !WRAPPER_PROGRAMS.contains(&program) {
+            return Some(program);
+        }
+        rest = tail;
+        while let Some((next, remainder)) = rest.split_first() {
+            let takes_arg = matches!(
+                *next,
+                "-u" | "--unset" | "-C" | "--chdir" | "-s" | "--signal"
+            );
+            let is_wrapper_argument =
+                next.starts_with('-') || next.contains('=') || is_duration_or_numeric(next);
+            if takes_arg {
+                rest = remainder.get(1..).unwrap_or(&[]);
+                continue;
+            }
+            if !is_wrapper_argument {
+                break;
+            }
+            rest = remainder;
+        }
+    }
+}
+
+pub fn is_duration_or_numeric(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let trimmed = token
+        .strip_suffix(|c| matches!(c, 's' | 'm' | 'h' | 'd'))
+        .unwrap_or(token);
+    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+pub fn effective_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut rest = strip_leading_assignments_and_keywords(tokens);
+    while let Some((first, tail)) = rest.split_first() {
+        let prog = program_name(first);
+        if WRAPPER_PROGRAMS.contains(&prog)
+            && !matches!(
+                prog,
+                "sudo" | "doas" | "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh"
+            )
+        {
+            rest = tail;
+            while let Some((next, remainder)) = rest.split_first() {
+                let takes_arg = matches!(
+                    *next,
+                    "-u" | "--unset" | "-C" | "--chdir" | "-s" | "--signal"
+                );
+                let is_wrapper_arg =
+                    next.starts_with('-') || next.contains('=') || is_duration_or_numeric(next);
+                if takes_arg {
+                    rest = remainder.get(1..).unwrap_or(&[]);
+                    continue;
+                }
+                if !is_wrapper_arg {
+                    break;
+                }
+                rest = remainder;
+            }
+            continue;
+        }
+        break;
+    }
+    rest
+}
+
+pub fn names_program(tokens: &[&str], program: &str) -> bool {
+    if effective_program(tokens) == Some(program) {
+        return true;
+    }
+    let leads_with_wrapper = tokens
+        .first()
+        .is_some_and(|token| WRAPPER_PROGRAMS.contains(&program_name(token)));
+    leads_with_wrapper
+        && tokens
+            .iter()
+            .filter(|token| !token.starts_with('-'))
+            .any(|token| program_name(token) == program)
+}
+
+pub fn denied_segment_rule(tokens: &[&str]) -> Option<&'static str> {
+    if is_recursive_force_remove(tokens) {
+        return Some("recursive forced delete");
+    }
+    let effective = effective_program(tokens);
+    let leads_with_wrapper = tokens
+        .first()
+        .is_some_and(|token| WRAPPER_PROGRAMS.contains(&program_name(token)));
+
+    if let Some(destructive) = effective.and_then(|prog| {
+        DESTRUCTIVE_PROGRAMS
+            .iter()
+            .copied()
+            .find(|&candidate| candidate == prog)
+    }) {
+        return Some(destructive);
+    }
+    if leads_with_wrapper {
+        for token in tokens.iter().filter(|t| !t.starts_with('-')) {
+            let prog = program_name(token);
+            if let Some(&destructive) = DESTRUCTIVE_PROGRAMS.iter().find(|&&c| c == prog) {
+                return Some(destructive);
+            }
+        }
+    }
+    git_denied_operation(tokens)
+}
+
+pub const GIT_VALUE_TAKING_GLOBALS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+];
+
+pub fn parse_git_subcommand<'a>(after: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
+    let mut index = 0;
+    while let Some(token) = after.get(index) {
+        if !token.starts_with('-') {
+            break;
+        }
+        let is_attached = (token.starts_with("-C") && *token != "-C")
+            || (token.starts_with("-c") && *token != "-c")
+            || token.starts_with("--git-dir=")
+            || token.starts_with("--work-tree=")
+            || token.starts_with("--namespace=")
+            || token.starts_with("--exec-path=")
+            || token.starts_with("--config-env=");
+        index += if is_attached {
+            1
+        } else if GIT_VALUE_TAKING_GLOBALS.contains(token) {
+            2
+        } else {
+            1
+        };
+    }
+    let subcommand = *after.get(index)?;
+    let sub_args = &after[index + 1..];
+    Some((subcommand, sub_args))
+}
+
+pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
+    if !names_program(tokens, "git") {
+        return None;
+    }
+    let git_index = tokens
+        .iter()
+        .position(|token| program_name(token) == "git")?;
+    let (subcommand, sub_args) = parse_git_subcommand(&tokens[git_index + 1..])?;
+
+    let has = |long: &[&str], short: &[char]| {
+        sub_args
+            .iter()
+            .filter(|token| token.starts_with('-'))
+            .any(|flag| long.contains(flag) || is_short_flag_bundle_containing(flag, short))
+    };
+
+    match subcommand {
+        "push" => Some("git push"),
+        "filter-branch" => Some("git filter-branch"),
+        "reset" if has(&["--hard"], &[]) => Some("git reset --hard"),
+        "clean" if has(&["--force"], &['f']) => Some("git clean --force"),
+        "branch"
+            if has(
+                &["--delete", "--force", "--move"],
+                &['d', 'D', 'f', 'm', 'M'],
+            ) =>
+        {
+            Some("destructive git branch operation")
+        }
+        _ => None,
+    }
+}
+
+pub fn matching_credential_path(cleaned: &str) -> Option<&'static str> {
+    const TEMPLATE_SUFFIXES: &[&str] = &["example", "sample", "template", "dist", "defaults"];
+
+    let normalized: std::borrow::Cow<'_, str> = if cleaned.contains('\\') {
+        std::borrow::Cow::Owned(cleaned.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(cleaned)
+    };
+
+    CREDENTIAL_PATHS.iter().copied().find(|path| {
+        normalized.match_indices(path).any(|(index, matched)| {
+            let opens = match normalized[..index].chars().next_back() {
+                None => true,
+                Some(previous) => {
+                    previous == '/'
+                        || previous == '='
+                        || previous == ':'
+                        || previous == '<'
+                        || previous == '>'
+                        || previous == '|'
+                        || previous == '&'
+                        || previous == ';'
+                        || previous.is_whitespace()
+                }
+            };
+            if !opens {
+                return false;
+            }
+            let rest = &normalized[index + matched.len()..];
+            match rest.chars().next() {
+                None => true,
+                Some(c) if (matched == ".env" || matched == ".envrc") && (c == '_' || c == '-') => {
+                    let suffix = rest[1..]
+                        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+                        .next()
+                        .unwrap_or("");
+                    !TEMPLATE_SUFFIXES.contains(&suffix)
+                }
+                Some(c) if c.is_alphanumeric() || c == '-' || c == '_' => false,
+                Some('.') => {
+                    let suffix = rest[1..]
+                        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+                        .next()
+                        .unwrap_or("");
+                    !TEMPLATE_SUFFIXES.contains(&suffix)
+                }
+                Some(_) => true,
+            }
+        })
+    })
+}
+
+pub fn matching_builtin_sensitive_substring(lowered_command: &str) -> Option<&'static str> {
+    BUILTIN_SENSITIVE_SUBSTRINGS
+        .iter()
+        .find(|needle| lowered_command.contains(**needle))
+        .copied()
+}
+
+pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
+    const PER_PROGRAM: &[(&str, &[&str])] = &[
+        (
+            "git",
+            &[
+                "-c",
+                "-o",
+                "-p",
+                "--paginate",
+                "--config",
+                "--output",
+                "--upload-pack",
+                "--receive-pack",
+                "--exec-path",
+                "--config-env",
+                "--work-tree",
+            ],
+        ),
+        ("cargo", &["--config", "--manifest-path"]),
+        ("fd", &["--exec", "--exec-batch"]),
+        (
+            "find",
+            &[
+                "-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fls", "-fprint0",
+                "-fprintf",
+            ],
+        ),
+        ("rg", &["--pre", "--hostname-bin"]),
+        ("tree", &["-o", "-H", "--output"]),
+        ("tail", &["-f", "-F", "--follow"]),
+        (
+            "export",
+            &[
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "DYLD_INSERT_LIBRARIES",
+                "DYLD_LIBRARY_PATH",
+                "BASH_ENV",
+                "ENV",
+                "PS4",
+                "PYTHONPATH",
+                "RUBYOPT",
+                "PERL5OPT",
+                "NODE_OPTIONS",
+            ],
+        ),
+    ];
+    const SHORT_FLAG_BUNDLE_PROGRAMS: &[(&str, &[char])] = &[
+        ("fd", &['x', 'X']),
+        ("tail", &['f', 'F']),
+        ("git", &['o', 'c', 'p']),
+        ("tree", &['o', 'H']),
+    ];
+
+    let Some(program) = tokens.first().map(|token| program_name(token)) else {
+        return false;
+    };
+    let arguments = &tokens[1..];
+    let has_flag = || {
+        PER_PROGRAM
+            .iter()
+            .find(|(name, _)| *name == program)
+            .is_some_and(|(_, flags)| {
+                flags.iter().any(|&flag| {
+                    arguments.iter().any(|argument| {
+                        if flag.starts_with("--") {
+                            argument == &flag
+                                || argument
+                                    .strip_prefix(flag)
+                                    .is_some_and(|rest| rest.starts_with('='))
+                        } else {
+                            argument.starts_with(flag)
+                        }
+                    })
+                })
+            })
+    };
+    let has_bundled = || {
+        SHORT_FLAG_BUNDLE_PROGRAMS
+            .iter()
+            .find(|(name, _)| *name == program)
+            .is_some_and(|(_, flags)| {
+                arguments
+                    .iter()
+                    .any(|argument| is_short_flag_bundle_containing(argument, flags))
+            })
+    };
+    let has_remote_helper =
+        || program == "git" && arguments.iter().any(|token| token.contains("::"));
+
+    has_flag()
+        || has_bundled()
+        || has_remote_helper()
+        || has_write_git_subcommand(program, arguments)
+}
+
+pub fn has_write_git_subcommand(program: &str, arguments: &[&str]) -> bool {
+    const WRITE_FLAGS: &[&str] = &[
+        "--delete",
+        "--move",
+        "--copy",
+        "--force",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+    ];
+    const WRITE_SHORT_FLAGS: &[char] = &['d', 'D', 'm', 'M', 'c', 'C', 'f'];
+
+    if program != "git" {
+        return false;
+    }
+    let Some((subcommand, sub_args)) = parse_git_subcommand(arguments) else {
+        return false;
+    };
+    let is_listing_branch = sub_args.contains(&"--list") || sub_args.contains(&"-l");
+    match subcommand {
+        "branch" if is_listing_branch => sub_args.iter().any(|token| {
+            WRITE_FLAGS.contains(token) || is_short_flag_bundle_containing(token, WRITE_SHORT_FLAGS)
+        }),
+        "remote" | "branch" if sub_args.iter().any(|token| !token.starts_with('-')) => true,
+        "remote" | "branch" => sub_args.iter().any(|token| {
+            WRITE_FLAGS.contains(token) || is_short_flag_bundle_containing(token, WRITE_SHORT_FLAGS)
+        }),
+        _ => false,
+    }
+}
+
+pub fn is_short_flag_bundle_containing(token: &str, flags: &[char]) -> bool {
+    match token.strip_prefix('-') {
+        Some(bundle)
+            if !bundle.starts_with('-') && bundle.chars().all(|c| c.is_ascii_alphabetic()) =>
+        {
+            bundle.chars().any(|c| flags.contains(&c))
+        }
+        _ => false,
+    }
+}
+
+pub fn unquote_segment(segment: &str) -> std::borrow::Cow<'_, str> {
+    if !segment.contains(['"', '\'']) {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    std::borrow::Cow::Owned(
+        segment
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\''))
+            .collect(),
+    )
+}
+
+pub fn program_name(token: &str) -> &str {
+    let unescaped = token.strip_prefix('\\').unwrap_or(token);
+    unescaped.rsplit('/').next().unwrap_or(unescaped)
+}
+
+pub fn is_network_pipe_to_interpreter(lowered_command: &str) -> bool {
+    if !lowered_command.contains('|') {
+        return false;
+    }
+    let fetches = NETWORK_FETCHERS
+        .iter()
+        .any(|fetcher| lowered_command.contains(fetcher));
+    if !fetches {
+        return false;
+    }
+    lowered_command.split('|').skip(1).any(|stage| {
+        stage
+            .split_whitespace()
+            .any(|token| PIPE_TARGETS.contains(&program_name(token)))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::JudgeConfig;
+    use crate::judge::{JudgeDecision, JudgeRequest};
+    use crate::session::SessionId;
+
+    fn evaluate_cmd(cmd: &str) -> Option<JudgeVerdict> {
+        let config = JudgeConfig::default();
+        let rules = JudgeRules::new(&config);
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some(cmd.to_string()),
+            path: None,
+            cwd: None,
+        };
+        rules.evaluate(&req)
+    }
+
+    #[test]
+    fn git_branch_mutating_flags_and_creation_are_not_allowed() {
+        assert_ne!(
+            evaluate_cmd("git branch -d feat").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -D -r origin/feat").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -M old new").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -m old new").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -c old copy").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -C old copy").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -u upstream/main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch --set-upstream-to=upstream/main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch --unset-upstream").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch --edit-description").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch new_branch").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn git_branch_read_only_flags_are_allowed() {
+        assert_eq!(
+            evaluate_cmd("git branch").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch --show-current").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch -r").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch --remotes").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch -a").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch --all").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch --list feat/*").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn git_tag_mutating_flags_are_not_allowed() {
+        assert_eq!(evaluate_cmd("git tag -d v1.0.0"), None);
+        assert_eq!(evaluate_cmd("git tag -D v1.0.0"), None);
+        assert_eq!(evaluate_cmd("git tag -a v1.0.0 -m release"), None);
+        assert_eq!(evaluate_cmd("git tag -s v1.0.0"), None);
+        assert_eq!(evaluate_cmd("git tag v1.0.0"), None);
+    }
+
+    #[test]
+    fn git_tag_read_only_flags_are_allowed() {
+        assert_eq!(
+            evaluate_cmd("git tag").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git tag -l").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git tag --list v*").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn credential_path_relative_traversal_blocked() {
+        let req_env = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("./src/../../.env".to_string()),
+            cwd: None,
+        };
+        let req_aws = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("foo/../.aws/credentials".to_string()),
+            cwd: None,
+        };
+        let req_ssh = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("cat ./src/../../.ssh/id_rsa".to_string()),
+            path: None,
+            cwd: None,
+        };
+
+        assert_eq!(
+            check_target_credential_path(&req_env),
+            Some(".env".to_string())
+        );
+        assert_eq!(
+            check_target_credential_path(&req_aws),
+            Some(".aws/credentials".to_string())
+        );
+        assert_eq!(
+            check_target_credential_path(&req_ssh),
+            Some(".ssh".to_string())
+        );
+    }
+
+    #[test]
+    fn template_files_are_not_blocked_as_credentials() {
+        let req_example = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(".env.example".to_string()),
+            cwd: None,
+        };
+        let req_sample = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(".env.sample".to_string()),
+            cwd: None,
+        };
+
+        assert_eq!(check_target_credential_path(&req_example), None);
+        assert_eq!(check_target_credential_path(&req_sample), None);
+    }
+
+    #[test]
+    fn timeout_with_duration_suffixes_parses_effective_command() {
+        assert_eq!(
+            evaluate_cmd("timeout 5s cargo check").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("timeout 1.5s git status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("timeout 2m cargo test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonicalize_path_resolves_symlinks() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "triage-test-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create_dir_all");
+        let target_file = temp_dir.join("real_config.toml");
+        std::fs::write(&target_file, "[judge]\nenabled = true\n").expect("write");
+        let symlink_path = temp_dir.join("symlink_config.toml");
+        std::os::unix::fs::symlink(&target_file, &symlink_path).expect("symlink");
+
+        let resolved = std::fs::canonicalize(&symlink_path).expect("canonicalize");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&target_file).expect("canonicalize target")
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn shell_profile_and_traversal_paths_blocked() {
+        let req_bashrc = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "write_to_file".to_string(),
+            command_line: None,
+            path: Some("~/.bashrc".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            check_target_credential_path(&req_bashrc),
+            Some(".bashrc".to_string())
+        );
+
+        let req_traversal = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("foo/bar/../../.ssh/id_ed25519".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            check_target_credential_path(&req_traversal),
+            Some(".ssh".to_string())
+        );
+    }
+
+    #[test]
+    fn env_variants_blocked_while_templates_allowed() {
+        let req_env_local = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "write_to_file".to_string(),
+            command_line: None,
+            path: Some("/project/.env.local".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            check_target_credential_path(&req_env_local),
+            Some(".env".to_string())
+        );
+
+        let req_env_underscore = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("/project/.env_production".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            check_target_credential_path(&req_env_underscore),
+            Some(".env".to_string())
+        );
+
+        let req_env_example = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "write_to_file".to_string(),
+            command_line: None,
+            path: Some("/project/.env.example".to_string()),
+            cwd: None,
+        };
+        assert_eq!(check_target_credential_path(&req_env_example), None);
+    }
+
+    #[test]
+    fn git_subcommands_with_global_flags_evaluate_accurately() {
+        assert_eq!(
+            evaluate_cmd("git -C /tmp --no-pager diff").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git -c user.name=\"x\" push origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git --no-pager reset --hard HEAD~1").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn chained_and_piped_commands_with_empty_segments_or_sensitive_needles() {
+        assert_eq!(
+            evaluate_cmd("git -C /tmp/repo --no-pager diff HEAD~1").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("VAR=\"value with spaces\" git status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("env -u FOO cargo check").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("echo \"security find-generic-password\"").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn unicode_words_are_preserved_without_byte_mangling() {
+        let words = tokenize_words("git commit -m \"feat: 🚀 こんにちは世界\"");
+        assert_eq!(
+            words,
+            vec!["git", "commit", "-m", "feat: 🚀 こんにちは世界"]
+        );
+    }
+
+    #[test]
+    fn relative_traversal_to_system_and_shadow_files_blocked() {
+        for path in &[
+            "./src/../../etc/passwd",
+            "foo/../../etc/shadow",
+            "bar/../etc/sudoers",
+            "a/b/../../etc/hosts",
+            "etc/passwd",
+            "etc/shadow",
+        ] {
+            let req = JudgeRequest {
+                session_id: SessionId::default(),
+                tool_name: "view_file".to_string(),
+                command_line: None,
+                path: Some(path.to_string()),
+                cwd: None,
+            };
+            assert!(
+                check_target_credential_path(&req).is_some(),
+                "Path {path} should be detected as a credential path"
+            );
+        }
+    }
+
+    #[test]
+    fn global_flags_with_write_subcommands_are_disqualified() {
+        assert!(has_disqualifying_argument(&[
+            "git",
+            "-C",
+            "/tmp/repo",
+            "branch",
+            "new_branch"
+        ]));
+        assert!(has_disqualifying_argument(&[
+            "git",
+            "-C",
+            "/tmp/repo",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:foo/bar.git"
+        ]));
+        assert!(!has_disqualifying_argument(&[
+            "git",
+            "-C",
+            "/tmp/repo",
+            "branch",
+            "--list"
+        ]));
+        assert!(has_disqualifying_argument(&[
+            "git",
+            "-C/tmp/repo",
+            "branch",
+            "new_branch"
+        ]));
+        assert!(!has_disqualifying_argument(&[
+            "git",
+            "-C/tmp/repo",
+            "branch",
+            "--list"
+        ]));
+        assert_eq!(
+            evaluate_cmd("git -C/tmp/repo status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn builtin_deny_substrings_returns_sensitive_needles() {
+        let substrings = builtin_deny_substrings();
+        assert!(!substrings.is_empty());
+        assert!(substrings.contains(&"cargo publish".to_string()));
+        assert!(substrings.contains(&"security find-generic-password".to_string()));
+    }
+
+    #[test]
+    fn compound_commands_with_null_redirections_and_unicode_semicolons() {
+        assert_eq!(
+            evaluate_cmd("cargo test > /dev/null 2>&1 && git status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("(git status && cargo check)").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("ls \"unclosed quote; echo safe").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("git status 'unclosed quote; echo safe").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            strip_null_redirections("echo \">/dev/null in quotes\" 2>/dev/null"),
+            "echo \">/dev/null in quotes\"  "
+        );
+        let words = tokenize_words("git commit -m \"feat: handle ; in string literals 🚀\"");
+        assert_eq!(
+            words,
+            vec![
+                "git",
+                "commit",
+                "-m",
+                "feat: handle ; in string literals 🚀"
+            ]
+        );
+    }
+
+    #[test]
+    fn developer_and_cli_secrets_blocked() {
+        for path in &[
+            "~/.cargo/credentials.toml",
+            "~/.cargo/credentials",
+            "~/.aws/config",
+            "~/.aws/credentials",
+            "~/.dockercfg",
+            "~/.vault-token",
+            "~/.config/op/config",
+            "C:\\Users\\admin\\.aws\\credentials",
+            "\\\\?\\C:\\Users\\admin\\.aws\\credentials",
+            "\\\\.\\C:\\.env",
+        ] {
+            let req = JudgeRequest {
+                session_id: SessionId::default(),
+                tool_name: "view_file".to_string(),
+                command_line: None,
+                path: Some(path.to_string()),
+                cwd: None,
+            };
+            assert!(
+                check_target_credential_path(&req).is_some(),
+                "Path {path} should be detected as a credential path"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_api_graphql_is_disqualified() {
+        assert_eq!(
+            evaluate_cmd("gh api graphql -f query='query { viewer { login } }'")
+                .map(|v| v.decision),
+            None
+        );
+        assert_eq!(evaluate_cmd("gh api graphql").map(|v| v.decision), None);
+        assert_eq!(evaluate_cmd("gh api /graphql").map(|v| v.decision), None);
+        assert_eq!(
+            evaluate_cmd("gh api user").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gh api /repos/owner/repo/pulls").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn git_execution_modifying_flags_disqualified() {
+        assert_eq!(
+            evaluate_cmd("git -c core.pager=rm status").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("git -c core.askPass=/tmp/script diff").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("git --exec-path=/tmp/malicious log").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("git --config-env=VAR=VAL status").map(|v| v.decision),
+            None
+        );
+        assert_eq!(evaluate_cmd("git -p status").map(|v| v.decision), None);
+        assert_eq!(
+            evaluate_cmd("git --paginate status").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("git status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git diff HEAD").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn export_disqualifies_sensitive_environment_variables() {
+        assert_eq!(
+            evaluate_cmd("export LD_PRELOAD=/tmp/evil.so").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("export DYLD_INSERT_LIBRARIES=/tmp/evil.dylib").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("export BASH_ENV=/tmp/evil.sh").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("export PATH=/usr/bin:$PATH").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("export RUST_BACKTRACE=1").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn git_tag_and_branch_attached_flags_disqualified() {
+        assert_ne!(
+            evaluate_cmd("git tag -d1.0.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git tag -D1.0.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git tag -f1.0.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git tag -a1.0.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git tag -s1.0.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git tag -u1.0.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git tag -l").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git tag --list").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git tag").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git tag 'v*'").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        assert_ne!(
+            evaluate_cmd("git branch -d feat").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -D feat").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -d123").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -r -d123").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -a -D123").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git branch -r -m123").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch -a").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch -r").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch --show-current").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+}

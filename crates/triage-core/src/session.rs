@@ -20,6 +20,12 @@ impl SessionId {
     }
 }
 
+impl Default for SessionId {
+    fn default() -> Self {
+        Self("external".to_string())
+    }
+}
+
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -543,6 +549,96 @@ pub trait SessionApi {
     fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
         Ok(Vec::new())
     }
+    /// Sets whether this session auto-approves agent tool calls, or clears the
+    /// override with `None` so the session follows the configured default.
+    ///
+    /// Deliberately three-state rather than a plain bool: a session that has
+    /// never been touched must keep tracking the config default when that
+    /// default changes, which a bool cannot express. Default: unsupported.
+    fn set_session_judge_policy(
+        &self,
+        session_id: SessionId,
+        enabled: Option<bool>,
+    ) -> Result<crate::judge::SessionJudgePolicy> {
+        let _ = (session_id, enabled);
+        anyhow::bail!("per-session judge policy is not supported by this session API")
+    }
+    /// One session's judge policy.
+    ///
+    /// Targeted rather than reading it out of
+    /// [`Self::list_session_contexts`]: that call fans out to a round trip per
+    /// live session to build rows a caller asking about one session does not
+    /// want. Default: unsupported.
+    fn session_judge_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::judge::SessionJudgePolicy> {
+        let _ = session_id;
+        anyhow::bail!("per-session judge policy is not supported by this session API")
+    }
+    /// Returns the judge policy for every active session. Implementations can override this
+    /// to read all policies under a single lock rather than iterating.
+    fn list_session_judge_policies(&self) -> Result<Vec<crate::judge::SessionJudgePolicyEntry>> {
+        let ids = self.list_sessions()?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(policy) = self.session_judge_policy(id.clone()) {
+                entries.push(crate::judge::SessionJudgePolicyEntry {
+                    session_id: id,
+                    policy,
+                });
+            }
+        }
+        Ok(entries)
+    }
+    /// Inspects the status of the tool-call approval judge hook in the given workspace.
+    fn get_judge_hook_status(
+        &self,
+        workspace_path: Option<String>,
+    ) -> Result<crate::judge::JudgeHookStatus> {
+        let _ = workspace_path;
+        anyhow::bail!("judge hook status is not supported by this session API")
+    }
+    /// Creates or updates `.agents/hooks.json` in the given workspace.
+    fn configure_judge_hook(
+        &self,
+        workspace_path: Option<String>,
+        enabled: bool,
+    ) -> Result<crate::judge::JudgeHookStatus> {
+        let _ = (workspace_path, enabled);
+        anyhow::bail!("configuring judge hook is not supported by this session API")
+    }
+    /// Returns the recent decision history from the approval judge.
+    fn get_judge_history(&self) -> Result<Vec<crate::judge::JudgeRecord>> {
+        Ok(Vec::new())
+    }
+    /// Returns active judge rules including both builtins and custom rules.
+    fn get_judge_rules(&self) -> Result<crate::judge::JudgeRulesInfo> {
+        anyhow::bail!("get_judge_rules is not supported by this session API")
+    }
+    /// Adds a custom command prefix to the allow rules.
+    fn add_judge_allow_command(&self, command: String) -> Result<crate::judge::JudgeRulesInfo> {
+        let _ = command;
+        anyhow::bail!("add_judge_allow_command is not supported by this session API")
+    }
+    /// Removes a custom command prefix from the allow rules.
+    fn remove_judge_allow_command(&self, command: String) -> Result<crate::judge::JudgeRulesInfo> {
+        let _ = command;
+        anyhow::bail!("remove_judge_allow_command is not supported by this session API")
+    }
+    /// Adds a custom substring to the deny rules.
+    fn add_judge_deny_substring(&self, substring: String) -> Result<crate::judge::JudgeRulesInfo> {
+        let _ = substring;
+        anyhow::bail!("add_judge_deny_substring is not supported by this session API")
+    }
+    /// Removes a custom substring from the deny rules.
+    fn remove_judge_deny_substring(
+        &self,
+        substring: String,
+    ) -> Result<crate::judge::JudgeRulesInfo> {
+        let _ = substring;
+        anyhow::bail!("remove_judge_deny_substring is not supported by this session API")
+    }
     /// Update status to embed in the `Hello` handshake. Defaults to "this build,
     /// nothing newer known" so non-daemon implementors (test mocks, the MCP
     /// recorder) need not care; the daemon's `SessionManager` overrides it.
@@ -608,6 +704,56 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     }
     fn list_session_contexts(&self) -> Result<Vec<SessionContextRow>> {
         (**self).list_session_contexts()
+    }
+    fn set_session_judge_policy(
+        &self,
+        session_id: SessionId,
+        enabled: Option<bool>,
+    ) -> Result<crate::judge::SessionJudgePolicy> {
+        (**self).set_session_judge_policy(session_id, enabled)
+    }
+    fn list_session_judge_policies(&self) -> Result<Vec<crate::judge::SessionJudgePolicyEntry>> {
+        (**self).list_session_judge_policies()
+    }
+    fn session_judge_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::judge::SessionJudgePolicy> {
+        (**self).session_judge_policy(session_id)
+    }
+    fn get_judge_hook_status(
+        &self,
+        workspace_path: Option<String>,
+    ) -> Result<crate::judge::JudgeHookStatus> {
+        (**self).get_judge_hook_status(workspace_path)
+    }
+    fn configure_judge_hook(
+        &self,
+        workspace_path: Option<String>,
+        enabled: bool,
+    ) -> Result<crate::judge::JudgeHookStatus> {
+        (**self).configure_judge_hook(workspace_path, enabled)
+    }
+    fn get_judge_history(&self) -> Result<Vec<crate::judge::JudgeRecord>> {
+        (**self).get_judge_history()
+    }
+    fn get_judge_rules(&self) -> Result<crate::judge::JudgeRulesInfo> {
+        (**self).get_judge_rules()
+    }
+    fn add_judge_allow_command(&self, command: String) -> Result<crate::judge::JudgeRulesInfo> {
+        (**self).add_judge_allow_command(command)
+    }
+    fn remove_judge_allow_command(&self, command: String) -> Result<crate::judge::JudgeRulesInfo> {
+        (**self).remove_judge_allow_command(command)
+    }
+    fn add_judge_deny_substring(&self, substring: String) -> Result<crate::judge::JudgeRulesInfo> {
+        (**self).add_judge_deny_substring(substring)
+    }
+    fn remove_judge_deny_substring(
+        &self,
+        substring: String,
+    ) -> Result<crate::judge::JudgeRulesInfo> {
+        (**self).remove_judge_deny_substring(substring)
     }
     fn server_update_info(&self) -> ServerUpdateInfo {
         (**self).server_update_info()

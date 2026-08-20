@@ -30,6 +30,7 @@ fn main() -> anyhow::Result<()> {
             println!("triaged {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Invocation::Reload => return triaged::service::reload_daemon(),
         Invocation::Service(_) | Invocation::Daemon { .. } => {}
     }
 
@@ -171,10 +172,12 @@ fn probe_daemon_socket(socket_path: &std::path::Path) -> DaemonSocketState {
 
 const HELP: &str = "\
 usage: triaged [--handover]
+       triaged reload
        triaged service <action>
        triaged --help | --version
 
 Options:
+  reload            Gracefully reload a running daemon with zero downtime (on Unix)
   --handover, -U    Take over sessions from a running daemon. Optional: a live
                     daemon is always handed over from, flag or not.
   service <action>  Manage the per-user login service and exit
@@ -193,6 +196,7 @@ argument is rejected rather than silently displacing the running daemon.";
 enum Invocation {
     Help,
     Version,
+    Reload,
     /// `triaged service <action>` — action is validated by `service::run_cli`.
     Service(String),
     /// Start the daemon. `handover` records whether `--handover`/`-U` was
@@ -239,6 +243,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Invoca
         ));
     }
 
+    if rest.first().map(String::as_str) == Some("reload")
+        || rest.iter().any(|arg| arg == "--reload" || arg == "-r")
+    {
+        if let Some(extra) = rest.get(1) {
+            anyhow::bail!("unexpected argument `{extra}` after `reload`\n\n{HELP}");
+        }
+        return Ok(Invocation::Reload);
+    }
+
     // The flag forms are position-independent, but the bare words are only a
     // request as the first token — anywhere else they are a stray word, and
     // treating one as a request would mask a typo.
@@ -268,6 +281,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Invoca
 /// in `main` before logging is initialized, so they never reach here.
 fn run(invocation: Invocation) -> anyhow::Result<()> {
     let is_handover = match invocation {
+        Invocation::Reload => return triaged::service::reload_daemon(),
         Invocation::Service(action) => return triaged::service::run_cli(&action),
         Invocation::Daemon { handover } => handover,
         // Answered in `main`; reachable only if that guard is refactored away.
@@ -446,6 +460,11 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // on first activity, so this never blocks startup). No-op when disabled.
     manager.start_summarizer(config.summarizer.clone());
 
+    // Install the tool-call approval judge. It shares the summarizer's resident
+    // model, so this only builds the rule tables and never loads anything.
+    manager.start_judge(config.judge.clone());
+    triaged::service::install_global_agent_hooks();
+
     // Start recording each live session's working directory into the manifest as
     // it changes, so a daemon kill restores sessions where they left off rather
     // than at their launch dir. Always on, independent of the summarizer.
@@ -620,62 +639,50 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     let ws_cache = Arc::clone(&web_cache);
     let pair_approval_tailnet_users = config.remote.pair_approval_tailnet_users.clone();
     let pair_approval_trust_local_peers = config.remote.pair_approval_trust_local_peers;
-    match tcp_listener
-        .as_ref()
-        .map(std::net::TcpListener::try_clone)
-        .transpose()
-    {
-        Ok(websocket_listener) => {
-            if let Err(error) = std::thread::Builder::new()
-                .name("triage-websocket-server".to_string())
-                .spawn(move || {
-                    #[cfg(unix)]
-                    let tcp_listener = match websocket_listener {
-                        Some(listener) => listener,
-                        None => loop {
-                            match std::net::TcpListener::bind(bind_addr) {
-                                Ok(listener) => {
-                                    use std::os::unix::io::AsRawFd;
-                                    triaged::handover::set_active_tcp_listener_fd(
-                                        listener.as_raw_fd(),
-                                    );
-                                    break listener;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        %bind_addr,
-                                        "TCP listener is still occupied after handover; retrying while IPC remains available."
-                                    );
-                                    std::thread::sleep(std::time::Duration::from_millis(250));
-                                }
-                            }
-                        },
-                    };
-                    #[cfg(not(unix))]
-                    let tcp_listener = websocket_listener
-                        .expect("non-Unix listener was bound before spawn");
-                    if let Err(error) = ws::start_websocket_server(
-                        ws_manager,
-                        tcp_listener,
-                        ws_cache,
-                        pair_approval_tailnet_users,
-                        pair_approval_trust_local_peers,
-                    ) {
-                        tracing::error!(error = ?error, "Multiplexed HTTP + WebSocket server failed");
+    if let Err(error) = std::thread::Builder::new()
+        .name("triage-websocket-server".to_string())
+        .spawn(move || {
+            #[cfg(unix)]
+            let tcp_listener = match tcp_listener {
+                Some(listener) => listener,
+                None => loop {
+                    match std::net::TcpListener::bind(bind_addr) {
+                        Ok(listener) => {
+                            use std::os::unix::io::AsRawFd;
+                            triaged::handover::set_active_tcp_listener_fd(
+                                listener.as_raw_fd(),
+                            );
+                            break listener;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                %bind_addr,
+                                "TCP listener is still occupied after handover; retrying while IPC remains available."
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
                     }
-                })
-            {
-                tracing::error!(
-                    %error,
-                    "could not start the WebSocket server thread; continuing with local IPC so inherited sessions remain owned"
-                );
+                },
+            };
+            #[cfg(not(unix))]
+            let tcp_listener = tcp_listener
+                .expect("non-Unix listener was bound before spawn");
+            if let Err(error) = ws::start_websocket_server(
+                ws_manager,
+                tcp_listener,
+                ws_cache,
+                pair_approval_tailnet_users,
+                pair_approval_trust_local_peers,
+            ) {
+                tracing::error!(error = ?error, "Multiplexed HTTP + WebSocket server failed");
             }
-        }
-        Err(error) => tracing::error!(
+        })
+    {
+        tracing::error!(
             %error,
-            "could not duplicate the TCP listener for the WebSocket server; continuing with local IPC"
-        ),
+            "could not start the WebSocket server thread; continuing with local IPC so inherited sessions remain owned"
+        );
     }
 
     #[cfg(unix)]
@@ -881,5 +888,12 @@ mod tests {
             parse_args(args(&["--handover", "-h"])).unwrap(),
             Invocation::Help
         );
+    }
+
+    #[test]
+    fn reload_arguments_are_parsed() {
+        assert_eq!(parse_args(args(&["reload"])).unwrap(), Invocation::Reload);
+        assert_eq!(parse_args(args(&["--reload"])).unwrap(), Invocation::Reload);
+        assert_eq!(parse_args(args(&["-r"])).unwrap(), Invocation::Reload);
     }
 }

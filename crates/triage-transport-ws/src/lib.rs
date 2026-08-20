@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use triage_core::judge::SessionJudgePolicy;
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEventEnvelope,
@@ -414,6 +415,66 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     .collect();
                 Ok(ServerResult::SessionContexts { entries })
             }
+            ClientRequest::GetSessionJudgePolicy { session_id } => {
+                let policy = self.api.session_judge_policy(session_id.clone())?;
+                Ok(ServerResult::SessionJudgePolicy { session_id, policy })
+            }
+            ClientRequest::SetSessionJudgePolicy {
+                session_id,
+                enabled,
+            } => {
+                let policy = self
+                    .api
+                    .set_session_judge_policy(session_id.clone(), enabled)?;
+                Ok(ServerResult::SessionJudgePolicy { session_id, policy })
+            }
+            ClientRequest::ListSessionJudgePolicies => {
+                let entries = self
+                    .api
+                    .list_session_judge_policies()?
+                    .into_iter()
+                    .map(|entry| SessionJudgePolicyEntry {
+                        session_id: entry.session_id,
+                        policy: entry.policy,
+                    })
+                    .collect();
+                Ok(ServerResult::SessionJudgePolicies { entries })
+            }
+            ClientRequest::GetJudgeHookStatus { workspace_path } => {
+                let status = self.api.get_judge_hook_status(workspace_path)?;
+                Ok(ServerResult::JudgeHookStatus { status })
+            }
+            ClientRequest::ConfigureJudgeHook {
+                workspace_path,
+                enabled,
+            } => {
+                let status = self.api.configure_judge_hook(workspace_path, enabled)?;
+                Ok(ServerResult::JudgeHookStatus { status })
+            }
+            ClientRequest::GetJudgeHistory => {
+                let records = self.api.get_judge_history()?;
+                Ok(ServerResult::JudgeHistory { records })
+            }
+            ClientRequest::GetJudgeRules => {
+                let rules = self.api.get_judge_rules()?;
+                Ok(ServerResult::JudgeRules { rules })
+            }
+            ClientRequest::AddJudgeAllowCommand { command } => {
+                let rules = self.api.add_judge_allow_command(command)?;
+                Ok(ServerResult::JudgeRules { rules })
+            }
+            ClientRequest::RemoveJudgeAllowCommand { command } => {
+                let rules = self.api.remove_judge_allow_command(command)?;
+                Ok(ServerResult::JudgeRules { rules })
+            }
+            ClientRequest::AddJudgeDenySubstring { substring } => {
+                let rules = self.api.add_judge_deny_substring(substring)?;
+                Ok(ServerResult::JudgeRules { rules })
+            }
+            ClientRequest::RemoveJudgeDenySubstring { substring } => {
+                let rules = self.api.remove_judge_deny_substring(substring)?;
+                Ok(ServerResult::JudgeRules { rules })
+            }
         }
     }
 
@@ -500,6 +561,38 @@ pub enum ClientRequest {
     },
     ListSessionSnippets,
     ListSessionContexts,
+    GetSessionJudgePolicy {
+        session_id: SessionId,
+    },
+    SetSessionJudgePolicy {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+    },
+    ListSessionJudgePolicies,
+    GetJudgeHookStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_path: Option<String>,
+    },
+    ConfigureJudgeHook {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_path: Option<String>,
+        enabled: bool,
+    },
+    GetJudgeHistory,
+    GetJudgeRules,
+    AddJudgeAllowCommand {
+        command: String,
+    },
+    RemoveJudgeAllowCommand {
+        command: String,
+    },
+    AddJudgeDenySubstring {
+        substring: String,
+    },
+    RemoveJudgeDenySubstring {
+        substring: String,
+    },
 }
 
 /// One session's current snippet, as carried in [`ServerResult::SessionSnippets`].
@@ -536,6 +629,14 @@ pub struct SessionContextEntry {
     /// session that has produced no output, or a daemon predating this field.
     #[serde(default)]
     pub last_activity_ms: u64,
+}
+
+/// One session's current auto-approval judge policy, as carried in
+/// [`ServerResult::SessionJudgePolicies`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionJudgePolicyEntry {
+    pub session_id: SessionId,
+    pub policy: SessionJudgePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -593,6 +694,11 @@ pub enum ServerMessage {
         current_version: String,
         latest_version: String,
     },
+    /// Connection-wide push: a session's tool-call approval judge policy changed.
+    SessionJudgePolicyUpdated {
+        session_id: SessionId,
+        policy: SessionJudgePolicy,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,6 +752,22 @@ pub enum ServerResult {
     },
     SessionContexts {
         entries: Vec<SessionContextEntry>,
+    },
+    SessionJudgePolicy {
+        session_id: SessionId,
+        policy: SessionJudgePolicy,
+    },
+    SessionJudgePolicies {
+        entries: Vec<SessionJudgePolicyEntry>,
+    },
+    JudgeHookStatus {
+        status: triage_core::judge::JudgeHookStatus,
+    },
+    JudgeHistory {
+        records: Vec<triage_core::judge::JudgeRecord>,
+    },
+    JudgeRules {
+        rules: triage_core::judge::JudgeRulesInfo,
     },
 }
 
