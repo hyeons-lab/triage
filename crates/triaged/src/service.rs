@@ -49,6 +49,7 @@ pub fn run_cli(action: &str) -> Result<()> {
         "uninstall" => platform::uninstall(&ServiceContext::detect()?),
         "start" => platform::start(&ServiceContext::detect()?),
         "stop" => platform::stop(&ServiceContext::detect()?),
+        "restart" | "reload" => platform::restart(&ServiceContext::detect()?),
         "status" => platform::status(&ServiceContext::detect()?),
         "" | "help" | "-h" | "--help" => {
             print_usage();
@@ -63,12 +64,13 @@ pub fn run_cli(action: &str) -> Result<()> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: triaged service <install|uninstall|start|stop|status>\n\
+        "Usage: triaged service <install|uninstall|start|stop|restart|status>\n\
          \n\
          install    register triaged to start at login and start it now\n\
          uninstall  stop triaged and remove the login registration\n\
          start      start the installed service\n\
          stop       stop the installed service\n\
+         restart    restart the service (on Unix, gracefully reloads with zero downtime; on Windows, restarts the task; also `reload`)\n\
          status     show whether the service is installed and running"
     );
 }
@@ -82,20 +84,231 @@ struct ServiceContext {
 
 impl ServiceContext {
     fn detect() -> Result<Self> {
-        let exe = std::env::current_exe()
+        let current = std::env::current_exe()
             .context("resolving the triaged executable path for service registration")?;
+        // If triaged was run via `cargo run` (inside target/debug or target/release),
+        // prefer the globally installed ~/.cargo/bin/triaged release binary if it exists.
+        let current_str = current.to_string_lossy();
+        let exe = if current_str.contains("/target/") || current_str.contains("\\target\\") {
+            let home_opt = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            if let Some(home) = home_opt {
+                let bin_name = format!("triaged{}", std::env::consts::EXE_SUFFIX);
+                let cargo_bin = PathBuf::from(home)
+                    .join(".cargo")
+                    .join("bin")
+                    .join(bin_name);
+                if cargo_bin.exists() {
+                    cargo_bin
+                } else {
+                    current
+                }
+            } else {
+                current
+            }
+        } else {
+            current
+        };
         Ok(Self { exe })
     }
 }
 
-/// `$HOME` as a path. Used to place the LaunchAgent plist (macOS) and the
-/// systemd user unit (Linux); the Windows logon task needs no home lookup.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Gracefully reloads a running daemon with zero downtime: spawns the latest
+/// binary detached in the background, transfers session descriptors, and verifies adoption.
+pub fn reload_daemon() -> Result<()> {
+    // Automatically ensure all global agent hooks are provisioned upon reload.
+    install_global_agent_hooks();
+
+    #[cfg(unix)]
+    {
+        use crate::ipc::{IpcClient, default_socket_path};
+        use std::os::unix::process::CommandExt;
+        use triage_core::session::SessionApi;
+
+        let socket_path = default_socket_path();
+        let ctx = ServiceContext::detect()?;
+
+        // If the socket isn't active, start the service.
+        if !socket_path.exists() || std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+            println!("No running triaged daemon found. Starting service...");
+            return platform::start(&ctx);
+        }
+
+        let mut cmd = std::process::Command::new(&ctx.exe);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
+        let _child = cmd
+            .spawn()
+            .context("spawning replacement triaged daemon in background")?;
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        while start.elapsed() < timeout {
+            let client = IpcClient::new(socket_path.clone());
+            if let Ok(sessions) = client.list_sessions() {
+                println!(
+                    "triaged daemon reloaded successfully ({} live sessions preserved).",
+                    sessions.len()
+                );
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        println!("triaged reload initiated (replacement daemon spawned in background).");
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let ctx = ServiceContext::detect()?;
+        platform::restart(&ctx)
+    }
+}
+
+/// `$HOME` as a path.
 fn home_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .context("neither HOME nor USERPROFILE environment variable is set")?;
     Ok(PathBuf::from(home))
+}
+
+/// Provisions global agent lifecycle hooks (in `~/.gemini/config/hooks.json` and `~/.agents/hooks.json`) if not already present.
+pub fn install_global_agent_hooks() {
+    if let Ok(home) = home_dir() {
+        let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+        let cargo_hook = home.join(".cargo").join("bin").join(&hook_name);
+        let hook_cmd = if cargo_hook.exists() {
+            cargo_hook.to_string_lossy().to_string()
+        } else {
+            "triage-hook".to_string()
+        };
+
+        let content = serde_json::json!({
+            "triage-approval-judge": {
+                "enabled": true,
+                "PreToolUse": [
+                    {
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": hook_cmd,
+                                "timeout": 15
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        if let Ok(json_str) = serde_json::to_string_pretty(&content) {
+            let hook_paths = [
+                home.join(".gemini").join("config").join("hooks.json"),
+                home.join(".agents").join("hooks.json"),
+            ];
+            for path in hook_paths {
+                if !path.exists() {
+                    let _ = atomic_write_file(&path, &json_str);
+                    tracing::info!(path = %path.display(), "Configured global agent hooks");
+                } else if let Ok(existing_str) = std::fs::read_to_string(&path)
+                    && let Ok(mut existing_val) =
+                        serde_json::from_str::<serde_json::Value>(&existing_str)
+                    && let Some(obj) = existing_val.as_object_mut()
+                    && !obj.contains_key("triage-approval-judge")
+                    && let Some(judge_obj) = content.get("triage-approval-judge").cloned()
+                {
+                    obj.insert("triage-approval-judge".to_string(), judge_obj);
+                    if let Ok(updated_str) = serde_json::to_string_pretty(&existing_val) {
+                        let _ = atomic_write_file(&path, &updated_str);
+                        tracing::info!(
+                            path = %path.display(),
+                            "Merged triage-approval-judge into existing hooks"
+                        );
+                    }
+                }
+            }
+
+            // Also ensure ~/.claude/settings.json is configured with the absolute hook command
+            let claude_settings = home.join(".claude").join("settings.json");
+            if claude_settings.exists()
+                && let Ok(file_content) = std::fs::read_to_string(&claude_settings)
+                && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&file_content)
+                && let Some(claude_map) = val.as_object_mut()
+            {
+                let mut hooks_obj = claude_map
+                    .get("hooks")
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let mut pre_arr = hooks_obj
+                    .get("PreToolUse")
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                let already_has = pre_arr.iter().any(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|cmd| {
+                                cmd.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.contains("triage-hook"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                if !already_has {
+                    pre_arr.push(serde_json::json!({
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": hook_cmd,
+                                "timeout": 15
+                            }
+                        ]
+                    }));
+                    hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
+                    claude_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
+                    if let Ok(updated) = serde_json::to_string_pretty(&val) {
+                        let _ = atomic_write_file(&claude_settings, &updated);
+                        tracing::info!(
+                            path = %claude_settings.display(),
+                            "Configured Claude Code hooks"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn atomic_write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
+    std::fs::write(&tmp, content)?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Directory for the daemon's stdout/stderr logs. Only macOS needs this: the
@@ -382,6 +595,7 @@ mod platform {
              first install after upgrading, the job being replaced is still governed by the old \
              plist's shorter stop timeout, so that one handover can be cut short."
         );
+        super::install_global_agent_hooks();
         Ok(())
     }
 
@@ -411,6 +625,10 @@ mod platform {
         launchctl(&["stop", SERVICE_LABEL])?;
         println!("Stopped triaged.");
         Ok(())
+    }
+
+    pub(super) fn restart(_ctx: &ServiceContext) -> Result<()> {
+        super::reload_daemon()
     }
 
     pub(super) fn status(_ctx: &ServiceContext) -> Result<()> {
@@ -467,6 +685,7 @@ mod platform {
             unit.display(),
             whoami()
         );
+        super::install_global_agent_hooks();
         Ok(())
     }
 
@@ -498,6 +717,10 @@ mod platform {
         systemctl(&["stop", &unit_name()])?;
         println!("Stopped triaged.");
         Ok(())
+    }
+
+    pub(super) fn restart(_ctx: &ServiceContext) -> Result<()> {
+        super::reload_daemon()
     }
 
     pub(super) fn status(_ctx: &ServiceContext) -> Result<()> {
@@ -537,6 +760,7 @@ mod platform {
         println!(
             "Installed and started triaged logon task ({SERVICE_NAME}). It will start automatically at each login."
         );
+        super::install_global_agent_hooks();
         Ok(())
     }
 
@@ -629,6 +853,11 @@ mod platform {
             .trim()
             .parse::<u32>()
             .ok()
+    }
+
+    pub(super) fn restart(ctx: &ServiceContext) -> Result<()> {
+        let _ = stop(ctx);
+        start(ctx)
     }
 
     pub(super) fn status(_ctx: &ServiceContext) -> Result<()> {

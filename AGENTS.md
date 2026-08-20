@@ -143,15 +143,17 @@ build rather than silently falling back.
 
 When upgrading or restarting the `triaged` daemon on Unix/macOS:
 
-1. **NEVER run `launchctl kickstart -k`, `killctl`, `killall triaged`, or `service stop` to restart the daemon.** Forcibly killing the daemon process before file descriptors (`SCM_RIGHTS`) are transferred causes the OS kernel to close all master PTY descriptors, which kills all active child shell sessions!
-2. **ALWAYS run `triaged --handover` (or `~/.cargo/bin/triaged --handover`) directly.**
-3. **Set adequate execution timeout**: When invoking `triaged --handover` via command tools, set `WaitMsBeforeAsync: 10000` so Phase 1 descriptor transfer and Phase 2 adoption sync complete synchronously.
-4. **Verify Handover Logs**: Confirm in `$HOME/.local/state/triage/triaged.log` that:
+1. **Ad-Hoc Code Signing on macOS (Apple Silicon)**: When updating the installed binary via `cp` (e.g. `cp target/release/triaged ~/.cargo/bin/triaged`), macOS ARM64 kernel invalidates the binary's code signature. Attempting to execute it causes the kernel to immediately terminate the process with `SIGKILL` (`-9`, code signature invalid). **Always re-sign after copying**: `codesign -s - -f ~/.cargo/bin/triaged` (or use `cargo install --path crates/triaged`).
+2. **NEVER run `launchctl kickstart -k`, `killctl`, `killall triaged`, or `service stop` to restart the daemon.** Forcibly killing the daemon process before file descriptors (`SCM_RIGHTS`) are transferred causes the OS kernel to close all master PTY descriptors, which kills all active child shell sessions!
+3. **ALWAYS run `triaged reload` (or `triaged --handover` / `~/.cargo/bin/triaged reload`) directly.**
+4. **Set adequate execution timeout**: When invoking `triaged --handover` via command tools, set `WaitMsBeforeAsync: 10000` so Phase 1 descriptor transfer and Phase 2 adoption sync complete synchronously.
+5. **Verify Handover Logs**: Confirm in `$HOME/.local/state/triage/triaged.log` that:
    - `"existing daemon detected; initiating zero-downtime process handover"`
    - `"Handover transfer completed. Waiting for client adoption sync (Phase 2)..."`
    - `"Adopting X inherited live sessions"`
    - `"Process handover handshake completed successfully. Exiting daemon."`
-5. **Supervision Resumption**: Because the macOS LaunchAgent (`com.hyeons-lab.triaged`) uses `KeepAlive: true`, `launchd` automatically respawns the newly installed `triaged` binary as a background LaunchAgent process upon the clean exit of the old daemon. The respawned process adopts the sessions and runs detached under `launchd` supervision.
+6. **Supervision Resumption**: Because the macOS LaunchAgent (`com.hyeons-lab.triaged`) uses `KeepAlive: true`, `launchd` automatically respawns the newly installed `triaged` binary as a background LaunchAgent process upon the clean exit of the old daemon. The respawned process adopts the sessions and runs detached under `launchd` supervision.
+7. **Browser Client Web Cache**: The Flutter web client uses a Service Worker (`flutter_service_worker.js`) that aggressively caches `main.dart.js` in browser `CacheStorage`. After a daemon upgrade, perform a hard reload (`Cmd + Shift + R` or DevTools -> Clear Site Data) in the browser to load the freshly embedded web bundle.
 
 ## Versioning and releases
 

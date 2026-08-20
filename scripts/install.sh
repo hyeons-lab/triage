@@ -23,7 +23,7 @@
 set -euo pipefail
 
 BIN_DIR="${TRIAGE_BIN_DIR:-$HOME/.cargo/bin}"
-BINARIES=(triaged triage triage-mcp)
+BINARIES=(triaged triage triage-mcp triage-hook)
 
 usage() {
     cat <<'EOF'
@@ -73,9 +73,20 @@ for binary in "${BINARIES[@]}"; do
     staged="$(mktemp "$dst.XXXXXX")"
     cp "$src" "$staged"
     chmod 755 "$staged"
+
+    # Explicit ad-hoc codesign on macOS before moving
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        codesign -s - -f "$staged" >/dev/null 2>&1 || true
+    fi
+
     # Atomic replace: $dst becomes a brand-new inode, never a rewritten one.
     mv -f "$staged" "$dst"
     staged=""
+
+    # Verify signature
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        codesign -v --strict "$dst" || die "codesign verification failed for $dst"
+    fi
 
     echo "==> Installed $dst"
 done
@@ -90,6 +101,45 @@ echo "==> Verifying the installed daemon launches"
     || die "$BIN_DIR/triaged failed to run — check 'codesign -v' and Console for a CODESIGNING kill"
 
 echo
-echo "The running daemon still holds the previous binary. To adopt this build"
-echo "without dropping sessions, hand over explicitly:"
-echo "    $BIN_DIR/triaged --handover"
+echo "==> Configuring agent lifecycle hooks"
+HOOK_JSON=$(cat <<EOF
+{
+  "triage-approval-judge": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$BIN_DIR/triage-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+)
+
+# Locations discovered by Antigravity, Claude Code, and user-level agents:
+HOOK_DESTINATIONS=(
+  "$HOME/.gemini/config/hooks.json"
+  "$HOME/.agents/hooks.json"
+)
+
+for hook_path in "${HOOK_DESTINATIONS[@]}"; do
+  if [[ ! -f "$hook_path" ]]; then
+    mkdir -p "$(dirname "$hook_path")"
+    echo "$HOOK_JSON" > "$hook_path"
+    echo "==> Created $hook_path"
+  else
+    echo "==> Existing $hook_path found (preserved)"
+  fi
+done
+
+echo
+echo "To reload and adopt this build with zero downtime, run:"
+echo "    $BIN_DIR/triaged reload"
+
