@@ -2,77 +2,74 @@ use crate::config::JudgeConfig;
 use crate::judge::{JudgeDecision, JudgeRequest, JudgeSource, JudgeVerdict};
 
 /// True if `tool_name` is a read-only inspection, search, web, or agent coordination tool.
-pub fn is_read_only_tool(lower: &str) -> bool {
+pub fn is_read_only_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let cleaned = lower.replace(['_', '-'], "");
     matches!(
-        lower,
+        cleaned.as_str(),
         "read"
-            | "view_file"
-            | "read_file"
             | "viewfile"
             | "readfile"
-            | "view_file_outline"
-            | "get_file_info"
-            | "read_symbol"
-            | "inspect_file"
-            | "list_dir"
+            | "viewfileoutline"
+            | "getfileinfo"
+            | "readsymbol"
+            | "inspectfile"
             | "listdir"
             | "ls"
-            | "list_directory"
-            | "find_by_name"
+            | "listdirectory"
             | "findbyname"
-            | "list_permissions"
             | "listpermissions"
-            | "grep_search"
-            | "grep"
             | "grepsearch"
-            | "search_files"
-            | "search_web"
-            | "web_search"
-            | "read_url_content"
-            | "read_browser_page"
-            | "ask_question"
-            | "invoke_subagent"
-            | "send_message"
-            | "manage_subagents"
-            | "define_subagent"
-            | "generate_image"
-            | "detect_changes"
-            | "get_review_context"
-            | "get_impact_radius"
-            | "get_affected_flows"
-            | "query_graph"
-            | "semantic_search_nodes"
-            | "get_architecture_overview"
-            | "list_communities"
+            | "grep"
+            | "searchfiles"
+            | "searchweb"
+            | "websearch"
+            | "readurlcontent"
+            | "readbrowserpage"
+            | "askquestion"
+            | "invokesubagent"
+            | "sendmessage"
+            | "managesubagents"
+            | "definesubagent"
+            | "managetask"
+            | "schedule"
+            | "generateimage"
+            | "detectchanges"
+            | "getreviewcontext"
+            | "getimpactradius"
+            | "getaffectedflows"
+            | "querygraph"
+            | "semanticsearchnodes"
+            | "getarchitectureoverview"
+            | "listcommunities"
+            | "refactortool"
     )
 }
 
 /// True if `tool_name` is an editing or writing tool.
-pub fn is_edit_tool(lower: &str) -> bool {
+pub fn is_edit_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let cleaned = lower.replace(['_', '-'], "");
     matches!(
-        lower,
-        "write_to_file"
-            | "replace_file_content"
-            | "edit_file"
-            | "write_file"
-            | "patch_file"
-            | "create_file"
+        cleaned.as_str(),
+        "writetofile"
+            | "replacefilecontent"
+            | "editfile"
+            | "writefile"
+            | "patchfile"
+            | "createfile"
+            | "edit"
+            | "write"
     )
 }
 
 /// True if `tool_name` is a shell command execution tool.
-pub fn is_command_tool(lower: &str) -> bool {
+pub fn is_command_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let cleaned = lower.replace(['_', '-'], "");
     matches!(
-        lower,
-        "run_command"
-            | "runcommand"
-            | "bash"
-            | "execute"
-            | "execute_command"
-            | "executecommand"
-            | "sh"
-            | "terminal"
-            | "exec"
+        cleaned.as_str(),
+        "runcommand" | "bash" | "execute" | "executecommand" | "sh" | "terminal" | "exec"
     )
 }
 
@@ -2233,6 +2230,34 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("git branch").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_antigravity_tools_and_paths() {
+        let rules = JudgeRules::new(&JudgeConfig::default());
+        let req_read = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "Read".to_string(),
+            command_line: None,
+            path: Some("~/.gemini/review-refinements.md".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&req_read).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        let req_manage = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "ManageSubagents".to_string(),
+            command_line: Some("list".to_string()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&req_manage).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }
