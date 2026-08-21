@@ -96,6 +96,9 @@ class TerminalStore extends ChangeNotifier {
   // (DSR/DA/Kitty queries) are not forwarded back to the host as fake user input.
   bool _isWritingSink = false;
 
+  // True if the previous chunk ended with '\r' so a split '\r\n' is not doubled.
+  bool _pendingCarriageReturn = false;
+
   // True for a brief window after a history replay; while set, emulator output
   // (the program's own query auto-answers) is not forwarded to the host.
   bool _suppressHostInput = false;
@@ -459,10 +462,68 @@ class TerminalStore extends ChangeNotifier {
     final wasWriting = _isWritingSink;
     _isWritingSink = true;
     try {
-      _sink.write(text);
+      final toWrite = (_inSynchronizedOutput || text.contains(_kSyncPrefix))
+          ? text
+          : _translateNewlines(text);
+      _sink.write(toWrite);
     } finally {
       _isWritingSink = wasWriting;
     }
+  }
+
+  static bool _isFollowedByRelativeCursorMovement(String text, int indexAfterLf) {
+    if (indexAfterLf >= text.length) return false;
+    final rest = text.substring(indexAfterLf);
+    if (!rest.startsWith('\x1b[')) return false;
+    var i = 2;
+    while (i < rest.length &&
+        ((rest.codeUnitAt(i) >= 48 && rest.codeUnitAt(i) <= 57) ||
+            rest.codeUnitAt(i) == 59)) {
+      i++;
+    }
+    if (i < rest.length) {
+      final finalChar = rest[i];
+      if (finalChar == 'D' || finalChar == 'C') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  String _translateNewlines(String input) {
+    var needsTranslation = false;
+    for (var i = 0; i < input.length; i++) {
+      final isLf = input[i] == '\n';
+      final precededByCr =
+          (i > 0 && input[i - 1] == '\r') || (i == 0 && _pendingCarriageReturn);
+      if (isLf && !precededByCr) {
+        if (!_isFollowedByRelativeCursorMovement(input, i + 1)) {
+          needsTranslation = true;
+          break;
+        }
+      }
+    }
+
+    final endsWithCr = input.endsWith('\r');
+    if (!needsTranslation) {
+      _pendingCarriageReturn = endsWithCr;
+      return input;
+    }
+
+    final buffer = StringBuffer();
+    for (var i = 0; i < input.length; i++) {
+      final isLf = input[i] == '\n';
+      final precededByCr =
+          (i > 0 && input[i - 1] == '\r') || (i == 0 && _pendingCarriageReturn);
+      if (isLf && !precededByCr) {
+        if (!_isFollowedByRelativeCursorMovement(input, i + 1)) {
+          buffer.write('\r');
+        }
+      }
+      buffer.write(input[i]);
+    }
+    _pendingCarriageReturn = endsWithCr;
+    return buffer.toString();
   }
 
   /// Strips `CSI > … m` private sequences (XTMODKEYS / modifyOtherKeys, which
@@ -498,6 +559,7 @@ class TerminalStore extends ChangeNotifier {
   void _resetCarries() {
     _utf8Carry.clear();
     _escapeCarry = '';
+    _pendingCarriageReturn = false;
     _syncTimer?.cancel();
     _syncTimer = null;
     _inSynchronizedOutput = false;

@@ -5398,6 +5398,57 @@ impl ActorState {
     }
 }
 
+fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
+    if slice.len() < 3 || slice[0] != 0x1b || slice[1] != b'[' {
+        return false;
+    }
+    let mut i = 2;
+    while i < slice.len() && (slice[i].is_ascii_digit() || slice[i] == b';') {
+        i += 1;
+    }
+    if i < slice.len() {
+        let final_byte = slice[i];
+        if final_byte == b'D' || final_byte == b'C' {
+            return true;
+        }
+    }
+    false
+}
+
+fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut last = 0;
+    let mut needs_translation = false;
+    let mut bare_lf_count = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && last != b'\r' {
+            let next_slice = &bytes[i + 1..];
+            if !is_followed_by_relative_cursor_movement(next_slice) {
+                needs_translation = true;
+                bare_lf_count += 1;
+            }
+        }
+        last = byte;
+    }
+
+    if !needs_translation {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+
+    let mut result = Vec::with_capacity(bytes.len() + bare_lf_count);
+    last = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && last != b'\r' {
+            let next_slice = &bytes[i + 1..];
+            if !is_followed_by_relative_cursor_movement(next_slice) {
+                result.push(b'\r');
+            }
+        }
+        result.push(byte);
+        last = byte;
+    }
+    std::borrow::Cow::Owned(result)
+}
+
 impl OutputState {
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
         self.log
@@ -5414,7 +5465,8 @@ impl OutputState {
             }
         }
         let current_working_directory = self.extract_current_working_directory(bytes);
-        self.terminal.advance_bytes(bytes);
+        let translated = translate_newlines(bytes);
+        self.terminal.advance_bytes(&translated);
         Ok(current_working_directory)
     }
 
@@ -5558,7 +5610,8 @@ impl OutputState {
 
     fn advance_replayed_bytes(&mut self, bytes: &[u8]) -> Option<PathBuf> {
         let current_working_directory = self.extract_current_working_directory(bytes);
-        self.terminal.advance_bytes(bytes);
+        let translated = translate_newlines(bytes);
+        self.terminal.advance_bytes(&translated);
         current_working_directory
     }
 
@@ -7669,6 +7722,84 @@ mod tests {
 
         assert!(resolve_session_context(Some(&dir)).is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_translate_newlines_direct() {
+        use std::borrow::Cow;
+
+        // Empty bytes should remain borrowed and empty
+        assert!(matches!(translate_newlines(b""), Cow::Borrowed(b"")));
+
+        // Normal text without bare newlines should remain borrowed
+        assert!(matches!(
+            translate_newlines(b"hello world"),
+            Cow::Borrowed(b"hello world")
+        ));
+        assert!(matches!(
+            translate_newlines(b"hello\r\nworld\r\n"),
+            Cow::Borrowed(b"hello\r\nworld\r\n")
+        ));
+
+        // Text with a bare newline should be translated to Owned with \r\n
+        let translated = translate_newlines(b"hello\nworld");
+        assert!(matches!(translated, Cow::Owned(_)));
+        assert_eq!(translated.as_ref(), b"hello\r\nworld");
+
+        // Mixed content with both CRLF and bare newlines should translate only bare ones
+        let mixed = translate_newlines(b"hello\r\nworld\nagain\r\n");
+        assert!(matches!(mixed, Cow::Owned(_)));
+        assert_eq!(mixed.as_ref(), b"hello\r\nworld\r\nagain\r\n");
+
+        // Relative cursor movement escape sequences (e.g. agy banner/spinner) preserve bare \n
+        let agy_banner = b"Row 1\n\x1b[35DRow 2\n\x1b[35DRow 3";
+        assert!(matches!(translate_newlines(agy_banner), Cow::Borrowed(_)));
+
+        let agy_spinner = "  ● Thinking...\n\x1b[13D";
+        assert!(matches!(
+            translate_newlines(agy_spinner.as_bytes()),
+            Cow::Borrowed(_)
+        ));
+
+        let cursor_forward = b"Header\n\x1b[10CIndent";
+        assert!(matches!(
+            translate_newlines(cursor_forward),
+            Cow::Borrowed(_)
+        ));
+
+        // Non-relative escape sequences (SGR colors, line erases, absolute cursor) still get \r\n
+        let sgr_color = translate_newlines(b"Done.\n\x1b[32;1mSuccess!\x1b[0m");
+        assert!(matches!(sgr_color, Cow::Owned(_)));
+        assert_eq!(sgr_color.as_ref(), b"Done.\r\n\x1b[32;1mSuccess!\x1b[0m");
+
+        let erase_line = translate_newlines(b"First\n\x1b[2KSecond");
+        assert!(matches!(erase_line, Cow::Owned(_)));
+        assert_eq!(erase_line.as_ref(), b"First\r\n\x1b[2KSecond");
+    }
+
+    #[test]
+    fn visible_rows_align_bare_line_feed_to_column_0() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 4,
+                cols: 32,
+                pixel_width: 320,
+                pixel_height: 80,
+                dpi: 96,
+            },
+        );
+
+        output
+            .ingest(b"Nodes: 330\nEdges: 2400\nFiles: 8")
+            .expect("ingest bare line feeds");
+        let rows = visible_rows(&output.terminal);
+
+        assert!(rows.iter().any(|row| row == "Nodes: 330"));
+        assert!(rows.iter().any(|row| row == "Edges: 2400"));
+        assert!(rows.iter().any(|row| row == "Files: 8"));
+        let _ = std::fs::remove_file(log_path);
     }
 
     #[test]

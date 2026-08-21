@@ -139,17 +139,28 @@ void main() {
   });
 
   test(
-    'raw LF and CRLF are preserved verbatim without forced normalization',
+    'bare LF is translated to CRLF, existing CRLF preserved',
     () {
       store.dispatch(const Attach());
       store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
       sink.ops.clear();
       store.dispatch(LiveBytes(b('a\nb\r\nc')));
-      expect(sink.written.toString(), 'a\nb\r\nc');
+      expect(sink.written.toString(), 'a\r\nb\r\nc');
     },
   );
 
-  test('split chunks pass bytes through verbatim', () {
+  test(
+    'relative cursor movement escape sequences preserve bare LF',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('Row 1\n\x1b[35DRow 2\n\x1b[13DSpinner')));
+      expect(sink.written.toString(), 'Row 1\n\x1b[35DRow 2\n\x1b[13DSpinner');
+    },
+  );
+
+  test('split chunks pass bytes through without duplicate CR', () {
     store.dispatch(const Attach());
     store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
     sink.ops.clear();
