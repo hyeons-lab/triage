@@ -13,6 +13,8 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T10:09-0700 Implemented `is_followed_by_relative_cursor_movement` and `translate_newlines` in `crates/triaged/src/session.rs` for `OutputState::ingest` and `OutputState::advance_replayed_bytes`.
 - 2026-08-21T10:09-0700 Implemented `_isFollowedByRelativeCursorMovement` and `_translateNewlines` in `flutter/triage_client/lib/terminal/terminal_store.dart` with cross-chunk `_pendingCarriageReturn` tracking and Mode 2026 synchronized output passthrough.
 - 2026-08-21T10:09-0700 Added unit tests in Rust and Flutter and verified the entire workspace test suite passes (276 Rust tests, 341 Flutter tests).
+- 2026-08-21T16:12-0700 Added `schedule`, `manage_task`, `manage_tasks`, `task_status`, `get_task_status`, `list_tasks`, and `refactor_tool` to `is_read_only_tool` in `crates/triage-core/src/judge_rules.rs`.
+- 2026-08-21T16:12-0700 Updated `crates/triage-hook/src/main.rs` to support string argument payloads in `extract_path`, skip file path extraction on command tools, and generate comprehensive permission overrides for file and tool formats (including expanded and contracted home directory paths).
 
 ## Decisions
 
@@ -22,4 +24,5 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 
 ## Commits
 
-- HEAD — fix(triaged): eliminate terminal newline staircasing while preserving relative cursor movements
+- cbfb07f — fix(triaged): eliminate terminal newline staircasing while preserving relative cursor movements
+- HEAD — fix(judge): expand read-only tool coverage and path permission overrides in triage-hook

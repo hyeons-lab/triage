@@ -136,6 +136,9 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_path(args: &serde_json::Value) -> Option<String> {
+    if let Some(s) = args.as_str() {
+        return Some(s.to_string());
+    }
     for key in [
         "AbsolutePath",
         "absolute_path",
@@ -354,10 +357,41 @@ fn encode_response(
                     }
                 }
                 if let Some(ref path) = req.path {
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
                     permission_overrides.push(format!("file({path})"));
+                    permission_overrides.push(format!("{}({path})", req.tool_name));
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("{lower_tool}({path})"));
+                    }
+                    if let Ok(home) =
+                        std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+                    {
+                        let home_trimmed = home.trim_end_matches(['/', '\\']);
+                        if path.starts_with('~') {
+                            let expanded = path.replacen('~', home_trimmed, 1);
+                            permission_overrides.push(format!("file({expanded})"));
+                            permission_overrides.push(format!("{}({expanded})", req.tool_name));
+                            if lower_tool != req.tool_name {
+                                permission_overrides.push(format!("{lower_tool}({expanded})"));
+                            }
+                        } else if path.starts_with(home_trimmed) {
+                            let contracted = format!("~{}", &path[home_trimmed.len()..]);
+                            permission_overrides.push(format!("file({contracted})"));
+                            permission_overrides.push(format!("{}({contracted})", req.tool_name));
+                            if lower_tool != req.tool_name {
+                                permission_overrides.push(format!("{lower_tool}({contracted})"));
+                            }
+                        }
+                    }
                 }
-                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase()) {
+                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase())
+                    || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
+                {
                     permission_overrides.push(format!("tool({})", req.tool_name));
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("tool({lower_tool})"));
+                    }
                 }
 
                 let mut unique_overrides = Vec::with_capacity(permission_overrides.len());
@@ -477,7 +511,11 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let session_id = extract_session_id(&val);
     let cwd = extract_cwd(&val);
     let command_line = extract_command_line(&tool_args);
-    let path = extract_path(&tool_args);
+    let path = if triage_core::judge::is_command_tool(&tool_name.to_ascii_lowercase()) {
+        None
+    } else {
+        extract_path(&tool_args)
+    };
 
     let request = JudgeRequest {
         session_id,

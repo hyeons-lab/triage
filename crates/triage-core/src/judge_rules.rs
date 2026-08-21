@@ -36,6 +36,14 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "manage_subagents"
             | "define_subagent"
             | "generate_image"
+            | "schedule"
+            | "manage_task"
+            | "manage_tasks"
+            | "managetask"
+            | "managetasks"
+            | "task_status"
+            | "get_task_status"
+            | "list_tasks"
             | "detect_changes"
             | "get_review_context"
             | "get_impact_radius"
@@ -44,6 +52,7 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "semantic_search_nodes"
             | "get_architecture_overview"
             | "list_communities"
+            | "refactor_tool"
     )
 }
 
