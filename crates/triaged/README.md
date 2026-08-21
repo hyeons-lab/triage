@@ -1,6 +1,6 @@
 # triaged
 
-Persistent daemon process that manages terminal session state, PTY multiplexing, and canonical VT performance structures for **Triage**, the attention-routing terminal supervisor.
+Persistent daemon process that manages terminal session state, PTY multiplexing, canonical VT performance structures, and local tool-call approval judging for **Triage**, the attention-routing terminal supervisor.
 
 The daemon runs persistently in the background, keeping terminal scrollbacks, layout grids, and active PTY handles alive even when no clients are attached.
 
@@ -17,7 +17,7 @@ cargo install triaged
 ```
 
 > **Building from source needs a nightly toolchain on aarch64.** The `cera`
-> inference engine behind the session summarizer uses unstable NEON intrinsics
+> inference engine behind the session summarizer and approval judge uses unstable NEON intrinsics
 > there, and currently requires **1.99.0-nightly or newer** (`nightly-2026-07-08`
 > and later). On an older toolchain the build fails inside `cera` with a wall of
 > `E0658` errors rather than a clear message. `rustup toolchain install nightly`
@@ -29,7 +29,7 @@ Or grab a prebuilt binary instead of compiling: releases after `v0.1.6` attach a
 `Triage-cli-<os>-v<version>` archive (`.tar.gz` for macOS/Linux, `.zip` for
 Windows) to the
 [Releases page](https://github.com/hyeons-lab/triage/releases), containing the
-`triaged`, `triage`, and `triage-mcp` binaries — unpack it and put them on your
+`triaged`, `triage`, `triage-mcp`, and `triage-hook` binaries — unpack it and put them on your
 `PATH`. The bundled `triaged` already embeds the web client. Each archive is
 signed and checksummed — see [Verifying a download](#verifying-a-download).
 
@@ -40,7 +40,7 @@ signed and checksummed — see [Verifying a download](#verifying-a-download).
 
 ## Running the Daemon
 
-Start the persistent supervisor process:
+Start the persistent supervisor process in the foreground:
 
 ```bash
 triaged
@@ -52,7 +52,7 @@ Instead of launching `triaged` by hand, register it to start automatically at
 login and run in the background:
 
 ```bash
-triaged service install     # register + start now
+triaged service install     # register + start now + provision agent hooks
 triaged service status      # is it installed / running?
 triaged service stop        # stop it
 triaged service start       # start it again
@@ -76,6 +76,54 @@ placed on your `PATH`).
 > **Linux: surviving logout.** A systemd `--user` service stops when your last
 > session ends. To keep `triaged` running after you log out, enable lingering:
 > `loginctl enable-linger $USER` (the `install` step prints this reminder).
+
+---
+
+## Tool-Call Approval Judge
+
+`triaged` includes a built-in security judge for AI agent CLIs (Antigravity, Claude Code, Cline, etc.) running inside Triage sessions. Instead of prompting you for every routine tool call, agent hooks query `triaged` via `triage-hook` before running commands.
+
+Every decision passes through three evaluation tiers:
+
+1. **Layer 1: Deterministic Deny Rules**: Destructive commands (`rm -rf /`, formatting disks), credential exfiltration, and dangerous operations are denied immediately without model invocation.
+2. **Layer 2: Deterministic Allow Rules**: Safe inspection commands (`git status`, `ls`, `cargo check`, `npm test`) are instantly auto-approved (<10ms).
+3. **Layer 3: Resident Model**: Ambiguous operations are evaluated by the resident `cera` engine (`LFM2-2.6B-GGUF`), constrained by grammar decoding strictly to `allow` or `ask`.
+
+For full setup, agent hook configs, audit logs, and rules customization, see [`docs/approval-judge.md`](../../docs/approval-judge.md).
+
+---
+
+## Configuration
+
+Triage is configured through `~/.config/triage/config.toml`. All options are optional and carry defaults:
+
+```toml
+[general]
+default_shell = "/bin/zsh"
+
+[ui]
+theme = "catppuccin-mocha"
+sidebar_width_percent = 22
+group_by = "worktree"        # "worktree", "repo", or "flat"
+
+[remote]
+bind = "0.0.0.0:7777"
+require_pairing = true
+
+[judge]
+enabled = true
+default_enabled_per_session = true
+timeout_ms = 8000
+deny_substrings = ["terraform apply"]
+allow_commands = ["npm test", "pnpm lint"]
+
+[summarizer]
+enabled = true
+bundle_id = "LFM2-2.6B-GGUF"
+quant = "Q4_K_M"
+```
+
+For the complete list of configuration options, defaults, and validation rules, see the [Configuration Reference](../../docs/configuration.md).
 
 ---
 
@@ -318,11 +366,21 @@ The upgrade is performed using a robust, low-level **Three-Phase Sync Protocol**
 
 ### Initiating a Handover
 
-To upgrade or restart the daemon with zero downtime, run the new binary with the `--handover` (or `-U`) flag:
+To upgrade or restart the daemon with zero downtime, run:
+
+```bash
+triaged reload
+```
+
+Or run the successor binary directly with `--handover`:
 
 ```bash
 triaged --handover
 ```
+
+### SIGTERM Rescue Handover
+
+If the supervisor stops `triaged` via `SIGTERM` (`launchctl stop`, `systemctl --user stop`, user logout, or standard `kill`), `triaged` does not close PTY masters. Instead, a self-pipe signal handler wakes an internal rescue thread that immediately spawns a detached successor (`triaged --handover`) to adopt all live sessions before the old process exits.
 
 ### Windows Support (no zero-downtime handover)
 

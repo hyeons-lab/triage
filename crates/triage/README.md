@@ -8,6 +8,7 @@ This TUI client connects to the persistent background daemon (`triaged`) over lo
 
 *   **Durable Sessions**: PTYs are owned by the daemon, so they stay alive when you close the client, detach, or restart the daemon.
 *   **Workspace Sidebar**: A session list showing each session's repo, worktree, and branch, so you can tell at a glance which terminal is which.
+*   **Approval Judge Controls**: Inspect and toggle per-session AI agent auto-approval policy (`F5` overlay; `y`/`n`/`r` policy toggle; status line badge).
 *   **Attach and Switch**: Cycle between sessions and drive the focused one directly; input goes through Triage's one-writer lease model.
 *   **Update Banner**: A read-only notice when a newer Triage release is published (see [Update checks](#update-checks)).
 *   **High Performance**: Built with Ratatui over a WezTerm-derived virtual terminal engine.
@@ -61,8 +62,15 @@ Everything else you type is forwarded to the focused session.
 | `Alt+↓` / `Alt+→` / `F3` | Next session |
 | `Alt+↑` / `Alt+←` / `F4` | Previous session |
 | `F2` | Show/hide the sidebar |
+| `F5` | Open Approval Judge settings overlay |
 | `PageUp` / `PageDown` | Scroll the focused session's scrollback |
 | `Ctrl+Q` | Quit the client (sessions keep running in the daemon) |
+
+Inside the `F5` settings overlay:
+- **`y`**: Enable auto-approval for this session
+- **`n`**: Disable auto-approval for this session (always ask)
+- **`r`**: Reset session to daemon default policy
+- **`Esc`** / **`q`** / **`F5`**: Close settings overlay
 
 `Ctrl+C` is forwarded to the session, not intercepted — it interrupts the
 running program, as in any terminal. Use `Ctrl+Q` to leave the client.

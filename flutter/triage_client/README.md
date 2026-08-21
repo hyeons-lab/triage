@@ -12,6 +12,14 @@ drives input through Triage's one-writer input-lease model. The pairing token is
 kept in secure storage, so the client reconnects on later launches without
 re-pairing.
 
+## Features
+
+- **Cross-Platform**: Web, macOS, Windows, Linux, Android, and iOS.
+- **Approval Judge Dashboard**: Multi-tab Settings dialog with real-time tool-call audit stream, rule manager, and rail auto-approval toggle switch.
+- **Advanced Terminal Emulation**: Synchronized Output mode 2026 support (eliminating cursor jumps), Unicode 11 wide-glyph and emoji rendering, and terminal query response filtering.
+- **Multi-Daemon Management**: Switch smoothly between multiple daemons (LAN, Tailscale, localhost) with independent tokens and rail layouts.
+- **Responsive Mobile & Desktop Layout**: Adaptive sidebar rail, touch selection with mobile clipboard support, and accessory input row.
+
 ## Getting the client
 
 ### Prebuilt desktop builds

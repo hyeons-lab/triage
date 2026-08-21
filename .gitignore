@@ -14,6 +14,9 @@ worktrees/
 # Added by code-review-graph
 .code-review-graph/
 
+# Agent local hooks
+.agents/
+
 # Triage daemon pre-built web client assets
 /crates/triaged/dist/
 

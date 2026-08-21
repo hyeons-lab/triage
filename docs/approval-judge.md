@@ -99,7 +99,7 @@ The hook configuration lives in `~/.agents/hooks.json` globally (or `~/.gemini/c
 
 Restart `triaged` so it picks up the config, or run `triaged reload`. When started
 inside a Triage session, judging honors that session's policy override (toggleable via
-**`a`** in the TUI or the Auto-Approval switch in Flutter). Agent sessions running outside
+**`F5`** in the TUI or the Auto-Approval switch in Flutter). Agent sessions running outside
 a Triage PTY follow the daemon's configured `default_enabled_per_session` policy, with safe
 in-process fallback to `ask` if the daemon is not running.
 
@@ -137,7 +137,7 @@ In the Flutter client:
 
 Any of these is sufficient, from narrowest to broadest:
 
-- Press `a` in the TUI or toggle the switch in Flutter to turn the session off.
+- Press `F5` in the TUI (then `n`) or toggle the switch in Flutter to turn the session off.
 - Set `default_enabled_per_session = false` to make judging opt-in per session.
 - Set `enabled = false` under `[judge]`.
 - Set `"enabled": false` in `~/.agents/hooks.json`, or delete the file.
