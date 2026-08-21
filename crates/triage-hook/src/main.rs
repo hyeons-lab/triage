@@ -60,7 +60,7 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
         .map(|s| s.to_string());
 
     if let Some(name) = name {
-        let args = val
+        let raw_args = val
             .get("args")
             .or_else(|| val.get("arguments"))
             .or_else(|| val.get("tool_input"))
@@ -69,6 +69,17 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
             .or_else(|| val.get("parameters"))
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        let args = if let serde_json::Value::String(ref s) = raw_args {
+            if s.trim_start().starts_with('{') {
+                serde_json::from_str(s).unwrap_or(raw_args)
+            } else {
+                raw_args
+            }
+        } else {
+            raw_args
+        };
+
         return Some((name, args));
     }
 
@@ -119,6 +130,9 @@ fn extract_session_id(val: &serde_json::Value) -> SessionId {
 }
 
 fn extract_command_line(args: &serde_json::Value) -> Option<String> {
+    if let Some(s) = args.as_str() {
+        return Some(s.to_string());
+    }
     for key in [
         "CommandLine",
         "command_line",
@@ -136,6 +150,11 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_path(args: &serde_json::Value) -> Option<String> {
+    if let Some(s) = args.as_str()
+        && (s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~'))
+    {
+        return Some(s.to_string());
+    }
     for key in [
         "AbsolutePath",
         "absolute_path",
@@ -354,10 +373,48 @@ fn encode_response(
                     }
                 }
                 if let Some(ref path) = req.path {
-                    permission_overrides.push(format!("file({path})"));
+                    let trimmed_path = path.trim();
+                    permission_overrides.push(format!("file({trimmed_path})"));
+                    permission_overrides.push(format!("{}({trimmed_path})", req.tool_name));
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("{lower_tool}({trimmed_path})"));
+                    }
+                    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok())
+                    {
+                        if trimmed_path.starts_with("~/") {
+                            let expanded = format!("{}{}", home, &trimmed_path[1..]);
+                            permission_overrides.push(format!("file({expanded})"));
+                            permission_overrides.push(format!("{}({expanded})", req.tool_name));
+                            if lower_tool != req.tool_name {
+                                permission_overrides.push(format!("{lower_tool}({expanded})"));
+                            }
+                        } else if trimmed_path.starts_with(&home) {
+                            let contracted = format!("~{}", &trimmed_path[home.len()..]);
+                            permission_overrides.push(format!("file({contracted})"));
+                            permission_overrides.push(format!("{}({contracted})", req.tool_name));
+                            if lower_tool != req.tool_name {
+                                permission_overrides.push(format!("{lower_tool}({contracted})"));
+                            }
+                        }
+                    }
                 }
-                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase()) {
+                if triage_core::judge::is_read_only_tool(&req.tool_name)
+                    || triage_core::judge::is_edit_tool(&req.tool_name)
+                {
                     permission_overrides.push(format!("tool({})", req.tool_name));
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("tool({lower_tool})"));
+                    }
+                    let cleaned = lower_tool.replace(['_', '-'], "");
+                    if cleaned != lower_tool && cleaned != req.tool_name {
+                        permission_overrides.push(format!("tool({cleaned})"));
+                    }
+                    permission_overrides.push(req.tool_name.clone());
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(lower_tool);
+                    }
                 }
 
                 let mut unique_overrides = Vec::with_capacity(permission_overrides.len());
@@ -740,6 +797,48 @@ mod tests {
         let claude_val: serde_json::Value =
             serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
         assert_eq!(detect_format(&claude_val), AgentFormat::ClaudeCode);
+    }
+
+    #[test]
+    fn agy_contract_read_and_manage_subagents() {
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "read-only tool call: Read".to_string(),
+        };
+        let request = JudgeRequest {
+            session_id: SessionId::new("123").unwrap(),
+            tool_name: "Read".to_string(),
+            command_line: None,
+            path: Some("~/.gemini/review-refinements.md".to_string()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
+        assert!(encoded.contains("file(~/.gemini/review-refinements.md)"));
+        assert!(encoded.contains("Read(~/.gemini/review-refinements.md)"));
+        assert!(encoded.contains("tool(Read)"));
+        assert!(encoded.contains("tool(read)"));
+
+        let verdict_manage = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "read-only tool call: ManageSubagents".to_string(),
+        };
+        let request_manage = JudgeRequest {
+            session_id: SessionId::new("123").unwrap(),
+            tool_name: "ManageSubagents".to_string(),
+            command_line: Some("list".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let encoded_manage = encode_response(
+            AgentFormat::Antigravity,
+            &verdict_manage,
+            Some(&request_manage),
+        );
+        assert!(encoded_manage.contains("tool(ManageSubagents)"));
+        assert!(encoded_manage.contains("tool(managesubagents)"));
+        assert!(encoded_manage.contains("ManageSubagents"));
     }
 
     #[test]

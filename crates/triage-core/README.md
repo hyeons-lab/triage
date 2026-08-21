@@ -1,11 +1,13 @@
 # triage-core
 
-Shared session trait, types, and protocol engine for **Triage**, the attention-routing terminal supervisor.
+Shared session traits, protocol definitions, configuration parser, and rule evaluation engine for **Triage**, the attention-routing terminal supervisor.
 
-This library is a core dependency of all other Triage components (`triaged` daemon, `triage` local client, `triage-mcp` server, and remote endpoints).
+This library is a core dependency of all other Triage components (`triaged` daemon, `triage` local client, `triage-hook` agent shim, `triage-mcp` server, and remote endpoints).
 
 ## Features
 
-*   **Session Protocol**: Flatbuffers binary protocol definitions and parser logic.
-*   **State Sharing**: Shared session state, layout management, and PTY manager traits.
-*   **Instrumentation**: Consolidated workspace logging and tracing configuration.
+*   **Session Protocol**: FlatBuffers binary protocol schema and serialization definitions for session snapshots, input streaming, and lifecycle events.
+*   **Approval Judge Rules**: Deterministic security rule evaluation tables (`judge_rules.rs`) for tool-call judging (Layer 1 deny rules and Layer 2 allow rules).
+*   **Typed Configuration**: TOML configuration parsing and strict validation (`config.rs`).
+*   **State Sharing**: Shared session state, layout management, and PTY manager abstractions.
+*   **IPC Definitions**: Shared wire structures for local domain socket and named pipe communication.
