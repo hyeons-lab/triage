@@ -43,32 +43,83 @@ const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Decodes the agent payload from arbitrary agent hook schemas (Claude, Antigravity, Gemini, etc.).
 fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Value)> {
-    // Check nested tool_call / toolCall / tool_use / toolUse
-    for key in ["tool_call", "toolCall", "tool_use", "toolUse"] {
+    if let Some(arr) = val.as_array() {
+        for item in arr {
+            if let Some(res) = extract_tool_info(item) {
+                return Some(res);
+            }
+        }
+    }
+
+    // Check nested tool_call / toolCall / tool_use / toolUse / function / step / action / call / request / payload / data
+    for key in [
+        "tool_call",
+        "toolCall",
+        "tool_use",
+        "toolUse",
+        "function",
+        "step",
+        "action",
+        "call",
+        "request",
+        "payload",
+        "data",
+        "toolCallItem",
+        "tool_call_item",
+    ] {
         if let Some(res) = val.get(key).and_then(extract_tool_info) {
             return Some(res);
         }
     }
 
-    // Check name / tool_name / toolName / tool
+    for key in [
+        "tool_calls",
+        "toolCalls",
+        "tool_uses",
+        "toolUses",
+        "tools",
+        "calls",
+    ] {
+        if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(res) = extract_tool_info(item) {
+                    return Some(res);
+                }
+            }
+        }
+    }
+
+    // Check name / tool_name / toolName / tool / function_name / functionName / tool_type / toolType / type
     let name = val
         .get("name")
         .or_else(|| val.get("tool_name"))
         .or_else(|| val.get("toolName"))
         .or_else(|| val.get("tool"))
+        .or_else(|| val.get("function_name"))
+        .or_else(|| val.get("functionName"))
+        .or_else(|| val.get("tool_type"))
+        .or_else(|| val.get("toolType"))
+        .or_else(|| val.get("type"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     if let Some(name) = name {
-        let args = val
+        let raw_args = val
             .get("args")
             .or_else(|| val.get("arguments"))
             .or_else(|| val.get("tool_input"))
             .or_else(|| val.get("toolInput"))
             .or_else(|| val.get("input"))
             .or_else(|| val.get("parameters"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            .or_else(|| val.get("params"));
+
+        let args = match raw_args {
+            Some(serde_json::Value::String(s)) => {
+                serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+            }
+            Some(v) => v.clone(),
+            None => val.clone(),
+        };
         return Some((name, args));
     }
 
@@ -360,8 +411,15 @@ fn encode_response(
                     let lower_tool = req.tool_name.to_ascii_lowercase();
                     permission_overrides.push(format!("file({path})"));
                     permission_overrides.push(format!("{}({path})", req.tool_name));
+                    permission_overrides.push(path.clone());
                     if lower_tool != req.tool_name {
                         permission_overrides.push(format!("{lower_tool}({path})"));
+                    }
+                    if let Some((dir, _)) = path.rsplit_once(['/', '\\']) {
+                        if !dir.is_empty() {
+                            permission_overrides.push(format!("{dir}/*"));
+                            permission_overrides.push(format!("file({dir}/*)"));
+                        }
                     }
                     if let Ok(home) =
                         std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
@@ -371,15 +429,29 @@ fn encode_response(
                             let expanded = path.replacen('~', home_trimmed, 1);
                             permission_overrides.push(format!("file({expanded})"));
                             permission_overrides.push(format!("{}({expanded})", req.tool_name));
+                            permission_overrides.push(expanded.clone());
                             if lower_tool != req.tool_name {
                                 permission_overrides.push(format!("{lower_tool}({expanded})"));
+                            }
+                            if let Some((dir, _)) = expanded.rsplit_once(['/', '\\']) {
+                                if !dir.is_empty() {
+                                    permission_overrides.push(format!("{dir}/*"));
+                                    permission_overrides.push(format!("file({dir}/*)"));
+                                }
                             }
                         } else if path.starts_with(home_trimmed) {
                             let contracted = format!("~{}", &path[home_trimmed.len()..]);
                             permission_overrides.push(format!("file({contracted})"));
                             permission_overrides.push(format!("{}({contracted})", req.tool_name));
+                            permission_overrides.push(contracted.clone());
                             if lower_tool != req.tool_name {
                                 permission_overrides.push(format!("{lower_tool}({contracted})"));
+                            }
+                            if let Some((dir, _)) = contracted.rsplit_once(['/', '\\']) {
+                                if !dir.is_empty() {
+                                    permission_overrides.push(format!("{dir}/*"));
+                                    permission_overrides.push(format!("file({dir}/*)"));
+                                }
                             }
                         }
                     }
@@ -388,9 +460,11 @@ fn encode_response(
                     || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
                 {
                     permission_overrides.push(format!("tool({})", req.tool_name));
+                    permission_overrides.push(req.tool_name.clone());
                     let lower_tool = req.tool_name.to_ascii_lowercase();
                     if lower_tool != req.tool_name {
                         permission_overrides.push(format!("tool({lower_tool})"));
+                        permission_overrides.push(lower_tool);
                     }
                 }
 
