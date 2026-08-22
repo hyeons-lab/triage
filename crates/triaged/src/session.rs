@@ -5409,10 +5409,15 @@ impl ActorState {
     }
 }
 
+const MAX_CARRY_ESCAPE_LEN: usize = 32;
+
 fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
     let Some(rest) = slice.strip_prefix(b"\x1b[") else {
         return false;
     };
+    if rest.is_empty() || matches!(rest[0], b'?' | b'>' | b'<' | b'=') {
+        return false;
+    }
     let param_len = rest
         .iter()
         .take_while(|&&b| b.is_ascii_digit() || b == b';')
@@ -5423,7 +5428,7 @@ fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
 /// True if `slice` begins with `\x1b` or `\x1b[<digits;]*` but has not yet
 /// received its terminating command character.
 ///
-/// The length is bounded to at most 24 bytes to avoid holding back arbitrarily
+/// The length is bounded to at most [`MAX_CARRY_ESCAPE_LEN`] bytes to avoid holding back arbitrarily
 /// long data streams if an invalid or non-standard sequence is encountered.
 fn is_partial_relative_cursor_prefix(slice: &[u8]) -> bool {
     if slice.is_empty() || slice[0] != 0x1b {
@@ -5439,11 +5444,11 @@ fn is_partial_relative_cursor_prefix(slice: &[u8]) -> bool {
     while i < slice.len() && (slice[i].is_ascii_digit() || slice[i] == b';') {
         i += 1;
     }
-    i == slice.len() && slice.len() <= 24
+    i == slice.len() && slice.len() <= MAX_CARRY_ESCAPE_LEN
 }
 
 fn find_trailing_partial_relative_cursor_split(input: &[u8], pending_cr: bool) -> usize {
-    let check_start = input.len().saturating_sub(24);
+    let check_start = input.len().saturating_sub(MAX_CARRY_ESCAPE_LEN);
     for i in (check_start..input.len()).rev() {
         if input[i] == 0x1b {
             let slice = &input[i..];
@@ -5509,33 +5514,36 @@ impl OutputState {
             return;
         }
 
-        let combined;
-        let input: &[u8] = if self.pending_escape_buffer.is_empty() {
-            bytes
-        } else {
-            self.pending_escape_buffer.extend_from_slice(bytes);
-            combined = std::mem::take(&mut self.pending_escape_buffer);
-            &combined
-        };
-
-        if input.is_empty() {
+        if self.pending_escape_buffer.is_empty() {
+            let split_idx =
+                find_trailing_partial_relative_cursor_split(bytes, self.pending_carriage_return);
+            let (to_process, carry) = bytes.split_at(split_idx);
+            if !carry.is_empty() {
+                self.pending_escape_buffer.extend_from_slice(carry);
+            }
+            if !to_process.is_empty() {
+                let translated =
+                    translate_newlines_with_state(to_process, self.pending_carriage_return);
+                self.terminal.advance_bytes(&translated);
+                self.pending_carriage_return = to_process.last() == Some(&b'\r');
+            }
             return;
         }
 
-        let split_idx =
-            find_trailing_partial_relative_cursor_split(input, self.pending_carriage_return);
-        let (to_process, carry) = input.split_at(split_idx);
-        if !carry.is_empty() {
-            self.pending_escape_buffer.extend_from_slice(carry);
-        }
+        self.pending_escape_buffer.extend_from_slice(bytes);
+        let split_idx = find_trailing_partial_relative_cursor_split(
+            &self.pending_escape_buffer,
+            self.pending_carriage_return,
+        );
 
-        if to_process.is_empty() {
-            return;
+        if split_idx > 0 {
+            let to_process = &self.pending_escape_buffer[..split_idx];
+            let translated =
+                translate_newlines_with_state(to_process, self.pending_carriage_return);
+            self.terminal.advance_bytes(&translated);
+            self.pending_carriage_return = to_process.last() == Some(&b'\r');
+            self.pending_escape_buffer.drain(..split_idx);
         }
-
-        let translated = translate_newlines_with_state(to_process, self.pending_carriage_return);
-        self.terminal.advance_bytes(&translated);
-        self.pending_carriage_return = to_process.last() == Some(&b'\r');
     }
 
     fn flush_pending_translated_bytes(&mut self) {

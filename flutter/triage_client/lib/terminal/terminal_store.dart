@@ -35,6 +35,8 @@ const int _kSyncBufferCap = 1024 * 1024; // 1 MiB
 
 const int _kSyncMarkerLength = 8; // length of '\x1b[?2026h' and '\x1b[?2026l'
 
+const int _kMaxCarryEscapeLength = 32;
+
 // Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
 // `Output`): a trailing not-yet-terminated `CSI > …` / `CSI ? 2026 …` and a complete
 // `CSI > … m` private sequence.
@@ -482,6 +484,14 @@ class TerminalStore extends ChangeNotifier {
         text.codeUnitAt(indexAfterLf + 1) != 0x5b) {
       return false;
     }
+    final firstUnit = text.codeUnitAt(indexAfterLf + 2);
+    // Reject private/experimental CSI parameter bytes: ?, >, <, =
+    if (firstUnit == 0x3f ||
+        firstUnit == 0x3e ||
+        firstUnit == 0x3c ||
+        firstUnit == 0x3d) {
+      return false;
+    }
     var i = indexAfterLf + 2;
     while (i < text.length &&
         ((text.codeUnitAt(i) >= 48 && text.codeUnitAt(i) <= 57) ||
@@ -558,7 +568,7 @@ class TerminalStore extends ChangeNotifier {
     final partial = _partialEscapeSequence.firstMatch(s);
     // Only hold a bounded partial; otherwise let it flush to avoid unbounded
     // growth on a stream that never completes the sequence.
-    if (partial != null && (s.length - partial.start) <= 24) {
+    if (partial != null && (s.length - partial.start) <= _kMaxCarryEscapeLength) {
       var carryStart = partial.start;
       // If the partial escape sequence is immediately preceded by a bare LF,
       // include the LF in the carry so newline translation isn't prematurely
