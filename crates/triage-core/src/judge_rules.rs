@@ -51,6 +51,7 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "get_architecture_overview"
             | "list_communities"
             | "refactor_tool"
+            | "refactortool"
     )
 }
 
