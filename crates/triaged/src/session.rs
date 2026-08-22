@@ -5440,6 +5440,9 @@ fn is_partial_relative_cursor_prefix(slice: &[u8]) -> bool {
     if slice[1] != b'[' {
         return false;
     }
+    if slice.len() >= 3 && matches!(slice[2], b'?' | b'>' | b'<' | b'=') {
+        return false;
+    }
     let mut i = 2;
     while i < slice.len() && (slice[i].is_ascii_digit() || slice[i] == b';') {
         i += 1;
