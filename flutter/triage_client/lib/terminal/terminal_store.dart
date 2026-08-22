@@ -462,10 +462,12 @@ class TerminalStore extends ChangeNotifier {
     final wasWriting = _isWritingSink;
     _isWritingSink = true;
     try {
-      final toWrite = (_inSynchronizedOutput || text.contains(_kSyncPrefix))
-          ? text
-          : _translateNewlines(text);
-      _sink.write(toWrite);
+      if (_inSynchronizedOutput || text.contains(_kSyncPrefix)) {
+        _pendingCarriageReturn = text.endsWith('\r');
+        _sink.write(text);
+      } else {
+        _sink.write(_translateNewlines(text));
+      }
     } finally {
       _isWritingSink = wasWriting;
     }

@@ -112,6 +112,11 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
                             | "ping"
                             | "system"
                             | "event"
+                            | "error"
+                            | "progress"
+                            | "status"
+                            | "notification"
+                            | "heartbeat"
                     )
                 })
             })
@@ -448,15 +453,30 @@ fn encode_response(
                         let is_tilde_home =
                             path == "~" || path.starts_with("~/") || path.starts_with("~\\");
                         if is_tilde_home {
-                            let expanded = if path == "~" {
+                            let sub = if path == "~" { "" } else { &path[1..] };
+                            let expanded = if sub.is_empty() {
                                 home.clone()
+                            } else if home.contains('\\') {
+                                format!("{home}{}", sub.replace('/', "\\"))
                             } else {
-                                format!("{home}{}", &path[1..])
+                                format!("{home}{}", sub.replace('\\', "/"))
                             };
                             permission_overrides.push(format!("file({expanded})"));
                             permission_overrides.push(format!("{}({expanded})", req.tool_name));
                             if lower_tool != req.tool_name {
                                 permission_overrides.push(format!("{lower_tool}({expanded})"));
+                            }
+                            if home.contains('\\') && sub.contains('/') {
+                                let fwd_expanded = format!("{home}{sub}");
+                                if fwd_expanded != expanded {
+                                    permission_overrides.push(format!("file({fwd_expanded})"));
+                                    permission_overrides
+                                        .push(format!("{}({fwd_expanded})", req.tool_name));
+                                    if lower_tool != req.tool_name {
+                                        permission_overrides
+                                            .push(format!("{lower_tool}({fwd_expanded})"));
+                                    }
+                                }
                             }
                         } else {
                             let norm_path = path.replace('\\', "/");

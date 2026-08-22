@@ -4775,6 +4775,7 @@ fn run_actor(
                 state.flush_subscribers();
             }
             Err(RecvTimeoutError::Disconnected) => {
+                state.output.flush_pending_translated_bytes();
                 state.output_closed = true;
                 state.mark_exited();
                 state.broadcast_exit();
@@ -5511,9 +5512,8 @@ impl OutputState {
         let input: &[u8] = if self.pending_escape_buffer.is_empty() {
             bytes
         } else {
-            let mut buf = std::mem::take(&mut self.pending_escape_buffer);
-            buf.extend_from_slice(bytes);
-            combined = buf;
+            self.pending_escape_buffer.extend_from_slice(bytes);
+            combined = std::mem::take(&mut self.pending_escape_buffer);
             &combined
         };
 
@@ -7911,11 +7911,25 @@ mod tests {
         output.ingest(b"\nline2\r").expect("ingest cr chunk 2");
         output.ingest(b"\r\nnext2").expect("ingest crlf chunk 2");
 
+        // 5. Multi-fragment split across 5 sequential chunk slices
+        output.ingest(b"\n").expect("ingest bare lf");
+        output.ingest(b"\x1b").expect("ingest esc");
+        output.ingest(b"[").expect("ingest bracket");
+        output.ingest(b"10D").expect("ingest move");
+        output.ingest(b"MultiFragment").expect("ingest text");
+
+        // 6. Trailing incomplete escape flushed on teardown / EOF
+        output
+            .ingest(b"\n\x1b[35")
+            .expect("ingest partial trailing esc");
+        output.flush_pending_translated_bytes();
+
         let rows = visible_rows(&output.terminal);
         assert!(rows.iter().any(|row| row.contains("Row 2")));
         assert!(rows.iter().any(|row| row.contains("Left")));
         assert!(rows.iter().any(|row| row.contains("next")));
         assert!(rows.iter().any(|row| row.contains("next2")));
+        assert!(rows.iter().any(|row| row.contains("MultiFragment")));
         let _ = std::fs::remove_file(log_path);
     }
 

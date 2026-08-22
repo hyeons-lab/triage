@@ -36,7 +36,6 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "manage_subagents"
             | "define_subagent"
             | "generate_image"
-            | "schedule"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
@@ -2254,6 +2253,6 @@ mod tests {
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
-        assert!(is_read_only_tool("schedule"));
+        assert!(!is_read_only_tool("schedule"));
     }
 }
