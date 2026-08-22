@@ -5515,6 +5515,13 @@ impl OutputState {
         }
 
         if self.pending_escape_buffer.is_empty() {
+            if !self.pending_carriage_return && !bytes.contains(&b'\n') && !bytes.contains(&b'\x1b')
+            {
+                self.terminal.advance_bytes(bytes);
+                self.pending_carriage_return = bytes.last() == Some(&b'\r');
+                return;
+            }
+
             let split_idx =
                 find_trailing_partial_relative_cursor_split(bytes, self.pending_carriage_return);
             let (to_process, carry) = bytes.split_at(split_idx);

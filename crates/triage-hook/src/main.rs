@@ -487,9 +487,17 @@ fn encode_response(
                         } else {
                             let norm_path = path.replace('\\', "/");
                             let norm_home = home.replace('\\', "/");
-                            if norm_path == norm_home
-                                || norm_path.starts_with(&format!("{norm_home}/"))
-                            {
+                            let matches_home = if cfg!(windows) || home.contains('\\') {
+                                norm_path.eq_ignore_ascii_case(&norm_home)
+                                    || norm_path.to_ascii_lowercase().starts_with(&format!(
+                                        "{}/",
+                                        norm_home.to_ascii_lowercase()
+                                    ))
+                            } else {
+                                norm_path == norm_home
+                                    || norm_path.starts_with(&format!("{norm_home}/"))
+                            };
+                            if matches_home {
                                 let suffix = &norm_path[norm_home.len()..];
                                 let contracted = if suffix.is_empty() {
                                     "~".to_string()

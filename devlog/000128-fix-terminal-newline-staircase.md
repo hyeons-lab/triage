@@ -27,6 +27,7 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T19:45-0700 Added `flush_pending_translated_bytes()` to idle actor timeout ticks in `crates/triaged/src/session.rs` to ensure partial trailing escapes are displayed when processes pause waiting for user input.
 - 2026-08-21T19:47-0700 Filtered standalone `.` and `..` directory references in `extract_path` across bare string and named key argument payloads in `crates/triage-hook/src/main.rs`.
 - 2026-08-21T19:50-0700 Rejected private/experimental CSI parameter bytes (`?`, `>`, `<`, `=`) in relative cursor detection, synchronized `MAX_CARRY_ESCAPE_LEN = 32` bounded carry constants across Rust and Dart, and replaced temporary vector moves with in-place buffer draining in `OutputState`.
+- 2026-08-21T19:52-0700 Added ASCII case-insensitive home matching on Windows in `crates/triage-hook/src/main.rs` and added pure throughput hot-path fast bypass in `advance_translated_bytes` in `crates/triaged/src/session.rs`.
 
 ## Decisions
 
@@ -53,4 +54,5 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 6de3c75 — fix(judge): harden tool scoping, path separator normalization, and streaming carries
 - 240e9dd — fix(triaged): flush trailing escape carry buffer on idle actor ticks
 - 112d4e0 — fix(hook): filter standalone dot references across string and key payloads
-- HEAD — fix(triaged): reject private CSI markers and synchronize carry bounds across Rust and Dart
+- 79d634b — fix(triaged): reject private CSI markers and synchronize carry bounds across Rust and Dart
+- HEAD — fix(triaged): optimize zero-escape throughput and handle Windows home case-insensitivity
