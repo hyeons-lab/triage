@@ -4771,6 +4771,7 @@ fn run_actor(
         match output_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(message) => state.handle_output(message),
             Err(RecvTimeoutError::Timeout) => {
+                state.output.flush_pending_translated_bytes();
                 state.refresh_idle_cwd();
                 state.flush_subscribers();
             }

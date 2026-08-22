@@ -24,6 +24,7 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T17:40-0700 Streamlined slice prefix inspection in `is_followed_by_relative_cursor_movement` and added `!bytes.contains(&b'\n')` fast path in `crates/triaged/src/session.rs`.
 - 2026-08-21T19:38-0700 Filtered out non-tool message envelope discriminators (`message`, `text`, `thought`, `ping`, `assistant`, `user`) on the `"type"` fallback in `extract_tool_info` and allowed dot-relative paths (`./...`, `../...`, `.env`) in generic JSON object extraction in `crates/triage-hook/src/main.rs`.
 - 2026-08-21T19:42-0700 Excluded `schedule` from `is_read_only_tool` in `crates/triage-core/src/judge_rules.rs`, broadened message envelope filters (`error`, `progress`, `status`, `notification`, `heartbeat`), normalized Windows path separators in tilde expansions, updated `_pendingCarriageReturn` tracking during synchronized output in Flutter, and eliminated buffer reallocation when merging chunk fragments in `OutputState`.
+- 2026-08-21T19:45-0700 Added `flush_pending_translated_bytes()` to idle actor timeout ticks in `crates/triaged/src/session.rs` to ensure partial trailing escapes are displayed when processes pause waiting for user input.
 
 ## Decisions
 
@@ -47,4 +48,5 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 0fe51d2 — fix(triaged): harden cross-chunk newline streaming and path boundary overrides
 - 790fe5e — fix(judge): restrict read-only tool scoping and sanitize wildcard directory overrides
 - 7e48f37 — fix(hook): filter message envelope discriminators and permit dot-relative paths
-- HEAD — fix(judge): harden tool scoping, path separator normalization, and streaming carries
+- 6de3c75 — fix(judge): harden tool scoping, path separator normalization, and streaming carries
+- HEAD — fix(triaged): flush trailing escape carry buffer on idle actor ticks
