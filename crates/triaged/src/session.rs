@@ -5560,10 +5560,13 @@ impl OutputState {
         if self.pending_escape_buffer.is_empty() {
             return;
         }
-        let pending = std::mem::take(&mut self.pending_escape_buffer);
-        let translated = translate_newlines_with_state(&pending, self.pending_carriage_return);
+        let translated = translate_newlines_with_state(
+            &self.pending_escape_buffer,
+            self.pending_carriage_return,
+        );
         self.terminal.advance_bytes(&translated);
-        self.pending_carriage_return = pending.last() == Some(&b'\r');
+        self.pending_carriage_return = self.pending_escape_buffer.last() == Some(&b'\r');
+        self.pending_escape_buffer.clear();
     }
 
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {

@@ -31,6 +31,7 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T19:54-0700 Made URL scheme detection in `crates/triage-hook/src/main.rs` case-insensitive (`http://`, `https://`, `ws://`, `wss://`).
 - 2026-08-21T19:56-0700 Added `payload`, `data`, and `body` to `raw_args` lookups in `crates/triage-hook/src/main.rs` and added `!bytes.contains(&b'\n')` fast return in `translate_newlines_with_state` in `crates/triaged/src/session.rs`.
 - 2026-08-21T19:58-0700 Rejected private CSI parameter bytes (`?`, `>`, `<`, `=`) in `is_partial_relative_cursor_prefix` in `crates/triaged/src/session.rs`.
+- 2026-08-21T20:01-0700 Stripped `file://` scheme prefixes in `crates/triage-hook/src/main.rs` and reused vector allocation in `flush_pending_translated_bytes` via `clear()` in `crates/triaged/src/session.rs`.
 
 ## Decisions
 
@@ -61,4 +62,5 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 78f95a4 — fix(triaged): optimize zero-escape throughput and handle Windows home case-insensitivity
 - 8e2185e — fix(hook): match URL schemes case-insensitively for path overrides
 - 6d9a468 — fix(hook): expand raw_args lookup keys and optimize newline translation exit
-- HEAD — fix(triaged): reject private CSI markers in partial prefix detection
+- c5d95d7 — fix(triaged): reject private CSI markers in partial prefix detection
+- HEAD — fix(hook): strip file scheme prefixes and reuse escape carry capacity

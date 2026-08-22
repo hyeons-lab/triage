@@ -442,28 +442,34 @@ fn encode_response(
                     }
                 }
                 if let Some(ref path) = req.path {
-                    let lower_path = path.to_ascii_lowercase();
+                    let clean_path = path.strip_prefix("file://").unwrap_or(path);
+                    let lower_path = clean_path.to_ascii_lowercase();
                     let is_url = lower_path.starts_with("http://")
                         || lower_path.starts_with("https://")
                         || lower_path.starts_with("ws://")
                         || lower_path.starts_with("wss://");
                     let lower_tool = req.tool_name.to_ascii_lowercase();
                     if !is_url {
-                        permission_overrides.push(format!("file({path})"));
+                        permission_overrides.push(format!("file({clean_path})"));
                     }
-                    permission_overrides.push(format!("{}({path})", req.tool_name));
+                    permission_overrides.push(format!("{}({clean_path})", req.tool_name));
                     if lower_tool != req.tool_name {
-                        permission_overrides.push(format!("{lower_tool}({path})"));
+                        permission_overrides.push(format!("{lower_tool}({clean_path})"));
                     }
                     let home_trimmed = std::env::var("HOME")
                         .or_else(|_| std::env::var("USERPROFILE"))
                         .ok()
                         .map(|h| h.trim_end_matches(['/', '\\']).to_string());
                     if !is_url && let Some(ref home) = home_trimmed {
-                        let is_tilde_home =
-                            path == "~" || path.starts_with("~/") || path.starts_with("~\\");
+                        let is_tilde_home = clean_path == "~"
+                            || clean_path.starts_with("~/")
+                            || clean_path.starts_with("~\\");
                         if is_tilde_home {
-                            let sub = if path == "~" { "" } else { &path[1..] };
+                            let sub = if clean_path == "~" {
+                                ""
+                            } else {
+                                &clean_path[1..]
+                            };
                             let expanded = if sub.is_empty() {
                                 home.clone()
                             } else if home.contains('\\') {
@@ -489,7 +495,7 @@ fn encode_response(
                                 }
                             }
                         } else {
-                            let norm_path = path.replace('\\', "/");
+                            let norm_path = clean_path.replace('\\', "/");
                             let norm_home = home.replace('\\', "/");
                             let matches_home = if cfg!(windows) || home.contains('\\') {
                                 norm_path.eq_ignore_ascii_case(&norm_home)
