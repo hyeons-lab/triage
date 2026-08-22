@@ -15,6 +15,10 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T10:09-0700 Added unit tests in Rust and Flutter and verified the entire workspace test suite passes (276 Rust tests, 341 Flutter tests).
 - 2026-08-21T16:12-0700 Added `schedule`, `manage_task`, `manage_tasks`, `task_status`, `get_task_status`, `list_tasks`, and `refactor_tool` to `is_read_only_tool` in `crates/triage-core/src/judge_rules.rs`.
 - 2026-08-21T16:12-0700 Updated `crates/triage-hook/src/main.rs` to support string argument payloads in `extract_path`, skip file path extraction on command tools, and generate comprehensive permission overrides for file and tool formats (including expanded and contracted home directory paths).
+- 2026-08-21T17:30-0700 Fixed path expansion and contraction boundary checks in `crates/triage-hook/src/main.rs` to ensure matching on exact path or directory separator boundaries (`~`, `~/`, `~\`, and `$HOME`, `$HOME/`, `$HOME\`).
+- 2026-08-21T17:30-0700 Optimized `_isFollowedByRelativeCursorMovement` in `flutter/triage_client/lib/terminal/terminal_store.dart` to inspect code units directly without allocating substring slices.
+- 2026-08-21T17:30-0700 Hardened cross-chunk streaming in `crates/triaged/src/session.rs` and `flutter/triage_client/lib/terminal/terminal_store.dart` by statefully tracking `pending_carriage_return` and carrying incomplete trailing escape sequences (`\n\x1b...`) across chunk boundaries so split CRLFs and relative moves are preserved.
+- 2026-08-21T17:30-0700 Added unit tests covering path expansion/contraction boundaries, split chunk CRLFs, and split chunk CSI relative movements across both Rust and Flutter.
 
 ## Decisions
 
@@ -22,7 +26,13 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - If `\n` is followed by CSI cursor horizontal relative moves (`\x1b[<N>D` / `\x1b[<N>C`), preserve `\n` as bare `\n` to keep the current cursor column index intact for relative adjustments (`agy` logo / spinner).
 - For all other `\n` (followed by text, whitespace, digits, newlines, or non-relative escape sequences like SGR colors `\x1b[...m`), translate `\n` to `\r\n` so CLI output (e.g. `cera-cli`, `llama-cli`, `println!`, JSON) starts at column 0 without staircasing.
 
+2026-08-21T17:30-0700 Stateful multi-chunk carry for newline translation:
+- Hold back trailing incomplete escape sequences starting after bare LF (`\n\x1b...`) until the next chunk arrives or watchdog flushes, avoiding premature CR injection when CSI relative movement commands (`CSI <N>D/C`) are split across PTY reads or WebSocket frames.
+- Track `pending_carriage_return` across chunk boundaries to eliminate duplicate `\r` when CRLF is split across chunks (`\r` at end of chunk 1, `\n` at start of chunk 2).
+
 ## Commits
 
 - cbfb07f — fix(triaged): eliminate terminal newline staircasing while preserving relative cursor movements
-- HEAD — fix(judge): expand read-only tool coverage and path permission overrides in triage-hook
+- b325c51 — fix(judge): expand read-only tool coverage and path permission overrides in triage-hook
+- a4f0776 — fix(hook): support nested subagent payloads and directory wildcard permission overrides
+- HEAD — fix(triaged): harden cross-chunk newline streaming and path boundary overrides

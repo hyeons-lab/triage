@@ -138,27 +138,21 @@ void main() {
     expect(sink.written.toString(), 'é🦀');
   });
 
-  test(
-    'bare LF is translated to CRLF, existing CRLF preserved',
-    () {
-      store.dispatch(const Attach());
-      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
-      sink.ops.clear();
-      store.dispatch(LiveBytes(b('a\nb\r\nc')));
-      expect(sink.written.toString(), 'a\r\nb\r\nc');
-    },
-  );
+  test('bare LF is translated to CRLF, existing CRLF preserved', () {
+    store.dispatch(const Attach());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('a\nb\r\nc')));
+    expect(sink.written.toString(), 'a\r\nb\r\nc');
+  });
 
-  test(
-    'relative cursor movement escape sequences preserve bare LF',
-    () {
-      store.dispatch(const Attach());
-      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
-      sink.ops.clear();
-      store.dispatch(LiveBytes(b('Row 1\n\x1b[35DRow 2\n\x1b[13DSpinner')));
-      expect(sink.written.toString(), 'Row 1\n\x1b[35DRow 2\n\x1b[13DSpinner');
-    },
-  );
+  test('relative cursor movement escape sequences preserve bare LF', () {
+    store.dispatch(const Attach());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('Row 1\n\x1b[35DRow 2\n\x1b[13DSpinner')));
+    expect(sink.written.toString(), 'Row 1\n\x1b[35DRow 2\n\x1b[13DSpinner');
+  });
 
   test('split chunks pass bytes through without duplicate CR', () {
     store.dispatch(const Attach());
@@ -167,6 +161,27 @@ void main() {
     store.dispatch(LiveBytes(b('line\r')));
     store.dispatch(LiveBytes(b('\nnext')));
     expect(sink.written.toString(), 'line\r\nnext');
+  });
+
+  test(
+    'split relative cursor movement escape sequence across chunks preserves bare LF',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('Row 1\n\x1b[')));
+      store.dispatch(LiveBytes(b('35DRow 2')));
+      expect(sink.written.toString(), 'Row 1\n\x1b[35DRow 2');
+    },
+  );
+
+  test('split non-relative escape sequence across chunks receives CRLF', () {
+    store.dispatch(const Attach());
+    store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('Done\n\x1b[')));
+    store.dispatch(LiveBytes(b('32mSuccess\x1b[0m')));
+    expect(sink.written.toString(), 'Done\r\n\x1b[32mSuccess\x1b[0m');
   });
 
   test('UserInput forwards to host, suppressed after exit', () {

@@ -2388,6 +2388,8 @@ fn spawn_adopted_pty_runtime(
         bytes_logged: 0,
         output_seq: 0,
         log_cache: None,
+        pending_carriage_return: false,
+        pending_escape_buffer: Vec::new(),
     };
 
     let (replay_len, replay) = read_replay_tail(&h_sess.log_path)?;
@@ -4644,6 +4646,8 @@ struct OutputState {
     bytes_logged: u64,
     output_seq: u64,
     log_cache: Option<Vec<u8>>,
+    pending_carriage_return: bool,
+    pending_escape_buffer: Vec<u8>,
 }
 
 /// Visible rows + output sequence + git context, returned by the actor's
@@ -5382,13 +5386,18 @@ impl ActorState {
                     if let Err(error) = result {
                         tracing::warn!(error = ?error, "PTY output reader closed with error");
                     }
+                    self.output.flush_pending_translated_bytes();
                     self.output_closed = true;
                     self.exited = true;
                     self.broadcast_exit();
                     break;
                 }
-                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.output.flush_pending_translated_bytes();
+                    break;
+                }
                 Err(RecvTimeoutError::Disconnected) => {
+                    self.output.flush_pending_translated_bytes();
                     self.output_closed = true;
                     self.broadcast_exit();
                     break;
@@ -5415,8 +5424,44 @@ fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
     false
 }
 
-fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    let mut last = 0;
+fn is_partial_relative_cursor_prefix(slice: &[u8]) -> bool {
+    if slice.is_empty() || slice[0] != 0x1b {
+        return false;
+    }
+    if slice.len() == 1 {
+        return true;
+    }
+    if slice[1] != b'[' {
+        return false;
+    }
+    let mut i = 2;
+    while i < slice.len() && (slice[i].is_ascii_digit() || slice[i] == b';') {
+        i += 1;
+    }
+    i == slice.len() && slice.len() <= 24
+}
+
+fn find_trailing_partial_relative_cursor_split(input: &[u8], pending_cr: bool) -> usize {
+    let check_start = input.len().saturating_sub(24);
+    for i in (check_start..input.len()).rev() {
+        if input[i] == 0x1b {
+            let slice = &input[i..];
+            if is_partial_relative_cursor_prefix(slice) {
+                if i > 0 && input[i - 1] == b'\n' {
+                    let preceded_by_cr = (i > 1 && input[i - 2] == b'\r') || (i == 1 && pending_cr);
+                    if !preceded_by_cr {
+                        return i - 1;
+                    }
+                }
+                return i;
+            }
+        }
+    }
+    input.len()
+}
+
+fn translate_newlines_with_state(bytes: &[u8], pending_cr: bool) -> std::borrow::Cow<'_, [u8]> {
+    let mut last = if pending_cr { b'\r' } else { 0 };
     let mut needs_translation = false;
     let mut bare_lf_count = 0;
     for (i, &byte) in bytes.iter().enumerate() {
@@ -5435,7 +5480,7 @@ fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     }
 
     let mut result = Vec::with_capacity(bytes.len() + bare_lf_count);
-    last = 0;
+    last = if pending_cr { b'\r' } else { 0 };
     for (i, &byte) in bytes.iter().enumerate() {
         if byte == b'\n' && last != b'\r' {
             let next_slice = &bytes[i + 1..];
@@ -5449,7 +5494,57 @@ fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Owned(result)
 }
 
+#[cfg(test)]
+fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    translate_newlines_with_state(bytes, false)
+}
+
 impl OutputState {
+    fn advance_translated_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() && self.pending_escape_buffer.is_empty() {
+            return;
+        }
+
+        let combined;
+        let input: &[u8] = if self.pending_escape_buffer.is_empty() {
+            bytes
+        } else {
+            let mut buf = std::mem::take(&mut self.pending_escape_buffer);
+            buf.extend_from_slice(bytes);
+            combined = buf;
+            &combined
+        };
+
+        if input.is_empty() {
+            return;
+        }
+
+        let split_idx =
+            find_trailing_partial_relative_cursor_split(input, self.pending_carriage_return);
+        let (to_process, carry) = input.split_at(split_idx);
+        if !carry.is_empty() {
+            self.pending_escape_buffer.extend_from_slice(carry);
+        }
+
+        if to_process.is_empty() {
+            return;
+        }
+
+        let translated = translate_newlines_with_state(to_process, self.pending_carriage_return);
+        self.terminal.advance_bytes(&translated);
+        self.pending_carriage_return = to_process.last() == Some(&b'\r');
+    }
+
+    fn flush_pending_translated_bytes(&mut self) {
+        if self.pending_escape_buffer.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_escape_buffer);
+        let translated = translate_newlines_with_state(&pending, self.pending_carriage_return);
+        self.terminal.advance_bytes(&translated);
+        self.pending_carriage_return = pending.last() == Some(&b'\r');
+    }
+
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
         self.log
             .write_all(bytes)
@@ -5465,8 +5560,7 @@ impl OutputState {
             }
         }
         let current_working_directory = self.extract_current_working_directory(bytes);
-        let translated = translate_newlines(bytes);
-        self.terminal.advance_bytes(&translated);
+        self.advance_translated_bytes(bytes);
         Ok(current_working_directory)
     }
 
@@ -5561,7 +5655,9 @@ impl OutputState {
                 self.log_cache = None;
             }
         }
-        Ok(self.advance_replayed_bytes(bytes))
+        let cwd = self.advance_replayed_bytes(bytes);
+        self.flush_pending_translated_bytes();
+        Ok(cwd)
     }
 
     /// Replays the trailing `tail` of a log whose full length is `total_len`.
@@ -5599,6 +5695,7 @@ impl OutputState {
             let (_, replay) = read_replay_tail(&self.log_path)?;
             self.advance_replayed_bytes(&replay);
         }
+        self.flush_pending_translated_bytes();
 
         let replay_writes = replay_gate.dropped_write_count();
         let replay_flushes = replay_gate.dropped_flush_count();
@@ -5610,8 +5707,7 @@ impl OutputState {
 
     fn advance_replayed_bytes(&mut self, bytes: &[u8]) -> Option<PathBuf> {
         let current_working_directory = self.extract_current_working_directory(bytes);
-        let translated = translate_newlines(bytes);
-        self.terminal.advance_bytes(&translated);
+        self.advance_translated_bytes(bytes);
         current_working_directory
     }
 
@@ -5787,6 +5883,8 @@ fn spawn_pty_runtime(
                     bytes_logged: 0,
                     output_seq: 0,
                     log_cache: Some(Vec::new()),
+                    pending_carriage_return: false,
+                    pending_escape_buffer: Vec::new(),
                 },
                 size: config.size,
                 log_path: config.log_path,
@@ -5813,6 +5911,8 @@ fn spawn_pty_runtime(
                 bytes_logged: 0,
                 output_seq: 0,
                 log_cache: Some(Vec::new()),
+                pending_carriage_return: false,
+                pending_escape_buffer: Vec::new(),
             };
             let (replay_len, replay) = read_replay_tail(&config.log_path)?;
             let replayed_working_directory = if replay_len == 0 {
@@ -5881,6 +5981,8 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         bytes_logged: 0,
         output_seq: 0,
         log_cache: Some(Vec::new()),
+        pending_carriage_return: false,
+        pending_escape_buffer: Vec::new(),
     })
 }
 
@@ -7775,6 +7877,34 @@ mod tests {
         let erase_line = translate_newlines(b"First\n\x1b[2KSecond");
         assert!(matches!(erase_line, Cow::Owned(_)));
         assert_eq!(erase_line.as_ref(), b"First\r\n\x1b[2KSecond");
+    }
+
+    #[test]
+    fn visible_rows_split_chunk_relative_cursor_and_crlf() {
+        let log_path = unique_log_path();
+        let mut output = test_output_state(
+            &log_path,
+            SessionSize {
+                rows: 4,
+                cols: 40,
+                pixel_width: 400,
+                pixel_height: 80,
+                dpi: 96,
+            },
+        );
+
+        // 1. Split relative cursor move across ingest chunks (Row 1\n\x1b[ and 35DRow 2)
+        output.ingest(b"Row 1\n\x1b[").expect("ingest chunk 1");
+        output.ingest(b"35DRow 2").expect("ingest chunk 2");
+
+        // 2. Split CRLF across ingest chunks (line\r and \nnext)
+        output.ingest(b"\nline\r").expect("ingest cr chunk");
+        output.ingest(b"\nnext").expect("ingest lf chunk");
+
+        let rows = visible_rows(&output.terminal);
+        assert!(rows.iter().any(|row| row.contains("Row 2")));
+        assert!(rows.iter().any(|row| row.contains("next")));
+        let _ = std::fs::remove_file(log_path);
     }
 
     #[test]
@@ -10211,6 +10341,8 @@ mod tests {
             bytes_logged: 0,
             output_seq: 0,
             log_cache: Some(Vec::new()),
+            pending_carriage_return: false,
+            pending_escape_buffer: Vec::new(),
         };
 
         output
@@ -10526,6 +10658,8 @@ mod tests {
             bytes_logged: 0,
             output_seq: 0,
             log_cache: Some(Vec::new()),
+            pending_carriage_return: false,
+            pending_escape_buffer: Vec::new(),
         }
     }
 

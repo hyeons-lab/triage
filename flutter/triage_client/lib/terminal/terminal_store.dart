@@ -471,19 +471,25 @@ class TerminalStore extends ChangeNotifier {
     }
   }
 
-  static bool _isFollowedByRelativeCursorMovement(String text, int indexAfterLf) {
-    if (indexAfterLf >= text.length) return false;
-    final rest = text.substring(indexAfterLf);
-    if (!rest.startsWith('\x1b[')) return false;
-    var i = 2;
-    while (i < rest.length &&
-        ((rest.codeUnitAt(i) >= 48 && rest.codeUnitAt(i) <= 57) ||
-            rest.codeUnitAt(i) == 59)) {
+  static bool _isFollowedByRelativeCursorMovement(
+    String text,
+    int indexAfterLf,
+  ) {
+    if (indexAfterLf + 2 >= text.length) return false;
+    if (text.codeUnitAt(indexAfterLf) != 0x1b ||
+        text.codeUnitAt(indexAfterLf + 1) != 0x5b) {
+      return false;
+    }
+    var i = indexAfterLf + 2;
+    while (i < text.length &&
+        ((text.codeUnitAt(i) >= 48 && text.codeUnitAt(i) <= 57) ||
+            text.codeUnitAt(i) == 59)) {
       i++;
     }
-    if (i < rest.length) {
-      final finalChar = rest[i];
-      if (finalChar == 'D' || finalChar == 'C') {
+    if (i < text.length) {
+      final finalUnit = text.codeUnitAt(i);
+      if (finalUnit == 0x44 || finalUnit == 0x43) {
+        // 'D' or 'C'
         return true;
       }
     }
@@ -491,6 +497,8 @@ class TerminalStore extends ChangeNotifier {
   }
 
   String _translateNewlines(String input) {
+    if (input.isEmpty) return input;
+
     var needsTranslation = false;
     for (var i = 0; i < input.length; i++) {
       final isLf = input[i] == '\n';
@@ -549,8 +557,20 @@ class TerminalStore extends ChangeNotifier {
     // Only hold a bounded partial; otherwise let it flush to avoid unbounded
     // growth on a stream that never completes the sequence.
     if (partial != null && (s.length - partial.start) <= 24) {
-      _escapeCarry = s.substring(partial.start);
-      s = s.substring(0, partial.start);
+      var carryStart = partial.start;
+      // If the partial escape sequence is immediately preceded by a bare LF,
+      // include the LF in the carry so newline translation isn't prematurely
+      // evaluated without its following escape sequence across chunk boundaries.
+      if (carryStart > 0 && s[carryStart - 1] == '\n') {
+        final precededByCr =
+            (carryStart > 1 && s[carryStart - 2] == '\r') ||
+            (carryStart == 1 && _pendingCarriageReturn);
+        if (!precededByCr) {
+          carryStart -= 1;
+        }
+      }
+      _escapeCarry = s.substring(carryStart);
+      s = s.substring(0, carryStart);
       _rearmSyncWatchdog();
     }
     return s.replaceAll(_completePrivateCsi, '');

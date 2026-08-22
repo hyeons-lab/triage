@@ -415,43 +415,57 @@ fn encode_response(
                     if lower_tool != req.tool_name {
                         permission_overrides.push(format!("{lower_tool}({path})"));
                     }
-                    if let Some((dir, _)) = path.rsplit_once(['/', '\\']) {
-                        if !dir.is_empty() {
-                            permission_overrides.push(format!("{dir}/*"));
-                            permission_overrides.push(format!("file({dir}/*)"));
-                        }
+                    if let Some((dir, _)) = path.rsplit_once(['/', '\\'])
+                        && !dir.is_empty()
+                    {
+                        permission_overrides.push(format!("{dir}/*"));
+                        permission_overrides.push(format!("file({dir}/*)"));
                     }
                     if let Ok(home) =
                         std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
                     {
                         let home_trimmed = home.trim_end_matches(['/', '\\']);
-                        if path.starts_with('~') {
-                            let expanded = path.replacen('~', home_trimmed, 1);
+                        let is_tilde_home =
+                            path == "~" || path.starts_with("~/") || path.starts_with("~\\");
+                        if is_tilde_home {
+                            let expanded = if path == "~" {
+                                home_trimmed.to_string()
+                            } else {
+                                format!("{home_trimmed}{}", &path[1..])
+                            };
                             permission_overrides.push(format!("file({expanded})"));
                             permission_overrides.push(format!("{}({expanded})", req.tool_name));
                             permission_overrides.push(expanded.clone());
                             if lower_tool != req.tool_name {
                                 permission_overrides.push(format!("{lower_tool}({expanded})"));
                             }
-                            if let Some((dir, _)) = expanded.rsplit_once(['/', '\\']) {
-                                if !dir.is_empty() {
-                                    permission_overrides.push(format!("{dir}/*"));
-                                    permission_overrides.push(format!("file({dir}/*)"));
-                                }
+                            if let Some((dir, _)) = expanded.rsplit_once(['/', '\\'])
+                                && !dir.is_empty()
+                            {
+                                permission_overrides.push(format!("{dir}/*"));
+                                permission_overrides.push(format!("file({dir}/*)"));
                             }
-                        } else if path.starts_with(home_trimmed) {
-                            let contracted = format!("~{}", &path[home_trimmed.len()..]);
+                        } else if path == home_trimmed
+                            || path.starts_with(&format!("{home_trimmed}/"))
+                            || path.starts_with(&format!("{home_trimmed}\\"))
+                        {
+                            let suffix = &path[home_trimmed.len()..];
+                            let contracted = if suffix.is_empty() {
+                                "~".to_string()
+                            } else {
+                                format!("~{suffix}")
+                            };
                             permission_overrides.push(format!("file({contracted})"));
                             permission_overrides.push(format!("{}({contracted})", req.tool_name));
                             permission_overrides.push(contracted.clone());
                             if lower_tool != req.tool_name {
                                 permission_overrides.push(format!("{lower_tool}({contracted})"));
                             }
-                            if let Some((dir, _)) = contracted.rsplit_once(['/', '\\']) {
-                                if !dir.is_empty() {
-                                    permission_overrides.push(format!("{dir}/*"));
-                                    permission_overrides.push(format!("file({dir}/*)"));
-                                }
+                            if let Some((dir, _)) = contracted.rsplit_once(['/', '\\'])
+                                && !dir.is_empty()
+                            {
+                                permission_overrides.push(format!("{dir}/*"));
+                                permission_overrides.push(format!("file({dir}/*)"));
                             }
                         }
                     }
@@ -1030,6 +1044,101 @@ mod tests {
         assert!(!override_strs.contains(&"command(echo)"));
         // Ensure no malformed unbalanced quotes exist
         assert!(!override_strs.iter().any(|s| s.contains("echo \"In)")));
+    }
+
+    #[test]
+    fn permission_overrides_home_path_boundary_handling() {
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(h) => h.trim_end_matches(['/', '\\']).to_string(),
+            Err(_) => return,
+        };
+
+        // 1. Literal tilde filename in current directory (e.g. ~literal_filename.txt)
+        let req_tilde_file = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("~literal_filename.txt".to_string()),
+            cwd: None,
+        };
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rules".to_string(),
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Must NOT expand ~literal_filename.txt into /Users/...literal_filename.txt
+        let corrupt_expansion = format!("{home}literal_filename.txt");
+        assert!(!overrides.iter().any(|s| s.contains(&corrupt_expansion)));
+        assert!(overrides.contains(&"file(~literal_filename.txt)"));
+
+        // 2. Sibling user directory (e.g. /home/user_other/repo)
+        let sibling_path = format!("{home}_other/repo/file.txt");
+        let req_sibling = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(sibling_path.clone()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_sibling));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Must NOT contract to ~_other/repo/file.txt
+        assert!(!overrides.iter().any(|s| s.contains("~_other")));
+        assert!(overrides.contains(&format!("file({sibling_path})").as_str()));
+
+        // 3. Valid home directory subpaths
+        let valid_tilde = "~/repo/main.rs".to_string();
+        let req_valid = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(valid_tilde),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_valid));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let expected_expanded = format!("{home}/repo/main.rs");
+        assert!(overrides.contains(&format!("file({expected_expanded})").as_str()));
+        assert!(overrides.contains(&"file(~/repo/main.rs)"));
+
+        // 4. Exact root home directory paths
+        let req_root_home = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "list_dir".to_string(),
+            command_line: None,
+            path: Some(home.clone()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_root_home));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"file(~)"));
+        assert!(overrides.contains(&format!("file({home})").as_str()));
     }
 
     #[test]
