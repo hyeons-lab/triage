@@ -22,6 +22,7 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T17:40-0700 Restricted `is_read_only_tool` in `crates/triage-core/src/judge_rules.rs` to exclude interactive / action-taking tools (`manage_task`, `manage_tasks`), keeping only dedicated status queries (`task_status`, `get_task_status`, `list_tasks`).
 - 2026-08-21T17:40-0700 Sanitized wildcard directory permission overrides in `crates/triage-hook/src/main.rs` via `is_safe_wildcard_dir` to explicitly forbid parent wildcard grants on root, `/Users`, `/home`, `~`, `$HOME`, and dot paths, and excluded network URLs from filesystem path overrides.
 - 2026-08-21T17:40-0700 Streamlined slice prefix inspection in `is_followed_by_relative_cursor_movement` and added `!bytes.contains(&b'\n')` fast path in `crates/triaged/src/session.rs`.
+- 2026-08-21T19:38-0700 Filtered out non-tool message envelope discriminators (`message`, `text`, `thought`, `ping`, `assistant`, `user`) on the `"type"` fallback in `extract_tool_info` and allowed dot-relative paths (`./...`, `../...`, `.env`) in generic JSON object extraction in `crates/triage-hook/src/main.rs`.
 
 ## Decisions
 
@@ -43,4 +44,5 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - b325c51 — fix(judge): expand read-only tool coverage and path permission overrides in triage-hook
 - a4f0776 — fix(hook): support nested subagent payloads and directory wildcard permission overrides
 - 0fe51d2 — fix(triaged): harden cross-chunk newline streaming and path boundary overrides
-- HEAD — fix(judge): restrict read-only tool scoping and sanitize wildcard directory overrides
+- 790fe5e — fix(judge): restrict read-only tool scoping and sanitize wildcard directory overrides
+- HEAD — fix(hook): filter message envelope discriminators and permit dot-relative paths

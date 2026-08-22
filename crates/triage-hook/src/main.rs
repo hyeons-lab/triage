@@ -99,7 +99,23 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
         .or_else(|| val.get("functionName"))
         .or_else(|| val.get("tool_type"))
         .or_else(|| val.get("toolType"))
-        .or_else(|| val.get("type"))
+        .or_else(|| {
+            val.get("type").filter(|v| {
+                v.as_str().is_some_and(|s| {
+                    !matches!(
+                        s,
+                        "message"
+                            | "text"
+                            | "thought"
+                            | "user"
+                            | "assistant"
+                            | "ping"
+                            | "system"
+                            | "event"
+                    )
+                })
+            })
+        })
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -230,8 +246,8 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         for val in obj.values() {
             if let Some(s) = val.as_str()
                 && (s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~'))
-                && s.len() > 1
-                && !s.starts_with('.')
+                && s != "."
+                && s != ".."
             {
                 return Some(s.to_string());
             }
@@ -1325,5 +1341,56 @@ mod tests {
         };
         let verdict = ask_daemon(req, Duration::ZERO);
         assert_eq!(verdict.decision, JudgeDecision::Allow);
+    }
+
+    #[test]
+    fn extract_tool_info_ignores_non_tool_envelope_types() {
+        let msg_payload = serde_json::json!({
+            "type": "message",
+            "content": "Hello world"
+        });
+        assert_eq!(extract_tool_info(&msg_payload), None);
+
+        let ping_payload = serde_json::json!({
+            "type": "ping"
+        });
+        assert_eq!(extract_tool_info(&ping_payload), None);
+
+        let tool_payload = serde_json::json!({
+            "type": "custom_reader",
+            "path": "file.txt"
+        });
+        assert_eq!(
+            extract_tool_info(&tool_payload),
+            Some(("custom_reader".to_string(), tool_payload.clone()))
+        );
+    }
+
+    #[test]
+    fn extract_path_extracts_dot_relative_paths_and_rejects_standalone_dots() {
+        let dot_rel = serde_json::json!({
+            "target": "./src/main.rs"
+        });
+        assert_eq!(extract_path(&dot_rel), Some("./src/main.rs".to_string()));
+
+        let parent_rel = serde_json::json!({
+            "file": "../Cargo.toml"
+        });
+        assert_eq!(extract_path(&parent_rel), Some("../Cargo.toml".to_string()));
+
+        let dot_file = serde_json::json!({
+            "item": ".env"
+        });
+        assert_eq!(extract_path(&dot_file), Some(".env".to_string()));
+
+        let single_dot = serde_json::json!({
+            "item": "."
+        });
+        assert_eq!(extract_path(&single_dot), None);
+
+        let double_dot = serde_json::json!({
+            "item": ".."
+        });
+        assert_eq!(extract_path(&double_dot), None);
     }
 }
