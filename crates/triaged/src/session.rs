@@ -5408,22 +5408,21 @@ impl ActorState {
 }
 
 fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
-    if slice.len() < 3 || slice[0] != 0x1b || slice[1] != b'[' {
+    let Some(rest) = slice.strip_prefix(b"\x1b[") else {
         return false;
-    }
-    let mut i = 2;
-    while i < slice.len() && (slice[i].is_ascii_digit() || slice[i] == b';') {
-        i += 1;
-    }
-    if i < slice.len() {
-        let final_byte = slice[i];
-        if final_byte == b'D' || final_byte == b'C' {
-            return true;
-        }
-    }
-    false
+    };
+    let param_len = rest
+        .iter()
+        .take_while(|&&b| b.is_ascii_digit() || b == b';')
+        .count();
+    matches!(rest.get(param_len), Some(b'D' | b'C'))
 }
 
+/// True if `slice` begins with `\x1b` or `\x1b[<digits;]*` but has not yet
+/// received its terminating command character.
+///
+/// The length is bounded to at most 24 bytes to avoid holding back arbitrarily
+/// long data streams if an invalid or non-standard sequence is encountered.
 fn is_partial_relative_cursor_prefix(slice: &[u8]) -> bool {
     if slice.is_empty() || slice[0] != 0x1b {
         return false;
@@ -5461,6 +5460,9 @@ fn find_trailing_partial_relative_cursor_split(input: &[u8], pending_cr: bool) -
 }
 
 fn translate_newlines_with_state(bytes: &[u8], pending_cr: bool) -> std::borrow::Cow<'_, [u8]> {
+    if !pending_cr && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
     let mut last = if pending_cr { b'\r' } else { 0 };
     let mut needs_translation = false;
     let mut bare_lf_count = 0;
@@ -7897,13 +7899,23 @@ mod tests {
         output.ingest(b"Row 1\n\x1b[").expect("ingest chunk 1");
         output.ingest(b"35DRow 2").expect("ingest chunk 2");
 
-        // 2. Split CRLF across ingest chunks (line\r and \nnext)
+        // 2. Parameterless relative move across ingest chunks (\n\x1b and [D)
+        output.ingest(b"\n\x1b").expect("ingest partial esc");
+        output.ingest(b"[DLeft").expect("ingest finish esc");
+
+        // 3. Split CRLF across ingest chunks (line\r and \nnext)
         output.ingest(b"\nline\r").expect("ingest cr chunk");
         output.ingest(b"\nnext").expect("ingest lf chunk");
 
+        // 4. Split CRLF where second chunk already has \r\n (line\r and \r\nnext)
+        output.ingest(b"\nline2\r").expect("ingest cr chunk 2");
+        output.ingest(b"\r\nnext2").expect("ingest crlf chunk 2");
+
         let rows = visible_rows(&output.terminal);
         assert!(rows.iter().any(|row| row.contains("Row 2")));
+        assert!(rows.iter().any(|row| row.contains("Left")));
         assert!(rows.iter().any(|row| row.contains("next")));
+        assert!(rows.iter().any(|row| row.contains("next2")));
         let _ = std::fs::remove_file(log_path);
     }
 

@@ -219,6 +219,8 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "DocumentPath",
         "Url",
         "url",
+        "Uri",
+        "uri",
     ] {
         if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
             return Some(val.to_string());
@@ -228,6 +230,8 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         for val in obj.values() {
             if let Some(s) = val.as_str()
                 && (s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~'))
+                && s.len() > 1
+                && !s.starts_with('.')
             {
                 return Some(s.to_string());
             }
@@ -408,64 +412,55 @@ fn encode_response(
                     }
                 }
                 if let Some(ref path) = req.path {
+                    let is_url = path.starts_with("http://")
+                        || path.starts_with("https://")
+                        || path.starts_with("ws://")
+                        || path.starts_with("wss://");
                     let lower_tool = req.tool_name.to_ascii_lowercase();
-                    permission_overrides.push(format!("file({path})"));
+                    if !is_url {
+                        permission_overrides.push(format!("file({path})"));
+                    }
                     permission_overrides.push(format!("{}({path})", req.tool_name));
-                    permission_overrides.push(path.clone());
                     if lower_tool != req.tool_name {
                         permission_overrides.push(format!("{lower_tool}({path})"));
                     }
-                    if let Some((dir, _)) = path.rsplit_once(['/', '\\'])
-                        && !dir.is_empty()
-                    {
-                        permission_overrides.push(format!("{dir}/*"));
-                        permission_overrides.push(format!("file({dir}/*)"));
-                    }
-                    if let Ok(home) =
-                        std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
-                    {
-                        let home_trimmed = home.trim_end_matches(['/', '\\']);
+                    let home_trimmed = std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .ok()
+                        .map(|h| h.trim_end_matches(['/', '\\']).to_string());
+                    if !is_url && let Some(ref home) = home_trimmed {
                         let is_tilde_home =
                             path == "~" || path.starts_with("~/") || path.starts_with("~\\");
                         if is_tilde_home {
                             let expanded = if path == "~" {
-                                home_trimmed.to_string()
+                                home.clone()
                             } else {
-                                format!("{home_trimmed}{}", &path[1..])
+                                format!("{home}{}", &path[1..])
                             };
                             permission_overrides.push(format!("file({expanded})"));
                             permission_overrides.push(format!("{}({expanded})", req.tool_name));
-                            permission_overrides.push(expanded.clone());
                             if lower_tool != req.tool_name {
                                 permission_overrides.push(format!("{lower_tool}({expanded})"));
                             }
-                            if let Some((dir, _)) = expanded.rsplit_once(['/', '\\'])
-                                && !dir.is_empty()
+                        } else {
+                            let norm_path = path.replace('\\', "/");
+                            let norm_home = home.replace('\\', "/");
+                            if norm_path == norm_home
+                                || norm_path.starts_with(&format!("{norm_home}/"))
                             {
-                                permission_overrides.push(format!("{dir}/*"));
-                                permission_overrides.push(format!("file({dir}/*)"));
-                            }
-                        } else if path == home_trimmed
-                            || path.starts_with(&format!("{home_trimmed}/"))
-                            || path.starts_with(&format!("{home_trimmed}\\"))
-                        {
-                            let suffix = &path[home_trimmed.len()..];
-                            let contracted = if suffix.is_empty() {
-                                "~".to_string()
-                            } else {
-                                format!("~{suffix}")
-                            };
-                            permission_overrides.push(format!("file({contracted})"));
-                            permission_overrides.push(format!("{}({contracted})", req.tool_name));
-                            permission_overrides.push(contracted.clone());
-                            if lower_tool != req.tool_name {
-                                permission_overrides.push(format!("{lower_tool}({contracted})"));
-                            }
-                            if let Some((dir, _)) = contracted.rsplit_once(['/', '\\'])
-                                && !dir.is_empty()
-                            {
-                                permission_overrides.push(format!("{dir}/*"));
-                                permission_overrides.push(format!("file({dir}/*)"));
+                                let suffix = &norm_path[norm_home.len()..];
+                                let contracted = if suffix.is_empty() {
+                                    "~".to_string()
+                                } else {
+                                    format!("~{suffix}")
+                                };
+                                permission_overrides.push(format!("file({contracted})"));
+                                permission_overrides
+                                    .push(format!("{}({contracted})", req.tool_name));
+                                if lower_tool != req.tool_name {
+                                    permission_overrides
+                                        .push(format!("{lower_tool}({contracted})"));
+                                }
                             }
                         }
                     }
@@ -1139,6 +1134,31 @@ mod tests {
             .collect();
         assert!(overrides.contains(&"file(~)"));
         assert!(overrides.contains(&format!("file({home})").as_str()));
+        // Must NOT emit wildcard overrides for entire home or system users directory
+        assert!(!overrides.contains(&"~/*"));
+        assert!(!overrides.contains(&"file(~/*)"));
+        assert!(!overrides.contains(&format!("{home}/*").as_str()));
+        assert!(!overrides.contains(&"/Users/*"));
+        assert!(!overrides.contains(&"/home/*"));
+
+        // 5. URL arguments must not emit file() or dir/* overrides
+        let req_url = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "read_url_content".to_string(),
+            command_line: None,
+            path: Some("https://example.com/api/v1".to_string()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_url));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!overrides.iter().any(|s| s.starts_with("file(")));
+        assert!(!overrides.iter().any(|s| s.contains("/*")));
     }
 
     #[test]

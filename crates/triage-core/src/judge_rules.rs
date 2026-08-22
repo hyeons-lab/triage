@@ -37,13 +37,12 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "define_subagent"
             | "generate_image"
             | "schedule"
-            | "manage_task"
-            | "manage_tasks"
-            | "managetask"
-            | "managetasks"
             | "task_status"
+            | "taskstatus"
             | "get_task_status"
+            | "gettaskstatus"
             | "list_tasks"
+            | "listtasks"
             | "detect_changes"
             | "get_review_context"
             | "get_impact_radius"
@@ -2244,5 +2243,17 @@ mod tests {
             evaluate_cmd("git branch").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
+    }
+
+    #[test]
+    fn test_manage_task_is_not_read_only() {
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("manage_tasks"));
+        assert!(!is_read_only_tool("managetask"));
+        assert!(!is_read_only_tool("managetasks"));
+        assert!(is_read_only_tool("task_status"));
+        assert!(is_read_only_tool("get_task_status"));
+        assert!(is_read_only_tool("list_tasks"));
+        assert!(is_read_only_tool("schedule"));
     }
 }

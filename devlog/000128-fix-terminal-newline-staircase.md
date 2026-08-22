@@ -19,6 +19,9 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T17:30-0700 Optimized `_isFollowedByRelativeCursorMovement` in `flutter/triage_client/lib/terminal/terminal_store.dart` to inspect code units directly without allocating substring slices.
 - 2026-08-21T17:30-0700 Hardened cross-chunk streaming in `crates/triaged/src/session.rs` and `flutter/triage_client/lib/terminal/terminal_store.dart` by statefully tracking `pending_carriage_return` and carrying incomplete trailing escape sequences (`\n\x1b...`) across chunk boundaries so split CRLFs and relative moves are preserved.
 - 2026-08-21T17:30-0700 Added unit tests covering path expansion/contraction boundaries, split chunk CRLFs, and split chunk CSI relative movements across both Rust and Flutter.
+- 2026-08-21T17:40-0700 Restricted `is_read_only_tool` in `crates/triage-core/src/judge_rules.rs` to exclude interactive / action-taking tools (`manage_task`, `manage_tasks`), keeping only dedicated status queries (`task_status`, `get_task_status`, `list_tasks`).
+- 2026-08-21T17:40-0700 Sanitized wildcard directory permission overrides in `crates/triage-hook/src/main.rs` via `is_safe_wildcard_dir` to explicitly forbid parent wildcard grants on root, `/Users`, `/home`, `~`, `$HOME`, and dot paths, and excluded network URLs from filesystem path overrides.
+- 2026-08-21T17:40-0700 Streamlined slice prefix inspection in `is_followed_by_relative_cursor_movement` and added `!bytes.contains(&b'\n')` fast path in `crates/triaged/src/session.rs`.
 
 ## Decisions
 
@@ -30,9 +33,14 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - Hold back trailing incomplete escape sequences starting after bare LF (`\n\x1b...`) until the next chunk arrives or watchdog flushes, avoiding premature CR injection when CSI relative movement commands (`CSI <N>D/C`) are split across PTY reads or WebSocket frames.
 - Track `pending_carriage_return` across chunk boundaries to eliminate duplicate `\r` when CRLF is split across chunks (`\r` at end of chunk 1, `\n` at start of chunk 2).
 
+2026-08-21T17:40-0700 Strict permission override scoping:
+- Never generate `{dir}/*` wildcard permission overrides for root or user account homes (`/Users`, `/home`, `~`, `$HOME`), strictly confining wildcard permissions to project subdirectories.
+- Keep interactive tools with input injection (`manage_task`) out of `is_read_only_tool`.
+
 ## Commits
 
 - cbfb07f — fix(triaged): eliminate terminal newline staircasing while preserving relative cursor movements
 - b325c51 — fix(judge): expand read-only tool coverage and path permission overrides in triage-hook
 - a4f0776 — fix(hook): support nested subagent payloads and directory wildcard permission overrides
-- HEAD — fix(triaged): harden cross-chunk newline streaming and path boundary overrides
+- 0fe51d2 — fix(triaged): harden cross-chunk newline streaming and path boundary overrides
+- HEAD — fix(judge): restrict read-only tool scoping and sanitize wildcard directory overrides
