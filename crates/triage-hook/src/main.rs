@@ -439,10 +439,11 @@ fn encode_response(
                     }
                 }
                 if let Some(ref path) = req.path {
-                    let is_url = path.starts_with("http://")
-                        || path.starts_with("https://")
-                        || path.starts_with("ws://")
-                        || path.starts_with("wss://");
+                    let lower_path = path.to_ascii_lowercase();
+                    let is_url = lower_path.starts_with("http://")
+                        || lower_path.starts_with("https://")
+                        || lower_path.starts_with("ws://")
+                        || lower_path.starts_with("wss://");
                     let lower_tool = req.tool_name.to_ascii_lowercase();
                     if !is_url {
                         permission_overrides.push(format!("file({path})"));
