@@ -209,7 +209,7 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
 
 fn extract_path(args: &serde_json::Value) -> Option<String> {
     if let Some(s) = args.as_str() {
-        return Some(s.to_string());
+        return (s != "." && s != "..").then(|| s.to_string());
     }
     for key in [
         "AbsolutePath",
@@ -233,6 +233,9 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "DirectoryPath",
         "directory_path",
         "directoryPath",
+        "SearchDirectory",
+        "search_directory",
+        "searchDirectory",
         "SearchPath",
         "search_path",
         "searchPath",
@@ -243,7 +246,10 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "Uri",
         "uri",
     ] {
-        if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
+        if let Some(val) = args.get(key).and_then(|v| v.as_str())
+            && val != "."
+            && val != ".."
+        {
             return Some(val.to_string());
         }
     }
@@ -1412,5 +1418,16 @@ mod tests {
             "item": ".."
         });
         assert_eq!(extract_path(&double_dot), None);
+
+        let str_dot = serde_json::json!(".");
+        assert_eq!(extract_path(&str_dot), None);
+
+        let str_dot_dot = serde_json::json!("..");
+        assert_eq!(extract_path(&str_dot_dot), None);
+
+        let named_dot = serde_json::json!({
+            "path": "."
+        });
+        assert_eq!(extract_path(&named_dot), None);
     }
 }
