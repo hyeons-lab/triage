@@ -35,6 +35,8 @@ const int _kSyncBufferCap = 1024 * 1024; // 1 MiB
 
 const int _kSyncMarkerLength = 8; // length of '\x1b[?2026h' and '\x1b[?2026l'
 
+const int _kMaxCarryEscapeLength = 32;
+
 // Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
 // `Output`): a trailing not-yet-terminated `CSI > …` / `CSI ? 2026 …` and a complete
 // `CSI > … m` private sequence.
@@ -95,6 +97,9 @@ class TerminalStore extends ChangeNotifier {
   // True while we are writing to the sink, so synchronous emulator auto-responses
   // (DSR/DA/Kitty queries) are not forwarded back to the host as fake user input.
   bool _isWritingSink = false;
+
+  // True if the previous chunk ended with '\r' so a split '\r\n' is not doubled.
+  bool _pendingCarriageReturn = false;
 
   // True for a brief window after a history replay; while set, emulator output
   // (the program's own query auto-answers) is not forwarded to the host.
@@ -459,10 +464,86 @@ class TerminalStore extends ChangeNotifier {
     final wasWriting = _isWritingSink;
     _isWritingSink = true;
     try {
-      _sink.write(text);
+      if (_inSynchronizedOutput || text.contains(_kSyncPrefix)) {
+        _pendingCarriageReturn = text.endsWith('\r');
+        _sink.write(text);
+      } else {
+        _sink.write(_translateNewlines(text));
+      }
     } finally {
       _isWritingSink = wasWriting;
     }
+  }
+
+  static bool _isFollowedByRelativeCursorMovement(
+    String text,
+    int indexAfterLf,
+  ) {
+    if (indexAfterLf + 2 >= text.length) return false;
+    if (text.codeUnitAt(indexAfterLf) != 0x1b ||
+        text.codeUnitAt(indexAfterLf + 1) != 0x5b) {
+      return false;
+    }
+    final firstUnit = text.codeUnitAt(indexAfterLf + 2);
+    // Reject private/experimental CSI parameter bytes: ?, >, <, =
+    if (firstUnit == 0x3f ||
+        firstUnit == 0x3e ||
+        firstUnit == 0x3c ||
+        firstUnit == 0x3d) {
+      return false;
+    }
+    var i = indexAfterLf + 2;
+    while (i < text.length &&
+        ((text.codeUnitAt(i) >= 48 && text.codeUnitAt(i) <= 57) ||
+            text.codeUnitAt(i) == 59)) {
+      i++;
+    }
+    if (i < text.length) {
+      final finalUnit = text.codeUnitAt(i);
+      if (finalUnit == 0x44 || finalUnit == 0x43) {
+        // 'D' or 'C'
+        return true;
+      }
+    }
+    return false;
+  }
+
+  String _translateNewlines(String input) {
+    if (input.isEmpty) return input;
+
+    var needsTranslation = false;
+    for (var i = 0; i < input.length; i++) {
+      final isLf = input[i] == '\n';
+      final precededByCr =
+          (i > 0 && input[i - 1] == '\r') || (i == 0 && _pendingCarriageReturn);
+      if (isLf && !precededByCr) {
+        if (!_isFollowedByRelativeCursorMovement(input, i + 1)) {
+          needsTranslation = true;
+          break;
+        }
+      }
+    }
+
+    final endsWithCr = input.endsWith('\r');
+    if (!needsTranslation) {
+      _pendingCarriageReturn = endsWithCr;
+      return input;
+    }
+
+    final buffer = StringBuffer();
+    for (var i = 0; i < input.length; i++) {
+      final isLf = input[i] == '\n';
+      final precededByCr =
+          (i > 0 && input[i - 1] == '\r') || (i == 0 && _pendingCarriageReturn);
+      if (isLf && !precededByCr) {
+        if (!_isFollowedByRelativeCursorMovement(input, i + 1)) {
+          buffer.write('\r');
+        }
+      }
+      buffer.write(input[i]);
+    }
+    _pendingCarriageReturn = endsWithCr;
+    return buffer.toString();
   }
 
   /// Strips `CSI > … m` private sequences (XTMODKEYS / modifyOtherKeys, which
@@ -487,9 +568,21 @@ class TerminalStore extends ChangeNotifier {
     final partial = _partialEscapeSequence.firstMatch(s);
     // Only hold a bounded partial; otherwise let it flush to avoid unbounded
     // growth on a stream that never completes the sequence.
-    if (partial != null && (s.length - partial.start) <= 24) {
-      _escapeCarry = s.substring(partial.start);
-      s = s.substring(0, partial.start);
+    if (partial != null && (s.length - partial.start) <= _kMaxCarryEscapeLength) {
+      var carryStart = partial.start;
+      // If the partial escape sequence is immediately preceded by a bare LF,
+      // include the LF in the carry so newline translation isn't prematurely
+      // evaluated without its following escape sequence across chunk boundaries.
+      if (carryStart > 0 && s[carryStart - 1] == '\n') {
+        final precededByCr =
+            (carryStart > 1 && s[carryStart - 2] == '\r') ||
+            (carryStart == 1 && _pendingCarriageReturn);
+        if (!precededByCr) {
+          carryStart -= 1;
+        }
+      }
+      _escapeCarry = s.substring(carryStart);
+      s = s.substring(0, carryStart);
       _rearmSyncWatchdog();
     }
     return s.replaceAll(_completePrivateCsi, '');
@@ -498,6 +591,7 @@ class TerminalStore extends ChangeNotifier {
   void _resetCarries() {
     _utf8Carry.clear();
     _escapeCarry = '';
+    _pendingCarriageReturn = false;
     _syncTimer?.cancel();
     _syncTimer = null;
     _inSynchronizedOutput = false;
