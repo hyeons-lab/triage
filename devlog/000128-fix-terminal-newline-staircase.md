@@ -29,6 +29,7 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 2026-08-21T19:50-0700 Rejected private/experimental CSI parameter bytes (`?`, `>`, `<`, `=`) in relative cursor detection, synchronized `MAX_CARRY_ESCAPE_LEN = 32` bounded carry constants across Rust and Dart, and replaced temporary vector moves with in-place buffer draining in `OutputState`.
 - 2026-08-21T19:52-0700 Added ASCII case-insensitive home matching on Windows in `crates/triage-hook/src/main.rs` and added pure throughput hot-path fast bypass in `advance_translated_bytes` in `crates/triaged/src/session.rs`.
 - 2026-08-21T19:54-0700 Made URL scheme detection in `crates/triage-hook/src/main.rs` case-insensitive (`http://`, `https://`, `ws://`, `wss://`).
+- 2026-08-21T19:56-0700 Added `payload`, `data`, and `body` to `raw_args` lookups in `crates/triage-hook/src/main.rs` and added `!bytes.contains(&b'\n')` fast return in `translate_newlines_with_state` in `crates/triaged/src/session.rs`.
 
 ## Decisions
 
@@ -57,4 +58,5 @@ Plan: [plans/000128-01-fix-terminal-newline-staircase.md](plans/000128-01-fix-te
 - 112d4e0 — fix(hook): filter standalone dot references across string and key payloads
 - 79d634b — fix(triaged): reject private CSI markers and synchronize carry bounds across Rust and Dart
 - 78f95a4 — fix(triaged): optimize zero-escape throughput and handle Windows home case-insensitivity
-- HEAD — fix(hook): match URL schemes case-insensitively for path overrides
+- 8e2185e — fix(hook): match URL schemes case-insensitively for path overrides
+- HEAD — fix(hook): expand raw_args lookup keys and optimize newline translation exit

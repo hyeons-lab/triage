@@ -5467,7 +5467,7 @@ fn find_trailing_partial_relative_cursor_split(input: &[u8], pending_cr: bool) -
 }
 
 fn translate_newlines_with_state(bytes: &[u8], pending_cr: bool) -> std::borrow::Cow<'_, [u8]> {
-    if !pending_cr && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+    if !bytes.contains(&b'\n') {
         return std::borrow::Cow::Borrowed(bytes);
     }
     let mut last = if pending_cr { b'\r' } else { 0 };

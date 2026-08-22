@@ -132,7 +132,10 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
             .or_else(|| val.get("toolInput"))
             .or_else(|| val.get("input"))
             .or_else(|| val.get("parameters"))
-            .or_else(|| val.get("params"));
+            .or_else(|| val.get("params"))
+            .or_else(|| val.get("payload"))
+            .or_else(|| val.get("data"))
+            .or_else(|| val.get("body"));
 
         let args = match raw_args {
             Some(serde_json::Value::String(s)) => {
