@@ -43,32 +43,107 @@ const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Decodes the agent payload from arbitrary agent hook schemas (Claude, Antigravity, Gemini, etc.).
 fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Value)> {
-    // Check nested tool_call / toolCall / tool_use / toolUse
-    for key in ["tool_call", "toolCall", "tool_use", "toolUse"] {
+    if let Some(arr) = val.as_array() {
+        for item in arr {
+            if let Some(res) = extract_tool_info(item) {
+                return Some(res);
+            }
+        }
+    }
+
+    // Check nested tool_call / toolCall / tool_use / toolUse / function / step / action / call / request / payload / data
+    for key in [
+        "tool_call",
+        "toolCall",
+        "tool_use",
+        "toolUse",
+        "function",
+        "step",
+        "action",
+        "call",
+        "request",
+        "payload",
+        "data",
+        "toolCallItem",
+        "tool_call_item",
+    ] {
         if let Some(res) = val.get(key).and_then(extract_tool_info) {
             return Some(res);
         }
     }
 
-    // Check name / tool_name / toolName / tool
+    for key in [
+        "tool_calls",
+        "toolCalls",
+        "tool_uses",
+        "toolUses",
+        "tools",
+        "calls",
+    ] {
+        if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(res) = extract_tool_info(item) {
+                    return Some(res);
+                }
+            }
+        }
+    }
+
+    // Check name / tool_name / toolName / tool / function_name / functionName / tool_type / toolType / type
     let name = val
         .get("name")
         .or_else(|| val.get("tool_name"))
         .or_else(|| val.get("toolName"))
         .or_else(|| val.get("tool"))
+        .or_else(|| val.get("function_name"))
+        .or_else(|| val.get("functionName"))
+        .or_else(|| val.get("tool_type"))
+        .or_else(|| val.get("toolType"))
+        .or_else(|| {
+            val.get("type").filter(|v| {
+                v.as_str().is_some_and(|s| {
+                    !matches!(
+                        s,
+                        "message"
+                            | "text"
+                            | "thought"
+                            | "user"
+                            | "assistant"
+                            | "ping"
+                            | "system"
+                            | "event"
+                            | "error"
+                            | "progress"
+                            | "status"
+                            | "notification"
+                            | "heartbeat"
+                    )
+                })
+            })
+        })
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     if let Some(name) = name {
-        let args = val
+        let raw_args = val
             .get("args")
             .or_else(|| val.get("arguments"))
             .or_else(|| val.get("tool_input"))
             .or_else(|| val.get("toolInput"))
             .or_else(|| val.get("input"))
             .or_else(|| val.get("parameters"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            .or_else(|| val.get("params"))
+            .or_else(|| val.get("payload"))
+            .or_else(|| val.get("data"))
+            .or_else(|| val.get("body"));
+
+        let args = match raw_args {
+            Some(serde_json::Value::String(s)) => {
+                serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+            }
+            Some(v) => v.clone(),
+            None => val.clone(),
+        };
         return Some((name, args));
     }
 
@@ -136,6 +211,9 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_path(args: &serde_json::Value) -> Option<String> {
+    if let Some(s) = args.as_str() {
+        return (s != "." && s != "..").then(|| s.to_string());
+    }
     for key in [
         "AbsolutePath",
         "absolute_path",
@@ -158,6 +236,9 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "DirectoryPath",
         "directory_path",
         "directoryPath",
+        "SearchDirectory",
+        "search_directory",
+        "searchDirectory",
         "SearchPath",
         "search_path",
         "searchPath",
@@ -165,8 +246,13 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "DocumentPath",
         "Url",
         "url",
+        "Uri",
+        "uri",
     ] {
-        if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
+        if let Some(val) = args.get(key).and_then(|v| v.as_str())
+            && val != "."
+            && val != ".."
+        {
             return Some(val.to_string());
         }
     }
@@ -174,6 +260,8 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         for val in obj.values() {
             if let Some(s) = val.as_str()
                 && (s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~'))
+                && s != "."
+                && s != ".."
             {
                 return Some(s.to_string());
             }
@@ -354,10 +442,99 @@ fn encode_response(
                     }
                 }
                 if let Some(ref path) = req.path {
-                    permission_overrides.push(format!("file({path})"));
+                    let clean_path = path.strip_prefix("file://").unwrap_or(path);
+                    let lower_path = clean_path.to_ascii_lowercase();
+                    let is_url = lower_path.starts_with("http://")
+                        || lower_path.starts_with("https://")
+                        || lower_path.starts_with("ws://")
+                        || lower_path.starts_with("wss://");
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
+                    if !is_url {
+                        permission_overrides.push(format!("file({clean_path})"));
+                    }
+                    permission_overrides.push(format!("{}({clean_path})", req.tool_name));
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("{lower_tool}({clean_path})"));
+                    }
+                    let home_trimmed = std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .ok()
+                        .map(|h| h.trim_end_matches(['/', '\\']).to_string());
+                    if !is_url && let Some(ref home) = home_trimmed {
+                        let is_tilde_home = clean_path == "~"
+                            || clean_path.starts_with("~/")
+                            || clean_path.starts_with("~\\");
+                        if is_tilde_home {
+                            let sub = if clean_path == "~" {
+                                ""
+                            } else {
+                                &clean_path[1..]
+                            };
+                            let expanded = if sub.is_empty() {
+                                home.clone()
+                            } else if home.contains('\\') {
+                                format!("{home}{}", sub.replace('/', "\\"))
+                            } else {
+                                format!("{home}{}", sub.replace('\\', "/"))
+                            };
+                            permission_overrides.push(format!("file({expanded})"));
+                            permission_overrides.push(format!("{}({expanded})", req.tool_name));
+                            if lower_tool != req.tool_name {
+                                permission_overrides.push(format!("{lower_tool}({expanded})"));
+                            }
+                            if home.contains('\\') && sub.contains('/') {
+                                let fwd_expanded = format!("{home}{sub}");
+                                if fwd_expanded != expanded {
+                                    permission_overrides.push(format!("file({fwd_expanded})"));
+                                    permission_overrides
+                                        .push(format!("{}({fwd_expanded})", req.tool_name));
+                                    if lower_tool != req.tool_name {
+                                        permission_overrides
+                                            .push(format!("{lower_tool}({fwd_expanded})"));
+                                    }
+                                }
+                            }
+                        } else {
+                            let norm_path = clean_path.replace('\\', "/");
+                            let norm_home = home.replace('\\', "/");
+                            let matches_home = if cfg!(windows) || home.contains('\\') {
+                                norm_path.eq_ignore_ascii_case(&norm_home)
+                                    || norm_path.to_ascii_lowercase().starts_with(&format!(
+                                        "{}/",
+                                        norm_home.to_ascii_lowercase()
+                                    ))
+                            } else {
+                                norm_path == norm_home
+                                    || norm_path.starts_with(&format!("{norm_home}/"))
+                            };
+                            if matches_home {
+                                let suffix = &norm_path[norm_home.len()..];
+                                let contracted = if suffix.is_empty() {
+                                    "~".to_string()
+                                } else {
+                                    format!("~{suffix}")
+                                };
+                                permission_overrides.push(format!("file({contracted})"));
+                                permission_overrides
+                                    .push(format!("{}({contracted})", req.tool_name));
+                                if lower_tool != req.tool_name {
+                                    permission_overrides
+                                        .push(format!("{lower_tool}({contracted})"));
+                                }
+                            }
+                        }
+                    }
                 }
-                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase()) {
+                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase())
+                    || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
+                {
                     permission_overrides.push(format!("tool({})", req.tool_name));
+                    permission_overrides.push(req.tool_name.clone());
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("tool({lower_tool})"));
+                        permission_overrides.push(lower_tool);
+                    }
                 }
 
                 let mut unique_overrides = Vec::with_capacity(permission_overrides.len());
@@ -477,7 +654,11 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let session_id = extract_session_id(&val);
     let cwd = extract_cwd(&val);
     let command_line = extract_command_line(&tool_args);
-    let path = extract_path(&tool_args);
+    let path = if triage_core::judge::is_command_tool(&tool_name.to_ascii_lowercase()) {
+        None
+    } else {
+        extract_path(&tool_args)
+    };
 
     let request = JudgeRequest {
         session_id,
@@ -921,6 +1102,126 @@ mod tests {
     }
 
     #[test]
+    fn permission_overrides_home_path_boundary_handling() {
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(h) => h.trim_end_matches(['/', '\\']).to_string(),
+            Err(_) => return,
+        };
+
+        // 1. Literal tilde filename in current directory (e.g. ~literal_filename.txt)
+        let req_tilde_file = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("~literal_filename.txt".to_string()),
+            cwd: None,
+        };
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rules".to_string(),
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Must NOT expand ~literal_filename.txt into /Users/...literal_filename.txt
+        let corrupt_expansion = format!("{home}literal_filename.txt");
+        assert!(!overrides.iter().any(|s| s.contains(&corrupt_expansion)));
+        assert!(overrides.contains(&"file(~literal_filename.txt)"));
+
+        // 2. Sibling user directory (e.g. /home/user_other/repo)
+        let sibling_path = format!("{home}_other/repo/file.txt");
+        let req_sibling = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(sibling_path.clone()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_sibling));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Must NOT contract to ~_other/repo/file.txt
+        assert!(!overrides.iter().any(|s| s.contains("~_other")));
+        assert!(overrides.contains(&format!("file({sibling_path})").as_str()));
+
+        // 3. Valid home directory subpaths
+        let valid_tilde = "~/repo/main.rs".to_string();
+        let req_valid = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(valid_tilde),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_valid));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let expected_expanded = format!("{home}/repo/main.rs");
+        assert!(overrides.contains(&format!("file({expected_expanded})").as_str()));
+        assert!(overrides.contains(&"file(~/repo/main.rs)"));
+
+        // 4. Exact root home directory paths
+        let req_root_home = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "list_dir".to_string(),
+            command_line: None,
+            path: Some(home.clone()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_root_home));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"file(~)"));
+        assert!(overrides.contains(&format!("file({home})").as_str()));
+        // Must NOT emit wildcard overrides for entire home or system users directory
+        assert!(!overrides.contains(&"~/*"));
+        assert!(!overrides.contains(&"file(~/*)"));
+        assert!(!overrides.contains(&format!("{home}/*").as_str()));
+        assert!(!overrides.contains(&"/Users/*"));
+        assert!(!overrides.contains(&"/home/*"));
+
+        // 5. URL arguments must not emit file() or dir/* overrides
+        let req_url = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "read_url_content".to_string(),
+            command_line: None,
+            path: Some("https://example.com/api/v1".to_string()),
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_url));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!overrides.iter().any(|s| s.starts_with("file(")));
+        assert!(!overrides.iter().any(|s| s.contains("/*")));
+    }
+
+    #[test]
     fn claude_code_response_uses_camel_case_keys() {
         let verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
@@ -1084,5 +1385,67 @@ mod tests {
         };
         let verdict = ask_daemon(req, Duration::ZERO);
         assert_eq!(verdict.decision, JudgeDecision::Allow);
+    }
+
+    #[test]
+    fn extract_tool_info_ignores_non_tool_envelope_types() {
+        let msg_payload = serde_json::json!({
+            "type": "message",
+            "content": "Hello world"
+        });
+        assert_eq!(extract_tool_info(&msg_payload), None);
+
+        let ping_payload = serde_json::json!({
+            "type": "ping"
+        });
+        assert_eq!(extract_tool_info(&ping_payload), None);
+
+        let tool_payload = serde_json::json!({
+            "type": "custom_reader",
+            "path": "file.txt"
+        });
+        assert_eq!(
+            extract_tool_info(&tool_payload),
+            Some(("custom_reader".to_string(), tool_payload.clone()))
+        );
+    }
+
+    #[test]
+    fn extract_path_extracts_dot_relative_paths_and_rejects_standalone_dots() {
+        let dot_rel = serde_json::json!({
+            "target": "./src/main.rs"
+        });
+        assert_eq!(extract_path(&dot_rel), Some("./src/main.rs".to_string()));
+
+        let parent_rel = serde_json::json!({
+            "file": "../Cargo.toml"
+        });
+        assert_eq!(extract_path(&parent_rel), Some("../Cargo.toml".to_string()));
+
+        let dot_file = serde_json::json!({
+            "item": ".env"
+        });
+        assert_eq!(extract_path(&dot_file), Some(".env".to_string()));
+
+        let single_dot = serde_json::json!({
+            "item": "."
+        });
+        assert_eq!(extract_path(&single_dot), None);
+
+        let double_dot = serde_json::json!({
+            "item": ".."
+        });
+        assert_eq!(extract_path(&double_dot), None);
+
+        let str_dot = serde_json::json!(".");
+        assert_eq!(extract_path(&str_dot), None);
+
+        let str_dot_dot = serde_json::json!("..");
+        assert_eq!(extract_path(&str_dot_dot), None);
+
+        let named_dot = serde_json::json!({
+            "path": "."
+        });
+        assert_eq!(extract_path(&named_dot), None);
     }
 }
