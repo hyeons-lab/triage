@@ -52,6 +52,27 @@ void main() {
       // Ensure the only terminating \\x1b[201~ is at the very end
       expect(formatted.indexOf('\x1b[201~'), formatted.length - '\x1b[201~'.length);
     });
+
+    test('strips 8-bit C1 escape injection sequence \\x9b201~ from payload', () {
+      const maliciousC1 = 'echo "safe"\x9b201~rm -rf /\x9b200~echo "more"';
+      final formatted = formatPasteInput(maliciousC1, true);
+      expect(
+        formatted,
+        '\x1b[200~echo "safe"rm -rf /\x9b200~echo "more"\x1b[201~',
+      );
+      expect(formatted.contains('\x9b201~'), isFalse);
+    });
+
+    test('strips combined 7-bit and 8-bit C1 injection sequences', () {
+      const mixed = 'line1\x1b[201~injected1\x9b201~injected2\x1b[201~line2';
+      final formatted = formatPasteInput(mixed, true);
+      expect(
+        formatted,
+        '\x1b[200~line1injected1injected2line2\x1b[201~',
+      );
+      expect(formatted.indexOf('\x1b[201~'), formatted.length - '\x1b[201~'.length);
+      expect(formatted.contains('\x9b201~'), isFalse);
+    });
   });
 
   group('SessionVm bracketed paste state', () {

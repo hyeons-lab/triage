@@ -26,11 +26,18 @@ Multi-line paste in terminal sessions (shells, REPLs, agent CLI tools like Claud
 - When bracketed paste mode is active on a session, paste operations wrap the clipboard text in `\x1b[200~` and `\x1b[201~`, stripping any embedded `\x1b[201~` to prevent escape injection attacks.
 - If bracketed paste mode is disabled, pasted text is passed verbatim as raw text.
 
+2026-08-24T13:45-0700 Terminal chord disambiguation and defense-in-depth sanitization:
+- On Linux/Windows, capture `Ctrl+Shift+V` and `Shift+Insert` for paste while allowing unshifted `Ctrl+V` to pass through as `0x16` (SYN / LNEXT / Vim visual block mode).
+- Strip 8-bit C1 escape terminator `\x9b201~` alongside standard 7-bit `\x1b[201~` to prevent paste injection on 8-bit terminals.
+- Guard asynchronous clipboard retrieval with `mounted` check and exception handling.
+
 ## Commits
 
-- HEAD — fix(terminal): support bracketed paste mode in flutter web and native clients
+- ec6c300 — fix(terminal): support bracketed paste mode in flutter web and native clients
+- HEAD — fix(terminal): address pr review comments for mounted safety, c1 escapes, and linux paste chords
 
 ## Progress
 
 - 2026-08-24T02:25-0700 Created branch worktree `worktrees/fix-bracketed-paste` and devlog plan.
 - 2026-08-24T02:32-0700 Implemented bracketed paste support across web and native Flutter views, synchronized snapshot state, added platform paste chords, and verified all 276 Rust tests and 351 Dart tests pass cleanly.
+- 2026-08-24T13:45-0700 Addressed PR #148 review comments: added mounted safety check across async clipboard fetch, disambiguated Linux/Windows paste chords (`Ctrl+Shift+V`/`Shift+Insert`) from `Ctrl+V`, added C1 `\x9b201~` sanitization, added unit tests, and updated review refinements.

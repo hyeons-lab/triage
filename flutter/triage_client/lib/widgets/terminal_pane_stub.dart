@@ -1017,7 +1017,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   // The platform paste chord, matching terminal emulator conventions across
-  // platforms: Cmd+V on macOS/iOS, Ctrl+Shift+V / Ctrl+V / Shift+Insert elsewhere.
+  // platforms: Cmd+V on macOS/iOS, Ctrl+Shift+V / Shift+Insert elsewhere so plain
+  // Ctrl+V (0x16 / LNEXT / Vim visual block) still reaches the program.
   bool _isPasteChord(KeyEvent event) {
     final keys = HardwareKeyboard.instance;
     // Shift+Insert (Universal across Linux/Windows/X11)
@@ -1041,20 +1042,26 @@ class _TerminalPaneState extends State<TerminalPane> {
             !keys.isAltPressed &&
             !keys.isShiftPressed;
       default:
-        // Linux / Windows: Ctrl+Shift+V or Ctrl+V
+        // Linux / Windows: Ctrl+Shift+V
         return keys.isControlPressed &&
+            keys.isShiftPressed &&
             !keys.isMetaPressed &&
             !keys.isAltPressed;
     }
   }
 
   Future<void> _pasteFromClipboard() async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final text = data?.text;
-    if (text != null && text.isNotEmpty) {
-      final formatted = formatPasteInput(text, _terminal.bracketedPasteMode);
-      widget.controller.sendInput(formatted);
-      _xtermController.clearSelection();
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      if (!mounted) return;
+      final text = data?.text;
+      if (text != null && text.isNotEmpty) {
+        final formatted = formatPasteInput(text, _terminal.bracketedPasteMode);
+        widget.controller.sendInput(formatted);
+        _xtermController.clearSelection();
+      }
+    } catch (e) {
+      debugPrint('TerminalPane: failed to read clipboard on paste: $e');
     }
   }
 
