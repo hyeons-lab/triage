@@ -339,7 +339,8 @@ class _TerminalPaneState extends State<TerminalPane> {
                 debugPrint('Terminal copy failed: $error');
               });
             }
-          } else if ((event.ctrlKey || event.metaKey) && event.key == 'v') {
+          } else if ((event.ctrlKey || event.metaKey) &&
+              (event.key == 'v' || event.key == 'V')) {
             // Deliberately not handled here: paste is left to the browser.
             //
             // Calling `preventDefault` on this keydown is what suppresses the
@@ -798,6 +799,18 @@ class _TerminalPaneState extends State<TerminalPane> {
     _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
   }
 
+  void _syncInitialBracketedPasteMode() {
+    try {
+      final isEnabled = widget.terminal?.bracketedPasteMode ?? false;
+      if (_term != null && isEnabled) {
+        final modes = js_util.getProperty(_term, 'modes');
+        if (modes != null) {
+          js_util.setProperty(modes, 'bracketedPasteMode', isEnabled);
+        }
+      }
+    } catch (_) {}
+  }
+
   bool _isBracketedPasteEnabled() {
     try {
       if (_term != null) {
@@ -827,6 +840,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// or Tab handling of its own while `dispose` still tried to take those
   /// listeners off, throwing before the rest of the teardown could run.
   void _bindContainerEvents() {
+    _syncInitialBracketedPasteMode();
     _containerEventOwners[_sanitizedId]?._unbindContainerEvents();
     _containerEventOwners[_sanitizedId] = this;
     _containerMouseDownSubscription = _container.onMouseDown.listen((event) {

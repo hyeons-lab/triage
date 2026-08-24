@@ -42,6 +42,22 @@ void main() {
       );
     });
 
+    test('preserves lone CR and mixed line endings within multi-line paste when enabled', () {
+      const mixedText = 'line1\rline2\nline3\r\nline4';
+      expect(
+        formatPasteInput(mixedText, true),
+        '\x1b[200~$mixedText\x1b[201~',
+      );
+    });
+
+    test('wraps whitespace-only string when enabled', () {
+      const whitespace = '   \t  \n  ';
+      expect(
+        formatPasteInput(whitespace, true),
+        '\x1b[200~$whitespace\x1b[201~',
+      );
+    });
+
     test('strips embedded escape injection sequence \\x1b[201~ from payload', () {
       const malicious = 'echo "safe"\x1b[201~rm -rf /\x1b[200~echo "more"';
       final formatted = formatPasteInput(malicious, true);
@@ -95,6 +111,21 @@ void main() {
       session.setBracketedPasteEnabled(false);
       expect(session.bracketedPasteEnabled, isFalse);
       expect(session.terminal.bracketedPasteMode, isFalse);
+    });
+
+    test('SessionVm with distinct title and sessionId synchronizes without errors', () {
+      final session = SessionVm(
+        title: 'triage / 01952e43-8472-7633-8a03-68e7b1a13fa4',
+        sessionId: '01952e43-8472-7633-8a03-68e7b1a13fa4',
+        status: 'attached',
+        statusColor: const Color(0xff7fd1c7),
+        icon: Icons.terminal,
+        rows: [],
+      );
+
+      session.setBracketedPasteEnabled(true);
+      expect(session.bracketedPasteEnabled, isTrue);
+      expect(session.terminal.bracketedPasteMode, isTrue);
     });
 
     test('TerminalPane.setBracketedPasteMode static handler is safe to call', () {

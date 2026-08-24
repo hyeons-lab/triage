@@ -105,6 +105,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // control code in _onTerminalOutput, then disarmed. Mirrors how a physical
   // Ctrl key would combine with the following keystroke.
   bool _ctrlArmed = false;
+  bool _isPasting = false;
 
   // The selection the floating Copy button is offering (mobile only), or null
   // when there is none. Not a visibility flag: it stays set while the button is
@@ -833,7 +834,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_copySelectionToClipboard()) return KeyEventResult.handled;
     }
     if (_isPasteChord(event)) {
-      _pasteFromClipboard();
+      unawaited(_pasteFromClipboard());
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
@@ -996,9 +997,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     );
   }
 
-  // The platform copy chord, matching xterm's defaultTerminalShortcuts so plain
-  // Ctrl+C still reaches the program as SIGINT: meta-only on Apple platforms,
-  // control+shift elsewhere.
+  // The platform copy chord, matching terminal emulator conventions: Cmd+C on
+  // macOS/iOS, Ctrl+Shift+C elsewhere so plain Ctrl+C still reaches the program.
   bool _isCopyChord() {
     final keys = HardwareKeyboard.instance;
     switch (defaultTargetPlatform) {
@@ -1041,6 +1041,9 @@ class _TerminalPaneState extends State<TerminalPane> {
             !keys.isControlPressed &&
             !keys.isAltPressed &&
             !keys.isShiftPressed;
+      case TargetPlatform.android:
+        return (keys.isControlPressed || keys.isMetaPressed) &&
+            !keys.isAltPressed;
       default:
         // Linux / Windows: Ctrl+Shift+V
         return keys.isControlPressed &&
@@ -1051,6 +1054,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   Future<void> _pasteFromClipboard() async {
+    if (_isPasting) return;
+    _isPasting = true;
     try {
       final data = await Clipboard.getData(Clipboard.kTextPlain);
       if (!mounted) return;
@@ -1062,6 +1067,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     } catch (e) {
       debugPrint('TerminalPane: failed to read clipboard on paste: $e');
+    } finally {
+      _isPasting = false;
     }
   }
 
