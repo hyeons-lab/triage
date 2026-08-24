@@ -36,11 +36,17 @@ Multi-line paste in terminal sessions (shells, REPLs, agent CLI tools like Claud
 - Compiled `_pasteEscapeInjectionPattern` regex in `formatPasteInput` and added `.contains()` fast-path.
 - Added `_isPasting` serialization lock and `unawaited` in native paste key handler, plus Android `Ctrl+V`/`Meta+V` paste chords.
 
+2026-08-24T15:29-0700 DOM re-binding reset and KeyRepeat event handling:
+- Unconditionally synchronized `bracketedPasteMode` in `_syncInitialBracketedPasteMode` on Web DOM container re-binding so switching to sessions with bracketed paste disabled cleanly resets the state.
+- Allowed `KeyRepeatEvent` alongside `KeyDownEvent` in native key handler so held paste chords execute reliably.
+- Eliminated redundant regex capture group in `_pasteEscapeInjectionPattern`.
+
 ## Commits
 
 - ec6c300 — fix(terminal): support bracketed paste mode in flutter web and native clients
 - 046553c — fix(terminal): address pr review comments for mounted safety, c1 escapes, and linux paste chords
-- HEAD — fix(terminal): address review refinements for web terminal key routing and regex optimization
+- 5864582 — fix(terminal): address review refinements for web terminal key routing and regex optimization
+- HEAD — fix(terminal): address review comments for dom mode reset and keyrepeat handling
 
 ## Progress
 
@@ -48,3 +54,4 @@ Multi-line paste in terminal sessions (shells, REPLs, agent CLI tools like Claud
 - 2026-08-24T02:32-0700 Implemented bracketed paste support across web and native Flutter views, synchronized snapshot state, added platform paste chords, and verified all 276 Rust tests and 351 Dart tests pass cleanly.
 - 2026-08-24T13:45-0700 Addressed PR #148 review comments: added mounted safety check across async clipboard fetch, disambiguated Linux/Windows paste chords (`Ctrl+Shift+V`/`Shift+Insert`) from `Ctrl+V`, added C1 `\x9b201~` sanitization, added unit tests, and updated review refinements.
 - 2026-08-24T13:56-0700 Addressed local and CI review refinements: fixed web terminal title key routing, synchronized initial mode on late terminal mount, handled uppercase V on web keydown, optimized regex in formatPasteInput, added paste concurrency latch, and verified all 276 Rust and 356 Dart tests pass cleanly.
+- 2026-08-24T15:29-0700 Addressed CI review feedback: unconditionally reset DOM bracketed paste mode on session re-binding, handled KeyRepeatEvent for native paste chords, simplified regex pattern, and verified all 276 Rust and 356 Dart tests pass cleanly.

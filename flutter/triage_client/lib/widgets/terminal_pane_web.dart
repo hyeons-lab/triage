@@ -802,7 +802,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _syncInitialBracketedPasteMode() {
     try {
       final isEnabled = widget.terminal?.bracketedPasteMode ?? false;
-      if (_term != null && isEnabled) {
+      if (_term != null) {
         final modes = js_util.getProperty(_term, 'modes');
         if (modes != null) {
           js_util.setProperty(modes, 'bracketedPasteMode', isEnabled);

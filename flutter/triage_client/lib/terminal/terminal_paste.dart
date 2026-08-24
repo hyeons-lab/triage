@@ -1,6 +1,6 @@
 /// Terminal paste utilities and bracketed paste formatting.
 
-final _pasteEscapeInjectionPattern = RegExp(r'(\x1b\[201~|\x9b201~)');
+final _pasteEscapeInjectionPattern = RegExp(r'\x1b\[201~|\x9b201~');
 
 /// Formats text for insertion into a terminal session as a paste operation.
 ///

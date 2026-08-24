@@ -12,6 +12,7 @@ import 'package:flutter/services.dart'
         HardwareKeyboard,
         KeyDownEvent,
         KeyEvent,
+        KeyRepeatEvent,
         LogicalKeyboardKey;
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -828,7 +829,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   // leaves xterm's normal key handling — including Ctrl+C -> SIGINT — untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
     if (ModalRoute.of(context)?.isCurrent == false) return KeyEventResult.ignored;
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
     if (event.logicalKey == LogicalKeyboardKey.keyC && _isCopyChord()) {
       // Nothing selected (or nothing in it) leaves xterm's own handling in place.
       if (_copySelectionToClipboard()) return KeyEventResult.handled;
