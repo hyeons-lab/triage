@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
+import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
 
@@ -46,6 +47,19 @@ class TerminalPane extends StatefulWidget {
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     _TerminalPaneState._discardCachedSession(sanitizedId);
+  }
+
+  static void setBracketedPasteMode(String terminalId, bool enabled) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final term = _TerminalPaneState._sessionTerms[sanitizedId];
+    if (term != null) {
+      try {
+        final modes = js_util.getProperty(term, 'modes');
+        if (modes != null) {
+          js_util.setProperty(modes, 'bracketedPasteMode', enabled);
+        }
+      } catch (_) {}
+    }
   }
 
   @override
@@ -784,6 +798,26 @@ class _TerminalPaneState extends State<TerminalPane> {
     _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
   }
 
+  bool _isBracketedPasteEnabled() {
+    try {
+      if (_term != null) {
+        final modes = js_util.getProperty(_term, 'modes');
+        if (modes != null) {
+          final val = js_util.getProperty(modes, 'bracketedPasteMode');
+          if (val == true) return true;
+        }
+      }
+    } catch (_) {}
+    try {
+      final dynTerm = widget.terminal;
+      if (dynTerm != null) {
+        final val = js_util.getProperty(dynTerm, 'bracketedPasteMode');
+        if (val == true) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
   /// Attaches this pane's listeners to [_container], taking off whatever the
   /// previous owner of that container left behind.
   ///
@@ -831,7 +865,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         final clipboardData = event.clipboardData;
         final text = clipboardData?.getData('text/plain') ?? '';
         if (text.isNotEmpty) {
-          _sendInput(text);
+          final isBracketed = _isBracketedPasteEnabled();
+          _sendInput(formatPasteInput(text, isBracketed));
         }
       }
     }

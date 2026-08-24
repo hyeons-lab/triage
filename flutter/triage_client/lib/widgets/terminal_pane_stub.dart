@@ -17,6 +17,7 @@ import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
+import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
@@ -58,6 +59,10 @@ class TerminalPane extends StatefulWidget {
 
   static void destroySession(String terminalId) {
     // Native implementation doesn't cache session DOM nodes.
+  }
+
+  static void setBracketedPasteMode(String terminalId, bool enabled) {
+    // Native uses widget.terminal.setBracketedPasteMode directly.
   }
 
   @override
@@ -823,13 +828,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
     if (ModalRoute.of(context)?.isCurrent == false) return KeyEventResult.ignored;
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    if (event.logicalKey != LogicalKeyboardKey.keyC) {
-      return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.keyC && _isCopyChord()) {
+      // Nothing selected (or nothing in it) leaves xterm's own handling in place.
+      if (_copySelectionToClipboard()) return KeyEventResult.handled;
     }
-    if (!_isCopyChord()) return KeyEventResult.ignored;
-    // Nothing selected (or nothing in it) leaves xterm's own handling in place.
-    if (!_copySelectionToClipboard()) return KeyEventResult.ignored;
-    return KeyEventResult.handled;
+    if (_isPasteChord(event)) {
+      _pasteFromClipboard();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
   }
 
   // Track what the floating Copy button should offer. The collapsed check is
@@ -1006,6 +1013,48 @@ class _TerminalPaneState extends State<TerminalPane> {
             keys.isShiftPressed &&
             !keys.isMetaPressed &&
             !keys.isAltPressed;
+    }
+  }
+
+  // The platform paste chord, matching terminal emulator conventions across
+  // platforms: Cmd+V on macOS/iOS, Ctrl+Shift+V / Ctrl+V / Shift+Insert elsewhere.
+  bool _isPasteChord(KeyEvent event) {
+    final keys = HardwareKeyboard.instance;
+    // Shift+Insert (Universal across Linux/Windows/X11)
+    if (event.logicalKey == LogicalKeyboardKey.insert &&
+        keys.isShiftPressed &&
+        !keys.isControlPressed &&
+        !keys.isMetaPressed &&
+        !keys.isAltPressed) {
+      return true;
+    }
+
+    if (event.logicalKey != LogicalKeyboardKey.keyV) {
+      return false;
+    }
+
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.macOS:
+      case TargetPlatform.iOS:
+        return keys.isMetaPressed &&
+            !keys.isControlPressed &&
+            !keys.isAltPressed &&
+            !keys.isShiftPressed;
+      default:
+        // Linux / Windows: Ctrl+Shift+V or Ctrl+V
+        return keys.isControlPressed &&
+            !keys.isMetaPressed &&
+            !keys.isAltPressed;
+    }
+  }
+
+  Future<void> _pasteFromClipboard() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text;
+    if (text != null && text.isNotEmpty) {
+      final formatted = formatPasteInput(text, _terminal.bracketedPasteMode);
+      widget.controller.sendInput(formatted);
+      _xtermController.clearSelection();
     }
   }
 
