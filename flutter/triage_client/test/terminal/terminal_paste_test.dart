@@ -11,11 +11,19 @@ void main() {
       expect(formatPasteInput('', false), '');
     });
 
-    test('returns verbatim string when bracketed paste is disabled', () {
+    test('normalizes CRLF and bare LF to CR when bracketed paste is disabled', () {
       expect(formatPasteInput('hello world', false), 'hello world');
       expect(
         formatPasteInput('line1\nline2\r\nline3', false),
-        'line1\nline2\r\nline3',
+        'line1\rline2\rline3',
+      );
+    });
+
+    test('preserves Unicode grapheme clusters and emojis with ZWJ when formatted', () {
+      const emojiText = '👨‍👩‍👧‍👦 Hello 世界 🚀\n';
+      expect(
+        formatPasteInput(emojiText, true),
+        '\x1b[200~$emojiText\x1b[201~',
       );
     });
 

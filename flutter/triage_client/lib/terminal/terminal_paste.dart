@@ -9,10 +9,15 @@ final _pasteEscapeInjectionPattern = RegExp(r'\x1b\[201~|\x9b201~');
 /// inside [text] is stripped to prevent premature termination of bracketed paste mode
 /// (paste injection defense).
 ///
-/// When [bracketedPasteEnabled] is false, the text is returned verbatim.
+/// When [bracketedPasteEnabled] is false, newlines (`\r\n` and `\n`) are normalized to
+/// carriage return `\r` (0x0D) so the terminal PTY line discipline translates them
+/// correctly without staircasing.
 String formatPasteInput(String text, bool bracketedPasteEnabled) {
-  if (!bracketedPasteEnabled || text.isEmpty) {
+  if (text.isEmpty) {
     return text;
+  }
+  if (!bracketedPasteEnabled) {
+    return text.replaceAll('\r\n', '\r').replaceAll('\n', '\r');
   }
   final sanitized = text.contains('\x1b[201~') || text.contains('\x9b201~')
       ? text.replaceAll(_pasteEscapeInjectionPattern, '')

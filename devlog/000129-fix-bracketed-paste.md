@@ -41,12 +41,17 @@ Multi-line paste in terminal sessions (shells, REPLs, agent CLI tools like Claud
 - Allowed `KeyRepeatEvent` alongside `KeyDownEvent` in native key handler so held paste chords execute reliably.
 - Eliminated redundant regex capture group in `_pasteEscapeInjectionPattern`.
 
+2026-08-24T17:55-0700 Unbracketed paste newline normalization and Windows paste chord:
+- Normalized CRLF and bare LF to CR (`\r`) in `formatPasteInput` when bracketed paste is disabled so the PTY line discipline translates line endings correctly without staircasing.
+- Added `TargetPlatform.windows` to `_isPasteChord` in `terminal_pane_stub.dart` supporting standard `Ctrl+V`.
+
 ## Commits
 
 - ec6c300 — fix(terminal): support bracketed paste mode in flutter web and native clients
 - 046553c — fix(terminal): address pr review comments for mounted safety, c1 escapes, and linux paste chords
 - 5864582 — fix(terminal): address review refinements for web terminal key routing and regex optimization
-- HEAD — fix(terminal): address review comments for dom mode reset and keyrepeat handling
+- 20db49d — fix(terminal): address review comments for dom mode reset and keyrepeat handling
+- HEAD — fix(terminal): normalize unbracketed paste newlines to cr and support windows ctrl+v
 
 ## Progress
 
@@ -55,3 +60,4 @@ Multi-line paste in terminal sessions (shells, REPLs, agent CLI tools like Claud
 - 2026-08-24T13:45-0700 Addressed PR #148 review comments: added mounted safety check across async clipboard fetch, disambiguated Linux/Windows paste chords (`Ctrl+Shift+V`/`Shift+Insert`) from `Ctrl+V`, added C1 `\x9b201~` sanitization, added unit tests, and updated review refinements.
 - 2026-08-24T13:56-0700 Addressed local and CI review refinements: fixed web terminal title key routing, synchronized initial mode on late terminal mount, handled uppercase V on web keydown, optimized regex in formatPasteInput, added paste concurrency latch, and verified all 276 Rust and 356 Dart tests pass cleanly.
 - 2026-08-24T15:29-0700 Addressed CI review feedback: unconditionally reset DOM bracketed paste mode on session re-binding, handled KeyRepeatEvent for native paste chords, simplified regex pattern, and verified all 276 Rust and 356 Dart tests pass cleanly.
+- 2026-08-24T17:55-0700 Addressed CI review feedback: normalized unbracketed paste newlines to CR, supported Windows Ctrl+V paste chord, added Unicode grapheme tests, and verified all 276 Rust and 357 Dart tests pass cleanly.

@@ -1047,8 +1047,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       case TargetPlatform.android:
         return (keys.isControlPressed || keys.isMetaPressed) &&
             !keys.isAltPressed;
+      case TargetPlatform.windows:
+        return keys.isControlPressed &&
+            !keys.isMetaPressed &&
+            !keys.isAltPressed;
       default:
-        // Linux / Windows: Ctrl+Shift+V
+        // Linux / BSD: Ctrl+Shift+V
         return keys.isControlPressed &&
             keys.isShiftPressed &&
             !keys.isMetaPressed &&
