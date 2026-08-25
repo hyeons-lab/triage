@@ -430,6 +430,20 @@ class SessionVm {
   /// Effective auto-approval judge policy (true = auto-approval enabled, false = manual approval).
   bool judgePolicyEffective = true;
 
+  /// Whether DEC Mode 2004 (bracketed paste) is enabled by the active shell/application.
+  bool bracketedPasteEnabled = false;
+
+  void setBracketedPasteEnabled(bool enabled) {
+    bracketedPasteEnabled = enabled;
+    try {
+      terminal.setBracketedPasteMode(enabled);
+    } catch (_) {}
+    TerminalPane.setBracketedPasteMode(title, enabled);
+    if (sessionId != null && sessionId != title) {
+      TerminalPane.setBracketedPasteMode(sessionId!, enabled);
+    }
+  }
+
   void applyJudgePolicy({
     required bool? explicit,
     required bool effective,
@@ -2833,6 +2847,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
       session.snippetDetail = snapshot?['snippet_detail'] as String?;
+      final bracketedPaste =
+          snapshot?['bracketed_paste_enabled'] as bool? ?? false;
+      session.setBracketedPasteEnabled(bracketedPaste);
       // Replay the raw output-history tail through the single write path. Live
       // chunks already covered by this snapshot are dropped by output_seq.
       session.applyHistory(
@@ -3174,6 +3191,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // lossy styled-row reconstruction. The store clears and re-emulates, then
     // resumes live (de-duplicating by output_seq).
     session.applyHistory(rawOutput, throughOutputSeq: snapshotOutputSeq);
+    final bracketedPaste =
+        snapshot['bracketed_paste_enabled'] as bool? ?? false;
+    session.setBracketedPasteEnabled(bracketedPaste);
 
     setState(() {
       // Plain mirror for the test fallback view only; not used for real render.
@@ -3598,6 +3618,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           );
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
+          final bracketedPaste =
+              snapshot?['bracketed_paste_enabled'] as bool? ?? false;
+          session.setBracketedPasteEnabled(bracketedPaste);
           _setupSessionInputListener(session);
           session.applyHistory(
             _rawOutputFromSnapshot(snapshot ?? const {}),
