@@ -50,6 +50,7 @@ void main() {
     await tapKey(tester, '◀');
     await tapKey(tester, '▶');
     await tapKey(tester, '^C');
+    await tapKey(tester, '^K');
     await tapKey(tester, '/');
     await tapKey(tester, '|');
     await tapKey(tester, '-');
@@ -65,6 +66,7 @@ void main() {
       '\x1b[D',
       '\x1b[C',
       '\x03',
+      '\x0b',
       '/',
       '|',
       '-',

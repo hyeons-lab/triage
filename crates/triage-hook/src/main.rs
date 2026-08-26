@@ -617,7 +617,7 @@ fn encode_response(
     request: Option<&JudgeRequest>,
 ) -> String {
     let decision_str = verdict.decision.as_hook_str();
-    let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Allow {
+    let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Ask {
         request
             .map(compute_permission_overrides)
             .unwrap_or_default()
@@ -630,15 +630,30 @@ fn encode_response(
             #[derive(serde::Serialize)]
             struct AntigravityResponse<'a> {
                 decision: &'a str,
-                #[serde(skip_serializing_if = "str::is_empty")]
-                reason: &'a str,
-                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: &'a Vec<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                reason: Option<&'a str>,
+                #[serde(
+                    rename = "permissionOverrides",
+                    skip_serializing_if = "Option::is_none"
+                )]
+                permission_overrides: Option<&'a Vec<String>>,
             }
+            let reason = if verdict.decision != triage_core::judge::JudgeDecision::Allow
+                && !verdict.reason.is_empty()
+            {
+                Some(verdict.reason.as_str())
+            } else {
+                None
+            };
+            let overrides = if !permission_overrides.is_empty() {
+                Some(&permission_overrides)
+            } else {
+                None
+            };
             serde_json::to_string(&AntigravityResponse {
                 decision: decision_str,
-                reason: &verdict.reason,
-                permission_overrides: &permission_overrides,
+                reason,
+                permission_overrides: overrides,
             })
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
@@ -962,10 +977,18 @@ mod tests {
 
     #[test]
     fn response_serializes_to_the_agy_contract() {
-        let verdict = JudgeVerdict {
+        let allow_verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
+        };
+        let allow_encoded = encode_response(AgentFormat::Antigravity, &allow_verdict, None);
+        assert_eq!(allow_encoded, r#"{"decision":"allow"}"#);
+
+        let ask_verdict = JudgeVerdict {
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "command requires confirmation".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::new("123").unwrap(),
@@ -974,10 +997,10 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
+        let encoded = encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        assert_eq!(val["reason"], "matched allow rule: ls");
+        assert_eq!(val["decision"], "ask");
+        assert_eq!(val["reason"], "command requires confirmation");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -995,9 +1018,9 @@ mod tests {
     #[test]
     fn permission_overrides_for_git_commands_with_global_flags_emit_bare_and_subcommand_tokens() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: git diff".to_string(),
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::default(),
@@ -1008,7 +1031,7 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
+        assert_eq!(val["decision"], "ask");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1027,9 +1050,9 @@ mod tests {
     #[test]
     fn permission_overrides_for_gradlew_commands_emit_stripped_and_base_tokens() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: ./gradlew".to_string(),
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::default(),
@@ -1040,7 +1063,7 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
+        assert_eq!(val["decision"], "ask");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1245,9 +1268,9 @@ mod tests {
             cwd: None,
         };
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rules".to_string(),
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -1288,9 +1311,9 @@ mod tests {
             cwd: None,
         };
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rules".to_string(),
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();

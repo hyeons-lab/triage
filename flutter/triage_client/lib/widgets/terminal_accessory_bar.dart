@@ -50,6 +50,7 @@ class TerminalAccessoryBar extends StatelessWidget {
             _key('◀', () => onSend('\x1b[D')),
             _key('▶', () => onSend('\x1b[C')),
             _key('^C', () => onSend('\x03')),
+            _key('^K', () => onSend('\x0b')),
             _key('/', () => onSend('/')),
             _key('|', () => onSend('|')),
             _key('-', () => onSend('-')),

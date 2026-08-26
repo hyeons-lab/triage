@@ -20,6 +20,7 @@
 - **2026-08-26T01:39-0700** Added `./` path prefix stripping and program base override emission (`./gradlew ktfmtFormat` -> `gradlew ktfmtFormat`, `./gradlew`, `gradlew`) in `crates/triage-hook/src/main.rs`, ensuring relative executable scripts match permission overrides regardless of whether the agent matches against the full relative path or the base binary.
 - **2026-08-26T01:43-0700** Fixed agent format detection in `crates/triage-hook/src/main.rs` to default to strict `Antigravity` format (emitting top-level `decision` and `permissionOverrides` without unknown `hookSpecificOutput` fields) unless explicitly in a Claude Code environment (`CLAUDE_CODE_VERSION` / `CLAUDE_PROJECT_DIR` / `--format=claude`).
 - **2026-08-26T01:51-0700** Cleaned `permissionOverrides` serialization in `crates/triage-hook/src/main.rs` to emit single camelCase `permissionOverrides` field, resolving `protojson` duplicate field deserialization errors.
+- **2026-08-26T10:20-0700** Added `^K` (`Ctrl+K`, `\x0b`) shortcut key to the on-screen accessory keyboard bar in `flutter/triage_client/lib/widgets/terminal_accessory_bar.dart` and added `codesign -s` / `codesign --sign` to `BUILTIN_ALLOW_COMMANDS` in `crates/triage-core/src/judge_rules.rs`.
 
 ## Decisions
 
@@ -30,6 +31,7 @@
 - **Positional CLI Subcommand Matching**: Replaced naive array index matching with `extract_positional_tokens` so global flags (e.g. `--locked`, `--offline`, `-C <dir>`, `--repo <repo>`, `-d <device>`, `--silent`) inserted between CLI executables and their subcommands match their intended allow rules without fragility.
 - **Relative Path Prefix Stripping**: Handled `./` path stripping in `add_command_override` to emit both `./script.sh` and `script.sh` permission tokens, allowing runners to match against either form seamlessly.
 - **Strict Antigravity Response Schema**: Preserved clean `AntigravityResponse` schema (`decision` + `permissionOverrides`) to prevent protojson deserialization failures from extraneous fields.
+- **Accessory Bar Quick Actions**: Added dedicated `^K` key next to `^C` on the mobile/touch accessory bar to enable quick subagent approval without requiring modifier chords.
 
 ## Commits
 
@@ -43,4 +45,5 @@
 - 7928ae4 — fix(hook): emit self and subagent colon prefixes for allowed command tokens
 - 4c7a994 — fix(hook): emit path-stripped and program base overrides for relative executable paths
 - a635ebc — fix(hook): preserve strict Antigravity response schema and prevent misclassification
-- HEAD — fix(hook): prevent duplicate protojson field in permission override response serialization
+- c7db8bc — fix(hook): prevent duplicate protojson field in permission override response serialization
+- HEAD — feat(client,judge): add ctrl+k shortcut key to accessory bar and ad-hoc codesign to allowlist

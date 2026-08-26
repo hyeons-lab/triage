@@ -171,6 +171,8 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "codesign --verify",
     "codesign -d",
     "codesign --display",
+    "codesign -s",
+    "codesign --sign",
     "triaged reload",
     "triaged --handover",
     // Read-only and routine git operations.
