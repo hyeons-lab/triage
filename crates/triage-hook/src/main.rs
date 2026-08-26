@@ -404,28 +404,30 @@ fn encode_response(
                 && let Some(req) = request
             {
                 if let Some(ref cmd) = req.command_line {
-                    let mut tool_prefixes = vec![
-                        "command".to_string(),
-                        "Bash".to_string(),
-                        "bash".to_string(),
-                        "run_command".to_string(),
-                        "runcommand".to_string(),
-                        "self:Bash".to_string(),
-                        "self:bash".to_string(),
-                        "self:run_command".to_string(),
-                        "self:runcommand".to_string(),
-                        "self:command".to_string(),
-                        "self".to_string(),
-                        "subagent:Bash".to_string(),
-                        "subagent:run_command".to_string(),
-                        "subagent:command".to_string(),
+                    const STATIC_TOOL_PREFIXES: &[&str] = &[
+                        "command",
+                        "Bash",
+                        "bash",
+                        "run_command",
+                        "runcommand",
+                        "self:Bash",
+                        "self:bash",
+                        "self:run_command",
+                        "self:runcommand",
+                        "self:command",
+                        "self",
+                        "subagent:Bash",
+                        "subagent:run_command",
+                        "subagent:command",
                     ];
-                    if !tool_prefixes.contains(&req.tool_name) {
-                        tool_prefixes.push(req.tool_name.clone());
+
+                    let mut tool_prefixes: Vec<&str> = STATIC_TOOL_PREFIXES.to_vec();
+                    if !tool_prefixes.contains(&req.tool_name.as_str()) {
+                        tool_prefixes.push(&req.tool_name);
                     }
                     let lower_tool = req.tool_name.to_ascii_lowercase();
-                    if !tool_prefixes.contains(&lower_tool) {
-                        tool_prefixes.push(lower_tool);
+                    if !tool_prefixes.contains(&lower_tool.as_str()) {
+                        tool_prefixes.push(&lower_tool);
                     }
 
                     let mut add_command_override = |cmd_str: &str| {
@@ -570,13 +572,8 @@ fn encode_response(
                     }
                 }
 
-                let mut unique_overrides = Vec::with_capacity(permission_overrides.len());
-                for item in permission_overrides {
-                    if !unique_overrides.contains(&item) {
-                        unique_overrides.push(item);
-                    }
-                }
-                permission_overrides = unique_overrides;
+                let mut seen = std::collections::HashSet::new();
+                permission_overrides.retain(|item| seen.insert(item.clone()));
             }
 
             #[derive(serde::Serialize)]

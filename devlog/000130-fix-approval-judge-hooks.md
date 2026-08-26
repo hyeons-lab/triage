@@ -12,6 +12,7 @@
 - **2026-08-26T00:11-0700** Added unit tests in `triage-core` and `triage-hook` validating tool recognition, Gradle execution with environment variables, and multi-prefix permission override serialization.
 - **2026-08-26T00:13-0700** Rebuilt and installed release binaries via `scripts/install.sh`, successfully reloaded live daemon with zero downtime preserving 31 active sessions.
 - **2026-08-26T00:22-0700** Added subagent-scoped permission override prefixes (`self:Bash`, `self:run_command`, `subagent:Bash`, `self`, etc.) in `crates/triage-hook/src/main.rs` so subagents invoked via `invoke_subagent(TypeName="self")` match permission overrides without prompting.
+- **2026-08-26T00:35-0700** Addressed PR review refinements: added plural/inverted aliases (`manage_tasks`, `managetasks`, `stop_task`, `stoptask`) to `is_read_only_tool()`, switched `tool_prefixes` to a static slice to eliminate per-call heap allocations, and used `HashSet::retain` for fast order-preserving deduplication of permission overrides.
 
 ## Decisions
 
@@ -21,4 +22,5 @@
 ## Commits
 
 - ae806fd — fix(judge,hook): expand read-only tools, add gradlew allowlist, and emit tool-specific permission overrides
-- HEAD — fix(hook): add subagent permission override prefixes for self and nested runners
+- 26af621 — fix(hook): add subagent permission override prefixes for self and nested runners
+- HEAD — refactor(hook,judge): add plural tool aliases, use static prefix slices, and deduplicate overrides

@@ -43,7 +43,9 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "define_subagent"
             | "schedule"
             | "manage_task"
+            | "manage_tasks"
             | "managetask"
+            | "managetasks"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
@@ -51,7 +53,9 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "list_tasks"
             | "listtasks"
             | "task_stop"
+            | "stop_task"
             | "taskstop"
+            | "stoptask"
             | "tool_search"
             | "toolsearch"
             | "skill"
@@ -2266,12 +2270,16 @@ mod tests {
     #[test]
     fn test_agent_coordination_and_task_tools_are_read_only() {
         assert!(is_read_only_tool("manage_task"));
+        assert!(is_read_only_tool("manage_tasks"));
         assert!(is_read_only_tool("managetask"));
+        assert!(is_read_only_tool("managetasks"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
         assert!(is_read_only_tool("task_stop"));
+        assert!(is_read_only_tool("stop_task"));
         assert!(is_read_only_tool("taskstop"));
+        assert!(is_read_only_tool("stoptask"));
         assert!(is_read_only_tool("schedule"));
         assert!(is_read_only_tool("websearch"));
         assert!(is_read_only_tool("web_fetch"));
