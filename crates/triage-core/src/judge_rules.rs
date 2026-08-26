@@ -554,14 +554,36 @@ impl JudgeRules {
         rules: &'a [(String, Vec<String>)],
         tokens: &[&str],
     ) -> Option<&'a str> {
+        let positional_tokens = extract_positional_tokens(tokens);
         rules
             .iter()
             .find(|(_, rule)| {
-                rule.len() <= tokens.len()
-                    && rule
-                        .iter()
-                        .zip(tokens)
-                        .all(|(expected, actual)| expected == actual)
+                // 1. Direct token prefix match (allowing full path on first token)
+                if rule.len() <= tokens.len()
+                    && rule.iter().enumerate().all(|(i, expected)| {
+                        if i == 0 {
+                            expected == tokens[0] || expected == program_name(tokens[0])
+                        } else {
+                            expected == tokens[i]
+                        }
+                    })
+                {
+                    return true;
+                }
+                // 2. Positional CLI subcommand match (ignoring intermediate global flags)
+                if rule.len() <= positional_tokens.len()
+                    && rule.iter().enumerate().all(|(i, expected)| {
+                        if i == 0 {
+                            expected == positional_tokens[0]
+                                || expected == program_name(positional_tokens[0])
+                        } else {
+                            expected == positional_tokens[i]
+                        }
+                    })
+                {
+                    return true;
+                }
+                false
             })
             .map(|(text, _)| text.as_str())
     }
@@ -571,11 +593,14 @@ impl JudgeRules {
         if program_name(first) != "gh" {
             return None;
         }
-        let after = &tokens[1..];
-        let subcommand = *after.first()?;
+        let positional = extract_positional_tokens(tokens);
+        if positional.len() < 2 {
+            return None;
+        }
+        let subcommand = positional[1];
         match subcommand {
             "api" => {
-                let sub_args = &after[1..];
+                let sub_args = &tokens[1..];
                 // Disallow `gh api graphql` since GraphQL requests default to HTTP POST mutations
                 if sub_args
                     .iter()
@@ -610,8 +635,7 @@ impl JudgeRules {
                 }
             }
             "auth" => {
-                let sub_args = &after[1..];
-                if sub_args.first() == Some(&"status") {
+                if positional.get(2) == Some(&"status") {
                     Some("gh auth status")
                 } else {
                     None
@@ -645,8 +669,8 @@ impl JudgeRules {
             "check-ignore" => Some("git check-ignore"),
             "blame" => Some("git blame"),
             "ls-files" => Some("git ls-files"),
-            "worktree" if sub_args.first() == Some(&"list") => Some("git worktree list"),
-            "stash" if sub_args.first() == Some(&"list") || sub_args.first() == Some(&"show") => {
+            "worktree" if sub_args.contains(&"list") => Some("git worktree list"),
+            "stash" if sub_args.contains(&"list") || sub_args.contains(&"show") => {
                 Some("git stash")
             }
             "tag" => {
@@ -1334,6 +1358,74 @@ pub fn denied_segment_rule(tokens: &[&str]) -> Option<&'static str> {
         }
     }
     git_denied_operation(tokens)
+}
+
+pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
+    // git
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+    // gh
+    "-R",
+    "--repo",
+    "--hostname",
+    "-h",
+    // cargo
+    "--manifest-path",
+    "--package",
+    "-p",
+    "--target-dir",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "--profile",
+    "--target",
+    "-Z",
+    // flutter / dart
+    "-d",
+    "--device-id",
+    "--target",
+    "-t",
+    // pnpm / npm / yarn
+    "--dir",
+    "--prefix",
+    "--filter",
+];
+
+pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut positionals = Vec::new();
+    positionals.push(tokens[0]);
+
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if token == "--" {
+            for &rest in &tokens[i + 1..] {
+                positionals.push(rest);
+            }
+            break;
+        }
+        if token.starts_with('-') {
+            if KNOWN_VALUE_TAKING_FLAGS.contains(&token) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        positionals.push(token);
+        i += 1;
+    }
+
+    positionals
 }
 
 pub const GIT_VALUE_TAKING_GLOBALS: &[&str] = &[
@@ -2319,6 +2411,58 @@ mod tests {
                 "cd worktrees/demo/android && ANDROID_HOME=$HOME/Library/Android/sdk ./gradlew test"
             )
             .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_robust_cli_positional_flag_matching() {
+        assert_eq!(
+            evaluate_cmd("gh --repo hyeons-lab/triage pr view 149").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gh -R hyeons-lab/triage issue list").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("cargo --locked test --all").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("cargo -p triage-core check").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("cargo --offline test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("flutter -d macos test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("flutter --no-pub test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("pnpm --silent test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git -C crates/triaged status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git --no-pager diff --stat").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("/usr/bin/cargo test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("/opt/homebrew/bin/gh pr list").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

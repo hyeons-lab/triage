@@ -494,9 +494,8 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             .ok()
             .map(|h| h.trim_end_matches(['/', '\\']).to_string());
         if !is_url && let Some(ref home) = home_trimmed {
-            let is_tilde_home = clean_path == "~"
-                || clean_path.starts_with("~/")
-                || clean_path.starts_with("~\\");
+            let is_tilde_home =
+                clean_path == "~" || clean_path.starts_with("~/") || clean_path.starts_with("~\\");
             if is_tilde_home {
                 let sub = if clean_path == "~" {
                     ""
@@ -530,10 +529,9 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                 let norm_home = home.replace('\\', "/");
                 let matches_home = if cfg!(windows) || home.contains('\\') {
                     norm_path.eq_ignore_ascii_case(&norm_home)
-                        || norm_path.to_ascii_lowercase().starts_with(&format!(
-                            "{}/",
-                            norm_home.to_ascii_lowercase()
-                        ))
+                        || norm_path
+                            .to_ascii_lowercase()
+                            .starts_with(&format!("{}/", norm_home.to_ascii_lowercase()))
                 } else {
                     norm_path == norm_home || norm_path.starts_with(&format!("{norm_home}/"))
                 };
@@ -577,7 +575,9 @@ fn encode_response(
 ) -> String {
     let decision_str = verdict.decision.as_hook_str();
     let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Allow {
-        request.map(compute_permission_overrides).unwrap_or_default()
+        request
+            .map(compute_permission_overrides)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
