@@ -21,10 +21,11 @@
 //! It also loads no model. The resident model belongs to the daemon; this
 //! process only carries a question to it.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use serde::Deserialize;
 use triage_core::judge::{JudgeRequest, JudgeVerdict};
 use triage_core::session::SessionId;
 
@@ -703,21 +704,21 @@ fn main() {
 /// Produces the verdict and detected agent format, resolving every failure to `ask`.
 fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let start_time = std::time::Instant::now();
-    // Spawn stdin reader on a background thread bounded by JUDGE_TIMEOUT.
+    // Stream-parse the first complete JSON value from stdin directly without waiting for EOF.
     // The reader thread is terminated when main() exits via std::process::exit(0).
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut reader = std::io::stdin().lock().take(2 * 1024 * 1024);
-        let res = reader.read_to_string(&mut buf).map(|_| buf);
+        let reader = std::io::stdin().lock();
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        let res = serde_json::Value::deserialize(&mut de);
         let _ = tx.send(res);
     });
 
-    let stdin = match rx.recv_timeout(JUDGE_TIMEOUT) {
-        Ok(Ok(content)) => content,
+    let val: serde_json::Value = match rx.recv_timeout(JUDGE_TIMEOUT) {
+        Ok(Ok(val)) => val,
         Ok(Err(error)) => {
             return (
-                JudgeVerdict::fallback(format!("could not read the hook payload: {error}")),
+                JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
                 AgentFormat::Generic,
                 None,
             );
@@ -725,16 +726,6 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
         Err(_) => {
             return (
                 JudgeVerdict::fallback("timed out waiting for stdin payload"),
-                AgentFormat::Generic,
-                None,
-            );
-        }
-    };
-    let val: serde_json::Value = match serde_json::from_str(&stdin) {
-        Ok(val) => val,
-        Err(error) => {
-            return (
-                JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
                 AgentFormat::Generic,
                 None,
             );
