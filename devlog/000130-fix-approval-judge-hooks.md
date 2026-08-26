@@ -20,6 +20,7 @@
 - **2026-08-26T01:39-0700** Added `./` path prefix stripping and program base override emission (`./gradlew ktfmtFormat` -> `gradlew ktfmtFormat`, `./gradlew`, `gradlew`) in `crates/triage-hook/src/main.rs`, ensuring relative executable scripts match permission overrides regardless of whether the agent matches against the full relative path or the base binary.
 - **2026-08-26T01:43-0700** Fixed agent format detection in `crates/triage-hook/src/main.rs` to default to strict `Antigravity` format (emitting top-level `decision` and `permissionOverrides` without unknown `hookSpecificOutput` fields) unless explicitly in a Claude Code environment (`CLAUDE_CODE_VERSION` / `CLAUDE_PROJECT_DIR` / `--format=claude`).
 - **2026-08-26T16:25-0700** Switched `crates/triage-hook/src/main.rs` stdin ingestion to stream-parse the first complete JSON value via `serde_json::Deserializer::from_reader` instead of `read_to_string`, eliminating a 10s wait for EOF on pipes that remain open.
+- **2026-08-26T16:31-0700** Added standard platform clipboard inspection and copy tools (`pbpaste`, `pbcopy`, `xclip`, `wl-paste`, `wl-copy`) to `BUILTIN_ALLOW_COMMANDS` in `crates/triage-core/src/judge_rules.rs`.
 
 ## Decisions
 
@@ -47,4 +48,5 @@
 - a635ebc — fix(hook): preserve strict Antigravity response schema and prevent misclassification
 - c7db8bc — fix(hook): prevent duplicate protojson field in permission override response serialization
 - 060b85d — feat(client,judge): add ctrl+k shortcut key to accessory bar and ad-hoc codesign to allowlist
-- HEAD — fix(hook): stream parse stdin json payload without blocking for eof
+- f333888 — fix(hook): stream parse stdin json payload without blocking for eof
+- HEAD — feat(judge): add clipboard utilities to builtin allowlist

@@ -173,6 +173,11 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "codesign --display",
     "codesign -s",
     "codesign --sign",
+    "pbpaste",
+    "pbcopy",
+    "xclip",
+    "wl-paste",
+    "wl-copy",
     "triaged reload",
     "triaged --handover",
     // Read-only and routine git operations.
