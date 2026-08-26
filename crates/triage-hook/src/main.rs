@@ -425,6 +425,7 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             if trimmed_target.is_empty() {
                 return;
             }
+            permission_overrides.push(trimmed_target.to_string());
             for prefix in &tool_prefixes {
                 permission_overrides.push(format!("{prefix}({trimmed_target})"));
             }
@@ -455,6 +456,13 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                         triage_core::judge_rules::parse_git_subcommand(&words[1..])
                     {
                         add_command_override(&format!("git {subcommand}"));
+                        if let Some(sub_idx) = words[1..].iter().position(|&w| w == subcommand) {
+                            let prefix_words = &words[..=sub_idx + 1];
+                            let git_with_globals = prefix_words.join(" ");
+                            if git_with_globals != format!("git {subcommand}") {
+                                add_command_override(&git_with_globals);
+                            }
+                        }
                     }
                 } else if !words[1].starts_with('-')
                     && !words[1].starts_with('"')
@@ -940,6 +948,38 @@ mod tests {
         assert!(overrides.contains(&"command(ls -la)"));
         assert!(overrides.contains(&"Bash(ls -la)"));
         assert!(overrides.contains(&"run_command(ls -la)"));
+    }
+
+    #[test]
+    fn permission_overrides_for_git_commands_with_global_flags_emit_bare_and_subcommand_tokens() {
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: git diff".to_string(),
+        };
+        let request = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "Bash".to_string(),
+            command_line: Some("git --no-pager diff --stat".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(val["decision"], "allow");
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"git --no-pager diff --stat"));
+        assert!(overrides.contains(&"Bash(git --no-pager diff --stat)"));
+        assert!(overrides.contains(&"git --no-pager diff"));
+        assert!(overrides.contains(&"Bash(git --no-pager diff)"));
+        assert!(overrides.contains(&"git diff"));
+        assert!(overrides.contains(&"Bash(git diff)"));
+        assert!(overrides.contains(&"self:Bash(git diff)"));
     }
 
     #[test]

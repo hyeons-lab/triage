@@ -15,6 +15,7 @@
 - **2026-08-26T00:35-0700** Addressed PR review refinements: added plural/inverted aliases (`manage_tasks`, `managetasks`, `stop_task`, `stoptask`) to `is_read_only_tool()`, switched `tool_prefixes` to a static slice to eliminate per-call heap allocations, and used `HashSet::retain` for fast order-preserving deduplication of permission overrides.
 - **2026-08-26T01:08-0700** Fixed remote session ID resolution in `flutter/triage_client/lib/main.dart` to use `session.remoteSessionId` across `writeInput`, `resizeSession`, and `_sessionIdFor` rather than string splitting `session.title`, preventing dropped keystrokes on sessions without slash delimiters.
 - **2026-08-26T01:14-0700** Unified `permissionOverrides` generation in `crates/triage-hook/src/main.rs` across all detected agent formats (`Antigravity`, `ClaudeCode`, `Generic`), ensuring hooks carrying `hook_event_name` (e.g. from lifecycle configs) always receive full permission overrides alongside `hookSpecificOutput`.
+- **2026-08-26T01:19-0700** Added bare command string overrides and global-flag git prefix extraction (`git --no-pager diff`) in `crates/triage-hook/src/main.rs`, ensuring commands like `git --no-pager diff --stat` match against all permutation tokens without manual prompting.
 
 ## Decisions
 
@@ -29,4 +30,5 @@
 - 26af621 — fix(hook): add subagent permission override prefixes for self and nested runners
 - 06e167c — refactor(hook,judge): add plural tool aliases, use static prefix slices, and deduplicate overrides
 - 4fde2f2 — fix(client): route web client terminal input using canonical remote session ID
-- HEAD — fix(hook): emit permission overrides across all detected agent formats
+- 94face4 — fix(hook): emit permission overrides across all detected agent formats
+- HEAD — fix(hook): emit bare command strings and global flag git prefixes in permission overrides
