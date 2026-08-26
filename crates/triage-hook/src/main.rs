@@ -404,22 +404,47 @@ fn encode_response(
                 && let Some(req) = request
             {
                 if let Some(ref cmd) = req.command_line {
+                    let mut tool_prefixes = vec![
+                        "command".to_string(),
+                        "Bash".to_string(),
+                        "bash".to_string(),
+                        "run_command".to_string(),
+                        "runcommand".to_string(),
+                    ];
+                    if !tool_prefixes.contains(&req.tool_name) {
+                        tool_prefixes.push(req.tool_name.clone());
+                    }
+                    let lower_tool = req.tool_name.to_ascii_lowercase();
+                    if !tool_prefixes.contains(&lower_tool) {
+                        tool_prefixes.push(lower_tool);
+                    }
+
+                    let mut add_command_override = |cmd_str: &str| {
+                        let trimmed_target = cmd_str.trim();
+                        if trimmed_target.is_empty() {
+                            return;
+                        }
+                        for prefix in &tool_prefixes {
+                            permission_overrides.push(format!("{prefix}({trimmed_target})"));
+                        }
+                    };
+
                     let trimmed = cmd.trim();
-                    permission_overrides.push(format!("command({trimmed})"));
+                    add_command_override(trimmed);
                     let stripped = strip_leading_env_vars(trimmed);
                     if stripped != trimmed && !stripped.is_empty() {
-                        permission_overrides.push(format!("command({stripped})"));
+                        add_command_override(stripped);
                     }
                     // Extract all chain & pipeline segments (e.g. for &&, ||, ;, |, \n)
                     let segments = triage_core::judge::pipeline_and_chain_segments(trimmed);
                     for seg in &segments {
                         let seg_trimmed = seg.trim();
                         if !seg_trimmed.is_empty() && seg_trimmed != trimmed {
-                            permission_overrides.push(format!("command({seg_trimmed})"));
+                            add_command_override(seg_trimmed);
                         }
                         let stripped_seg = strip_leading_env_vars(seg_trimmed);
                         if stripped_seg != seg_trimmed && !stripped_seg.is_empty() {
-                            permission_overrides.push(format!("command({stripped_seg})"));
+                            add_command_override(stripped_seg);
                         }
                         let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
                         let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
@@ -428,15 +453,14 @@ fn encode_response(
                                 if let Some((subcommand, _)) =
                                     triage_core::judge_rules::parse_git_subcommand(&words[1..])
                                 {
-                                    permission_overrides.push(format!("command(git {subcommand})"));
+                                    add_command_override(&format!("git {subcommand}"));
                                 }
                             } else if !words[1].starts_with('-')
                                 && !words[1].starts_with('"')
                                 && !words[1].starts_with('\'')
                                 && !words[0].contains('=')
                             {
-                                permission_overrides
-                                    .push(format!("command({} {})", words[0], words[1]));
+                                add_command_override(&format!("{} {}", words[0], words[1]));
                             }
                         }
                     }
@@ -892,10 +916,21 @@ mod tests {
             cwd: None,
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
-        assert_eq!(
-            encoded,
-            r#"{"decision":"allow","reason":"matched allow rule: ls","permissionOverrides":["command(VAR=1 ls -la)","command(ls -la)"]}"#
-        );
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(val["decision"], "allow");
+        assert_eq!(val["reason"], "matched allow rule: ls");
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"command(VAR=1 ls -la)"));
+        assert!(overrides.contains(&"Bash(VAR=1 ls -la)"));
+        assert!(overrides.contains(&"run_command(VAR=1 ls -la)"));
+        assert!(overrides.contains(&"command(ls -la)"));
+        assert!(overrides.contains(&"Bash(ls -la)"));
+        assert!(overrides.contains(&"run_command(ls -la)"));
     }
 
     #[test]
@@ -1091,12 +1126,20 @@ mod tests {
         let overrides = val["permissionOverrides"].as_array().unwrap();
         let override_strs: Vec<&str> = overrides.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(override_strs.contains(&"command(echo \"In origin but not local:\")"));
+        assert!(override_strs.contains(&"Bash(echo \"In origin but not local:\")"));
+        assert!(override_strs.contains(&"run_command(echo \"In origin but not local:\")"));
         assert!(override_strs.contains(&"command(git log 1a1ab03..origin/main --oneline)"));
+        assert!(override_strs.contains(&"Bash(git log 1a1ab03..origin/main --oneline)"));
+        assert!(override_strs.contains(&"run_command(git log 1a1ab03..origin/main --oneline)"));
         assert!(override_strs.contains(&"command(git log)"));
+        assert!(override_strs.contains(&"Bash(git log)"));
+        assert!(override_strs.contains(&"run_command(git log)"));
         assert!(!override_strs.contains(&"tool(run_command)"));
         // Ensure no broad single-word base executable overrides are emitted
         assert!(!override_strs.contains(&"command(git)"));
+        assert!(!override_strs.contains(&"Bash(git)"));
         assert!(!override_strs.contains(&"command(echo)"));
+        assert!(!override_strs.contains(&"Bash(echo)"));
         // Ensure no malformed unbalanced quotes exist
         assert!(!override_strs.iter().any(|s| s.contains("echo \"In)")));
     }

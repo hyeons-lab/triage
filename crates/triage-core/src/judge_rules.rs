@@ -28,20 +28,35 @@ pub fn is_read_only_tool(lower: &str) -> bool {
             | "search_files"
             | "search_web"
             | "web_search"
+            | "websearch"
             | "read_url_content"
+            | "read_url"
             | "read_browser_page"
+            | "web_fetch"
+            | "webfetch"
             | "ask_question"
+            | "ask_user_question"
+            | "askuserquestion"
             | "invoke_subagent"
             | "send_message"
             | "manage_subagents"
             | "define_subagent"
-            | "generate_image"
+            | "schedule"
+            | "manage_task"
+            | "managetask"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
             | "gettaskstatus"
             | "list_tasks"
             | "listtasks"
+            | "task_stop"
+            | "taskstop"
+            | "tool_search"
+            | "toolsearch"
+            | "skill"
+            | "artifact"
+            | "generate_image"
             | "detect_changes"
             | "get_review_context"
             | "get_impact_radius"
@@ -231,6 +246,9 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "sleep",
     "just",
     "make",
+    "./gradlew",
+    "gradlew",
+    "gradle",
     "dart pub get",
     "dart pub",
     "dart run",
@@ -2246,14 +2264,54 @@ mod tests {
     }
 
     #[test]
-    fn test_manage_task_is_not_read_only() {
-        assert!(!is_read_only_tool("manage_task"));
-        assert!(!is_read_only_tool("manage_tasks"));
-        assert!(!is_read_only_tool("managetask"));
-        assert!(!is_read_only_tool("managetasks"));
+    fn test_agent_coordination_and_task_tools_are_read_only() {
+        assert!(is_read_only_tool("manage_task"));
+        assert!(is_read_only_tool("managetask"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
-        assert!(!is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("task_stop"));
+        assert!(is_read_only_tool("taskstop"));
+        assert!(is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("websearch"));
+        assert!(is_read_only_tool("web_fetch"));
+        assert!(is_read_only_tool("webfetch"));
+        assert!(is_read_only_tool("read_url"));
+        assert!(is_read_only_tool("tool_search"));
+        assert!(is_read_only_tool("toolsearch"));
+        assert!(is_read_only_tool("skill"));
+        assert!(is_read_only_tool("artifact"));
+        assert!(is_read_only_tool("ask_user_question"));
+        assert!(is_read_only_tool("askuserquestion"));
+    }
+
+    #[test]
+    fn test_gradle_build_commands_are_allowed() {
+        assert_eq!(
+            evaluate_cmd("./gradlew test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gradlew build").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gradle check").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd(
+                "ANDROID_HOME=$HOME/Library/Android/sdk ./gradlew ktfmtFormat testDebugUnitTest"
+            )
+            .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd(
+                "cd worktrees/demo/android && ANDROID_HOME=$HOME/Library/Android/sdk ./gradlew test"
+            )
+            .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
     }
 }
