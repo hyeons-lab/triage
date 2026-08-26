@@ -391,191 +391,191 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     }
 }
 
+fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
+    let mut permission_overrides = Vec::new();
+    if let Some(ref cmd) = req.command_line {
+        const STATIC_TOOL_PREFIXES: &[&str] = &[
+            "command",
+            "Bash",
+            "bash",
+            "run_command",
+            "runcommand",
+            "self:Bash",
+            "self:bash",
+            "self:run_command",
+            "self:runcommand",
+            "self:command",
+            "self",
+            "subagent:Bash",
+            "subagent:run_command",
+            "subagent:command",
+        ];
+
+        let mut tool_prefixes: Vec<&str> = STATIC_TOOL_PREFIXES.to_vec();
+        if !tool_prefixes.contains(&req.tool_name.as_str()) {
+            tool_prefixes.push(&req.tool_name);
+        }
+        let lower_tool = req.tool_name.to_ascii_lowercase();
+        if !tool_prefixes.contains(&lower_tool.as_str()) {
+            tool_prefixes.push(&lower_tool);
+        }
+
+        let mut add_command_override = |cmd_str: &str| {
+            let trimmed_target = cmd_str.trim();
+            if trimmed_target.is_empty() {
+                return;
+            }
+            for prefix in &tool_prefixes {
+                permission_overrides.push(format!("{prefix}({trimmed_target})"));
+            }
+        };
+
+        let trimmed = cmd.trim();
+        add_command_override(trimmed);
+        let stripped = strip_leading_env_vars(trimmed);
+        if stripped != trimmed && !stripped.is_empty() {
+            add_command_override(stripped);
+        }
+        // Extract all chain & pipeline segments (e.g. for &&, ||, ;, |, \n)
+        let segments = triage_core::judge::pipeline_and_chain_segments(trimmed);
+        for seg in &segments {
+            let seg_trimmed = seg.trim();
+            if !seg_trimmed.is_empty() && seg_trimmed != trimmed {
+                add_command_override(seg_trimmed);
+            }
+            let stripped_seg = strip_leading_env_vars(seg_trimmed);
+            if stripped_seg != seg_trimmed && !stripped_seg.is_empty() {
+                add_command_override(stripped_seg);
+            }
+            let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
+            let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
+            if words.len() >= 2 {
+                if triage_core::judge_rules::program_name(words[0]) == "git" {
+                    if let Some((subcommand, _)) =
+                        triage_core::judge_rules::parse_git_subcommand(&words[1..])
+                    {
+                        add_command_override(&format!("git {subcommand}"));
+                    }
+                } else if !words[1].starts_with('-')
+                    && !words[1].starts_with('"')
+                    && !words[1].starts_with('\'')
+                    && !words[0].contains('=')
+                {
+                    add_command_override(&format!("{} {}", words[0], words[1]));
+                }
+            }
+        }
+    }
+    if let Some(ref path) = req.path {
+        let clean_path = path.strip_prefix("file://").unwrap_or(path);
+        let lower_path = clean_path.to_ascii_lowercase();
+        let is_url = lower_path.starts_with("http://")
+            || lower_path.starts_with("https://")
+            || lower_path.starts_with("ws://")
+            || lower_path.starts_with("wss://");
+        let lower_tool = req.tool_name.to_ascii_lowercase();
+        if !is_url {
+            permission_overrides.push(format!("file({clean_path})"));
+        }
+        permission_overrides.push(format!("{}({clean_path})", req.tool_name));
+        if lower_tool != req.tool_name {
+            permission_overrides.push(format!("{lower_tool}({clean_path})"));
+        }
+        let home_trimmed = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .map(|h| h.trim_end_matches(['/', '\\']).to_string());
+        if !is_url && let Some(ref home) = home_trimmed {
+            let is_tilde_home = clean_path == "~"
+                || clean_path.starts_with("~/")
+                || clean_path.starts_with("~\\");
+            if is_tilde_home {
+                let sub = if clean_path == "~" {
+                    ""
+                } else {
+                    &clean_path[1..]
+                };
+                let expanded = if sub.is_empty() {
+                    home.clone()
+                } else if home.contains('\\') {
+                    format!("{home}{}", sub.replace('/', "\\"))
+                } else {
+                    format!("{home}{}", sub.replace('\\', "/"))
+                };
+                permission_overrides.push(format!("file({expanded})"));
+                permission_overrides.push(format!("{}({expanded})", req.tool_name));
+                if lower_tool != req.tool_name {
+                    permission_overrides.push(format!("{lower_tool}({expanded})"));
+                }
+                if home.contains('\\') && sub.contains('/') {
+                    let fwd_expanded = format!("{home}{sub}");
+                    if fwd_expanded != expanded {
+                        permission_overrides.push(format!("file({fwd_expanded})"));
+                        permission_overrides.push(format!("{}({fwd_expanded})", req.tool_name));
+                        if lower_tool != req.tool_name {
+                            permission_overrides.push(format!("{lower_tool}({fwd_expanded})"));
+                        }
+                    }
+                }
+            } else {
+                let norm_path = clean_path.replace('\\', "/");
+                let norm_home = home.replace('\\', "/");
+                let matches_home = if cfg!(windows) || home.contains('\\') {
+                    norm_path.eq_ignore_ascii_case(&norm_home)
+                        || norm_path.to_ascii_lowercase().starts_with(&format!(
+                            "{}/",
+                            norm_home.to_ascii_lowercase()
+                        ))
+                } else {
+                    norm_path == norm_home || norm_path.starts_with(&format!("{norm_home}/"))
+                };
+                if matches_home {
+                    let suffix = &norm_path[norm_home.len()..];
+                    let contracted = if suffix.is_empty() {
+                        "~".to_string()
+                    } else {
+                        format!("~{suffix}")
+                    };
+                    permission_overrides.push(format!("file({contracted})"));
+                    permission_overrides.push(format!("{}({contracted})", req.tool_name));
+                    if lower_tool != req.tool_name {
+                        permission_overrides.push(format!("{lower_tool}({contracted})"));
+                    }
+                }
+            }
+        }
+    }
+    if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase())
+        || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
+    {
+        permission_overrides.push(format!("tool({})", req.tool_name));
+        permission_overrides.push(req.tool_name.clone());
+        let lower_tool = req.tool_name.to_ascii_lowercase();
+        if lower_tool != req.tool_name {
+            permission_overrides.push(format!("tool({lower_tool})"));
+            permission_overrides.push(lower_tool);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    permission_overrides.retain(|item| seen.insert(item.clone()));
+    permission_overrides
+}
+
 fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
     request: Option<&JudgeRequest>,
 ) -> String {
     let decision_str = verdict.decision.as_hook_str();
+    let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Allow {
+        request.map(compute_permission_overrides).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     match format {
         AgentFormat::Antigravity | AgentFormat::Generic => {
-            let mut permission_overrides = Vec::new();
-            if verdict.decision == triage_core::judge::JudgeDecision::Allow
-                && let Some(req) = request
-            {
-                if let Some(ref cmd) = req.command_line {
-                    const STATIC_TOOL_PREFIXES: &[&str] = &[
-                        "command",
-                        "Bash",
-                        "bash",
-                        "run_command",
-                        "runcommand",
-                        "self:Bash",
-                        "self:bash",
-                        "self:run_command",
-                        "self:runcommand",
-                        "self:command",
-                        "self",
-                        "subagent:Bash",
-                        "subagent:run_command",
-                        "subagent:command",
-                    ];
-
-                    let mut tool_prefixes: Vec<&str> = STATIC_TOOL_PREFIXES.to_vec();
-                    if !tool_prefixes.contains(&req.tool_name.as_str()) {
-                        tool_prefixes.push(&req.tool_name);
-                    }
-                    let lower_tool = req.tool_name.to_ascii_lowercase();
-                    if !tool_prefixes.contains(&lower_tool.as_str()) {
-                        tool_prefixes.push(&lower_tool);
-                    }
-
-                    let mut add_command_override = |cmd_str: &str| {
-                        let trimmed_target = cmd_str.trim();
-                        if trimmed_target.is_empty() {
-                            return;
-                        }
-                        for prefix in &tool_prefixes {
-                            permission_overrides.push(format!("{prefix}({trimmed_target})"));
-                        }
-                    };
-
-                    let trimmed = cmd.trim();
-                    add_command_override(trimmed);
-                    let stripped = strip_leading_env_vars(trimmed);
-                    if stripped != trimmed && !stripped.is_empty() {
-                        add_command_override(stripped);
-                    }
-                    // Extract all chain & pipeline segments (e.g. for &&, ||, ;, |, \n)
-                    let segments = triage_core::judge::pipeline_and_chain_segments(trimmed);
-                    for seg in &segments {
-                        let seg_trimmed = seg.trim();
-                        if !seg_trimmed.is_empty() && seg_trimmed != trimmed {
-                            add_command_override(seg_trimmed);
-                        }
-                        let stripped_seg = strip_leading_env_vars(seg_trimmed);
-                        if stripped_seg != seg_trimmed && !stripped_seg.is_empty() {
-                            add_command_override(stripped_seg);
-                        }
-                        let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
-                        let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
-                        if words.len() >= 2 {
-                            if triage_core::judge_rules::program_name(words[0]) == "git" {
-                                if let Some((subcommand, _)) =
-                                    triage_core::judge_rules::parse_git_subcommand(&words[1..])
-                                {
-                                    add_command_override(&format!("git {subcommand}"));
-                                }
-                            } else if !words[1].starts_with('-')
-                                && !words[1].starts_with('"')
-                                && !words[1].starts_with('\'')
-                                && !words[0].contains('=')
-                            {
-                                add_command_override(&format!("{} {}", words[0], words[1]));
-                            }
-                        }
-                    }
-                }
-                if let Some(ref path) = req.path {
-                    let clean_path = path.strip_prefix("file://").unwrap_or(path);
-                    let lower_path = clean_path.to_ascii_lowercase();
-                    let is_url = lower_path.starts_with("http://")
-                        || lower_path.starts_with("https://")
-                        || lower_path.starts_with("ws://")
-                        || lower_path.starts_with("wss://");
-                    let lower_tool = req.tool_name.to_ascii_lowercase();
-                    if !is_url {
-                        permission_overrides.push(format!("file({clean_path})"));
-                    }
-                    permission_overrides.push(format!("{}({clean_path})", req.tool_name));
-                    if lower_tool != req.tool_name {
-                        permission_overrides.push(format!("{lower_tool}({clean_path})"));
-                    }
-                    let home_trimmed = std::env::var("HOME")
-                        .or_else(|_| std::env::var("USERPROFILE"))
-                        .ok()
-                        .map(|h| h.trim_end_matches(['/', '\\']).to_string());
-                    if !is_url && let Some(ref home) = home_trimmed {
-                        let is_tilde_home = clean_path == "~"
-                            || clean_path.starts_with("~/")
-                            || clean_path.starts_with("~\\");
-                        if is_tilde_home {
-                            let sub = if clean_path == "~" {
-                                ""
-                            } else {
-                                &clean_path[1..]
-                            };
-                            let expanded = if sub.is_empty() {
-                                home.clone()
-                            } else if home.contains('\\') {
-                                format!("{home}{}", sub.replace('/', "\\"))
-                            } else {
-                                format!("{home}{}", sub.replace('\\', "/"))
-                            };
-                            permission_overrides.push(format!("file({expanded})"));
-                            permission_overrides.push(format!("{}({expanded})", req.tool_name));
-                            if lower_tool != req.tool_name {
-                                permission_overrides.push(format!("{lower_tool}({expanded})"));
-                            }
-                            if home.contains('\\') && sub.contains('/') {
-                                let fwd_expanded = format!("{home}{sub}");
-                                if fwd_expanded != expanded {
-                                    permission_overrides.push(format!("file({fwd_expanded})"));
-                                    permission_overrides
-                                        .push(format!("{}({fwd_expanded})", req.tool_name));
-                                    if lower_tool != req.tool_name {
-                                        permission_overrides
-                                            .push(format!("{lower_tool}({fwd_expanded})"));
-                                    }
-                                }
-                            }
-                        } else {
-                            let norm_path = clean_path.replace('\\', "/");
-                            let norm_home = home.replace('\\', "/");
-                            let matches_home = if cfg!(windows) || home.contains('\\') {
-                                norm_path.eq_ignore_ascii_case(&norm_home)
-                                    || norm_path.to_ascii_lowercase().starts_with(&format!(
-                                        "{}/",
-                                        norm_home.to_ascii_lowercase()
-                                    ))
-                            } else {
-                                norm_path == norm_home
-                                    || norm_path.starts_with(&format!("{norm_home}/"))
-                            };
-                            if matches_home {
-                                let suffix = &norm_path[norm_home.len()..];
-                                let contracted = if suffix.is_empty() {
-                                    "~".to_string()
-                                } else {
-                                    format!("~{suffix}")
-                                };
-                                permission_overrides.push(format!("file({contracted})"));
-                                permission_overrides
-                                    .push(format!("{}({contracted})", req.tool_name));
-                                if lower_tool != req.tool_name {
-                                    permission_overrides
-                                        .push(format!("{lower_tool}({contracted})"));
-                                }
-                            }
-                        }
-                    }
-                }
-                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase())
-                    || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
-                {
-                    permission_overrides.push(format!("tool({})", req.tool_name));
-                    permission_overrides.push(req.tool_name.clone());
-                    let lower_tool = req.tool_name.to_ascii_lowercase();
-                    if lower_tool != req.tool_name {
-                        permission_overrides.push(format!("tool({lower_tool})"));
-                        permission_overrides.push(lower_tool);
-                    }
-                }
-
-                let mut seen = std::collections::HashSet::new();
-                permission_overrides.retain(|item| seen.insert(item.clone()));
-            }
-
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
             struct AntigravityResponse<'a> {
@@ -607,11 +607,14 @@ fn encode_response(
                 decision: &'a str,
                 #[serde(skip_serializing_if = "str::is_empty")]
                 reason: &'a str,
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                permission_overrides: Vec<String>,
                 hook_specific_output: ClaudeHookSpecificOutput<'a>,
             }
             serde_json::to_string(&ClaudeResponse {
                 decision: decision_str,
                 reason: &verdict.reason,
+                permission_overrides,
                 hook_specific_output: ClaudeHookSpecificOutput {
                     hook_event_name: "PreToolUse",
                     permission_decision: decision_str,
