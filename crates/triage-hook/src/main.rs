@@ -298,9 +298,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         }
     }
 
-    if std::env::var("CLAUDE_CODE_VERSION").is_ok()
-        || std::env::var("CLAUDE_PROJECT_DIR").is_ok()
-    {
+    if std::env::var("CLAUDE_CODE_VERSION").is_ok() || std::env::var("CLAUDE_PROJECT_DIR").is_ok() {
         return AgentFormat::ClaudeCode;
     }
 
@@ -630,18 +628,17 @@ fn encode_response(
     match format {
         AgentFormat::Antigravity | AgentFormat::Generic => {
             #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
             struct AntigravityResponse<'a> {
                 decision: &'a str,
                 #[serde(skip_serializing_if = "str::is_empty")]
                 reason: &'a str,
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: Vec<String>,
+                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
+                permission_overrides: &'a Vec<String>,
             }
             serde_json::to_string(&AntigravityResponse {
                 decision: decision_str,
                 reason: &verdict.reason,
-                permission_overrides,
+                permission_overrides: &permission_overrides,
             })
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
@@ -655,19 +652,19 @@ fn encode_response(
                 permission_decision_reason: &'a str,
             }
             #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
             struct ClaudeResponse<'a> {
                 decision: &'a str,
                 #[serde(skip_serializing_if = "str::is_empty")]
                 reason: &'a str,
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: Vec<String>,
+                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
+                permission_overrides: &'a Vec<String>,
+                #[serde(rename = "hookSpecificOutput")]
                 hook_specific_output: ClaudeHookSpecificOutput<'a>,
             }
             serde_json::to_string(&ClaudeResponse {
                 decision: decision_str,
                 reason: &verdict.reason,
-                permission_overrides,
+                permission_overrides: &permission_overrides,
                 hook_specific_output: ClaudeHookSpecificOutput {
                     hook_event_name: "PreToolUse",
                     permission_decision: decision_str,

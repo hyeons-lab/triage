@@ -19,6 +19,7 @@
 - **2026-08-26T01:31-0700** Added `self:<cmd>` and `subagent:<cmd>` colon prefixes directly to `add_command_override` in `crates/triage-hook/src/main.rs`, enabling subagent-initiated commands in Antigravity to match subagent permission grants without modal prompting.
 - **2026-08-26T01:39-0700** Added `./` path prefix stripping and program base override emission (`./gradlew ktfmtFormat` -> `gradlew ktfmtFormat`, `./gradlew`, `gradlew`) in `crates/triage-hook/src/main.rs`, ensuring relative executable scripts match permission overrides regardless of whether the agent matches against the full relative path or the base binary.
 - **2026-08-26T01:43-0700** Fixed agent format detection in `crates/triage-hook/src/main.rs` to default to strict `Antigravity` format (emitting top-level `decision` and `permissionOverrides` without unknown `hookSpecificOutput` fields) unless explicitly in a Claude Code environment (`CLAUDE_CODE_VERSION` / `CLAUDE_PROJECT_DIR` / `--format=claude`).
+- **2026-08-26T01:51-0700** Cleaned `permissionOverrides` serialization in `crates/triage-hook/src/main.rs` to emit single camelCase `permissionOverrides` field, resolving `protojson` duplicate field deserialization errors.
 
 ## Decisions
 
@@ -41,4 +42,5 @@
 - 668073d — fix(judge): robust positional CLI flag parsing and token normalization across all CLI tools
 - 7928ae4 — fix(hook): emit self and subagent colon prefixes for allowed command tokens
 - 4c7a994 — fix(hook): emit path-stripped and program base overrides for relative executable paths
-- HEAD — fix(hook): preserve strict Antigravity response schema and prevent misclassification
+- a635ebc — fix(hook): preserve strict Antigravity response schema and prevent misclassification
+- HEAD — fix(hook): prevent duplicate protojson field in permission override response serialization
