@@ -431,6 +431,18 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             for prefix in &tool_prefixes {
                 permission_overrides.push(format!("{prefix}({trimmed_target})"));
             }
+
+            if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
+                let trimmed_sub = without_dot_slash.trim();
+                if !trimmed_sub.is_empty() {
+                    permission_overrides.push(trimmed_sub.to_string());
+                    permission_overrides.push(format!("self:{trimmed_sub}"));
+                    permission_overrides.push(format!("subagent:{trimmed_sub}"));
+                    for prefix in &tool_prefixes {
+                        permission_overrides.push(format!("{prefix}({trimmed_sub})"));
+                    }
+                }
+            }
         };
 
         let trimmed = cmd.trim();
@@ -452,26 +464,44 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             }
             let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
             let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
-            if words.len() >= 2 {
-                if triage_core::judge_rules::program_name(words[0]) == "git" {
-                    if let Some((subcommand, _)) =
-                        triage_core::judge_rules::parse_git_subcommand(&words[1..])
-                    {
-                        add_command_override(&format!("git {subcommand}"));
-                        if let Some(sub_idx) = words[1..].iter().position(|&w| w == subcommand) {
-                            let prefix_words = &words[..=sub_idx + 1];
-                            let git_with_globals = prefix_words.join(" ");
-                            if git_with_globals != format!("git {subcommand}") {
-                                add_command_override(&git_with_globals);
+            if !words.is_empty() {
+                let prog = triage_core::judge_rules::program_name(words[0]);
+                if prog == "gradlew"
+                    || prog == "gradle"
+                    || prog == "make"
+                    || prog == "just"
+                    || prog == "sleep"
+                {
+                    add_command_override(words[0]);
+                    if prog != words[0] {
+                        add_command_override(prog);
+                    }
+                }
+                if words.len() >= 2 {
+                    if prog == "git" {
+                        if let Some((subcommand, _)) =
+                            triage_core::judge_rules::parse_git_subcommand(&words[1..])
+                        {
+                            add_command_override(&format!("git {subcommand}"));
+                            if let Some(sub_idx) = words[1..].iter().position(|&w| w == subcommand)
+                            {
+                                let prefix_words = &words[..=sub_idx + 1];
+                                let git_with_globals = prefix_words.join(" ");
+                                if git_with_globals != format!("git {subcommand}") {
+                                    add_command_override(&git_with_globals);
+                                }
                             }
                         }
+                    } else if !words[1].starts_with('-')
+                        && !words[1].starts_with('"')
+                        && !words[1].starts_with('\'')
+                        && !words[0].contains('=')
+                    {
+                        add_command_override(&format!("{} {}", words[0], words[1]));
+                        if prog != words[0] {
+                            add_command_override(&format!("{prog} {}", words[1]));
+                        }
                     }
-                } else if !words[1].starts_with('-')
-                    && !words[1].starts_with('"')
-                    && !words[1].starts_with('\'')
-                    && !words[0].contains('=')
-                {
-                    add_command_override(&format!("{} {}", words[0], words[1]));
                 }
             }
         }
@@ -982,6 +1012,39 @@ mod tests {
         assert!(overrides.contains(&"git diff"));
         assert!(overrides.contains(&"Bash(git diff)"));
         assert!(overrides.contains(&"self:Bash(git diff)"));
+    }
+
+    #[test]
+    fn permission_overrides_for_gradlew_commands_emit_stripped_and_base_tokens() {
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: ./gradlew".to_string(),
+        };
+        let request = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "Bash".to_string(),
+            command_line: Some("./gradlew ktfmtFormat".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(val["decision"], "allow");
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"./gradlew ktfmtFormat"));
+        assert!(overrides.contains(&"gradlew ktfmtFormat"));
+        assert!(overrides.contains(&"Bash(./gradlew ktfmtFormat)"));
+        assert!(overrides.contains(&"Bash(gradlew ktfmtFormat)"));
+        assert!(overrides.contains(&"./gradlew"));
+        assert!(overrides.contains(&"gradlew"));
+        assert!(overrides.contains(&"Bash(./gradlew)"));
+        assert!(overrides.contains(&"Bash(gradlew)"));
     }
 
     #[test]

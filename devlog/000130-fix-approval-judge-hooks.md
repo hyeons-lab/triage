@@ -16,8 +16,8 @@
 - **2026-08-26T01:08-0700** Fixed remote session ID resolution in `flutter/triage_client/lib/main.dart` to use `session.remoteSessionId` across `writeInput`, `resizeSession`, and `_sessionIdFor` rather than string splitting `session.title`, preventing dropped keystrokes on sessions without slash delimiters.
 - **2026-08-26T01:14-0700** Unified `permissionOverrides` generation in `crates/triage-hook/src/main.rs` across all detected agent formats (`Antigravity`, `ClaudeCode`, `Generic`), ensuring hooks carrying `hook_event_name` (e.g. from lifecycle configs) always receive full permission overrides alongside `hookSpecificOutput`.
 - **2026-08-26T01:19-0700** Added bare command string overrides and global-flag git prefix extraction (`git --no-pager diff`) in `crates/triage-hook/src/main.rs`, ensuring commands like `git --no-pager diff --stat` match against all permutation tokens without manual prompting.
-- **2026-08-26T01:23-0700** Implemented robust positional CLI token extraction and flag parsing in `crates/triage-core/src/judge_rules.rs` (`extract_positional_tokens` and `matching_token_allow_rule`), allowing commands with arbitrary global flags (`gh --repo ...`, `cargo --locked ...`, `flutter -d ...`, `pnpm --silent ...`, `git -C ...`) and absolute executable paths to match allow rules reliably.
 - **2026-08-26T01:31-0700** Added `self:<cmd>` and `subagent:<cmd>` colon prefixes directly to `add_command_override` in `crates/triage-hook/src/main.rs`, enabling subagent-initiated commands in Antigravity to match subagent permission grants without modal prompting.
+- **2026-08-26T01:39-0700** Added `./` path prefix stripping and program base override emission (`./gradlew ktfmtFormat` -> `gradlew ktfmtFormat`, `./gradlew`, `gradlew`) in `crates/triage-hook/src/main.rs`, ensuring relative executable scripts match permission overrides regardless of whether the agent matches against the full relative path or the base binary.
 
 ## Decisions
 
@@ -26,6 +26,7 @@
 - **Canonical Session ID Routing in Web Client**: Switched web terminal input and resize handlers to use `session.remoteSessionId` instead of splitting `session.title` by `" / "` so sessions with custom or single-word titles reliably deliver keystrokes over WebSockets.
 - **Unified Permission Override Serialization**: Computed and emitted `permissionOverrides` on all hook responses regardless of detected agent format so lifecycle hooks delivering `hook_event_name` never drop permission grants for Antigravity or nested agents.
 - **Positional CLI Subcommand Matching**: Replaced naive array index matching with `extract_positional_tokens` so global flags (e.g. `--locked`, `--offline`, `-C <dir>`, `--repo <repo>`, `-d <device>`, `--silent`) inserted between CLI executables and their subcommands match their intended allow rules without fragility.
+- **Relative Path Prefix Stripping**: Handled `./` path stripping in `add_command_override` to emit both `./script.sh` and `script.sh` permission tokens, allowing runners to match against either form seamlessly.
 
 ## Commits
 
@@ -36,4 +37,5 @@
 - 94face4 — fix(hook): emit permission overrides across all detected agent formats
 - fef8c37 — fix(hook): emit bare command strings and global flag git prefixes in permission overrides
 - 668073d — fix(judge): robust positional CLI flag parsing and token normalization across all CLI tools
-- HEAD — fix(hook): emit self and subagent colon prefixes for allowed command tokens
+- 7928ae4 — fix(hook): emit self and subagent colon prefixes for allowed command tokens
+- HEAD — fix(hook): emit path-stripped and program base overrides for relative executable paths
