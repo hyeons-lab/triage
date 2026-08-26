@@ -410,6 +410,15 @@ fn encode_response(
                         "bash".to_string(),
                         "run_command".to_string(),
                         "runcommand".to_string(),
+                        "self:Bash".to_string(),
+                        "self:bash".to_string(),
+                        "self:run_command".to_string(),
+                        "self:runcommand".to_string(),
+                        "self:command".to_string(),
+                        "self".to_string(),
+                        "subagent:Bash".to_string(),
+                        "subagent:run_command".to_string(),
+                        "subagent:command".to_string(),
                     ];
                     if !tool_prefixes.contains(&req.tool_name) {
                         tool_prefixes.push(req.tool_name.clone());

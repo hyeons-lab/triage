@@ -11,12 +11,14 @@
 - **2026-08-26T00:10-0700** Updated `encode_response()` in `crates/triage-hook/src/main.rs` to generate multi-prefix permission overrides for commands across `Bash(...)`, `run_command(...)`, `command(...)`, and `{req.tool_name}(...)`.
 - **2026-08-26T00:11-0700** Added unit tests in `triage-core` and `triage-hook` validating tool recognition, Gradle execution with environment variables, and multi-prefix permission override serialization.
 - **2026-08-26T00:13-0700** Rebuilt and installed release binaries via `scripts/install.sh`, successfully reloaded live daemon with zero downtime preserving 31 active sessions.
+- **2026-08-26T00:22-0700** Added subagent-scoped permission override prefixes (`self:Bash`, `self:run_command`, `subagent:Bash`, `self`, etc.) in `crates/triage-hook/src/main.rs` so subagents invoked via `invoke_subagent(TypeName="self")` match permission overrides without prompting.
 
 ## Decisions
 
-- **Multi-prefix command permission overrides**: `triage-hook` emits overrides with `Bash(...)`, `run_command(...)`, `command(...)`, and `{req.tool_name}(...)` so agent runners (Claude Code, Antigravity, custom runners) match against their expected tool names without manual approval modals.
+- **Multi-prefix command permission overrides**: `triage-hook` emits overrides with `Bash(...)`, `run_command(...)`, `command(...)`, `self:Bash(...)`, `subagent:Bash(...)`, and `{req.tool_name}(...)` so agent runners (Claude Code, Antigravity, subagents, custom runners) match against their expected tool names without manual approval modals.
 - **Gradle in builtin allowlist**: Added `./gradlew`, `gradlew`, and `gradle` to `BUILTIN_ALLOW_COMMANDS` to fast-path standard builds, test suites, and formatting checks without requiring custom config overrides.
 
 ## Commits
 
-- HEAD — fix(judge,hook): expand read-only tools, add gradlew allowlist, and emit tool-specific permission overrides
+- ae806fd — fix(judge,hook): expand read-only tools, add gradlew allowlist, and emit tool-specific permission overrides
+- HEAD — fix(hook): add subagent permission override prefixes for self and nested runners
