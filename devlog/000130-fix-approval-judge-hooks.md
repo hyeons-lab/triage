@@ -17,6 +17,7 @@
 - **2026-08-26T01:14-0700** Unified `permissionOverrides` generation in `crates/triage-hook/src/main.rs` across all detected agent formats (`Antigravity`, `ClaudeCode`, `Generic`), ensuring hooks carrying `hook_event_name` (e.g. from lifecycle configs) always receive full permission overrides alongside `hookSpecificOutput`.
 - **2026-08-26T01:19-0700** Added bare command string overrides and global-flag git prefix extraction (`git --no-pager diff`) in `crates/triage-hook/src/main.rs`, ensuring commands like `git --no-pager diff --stat` match against all permutation tokens without manual prompting.
 - **2026-08-26T01:23-0700** Implemented robust positional CLI token extraction and flag parsing in `crates/triage-core/src/judge_rules.rs` (`extract_positional_tokens` and `matching_token_allow_rule`), allowing commands with arbitrary global flags (`gh --repo ...`, `cargo --locked ...`, `flutter -d ...`, `pnpm --silent ...`, `git -C ...`) and absolute executable paths to match allow rules reliably.
+- **2026-08-26T01:31-0700** Added `self:<cmd>` and `subagent:<cmd>` colon prefixes directly to `add_command_override` in `crates/triage-hook/src/main.rs`, enabling subagent-initiated commands in Antigravity to match subagent permission grants without modal prompting.
 
 ## Decisions
 
@@ -34,4 +35,5 @@
 - 4fde2f2 — fix(client): route web client terminal input using canonical remote session ID
 - 94face4 — fix(hook): emit permission overrides across all detected agent formats
 - fef8c37 — fix(hook): emit bare command strings and global flag git prefixes in permission overrides
-- HEAD — fix(judge): robust positional CLI flag parsing and token normalization across all CLI tools
+- 668073d — fix(judge): robust positional CLI flag parsing and token normalization across all CLI tools
+- HEAD — fix(hook): emit self and subagent colon prefixes for allowed command tokens

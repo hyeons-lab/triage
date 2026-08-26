@@ -426,6 +426,8 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                 return;
             }
             permission_overrides.push(trimmed_target.to_string());
+            permission_overrides.push(format!("self:{trimmed_target}"));
+            permission_overrides.push(format!("subagent:{trimmed_target}"));
             for prefix in &tool_prefixes {
                 permission_overrides.push(format!("{prefix}({trimmed_target})"));
             }
