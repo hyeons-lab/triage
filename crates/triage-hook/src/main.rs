@@ -298,12 +298,25 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         }
     }
 
-    // Auto-detect format based on characteristic payload keys
-    if val.get("conversationId").is_some() || val.get("stepIdx").is_some() {
-        return AgentFormat::Antigravity;
-    }
-    if val.get("hook_event_name").is_some() || val.get("hookEventName").is_some() {
+    if std::env::var("CLAUDE_CODE_VERSION").is_ok()
+        || std::env::var("CLAUDE_PROJECT_DIR").is_ok()
+    {
         return AgentFormat::ClaudeCode;
+    }
+
+    // Auto-detect format based on characteristic payload keys
+    if val.get("conversationId").is_some()
+        || val.get("stepIdx").is_some()
+        || val.get("toolCall").is_some()
+        || val.get("tool_call").is_some()
+        || val.get("workspacePaths").is_some()
+        || val.get("workspace_paths").is_some()
+        || val.get("transcriptPath").is_some()
+        || val.get("transcript_path").is_some()
+        || val.get("artifactDirectoryPath").is_some()
+        || val.get("modelName").is_some()
+    {
+        return AgentFormat::Antigravity;
     }
 
     AgentFormat::Antigravity
@@ -1067,9 +1080,13 @@ mod tests {
             serde_json::from_str(r#"{"conversationId": "123", "stepIdx": 1}"#).unwrap();
         assert_eq!(detect_format(&agy_val), AgentFormat::Antigravity);
 
-        let claude_val: serde_json::Value =
+        let tool_call_val: serde_json::Value =
+            serde_json::from_str(r#"{"toolCall": {"name": "run_command"}}"#).unwrap();
+        assert_eq!(detect_format(&tool_call_val), AgentFormat::Antigravity);
+
+        let hook_event_val: serde_json::Value =
             serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
-        assert_eq!(detect_format(&claude_val), AgentFormat::ClaudeCode);
+        assert_eq!(detect_format(&hook_event_val), AgentFormat::Antigravity);
     }
 
     #[test]
