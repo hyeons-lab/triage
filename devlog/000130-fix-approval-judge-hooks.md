@@ -13,14 +13,17 @@
 - **2026-08-26T00:13-0700** Rebuilt and installed release binaries via `scripts/install.sh`, successfully reloaded live daemon with zero downtime preserving 31 active sessions.
 - **2026-08-26T00:22-0700** Added subagent-scoped permission override prefixes (`self:Bash`, `self:run_command`, `subagent:Bash`, `self`, etc.) in `crates/triage-hook/src/main.rs` so subagents invoked via `invoke_subagent(TypeName="self")` match permission overrides without prompting.
 - **2026-08-26T00:35-0700** Addressed PR review refinements: added plural/inverted aliases (`manage_tasks`, `managetasks`, `stop_task`, `stoptask`) to `is_read_only_tool()`, switched `tool_prefixes` to a static slice to eliminate per-call heap allocations, and used `HashSet::retain` for fast order-preserving deduplication of permission overrides.
+- **2026-08-26T01:08-0700** Fixed remote session ID resolution in `flutter/triage_client/lib/main.dart` to use `session.remoteSessionId` across `writeInput`, `resizeSession`, and `_sessionIdFor` rather than string splitting `session.title`, preventing dropped keystrokes on sessions without slash delimiters.
 
 ## Decisions
 
 - **Multi-prefix command permission overrides**: `triage-hook` emits overrides with `Bash(...)`, `run_command(...)`, `command(...)`, `self:Bash(...)`, `subagent:Bash(...)`, and `{req.tool_name}(...)` so agent runners (Claude Code, Antigravity, subagents, custom runners) match against their expected tool names without manual approval modals.
 - **Gradle in builtin allowlist**: Added `./gradlew`, `gradlew`, and `gradle` to `BUILTIN_ALLOW_COMMANDS` to fast-path standard builds, test suites, and formatting checks without requiring custom config overrides.
+- **Canonical Session ID Routing in Web Client**: Switched web terminal input and resize handlers to use `session.remoteSessionId` instead of splitting `session.title` by `" / "` so sessions with custom or single-word titles reliably deliver keystrokes over WebSockets.
 
 ## Commits
 
 - ae806fd — fix(judge,hook): expand read-only tools, add gradlew allowlist, and emit tool-specific permission overrides
 - 26af621 — fix(hook): add subagent permission override prefixes for self and nested runners
-- HEAD — refactor(hook,judge): add plural tool aliases, use static prefix slices, and deduplicate overrides
+- 06e167c — refactor(hook,judge): add plural tool aliases, use static prefix slices, and deduplicate overrides
+- HEAD — fix(client): route web client terminal input using canonical remote session ID
