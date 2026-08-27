@@ -134,7 +134,7 @@ pub fn is_command_tool(raw: &str) -> bool {
     )
 }
 
-pub const MAX_COMMAND_CHARS: usize = 800;
+pub const MAX_COMMAND_CHARS: usize = 8192;
 
 pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     // Read-only filesystem and content inspection.

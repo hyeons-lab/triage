@@ -72,4 +72,5 @@
 - 89cb78b — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
 - 3ad4013 — feat(judge): auto-approve safe non-force git push while protecting destructive force flags
 - e93849f — style: format code with cargo fmt across all crates
-- HEAD — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
+- b6147b4 — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
+- HEAD — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
