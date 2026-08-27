@@ -25,7 +25,6 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use serde::Deserialize;
 use triage_core::judge::{JudgeRequest, JudgeVerdict};
 use triage_core::session::SessionId;
 
@@ -667,14 +666,39 @@ fn main() {
 /// Produces the verdict and detected agent format, resolving every failure to `ask`.
 fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let start_time = std::time::Instant::now();
-    // Stream-parse the first complete JSON value from stdin directly without waiting for EOF.
-    // The reader thread is terminated when main() exits via std::process::exit(0).
+    // Read stdin incrementally in chunks and parse as soon as a complete JSON payload
+    // is received. This prevents blocking on open, unclosed pipes where EOF is not sent.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let reader = std::io::stdin().lock();
-        let mut de = serde_json::Deserializer::from_reader(reader);
-        let res = serde_json::Value::deserialize(&mut de);
-        let _ = tx.send(res);
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 1024];
+
+        loop {
+            match stdin.read(&mut chunk) {
+                Ok(0) => {
+                    if buf.is_empty() {
+                        let _ = tx.send(Err("empty stdin".to_string()));
+                    } else {
+                        let res = serde_json::from_slice(&buf).map_err(|e| e.to_string());
+                        let _ = tx.send(res);
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                        let _ = tx.send(Ok(val));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                    break;
+                }
+            }
+        }
     });
 
     let val: serde_json::Value = match rx.recv_timeout(JUDGE_TIMEOUT) {
