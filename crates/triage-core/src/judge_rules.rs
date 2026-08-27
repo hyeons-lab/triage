@@ -701,12 +701,20 @@ impl JudgeRules {
                 Some("diff") => Some("gh pr diff"),
                 Some("status") => Some("gh pr status"),
                 Some("ready") => Some("gh pr ready"),
+                Some("create") => Some("gh pr create"),
+                Some("edit") => Some("gh pr edit"),
+                Some("comment") => Some("gh pr comment"),
+                Some("review") => Some("gh pr review"),
+                Some("checkout") => Some("gh pr checkout"),
                 _ => None,
             },
             "issue" => match sub_action {
                 Some("view") => Some("gh issue view"),
                 Some("list") => Some("gh issue list"),
                 Some("status") => Some("gh issue status"),
+                Some("create") => Some("gh issue create"),
+                Some("edit") => Some("gh issue edit"),
+                Some("comment") => Some("gh issue comment"),
                 _ => None,
             },
             "run" => match sub_action {
@@ -739,6 +747,8 @@ impl JudgeRules {
                 _ => None,
             },
             "status" => Some("gh status"),
+            "search" => Some("gh search"),
+            "browse" => Some("gh browse"),
             "api" => {
                 let sub_args = &tokens[1..];
                 // Disallow `gh api graphql` since GraphQL requests default to HTTP POST mutations

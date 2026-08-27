@@ -71,4 +71,5 @@
 - 4bf2bb4 — test(hook): add namespaced tool fallback tests in triage-hook
 - 89cb78b — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
 - 3ad4013 — feat(judge): auto-approve safe non-force git push while protecting destructive force flags
-- HEAD — style: format code with cargo fmt across all crates
+- e93849f — style: format code with cargo fmt across all crates
+- HEAD — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
