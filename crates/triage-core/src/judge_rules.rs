@@ -1034,11 +1034,15 @@ impl JudgeRules {
                     "--delete",
                     "--mirror",
                     "--prune",
+                    "--receive-pack",
+                    "--exec",
                 ];
                 let is_dangerous = sub_args.iter().any(|arg| {
                     GIT_PUSH_DANGEROUS_FLAGS.contains(arg)
                         || arg.starts_with("-f")
                         || arg.starts_with("--force")
+                        || arg.starts_with("--receive-pack")
+                        || arg.starts_with("--exec")
                         || arg.starts_with('+')
                         || arg.starts_with(':')
                 });
@@ -1913,10 +1917,16 @@ pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
                     "--delete",
                     "--mirror",
                     "--prune",
+                    "--receive-pack",
+                    "--exec",
                 ],
                 &['f', 'd'],
             ) || sub_args.iter().any(|arg| {
-                arg.starts_with('+') || arg.starts_with(':') || arg.starts_with("--force")
+                arg.starts_with('+')
+                    || arg.starts_with(':')
+                    || arg.starts_with("--force")
+                    || arg.starts_with("--receive-pack")
+                    || arg.starts_with("--exec")
             }) =>
         {
             Some("destructive git push operation")
@@ -3180,5 +3190,25 @@ mod tests {
         assert!(!is_read_only_tool("task_stop"));
         assert!(!is_read_only_tool("stop_task"));
         assert!(!is_read_only_tool("schedule"));
+    }
+
+    #[test]
+    fn test_git_push_receive_pack_and_exec_blocked() {
+        assert_ne!(
+            evaluate_cmd("git push --receive-pack='sh -c evil' origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git push --exec=calc.exe origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git push origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git push -u origin HEAD:refs/heads/feature").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
     }
 }

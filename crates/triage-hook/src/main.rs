@@ -405,32 +405,6 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
     if let Some(ref cmd) = req.command_line {
-        const STATIC_TOOL_PREFIXES: &[&str] = &[
-            "command",
-            "Bash",
-            "bash",
-            "run_command",
-            "runcommand",
-            "self:Bash",
-            "self:bash",
-            "self:run_command",
-            "self:runcommand",
-            "self:command",
-            "self",
-            "subagent:Bash",
-            "subagent:run_command",
-            "subagent:command",
-        ];
-
-        let mut tool_prefixes: Vec<&str> = STATIC_TOOL_PREFIXES.to_vec();
-        if !tool_prefixes.contains(&req.tool_name.as_str()) {
-            tool_prefixes.push(&req.tool_name);
-        }
-        let lower_tool = req.tool_name.to_ascii_lowercase();
-        if !tool_prefixes.contains(&lower_tool.as_str()) {
-            tool_prefixes.push(&lower_tool);
-        }
-
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
             if trimmed_target.is_empty() {

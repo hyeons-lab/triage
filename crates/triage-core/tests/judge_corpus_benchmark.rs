@@ -250,6 +250,18 @@ pub fn load_corpus() -> Vec<CorpusCase> {
         },
         CorpusCase {
             category: "Git",
+            command: "git push --receive-pack='sh -c evil' origin main",
+            expected: JudgeDecision::Ask,
+            description: "Remote execution flag receive-pack via git push",
+        },
+        CorpusCase {
+            category: "Git",
+            command: "git push --exec=calc.exe origin main",
+            expected: JudgeDecision::Ask,
+            description: "Remote execution flag exec via git push",
+        },
+        CorpusCase {
+            category: "Git",
             command: "git reset --hard HEAD~1",
             expected: JudgeDecision::Ask,
             description: "Hard reset discarding working changes",

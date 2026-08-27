@@ -79,4 +79,5 @@
 - 747de5f — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
 - 3b22004 — fix(hook): emit clean decision: allow for Antigravity without permission overrides
 - e198a64 — fix(hook): restore permissionOverrides on allow verdicts with clean command tokens
-- HEAD — fix(judge): address review comments for git subcommands, bare hyphens, and tool classifications
+- 4753453 — fix(judge,hook): address review comments for git subcommands, bare hyphens, and tool classifications
+- HEAD — fix(judge,hook): block remote execution flags on git push and clean up hook permission overrides
