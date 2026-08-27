@@ -21,6 +21,7 @@
 - **2026-08-26T01:43-0700** Fixed agent format detection in `crates/triage-hook/src/main.rs` to default to strict `Antigravity` format (emitting top-level `decision` and `permissionOverrides` without unknown `hookSpecificOutput` fields) unless explicitly in a Claude Code environment (`CLAUDE_CODE_VERSION` / `CLAUDE_PROJECT_DIR` / `--format=claude`).
 - **2026-08-26T16:25-0700** Switched `crates/triage-hook/src/main.rs` stdin ingestion to stream-parse the first complete JSON value via `serde_json::Deserializer::from_reader` instead of `read_to_string`, eliminating a 10s wait for EOF on pipes that remain open.
 - **2026-08-26T16:31-0700** Added standard platform clipboard inspection and copy tools (`pbpaste`, `pbcopy`, `xclip`, `wl-paste`, `wl-copy`) to `BUILTIN_ALLOW_COMMANDS` in `crates/triage-core/src/judge_rules.rs`.
+- **2026-08-26T17:28-0700** Fixed bug in `crates/triage-core/src/judge_rules.rs` where short flag disqualifier checks matched against long flags starting with the same letter (e.g. `--oneline`, `--cached`, `--color`, `--porcelain` matching short `-o`, `-c`, `-p`), which falsely disqualified allowed git commands.
 
 ## Decisions
 
@@ -33,6 +34,7 @@
 - **Strict Antigravity Response Schema**: Preserved clean `AntigravityResponse` schema (`decision` + `permissionOverrides`) to prevent protojson deserialization failures from extraneous fields.
 - **Accessory Bar Quick Actions**: Added dedicated `^K` key next to `^C` on the mobile/touch accessory bar to enable quick subagent approval without requiring modifier chords.
 - **Stream-Parsed Stdin Payloads**: Stream-parsed JSON values on stdin directly in `triage-hook` without waiting for pipe EOF so lifecycle hooks resolve in sub-millisecond time.
+- **Strict Short Flag Matching**: Enforced `!argument.starts_with("--")` before matching short flag prefixes so long flags starting with `-o`, `-c`, `-p` (like `--oneline`, `--cached`, `--color`) are not falsely disqualified as dangerous flags.
 
 ## Commits
 
@@ -49,4 +51,5 @@
 - c7db8bc — fix(hook): prevent duplicate protojson field in permission override response serialization
 - 060b85d — feat(client,judge): add ctrl+k shortcut key to accessory bar and ad-hoc codesign to allowlist
 - f333888 — fix(hook): stream parse stdin json payload without blocking for eof
-- HEAD — feat(judge): add clipboard utilities to builtin allowlist
+- e3744e6 — feat(judge): add clipboard utilities to builtin allowlist
+- HEAD — fix(judge): prevent short flag disqualification matching against long flags

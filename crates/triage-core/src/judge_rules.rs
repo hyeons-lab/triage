@@ -633,6 +633,7 @@ impl JudgeRules {
                             || lower.starts_with(&format!("{flag}="))
                             || (flag.starts_with('-')
                                 && !flag.starts_with("--")
+                                && !lower.starts_with("--")
                                 && lower.starts_with(flag))
                     })
                 }) {
@@ -1634,7 +1635,7 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
                                     .strip_prefix(flag)
                                     .is_some_and(|rest| rest.starts_with('='))
                         } else {
-                            argument.starts_with(flag)
+                            !argument.starts_with("--") && argument.starts_with(flag)
                         }
                     })
                 })
@@ -2461,15 +2462,31 @@ mod tests {
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("git --no-pager diff --stat").map(|v| v.decision),
+            evaluate_cmd("git log --oneline -5").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("/usr/bin/cargo test").map(|v| v.decision),
+            evaluate_cmd("git diff --cached").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("/opt/homebrew/bin/gh pr list").map(|v| v.decision),
+            evaluate_cmd("git status --porcelain").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git diff --color").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git branch -a").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("pbpaste").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("pbcopy").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }
