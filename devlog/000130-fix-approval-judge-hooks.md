@@ -31,6 +31,7 @@
 - **2026-08-26T20:05-0700** Addressed PR #149 review comments: removed process-management/cancellation tools (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool()`, guarded git worktree and stash positional parsing to prevent allowing destructive actions (`git worktree remove list`, `git stash drop show`), preserved bare `-` in `extract_positional_tokens()`, added `gradle publish` to sensitive substrings, and added comprehensive unit tests.
 - **2026-08-26T21:44-0700** Added Layer 2 allow rules for safe `git fetch`, `git pull`, and `git worktree add` commands while blocking remote execution vectors (`ext::`, `fd::`, `--upload-pack`, `--exec`), and aligned `triage-hook` response serialization to emit strict protojson responses (`decision` + `reason`) for Antigravity and full schema (`hookSpecificOutput` + `permissionOverrides`) for Claude Code.
 - **2026-08-27T01:30-0700** Routed all judge requests through daemon IPC with fallback to in-process offline rules, ensuring daemon decision history and live statistics accurately record all routine allow decisions alongside model evaluations.
+- **2026-08-27T02:15-0700** Added `permissionOverrides` serialization to `AntigravityResponse` in `triage-hook`, added `manage_task` and `schedule` to read-only tool recognition, expanded `BUILTIN_ALLOW_COMMANDS` with standard testing, query, and script runners (`python`, `python3`, `pytest`, `uv`, `node`, `adb`, `go`, `./scripts/*`), and updated unit tests.
 
 ## Decisions
 
@@ -54,6 +55,8 @@
 - **Strict Agent Format Response Contracts**: Enforced strict protojson output (`decision` + `reason`) for Antigravity to avoid unmarshaling failures on unknown fields, while providing complete camelCase `hookSpecificOutput` and `permissionOverrides` for Claude Code and generic agent runners.
 - **Safe Git Network Operations**: Auto-approved non-destructive `git fetch`, `git pull`, and `git worktree add` commands while blocking remote execution vectors (`ext::`, `fd::`, `--upload-pack`, `--exec`).
 - **Authoritative Daemon Audit Trail**: Evaluated all tool calls through daemon IPC by default (falling back to in-process rules if the daemon is stopped or unreachable) so daemon `judge_history`, settings logs, and client telemetry reflect the complete audit trail and accurate approval statistics.
+- **Spec-Compliant Antigravity `permissionOverrides` on All Verdicts**: Emitted camelCase `permissionOverrides` in `AntigravityResponse` so Antigravity CLI has the necessary grant tokens to present interactive approval dialogs on `ask` verdicts and auto-approve on `allow` verdicts.
+- **Task Management and Python Allowlisting**: Added `manage_task` and `schedule` to read-only tools and allowlisted `python`, `python3`, `node`, `pytest`, and `adb` tools to eliminate false approval prompts on background task monitoring and routine agent helper scripts.
 
 ## Commits
 
@@ -87,4 +90,5 @@
 - 4753453 — fix(judge,hook): address review comments for git subcommands, bare hyphens, and tool classifications
 - 1d4095b — fix(judge,hook): block remote execution flags on git push and clean up hook permission overrides
 - deeb9b0 — fix(judge,hook): allow safe git fetch/pull/worktree and enforce strict protojson response for Antigravity
-- HEAD — fix(hook): route judge requests through daemon IPC to populate decision history
+- 0a3e836 — fix(hook): route judge requests through daemon IPC to populate decision history
+- HEAD — fix(judge,hook): emit permissionOverrides for Antigravity, classify task tools, and allowlist python/scripts/adb

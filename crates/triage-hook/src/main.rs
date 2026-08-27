@@ -560,10 +560,13 @@ fn encode_response(
     match format {
         AgentFormat::Antigravity => {
             #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
             struct AntigravityResponse<'a> {
                 decision: &'a str,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 reason: Option<&'a str>,
+                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
+                permission_overrides: &'a Vec<String>,
             }
 
             let reason_opt = if !verdict.reason.is_empty() {
@@ -575,6 +578,7 @@ fn encode_response(
             serde_json::to_string(&AntigravityResponse {
                 decision: decision_str,
                 reason: reason_opt,
+                permission_overrides: &permission_overrides,
             })
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
@@ -963,7 +967,13 @@ mod tests {
         assert_eq!(allow_val["reason"], "matched allow rule: ls");
         assert!(allow_val.get("permissionDecision").is_none());
         assert!(allow_val.get("hookSpecificOutput").is_none());
-        assert!(allow_val.get("permissionOverrides").is_none());
+        let allow_overrides: Vec<&str> = allow_val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(allow_overrides.contains(&"command(git status)"));
 
         let ask_verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,
@@ -983,7 +993,14 @@ mod tests {
         assert_eq!(val["reason"], "command requires confirmation");
         assert!(val.get("permissionDecision").is_none());
         assert!(val.get("hookSpecificOutput").is_none());
-        assert!(val.get("permissionOverrides").is_none());
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"command(VAR=1 ls -la)"));
+        assert!(overrides.contains(&"command(ls -la)"));
     }
 
     #[test]

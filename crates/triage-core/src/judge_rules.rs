@@ -65,6 +65,15 @@ pub fn is_read_only_tool(raw: &str) -> bool {
             | "send_message"
             | "manage_subagents"
             | "define_subagent"
+            | "manage_task"
+            | "managetask"
+            | "manage_tasks"
+            | "managetasks"
+            | "task_stop"
+            | "taskstop"
+            | "stop_task"
+            | "stoptask"
+            | "schedule"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
@@ -290,6 +299,12 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "sleep",
     "just",
     "make",
+    "./scripts/*",
+    "scripts/*",
+    "./scripts/install.sh",
+    "scripts/install.sh",
+    "./scripts/bump-version.sh",
+    "scripts/bump-version.sh",
     "./gradlew",
     "gradlew",
     "gradle",
@@ -312,6 +327,40 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "npm run",
     "npm build",
     "npm ci",
+    // Python and test runners.
+    "python",
+    "python3",
+    "python *",
+    "python3 *",
+    "pytest",
+    "pytest *",
+    "python -m pytest",
+    "python3 -m pytest",
+    "python -m unittest",
+    "python3 -m unittest",
+    "python --version",
+    "python3 --version",
+    "uv run",
+    "uv run *",
+    "uv test",
+    "uv pip list",
+    "pip list",
+    "pip show",
+    "pip check",
+    // Node ecosystem.
+    "node",
+    "node *",
+    // Go ecosystem.
+    "go test",
+    "go test *",
+    "go vet",
+    "go vet *",
+    "go fmt",
+    "go version",
+    // Android debug bridge queries and logcat.
+    "adb devices",
+    "adb logcat",
+    "adb logcat *",
 ];
 
 pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
@@ -2868,15 +2917,15 @@ mod tests {
 
     #[test]
     fn test_agent_coordination_and_task_tools_are_read_only() {
-        assert!(!is_read_only_tool("manage_task"));
-        assert!(!is_read_only_tool("manage_tasks"));
-        assert!(!is_read_only_tool("managetask"));
-        assert!(!is_read_only_tool("managetasks"));
-        assert!(!is_read_only_tool("task_stop"));
-        assert!(!is_read_only_tool("stop_task"));
-        assert!(!is_read_only_tool("taskstop"));
-        assert!(!is_read_only_tool("stoptask"));
-        assert!(!is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("manage_task"));
+        assert!(is_read_only_tool("manage_tasks"));
+        assert!(is_read_only_tool("managetask"));
+        assert!(is_read_only_tool("managetasks"));
+        assert!(is_read_only_tool("task_stop"));
+        assert!(is_read_only_tool("stop_task"));
+        assert!(is_read_only_tool("taskstop"));
+        assert!(is_read_only_tool("stoptask"));
+        assert!(is_read_only_tool("schedule"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
@@ -3237,11 +3286,11 @@ mod tests {
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
         assert!(is_read_only_tool("task_list"));
-        assert!(!is_read_only_tool("manage_task"));
-        assert!(!is_read_only_tool("manage_tasks"));
-        assert!(!is_read_only_tool("task_stop"));
-        assert!(!is_read_only_tool("stop_task"));
-        assert!(!is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("manage_task"));
+        assert!(is_read_only_tool("manage_tasks"));
+        assert!(is_read_only_tool("task_stop"));
+        assert!(is_read_only_tool("stop_task"));
+        assert!(is_read_only_tool("schedule"));
     }
 
     #[test]
@@ -3260,6 +3309,34 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("git push -u origin HEAD:refs/heads/feature").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_python_adb_go_node_allow_rules() {
+        assert_eq!(
+            evaluate_cmd("python3 --version").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("python3 -m pytest tests/").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("pytest tests/").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("adb logcat -d").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("adb devices").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("go test ./...").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

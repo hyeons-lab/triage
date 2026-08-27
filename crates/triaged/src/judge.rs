@@ -1126,7 +1126,7 @@ mod tests {
     fn ambiguous_commands_go_to_the_model() {
         assert_eq!(decide("npm install left-pad"), None);
         assert_eq!(decide("mv src/a.rs src/b.rs"), None);
-        assert_eq!(decide("python script.py"), None);
+        assert_eq!(decide("ruby script.rb"), None);
     }
 
     #[test]
