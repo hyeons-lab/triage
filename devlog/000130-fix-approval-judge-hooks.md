@@ -30,6 +30,7 @@
 - **2026-08-26T18:48-0700** Added `normalize_tool_name` to `JudgeRules` to strip server and namespace prefixes (`default_api:`, `mcp__*`, `cortex:`, `server:`, etc.) from tool calls, resolving false-positive `Ask` verdicts on standard Antigravity and MCP tool invocations (`default_api:run_command`, `default_api:view_file`, `code-review-graph:query_graph`).
 - **2026-08-26T20:05-0700** Addressed PR #149 review comments: removed process-management/cancellation tools (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool()`, guarded git worktree and stash positional parsing to prevent allowing destructive actions (`git worktree remove list`, `git stash drop show`), preserved bare `-` in `extract_positional_tokens()`, added `gradle publish` to sensitive substrings, and added comprehensive unit tests.
 - **2026-08-26T21:44-0700** Added Layer 2 allow rules for safe `git fetch`, `git pull`, and `git worktree add` commands while blocking remote execution vectors (`ext::`, `fd::`, `--upload-pack`, `--exec`), and aligned `triage-hook` response serialization to emit strict protojson responses (`decision` + `reason`) for Antigravity and full schema (`hookSpecificOutput` + `permissionOverrides`) for Claude Code.
+- **2026-08-27T01:30-0700** Routed all judge requests through daemon IPC with fallback to in-process offline rules, ensuring daemon decision history and live statistics accurately record all routine allow decisions alongside model evaluations.
 
 ## Decisions
 
@@ -52,6 +53,7 @@
 - **Positional Subcommand Guarding**: Required git `worktree` and `stash` rules to check extracted positionals rather than broad substring containment, preventing commands like `git worktree remove list` or `git stash drop show` from being auto-approved.
 - **Strict Agent Format Response Contracts**: Enforced strict protojson output (`decision` + `reason`) for Antigravity to avoid unmarshaling failures on unknown fields, while providing complete camelCase `hookSpecificOutput` and `permissionOverrides` for Claude Code and generic agent runners.
 - **Safe Git Network Operations**: Auto-approved non-destructive `git fetch`, `git pull`, and `git worktree add` commands while blocking remote execution vectors (`ext::`, `fd::`, `--upload-pack`, `--exec`).
+- **Authoritative Daemon Audit Trail**: Evaluated all tool calls through daemon IPC by default (falling back to in-process rules if the daemon is stopped or unreachable) so daemon `judge_history`, settings logs, and client telemetry reflect the complete audit trail and accurate approval statistics.
 
 ## Commits
 
@@ -84,4 +86,5 @@
 - e198a64 — fix(hook): restore permissionOverrides on allow verdicts with clean command tokens
 - 4753453 — fix(judge,hook): address review comments for git subcommands, bare hyphens, and tool classifications
 - 1d4095b — fix(judge,hook): block remote execution flags on git push and clean up hook permission overrides
-- HEAD — fix(judge,hook): allow safe git fetch/pull/worktree and enforce strict protojson response for Antigravity
+- deeb9b0 — fix(judge,hook): allow safe git fetch/pull/worktree and enforce strict protojson response for Antigravity
+- HEAD — fix(hook): route judge requests through daemon IPC to populate decision history

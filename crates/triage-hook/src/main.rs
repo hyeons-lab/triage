@@ -732,12 +732,6 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
         path,
         cwd,
     };
-    // 1. Fast path: Evaluate deterministic Layer 1 (Deny) and Layer 2 (Allow) rules directly in-process.
-    // This takes <0.1ms and avoids any IPC/thread overhead for standard developer commands.
-    if let Some(verdict) = evaluate_in_process(&request) {
-        return (verdict, format, Some(request));
-    }
-    // 2. Slow path: For ambiguous commands needing Layer 3 model evaluation, ask the daemon.
     let remaining_timeout = JUDGE_TIMEOUT.saturating_sub(start_time.elapsed());
     let verdict = ask_daemon(request.clone(), remaining_timeout);
     (verdict, format, Some(request))
