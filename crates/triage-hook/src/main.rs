@@ -567,11 +567,6 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             }
         }
     }
-    if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase())
-        || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
-    {
-        permission_overrides.push(format!("tool({})", req.tool_name));
-    }
 
     let mut seen = std::collections::HashSet::new();
     permission_overrides.retain(|item| seen.insert(item.clone()));
@@ -601,12 +596,12 @@ fn encode_response(
                 )]
                 permission_overrides: Option<&'a Vec<String>>,
             }
-            let reason = if verdict.decision != triage_core::judge::JudgeDecision::Allow
-                && !verdict.reason.is_empty()
+            let reason = if verdict.decision == triage_core::judge::JudgeDecision::Allow
+                || verdict.reason.is_empty()
             {
-                Some(verdict.reason.as_str())
-            } else {
                 None
+            } else {
+                Some(verdict.reason.as_str())
             };
             let overrides = if !permission_overrides.is_empty() {
                 Some(&permission_overrides)
@@ -966,8 +961,24 @@ mod tests {
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
-        let allow_encoded = encode_response(AgentFormat::Antigravity, &allow_verdict, None);
-        assert_eq!(allow_encoded, r#"{"decision":"allow"}"#);
+        let allow_req = JudgeRequest {
+            session_id: SessionId::new("123").unwrap(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("git status".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let allow_encoded =
+            encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
+        let allow_val: serde_json::Value = serde_json::from_str(&allow_encoded).unwrap();
+        assert_eq!(allow_val["decision"], "allow");
+        let allow_overrides: Vec<&str> = allow_val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(allow_overrides.contains(&"command(git status)"));
 
         let ask_verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,

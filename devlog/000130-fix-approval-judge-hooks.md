@@ -68,4 +68,5 @@
 - 530bc71 — fix(hook): fast-path in-process layer 1 and 2 rules and emit permission overrides on allow
 - 1e94bfb — fix(hook): parse stdin payload incrementally on first complete json object without blocking on unclosed pipes
 - 3a96262 — fix(judge): normalize tool names by stripping MCP and namespace prefixes
-- HEAD — test(hook): add namespaced tool fallback tests in triage-hook
+- 4bf2bb4 — test(hook): add namespaced tool fallback tests in triage-hook
+- HEAD — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
