@@ -28,6 +28,7 @@
 - **2026-08-26T18:10-0700** Added deterministic in-process Layer 1 and 2 rule fast-path to `triage-hook` to evaluate safe developer commands in <0.1ms without IPC overhead, and ensured `permissionOverrides` are always computed and emitted on `allow` verdicts so Antigravity CLI receives explicit permission grants.
 - **2026-08-26T18:42-0700** Replaced `serde_json::Deserializer::from_reader` in `triage-hook` with incremental chunk-buffered stdin reading that parses as soon as a complete JSON object is received, resolving an issue where `from_reader` blocked on open, unclosed pipes where the runner does not send EOF before receiving the hook decision.
 - **2026-08-26T18:48-0700** Added `normalize_tool_name` to `JudgeRules` to strip server and namespace prefixes (`default_api:`, `mcp__*`, `cortex:`, `server:`, etc.) from tool calls, resolving false-positive `Ask` verdicts on standard Antigravity and MCP tool invocations (`default_api:run_command`, `default_api:view_file`, `code-review-graph:query_graph`).
+- **2026-08-26T20:05-0700** Addressed PR #149 review comments: removed process-management/cancellation tools (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool()`, guarded git worktree and stash positional parsing to prevent allowing destructive actions (`git worktree remove list`, `git stash drop show`), preserved bare `-` in `extract_positional_tokens()`, added `gradle publish` to sensitive substrings, and added comprehensive unit tests.
 
 ## Decisions
 
@@ -46,6 +47,8 @@
 - **In-Process Fast-Path & Persistent Overrides**: Evaluated deterministic rules directly in `triage-hook` before IPC and emitted `permissionOverrides` on `allow` decisions so Antigravity CLI receives sub-millisecond responses and explicit tool permission grants.
 - **Incremental Chunk-Buffered Stdin Reading**: Read stdin in 1KB chunks and parse on each chunk arrival so `triage-hook` never blocks waiting for EOF on unclosed pipe descriptors.
 - **Tool Name Namespace Normalization**: Normalized namespaced and prefixed tool calls (`default_api:*`, `mcp__*`, `server:*`) so standard developer tools match their core tool categories without requiring per-plugin duplication.
+- **Interactive & Process-Management Tool Exemption from Read-Only**: Separated pure status query tools (`task_status`, `list_tasks`, `task_list`) from multi-action tools that accept input injection or cancel running processes (`manage_task`, `task_stop`, `schedule`), ensuring command-bearing tools undergo rigorous command and path evaluation.
+- **Positional Subcommand Guarding**: Required git `worktree` and `stash` rules to check extracted positionals rather than broad substring containment, preventing commands like `git worktree remove list` or `git stash drop show` from being auto-approved.
 
 ## Commits
 
@@ -75,4 +78,5 @@
 - b6147b4 — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
 - 747de5f — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
 - 3b22004 — fix(hook): emit clean decision: allow for Antigravity without permission overrides
-- HEAD — fix(hook): restore permissionOverrides on allow verdicts with clean command tokens
+- e198a64 — fix(hook): restore permissionOverrides on allow verdicts with clean command tokens
+- HEAD — fix(judge): address review comments for git subcommands, bare hyphens, and tool classifications

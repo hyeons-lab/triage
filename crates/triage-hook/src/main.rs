@@ -1021,6 +1021,32 @@ mod tests {
     }
 
     #[test]
+    fn permission_overrides_for_custom_tool_name_emits_dynamic_tool_prefixes() {
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: ls".to_string(),
+        };
+        let request = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "ExecuteCustomCommand".to_string(),
+            command_line: Some("ls -la".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
+        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(val["decision"], "allow");
+        let overrides: Vec<&str> = val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(overrides.contains(&"command(ls -la)"));
+    }
+
+    #[test]
     fn permission_overrides_for_git_commands_with_global_flags_emit_bare_and_subcommand_tokens() {
         let verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,

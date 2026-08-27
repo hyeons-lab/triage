@@ -65,21 +65,14 @@ pub fn is_read_only_tool(raw: &str) -> bool {
             | "send_message"
             | "manage_subagents"
             | "define_subagent"
-            | "schedule"
-            | "manage_task"
-            | "manage_tasks"
-            | "managetask"
-            | "managetasks"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
             | "gettaskstatus"
             | "list_tasks"
             | "listtasks"
-            | "task_stop"
-            | "stop_task"
-            | "taskstop"
-            | "stoptask"
+            | "task_list"
+            | "tasklist"
             | "tool_search"
             | "toolsearch"
             | "skill"
@@ -338,6 +331,8 @@ pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
     // Outward-facing publishing / releases.
     "cargo publish",
     "npm publish",
+    "gradle publish",
+    "gradlew publish",
     "gh release",
     "gh pr create",
     // Permission blanket-opening.
@@ -752,9 +747,13 @@ impl JudgeRules {
             "api" => {
                 let sub_args = &tokens[1..];
                 // Disallow `gh api graphql` since GraphQL requests default to HTTP POST mutations
-                if sub_args
-                    .iter()
-                    .any(|arg| arg.to_ascii_lowercase().contains("graphql"))
+                if positional
+                    .get(2..)
+                    .map(|eps| {
+                        eps.iter()
+                            .any(|arg| arg.to_ascii_lowercase().contains("graphql"))
+                    })
+                    .unwrap_or(false)
                 {
                     return None;
                 }
@@ -802,6 +801,7 @@ impl JudgeRules {
             return None;
         }
         let (subcommand, sub_args) = parse_git_subcommand(&tokens[1..])?;
+        let sub_positionals = extract_positional_tokens(sub_args);
 
         match subcommand {
             "diff" => Some("git diff"),
@@ -820,7 +820,7 @@ impl JudgeRules {
             "check-ignore" => Some("git check-ignore"),
             "blame" => Some("git blame"),
             "ls-files" => Some("git ls-files"),
-            "worktree" if sub_args.contains(&"list") => Some("git worktree list"),
+            "worktree" if sub_positionals.first() == Some(&"list") => Some("git worktree list"),
             "stash" => Some("git stash"),
             "rebase"
                 if sub_args.contains(&"--continue")
@@ -1772,6 +1772,21 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     "--repo",
     "--hostname",
     "-h",
+    "-H",
+    "--header",
+    "-X",
+    "--method",
+    "-f",
+    "--field",
+    "-F",
+    "--raw-field",
+    "--input",
+    "-p",
+    "--preview",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
     // cargo
     "--manifest-path",
     "--package",
@@ -1796,13 +1811,8 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
 ];
 
 pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
-    if tokens.is_empty() {
-        return Vec::new();
-    }
     let mut positionals = Vec::new();
-    positionals.push(tokens[0]);
-
-    let mut i = 1;
+    let mut i = 0;
     while i < tokens.len() {
         let token = tokens[i];
         if token == "--" {
@@ -1811,7 +1821,22 @@ pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
             }
             break;
         }
-        if token.starts_with('-') {
+        if token != "-" && token.starts_with('-') {
+            if (token.starts_with("-C") && token != "-C")
+                || (token.starts_with("-c") && token != "-c")
+                || (token.starts_with("-R") && token != "-R")
+                || (token.starts_with("-p") && token != "-p")
+                || (token.starts_with("-H") && token != "-H")
+                || (token.starts_with("-f") && token != "-f")
+                || (token.starts_with("-F") && token != "-F")
+                || (token.starts_with("-d") && token != "-d")
+                || (token.starts_with("-t") && token != "-t")
+                || (token.starts_with("-Z") && token != "-Z")
+                || token.contains('=')
+            {
+                i += 1;
+                continue;
+            }
             if KNOWN_VALUE_TAKING_FLAGS.contains(&token) {
                 i += 2;
                 continue;
@@ -1906,6 +1931,9 @@ pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
             ) =>
         {
             Some("destructive git branch operation")
+        }
+        "stash" if sub_args.iter().any(|&arg| arg == "drop" || arg == "clear") => {
+            Some("destructive git stash operation")
         }
         _ => None,
     }
@@ -2803,18 +2831,20 @@ mod tests {
 
     #[test]
     fn test_agent_coordination_and_task_tools_are_read_only() {
-        assert!(is_read_only_tool("manage_task"));
-        assert!(is_read_only_tool("manage_tasks"));
-        assert!(is_read_only_tool("managetask"));
-        assert!(is_read_only_tool("managetasks"));
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("manage_tasks"));
+        assert!(!is_read_only_tool("managetask"));
+        assert!(!is_read_only_tool("managetasks"));
+        assert!(!is_read_only_tool("task_stop"));
+        assert!(!is_read_only_tool("stop_task"));
+        assert!(!is_read_only_tool("taskstop"));
+        assert!(!is_read_only_tool("stoptask"));
+        assert!(!is_read_only_tool("schedule"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
-        assert!(is_read_only_tool("task_stop"));
-        assert!(is_read_only_tool("stop_task"));
-        assert!(is_read_only_tool("taskstop"));
-        assert!(is_read_only_tool("stoptask"));
-        assert!(is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("task_list"));
+        assert!(is_read_only_tool("tasklist"));
         assert!(is_read_only_tool("websearch"));
         assert!(is_read_only_tool("web_fetch"));
         assert!(is_read_only_tool("webfetch"));
@@ -3049,5 +3079,106 @@ mod tests {
             rules.evaluate(&mcp_req).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
+    }
+
+    #[test]
+    fn test_git_worktree_and_stash_mutations_not_allowed() {
+        assert_ne!(
+            evaluate_cmd("git worktree remove list").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git stash drop show").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git stash clear").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git worktree list").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git worktree list --porcelain").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git stash list").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git stash show 'stash@{0}'").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git stash show").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git stash pop").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_extract_positional_tokens_preserves_bare_hyphen() {
+        let tokens = vec!["git", "switch", "-"];
+        let positionals = extract_positional_tokens(&tokens);
+        assert_eq!(positionals, vec!["git", "switch", "-"]);
+
+        let tokens = vec!["git", "diff", "--", "-"];
+        let positionals = extract_positional_tokens(&tokens);
+        assert_eq!(positionals, vec!["git", "diff", "-"]);
+    }
+
+    #[test]
+    fn test_gh_api_headers_and_graphql() {
+        assert_eq!(
+            evaluate_cmd("gh api -H 'X-Custom: graphql' repos/hyeons-lab/triage")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("gh api graphql -f query='{ viewer { login } }'").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_gradle_publish_denied() {
+        assert_eq!(
+            evaluate_cmd("./gradlew publish").map(|v| v.decision),
+            Some(JudgeDecision::Ask)
+        );
+        assert_eq!(
+            evaluate_cmd("gradlew publish").map(|v| v.decision),
+            Some(JudgeDecision::Ask)
+        );
+        assert_eq!(
+            evaluate_cmd("gradle publish").map(|v| v.decision),
+            Some(JudgeDecision::Ask)
+        );
+        assert_eq!(
+            evaluate_cmd("./gradlew test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("./gradlew build").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_task_tools_classification() {
+        assert!(is_read_only_tool("task_status"));
+        assert!(is_read_only_tool("get_task_status"));
+        assert!(is_read_only_tool("list_tasks"));
+        assert!(is_read_only_tool("task_list"));
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("manage_tasks"));
+        assert!(!is_read_only_tool("task_stop"));
+        assert!(!is_read_only_tool("stop_task"));
+        assert!(!is_read_only_tool("schedule"));
     }
 }
