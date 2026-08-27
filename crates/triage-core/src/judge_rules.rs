@@ -1032,11 +1032,7 @@ impl JudgeRules {
                         || arg.starts_with('+')
                         || arg.starts_with(':')
                 });
-                if is_dangerous {
-                    None
-                } else {
-                    Some("git push")
-                }
+                if is_dangerous { None } else { Some("git push") }
             }
             _ => None,
         }
@@ -1884,9 +1880,9 @@ pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
                     "--prune",
                 ],
                 &['f', 'd'],
-            ) || sub_args
-                .iter()
-                .any(|arg| arg.starts_with('+') || arg.starts_with(':') || arg.starts_with("--force")) =>
+            ) || sub_args.iter().any(|arg| {
+                arg.starts_with('+') || arg.starts_with(':') || arg.starts_with("--force")
+            }) =>
         {
             Some("destructive git push operation")
         }

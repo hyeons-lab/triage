@@ -639,7 +639,10 @@ mod tests {
         // Dangerous flags on find or git are disqualified.
         assert_eq!(decide("find /tmp -delete"), None);
         assert_eq!(decide("find . -exec rm {} +"), None);
-        assert_eq!(decide("git --no-pager push --force"), Some(JudgeDecision::Ask));
+        assert_eq!(
+            decide("git --no-pager push --force"),
+            Some(JudgeDecision::Ask)
+        );
         assert_eq!(decide("git tag -d v1.0"), None);
         assert_eq!(decide("git tag -a v1.0 -m 'release'"), None);
         assert_eq!(decide("gh api --field=title=bug /repos/x/y/issues"), None);
@@ -714,7 +717,10 @@ mod tests {
         // `git push --force` starts with no allowlisted rule, but `git branch -D` does
         // overlap `git branch`, so ordering is load-bearing.
         assert_eq!(decide("git branch -D feature"), Some(JudgeDecision::Ask));
-        assert_eq!(decide("git push --force origin main"), Some(JudgeDecision::Ask));
+        assert_eq!(
+            decide("git push --force origin main"),
+            Some(JudgeDecision::Ask)
+        );
         assert_eq!(decide("git push origin main"), Some(JudgeDecision::Allow));
     }
 
