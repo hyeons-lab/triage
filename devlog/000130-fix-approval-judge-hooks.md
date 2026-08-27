@@ -73,4 +73,5 @@
 - 3ad4013 — feat(judge): auto-approve safe non-force git push while protecting destructive force flags
 - e93849f — style: format code with cargo fmt across all crates
 - b6147b4 — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
-- HEAD — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
+- 747de5f — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
+- HEAD — fix(hook): emit clean decision: allow for Antigravity without permission overrides

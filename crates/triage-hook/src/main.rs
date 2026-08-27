@@ -603,7 +603,9 @@ fn encode_response(
             } else {
                 Some(verdict.reason.as_str())
             };
-            let overrides = if !permission_overrides.is_empty() {
+            let overrides = if verdict.decision != triage_core::judge::JudgeDecision::Allow
+                && !permission_overrides.is_empty()
+            {
                 Some(&permission_overrides)
             } else {
                 None
@@ -655,6 +657,21 @@ fn main() {
     let mut stdout = std::io::stdout();
     let _ = writeln!(stdout, "{encoded}");
     let _ = stdout.flush();
+    if let Ok(mut log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/triage-hook.log")
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            log_file,
+            "[{:?}] Request: {:?} -> Verdict: {:?} -> Output: {}",
+            std::time::SystemTime::now(),
+            request,
+            verdict,
+            encoded
+        );
+    }
     std::process::exit(0);
 }
 
@@ -972,13 +989,8 @@ mod tests {
             encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
         let allow_val: serde_json::Value = serde_json::from_str(&allow_encoded).unwrap();
         assert_eq!(allow_val["decision"], "allow");
-        let allow_overrides: Vec<&str> = allow_val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(allow_overrides.contains(&"command(git status)"));
+        assert!(allow_val.get("reason").is_none());
+        assert!(allow_val.get("permissionOverrides").is_none());
 
         let ask_verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,
