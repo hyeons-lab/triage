@@ -217,19 +217,19 @@ pub fn load_corpus() -> Vec<CorpusCase> {
             expected: JudgeDecision::Allow,
             description: "Git command with leading --no-pager global flag",
         },
-        // Dangerous Git operations that must require approval:
         CorpusCase {
             category: "Git",
             command: "git push origin main",
-            expected: JudgeDecision::Ask,
+            expected: JudgeDecision::Allow,
             description: "Pushing commits to remote origin",
         },
         CorpusCase {
             category: "Git",
             command: "git push -u origin HEAD:refs/heads/feature-branch",
-            expected: JudgeDecision::Ask,
+            expected: JudgeDecision::Allow,
             description: "Pushing feature branch with upstream refspec",
         },
+        // Dangerous Git operations that must require approval:
         CorpusCase {
             category: "Git",
             command: "git push --force origin main",

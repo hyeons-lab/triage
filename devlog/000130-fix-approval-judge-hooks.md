@@ -69,4 +69,5 @@
 - 1e94bfb — fix(hook): parse stdin payload incrementally on first complete json object without blocking on unclosed pipes
 - 3a96262 — fix(judge): normalize tool names by stripping MCP and namespace prefixes
 - 4bf2bb4 — test(hook): add namespaced tool fallback tests in triage-hook
-- HEAD — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
+- 89cb78b — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
+- HEAD — feat(judge): auto-approve safe non-force git push while protecting destructive force flags

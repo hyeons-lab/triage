@@ -1014,6 +1014,30 @@ impl JudgeRules {
             {
                 Some("git remote -v")
             }
+            "push" => {
+                const GIT_PUSH_DANGEROUS_FLAGS: &[&str] = &[
+                    "-f",
+                    "--force",
+                    "--force-with-lease",
+                    "--force-if-includes",
+                    "-d",
+                    "--delete",
+                    "--mirror",
+                    "--prune",
+                ];
+                let is_dangerous = sub_args.iter().any(|arg| {
+                    GIT_PUSH_DANGEROUS_FLAGS.contains(arg)
+                        || arg.starts_with("-f")
+                        || arg.starts_with("--force")
+                        || arg.starts_with('+')
+                        || arg.starts_with(':')
+                });
+                if is_dangerous {
+                    None
+                } else {
+                    Some("git push")
+                }
+            }
             _ => None,
         }
     }
@@ -1849,7 +1873,23 @@ pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
     };
 
     match subcommand {
-        "push" => Some("git push"),
+        "push"
+            if has(
+                &[
+                    "--force",
+                    "--force-with-lease",
+                    "--force-if-includes",
+                    "--delete",
+                    "--mirror",
+                    "--prune",
+                ],
+                &['f', 'd'],
+            ) || sub_args
+                .iter()
+                .any(|arg| arg.starts_with('+') || arg.starts_with(':') || arg.starts_with("--force")) =>
+        {
+            Some("destructive git push operation")
+        }
         "filter-branch" => Some("git filter-branch"),
         "reset" if has(&["--hard"], &[]) => Some("git reset --hard"),
         "clean" if has(&["--force"], &['f']) => Some("git clean --force"),

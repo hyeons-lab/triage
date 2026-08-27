@@ -1402,12 +1402,11 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_url));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides: Vec<&str> = val
+            .get("permissionOverrides")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
         assert!(!overrides.iter().any(|s| s.starts_with("file(")));
         assert!(!overrides.iter().any(|s| s.contains("/*")));
     }

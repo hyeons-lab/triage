@@ -639,7 +639,7 @@ mod tests {
         // Dangerous flags on find or git are disqualified.
         assert_eq!(decide("find /tmp -delete"), None);
         assert_eq!(decide("find . -exec rm {} +"), None);
-        assert_eq!(decide("git --no-pager push"), Some(JudgeDecision::Ask));
+        assert_eq!(decide("git --no-pager push --force"), Some(JudgeDecision::Ask));
         assert_eq!(decide("git tag -d v1.0"), None);
         assert_eq!(decide("git tag -a v1.0 -m 'release'"), None);
         assert_eq!(decide("gh api --field=title=bug /repos/x/y/issues"), None);
@@ -711,10 +711,11 @@ mod tests {
 
     #[test]
     fn sensitive_rules_escalate_to_ask_over_allow_rules() {
-        // `git push` starts with no allowlisted rule, but `git branch -D` does
+        // `git push --force` starts with no allowlisted rule, but `git branch -D` does
         // overlap `git branch`, so ordering is load-bearing.
         assert_eq!(decide("git branch -D feature"), Some(JudgeDecision::Ask));
-        assert_eq!(decide("git push origin main"), Some(JudgeDecision::Ask));
+        assert_eq!(decide("git push --force origin main"), Some(JudgeDecision::Ask));
+        assert_eq!(decide("git push origin main"), Some(JudgeDecision::Allow));
     }
 
     #[test]
@@ -776,9 +777,9 @@ mod tests {
     #[test]
     fn git_sensitive_operations_ask_through_wrappers() {
         for command in [
-            "env git push origin main",
-            "env -u FOO git push",
-            "timeout 5 git push",
+            "env git push --force origin main",
+            "env -u FOO git push --force",
+            "timeout 5 git push --force",
             "timeout -s KILL 5 git reset --hard HEAD~1",
             "sudo git clean -f",
             "nice git filter-branch --tree-filter 'rm -f passwords.txt' HEAD",
@@ -945,11 +946,11 @@ mod tests {
     #[test]
     fn a_git_global_flag_cannot_hide_a_destructive_subcommand() {
         // git accepts global flags before the subcommand, so substring rules
-        // that assumed `git push` were adjacent missed all of these.
+        // that assumed `git push --force` were adjacent missed all of these.
         for command in [
-            "git --no-pager push origin main",
+            "git --no-pager push --force origin main",
             "git -C . reset --hard",
-            "git -c core.pager=cat push",
+            "git -c core.pager=cat push --force",
             "git clean --force -d",
             "git --no-pager filter-branch --all",
         ] {
