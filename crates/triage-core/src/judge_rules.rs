@@ -820,7 +820,34 @@ impl JudgeRules {
             "check-ignore" => Some("git check-ignore"),
             "blame" => Some("git blame"),
             "ls-files" => Some("git ls-files"),
+            "fetch" => {
+                let has_dangerous = sub_args.iter().any(|arg| {
+                    arg.contains("ext::")
+                        || arg.contains("fd::")
+                        || arg.starts_with("--upload-pack")
+                        || arg.starts_with("--exec")
+                });
+                if has_dangerous {
+                    None
+                } else {
+                    Some("git fetch")
+                }
+            }
+            "pull" => {
+                let has_dangerous = sub_args.iter().any(|arg| {
+                    arg.contains("ext::")
+                        || arg.contains("fd::")
+                        || arg.starts_with("--upload-pack")
+                        || arg.starts_with("--exec")
+                });
+                if has_dangerous {
+                    None
+                } else {
+                    Some("git pull")
+                }
+            }
             "worktree" if sub_positionals.first() == Some(&"list") => Some("git worktree list"),
+            "worktree" if sub_positionals.first() == Some(&"add") => Some("git worktree add"),
             "stash" => Some("git stash"),
             "rebase"
                 if sub_args.contains(&"--continue")
@@ -2982,6 +3009,31 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("git stash pop").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git fetch origin").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git -C worktrees/foo fetch --all").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git pull origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git pull --rebase").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git worktree add worktrees/feat -b feat/x origin/main")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git fetch ext::sh -c id").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
