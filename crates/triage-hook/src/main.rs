@@ -591,37 +591,9 @@ fn encode_response(
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
         AgentFormat::ClaudeCode => {
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct ClaudeHookSpecificOutput<'a> {
-                hook_event_name: &'static str,
-                permission_decision: &'a str,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                permission_decision_reason: Option<&'a str>,
-            }
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct ClaudeResponse<'a> {
-                hook_specific_output: ClaudeHookSpecificOutput<'a>,
-            }
-
-            let reason_opt = if !verdict.reason.is_empty() {
-                Some(verdict.reason.as_str())
-            } else {
-                None
-            };
-
-            serde_json::to_string(&ClaudeResponse {
-                hook_specific_output: ClaudeHookSpecificOutput {
-                    hook_event_name: "PreToolUse",
-                    permission_decision: decision_str,
-                    permission_decision_reason: reason_opt,
-                },
-            })
-            .unwrap_or_else(|_| {
-                r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}"#
-                    .to_string()
-            })
+            // Claude Code has its own native auto mode and permission system.
+            // Do not alter or intercept Claude Code behavior; return empty output for silent passthrough.
+            String::new()
         }
         AgentFormat::Generic => {
             #[derive(serde::Serialize)]
@@ -653,9 +625,11 @@ fn encode_response(
 fn main() {
     let (verdict, format, request) = decide();
     let encoded = encode_response(format, &verdict, request.as_ref());
-    let mut stdout = std::io::stdout();
-    let _ = writeln!(stdout, "{encoded}");
-    let _ = stdout.flush();
+    if !encoded.is_empty() {
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout, "{encoded}");
+        let _ = stdout.flush();
+    }
     if let Ok(mut log_file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1105,17 +1079,14 @@ mod tests {
     }
 
     #[test]
-    fn response_serializes_to_the_claude_contract() {
+    fn claude_code_format_returns_empty_string_for_silent_passthrough() {
         let verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
         let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
-        assert_eq!(
-            encoded,
-            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
-        );
+        assert_eq!(encoded, "");
     }
 
     #[test]
@@ -1458,26 +1429,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_response_uses_camel_case_keys() {
+    fn generic_response_uses_camel_case_keys() {
         let verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rules".to_string(),
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
+        let encoded = encode_response(AgentFormat::Generic, &verdict, None);
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert!(val.get("hookSpecificOutput").is_some());
-        let hook_output = &val["hookSpecificOutput"];
-        assert_eq!(hook_output["hookEventName"], "PreToolUse");
-        assert_eq!(hook_output["permissionDecision"], "allow");
-        assert_eq!(
-            hook_output["permissionDecisionReason"],
-            "matched allow rules"
-        );
-        // Ensure no snake_case keys leaked
-        assert!(val.get("hook_specific_output").is_none());
-        assert!(hook_output.get("hook_event_name").is_none());
-        assert!(hook_output.get("permission_decision").is_none());
+        assert_eq!(val["decision"], "allow");
+        assert_eq!(val["reason"], "matched allow rules");
     }
 
     #[test]

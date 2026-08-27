@@ -34,6 +34,7 @@
 - **2026-08-27T02:15-0700** Added `permissionOverrides` serialization to `AntigravityResponse` in `triage-hook`, added `manage_task` and `schedule` to read-only tool recognition, expanded `BUILTIN_ALLOW_COMMANDS` with standard testing, query, and script runners (`python`, `python3`, `pytest`, `uv`, `node`, `adb`, `go`, `./scripts/*`), and updated unit tests.
 - **2026-08-27T07:48-0700** Added Docker, Podman, archive tools (`unzip`, `tar`, `gzip`, `zip`), and Triage workspace binaries (`triage-hook`, `triaged`, `triage`) to `BUILTIN_ALLOW_COMMANDS`, preventing false approval prompts for container builds and conversions.
 - **2026-08-27T09:11-0700** Aligned `triage-hook` response encoding with Claude Code's PreToolUse specification by emitting pure `hookSpecificOutput` with `permissionDecision: "allow" | "deny" | "ask"`, removing extraneous top-level fields (`decision: "approve"`, `permissionOverrides`) that caused Claude Code's hook parser to reject approvals and prompt the user.
+- **2026-08-27T09:23-0700** Removed `triage-hook` from Claude Code `~/.claude/settings.json` and updated `triage-hook` to act as a silent passthrough (empty output on exit 0) when Claude Code is detected, ensuring Claude Code's native auto mode handles all permissions with zero hook interference.
 
 ## Decisions
 
@@ -60,7 +61,7 @@
 - **Spec-Compliant Antigravity `permissionOverrides` on All Verdicts**: Emitted camelCase `permissionOverrides` in `AntigravityResponse` so Antigravity CLI has the necessary grant tokens to present interactive approval dialogs on `ask` verdicts and auto-approve on `allow` verdicts.
 - **Task Management and Python Allowlisting**: Added `manage_task` and `schedule` to read-only tools and allowlisted `python`, `python3`, `node`, `pytest`, and `adb` tools to eliminate false approval prompts on background task monitoring and routine agent helper scripts.
 - **Docker and Container Toolchain Allowlisting**: Auto-approved routine container operations (`docker build`, `docker run`, `docker compose`, `docker ps`, `docker images`, `docker logs`, `podman`) and archive utilities (`unzip`, `tar`, `gzip`) in Layer 2 deterministic rules so containerized builds and cross-compilations run seamlessly without prompting.
-- **Strict Claude Code Hook Schema Conformance**: Aligned Claude Code PreToolUse output with official specification (`hookSpecificOutput` containing `hookEventName`, `permissionDecision`, `permissionDecisionReason`). Omitted Antigravity-only `permissionOverrides` and deprecated `decision: "approve"` so Claude Code accepts `allow` verdicts immediately without user confirmation prompts.
+- **Claude Code Native Auto Mode Passthrough**: Preserved Claude Code's built-in auto mode (`permissions: { defaultMode: "auto" }`) without hook interception. Removed `triage-hook` from Claude Code settings and configured `triage-hook` to return an empty response (silent exit 0) when invoked by Claude Code.
 
 ## Commits
 
@@ -97,4 +98,5 @@
 - 0a3e836 — fix(hook): route judge requests through daemon IPC to populate decision history
 - 8c48137 — fix(judge,hook): emit permissionOverrides for Antigravity, classify task tools, and allowlist python/scripts/adb
 - f6b6722 — feat(judge): add docker, podman, archive utilities, and triage binaries to builtin allowlist
-- HEAD — fix(hook): align Claude Code PreToolUse hook response to strict schema
+- 994912c — fix(hook): align Claude Code PreToolUse hook response to strict schema
+- HEAD — fix(hook): make Claude Code format silent passthrough to preserve native auto mode
