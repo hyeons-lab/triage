@@ -302,7 +302,15 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         return AgentFormat::ClaudeCode;
     }
 
-    // Auto-detect format based on characteristic payload keys
+    // Claude Code specific payload fields
+    if val.get("hook_event_name").is_some()
+        || val.get("hookEventName").is_some()
+        || (val.get("tool_input").is_some() && val.get("toolCall").is_none())
+    {
+        return AgentFormat::ClaudeCode;
+    }
+
+    // Antigravity specific payload fields
     if val.get("conversationId").is_some()
         || val.get("stepIdx").is_some()
         || val.get("toolCall").is_some()
@@ -582,7 +590,7 @@ fn encode_response(
             })
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
-        AgentFormat::ClaudeCode | AgentFormat::Generic => {
+        AgentFormat::ClaudeCode => {
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
             struct ClaudeHookSpecificOutput<'a> {
@@ -594,13 +602,6 @@ fn encode_response(
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
             struct ClaudeResponse<'a> {
-                #[serde(skip_serializing_if = "Option::is_none")]
-                decision: Option<&'a str>,
-                permission_decision: &'a str,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                reason: Option<&'a str>,
-                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: &'a Vec<String>,
                 hook_specific_output: ClaudeHookSpecificOutput<'a>,
             }
 
@@ -610,24 +611,41 @@ fn encode_response(
                 None
             };
 
-            let decision_opt = match verdict.decision {
-                triage_core::judge::JudgeDecision::Allow => Some("approve"),
-                triage_core::judge::JudgeDecision::Deny => Some("block"),
-                triage_core::judge::JudgeDecision::Ask => None,
-            };
-
             serde_json::to_string(&ClaudeResponse {
-                decision: decision_opt,
-                permission_decision: decision_str,
-                reason: reason_opt,
-                permission_overrides: &permission_overrides,
                 hook_specific_output: ClaudeHookSpecificOutput {
                     hook_event_name: "PreToolUse",
                     permission_decision: decision_str,
                     permission_decision_reason: reason_opt,
                 },
             })
-            .unwrap_or_else(|_| r#"{"permissionDecision":"ask"}"#.to_string())
+            .unwrap_or_else(|_| {
+                r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}"#
+                    .to_string()
+            })
+        }
+        AgentFormat::Generic => {
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct GenericResponse<'a> {
+                decision: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                reason: Option<&'a str>,
+                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
+                permission_overrides: &'a Vec<String>,
+            }
+
+            let reason_opt = if !verdict.reason.is_empty() {
+                Some(verdict.reason.as_str())
+            } else {
+                None
+            };
+
+            serde_json::to_string(&GenericResponse {
+                decision: decision_str,
+                reason: reason_opt,
+                permission_overrides: &permission_overrides,
+            })
+            .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
     }
 }
@@ -1017,9 +1035,9 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&request));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "approve");
+        assert_eq!(val["decision"], "allow");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1043,10 +1061,9 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&request));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert!(val.get("decision").is_none());
-        assert_eq!(val["permissionDecision"], "ask");
+        assert_eq!(val["decision"], "ask");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1072,10 +1089,9 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&request));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert!(val.get("decision").is_none());
-        assert_eq!(val["permissionDecision"], "ask");
+        assert_eq!(val["decision"], "ask");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1098,7 +1114,7 @@ mod tests {
         let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
         assert_eq!(
             encoded,
-            r#"{"decision":"approve","permissionDecision":"allow","reason":"matched allow rule: ls","hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
         );
     }
 
@@ -1114,7 +1130,12 @@ mod tests {
 
         let hook_event_val: serde_json::Value =
             serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
-        assert_eq!(detect_format(&hook_event_val), AgentFormat::Antigravity);
+        assert_eq!(detect_format(&hook_event_val), AgentFormat::ClaudeCode);
+
+        let tool_input_val: serde_json::Value =
+            serde_json::from_str(r#"{"tool_name": "Bash", "tool_input": {"command": "ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_format(&tool_input_val), AgentFormat::ClaudeCode);
     }
 
     #[test]
@@ -1302,7 +1323,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::Fallback,
             reason: "requires confirmation".to_string(),
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&req));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         let overrides = val["permissionOverrides"].as_array().unwrap();
         let override_strs: Vec<&str> = overrides.iter().map(|v| v.as_str().unwrap()).collect();
@@ -1337,7 +1358,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::Fallback,
             reason: "requires confirmation".to_string(),
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&req_tilde_file));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
@@ -1359,7 +1380,7 @@ mod tests {
             path: Some(sibling_path.clone()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&req_sibling));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_sibling));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
@@ -1380,7 +1401,7 @@ mod tests {
             path: Some(valid_tilde),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&req_valid));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_valid));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
@@ -1400,7 +1421,7 @@ mod tests {
             path: Some(home.clone()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&req_root_home));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_root_home));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
@@ -1425,7 +1446,7 @@ mod tests {
             path: Some("https://example.com/api/v1".to_string()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, Some(&req_url));
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_url));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         let overrides: Vec<&str> = val
             .get("permissionOverrides")
@@ -1445,9 +1466,6 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "approve");
-        assert_eq!(val["permissionDecision"], "allow");
-        assert_eq!(val["reason"], "matched allow rules");
         assert!(val.get("hookSpecificOutput").is_some());
         let hook_output = &val["hookSpecificOutput"];
         assert_eq!(hook_output["hookEventName"], "PreToolUse");
