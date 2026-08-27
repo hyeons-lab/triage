@@ -193,6 +193,15 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "git branch",
     "git tag",
     "git stash",
+    "git rebase --continue",
+    "git rebase --abort",
+    "git rebase --skip",
+    "git rebase --quit",
+    "git cherry-pick --continue",
+    "git cherry-pick --abort",
+    "git cherry-pick --skip",
+    "git merge --continue",
+    "git merge --abort",
     "git remote -v",
     "git rev-parse",
     "git rev-list",
@@ -541,16 +550,38 @@ impl JudgeRules {
     fn matching_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
         let first = tokens.first()?;
         let prog = program_name(first);
-        if prog == "git" {
-            if let Some(rule) = self.matching_git_allow_rule(tokens) {
-                return Some(rule);
+        match prog {
+            "git" => {
+                if let Some(rule) = self.matching_git_allow_rule(tokens) {
+                    return Some(rule);
+                }
+                return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
             }
-            return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
-        }
-        if prog == "gh"
-            && let Some(rule) = self.matching_gh_allow_rule(tokens)
-        {
-            return Some(rule);
+            "gh" => {
+                if let Some(rule) = self.matching_gh_allow_rule(tokens) {
+                    return Some(rule);
+                }
+                return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
+            }
+            "cargo" => {
+                if let Some(rule) = self.matching_cargo_allow_rule(tokens) {
+                    return Some(rule);
+                }
+                return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
+            }
+            "flutter" | "dart" => {
+                if let Some(rule) = self.matching_flutter_allow_rule(tokens) {
+                    return Some(rule);
+                }
+                return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
+            }
+            "npm" | "pnpm" | "yarn" | "bun" => {
+                if let Some(rule) = self.matching_js_pm_allow_rule(tokens) {
+                    return Some(rule);
+                }
+                return self.matching_token_allow_rule(&self.custom_allow_commands, tokens);
+            }
+            _ => {}
         }
         self.matching_token_allow_rule(&self.custom_allow_commands, tokens)
             .or_else(|| self.matching_token_allow_rule(self.builtin_allow_commands, tokens))
@@ -564,7 +595,26 @@ impl JudgeRules {
         let positional_tokens = extract_positional_tokens(tokens);
         rules
             .iter()
-            .find(|(_, rule)| {
+            .find(|(text, rule)| {
+                // Wildcard matching (e.g. "pytest *", "adb logcat*", "make *")
+                if text.ends_with('*') {
+                    let prefix_str = text.trim_end_matches('*').trim();
+                    let prefix_rule = tokenize_words(prefix_str);
+                    if !prefix_rule.is_empty() && prefix_rule.len() <= positional_tokens.len() {
+                        let matches_prefix = prefix_rule.iter().enumerate().all(|(i, expected)| {
+                            if i == 0 {
+                                expected == positional_tokens[0]
+                                    || expected == program_name(positional_tokens[0])
+                            } else {
+                                expected == positional_tokens[i]
+                            }
+                        });
+                        if matches_prefix {
+                            return true;
+                        }
+                    }
+                }
+
                 // 1. Direct token prefix match (allowing full path on first token)
                 if rule.len() <= tokens.len()
                     && rule.iter().enumerate().all(|(i, expected)| {
@@ -602,10 +652,62 @@ impl JudgeRules {
         }
         let positional = extract_positional_tokens(tokens);
         if positional.len() < 2 {
+            if tokens
+                .iter()
+                .any(|t| *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h")
+            {
+                return Some("gh --version");
+            }
             return None;
         }
         let subcommand = positional[1];
+        let sub_action = positional.get(2).copied();
         match subcommand {
+            "pr" => match sub_action {
+                Some("view") => Some("gh pr view"),
+                Some("list") => Some("gh pr list"),
+                Some("checks") => Some("gh pr checks"),
+                Some("diff") => Some("gh pr diff"),
+                Some("status") => Some("gh pr status"),
+                Some("ready") => Some("gh pr ready"),
+                _ => None,
+            },
+            "issue" => match sub_action {
+                Some("view") => Some("gh issue view"),
+                Some("list") => Some("gh issue list"),
+                Some("status") => Some("gh issue status"),
+                _ => None,
+            },
+            "run" => match sub_action {
+                Some("view") => Some("gh run view"),
+                Some("list") => Some("gh run list"),
+                Some("watch") => Some("gh run watch"),
+                _ => None,
+            },
+            "repo" => match sub_action {
+                Some("view") => Some("gh repo view"),
+                Some("list") => Some("gh repo list"),
+                _ => None,
+            },
+            "release" => match sub_action {
+                Some("view") => Some("gh release view"),
+                Some("list") => Some("gh release list"),
+                _ => None,
+            },
+            "workflow" => match sub_action {
+                Some("view") => Some("gh workflow view"),
+                Some("list") => Some("gh workflow list"),
+                _ => None,
+            },
+            "secret" => match sub_action {
+                Some("list") => Some("gh secret list"),
+                _ => None,
+            },
+            "stack" => match sub_action {
+                Some("view") => Some("gh stack view"),
+                _ => None,
+            },
+            "status" => Some("gh status"),
             "api" => {
                 let sub_args = &tokens[1..];
                 // Disallow `gh api graphql` since GraphQL requests default to HTTP POST mutations
@@ -643,7 +745,7 @@ impl JudgeRules {
                 }
             }
             "auth" => {
-                if positional.get(2) == Some(&"status") {
+                if sub_action == Some("status") {
                     Some("gh auth status")
                 } else {
                     None
@@ -678,8 +780,30 @@ impl JudgeRules {
             "blame" => Some("git blame"),
             "ls-files" => Some("git ls-files"),
             "worktree" if sub_args.contains(&"list") => Some("git worktree list"),
-            "stash" if sub_args.contains(&"list") || sub_args.contains(&"show") => {
-                Some("git stash")
+            "stash" => Some("git stash"),
+            "rebase"
+                if sub_args.contains(&"--continue")
+                    || sub_args.contains(&"--abort")
+                    || sub_args.contains(&"--skip")
+                    || sub_args.contains(&"--quit")
+                    || sub_args.contains(&"--show-current-patch") =>
+            {
+                Some("git rebase")
+            }
+            "cherry-pick"
+                if sub_args.contains(&"--continue")
+                    || sub_args.contains(&"--abort")
+                    || sub_args.contains(&"--skip")
+                    || sub_args.contains(&"--quit") =>
+            {
+                Some("git cherry-pick")
+            }
+            "merge"
+                if sub_args.contains(&"--continue")
+                    || sub_args.contains(&"--abort")
+                    || sub_args.contains(&"--quit") =>
+            {
+                Some("git merge")
             }
             "tag" => {
                 const GIT_TAG_MUTATING_FLAGS: &[&str] = &[
@@ -731,7 +855,8 @@ impl JudgeRules {
                     None
                 } else if sub_args.is_empty()
                     || (sub_args.iter().all(|a| {
-                        GIT_TAG_READ_ONLY_FLAGS.contains(a)
+                        !a.starts_with('-')
+                            || GIT_TAG_READ_ONLY_FLAGS.contains(a)
                             || a.starts_with("--sort=")
                             || a.starts_with("--points-at=")
                             || a.starts_with("--merged=")
@@ -741,7 +866,19 @@ impl JudgeRules {
                             || a.contains('*')
                     }) && (sub_args.contains(&"--list")
                         || sub_args.contains(&"-l")
-                        || sub_args.iter().any(|a| a.contains('*'))))
+                        || sub_args.contains(&"--contains")
+                        || sub_args.contains(&"--no-contains")
+                        || sub_args.contains(&"--merged")
+                        || sub_args.contains(&"--no-merged")
+                        || sub_args.contains(&"--points-at")
+                        || sub_args.iter().any(|a| {
+                            a.contains('*')
+                                || a.starts_with("--contains=")
+                                || a.starts_with("--no-contains=")
+                                || a.starts_with("--merged=")
+                                || a.starts_with("--no-merged=")
+                                || a.starts_with("--points-at=")
+                        })))
                 {
                     Some("git tag")
                 } else {
@@ -802,7 +939,8 @@ impl JudgeRules {
                 } else if sub_args.is_empty()
                     || sub_args.contains(&"--show-current")
                     || (sub_args.iter().all(|a| {
-                        GIT_BRANCH_READ_ONLY_FLAGS.contains(a)
+                        !a.starts_with('-')
+                            || GIT_BRANCH_READ_ONLY_FLAGS.contains(a)
                             || a.starts_with("--sort=")
                             || a.starts_with("--points-at=")
                             || a.starts_with("--merged=")
@@ -818,16 +956,198 @@ impl JudgeRules {
                         || sub_args.contains(&"-vv")
                         || sub_args.contains(&"--verbose")
                         || sub_args.contains(&"--list")
-                        || sub_args.contains(&"-l")))
+                        || sub_args.contains(&"-l")
+                        || sub_args.contains(&"--contains")
+                        || sub_args.contains(&"--no-contains")
+                        || sub_args.contains(&"--merged")
+                        || sub_args.contains(&"--no-merged")
+                        || sub_args.contains(&"--points-at")
+                        || sub_args.iter().any(|a| {
+                            a.starts_with("--contains=")
+                                || a.starts_with("--no-contains=")
+                                || a.starts_with("--merged=")
+                                || a.starts_with("--no-merged=")
+                                || a.starts_with("--points-at=")
+                        })))
                 {
                     Some("git branch")
                 } else {
                     None
                 }
             }
-            "remote" if sub_args.contains(&"-v") || sub_args.contains(&"--verbose") => {
+            "remote"
+                if (sub_args.contains(&"-v")
+                    || sub_args.contains(&"--verbose")
+                    || sub_args.is_empty())
+                    && sub_args.iter().all(|a| a.starts_with('-')) =>
+            {
                 Some("git remote -v")
             }
+            _ => None,
+        }
+    }
+
+    fn matching_cargo_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        if program_name(first) != "cargo" {
+            return None;
+        }
+        let positional = extract_positional_tokens(tokens);
+        if positional.len() < 2 {
+            if tokens.iter().any(|t| {
+                *t == "--version"
+                    || *t == "-V"
+                    || *t == "--help"
+                    || *t == "-h"
+                    || *t == "version"
+                    || *t == "help"
+            }) {
+                return Some("cargo --version");
+            }
+            return None;
+        }
+        let subcommand = positional[1];
+        match subcommand {
+            "check" => Some("cargo check"),
+            "build" => Some("cargo build"),
+            "test" => Some("cargo test"),
+            "clippy" => Some("cargo clippy"),
+            "fmt" => Some("cargo fmt"),
+            "doc" => Some("cargo doc"),
+            "tree" => Some("cargo tree"),
+            "metadata" => Some("cargo metadata"),
+            "install" => Some("cargo install"),
+            "init" => Some("cargo init"),
+            "new" => Some("cargo new"),
+            "clean" => Some("cargo clean"),
+            "bench" => Some("cargo bench"),
+            "locate-project" => Some("cargo locate-project"),
+            "verify-project" => Some("cargo verify-project"),
+            "report" => Some("cargo report"),
+            "help" => Some("cargo help"),
+            _ => None,
+        }
+    }
+
+    fn matching_flutter_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        let prog = program_name(first);
+        if prog != "flutter" && prog != "dart" {
+            return None;
+        }
+        let positional = extract_positional_tokens(tokens);
+        if positional.len() < 2 {
+            if tokens
+                .iter()
+                .any(|t| *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h")
+            {
+                return Some("flutter --version");
+            }
+            return None;
+        }
+        let subcommand = positional[1];
+        if prog == "flutter" {
+            match subcommand {
+                "test" => Some("flutter test"),
+                "analyze" => Some("flutter analyze"),
+                "doctor" => Some("flutter doctor"),
+                "build" => Some("flutter build"),
+                "devices" => Some("flutter devices"),
+                "emulators" => Some("flutter emulators"),
+                "logs" => Some("flutter logs"),
+                "format" => Some("flutter format"),
+                "clean" => Some("flutter clean"),
+                "gen-l10n" => Some("flutter gen-l10n"),
+                "pub" => {
+                    if let Some(&action) = positional.get(2) {
+                        match action {
+                            "get" => Some("flutter pub get"),
+                            "deps" | "outdated" | "upgrade" | "downgrade" | "cache" | "test" => {
+                                Some("flutter pub")
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        Some("flutter pub")
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            // dart
+            match subcommand {
+                "analyze" => Some("dart analyze"),
+                "test" => Some("dart test"),
+                "format" => Some("dart format"),
+                "doctor" => Some("dart doctor"),
+                "run" => Some("dart run"),
+                "compile" => Some("dart compile"),
+                "pub" => {
+                    if let Some(&action) = positional.get(2) {
+                        match action {
+                            "get" => Some("dart pub get"),
+                            "deps" | "outdated" | "upgrade" | "downgrade" | "cache" | "test" => {
+                                Some("dart pub")
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        Some("dart pub")
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn matching_js_pm_allow_rule(&self, tokens: &[&str]) -> Option<&str> {
+        let first = tokens.first()?;
+        let prog = program_name(first);
+        if !matches!(prog, "pnpm" | "npm" | "yarn" | "bun") {
+            return None;
+        }
+        let positional = extract_positional_tokens(tokens);
+        if positional.len() < 2 {
+            if tokens
+                .iter()
+                .any(|t| *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h")
+            {
+                return Some(match prog {
+                    "pnpm" => "pnpm test",
+                    "yarn" => "yarn test",
+                    "bun" => "bun test",
+                    _ => "npm test",
+                });
+            }
+            return None;
+        }
+        let subcommand = positional[1];
+        match subcommand {
+            "test" | "t" => Some(match prog {
+                "pnpm" => "pnpm test",
+                "yarn" => "yarn test",
+                "bun" => "bun test",
+                _ => "npm test",
+            }),
+            "run" => Some(match prog {
+                "pnpm" => "pnpm run",
+                "yarn" => "yarn run",
+                "bun" => "bun run",
+                _ => "npm run",
+            }),
+            "build" => Some(match prog {
+                "pnpm" => "pnpm build",
+                "yarn" => "yarn build",
+                "bun" => "bun build",
+                _ => "npm build",
+            }),
+            "check" | "lint" | "format" | "typecheck" | "tsc" | "ci" | "list" | "ls" | "audit"
+            | "outdated" | "why" | "info" => Some(match prog {
+                "pnpm" => "pnpm check",
+                "yarn" => "yarn check",
+                "bun" => "bun check",
+                _ => "npm ci",
+            }),
             _ => None,
         }
     }
@@ -1170,6 +1490,15 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
 }
 
 pub fn tokenize_words(segment: &str) -> Vec<String> {
+    if let Some(words) = shlex::split(segment)
+        && !words.is_empty()
+    {
+        return words;
+    }
+    fallback_tokenize_words(segment)
+}
+
+fn fallback_tokenize_words(segment: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -1678,13 +2007,41 @@ pub fn has_write_git_subcommand(program: &str, arguments: &[&str]) -> bool {
     let Some((subcommand, sub_args)) = parse_git_subcommand(arguments) else {
         return false;
     };
-    let is_listing_branch = sub_args.contains(&"--list") || sub_args.contains(&"-l");
+    let is_listing_branch = sub_args.is_empty()
+        || sub_args.contains(&"--show-current")
+        || sub_args.contains(&"--list")
+        || sub_args.contains(&"-l")
+        || sub_args.contains(&"-a")
+        || sub_args.contains(&"--all")
+        || sub_args.contains(&"-r")
+        || sub_args.contains(&"--remotes")
+        || sub_args.contains(&"--contains")
+        || sub_args.contains(&"--no-contains")
+        || sub_args.contains(&"--merged")
+        || sub_args.contains(&"--no-merged")
+        || sub_args.contains(&"--points-at")
+        || sub_args.iter().any(|a| {
+            a.starts_with("--contains=")
+                || a.starts_with("--no-contains=")
+                || a.starts_with("--merged=")
+                || a.starts_with("--no-merged=")
+                || a.starts_with("--points-at=")
+        });
     match subcommand {
         "branch" if is_listing_branch => sub_args.iter().any(|token| {
             WRITE_FLAGS.contains(token) || is_short_flag_bundle_containing(token, WRITE_SHORT_FLAGS)
         }),
-        "remote" | "branch" if sub_args.iter().any(|token| !token.starts_with('-')) => true,
-        "remote" | "branch" => sub_args.iter().any(|token| {
+        "remote"
+            if sub_args.iter().all(|a| a.starts_with('-'))
+                && (sub_args.contains(&"-v")
+                    || sub_args.contains(&"--verbose")
+                    || sub_args.is_empty()) =>
+        {
+            false
+        }
+        "remote" => true,
+        "branch" if sub_args.iter().any(|token| !token.starts_with('-')) => true,
+        "branch" => sub_args.iter().any(|token| {
             WRITE_FLAGS.contains(token) || is_short_flag_bundle_containing(token, WRITE_SHORT_FLAGS)
         }),
         _ => false,
@@ -2487,6 +2844,92 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("pbcopy").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("env GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true git rebase --continue")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git rebase --abort").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git cherry-pick --continue").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git merge --abort").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git stash pop").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("cargo test --all-targets -- --nocapture").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("cargo clippy --workspace -- -D warnings").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("flutter test test/widget_test.dart").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("flutter pub get").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("dart format --fix .").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("pnpm run test:unit --filter @app/core").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("npm run build").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("bun test").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("yarn check").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        // Wildcard custom rule test
+        let custom_cfg = JudgeConfig {
+            allow_commands: vec!["adb logcat*".into(), "pytest *".into()],
+            ..JudgeConfig::default()
+        };
+        let custom_rules = JudgeRules::new(&custom_cfg);
+        let req1 = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".into(),
+            command_line: Some("adb logcat -d -v time".into()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            custom_rules.evaluate(&req1).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        let req2 = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".into(),
+            command_line: Some("pytest tests/test_api.py -v".into()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            custom_rules.evaluate(&req2).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

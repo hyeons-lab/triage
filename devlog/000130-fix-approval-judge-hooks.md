@@ -22,6 +22,9 @@
 - **2026-08-26T16:25-0700** Switched `crates/triage-hook/src/main.rs` stdin ingestion to stream-parse the first complete JSON value via `serde_json::Deserializer::from_reader` instead of `read_to_string`, eliminating a 10s wait for EOF on pipes that remain open.
 - **2026-08-26T16:31-0700** Added standard platform clipboard inspection and copy tools (`pbpaste`, `pbcopy`, `xclip`, `wl-paste`, `wl-copy`) to `BUILTIN_ALLOW_COMMANDS` in `crates/triage-core/src/judge_rules.rs`.
 - **2026-08-26T17:28-0700** Fixed bug in `crates/triage-core/src/judge_rules.rs` where short flag disqualifier checks matched against long flags starting with the same letter (e.g. `--oneline`, `--cached`, `--color`, `--porcelain` matching short `-o`, `-c`, `-p`), which falsely disqualified allowed git commands.
+- **2026-08-26T17:45-0700** Replaced brittle ad-hoc string allowlisting with structured `shlex` POSIX lexing and dedicated toolchain grammar parsers (`cargo`, `flutter`, `dart`, `pnpm`, `npm`, `yarn`, `bun`, `gh`, `git`).
+- **2026-08-26T17:50-0700** Added wildcard rule support (`*` glob suffix) in `JudgeRules` for custom config entries (e.g. `adb logcat*`, `pytest *`).
+- **2026-08-26T17:52-0700** Created comprehensive evaluation benchmark suite (`crates/triage-core/tests/judge_corpus_benchmark.rs`) evaluating a 135-command corpus across 8 toolchain categories with automated category-level approval statistics.
 
 ## Decisions
 
@@ -35,6 +38,8 @@
 - **Accessory Bar Quick Actions**: Added dedicated `^K` key next to `^C` on the mobile/touch accessory bar to enable quick subagent approval without requiring modifier chords.
 - **Stream-Parsed Stdin Payloads**: Stream-parsed JSON values on stdin directly in `triage-hook` without waiting for pipe EOF so lifecycle hooks resolve in sub-millisecond time.
 - **Strict Short Flag Matching**: Enforced `!argument.starts_with("--")` before matching short flag prefixes so long flags starting with `-o`, `-c`, `-p` (like `--oneline`, `--cached`, `--color`) are not falsely disqualified as dangerous flags.
+- **Authoritative Toolchain Grammar Parsers**: Structured CLI parsing using `shlex` and toolchain grammars (`cargo`, `flutter`, `npm`, `pnpm`, `yarn`, `bun`, `gh`, `git`) to eliminate brittle exact-substring matching while preserving strict security boundaries on mutations and publishing.
+- **Regression Corpus Benchmark**: Checked-in evaluation corpus benchmark suite in `crates/triage-core/tests/judge_corpus_benchmark.rs` to measure approval percentages across 8 categories and guarantee zero regressions.
 
 ## Commits
 
@@ -52,4 +57,5 @@
 - 060b85d — feat(client,judge): add ctrl+k shortcut key to accessory bar and ad-hoc codesign to allowlist
 - f333888 — fix(hook): stream parse stdin json payload without blocking for eof
 - e3744e6 — feat(judge): add clipboard utilities to builtin allowlist
-- HEAD — fix(judge): prevent short flag disqualification matching against long flags
+- 501f942 — fix(judge): prevent short flag disqualification matching against long flags
+- HEAD — feat(judge): add shlex parsing, structured toolchain grammars, and corpus benchmark
