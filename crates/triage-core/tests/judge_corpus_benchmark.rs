@@ -238,6 +238,18 @@ pub fn load_corpus() -> Vec<CorpusCase> {
         },
         CorpusCase {
             category: "Git",
+            command: "git push origin --delete old-feature",
+            expected: JudgeDecision::Ask,
+            description: "Remote branch deletion via git push",
+        },
+        CorpusCase {
+            category: "Git",
+            command: "git push origin +HEAD:main",
+            expected: JudgeDecision::Ask,
+            description: "Force refspec remote push",
+        },
+        CorpusCase {
+            category: "Git",
             command: "git reset --hard HEAD~1",
             expected: JudgeDecision::Ask,
             description: "Hard reset discarding working changes",

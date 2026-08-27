@@ -1,8 +1,32 @@
 use crate::config::JudgeConfig;
 use crate::judge::{JudgeDecision, JudgeRequest, JudgeSource, JudgeVerdict};
 
+/// Strips server / namespace prefixes (e.g. `default_api:view_file` -> `view_file`,
+/// `mcp__code_review_graph__query_graph` -> `query_graph`, `cortex:read` -> `read`).
+pub fn normalize_tool_name(tool_name: &str) -> &str {
+    let mut s = tool_name.trim();
+    if let Some(rest) = s.strip_prefix("cortex_step_type_") {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_prefix("cortex:") {
+        s = rest;
+    }
+    if let Some(idx) = s.rfind(':') {
+        s = &s[idx + 1..];
+    }
+    if let Some(idx) = s.rfind('/') {
+        s = &s[idx + 1..];
+    }
+    if let Some(idx) = s.rfind("__") {
+        s = &s[idx + 2..];
+    }
+    s.trim()
+}
+
 /// True if `tool_name` is a read-only inspection, search, web, or agent coordination tool.
-pub fn is_read_only_tool(lower: &str) -> bool {
+pub fn is_read_only_tool(raw: &str) -> bool {
+    let lower_str = normalize_tool_name(raw).to_ascii_lowercase();
+    let lower = lower_str.as_str();
     matches!(
         lower,
         "read"
@@ -75,7 +99,9 @@ pub fn is_read_only_tool(lower: &str) -> bool {
 }
 
 /// True if `tool_name` is an editing or writing tool.
-pub fn is_edit_tool(lower: &str) -> bool {
+pub fn is_edit_tool(raw: &str) -> bool {
+    let lower_str = normalize_tool_name(raw).to_ascii_lowercase();
+    let lower = lower_str.as_str();
     matches!(
         lower,
         "write_to_file"
@@ -88,7 +114,9 @@ pub fn is_edit_tool(lower: &str) -> bool {
 }
 
 /// True if `tool_name` is a shell command execution tool.
-pub fn is_command_tool(lower: &str) -> bool {
+pub fn is_command_tool(raw: &str) -> bool {
+    let lower_str = normalize_tool_name(raw).to_ascii_lowercase();
+    let lower = lower_str.as_str();
     matches!(
         lower,
         "run_command"
@@ -99,6 +127,9 @@ pub fn is_command_tool(lower: &str) -> bool {
             | "executecommand"
             | "sh"
             | "terminal"
+            | "shell"
+            | "cmd"
+            | "command"
             | "exec"
     )
 }
@@ -2930,6 +2961,46 @@ mod tests {
         };
         assert_eq!(
             custom_rules.evaluate(&req2).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_namespaced_and_prefixed_tool_calls() {
+        let rules = JudgeRules::new(&JudgeConfig::default());
+        let view_req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "default_api:view_file".into(),
+            command_line: None,
+            path: Some("/Users/dev/project/src/main.rs".into()),
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&view_req).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        let cmd_req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "default_api:run_command".into(),
+            command_line: Some("cargo test".into()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&cmd_req).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        let mcp_req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "code-review-graph:query_graph".into(),
+            command_line: None,
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&mcp_req).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }
