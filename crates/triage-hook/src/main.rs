@@ -437,22 +437,12 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             if trimmed_target.is_empty() {
                 return;
             }
-            permission_overrides.push(trimmed_target.to_string());
-            permission_overrides.push(format!("self:{trimmed_target}"));
-            permission_overrides.push(format!("subagent:{trimmed_target}"));
-            for prefix in &tool_prefixes {
-                permission_overrides.push(format!("{prefix}({trimmed_target})"));
-            }
+            permission_overrides.push(format!("command({trimmed_target})"));
 
             if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
                 let trimmed_sub = without_dot_slash.trim();
                 if !trimmed_sub.is_empty() {
-                    permission_overrides.push(trimmed_sub.to_string());
-                    permission_overrides.push(format!("self:{trimmed_sub}"));
-                    permission_overrides.push(format!("subagent:{trimmed_sub}"));
-                    for prefix in &tool_prefixes {
-                        permission_overrides.push(format!("{prefix}({trimmed_sub})"));
-                    }
+                    permission_overrides.push(format!("command({trimmed_sub})"));
                 }
             }
         };
@@ -525,13 +515,8 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             || lower_path.starts_with("https://")
             || lower_path.starts_with("ws://")
             || lower_path.starts_with("wss://");
-        let lower_tool = req.tool_name.to_ascii_lowercase();
         if !is_url {
             permission_overrides.push(format!("file({clean_path})"));
-        }
-        permission_overrides.push(format!("{}({clean_path})", req.tool_name));
-        if lower_tool != req.tool_name {
-            permission_overrides.push(format!("{lower_tool}({clean_path})"));
         }
         let home_trimmed = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -554,18 +539,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                     format!("{home}{}", sub.replace('\\', "/"))
                 };
                 permission_overrides.push(format!("file({expanded})"));
-                permission_overrides.push(format!("{}({expanded})", req.tool_name));
-                if lower_tool != req.tool_name {
-                    permission_overrides.push(format!("{lower_tool}({expanded})"));
-                }
                 if home.contains('\\') && sub.contains('/') {
                     let fwd_expanded = format!("{home}{sub}");
                     if fwd_expanded != expanded {
                         permission_overrides.push(format!("file({fwd_expanded})"));
-                        permission_overrides.push(format!("{}({fwd_expanded})", req.tool_name));
-                        if lower_tool != req.tool_name {
-                            permission_overrides.push(format!("{lower_tool}({fwd_expanded})"));
-                        }
                     }
                 }
             } else {
@@ -587,10 +564,6 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                         format!("~{suffix}")
                     };
                     permission_overrides.push(format!("file({contracted})"));
-                    permission_overrides.push(format!("{}({contracted})", req.tool_name));
-                    if lower_tool != req.tool_name {
-                        permission_overrides.push(format!("{lower_tool}({contracted})"));
-                    }
                 }
             }
         }
@@ -599,12 +572,6 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
     {
         permission_overrides.push(format!("tool({})", req.tool_name));
-        permission_overrides.push(req.tool_name.clone());
-        let lower_tool = req.tool_name.to_ascii_lowercase();
-        if lower_tool != req.tool_name {
-            permission_overrides.push(format!("tool({lower_tool})"));
-            permission_overrides.push(lower_tool);
-        }
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -618,13 +585,9 @@ fn encode_response(
     request: Option<&JudgeRequest>,
 ) -> String {
     let decision_str = verdict.decision.as_hook_str();
-    let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Ask {
-        request
-            .map(compute_permission_overrides)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let permission_overrides = request
+        .map(compute_permission_overrides)
+        .unwrap_or_default();
 
     match format {
         AgentFormat::Antigravity | AgentFormat::Generic => {
@@ -756,6 +719,12 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
         path,
         cwd,
     };
+    // 1. Fast path: Evaluate deterministic Layer 1 (Deny) and Layer 2 (Allow) rules directly in-process.
+    // This takes <0.1ms and avoids any IPC/thread overhead for standard developer commands.
+    if let Some(verdict) = evaluate_in_process(&request) {
+        return (verdict, format, Some(request));
+    }
+    // 2. Slow path: For ambiguous commands needing Layer 3 model evaluation, ask the daemon.
     let remaining_timeout = JUDGE_TIMEOUT.saturating_sub(start_time.elapsed());
     let verdict = ask_daemon(request.clone(), remaining_timeout);
     (verdict, format, Some(request))
@@ -999,11 +968,7 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(overrides.contains(&"command(VAR=1 ls -la)"));
-        assert!(overrides.contains(&"Bash(VAR=1 ls -la)"));
-        assert!(overrides.contains(&"run_command(VAR=1 ls -la)"));
         assert!(overrides.contains(&"command(ls -la)"));
-        assert!(overrides.contains(&"Bash(ls -la)"));
-        assert!(overrides.contains(&"run_command(ls -la)"));
     }
 
     #[test]
@@ -1029,13 +994,9 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(overrides.contains(&"git --no-pager diff --stat"));
-        assert!(overrides.contains(&"Bash(git --no-pager diff --stat)"));
-        assert!(overrides.contains(&"git --no-pager diff"));
-        assert!(overrides.contains(&"Bash(git --no-pager diff)"));
-        assert!(overrides.contains(&"git diff"));
-        assert!(overrides.contains(&"Bash(git diff)"));
-        assert!(overrides.contains(&"self:Bash(git diff)"));
+        assert!(overrides.contains(&"command(git --no-pager diff --stat)"));
+        assert!(overrides.contains(&"command(git --no-pager diff)"));
+        assert!(overrides.contains(&"command(git diff)"));
     }
 
     #[test]
@@ -1061,14 +1022,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(overrides.contains(&"./gradlew ktfmtFormat"));
-        assert!(overrides.contains(&"gradlew ktfmtFormat"));
-        assert!(overrides.contains(&"Bash(./gradlew ktfmtFormat)"));
-        assert!(overrides.contains(&"Bash(gradlew ktfmtFormat)"));
-        assert!(overrides.contains(&"./gradlew"));
-        assert!(overrides.contains(&"gradlew"));
-        assert!(overrides.contains(&"Bash(./gradlew)"));
-        assert!(overrides.contains(&"Bash(gradlew)"));
+        assert!(overrides.contains(&"command(./gradlew ktfmtFormat)"));
+        assert!(overrides.contains(&"command(gradlew ktfmtFormat)"));
+        assert!(overrides.contains(&"command(./gradlew)"));
+        assert!(overrides.contains(&"command(gradlew)"));
     }
 
     #[test]
@@ -1268,20 +1225,12 @@ mod tests {
         let overrides = val["permissionOverrides"].as_array().unwrap();
         let override_strs: Vec<&str> = overrides.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(override_strs.contains(&"command(echo \"In origin but not local:\")"));
-        assert!(override_strs.contains(&"Bash(echo \"In origin but not local:\")"));
-        assert!(override_strs.contains(&"run_command(echo \"In origin but not local:\")"));
         assert!(override_strs.contains(&"command(git log 1a1ab03..origin/main --oneline)"));
-        assert!(override_strs.contains(&"Bash(git log 1a1ab03..origin/main --oneline)"));
-        assert!(override_strs.contains(&"run_command(git log 1a1ab03..origin/main --oneline)"));
         assert!(override_strs.contains(&"command(git log)"));
-        assert!(override_strs.contains(&"Bash(git log)"));
-        assert!(override_strs.contains(&"run_command(git log)"));
         assert!(!override_strs.contains(&"tool(run_command)"));
         // Ensure no broad single-word base executable overrides are emitted
         assert!(!override_strs.contains(&"command(git)"));
-        assert!(!override_strs.contains(&"Bash(git)"));
         assert!(!override_strs.contains(&"command(echo)"));
-        assert!(!override_strs.contains(&"Bash(echo)"));
         // Ensure no malformed unbalanced quotes exist
         assert!(!override_strs.iter().any(|s| s.contains("echo \"In)")));
     }

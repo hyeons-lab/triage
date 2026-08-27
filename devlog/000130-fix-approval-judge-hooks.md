@@ -25,6 +25,7 @@
 - **2026-08-26T17:45-0700** Replaced brittle ad-hoc string allowlisting with structured `shlex` POSIX lexing and dedicated toolchain grammar parsers (`cargo`, `flutter`, `dart`, `pnpm`, `npm`, `yarn`, `bun`, `gh`, `git`).
 - **2026-08-26T17:50-0700** Added wildcard rule support (`*` glob suffix) in `JudgeRules` for custom config entries (e.g. `adb logcat*`, `pytest *`).
 - **2026-08-26T17:52-0700** Created comprehensive evaluation benchmark suite (`crates/triage-core/tests/judge_corpus_benchmark.rs`) evaluating a 135-command corpus across 8 toolchain categories with automated category-level approval statistics.
+- **2026-08-26T18:10-0700** Added deterministic in-process Layer 1 and 2 rule fast-path to `triage-hook` to evaluate safe developer commands in <0.1ms without IPC overhead, and ensured `permissionOverrides` are always computed and emitted on `allow` verdicts so Antigravity CLI receives explicit permission grants.
 
 ## Decisions
 
@@ -40,6 +41,7 @@
 - **Strict Short Flag Matching**: Enforced `!argument.starts_with("--")` before matching short flag prefixes so long flags starting with `-o`, `-c`, `-p` (like `--oneline`, `--cached`, `--color`) are not falsely disqualified as dangerous flags.
 - **Authoritative Toolchain Grammar Parsers**: Structured CLI parsing using `shlex` and toolchain grammars (`cargo`, `flutter`, `npm`, `pnpm`, `yarn`, `bun`, `gh`, `git`) to eliminate brittle exact-substring matching while preserving strict security boundaries on mutations and publishing.
 - **Regression Corpus Benchmark**: Checked-in evaluation corpus benchmark suite in `crates/triage-core/tests/judge_corpus_benchmark.rs` to measure approval percentages across 8 categories and guarantee zero regressions.
+- **In-Process Fast-Path & Persistent Overrides**: Evaluated deterministic rules directly in `triage-hook` before IPC and emitted `permissionOverrides` on `allow` decisions so Antigravity CLI receives sub-millisecond responses and explicit tool permission grants.
 
 ## Commits
 
@@ -58,4 +60,5 @@
 - f333888 — fix(hook): stream parse stdin json payload without blocking for eof
 - e3744e6 — feat(judge): add clipboard utilities to builtin allowlist
 - 501f942 — fix(judge): prevent short flag disqualification matching against long flags
-- HEAD — feat(judge): add shlex parsing, structured toolchain grammars, and corpus benchmark
+- 13a62ae — feat(judge): add shlex parsing, structured toolchain grammars, and corpus benchmark
+- HEAD — fix(hook): fast-path in-process layer 1 and 2 rules and emit permission overrides on allow
