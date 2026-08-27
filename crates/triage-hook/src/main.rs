@@ -1207,6 +1207,28 @@ mod tests {
             evaluate_in_process(&safe_req).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
+        let namespaced_view = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "default_api:view_file".to_string(),
+            command_line: None,
+            path: Some("/work/project/src/main.rs".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            evaluate_in_process(&namespaced_view).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        let namespaced_cmd = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "default_api:run_command".to_string(),
+            command_line: Some("git status".to_string()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            evaluate_in_process(&namespaced_cmd).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
         assert_ne!(
             evaluate_in_process(&destructive_req).map(|v| v.decision),
             Some(JudgeDecision::Allow)

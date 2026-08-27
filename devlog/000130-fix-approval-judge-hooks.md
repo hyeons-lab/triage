@@ -67,4 +67,5 @@
 - 13a62ae — feat(judge): add shlex parsing, structured toolchain grammars, and corpus benchmark
 - 530bc71 — fix(hook): fast-path in-process layer 1 and 2 rules and emit permission overrides on allow
 - 1e94bfb — fix(hook): parse stdin payload incrementally on first complete json object without blocking on unclosed pipes
-- HEAD — fix(judge): normalize tool names by stripping MCP and namespace prefixes
+- 3a96262 — fix(judge): normalize tool names by stripping MCP and namespace prefixes
+- HEAD — test(hook): add namespaced tool fallback tests in triage-hook
