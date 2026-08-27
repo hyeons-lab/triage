@@ -361,6 +361,54 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "adb devices",
     "adb logcat",
     "adb logcat *",
+    // Docker & Container tools.
+    "docker",
+    "docker *",
+    "docker build",
+    "docker build *",
+    "docker run",
+    "docker run *",
+    "docker compose",
+    "docker compose *",
+    "docker ps",
+    "docker ps *",
+    "docker images",
+    "docker images *",
+    "docker logs",
+    "docker logs *",
+    "docker exec",
+    "docker exec *",
+    "docker version",
+    "docker info",
+    "docker inspect",
+    "podman",
+    "podman *",
+    "podman build",
+    "podman build *",
+    "podman run",
+    "podman run *",
+    // Archive & Compression utilities.
+    "unzip",
+    "unzip *",
+    "zip",
+    "zip *",
+    "zipinfo",
+    "zipinfo *",
+    "tar",
+    "tar *",
+    "gzip",
+    "gzip *",
+    "gunzip",
+    "gunzip *",
+    // Triage workspace binaries & hooks.
+    "triage",
+    "triage *",
+    "triaged",
+    "triaged *",
+    "triage-hook",
+    "triage-hook *",
+    "triage-mcp",
+    "triage-mcp *",
 ];
 
 pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
@@ -3337,6 +3385,35 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("go test ./...").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_docker_podman_and_archive_allow_rules() {
+        assert_eq!(
+            evaluate_cmd("docker build --platform linux/amd64 -t my-img:latest .")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("docker run --rm -it my-img:latest").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("docker ps -a").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("docker images").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("unzip -l archive.zip").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("tar -xzf archive.tar.gz").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }
