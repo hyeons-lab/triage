@@ -450,12 +450,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _toggleCtrl() {
     _setCtrlArmed(!_ctrlArmed);
-    _focusTerminal();
   }
 
   // Send a raw byte sequence from an accessory-bar key, then disarm sticky Ctrl
-  // (a bare Ctrl toggle arms it via _toggleCtrl instead of coming through here)
-  // and refocus so tapping a key never dismisses the soft keyboard.
+  // (a bare Ctrl toggle arms it via _toggleCtrl instead of coming through here).
+  // Does not request focus so tapping shortcuts does not pop open the soft keyboard.
   void _sendAccessory(String bytes) {
     _sendInput(bytes);
     _setCtrlArmed(false);

@@ -595,12 +595,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   // Send a raw byte sequence from an accessory-bar key. Ctrl+<letter> keys pass
   // the already-encoded control byte; a bare Ctrl toggle arms _ctrlArmed instead
-  // of sending anything. Re-focus the terminal so tapping a key never dismisses
-  // the soft keyboard.
+  // of sending anything. Does not request focus so tapping shortcuts does not
+  // pop open the soft keyboard.
   void _sendAccessory(String bytes) {
     widget.controller.sendInput(bytes);
     _disarmCtrl();
-    _focusTerminal();
   }
 
   void _toggleCtrl() {
@@ -609,7 +608,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     } else {
       _armCtrl();
     }
-    _focusTerminal();
   }
 
   void _focusTerminal() {
