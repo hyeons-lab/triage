@@ -45,6 +45,7 @@
 - **2026-08-27T21:58-0700** Applied Round 5 review refinements: handled top-level version queries (`git --version`, `git -v`, `git version`) in `matching_git_allow_rule`, corrected `dart --version` rule return string in `matching_flutter_allow_rule`, cleaned redundant script entries in `BUILTIN_ALLOW_COMMANDS`, adjusted `normalize_tool_name` to strip `cortex_step_type_` after namespace delimiter resolution, fixed duplicate commit hash in devlog history, and expanded corpus benchmark coverage with version query test cases across all toolchains.
 - **2026-08-27T22:04-0700** Applied Round 6 review refinements: expanded `BASE_COMMAND_PREFIXES`, `READ_FILE_PREFIXES`, and `EDIT_FILE_PREFIXES` to cover all tool names and aliases (`read`, `write`, `edit`, `shell`, `terminal`, `exec`), unconditionally emitted subagent-prefixed and self-prefixed tokens for all tools in `compute_permission_overrides`, collapsed duplicate token-matching logic into `matches_slice` helper in `matching_token_allow_rule`, streamlined trailing `--` token collection with `extend_from_slice` in `extract_positional_tokens`, and removed redundant `"dart pub get"` entry in `BUILTIN_ALLOW_COMMANDS`.
 - **2026-08-27T22:09-0700** Applied Round 7 review refinements: guarded top-level version queries in `matching_git_allow_rule` with `positional.len() < 2` to prevent argument collisions on commands with operand named `version` (e.g. `git tag -d version`), eliminated duplicate `matches_slice` check in `matching_token_allow_rule`, optimized `compute_permission_overrides` deduplication using pre-allocated `HashSet<&str>` reference lookups, and added collision tests in `judge_rules.rs`.
+- **2026-08-27T22:20-0700** Applied Round 8 review refinements: separated state-modifying tools (`manage_task`, `task_stop`) from `is_read_only_tool` while dynamically mapping `Action: "status"` and `"list"` invocations in `triage-hook` to `task_status` for immediate read auto-approval, added `cargo run` and `flutter run` subcommands to their respective allow rules, eliminated unnecessary lowercase String allocation in `is_command_tool`, and deferred `norm_sub` string allocations in `compute_permission_overrides`.
 
 ## Decisions
 
@@ -90,6 +91,7 @@
 - **Authoritative Toolchain Version Flag Matching**: Handled `--version`, `-v`, `--help`, and `version` subcommands in toolchain rule evaluators before requiring subcommands, ensuring top-level diagnostic and version queries auto-approve deterministically without prompting.
 - **Unconditional Subagent Permission Overrides**: Removed prefix suppression guards in `compute_permission_overrides` so that all file, search, and command tool calls generate explicit `subagent:<tool>(...)` and `self:<tool>(...)` overrides. This ensures Antigravity's internal subagent permission matcher resolves subagent tool calls automatically without prompting the user.
 - **Positional Guarding for Version Rule Evaluator**: Enforced `positional.len() < 2` before matching `--version`, `-v`, `--help`, or `version` in `matching_git_allow_rule` so that subcommands operating on tags or branches named `version` evaluate against their specific subcommand policies instead of false-positive auto-approval.
+- **Dynamic Multi-Action Task Mapping in Hook**: Mapped `manage_task` with query actions (`status`, `list`) to `task_status` in `triage-hook` while directing termination actions (`kill`, `stop`) to `task_stop` and command injections (`send_input`) to full command validation. This adheres strictly to the Pillar 6 state-modifying separation invariant while allowing subagents to inspect background tasks without interactive approval prompts.
 
 ## Commits
 
@@ -139,4 +141,5 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- HEAD — fix(judge,hook): guard git version positional length and optimize override deduplication
+- ea4b359 — fix(judge,hook): guard git version positional length and optimize override deduplication
+- HEAD — fix(judge,hook): separate task management actions and allowlist cargo/flutter run

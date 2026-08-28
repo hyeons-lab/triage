@@ -63,14 +63,6 @@ pub fn is_read_only_tool(raw: &str) -> bool {
             | "manage_subagents"
             | "define_subagent"
             | "schedule"
-            | "manage_task"
-            | "manage_tasks"
-            | "managetask"
-            | "managetasks"
-            | "task_stop"
-            | "stop_task"
-            | "taskstop"
-            | "stoptask"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
@@ -1189,6 +1181,7 @@ impl JudgeRules {
         match subcommand {
             "check" => Some("cargo check"),
             "build" => Some("cargo build"),
+            "run" => Some("cargo run"),
             "test" => Some("cargo test"),
             "clippy" => Some("cargo clippy"),
             "fmt" => Some("cargo fmt"),
@@ -1232,6 +1225,7 @@ impl JudgeRules {
         if prog == "flutter" {
             match subcommand {
                 "test" => Some("flutter test"),
+                "run" => Some("flutter run"),
                 "analyze" => Some("flutter analyze"),
                 "doctor" => Some("flutter doctor"),
                 "build" => Some("flutter build"),
@@ -3052,14 +3046,8 @@ mod tests {
 
     #[test]
     fn test_agent_coordination_and_task_tools_are_read_only() {
-        assert!(is_read_only_tool("manage_task"));
-        assert!(is_read_only_tool("manage_tasks"));
-        assert!(is_read_only_tool("managetask"));
-        assert!(is_read_only_tool("managetasks"));
-        assert!(is_read_only_tool("task_stop"));
-        assert!(is_read_only_tool("stop_task"));
-        assert!(is_read_only_tool("taskstop"));
-        assert!(is_read_only_tool("stoptask"));
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("task_stop"));
         assert!(is_read_only_tool("schedule"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
@@ -3421,11 +3409,12 @@ mod tests {
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
         assert!(is_read_only_tool("task_list"));
-        assert!(is_read_only_tool("manage_task"));
-        assert!(is_read_only_tool("manage_tasks"));
-        assert!(is_read_only_tool("task_stop"));
-        assert!(is_read_only_tool("stop_task"));
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("manage_tasks"));
+        assert!(!is_read_only_tool("task_stop"));
+        assert!(!is_read_only_tool("stop_task"));
         assert!(is_read_only_tool("schedule"));
+        assert!(is_command_tool("manage_task"));
     }
 
     #[test]

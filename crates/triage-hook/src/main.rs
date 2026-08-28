@@ -489,8 +489,6 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let norm_tool = triage_core::judge_rules::normalize_tool_name(&req.tool_name);
     let custom_sub = format!("subagent:{}", req.tool_name);
     let custom_self = format!("self:{}", req.tool_name);
-    let norm_sub = format!("subagent:{norm_tool}");
-    let norm_self = format!("self:{norm_tool}");
 
     if let Some(ref cmd) = req.command_line {
         let mut add_command_override = |cmd_str: &str| {
@@ -506,8 +504,8 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             permission_overrides.push(format!("{custom_self}({trimmed_target})"));
             if norm_tool != req.tool_name {
                 permission_overrides.push(format!("{norm_tool}({trimmed_target})"));
-                permission_overrides.push(format!("{norm_sub}({trimmed_target})"));
-                permission_overrides.push(format!("{norm_self}({trimmed_target})"));
+                permission_overrides.push(format!("subagent:{norm_tool}({trimmed_target})"));
+                permission_overrides.push(format!("self:{norm_tool}({trimmed_target})"));
             }
 
             if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
@@ -521,8 +519,8 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                     permission_overrides.push(format!("{custom_self}({trimmed_sub})"));
                     if norm_tool != req.tool_name {
                         permission_overrides.push(format!("{norm_tool}({trimmed_sub})"));
-                        permission_overrides.push(format!("{norm_sub}({trimmed_sub})"));
-                        permission_overrides.push(format!("{norm_self}({trimmed_sub})"));
+                        permission_overrides.push(format!("subagent:{norm_tool}({trimmed_sub})"));
+                        permission_overrides.push(format!("self:{norm_tool}({trimmed_sub})"));
                     }
                 }
             }
@@ -598,8 +596,8 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                 permission_overrides.push(format!("{custom_self}({p_str})"));
                 if norm_tool != req.tool_name {
                     permission_overrides.push(format!("{norm_tool}({p_str})"));
-                    permission_overrides.push(format!("{norm_sub}({p_str})"));
-                    permission_overrides.push(format!("{norm_self}({p_str})"));
+                    permission_overrides.push(format!("subagent:{norm_tool}({p_str})"));
+                    permission_overrides.push(format!("self:{norm_tool}({p_str})"));
                 }
             }
         };
@@ -794,15 +792,30 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let session_id = extract_session_id(&val);
     let cwd = extract_cwd(&val);
     let command_line = extract_command_line(&tool_args);
-    let path = if triage_core::judge::is_command_tool(&tool_name.to_ascii_lowercase()) {
+    let path = if triage_core::judge::is_command_tool(&tool_name) {
         None
     } else {
         extract_path(&tool_args)
     };
 
+    let mut effective_tool = tool_name;
+    let norm = triage_core::judge_rules::normalize_tool_name(&effective_tool);
+    if (norm == "manage_task" || norm == "manage_tasks")
+        && let Some(action) = tool_args
+            .get("Action")
+            .or_else(|| tool_args.get("action"))
+            .and_then(|v| v.as_str())
+    {
+        if action == "status" || action == "list" {
+            effective_tool = "task_status".to_string();
+        } else if action == "kill" || action == "stop" {
+            effective_tool = "task_stop".to_string();
+        }
+    }
+
     let request = JudgeRequest {
         session_id,
-        tool_name,
+        tool_name: effective_tool,
         command_line,
         path,
         cwd,
