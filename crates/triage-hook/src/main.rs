@@ -336,7 +336,6 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
     AgentFormat::Antigravity
 }
 
-#[allow(dead_code)]
 fn strip_leading_env_vars(mut cmd: &str) -> &str {
     loop {
         let trimmed = cmd.trim_start();
@@ -419,7 +418,6 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
 static BASE_COMMAND_PREFIXES: &[&str] = &[
     "command",
     "run_command",
@@ -447,7 +445,6 @@ static BASE_COMMAND_PREFIXES: &[&str] = &[
     "subagent:terminal",
 ];
 
-#[allow(dead_code)]
 static READ_FILE_PREFIXES: &[&str] = &[
     "file",
     "view_file",
@@ -472,7 +469,6 @@ static READ_FILE_PREFIXES: &[&str] = &[
     "subagent:read",
 ];
 
-#[allow(dead_code)]
 static EDIT_FILE_PREFIXES: &[&str] = &[
     "file",
     "write_to_file",
@@ -494,7 +490,6 @@ static EDIT_FILE_PREFIXES: &[&str] = &[
     "subagent:edit",
 ];
 
-#[allow(dead_code)]
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     if req.command_line.is_none() && req.path.is_none() {
         return Vec::new();
@@ -689,7 +684,7 @@ struct HookJsonResponse<'a> {
 fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
-    _request: Option<&JudgeRequest>,
+    request: Option<&JudgeRequest>,
 ) -> String {
     if format == AgentFormat::ClaudeCode {
         // Claude Code has its own native auto mode and permission system.
@@ -698,7 +693,17 @@ fn encode_response(
     }
 
     match verdict.decision {
-        triage_core::judge::JudgeDecision::Allow => r#"{"decision":"allow"}"#.to_string(),
+        triage_core::judge::JudgeDecision::Allow => {
+            let permission_overrides = request
+                .map(compute_permission_overrides)
+                .unwrap_or_default();
+            serde_json::to_string(&HookJsonResponse {
+                decision: "allow",
+                reason: None,
+                permission_overrides: &permission_overrides,
+            })
+            .unwrap_or_default()
+        }
         triage_core::judge::JudgeDecision::Deny => {
             let reason_opt = if !verdict.reason.is_empty() {
                 Some(verdict.reason.as_str())

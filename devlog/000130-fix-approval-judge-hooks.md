@@ -147,10 +147,10 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 2beea9b — fix(hook): emit clean decision allow without invalid permission overrides
-- HEAD — fix(judge): isolate heredoc body quotes and backticks in shell metacharacter parser
+- cc72c38 — fix(judge): isolate heredoc body quotes and backticks in shell metacharacter parser
+- HEAD — fix(hook): emit comprehensive permission overrides on allow decisions
 
 ## What Changed
-- Fixed `has_complex_shell_metacharacters` and `pipeline_and_chain_segments` in `crates/triage-core/src/judge_rules.rs` to isolate multiline heredoc bodies (`<<'PY'` ... `PY`). This prevents embedded quotes and Kotlin test function backticks inside inline python file-editing scripts from prematurely disqualifying deterministic allow rules.
-- Synchronized all `hooks.json` registrations (`.agents/hooks.json`, `~/.gemini/config/hooks.json`) to use the official wildcard `"matcher": "*"` and absolute binary path.
-- Updated `~/.gemini/antigravity-cli/bin/triage-hook` alongside `~/.cargo/bin/triage-hook`, re-signed both ARM64 binaries, and reloaded the daemon with zero downtime.
+- Reconnected `compute_permission_overrides` on `Allow` hook responses to emit permission grants (`command(...)`, `run_command(...)`, `Bash(...)`, `subagent:...`) required by Antigravity's internal `EnsurePermissions` engine to bypass prompting on auto-approved tool calls.
+- Preserved silent passthrough (`""`, exit 0) for `Ask` / non-allow decisions so unapproved commands fall through cleanly to the agent's default permissions.
+- Re-verified full test suite across workspace (282 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
