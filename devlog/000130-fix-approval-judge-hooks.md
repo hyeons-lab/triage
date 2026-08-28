@@ -147,9 +147,10 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- a593f12 — fix(hook): unquote string parameters and emit gh subcommand permission overrides
-- HEAD — fix(hook): emit protojson allowTool and denyReason fields in hook responses
+- 777cdd6 — fix(hook): emit protojson allowTool and denyReason fields in hook responses
+- HEAD — feat(triaged): automatically provision and refresh agent lifecycle hooks on startup
 
 ## What Changed
-- Added protojson fields `allowTool: true` (on `Allow`) and `denyReason` / `allowTool: false` (on `Deny`) to `HookJsonResponse` in [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs#L707-L760). This explicitly matches Antigravity's internal Go runtime protobuf schema (`PreToolUseHookResponse.allow_tool`), guaranteeing tool execution is allowed directly without triggering permission confirmation prompts.
+- Updated `install_global_agent_hooks` and `configure_hook` in `crates/triaged/src/` to automatically provision, validate, and refresh hook registrations on daemon startup and upgrades.
+- Ensures absolute binary paths (`~/.cargo/bin/triage-hook`), correct regex matchers (`.*`), and automatic symlink maintenance for `~/.gemini/antigravity-cli/bin/triage-hook`.
 - Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

@@ -281,6 +281,15 @@ pub fn configure_hook(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
+    let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+    let cargo_hook = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".cargo").join("bin").join(&hook_name))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "triage-hook".to_string());
+
     judge_obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
     if !judge_obj.contains_key("PreToolUse") {
         judge_obj.insert(
@@ -291,7 +300,7 @@ pub fn configure_hook(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "triage-hook",
+                            "command": cargo_hook,
                             "timeout": 15
                         }
                     ]
