@@ -43,6 +43,7 @@
 - **2026-08-27T21:26-0700** Addressed Round 3 review findings: classified internal agent coordination tools (`schedule`, `manage_task`, `task_stop`) in `is_read_only_tool` to eliminate false interactive modals during timer/background task management, removed mutating sub-actions (`create`, `edit`, `comment`, `review`) from `matching_gh_allow_rule` while adding safe PR description updates (`gh pr edit`) to `BUILTIN_ALLOW_COMMANDS`, deleted duplicate `"adb exec-out"` entry, replaced private `is_edit_file_tool` with canonical `triage_core::judge_rules::is_edit_tool`, and used slice borrows in `HookJsonResponse`.
 - **2026-08-27T21:40-0700** Applied Round 4 review refinements: scoped read-only tool auto-approval in `JudgeRules::evaluate` strictly to tool calls carrying no `command_line` payload while routing commands embedded in multi-action tools (`manage_task` with `send_input`) through full command allowlist/security checks, added `manage_task` to `is_command_tool`, added `"Input"` key extraction to `extract_command_line`, eliminated intermediate prefix vector allocations in `compute_permission_overrides`, removed redundant `cortex:` check in `normalize_tool_name`, and skipped permission override evaluation on the Claude Code passthrough path.
 - **2026-08-27T21:58-0700** Applied Round 5 review refinements: handled top-level version queries (`git --version`, `git -v`, `git version`) in `matching_git_allow_rule`, corrected `dart --version` rule return string in `matching_flutter_allow_rule`, cleaned redundant script entries in `BUILTIN_ALLOW_COMMANDS`, adjusted `normalize_tool_name` to strip `cortex_step_type_` after namespace delimiter resolution, fixed duplicate commit hash in devlog history, and expanded corpus benchmark coverage with version query test cases across all toolchains.
+- **2026-08-27T22:04-0700** Applied Round 6 review refinements: expanded `BASE_COMMAND_PREFIXES`, `READ_FILE_PREFIXES`, and `EDIT_FILE_PREFIXES` to cover all tool names and aliases (`read`, `write`, `edit`, `shell`, `terminal`, `exec`), unconditionally emitted subagent-prefixed and self-prefixed tokens for all tools in `compute_permission_overrides`, collapsed duplicate token-matching logic into `matches_slice` helper in `matching_token_allow_rule`, streamlined trailing `--` token collection with `extend_from_slice` in `extract_positional_tokens`, and removed redundant `"dart pub get"` entry in `BUILTIN_ALLOW_COMMANDS`.
 
 ## Decisions
 
@@ -86,6 +87,7 @@
 - **Command-Bearing Tool Separation in Rule Evaluation**: Structured `JudgeRules::evaluate` so that read-only classification applies strictly when `request.command_line.is_none()`. Pure status queries (`task_status`, `list_tasks`, `manage_task(Action: "status")`, timer `schedule`) auto-approve without prompts, whereas interactive command injection (`manage_task(Action: "send_input", Input: "...")`) routes through full command validation.
 - **Zero-Allocation Static Prefix Slices**: Iterated directly over static string slices (`BASE_COMMAND_PREFIXES`, `base_file_slice`) in `compute_permission_overrides`, eliminating intermediate vector allocations on every hook execution.
 - **Authoritative Toolchain Version Flag Matching**: Handled `--version`, `-v`, `--help`, and `version` subcommands in toolchain rule evaluators before requiring subcommands, ensuring top-level diagnostic and version queries auto-approve deterministically without prompting.
+- **Unconditional Subagent Permission Overrides**: Removed prefix suppression guards in `compute_permission_overrides` so that all file, search, and command tool calls generate explicit `subagent:<tool>(...)` and `self:<tool>(...)` overrides. This ensures Antigravity's internal subagent permission matcher resolves subagent tool calls automatically without prompting the user.
 
 ## Commits
 
@@ -133,4 +135,5 @@
 - e4c607d — fix(judge,hook): support path wildcards, clean static tables, and unify hook responses
 - 34928bc — fix(judge,hook): permit agent task coordination, secure gh pr mutations, and use canonical edit tool check
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
-- HEAD — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
+- 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
+- HEAD — fix(judge,hook): emit comprehensive subagent overrides and clean token matching

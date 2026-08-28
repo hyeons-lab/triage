@@ -308,7 +308,6 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "./gradlew",
     "gradlew",
     "gradle",
-    "dart pub get",
     "dart pub",
     "dart run",
     "pnpm test",
@@ -715,6 +714,19 @@ impl JudgeRules {
         tokens: &[&str],
     ) -> Option<&'a str> {
         let positional_tokens = extract_positional_tokens(tokens);
+        let matches_slice = |rule: &[String], target: &[&str]| -> bool {
+            if rule.is_empty() || rule.len() > target.len() {
+                return false;
+            }
+            rule.iter().enumerate().all(|(i, expected)| {
+                if i == 0 {
+                    expected == target[0] || expected == program_name(target[0])
+                } else {
+                    expected == target[i]
+                }
+            })
+        };
+
         rules
             .iter()
             .find(|(text, rule)| {
@@ -732,44 +744,17 @@ impl JudgeRules {
                             return true;
                         }
                     }
-                    if !rule.is_empty() && rule.len() <= positional_tokens.len() {
-                        let matches_prefix = rule.iter().enumerate().all(|(i, expected)| {
-                            if i == 0 {
-                                expected == positional_tokens[0]
-                                    || expected == program_name(positional_tokens[0])
-                            } else {
-                                expected == positional_tokens[i]
-                            }
-                        });
-                        if matches_prefix {
-                            return true;
-                        }
+                    if matches_slice(rule, &positional_tokens) {
+                        return true;
                     }
                 }
 
                 // 1. Direct token prefix match (allowing full path on first token)
-                if rule.len() <= tokens.len()
-                    && rule.iter().enumerate().all(|(i, expected)| {
-                        if i == 0 {
-                            expected == tokens[0] || expected == program_name(tokens[0])
-                        } else {
-                            expected == tokens[i]
-                        }
-                    })
-                {
+                if matches_slice(rule, tokens) {
                     return true;
                 }
                 // 2. Positional CLI subcommand match (ignoring intermediate global flags)
-                if rule.len() <= positional_tokens.len()
-                    && rule.iter().enumerate().all(|(i, expected)| {
-                        if i == 0 {
-                            expected == positional_tokens[0]
-                                || expected == program_name(positional_tokens[0])
-                        } else {
-                            expected == positional_tokens[i]
-                        }
-                    })
-                {
+                if matches_slice(rule, &positional_tokens) {
                     return true;
                 }
                 false
@@ -1995,9 +1980,7 @@ pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
     while i < tokens.len() {
         let token = tokens[i];
         if token == "--" {
-            for &rest in &tokens[i + 1..] {
-                positionals.push(rest);
-            }
+            positionals.extend_from_slice(&tokens[i + 1..]);
             break;
         }
         if token != "-" && token.starts_with('-') {

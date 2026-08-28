@@ -417,12 +417,26 @@ static BASE_COMMAND_PREFIXES: &[&str] = &[
     "run_command",
     "Bash",
     "bash",
+    "exec",
+    "executecommand",
+    "shell",
+    "terminal",
     "self:command",
     "self:run_command",
     "self:Bash",
+    "self:bash",
+    "self:exec",
+    "self:executecommand",
+    "self:shell",
+    "self:terminal",
     "subagent:command",
     "subagent:run_command",
     "subagent:Bash",
+    "subagent:bash",
+    "subagent:exec",
+    "subagent:executecommand",
+    "subagent:shell",
+    "subagent:terminal",
 ];
 
 static READ_FILE_PREFIXES: &[&str] = &[
@@ -432,14 +446,21 @@ static READ_FILE_PREFIXES: &[&str] = &[
     "find_by_name",
     "list_dir",
     "read_file",
+    "read",
     "self:file",
     "self:view_file",
     "self:grep_search",
+    "self:find_by_name",
+    "self:list_dir",
     "self:read_file",
+    "self:read",
     "subagent:file",
     "subagent:view_file",
     "subagent:grep_search",
+    "subagent:find_by_name",
+    "subagent:list_dir",
     "subagent:read_file",
+    "subagent:read",
 ];
 
 static EDIT_FILE_PREFIXES: &[&str] = &[
@@ -447,22 +468,31 @@ static EDIT_FILE_PREFIXES: &[&str] = &[
     "write_to_file",
     "replace_file_content",
     "edit_file",
+    "write",
+    "edit",
     "self:file",
     "self:write_to_file",
     "self:replace_file_content",
+    "self:edit_file",
+    "self:write",
+    "self:edit",
     "subagent:file",
     "subagent:write_to_file",
     "subagent:replace_file_content",
+    "subagent:edit_file",
+    "subagent:write",
+    "subagent:edit",
 ];
 
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
+    let norm_tool = triage_core::judge_rules::normalize_tool_name(&req.tool_name);
+    let custom_sub = format!("subagent:{}", req.tool_name);
+    let custom_self = format!("self:{}", req.tool_name);
+    let norm_sub = format!("subagent:{norm_tool}");
+    let norm_self = format!("self:{norm_tool}");
 
     if let Some(ref cmd) = req.command_line {
-        let custom_sub = format!("subagent:{}", req.tool_name);
-        let custom_self = format!("self:{}", req.tool_name);
-        let has_custom_prefix = !BASE_COMMAND_PREFIXES.contains(&req.tool_name.as_str());
-
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
             if trimmed_target.is_empty() {
@@ -471,10 +501,13 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             for &prefix in BASE_COMMAND_PREFIXES {
                 permission_overrides.push(format!("{prefix}({trimmed_target})"));
             }
-            if has_custom_prefix {
-                permission_overrides.push(format!("{}({trimmed_target})", req.tool_name));
-                permission_overrides.push(format!("{custom_sub}({trimmed_target})"));
-                permission_overrides.push(format!("{custom_self}({trimmed_target})"));
+            permission_overrides.push(format!("{}({trimmed_target})", req.tool_name));
+            permission_overrides.push(format!("{custom_sub}({trimmed_target})"));
+            permission_overrides.push(format!("{custom_self}({trimmed_target})"));
+            if norm_tool != req.tool_name {
+                permission_overrides.push(format!("{norm_tool}({trimmed_target})"));
+                permission_overrides.push(format!("{norm_sub}({trimmed_target})"));
+                permission_overrides.push(format!("{norm_self}({trimmed_target})"));
             }
 
             if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
@@ -483,10 +516,13 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                     for &prefix in BASE_COMMAND_PREFIXES {
                         permission_overrides.push(format!("{prefix}({trimmed_sub})"));
                     }
-                    if has_custom_prefix {
-                        permission_overrides.push(format!("{}({trimmed_sub})", req.tool_name));
-                        permission_overrides.push(format!("{custom_sub}({trimmed_sub})"));
-                        permission_overrides.push(format!("{custom_self}({trimmed_sub})"));
+                    permission_overrides.push(format!("{}({trimmed_sub})", req.tool_name));
+                    permission_overrides.push(format!("{custom_sub}({trimmed_sub})"));
+                    permission_overrides.push(format!("{custom_self}({trimmed_sub})"));
+                    if norm_tool != req.tool_name {
+                        permission_overrides.push(format!("{norm_tool}({trimmed_sub})"));
+                        permission_overrides.push(format!("{norm_sub}({trimmed_sub})"));
+                        permission_overrides.push(format!("{norm_self}({trimmed_sub})"));
                     }
                 }
             }
@@ -545,9 +581,6 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         } else {
             READ_FILE_PREFIXES
         };
-        let custom_sub = format!("subagent:{}", req.tool_name);
-        let custom_self = format!("self:{}", req.tool_name);
-        let has_custom_prefix = !base_file_slice.contains(&req.tool_name.as_str());
 
         let clean_path = path.strip_prefix("file://").unwrap_or(path);
         let lower_path = clean_path.to_ascii_lowercase();
@@ -560,10 +593,13 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                 for &prefix in base_file_slice {
                     permission_overrides.push(format!("{prefix}({p_str})"));
                 }
-                if has_custom_prefix {
-                    permission_overrides.push(format!("{}({p_str})", req.tool_name));
-                    permission_overrides.push(format!("{custom_sub}({p_str})"));
-                    permission_overrides.push(format!("{custom_self}({p_str})"));
+                permission_overrides.push(format!("{}({p_str})", req.tool_name));
+                permission_overrides.push(format!("{custom_sub}({p_str})"));
+                permission_overrides.push(format!("{custom_self}({p_str})"));
+                if norm_tool != req.tool_name {
+                    permission_overrides.push(format!("{norm_tool}({p_str})"));
+                    permission_overrides.push(format!("{norm_sub}({p_str})"));
+                    permission_overrides.push(format!("{norm_self}({p_str})"));
                 }
             }
         };
