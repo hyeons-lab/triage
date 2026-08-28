@@ -249,7 +249,9 @@ pub fn install_global_agent_hooks() {
                             })
                             .unwrap_or(false);
 
-                    if needs_update && let Some(judge_obj) = content.get("triage-approval-judge").cloned() {
+                    if needs_update
+                        && let Some(judge_obj) = content.get("triage-approval-judge").cloned()
+                    {
                         obj.insert("triage-approval-judge".to_string(), judge_obj);
                         if let Ok(updated_str) = serde_json::to_string_pretty(&existing_val) {
                             let _ = atomic_write_file(&path, &updated_str);

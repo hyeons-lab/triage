@@ -213,13 +213,14 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
     ] {
         if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
             let trimmed = val.trim();
-            let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
-                || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
-            {
-                trimmed[1..trimmed.len() - 1].trim()
-            } else {
-                trimmed
-            };
+            let unquoted =
+                if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+                {
+                    trimmed[1..trimmed.len() - 1].trim()
+                } else {
+                    trimmed
+                };
             return Some(unquoted.to_string());
         }
     }
@@ -275,13 +276,14 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
     ] {
         if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
             let trimmed = val.trim();
-            let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
-                || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
-            {
-                trimmed[1..trimmed.len() - 1].trim()
-            } else {
-                trimmed
-            };
+            let unquoted =
+                if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+                {
+                    trimmed[1..trimmed.len() - 1].trim()
+                } else {
+                    trimmed
+                };
             return (unquoted != "." && unquoted != "..").then(|| unquoted.to_string());
         }
     }

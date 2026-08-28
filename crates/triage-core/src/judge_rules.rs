@@ -1764,23 +1764,23 @@ pub fn has_complex_shell_metacharacters(command: &str) -> bool {
     while i < bytes.len() {
         let b = bytes[i];
         if in_heredoc_body {
-            if let Some(ref delim) = heredoc_delimiter {
-                if b == b'\n' || b == b'\r' {
-                    let next_line_start =
-                        if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                            i + 2
-                        } else {
-                            i + 1
-                        };
-                    let line_rest = &command[next_line_start..];
-                    let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
-                    let line = line_rest[..line_end].trim();
-                    if line == delim.as_str() {
-                        heredoc_delimiter = None;
-                        in_heredoc_body = false;
-                        i = next_line_start + line_end;
-                        continue;
-                    }
+            if let Some(ref delim) = heredoc_delimiter
+                && (b == b'\n' || b == b'\r')
+            {
+                let next_line_start = if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n'
+                {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                let line_rest = &command[next_line_start..];
+                let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
+                let line = line_rest[..line_end].trim();
+                if line == delim.as_str() {
+                    heredoc_delimiter = None;
+                    in_heredoc_body = false;
+                    i = next_line_start + line_end;
+                    continue;
                 }
             }
             i += 1;
@@ -1916,23 +1916,23 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
     while i < bytes.len() {
         let b = bytes[i];
         if in_heredoc_body {
-            if let Some(ref delim) = heredoc_delimiter {
-                if b == b'\n' || b == b'\r' {
-                    let next_line_start =
-                        if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                            i + 2
-                        } else {
-                            i + 1
-                        };
-                    let line_rest = &command[next_line_start..];
-                    let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
-                    let line = line_rest[..line_end].trim();
-                    if line == delim.as_str() {
-                        heredoc_delimiter = None;
-                        in_heredoc_body = false;
-                        i = next_line_start + line_end;
-                        continue;
-                    }
+            if let Some(ref delim) = heredoc_delimiter
+                && (b == b'\n' || b == b'\r')
+            {
+                let next_line_start = if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n'
+                {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                let line_rest = &command[next_line_start..];
+                let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
+                let line = line_rest[..line_end].trim();
+                if line == delim.as_str() {
+                    heredoc_delimiter = None;
+                    in_heredoc_body = false;
+                    i = next_line_start + line_end;
+                    continue;
                 }
             }
             i += 1;

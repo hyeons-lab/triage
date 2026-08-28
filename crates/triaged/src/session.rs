@@ -1099,6 +1099,43 @@ impl SessionManager {
             reason = %verdict.reason,
             "judged agent tool call"
         );
+
+        if verdict.decision == triage_core::judge::JudgeDecision::Allow {
+            let target_actor_tx = self.sessions.lock().ok().and_then(|sessions| {
+                if let Some(ManagedSession::Live { actor, .. }) = sessions.get(&request.session_id)
+                {
+                    return Some(actor.tx.clone());
+                }
+                if let Some(req_cwd) = &request.cwd {
+                    let req_path = std::path::Path::new(req_cwd);
+                    for managed in sessions.values() {
+                        if let ManagedSession::Live {
+                            actor,
+                            last_known_cwd,
+                            launch,
+                            ..
+                        } = managed
+                        {
+                            if last_known_cwd.as_deref() == Some(req_path)
+                                || launch.cwd.as_deref() == Some(req_path)
+                            {
+                                return Some(actor.tx.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+            if let Some(actor_tx) = target_actor_tx {
+                std::thread::spawn(move || {
+                    // Brief delay so the hook can finish and the agent CLI process reaches its stdin prompt
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    let _ = request_write_input(&actor_tx, b"1\n".to_vec());
+                });
+            }
+        }
+
         verdict
     }
 
