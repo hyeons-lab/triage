@@ -456,7 +456,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // (a bare Ctrl toggle arms it via _toggleCtrl instead of coming through here).
   // Does not request focus so tapping shortcuts does not pop open the soft keyboard.
   void _sendAccessory(String bytes) {
-    _sendInput(bytes);
+    _sessionInputRouter.sendInput(_sanitizedId, bytes);
     _setCtrlArmed(false);
   }
 

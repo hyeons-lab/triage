@@ -302,14 +302,6 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         return AgentFormat::ClaudeCode;
     }
 
-    // Claude Code specific payload fields
-    if val.get("hook_event_name").is_some()
-        || val.get("hookEventName").is_some()
-        || (val.get("tool_input").is_some() && val.get("toolCall").is_none())
-    {
-        return AgentFormat::ClaudeCode;
-    }
-
     // Antigravity specific payload fields
     if val.get("conversationId").is_some()
         || val.get("stepIdx").is_some()
@@ -323,6 +315,14 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         || val.get("modelName").is_some()
     {
         return AgentFormat::Antigravity;
+    }
+
+    // Claude Code specific payload fields
+    if val.get("hook_event_name").is_some()
+        || val.get("hookEventName").is_some()
+        || val.get("tool_input").is_some()
+    {
+        return AgentFormat::ClaudeCode;
     }
 
     AgentFormat::Antigravity
@@ -410,46 +410,84 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     }
 }
 
+static BASE_COMMAND_PREFIXES: &[&str] = &[
+    "command",
+    "run_command",
+    "Bash",
+    "bash",
+    "self:command",
+    "self:run_command",
+    "self:Bash",
+    "subagent:command",
+    "subagent:run_command",
+    "subagent:Bash",
+];
+
+static READ_FILE_PREFIXES: &[&str] = &[
+    "file",
+    "view_file",
+    "grep_search",
+    "find_by_name",
+    "list_dir",
+    "read_file",
+    "self:file",
+    "self:view_file",
+    "self:grep_search",
+    "self:read_file",
+    "subagent:file",
+    "subagent:view_file",
+    "subagent:grep_search",
+    "subagent:read_file",
+];
+
+static EDIT_FILE_PREFIXES: &[&str] = &[
+    "file",
+    "write_to_file",
+    "replace_file_content",
+    "edit_file",
+    "self:file",
+    "self:write_to_file",
+    "self:replace_file_content",
+    "subagent:file",
+    "subagent:write_to_file",
+    "subagent:replace_file_content",
+];
+
+fn is_edit_file_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "write_to_file"
+            | "writetofile"
+            | "replace_file_content"
+            | "replacefilecontent"
+            | "edit_file"
+            | "editfile"
+            | "patch_file"
+            | "patchfile"
+    )
+}
+
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
 
-    let mut command_prefixes = vec![
-        "command".to_string(),
-        "run_command".to_string(),
-        "Bash".to_string(),
-        "bash".to_string(),
-        "self:command".to_string(),
-        "self:run_command".to_string(),
-        "self:Bash".to_string(),
-        "subagent:command".to_string(),
-        "subagent:run_command".to_string(),
-        "subagent:Bash".to_string(),
-    ];
-    if !command_prefixes.contains(&req.tool_name) {
+    let mut command_prefixes: Vec<String> = BASE_COMMAND_PREFIXES
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
+    if !BASE_COMMAND_PREFIXES.contains(&req.tool_name.as_str()) {
         command_prefixes.push(req.tool_name.clone());
         command_prefixes.push(format!("subagent:{}", req.tool_name));
         command_prefixes.push(format!("self:{}", req.tool_name));
     }
 
-    let mut file_prefixes = vec![
-        "file".to_string(),
-        "view_file".to_string(),
-        "grep_search".to_string(),
-        "find_by_name".to_string(),
-        "list_dir".to_string(),
-        "read_file".to_string(),
-        "write_to_file".to_string(),
-        "replace_file_content".to_string(),
-        "self:file".to_string(),
-        "self:view_file".to_string(),
-        "self:grep_search".to_string(),
-        "self:read_file".to_string(),
-        "subagent:file".to_string(),
-        "subagent:view_file".to_string(),
-        "subagent:grep_search".to_string(),
-        "subagent:read_file".to_string(),
-    ];
-    if !file_prefixes.contains(&req.tool_name) {
+    let lower_tool = req.tool_name.to_ascii_lowercase();
+    let base_file_slice = if is_edit_file_tool(&lower_tool) {
+        EDIT_FILE_PREFIXES
+    } else {
+        READ_FILE_PREFIXES
+    };
+    let mut file_prefixes: Vec<String> = base_file_slice.iter().map(|&s| s.to_string()).collect();
+    if !base_file_slice.contains(&req.tool_name.as_str()) {
         file_prefixes.push(req.tool_name.clone());
         file_prefixes.push(format!("subagent:{}", req.tool_name));
         file_prefixes.push(format!("self:{}", req.tool_name));
@@ -494,47 +532,29 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             }
             let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
             let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
-            if !words.is_empty() {
+            if words.len() >= 2 {
                 let prog = triage_core::judge_rules::program_name(words[0]);
-                if prog == "gradlew"
-                    || prog == "gradle"
-                    || prog == "make"
-                    || prog == "just"
-                    || prog == "sleep"
-                    || prog == "adb"
-                    || prog == "pytest"
-                    || prog == "python"
-                    || prog == "python3"
-                {
-                    add_command_override(words[0]);
-                    if prog != words[0] {
-                        add_command_override(prog);
-                    }
-                }
-                if words.len() >= 2 {
-                    if prog == "git" {
-                        if let Some((subcommand, _)) =
-                            triage_core::judge_rules::parse_git_subcommand(&words[1..])
-                        {
-                            add_command_override(&format!("git {subcommand}"));
-                            if let Some(sub_idx) = words[1..].iter().position(|&w| w == subcommand)
-                            {
-                                let prefix_words = &words[..=sub_idx + 1];
-                                let git_with_globals = prefix_words.join(" ");
-                                if git_with_globals != format!("git {subcommand}") {
-                                    add_command_override(&git_with_globals);
-                                }
+                if prog == "git" {
+                    if let Some((subcommand, _)) =
+                        triage_core::judge_rules::parse_git_subcommand(&words[1..])
+                    {
+                        add_command_override(&format!("git {subcommand}"));
+                        if let Some(sub_idx) = words[1..].iter().position(|&w| w == subcommand) {
+                            let prefix_words = &words[..=sub_idx + 1];
+                            let git_with_globals = prefix_words.join(" ");
+                            if git_with_globals != format!("git {subcommand}") {
+                                add_command_override(&git_with_globals);
                             }
                         }
-                    } else if !words[1].starts_with('-')
-                        && !words[1].starts_with('"')
-                        && !words[1].starts_with('\'')
-                        && !words[0].contains('=')
-                    {
-                        add_command_override(&format!("{} {}", words[0], words[1]));
-                        if prog != words[0] {
-                            add_command_override(&format!("{prog} {}", words[1]));
-                        }
+                    }
+                } else if !words[1].starts_with('-')
+                    && !words[1].starts_with('"')
+                    && !words[1].starts_with('\'')
+                    && !words[0].contains('=')
+                {
+                    add_command_override(&format!("{} {}", words[0], words[1]));
+                    if prog != words[0] {
+                        add_command_override(&format!("{prog} {}", words[1]));
                     }
                 }
             }
@@ -617,9 +637,13 @@ fn encode_response(
     request: Option<&JudgeRequest>,
 ) -> String {
     let decision_str = verdict.decision.as_hook_str();
-    let permission_overrides = request
-        .map(compute_permission_overrides)
-        .unwrap_or_default();
+    let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Deny {
+        Vec::new()
+    } else {
+        request
+            .map(compute_permission_overrides)
+            .unwrap_or_default()
+    };
 
     match format {
         AgentFormat::Antigravity => {
@@ -686,23 +710,10 @@ fn main() {
         let _ = writeln!(stdout, "{encoded}");
         let _ = stdout.flush();
     }
-    if let Ok(mut log_file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/triage-hook.log")
-    {
-        use std::io::Write as _;
-        let _ = writeln!(
-            log_file,
-            "[{:?}] Request: {:?} -> Verdict: {:?} -> Output: {}",
-            std::time::SystemTime::now(),
-            request,
-            verdict,
-            encoded
-        );
-    }
     std::process::exit(0);
 }
+
+const MAX_STDIN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Produces the verdict and detected agent format, resolving every failure to `ask`.
 fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
@@ -728,6 +739,10 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
                     break;
                 }
                 Ok(n) => {
+                    if buf.len() + n > MAX_STDIN_BYTES {
+                        let _ = tx.send(Err("stdin payload exceeded 2MB limit".to_string()));
+                        break;
+                    }
                     buf.extend_from_slice(&chunk[..n]);
                     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&buf) {
                         let _ = tx.send(Ok(val));
@@ -1128,8 +1143,6 @@ mod tests {
             .collect();
         assert!(overrides.contains(&"command(./gradlew ktfmtFormat)"));
         assert!(overrides.contains(&"command(gradlew ktfmtFormat)"));
-        assert!(overrides.contains(&"command(./gradlew)"));
-        assert!(overrides.contains(&"command(gradlew)"));
     }
 
     #[test]

@@ -65,15 +65,6 @@ pub fn is_read_only_tool(raw: &str) -> bool {
             | "send_message"
             | "manage_subagents"
             | "define_subagent"
-            | "manage_task"
-            | "managetask"
-            | "manage_tasks"
-            | "managetasks"
-            | "task_stop"
-            | "taskstop"
-            | "stop_task"
-            | "stoptask"
-            | "schedule"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
@@ -537,12 +528,20 @@ fn builtin_parsed_allow_commands() -> &'static [(String, Vec<String>)] {
         BUILTIN_ALLOW_COMMANDS
             .iter()
             .map(|entry| {
-                let tokens = tokenize_words(entry);
+                let clean_entry = entry.trim_end_matches('*').trim();
+                let tokens = tokenize_words(clean_entry);
                 ((*entry).to_string(), tokens)
             })
             .filter(|(_, tokens)| !tokens.is_empty())
             .collect()
     })
+}
+
+fn is_dangerous_git_network_arg(arg: &str) -> bool {
+    arg.contains("ext::")
+        || arg.contains("fd::")
+        || arg.starts_with("--upload-pack")
+        || arg.starts_with("--exec")
 }
 
 impl JudgeRules {
@@ -557,7 +556,8 @@ impl JudgeRules {
             entries
                 .iter()
                 .map(|entry| {
-                    let tokens = tokenize_words(entry);
+                    let clean_entry = entry.trim_end_matches('*').trim();
+                    let tokens = tokenize_words(clean_entry);
                     (entry.clone(), tokens)
                 })
                 .filter(|(_, tokens)| !tokens.is_empty())
@@ -760,21 +760,18 @@ impl JudgeRules {
             .iter()
             .find(|(text, rule)| {
                 // Wildcard matching (e.g. "pytest *", "adb logcat*", "make *")
-                if text.ends_with('*') {
-                    let prefix_str = text.trim_end_matches('*').trim();
-                    let prefix_rule = tokenize_words(prefix_str);
-                    if !prefix_rule.is_empty() && prefix_rule.len() <= positional_tokens.len() {
-                        let matches_prefix = prefix_rule.iter().enumerate().all(|(i, expected)| {
-                            if i == 0 {
-                                expected == positional_tokens[0]
-                                    || expected == program_name(positional_tokens[0])
-                            } else {
-                                expected == positional_tokens[i]
-                            }
-                        });
-                        if matches_prefix {
-                            return true;
+                if text.ends_with('*') && !rule.is_empty() && rule.len() <= positional_tokens.len()
+                {
+                    let matches_prefix = rule.iter().enumerate().all(|(i, expected)| {
+                        if i == 0 {
+                            expected == positional_tokens[0]
+                                || expected == program_name(positional_tokens[0])
+                        } else {
+                            expected == positional_tokens[i]
                         }
+                    });
+                    if matches_prefix {
+                        return true;
                     }
                 }
 
@@ -958,26 +955,20 @@ impl JudgeRules {
             "blame" => Some("git blame"),
             "ls-files" => Some("git ls-files"),
             "fetch" => {
-                let has_dangerous = sub_args.iter().any(|arg| {
-                    arg.contains("ext::")
-                        || arg.contains("fd::")
-                        || arg.starts_with("--upload-pack")
-                        || arg.starts_with("--exec")
-                });
-                if has_dangerous {
+                if sub_args
+                    .iter()
+                    .any(|&arg| is_dangerous_git_network_arg(arg))
+                {
                     None
                 } else {
                     Some("git fetch")
                 }
             }
             "pull" => {
-                let has_dangerous = sub_args.iter().any(|arg| {
-                    arg.contains("ext::")
-                        || arg.contains("fd::")
-                        || arg.starts_with("--upload-pack")
-                        || arg.starts_with("--exec")
-                });
-                if has_dangerous {
+                if sub_args
+                    .iter()
+                    .any(|&arg| is_dangerous_git_network_arg(arg))
+                {
                     None
                 } else {
                     Some("git pull")
@@ -1465,8 +1456,12 @@ pub fn persist_judge_config(config: &crate::config::JudgeConfig) -> anyhow::Resu
     file.sync_all()?;
     drop(file);
     if let Err(err) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.into());
+        if std::fs::copy(&tmp_path, &path).is_ok() {
+            let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
     }
     Ok(())
 }
@@ -2028,7 +2023,6 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     "-R",
     "--repo",
     "--hostname",
-    "-h",
     "-H",
     "--header",
     "-X",
@@ -2038,7 +2032,6 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     "-F",
     "--raw-field",
     "--input",
-    "-p",
     "--preview",
     "-q",
     "--jq",
@@ -2047,7 +2040,6 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     // cargo
     "--manifest-path",
     "--package",
-    "-p",
     "--target-dir",
     "--bin",
     "--example",
@@ -2057,10 +2049,7 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     "--target",
     "-Z",
     // flutter / dart
-    "-d",
     "--device-id",
-    "--target",
-    "-t",
     // pnpm / npm / yarn
     "--dir",
     "--prefix",
@@ -2068,15 +2057,14 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     // adb / fastboot
     "-s",
     "--serial",
-    "-t",
-    "-e",
-    "-d",
     "--device",
 ];
 
 pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
     let mut positionals = Vec::new();
     let mut i = 0;
+    let prog = tokens.first().map(|&t| program_name(t)).unwrap_or("");
+
     while i < tokens.len() {
         let token = tokens[i];
         if token == "--" {
@@ -2089,20 +2077,66 @@ pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
             if (token.starts_with("-C") && token != "-C")
                 || (token.starts_with("-c") && token != "-c")
                 || (token.starts_with("-R") && token != "-R")
-                || (token.starts_with("-p") && token != "-p")
                 || (token.starts_with("-H") && token != "-H")
                 || (token.starts_with("-f") && token != "-f")
                 || (token.starts_with("-F") && token != "-F")
-                || (token.starts_with("-d") && token != "-d")
                 || (token.starts_with("-t") && token != "-t")
                 || (token.starts_with("-s") && token != "-s")
                 || (token.starts_with("-Z") && token != "-Z")
+                || (token.starts_with("-p") && token != "-p" && prog == "cargo")
+                || (token.starts_with("-d") && token != "-d" && prog == "flutter")
                 || token.contains('=')
             {
                 i += 1;
                 continue;
             }
-            if KNOWN_VALUE_TAKING_FLAGS.contains(&token) {
+
+            let is_value_taking = match prog {
+                "cargo" => matches!(
+                    token,
+                    "-p" | "--package"
+                        | "--manifest-path"
+                        | "--target-dir"
+                        | "--bin"
+                        | "--example"
+                        | "--test"
+                        | "--bench"
+                        | "--profile"
+                        | "--target"
+                        | "-Z"
+                ),
+                "flutter" | "dart" => {
+                    matches!(token, "-d" | "--device-id" | "-t" | "--target")
+                }
+                "adb" | "fastboot" => {
+                    matches!(token, "-s" | "--serial" | "-t" | "--device")
+                }
+                "gh" => matches!(
+                    token,
+                    "-R" | "--repo"
+                        | "--hostname"
+                        | "-H"
+                        | "--header"
+                        | "-X"
+                        | "--method"
+                        | "-f"
+                        | "--field"
+                        | "-F"
+                        | "--raw-field"
+                        | "--input"
+                        | "--preview"
+                        | "-q"
+                        | "--jq"
+                        | "-t"
+                        | "--template"
+                ),
+                "pnpm" | "npm" | "yarn" | "bun" => {
+                    matches!(token, "--dir" | "--prefix" | "--filter")
+                }
+                _ => GIT_VALUE_TAKING_GLOBALS.contains(&token),
+            };
+
+            if is_value_taking {
                 i += 2;
                 continue;
             }
@@ -2449,7 +2483,12 @@ pub fn unquote_segment(segment: &str) -> std::borrow::Cow<'_, str> {
 
 pub fn program_name(token: &str) -> &str {
     let unescaped = token.strip_prefix('\\').unwrap_or(token);
-    unescaped.rsplit('/').next().unwrap_or(unescaped)
+    let base = unescaped.rsplit(['/', '\\']).next().unwrap_or(unescaped);
+    if let Some(stripped) = base.strip_suffix(".exe") {
+        stripped
+    } else {
+        base
+    }
 }
 
 pub fn is_network_pipe_to_interpreter(lowered_command: &str) -> bool {
@@ -3102,15 +3141,15 @@ mod tests {
 
     #[test]
     fn test_agent_coordination_and_task_tools_are_read_only() {
-        assert!(is_read_only_tool("manage_task"));
-        assert!(is_read_only_tool("manage_tasks"));
-        assert!(is_read_only_tool("managetask"));
-        assert!(is_read_only_tool("managetasks"));
-        assert!(is_read_only_tool("task_stop"));
-        assert!(is_read_only_tool("stop_task"));
-        assert!(is_read_only_tool("taskstop"));
-        assert!(is_read_only_tool("stoptask"));
-        assert!(is_read_only_tool("schedule"));
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("manage_tasks"));
+        assert!(!is_read_only_tool("managetask"));
+        assert!(!is_read_only_tool("managetasks"));
+        assert!(!is_read_only_tool("task_stop"));
+        assert!(!is_read_only_tool("stop_task"));
+        assert!(!is_read_only_tool("taskstop"));
+        assert!(!is_read_only_tool("stoptask"));
+        assert!(!is_read_only_tool("schedule"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
@@ -3471,11 +3510,11 @@ mod tests {
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
         assert!(is_read_only_tool("task_list"));
-        assert!(is_read_only_tool("manage_task"));
-        assert!(is_read_only_tool("manage_tasks"));
-        assert!(is_read_only_tool("task_stop"));
-        assert!(is_read_only_tool("stop_task"));
-        assert!(is_read_only_tool("schedule"));
+        assert!(!is_read_only_tool("manage_task"));
+        assert!(!is_read_only_tool("manage_tasks"));
+        assert!(!is_read_only_tool("task_stop"));
+        assert!(!is_read_only_tool("stop_task"));
+        assert!(!is_read_only_tool("schedule"));
     }
 
     #[test]
@@ -3525,15 +3564,18 @@ mod tests {
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("$HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT shell \"am broadcast -n ai.liquid.lfm2/.service.DebugSignalReceiver\"").map(|v| v.decision),
+            evaluate_cmd("adb -s MOCK_SERIAL_123 shell \"am broadcast -n com.example.app/.service.DebugReceiver\"").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("sleep 1.5 && $HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT exec-out screencap -p > /tmp/s25u_popup.png").map(|v| v.decision),
+            evaluate_cmd(
+                "sleep 1.5 && adb -s MOCK_SERIAL_123 exec-out screencap -p > /tmp/popup.png"
+            )
+            .map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("git -C /Users/dberrios/development/liquid-agent-mobile/worktrees/mobile-demos-brain-routing diff feat/photo-vision-capture...feat/mobile-demos-brain-routing > /Users/dberrios/.gemini/antigravity-cli/brain/31763373-0877-4673-8e1a-10802e0d0fc1/scratch/branch_review_diff.patch").map(|v| v.decision),
+            evaluate_cmd("git -C /work/repo/worktrees/feature diff main...HEAD > /work/repo/scratch/diff.patch").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(

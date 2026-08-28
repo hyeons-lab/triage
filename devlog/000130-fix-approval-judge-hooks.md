@@ -38,6 +38,7 @@
 - **2026-08-27T20:25-0700** Removed explicit `_focusTerminal()` focus requests from accessory bar button taps in `terminal_pane_stub.dart` and `terminal_pane_web.dart`, preventing mobile OS virtual keyboards from popping open when tapping bottom shortcuts.
 - **2026-08-27T20:34-0700** Removed raw `>` output redirection restriction from `has_complex_shell_metacharacters`, allowing standard file output redirections (e.g. `git diff ... > scratch.patch`, `adb screencap > /tmp/img.png`) to be evaluated and auto-approved under Layer 2 allowlist rules rather than falling back to model `Ask`.
 - **2026-08-27T20:47-0700** Added comprehensive subagent and tool prefix grants (`view_file`, `grep_search`, `subagent:view_file`, `subagent:run_command`, `self:run_command`, `Bash`) to `permissionOverrides` in `triage-hook`, ensuring Antigravity's in-memory permission engine recognizes grants across all subagent lifecycle requests.
+- **2026-08-27T21:08-0700** Addressed MAX-effort review audit findings: separated state-modifying tools (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool`, prevented web terminal accessory bar from focusing on tap, refined per-tool value-taking CLI flags (`cargo -p`, `flutter -d`, `gh -R`), normalized Windows path separators and `.exe` stripping in `program_name`, added cross-device copy fallback in `persist_judge_config`, optimized wildcard rule pre-tokenization in `JudgeRules`, enforced 2MB upper bound on stdin ingestion, removed unvalidated debug log, and scoped write file prefixes exclusively to edit tools.
 
 ## Decisions
 
@@ -70,6 +71,9 @@
 - **Non-Focusing Mobile Accessory Bar**: Removed `_focusTerminal()` calls on accessory key sends (`_sendAccessory`) and Ctrl toggle (`_toggleCtrl`). Because `TerminalAccessoryBar` keys use raw `GestureDetector` widgets without focus nodes, tapping shortcut keys delivers keystrokes to the terminal without requesting OS keyboard focus or popping up the soft keyboard.
 - **Permit Standard Output Redirection in Deterministic Rules**: Allowed standard `>` and `>>` output redirections while preserving strict checks against command substitutions (`$(...)`, `` `...` ``), process substitutions (`<(...)`, `>(...)`), and credential/sensitive path targets, ensuring routine diff exports, screencaps, and log dumps proceed without interactive prompts.
 - **Comprehensive Subagent and Tool Prefix Override Matrix**: Expanded `compute_permission_overrides` to emit grants for all core tool names (`view_file`, `grep_search`, `find_by_name`, `list_dir`, `read_file`, `write_to_file`, `replace_file_content`, `run_command`, `Bash`) with explicit `subagent:` and `self:` prefixes. This ensures Antigravity's internal subagent permission cache matches incoming tool calls without fallback confirmation dialogs.
+- **State-Modifying & Cancellation Tool Separation**: Strictly excluded multi-action tools with process termination (`kill`) or input injection (`send_input`) capabilities (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool`, confining read-only auto-approvals strictly to status inspection tools (`task_status`, `list_tasks`).
+- **Scoped Positional CLI Flag Parsing**: Mapped value-taking CLI flags by executable program (`cargo -p`, `flutter -d`, `adb -s`, `gh -R`) so tools with shared short flags (e.g. `git log -p` vs `cargo -p`) parse positionals accurately without consuming valid subcommands.
+- **Pre-tokenized Wildcard Rule Caching**: Stripped trailing wildcards and pre-parsed command tokens at initialization time in `JudgeRules`, completely eliminating runtime `shlex::split` heap allocations during rule lookup.
 
 ## Commits
 
@@ -112,4 +116,5 @@
 - 37f3579 — fix(client): prevent accessory bar taps from popping soft keyboard on mobile
 - 0bf578d — fix(judge): allow standard output redirection in deterministic rules
 - 358d55c — fix(hook): omit permissionOverrides on allow verdicts for Antigravity subagents
-- HEAD — fix(hook): emit comprehensive subagent and tool prefix permission overrides
+- 5240c69 — fix(hook): emit comprehensive subagent and tool prefix permission overrides
+- HEAD — fix(judge,hook): apply MAX-effort review audit fixes across rules, flags, and hook protocol
