@@ -1138,26 +1138,29 @@ impl JudgeRules {
                 Some("git remote -v")
             }
             "push" => {
-                const GIT_PUSH_DANGEROUS_FLAGS: &[&str] = &[
-                    "-f",
-                    "--force",
-                    "--force-with-lease",
-                    "--force-if-includes",
-                    "-d",
-                    "--delete",
-                    "--mirror",
-                    "--prune",
-                    "--receive-pack",
-                    "--exec",
-                ];
                 let is_dangerous = sub_args.iter().any(|arg| {
-                    GIT_PUSH_DANGEROUS_FLAGS.contains(arg)
+                    if *arg == "--force-with-lease"
+                        || arg.starts_with("--force-with-lease=")
+                        || *arg == "--force-if-includes"
+                    {
+                        return false;
+                    }
+                    *arg == "-f"
+                        || *arg == "--force"
                         || arg.starts_with("-f")
-                        || arg.starts_with("--force")
-                        || arg.starts_with("--receive-pack")
-                        || arg.starts_with("--exec")
+                        || arg.starts_with("--force=")
+                        || *arg == "-d"
+                        || *arg == "--delete"
+                        || arg.starts_with("-d")
+                        || arg.starts_with("--delete=")
+                        || *arg == "--mirror"
+                        || *arg == "--prune"
+                        || *arg == "--receive-pack"
+                        || arg.starts_with("--receive-pack=")
+                        || *arg == "--exec"
+                        || arg.starts_with("--exec=")
                         || arg.starts_with('+')
-                        || arg.starts_with(':')
+                        || (arg.starts_with(':') && !arg.starts_with("::"))
                 });
                 if is_dangerous { None } else { Some("git push") }
             }
@@ -2113,24 +2116,32 @@ pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
 
     match subcommand {
         "push"
-            if has(
-                &[
-                    "--force",
-                    "--force-with-lease",
-                    "--force-if-includes",
-                    "--delete",
-                    "--mirror",
-                    "--prune",
-                    "--receive-pack",
-                    "--exec",
-                ],
-                &['f', 'd'],
-            ) || sub_args.iter().any(|arg| {
-                arg.starts_with('+')
-                    || arg.starts_with(':')
-                    || arg.starts_with("--force")
-                    || arg.starts_with("--receive-pack")
-                    || arg.starts_with("--exec")
+            if sub_args.iter().any(|arg| {
+                if *arg == "--force-with-lease"
+                    || arg.starts_with("--force-with-lease=")
+                    || *arg == "--force-if-includes"
+                {
+                    return false;
+                }
+                *arg == "-f"
+                    || *arg == "--force"
+                    || (arg.starts_with("-f") && !arg.starts_with("--"))
+                    || arg.starts_with("--force=")
+                    || *arg == "-d"
+                    || *arg == "--delete"
+                    || (arg.starts_with("-d") && !arg.starts_with("--"))
+                    || arg.starts_with("--delete=")
+                    || *arg == "--mirror"
+                    || *arg == "--prune"
+                    || *arg == "--receive-pack"
+                    || arg.starts_with("--receive-pack=")
+                    || *arg == "--exec"
+                    || arg.starts_with("--exec=")
+                    || arg.starts_with('+')
+                    || (arg.starts_with(':') && !arg.starts_with("::"))
+                    || (arg.starts_with('-')
+                        && !arg.starts_with("--")
+                        && is_short_flag_bundle_containing(arg, &['f', 'd']))
             }) =>
         {
             Some("destructive git push operation")
@@ -3437,6 +3448,23 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("git push -u origin HEAD:refs/heads/feature").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git push origin feat/mobile-demos --force-with-lease")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git push --force-if-includes origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git push origin main --force").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_ne!(
+            evaluate_cmd("git push origin main -f").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

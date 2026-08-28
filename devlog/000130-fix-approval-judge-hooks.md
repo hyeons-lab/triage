@@ -48,6 +48,7 @@
 - **2026-08-27T22:20-0700** Applied Round 8 review refinements: separated state-modifying tools (`manage_task`, `task_stop`) from `is_read_only_tool` while dynamically mapping `Action: "status"` and `"list"` invocations in `triage-hook` to `task_status` for immediate read auto-approval, added `cargo run` and `flutter run` subcommands to their respective allow rules, eliminated unnecessary lowercase String allocation in `is_command_tool`, and deferred `norm_sub` string allocations in `compute_permission_overrides`.
 - **2026-08-27T22:27-0700** Applied Round 9 review refinements: eliminated redundant `lower_tool_name` String allocation in `JudgeRules::evaluate`, synchronized `BUILTIN_ALLOW_COMMANDS` table with structured subcommands (`cargo run/clean/bench`, `flutter run/format/clean`), added early return on empty command/path in `compute_permission_overrides`, and verified clean test passes across workspace.
 - **2026-08-27T22:37-0700** Applied Round 10 review refinements: removed dead version check in `matching_git_allow_rule` positional length guard, added `"version"` match arm to `matching_cargo_allow_rule` and cleaned positional length check, and replaced HashSet deduplication with zero-allocation in-place linear scan in `compute_permission_overrides`.
+- **2026-08-27T22:40-0700** Applied Round 11 review refinements: updated `denied_git_operation` and `matching_git_allow_rule` to permit safe non-destructive force pushes (`--force-with-lease` and `--force-if-includes`) so rebased feature branches push without stalling unpromptable background subagents, while keeping destructive blind force pushes (`--force`, `-f`, `+ref`) and branch deletions (`-d`, `--delete`, `:ref`) strictly protected.
 
 ## Decisions
 
@@ -96,6 +97,7 @@
 - **Dynamic Multi-Action Task Mapping in Hook**: Mapped `manage_task` with query actions (`status`, `list`) to `task_status` in `triage-hook` while directing termination actions (`kill`, `stop`) to `task_stop` and command injections (`send_input`) to full command validation. This adheres strictly to the Pillar 6 state-modifying separation invariant while allowing subagents to inspect background tasks without interactive approval prompts.
 - **Static Allowlist Invariant Synchronization**: Aligned `BUILTIN_ALLOW_COMMANDS` explicitly with toolchain grammar parsers to ensure consistency between static configuration dumps and structured CLI evaluation.
 - **Zero-Allocation Deduplication**: Used in-place linear scan on `deduped` in `compute_permission_overrides` instead of a heap-allocated `HashSet`, eliminating duplicate String clones and hashing overhead on hook invocation.
+- **Safe Git Force-Push Permitted**: Allowlisted `--force-with-lease` and `--force-if-includes` in both Layer 1 and Layer 2 evaluators. Unlike blind `--force` or `+ref`, lease-based force pushing guarantees the remote ref has not moved since last fetch, preventing unpromptable subagents from wedging when pushing rebased feature branches.
 
 ## Commits
 
@@ -148,4 +150,5 @@
 - ea4b359 — fix(judge,hook): guard git version positional length and optimize override deduplication
 - 11729d0 — fix(judge,hook): separate task management actions and allowlist cargo/flutter run
 - cabe349 — fix(judge,hook): sync allowlist tables and eliminate tool name allocations
-- HEAD — fix(judge,hook): clean version positional checks and use zero-alloc deduplication
+- de87de9 — fix(judge,hook): clean version positional checks and use zero-alloc deduplication
+- HEAD — feat(judge): permit safe force-with-lease and force-if-includes git pushes
