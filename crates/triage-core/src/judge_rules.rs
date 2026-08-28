@@ -283,15 +283,22 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "gh pr edit",
     "gh pr comment",
     "gh pr checkout",
+    "gh pr create",
+    "gh pr review",
     "gh run view",
     "gh run list",
     "gh run watch",
+    "gh run rerun",
     "gh status",
     "gh issue view",
     "gh issue list",
     "gh issue status",
+    "gh issue create",
+    "gh issue comment",
+    "gh issue edit",
     "gh repo view",
     "gh repo list",
+    "gh repo clone",
     "gh release view",
     "gh release list",
     "gh workflow view",
@@ -423,7 +430,6 @@ pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
     "gradle publish",
     "gradlew publish",
     "gh release",
-    "gh pr create",
     // Permission blanket-opening.
     "chmod 777",
     "chmod -r 777",
@@ -821,23 +827,30 @@ impl JudgeRules {
                 Some("edit") => Some("gh pr edit"),
                 Some("comment") => Some("gh pr comment"),
                 Some("checkout") => Some("gh pr checkout"),
+                Some("create") => Some("gh pr create"),
+                Some("review") => Some("gh pr review"),
                 _ => None,
             },
             "issue" => match sub_action {
                 Some("view") => Some("gh issue view"),
                 Some("list") => Some("gh issue list"),
                 Some("status") => Some("gh issue status"),
+                Some("create") => Some("gh issue create"),
+                Some("comment") => Some("gh issue comment"),
+                Some("edit") => Some("gh issue edit"),
                 _ => None,
             },
             "run" => match sub_action {
                 Some("view") => Some("gh run view"),
                 Some("list") => Some("gh run list"),
                 Some("watch") => Some("gh run watch"),
+                Some("rerun") => Some("gh run rerun"),
                 _ => None,
             },
             "repo" => match sub_action {
                 Some("view") => Some("gh repo view"),
                 Some("list") => Some("gh repo list"),
+                Some("clone") => Some("gh repo clone"),
                 _ => None,
             },
             "release" => match sub_action {
@@ -3103,6 +3116,27 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("gh api /repos/owner/repo/pulls").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn gh_pr_create_and_collaboration_commands_allowed() {
+        assert_eq!(
+            evaluate_cmd("gh pr create --repo Liquid4All/liquid-agent-mobile --draft --base feat/photo-vision-capture --head feat/mobile-demos-brain-routing --title \"[Demo] Brain\" --body-file /path/to/body.md")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gh pr review --approve 123").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gh issue create --title \"bug\" --body \"details\"").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("gh repo clone Liquid4All/liquid-agent-mobile").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

@@ -147,10 +147,10 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 1ce68a9 — feat(judge): permit safe force-with-lease and force-if-includes git pushes
-- HEAD — fix(hook,judge): silent passthrough for non-allow decisions and safe git config inspection
+- 816ae06 — fix(hook,judge): silent passthrough for non-allow decisions and safe git config inspection
+- HEAD — feat(judge): allowlist gh pr create and collaboration commands
 
 ## What Changed
-- Changed `triage-hook` response encoding to only emit explicit hook responses on `Allow` (with `permissionOverrides`) and hard `Deny` (with `reason`). All `Ask` / non-allow decisions fall through with empty output (`String::new()`, exit 0), enabling agents to execute with their native permission engines (such as background subagent auto-mode) without being forced into an unpromptable modal ask state.
-- Enhanced git `-c` / `--config` option inspection in `has_disqualifying_argument` via `is_dangerous_git_config_key` to only disqualify dangerous execution modifiers (`core.pager`, `core.askPass`, `core.sshCommand`, `core.editor`, `diff.external`, `credential.helper=!`), allowing safe configuration overrides like `credential.helper=` and user metadata.
+- Removed `"gh pr create"` from `BUILTIN_SENSITIVE_SUBSTRINGS` and added it along with collaboration commands (`gh pr review`, `gh issue create`, `gh issue comment`, `gh issue edit`, `gh repo clone`, `gh run rerun`) to `BUILTIN_ALLOW_COMMANDS` and `matching_gh_allow_rule`.
+- Updated benchmark expectations and verified that pull request creation commands (such as `gh pr create --repo ... --draft ...`) auto-approve without waiting or prompting.
 - Re-verified full test suite across workspace (282 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

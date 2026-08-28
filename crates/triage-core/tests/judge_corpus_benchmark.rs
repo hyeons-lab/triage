@@ -634,7 +634,7 @@ pub fn load_corpus() -> Vec<CorpusCase> {
         CorpusCase {
             category: "GitHub CLI",
             command: "gh pr create --title \"feat: update\" --body \"details\"",
-            expected: JudgeDecision::Ask,
+            expected: JudgeDecision::Allow,
             description: "Opening new remote pull request",
         },
         CorpusCase {
