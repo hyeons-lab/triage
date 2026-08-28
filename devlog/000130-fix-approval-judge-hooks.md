@@ -39,6 +39,7 @@
 - **2026-08-27T20:34-0700** Removed raw `>` output redirection restriction from `has_complex_shell_metacharacters`, allowing standard file output redirections (e.g. `git diff ... > scratch.patch`, `adb screencap > /tmp/img.png`) to be evaluated and auto-approved under Layer 2 allowlist rules rather than falling back to model `Ask`.
 - **2026-08-27T20:47-0700** Added comprehensive subagent and tool prefix grants (`view_file`, `grep_search`, `subagent:view_file`, `subagent:run_command`, `self:run_command`, `Bash`) to `permissionOverrides` in `triage-hook`, ensuring Antigravity's in-memory permission engine recognizes grants across all subagent lifecycle requests.
 - **2026-08-27T21:08-0700** Addressed MAX-effort review audit findings: separated state-modifying tools (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool`, prevented web terminal accessory bar from focusing on tap, refined per-tool value-taking CLI flags (`cargo -p`, `flutter -d`, `gh -R`), normalized Windows path separators and `.exe` stripping in `program_name`, added cross-device copy fallback in `persist_judge_config`, optimized wildcard rule pre-tokenization in `JudgeRules`, enforced 2MB upper bound on stdin ingestion, removed unvalidated debug log, and scoped write file prefixes exclusively to edit tools.
+- **2026-08-27T21:16-0700** Applied Round 2 review audit refinements: added path wildcard matching (`./scripts/*`, `scripts/*`) in `matching_token_allow_rule`, corrected package manager version/help flag return strings, removed dead `KNOWN_VALUE_TAKING_FLAGS` constant, consolidated duplicate JSON serialization structs in `triage-hook`, made command/file prefix allocations lazy on incoming tool payloads, eliminated duplicate trailing wildcard entries in `BUILTIN_ALLOW_COMMANDS`, and expanded benchmark coverage to non-command and namespaced tools.
 
 ## Decisions
 
@@ -74,6 +75,9 @@
 - **State-Modifying & Cancellation Tool Separation**: Strictly excluded multi-action tools with process termination (`kill`) or input injection (`send_input`) capabilities (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool`, confining read-only auto-approvals strictly to status inspection tools (`task_status`, `list_tasks`).
 - **Scoped Positional CLI Flag Parsing**: Mapped value-taking CLI flags by executable program (`cargo -p`, `flutter -d`, `adb -s`, `gh -R`) so tools with shared short flags (e.g. `git log -p` vs `cargo -p`) parse positionals accurately without consuming valid subcommands.
 - **Pre-tokenized Wildcard Rule Caching**: Stripped trailing wildcards and pre-parsed command tokens at initialization time in `JudgeRules`, completely eliminating runtime `shlex::split` heap allocations during rule lookup.
+- **Script Path Wildcard Matching**: Extended `matching_token_allow_rule` to recognize path-prefix wildcard entries containing `/` or `\` (e.g. `./scripts/*` or `scripts/*`), matching against the executable path directly so custom development scripts in project subdirectories auto-approve without manual allowlisting.
+- **Lazy Hook Prefix Vector Allocation**: Deferred allocating and formatting tool prefix vectors in `triage-hook` until verifying presence of `command_line` or `path` fields, eliminating heap churn on high-frequency status queries.
+- **Unified Hook JSON Serialization**: Merged `AntigravityResponse` and `GenericResponse` into a single `HookJsonResponse` definition to ensure schema invariants remain lockstep across all protocol variations.
 
 ## Commits
 
@@ -117,4 +121,5 @@
 - 0bf578d — fix(judge): allow standard output redirection in deterministic rules
 - 358d55c — fix(hook): omit permissionOverrides on allow verdicts for Antigravity subagents
 - 5240c69 — fix(hook): emit comprehensive subagent and tool prefix permission overrides
-- HEAD — fix(judge,hook): apply MAX-effort review audit fixes across rules, flags, and hook protocol
+- 139b6ca — fix(judge,hook): apply MAX-effort review audit fixes across rules, flags, and hook protocol
+- HEAD — fix(judge,hook): support path wildcards, clean static tables, and unify hook responses

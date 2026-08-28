@@ -288,11 +288,8 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "gh --version",
     // Utilities & Task runners.
     "sleep",
-    "sleep *",
     "just",
-    "just *",
     "make",
-    "make *",
     "./scripts/*",
     "scripts/*",
     "./scripts/install.sh",
@@ -300,11 +297,8 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "./scripts/bump-version.sh",
     "scripts/bump-version.sh",
     "./gradlew",
-    "./gradlew *",
     "gradlew",
-    "gradlew *",
     "gradle",
-    "gradle *",
     "dart pub get",
     "dart pub",
     "dart run",
@@ -327,10 +321,7 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     // Python and test runners.
     "python",
     "python3",
-    "python *",
-    "python3 *",
     "pytest",
-    "pytest *",
     "python -m pytest",
     "python3 -m pytest",
     "python -m unittest",
@@ -338,7 +329,6 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "python --version",
     "python3 --version",
     "uv run",
-    "uv run *",
     "uv test",
     "uv pip list",
     "pip list",
@@ -346,100 +336,61 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "pip check",
     // Node ecosystem.
     "node",
-    "node *",
     // Go ecosystem.
     "go test",
-    "go test *",
     "go vet",
-    "go vet *",
     "go fmt",
     "go version",
     // Android debug bridge and fastboot.
     "adb",
-    "adb *",
     "adb devices",
-    "adb devices *",
     "adb logcat",
-    "adb logcat *",
     "adb shell",
-    "adb shell *",
     "adb exec-out",
-    "adb exec-out *",
+    "adb exec-out",
     "adb push",
-    "adb push *",
     "adb pull",
-    "adb pull *",
     "adb install",
-    "adb install *",
     "adb uninstall",
-    "adb uninstall *",
     "adb forward",
-    "adb forward *",
     "adb reverse",
-    "adb reverse *",
     "adb emu",
-    "adb emu *",
     "adb bugreport",
-    "adb bugreport *",
     "adb wait-for-device",
-    "adb wait-for-device *",
     "adb connect",
-    "adb connect *",
     "adb disconnect",
-    "adb disconnect *",
     "adb start-server",
     "adb kill-server",
     "adb version",
     "fastboot",
-    "fastboot *",
+    "fastboot devices",
     // Docker & Container tools.
     "docker",
-    "docker *",
     "docker build",
-    "docker build *",
     "docker run",
-    "docker run *",
     "docker compose",
-    "docker compose *",
     "docker ps",
-    "docker ps *",
     "docker images",
-    "docker images *",
     "docker logs",
-    "docker logs *",
     "docker exec",
-    "docker exec *",
     "docker version",
     "docker info",
     "docker inspect",
     "podman",
-    "podman *",
     "podman build",
-    "podman build *",
     "podman run",
-    "podman run *",
     // Archive & Compression utilities.
     "unzip",
-    "unzip *",
     "zip",
-    "zip *",
     "zipinfo",
-    "zipinfo *",
     "tar",
-    "tar *",
     "gzip",
-    "gzip *",
     "gunzip",
-    "gunzip *",
     // Triage workspace binaries & hooks.
     "triage",
-    "triage *",
     "triaged",
-    "triaged *",
     "triage-hook",
-    "triage-hook *",
     "triage-mcp",
-    "triage-mcp *",
 ];
 
 pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
@@ -759,19 +710,32 @@ impl JudgeRules {
         rules
             .iter()
             .find(|(text, rule)| {
-                // Wildcard matching (e.g. "pytest *", "adb logcat*", "make *")
-                if text.ends_with('*') && !rule.is_empty() && rule.len() <= positional_tokens.len()
-                {
-                    let matches_prefix = rule.iter().enumerate().all(|(i, expected)| {
-                        if i == 0 {
-                            expected == positional_tokens[0]
-                                || expected == program_name(positional_tokens[0])
-                        } else {
-                            expected == positional_tokens[i]
+                // Wildcard matching (e.g. "./scripts/*", "pytest *", "adb logcat*", "make *")
+                if text.ends_with('*') {
+                    let prefix = text.trim_end_matches('*');
+                    if (prefix.contains('/') || prefix.contains('\\'))
+                        && let Some(&first_token) = tokens.first()
+                    {
+                        let norm_prefix = prefix.replace('\\', "/");
+                        let norm_first = first_token.replace('\\', "/");
+                        let clean_prefix = norm_prefix.strip_prefix("./").unwrap_or(&norm_prefix);
+                        let clean_first = norm_first.strip_prefix("./").unwrap_or(&norm_first);
+                        if clean_first.starts_with(clean_prefix) {
+                            return true;
                         }
-                    });
-                    if matches_prefix {
-                        return true;
+                    }
+                    if !rule.is_empty() && rule.len() <= positional_tokens.len() {
+                        let matches_prefix = rule.iter().enumerate().all(|(i, expected)| {
+                            if i == 0 {
+                                expected == positional_tokens[0]
+                                    || expected == program_name(positional_tokens[0])
+                            } else {
+                                expected == positional_tokens[i]
+                            }
+                        });
+                        if matches_prefix {
+                            return true;
+                        }
                     }
                 }
 
@@ -1333,10 +1297,10 @@ impl JudgeRules {
                 .any(|t| *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h")
             {
                 return Some(match prog {
-                    "pnpm" => "pnpm test",
-                    "yarn" => "yarn test",
-                    "bun" => "bun test",
-                    _ => "npm test",
+                    "pnpm" => "pnpm --version",
+                    "yarn" => "yarn --version",
+                    "bun" => "bun --version",
+                    _ => "npm --version",
                 });
             }
             return None;
@@ -2009,56 +1973,6 @@ pub fn denied_segment_rule(tokens: &[&str]) -> Option<&'static str> {
     }
     git_denied_operation(tokens)
 }
-
-pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
-    // git
-    "-C",
-    "-c",
-    "--git-dir",
-    "--work-tree",
-    "--namespace",
-    "--exec-path",
-    "--config-env",
-    // gh
-    "-R",
-    "--repo",
-    "--hostname",
-    "-H",
-    "--header",
-    "-X",
-    "--method",
-    "-f",
-    "--field",
-    "-F",
-    "--raw-field",
-    "--input",
-    "--preview",
-    "-q",
-    "--jq",
-    "-t",
-    "--template",
-    // cargo
-    "--manifest-path",
-    "--package",
-    "--target-dir",
-    "--bin",
-    "--example",
-    "--test",
-    "--bench",
-    "--profile",
-    "--target",
-    "-Z",
-    // flutter / dart
-    "--device-id",
-    // pnpm / npm / yarn
-    "--dir",
-    "--prefix",
-    "--filter",
-    // adb / fastboot
-    "-s",
-    "--serial",
-    "--device",
-];
 
 pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
     let mut positionals = Vec::new();
@@ -3625,5 +3539,27 @@ mod tests {
             evaluate_cmd("tar -xzf archive.tar.gz").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
+    }
+
+    #[test]
+    fn test_scripts_path_wildcard_and_pm_version_rules() {
+        assert_eq!(
+            evaluate_cmd("./scripts/install.sh").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("./scripts/custom_build.sh").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("scripts/bump-version.sh 0.4.0").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        let npm_ver = evaluate_cmd("npm --version").unwrap();
+        assert_eq!(npm_ver.decision, JudgeDecision::Allow);
+        assert_eq!(npm_ver.reason, "matched allow rule: npm --version");
+        let pnpm_ver = evaluate_cmd("pnpm -v").unwrap();
+        assert_eq!(pnpm_ver.decision, JudgeDecision::Allow);
+        assert_eq!(pnpm_ver.reason, "matched allow rule: pnpm --version");
     }
 }

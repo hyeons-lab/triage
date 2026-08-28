@@ -988,3 +988,79 @@ fn test_approval_judge_corpus_benchmark() {
         );
     }
 }
+
+#[test]
+fn test_non_command_and_namespaced_tools_benchmark() {
+    use triage_core::judge_rules::{
+        is_command_tool, is_edit_tool, is_read_only_tool, normalize_tool_name,
+    };
+
+    let config = JudgeConfig::default();
+    let rules = JudgeRules::new(&config);
+
+    // 1. Read-only tools
+    let read_only_cases = &[
+        "view_file",
+        "default_api:view_file",
+        "mcp__readFile",
+        "grep_search",
+        "find_by_name",
+        "list_dir",
+        "task_status",
+        "list_tasks",
+    ];
+    for tool in read_only_cases {
+        assert!(is_read_only_tool(tool), "expected {tool} to be read-only");
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: tool.to_string(),
+            command_line: None,
+            path: Some("/work/project/src/main.rs".to_string()),
+            cwd: None,
+        };
+        let verdict = rules.evaluate(&req).unwrap();
+        assert_eq!(verdict.decision, JudgeDecision::Allow);
+    }
+
+    // 2. Sensitive credential paths blocked on read-only tools
+    let secret_path_req = JudgeRequest {
+        session_id: SessionId::default(),
+        tool_name: "view_file".to_string(),
+        command_line: None,
+        path: Some("~/.ssh/id_rsa".to_string()),
+        cwd: None,
+    };
+    let secret_verdict = rules.evaluate(&secret_path_req).unwrap();
+    assert_eq!(secret_verdict.decision, JudgeDecision::Ask);
+
+    // 3. Edit tools
+    let edit_cases = &[
+        "write_to_file",
+        "default_api:write_to_file",
+        "replace_file_content",
+        "edit_file",
+    ];
+    for tool in edit_cases {
+        assert!(is_edit_tool(tool), "expected {tool} to be an edit tool");
+    }
+
+    // 4. Command tools
+    let command_cases = &[
+        "run_command",
+        "default_api:run_command",
+        "Bash",
+        "bash",
+        "terminal",
+        "exec",
+    ];
+    for tool in command_cases {
+        assert!(
+            is_command_tool(tool),
+            "expected {tool} to be a command tool"
+        );
+    }
+
+    // 5. Normalized names
+    assert_eq!(normalize_tool_name("default_api:view_file"), "view_file");
+    assert_eq!(normalize_tool_name("mcp__server__read_file"), "read_file");
+}

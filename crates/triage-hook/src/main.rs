@@ -470,30 +470,17 @@ fn is_edit_file_tool(tool: &str) -> bool {
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
 
-    let mut command_prefixes: Vec<String> = BASE_COMMAND_PREFIXES
-        .iter()
-        .map(|&s| s.to_string())
-        .collect();
-    if !BASE_COMMAND_PREFIXES.contains(&req.tool_name.as_str()) {
-        command_prefixes.push(req.tool_name.clone());
-        command_prefixes.push(format!("subagent:{}", req.tool_name));
-        command_prefixes.push(format!("self:{}", req.tool_name));
-    }
-
-    let lower_tool = req.tool_name.to_ascii_lowercase();
-    let base_file_slice = if is_edit_file_tool(&lower_tool) {
-        EDIT_FILE_PREFIXES
-    } else {
-        READ_FILE_PREFIXES
-    };
-    let mut file_prefixes: Vec<String> = base_file_slice.iter().map(|&s| s.to_string()).collect();
-    if !base_file_slice.contains(&req.tool_name.as_str()) {
-        file_prefixes.push(req.tool_name.clone());
-        file_prefixes.push(format!("subagent:{}", req.tool_name));
-        file_prefixes.push(format!("self:{}", req.tool_name));
-    }
-
     if let Some(ref cmd) = req.command_line {
+        let mut command_prefixes: Vec<String> = BASE_COMMAND_PREFIXES
+            .iter()
+            .map(|&s| s.to_string())
+            .collect();
+        if !BASE_COMMAND_PREFIXES.contains(&req.tool_name.as_str()) {
+            command_prefixes.push(req.tool_name.clone());
+            command_prefixes.push(format!("subagent:{}", req.tool_name));
+            command_prefixes.push(format!("self:{}", req.tool_name));
+        }
+
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
             if trimmed_target.is_empty() {
@@ -561,6 +548,20 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         }
     }
     if let Some(ref path) = req.path {
+        let lower_tool = req.tool_name.to_ascii_lowercase();
+        let base_file_slice = if is_edit_file_tool(&lower_tool) {
+            EDIT_FILE_PREFIXES
+        } else {
+            READ_FILE_PREFIXES
+        };
+        let mut file_prefixes: Vec<String> =
+            base_file_slice.iter().map(|&s| s.to_string()).collect();
+        if !base_file_slice.contains(&req.tool_name.as_str()) {
+            file_prefixes.push(req.tool_name.clone());
+            file_prefixes.push(format!("subagent:{}", req.tool_name));
+            file_prefixes.push(format!("self:{}", req.tool_name));
+        }
+
         let clean_path = path.strip_prefix("file://").unwrap_or(path);
         let lower_path = clean_path.to_ascii_lowercase();
         let is_url = lower_path.starts_with("http://")
@@ -631,6 +632,16 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     permission_overrides
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookJsonResponse<'a> {
+    decision: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
+    permission_overrides: &'a Vec<String>,
+}
+
 fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
@@ -646,24 +657,14 @@ fn encode_response(
     };
 
     match format {
-        AgentFormat::Antigravity => {
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct AntigravityResponse<'a> {
-                decision: &'a str,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                reason: Option<&'a str>,
-                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: &'a Vec<String>,
-            }
-
+        AgentFormat::Antigravity | AgentFormat::Generic => {
             let reason_opt = if !verdict.reason.is_empty() {
                 Some(verdict.reason.as_str())
             } else {
                 None
             };
 
-            serde_json::to_string(&AntigravityResponse {
+            serde_json::to_string(&HookJsonResponse {
                 decision: decision_str,
                 reason: reason_opt,
                 permission_overrides: &permission_overrides,
@@ -674,30 +675,6 @@ fn encode_response(
             // Claude Code has its own native auto mode and permission system.
             // Do not alter or intercept Claude Code behavior; return empty output for silent passthrough.
             String::new()
-        }
-        AgentFormat::Generic => {
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct GenericResponse<'a> {
-                decision: &'a str,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                reason: Option<&'a str>,
-                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: &'a Vec<String>,
-            }
-
-            let reason_opt = if !verdict.reason.is_empty() {
-                Some(verdict.reason.as_str())
-            } else {
-                None
-            };
-
-            serde_json::to_string(&GenericResponse {
-                decision: decision_str,
-                reason: reason_opt,
-                permission_overrides: &permission_overrides,
-            })
-            .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
     }
 }
