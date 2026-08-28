@@ -336,6 +336,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
     AgentFormat::Antigravity
 }
 
+#[allow(dead_code)]
 fn strip_leading_env_vars(mut cmd: &str) -> &str {
     loop {
         let trimmed = cmd.trim_start();
@@ -418,6 +419,7 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     }
 }
 
+#[allow(dead_code)]
 static BASE_COMMAND_PREFIXES: &[&str] = &[
     "command",
     "run_command",
@@ -445,6 +447,7 @@ static BASE_COMMAND_PREFIXES: &[&str] = &[
     "subagent:terminal",
 ];
 
+#[allow(dead_code)]
 static READ_FILE_PREFIXES: &[&str] = &[
     "file",
     "view_file",
@@ -469,6 +472,7 @@ static READ_FILE_PREFIXES: &[&str] = &[
     "subagent:read",
 ];
 
+#[allow(dead_code)]
 static EDIT_FILE_PREFIXES: &[&str] = &[
     "file",
     "write_to_file",
@@ -490,6 +494,7 @@ static EDIT_FILE_PREFIXES: &[&str] = &[
     "subagent:edit",
 ];
 
+#[allow(dead_code)]
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     if req.command_line.is_none() && req.path.is_none() {
         return Vec::new();
@@ -684,7 +689,7 @@ struct HookJsonResponse<'a> {
 fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
-    request: Option<&JudgeRequest>,
+    _request: Option<&JudgeRequest>,
 ) -> String {
     if format == AgentFormat::ClaudeCode {
         // Claude Code has its own native auto mode and permission system.
@@ -693,17 +698,7 @@ fn encode_response(
     }
 
     match verdict.decision {
-        triage_core::judge::JudgeDecision::Allow => {
-            let permission_overrides = request
-                .map(compute_permission_overrides)
-                .unwrap_or_default();
-            serde_json::to_string(&HookJsonResponse {
-                decision: "allow",
-                reason: None,
-                permission_overrides: &permission_overrides,
-            })
-            .unwrap_or_default()
-        }
+        triage_core::judge::JudgeDecision::Allow => r#"{"decision":"allow"}"#.to_string(),
         triage_core::judge::JudgeDecision::Deny => {
             let reason_opt = if !verdict.reason.is_empty() {
                 Some(verdict.reason.as_str())
@@ -1063,16 +1058,14 @@ mod tests {
         };
         let allow_encoded =
             encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
-        let allow_val: serde_json::Value = serde_json::from_str(&allow_encoded).unwrap();
-        assert_eq!(allow_val["decision"], "allow");
-        let allow_overrides: Vec<&str> = allow_val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(allow_overrides.contains(&"command(git status)"));
-        assert!(allow_overrides.contains(&"subagent:run_command(git status)"));
+        assert_eq!(allow_encoded, r#"{"decision":"allow"}"#);
+        let allow_overrides = compute_permission_overrides(&allow_req);
+        assert!(allow_overrides.iter().any(|s| s == "command(git status)"));
+        assert!(
+            allow_overrides
+                .iter()
+                .any(|s| s == "subagent:run_command(git status)")
+        );
 
         let ask_verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,
@@ -1096,27 +1089,14 @@ mod tests {
         };
         let allow_cmd_encoded =
             encode_response(AgentFormat::Antigravity, &allow_cmd_verdict, Some(&request));
-        let val: serde_json::Value = serde_json::from_str(&allow_cmd_encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        assert!(val.get("permissionDecision").is_none());
-        assert!(val.get("hookSpecificOutput").is_none());
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(overrides.contains(&"command(VAR=1 ls -la)"));
-        assert!(overrides.contains(&"command(ls -la)"));
+        assert_eq!(allow_cmd_encoded, r#"{"decision":"allow"}"#);
+        let overrides = compute_permission_overrides(&request);
+        assert!(overrides.iter().any(|s| s == "command(VAR=1 ls -la)"));
+        assert!(overrides.iter().any(|s| s == "command(ls -la)"));
     }
 
     #[test]
     fn permission_overrides_for_custom_tool_name_emits_dynamic_tool_prefixes() {
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: ls".to_string(),
-        };
         let request = JudgeRequest {
             session_id: SessionId::default(),
             tool_name: "ExecuteCustomCommand".to_string(),
@@ -1124,25 +1104,12 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(overrides.contains(&"command(ls -la)"));
+        let overrides = compute_permission_overrides(&request);
+        assert!(overrides.iter().any(|s| s == "command(ls -la)"));
     }
 
     #[test]
     fn permission_overrides_for_git_commands_with_global_flags_emit_bare_and_subcommand_tokens() {
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: git diff".to_string(),
-        };
         let request = JudgeRequest {
             session_id: SessionId::default(),
             tool_name: "Bash".to_string(),
@@ -1150,27 +1117,22 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(overrides.contains(&"command(git --no-pager diff --stat)"));
-        assert!(overrides.contains(&"command(git --no-pager diff)"));
-        assert!(overrides.contains(&"command(git diff)"));
+        let overrides = compute_permission_overrides(&request);
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(git --no-pager diff --stat)")
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(git --no-pager diff)")
+        );
+        assert!(overrides.iter().any(|s| s == "command(git diff)"));
     }
 
     #[test]
     fn permission_overrides_for_gradlew_commands_emit_stripped_and_base_tokens() {
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: gradlew".to_string(),
-        };
         let request = JudgeRequest {
             session_id: SessionId::default(),
             tool_name: "Bash".to_string(),
@@ -1178,17 +1140,17 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(overrides.contains(&"command(./gradlew ktfmtFormat)"));
-        assert!(overrides.contains(&"command(gradlew ktfmtFormat)"));
+        let overrides = compute_permission_overrides(&request);
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(./gradlew ktfmtFormat)")
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(gradlew ktfmtFormat)")
+        );
     }
 
     #[test]
@@ -1449,22 +1411,22 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: git log".to_string(),
-        };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides = val["permissionOverrides"].as_array().unwrap();
-        let override_strs: Vec<&str> = overrides.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(override_strs.contains(&"command(echo \"In origin but not local:\")"));
-        assert!(override_strs.contains(&"command(git log 1a1ab03..origin/main --oneline)"));
-        assert!(override_strs.contains(&"command(git log)"));
-        assert!(!override_strs.contains(&"tool(run_command)"));
+        let override_strs = compute_permission_overrides(&req);
+        assert!(
+            override_strs
+                .iter()
+                .any(|s| s == "command(echo \"In origin but not local:\")")
+        );
+        assert!(
+            override_strs
+                .iter()
+                .any(|s| s == "command(git log 1a1ab03..origin/main --oneline)")
+        );
+        assert!(override_strs.iter().any(|s| s == "command(git log)"));
+        assert!(!override_strs.iter().any(|s| s == "tool(run_command)"));
         // Ensure no broad single-word base executable overrides are emitted
-        assert!(!override_strs.contains(&"command(git)"));
-        assert!(!override_strs.contains(&"command(echo)"));
+        assert!(!override_strs.iter().any(|s| s == "command(git)"));
+        assert!(!override_strs.iter().any(|s| s == "command(echo)"));
         // Ensure no malformed unbalanced quotes exist
         assert!(!override_strs.iter().any(|s| s.contains("echo \"In)")));
     }
@@ -1484,23 +1446,11 @@ mod tests {
             path: Some("~literal_filename.txt".to_string()),
             cwd: None,
         };
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "read-only tool call: view_file".to_string(),
-        };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_tilde_file);
         // Must NOT expand ~literal_filename.txt into /Users/...literal_filename.txt
         let corrupt_expansion = format!("{home}literal_filename.txt");
         assert!(!overrides.iter().any(|s| s.contains(&corrupt_expansion)));
-        assert!(overrides.contains(&"file(~literal_filename.txt)"));
+        assert!(overrides.iter().any(|s| s == "file(~literal_filename.txt)"));
 
         // 2. Sibling user directory (e.g. /home/user_other/repo)
         let sibling_path = format!("{home}_other/repo/file.txt");
@@ -1511,17 +1461,14 @@ mod tests {
             path: Some(sibling_path.clone()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_sibling));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_sibling);
         // Must NOT contract to ~_other/repo/file.txt
         assert!(!overrides.iter().any(|s| s.contains("~_other")));
-        assert!(overrides.contains(&format!("file({sibling_path})").as_str()));
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == &format!("file({sibling_path})"))
+        );
 
         // 3. Valid home directory subpaths
         let valid_tilde = "~/repo/main.rs".to_string();
@@ -1532,17 +1479,14 @@ mod tests {
             path: Some(valid_tilde),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_valid));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_valid);
         let expected_expanded = format!("{home}/repo/main.rs");
-        assert!(overrides.contains(&format!("file({expected_expanded})").as_str()));
-        assert!(overrides.contains(&"file(~/repo/main.rs)"));
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == &format!("file({expected_expanded})"))
+        );
+        assert!(overrides.iter().any(|s| s == "file(~/repo/main.rs)"));
 
         // 4. Exact root home directory paths
         let req_root_home = JudgeRequest {
@@ -1552,22 +1496,15 @@ mod tests {
             path: Some(home.clone()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_root_home));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(overrides.contains(&"file(~)"));
-        assert!(overrides.contains(&format!("file({home})").as_str()));
+        let overrides = compute_permission_overrides(&req_root_home);
+        assert!(overrides.iter().any(|s| s == "file(~)"));
+        assert!(overrides.iter().any(|s| s == &format!("file({home})")));
         // Must NOT emit wildcard overrides for entire home or system users directory
-        assert!(!overrides.contains(&"~/*"));
-        assert!(!overrides.contains(&"file(~/*)"));
-        assert!(!overrides.contains(&format!("{home}/*").as_str()));
-        assert!(!overrides.contains(&"/Users/*"));
-        assert!(!overrides.contains(&"/home/*"));
+        assert!(!overrides.iter().any(|s| s == "~/*"));
+        assert!(!overrides.iter().any(|s| s == "file(~/*)"));
+        assert!(!overrides.iter().any(|s| s == &format!("{home}/*")));
+        assert!(!overrides.iter().any(|s| s == "/Users/*"));
+        assert!(!overrides.iter().any(|s| s == "/home/*"));
 
         // 5. URL arguments must not emit file() or dir/* overrides
         let req_url = JudgeRequest {
@@ -1577,13 +1514,7 @@ mod tests {
             path: Some("https://example.com/api/v1".to_string()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_url));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val
-            .get("permissionOverrides")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
+        let overrides = compute_permission_overrides(&req_url);
         assert!(!overrides.iter().any(|s| s.starts_with("file(")));
         assert!(!overrides.iter().any(|s| s.contains("/*")));
     }

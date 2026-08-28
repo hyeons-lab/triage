@@ -147,10 +147,10 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 816ae06 — fix(hook,judge): silent passthrough for non-allow decisions and safe git config inspection
-- HEAD — feat(judge): allowlist gh pr create and collaboration commands
+- cb092c8 — feat(judge): allowlist gh pr create and collaboration commands
+- HEAD — fix(hook): emit clean decision allow without invalid permission overrides
 
 ## What Changed
-- Removed `"gh pr create"` from `BUILTIN_SENSITIVE_SUBSTRINGS` and added it along with collaboration commands (`gh pr review`, `gh issue create`, `gh issue comment`, `gh issue edit`, `gh repo clone`, `gh run rerun`) to `BUILTIN_ALLOW_COMMANDS` and `matching_gh_allow_rule`.
-- Updated benchmark expectations and verified that pull request creation commands (such as `gh pr create --repo ... --draft ...`) auto-approve without waiting or prompting.
+- Simplified `triage-hook` output for allowed decisions to pure `{"decision":"allow"}`, eliminating the generation of verbose / non-standard `permissionOverrides` arrays (which caused Antigravity's internal grammar parser to choke on nested brackets, quotes, and colons in PR titles).
+- Maintained silent passthrough (`""`, exit 0) on `Ask` / non-allow decisions so unapproved commands fall through cleanly to the agent's native permission handler.
 - Re-verified full test suite across workspace (282 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
