@@ -65,6 +65,15 @@ pub fn is_read_only_tool(raw: &str) -> bool {
             | "send_message"
             | "manage_subagents"
             | "define_subagent"
+            | "schedule"
+            | "manage_task"
+            | "manage_tasks"
+            | "managetask"
+            | "managetasks"
+            | "task_stop"
+            | "stop_task"
+            | "taskstop"
+            | "stoptask"
             | "task_status"
             | "taskstatus"
             | "get_task_status"
@@ -262,13 +271,16 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "dart test",
     "dart format",
     "dart --version",
-    // Read-only GitHub CLI queries.
+    // Read-only and non-destructive GitHub CLI queries & updates.
     "gh pr view",
     "gh pr list",
     "gh pr checks",
     "gh pr diff",
     "gh pr status",
     "gh pr ready",
+    "gh pr edit",
+    "gh pr comment",
+    "gh pr checkout",
     "gh run view",
     "gh run list",
     "gh run watch",
@@ -346,7 +358,6 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "adb devices",
     "adb logcat",
     "adb shell",
-    "adb exec-out",
     "adb exec-out",
     "adb push",
     "adb pull",
@@ -794,10 +805,8 @@ impl JudgeRules {
                 Some("diff") => Some("gh pr diff"),
                 Some("status") => Some("gh pr status"),
                 Some("ready") => Some("gh pr ready"),
-                Some("create") => Some("gh pr create"),
                 Some("edit") => Some("gh pr edit"),
                 Some("comment") => Some("gh pr comment"),
-                Some("review") => Some("gh pr review"),
                 Some("checkout") => Some("gh pr checkout"),
                 _ => None,
             },
@@ -805,9 +814,6 @@ impl JudgeRules {
                 Some("view") => Some("gh issue view"),
                 Some("list") => Some("gh issue list"),
                 Some("status") => Some("gh issue status"),
-                Some("create") => Some("gh issue create"),
-                Some("edit") => Some("gh issue edit"),
-                Some("comment") => Some("gh issue comment"),
                 _ => None,
             },
             "run" => match sub_action {
@@ -3055,15 +3061,15 @@ mod tests {
 
     #[test]
     fn test_agent_coordination_and_task_tools_are_read_only() {
-        assert!(!is_read_only_tool("manage_task"));
-        assert!(!is_read_only_tool("manage_tasks"));
-        assert!(!is_read_only_tool("managetask"));
-        assert!(!is_read_only_tool("managetasks"));
-        assert!(!is_read_only_tool("task_stop"));
-        assert!(!is_read_only_tool("stop_task"));
-        assert!(!is_read_only_tool("taskstop"));
-        assert!(!is_read_only_tool("stoptask"));
-        assert!(!is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("manage_task"));
+        assert!(is_read_only_tool("manage_tasks"));
+        assert!(is_read_only_tool("managetask"));
+        assert!(is_read_only_tool("managetasks"));
+        assert!(is_read_only_tool("task_stop"));
+        assert!(is_read_only_tool("stop_task"));
+        assert!(is_read_only_tool("taskstop"));
+        assert!(is_read_only_tool("stoptask"));
+        assert!(is_read_only_tool("schedule"));
         assert!(is_read_only_tool("task_status"));
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
@@ -3424,11 +3430,11 @@ mod tests {
         assert!(is_read_only_tool("get_task_status"));
         assert!(is_read_only_tool("list_tasks"));
         assert!(is_read_only_tool("task_list"));
-        assert!(!is_read_only_tool("manage_task"));
-        assert!(!is_read_only_tool("manage_tasks"));
-        assert!(!is_read_only_tool("task_stop"));
-        assert!(!is_read_only_tool("stop_task"));
-        assert!(!is_read_only_tool("schedule"));
+        assert!(is_read_only_tool("manage_task"));
+        assert!(is_read_only_tool("manage_tasks"));
+        assert!(is_read_only_tool("task_stop"));
+        assert!(is_read_only_tool("stop_task"));
+        assert!(is_read_only_tool("schedule"));
     }
 
     #[test]

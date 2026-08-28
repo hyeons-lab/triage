@@ -453,20 +453,6 @@ static EDIT_FILE_PREFIXES: &[&str] = &[
     "subagent:replace_file_content",
 ];
 
-fn is_edit_file_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "write_to_file"
-            | "writetofile"
-            | "replace_file_content"
-            | "replacefilecontent"
-            | "edit_file"
-            | "editfile"
-            | "patch_file"
-            | "patchfile"
-    )
-}
-
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
 
@@ -548,8 +534,7 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         }
     }
     if let Some(ref path) = req.path {
-        let lower_tool = req.tool_name.to_ascii_lowercase();
-        let base_file_slice = if is_edit_file_tool(&lower_tool) {
+        let base_file_slice = if triage_core::judge_rules::is_edit_tool(&req.tool_name) {
             EDIT_FILE_PREFIXES
         } else {
             READ_FILE_PREFIXES
@@ -638,8 +623,8 @@ struct HookJsonResponse<'a> {
     decision: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
-    #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
-    permission_overrides: &'a Vec<String>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    permission_overrides: &'a [String],
 }
 
 fn encode_response(

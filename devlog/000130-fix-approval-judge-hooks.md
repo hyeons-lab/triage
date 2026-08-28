@@ -40,6 +40,7 @@
 - **2026-08-27T20:47-0700** Added comprehensive subagent and tool prefix grants (`view_file`, `grep_search`, `subagent:view_file`, `subagent:run_command`, `self:run_command`, `Bash`) to `permissionOverrides` in `triage-hook`, ensuring Antigravity's in-memory permission engine recognizes grants across all subagent lifecycle requests.
 - **2026-08-27T21:08-0700** Addressed MAX-effort review audit findings: separated state-modifying tools (`manage_task`, `task_stop`, `schedule`) from `is_read_only_tool`, prevented web terminal accessory bar from focusing on tap, refined per-tool value-taking CLI flags (`cargo -p`, `flutter -d`, `gh -R`), normalized Windows path separators and `.exe` stripping in `program_name`, added cross-device copy fallback in `persist_judge_config`, optimized wildcard rule pre-tokenization in `JudgeRules`, enforced 2MB upper bound on stdin ingestion, removed unvalidated debug log, and scoped write file prefixes exclusively to edit tools.
 - **2026-08-27T21:16-0700** Applied Round 2 review audit refinements: added path wildcard matching (`./scripts/*`, `scripts/*`) in `matching_token_allow_rule`, corrected package manager version/help flag return strings, removed dead `KNOWN_VALUE_TAKING_FLAGS` constant, consolidated duplicate JSON serialization structs in `triage-hook`, made command/file prefix allocations lazy on incoming tool payloads, eliminated duplicate trailing wildcard entries in `BUILTIN_ALLOW_COMMANDS`, and expanded benchmark coverage to non-command and namespaced tools.
+- **2026-08-27T21:26-0700** Addressed Round 3 review findings: classified internal agent coordination tools (`schedule`, `manage_task`, `task_stop`) in `is_read_only_tool` to eliminate false interactive modals during timer/background task management, removed mutating sub-actions (`create`, `edit`, `comment`, `review`) from `matching_gh_allow_rule` while adding safe PR description updates (`gh pr edit`) to `BUILTIN_ALLOW_COMMANDS`, deleted duplicate `"adb exec-out"` entry, replaced private `is_edit_file_tool` with canonical `triage_core::judge_rules::is_edit_tool`, and used slice borrows in `HookJsonResponse`.
 
 ## Decisions
 
@@ -78,6 +79,8 @@
 - **Script Path Wildcard Matching**: Extended `matching_token_allow_rule` to recognize path-prefix wildcard entries containing `/` or `\` (e.g. `./scripts/*` or `scripts/*`), matching against the executable path directly so custom development scripts in project subdirectories auto-approve without manual allowlisting.
 - **Lazy Hook Prefix Vector Allocation**: Deferred allocating and formatting tool prefix vectors in `triage-hook` until verifying presence of `command_line` or `path` fields, eliminating heap churn on high-frequency status queries.
 - **Unified Hook JSON Serialization**: Merged `AntigravityResponse` and `GenericResponse` into a single `HookJsonResponse` definition to ensure schema invariants remain lockstep across all protocol variations.
+- **Agent Coordination & Timer Scheduling Exemption**: Added internal coordination tools (`schedule`, `manage_task`, `task_stop`) back to `is_read_only_tool` so that timer scheduling and status checking of asynchronous background tasks never produce intrusive approval modals.
+- **PR Mutation Boundaries in GitHub CLI**: Strictly excluded PR/issue creation (`gh pr create`, `gh issue create`) from allowlists to require explicit user confirmation for outward-facing mutations, while auto-approving safe non-destructive updates (`gh pr edit`, `gh pr comment`, `gh pr checkout`).
 
 ## Commits
 
@@ -103,7 +106,7 @@
 - 4bf2bb4 — test(hook): add namespaced tool fallback tests in triage-hook
 - 89cb78b — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
 - 3ad4013 — feat(judge): auto-approve safe non-force git push while protecting destructive force flags
-- e93849f — style: format code with cargo fmt across all crates
+- b6147b4 — style: format code with cargo fmt across all crates
 - b6147b4 — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
 - 747de5f — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
 - 3b22004 — fix(hook): emit clean decision: allow for Antigravity without permission overrides
@@ -122,4 +125,5 @@
 - 358d55c — fix(hook): omit permissionOverrides on allow verdicts for Antigravity subagents
 - 5240c69 — fix(hook): emit comprehensive subagent and tool prefix permission overrides
 - 139b6ca — fix(judge,hook): apply MAX-effort review audit fixes across rules, flags, and hook protocol
-- HEAD — fix(judge,hook): support path wildcards, clean static tables, and unify hook responses
+- e4c607d — fix(judge,hook): support path wildcards, clean static tables, and unify hook responses
+- HEAD — fix(judge,hook): permit agent task coordination, secure gh pr mutations, and use canonical edit tool check
