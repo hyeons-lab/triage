@@ -147,10 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- a2182db — fix(judge): allowlist git ls-remote and narrow sensitive gh release mutations
-- HEAD — fix(hook): unquote string parameters and emit gh subcommand permission overrides
+- a593f12 — fix(hook): unquote string parameters and emit gh subcommand permission overrides
+- HEAD — fix(hook): emit protojson allowTool and denyReason fields in hook responses
 
 ## What Changed
-- In `crates/triage-hook/src/main.rs`, updated `extract_command_line` and `extract_path` to strip wrapping literal quotes (e.g. `"\"gh pr view 113\""`). This prevents nested quote characters inside `permissionOverrides` strings that previously caused Antigravity's permission matcher to fail matching.
-- Added explicit `gh` subcommands (`gh pr view`, `gh pr`, `gh`, etc.) in `compute_permission_overrides`.
+- Added protojson fields `allowTool: true` (on `Allow`) and `denyReason` / `allowTool: false` (on `Deny`) to `HookJsonResponse` in [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs#L707-L760). This explicitly matches Antigravity's internal Go runtime protobuf schema (`PreToolUseHookResponse.allow_tool`), guaranteeing tool execution is allowed directly without triggering permission confirmation prompts.
 - Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

@@ -709,6 +709,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
 struct HookJsonResponse<'a> {
     decision: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    allow_tool: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deny_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     permission_overrides: &'a [String],
@@ -732,6 +736,8 @@ fn encode_response(
                 .unwrap_or_default();
             serde_json::to_string(&HookJsonResponse {
                 decision: "allow",
+                allow_tool: Some(true),
+                deny_reason: None,
                 reason: None,
                 permission_overrides: &permission_overrides,
             })
@@ -745,6 +751,8 @@ fn encode_response(
             };
             serde_json::to_string(&HookJsonResponse {
                 decision: "deny",
+                allow_tool: Some(false),
+                deny_reason: reason_opt,
                 reason: reason_opt,
                 permission_overrides: &[],
             })
@@ -1234,7 +1242,7 @@ mod tests {
             reason: String::new(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, None);
-        assert_eq!(encoded, r#"{"decision":"deny"}"#);
+        assert_eq!(encoded, r#"{"decision":"deny","allowTool":false}"#);
     }
 
     #[test]
