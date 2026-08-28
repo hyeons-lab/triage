@@ -573,8 +573,8 @@ fn encode_response(
                 decision: &'a str,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 reason: Option<&'a str>,
-                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: &'a Vec<String>,
+                #[serde(rename = "permissionOverrides", skip_serializing_if = "Option::is_none")]
+                permission_overrides: Option<&'a Vec<String>>,
             }
 
             let reason_opt = if !verdict.reason.is_empty() {
@@ -582,11 +582,18 @@ fn encode_response(
             } else {
                 None
             };
+            let overrides_opt = if verdict.decision != triage_core::judge::JudgeDecision::Allow
+                && !permission_overrides.is_empty()
+            {
+                Some(&permission_overrides)
+            } else {
+                None
+            };
 
             serde_json::to_string(&AntigravityResponse {
                 decision: decision_str,
                 reason: reason_opt,
-                permission_overrides: &permission_overrides,
+                permission_overrides: overrides_opt,
             })
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
@@ -959,13 +966,7 @@ mod tests {
         assert_eq!(allow_val["reason"], "matched allow rule: ls");
         assert!(allow_val.get("permissionDecision").is_none());
         assert!(allow_val.get("hookSpecificOutput").is_none());
-        let allow_overrides: Vec<&str> = allow_val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(allow_overrides.contains(&"command(git status)"));
+        assert!(allow_val.get("permissionOverrides").is_none());
 
         let ask_verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,
@@ -998,9 +999,9 @@ mod tests {
     #[test]
     fn permission_overrides_for_custom_tool_name_emits_dynamic_tool_prefixes() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rule: ls".to_string(),
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::default(),
@@ -1011,7 +1012,7 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
+        assert_eq!(val["decision"], "ask");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
