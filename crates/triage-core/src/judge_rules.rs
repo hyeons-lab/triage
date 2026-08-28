@@ -8,9 +8,6 @@ pub fn normalize_tool_name(tool_name: &str) -> &str {
     if let Some(rest) = s.strip_prefix("cortex_step_type_") {
         s = rest;
     }
-    if let Some(rest) = s.strip_prefix("cortex:") {
-        s = rest;
-    }
     if let Some(idx) = s.rfind(':') {
         s = &s[idx + 1..];
     }
@@ -133,6 +130,10 @@ pub fn is_command_tool(raw: &str) -> bool {
             | "cmd"
             | "command"
             | "exec"
+            | "manage_task"
+            | "manage_tasks"
+            | "managetask"
+            | "managetasks"
     )
 }
 
@@ -538,8 +539,8 @@ impl JudgeRules {
         let tool_name = request.tool_name.trim();
         let lower_tool_name = tool_name.to_ascii_lowercase();
 
-        // 1. Read-only inspection tools.
-        if is_read_only_tool(&lower_tool_name) {
+        // 1. Read-only inspection tools (when not carrying a command line).
+        if is_read_only_tool(&lower_tool_name) && request.command_line.is_none() {
             if let Some(secret) = check_target_credential_path(request) {
                 return Some(JudgeVerdict::fallback(format!(
                     "requires manual approval for credential path: {secret}"

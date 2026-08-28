@@ -202,6 +202,8 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
         "cmd",
         "script",
         "code",
+        "Input",
+        "input",
     ] {
         if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
             return Some(val.to_string());
@@ -457,30 +459,34 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
 
     if let Some(ref cmd) = req.command_line {
-        let mut command_prefixes: Vec<String> = BASE_COMMAND_PREFIXES
-            .iter()
-            .map(|&s| s.to_string())
-            .collect();
-        if !BASE_COMMAND_PREFIXES.contains(&req.tool_name.as_str()) {
-            command_prefixes.push(req.tool_name.clone());
-            command_prefixes.push(format!("subagent:{}", req.tool_name));
-            command_prefixes.push(format!("self:{}", req.tool_name));
-        }
+        let custom_sub = format!("subagent:{}", req.tool_name);
+        let custom_self = format!("self:{}", req.tool_name);
+        let has_custom_prefix = !BASE_COMMAND_PREFIXES.contains(&req.tool_name.as_str());
 
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
             if trimmed_target.is_empty() {
                 return;
             }
-            for prefix in &command_prefixes {
+            for &prefix in BASE_COMMAND_PREFIXES {
                 permission_overrides.push(format!("{prefix}({trimmed_target})"));
+            }
+            if has_custom_prefix {
+                permission_overrides.push(format!("{}({trimmed_target})", req.tool_name));
+                permission_overrides.push(format!("{custom_sub}({trimmed_target})"));
+                permission_overrides.push(format!("{custom_self}({trimmed_target})"));
             }
 
             if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
                 let trimmed_sub = without_dot_slash.trim();
                 if !trimmed_sub.is_empty() {
-                    for prefix in &command_prefixes {
+                    for &prefix in BASE_COMMAND_PREFIXES {
                         permission_overrides.push(format!("{prefix}({trimmed_sub})"));
+                    }
+                    if has_custom_prefix {
+                        permission_overrides.push(format!("{}({trimmed_sub})", req.tool_name));
+                        permission_overrides.push(format!("{custom_sub}({trimmed_sub})"));
+                        permission_overrides.push(format!("{custom_self}({trimmed_sub})"));
                     }
                 }
             }
@@ -539,13 +545,9 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         } else {
             READ_FILE_PREFIXES
         };
-        let mut file_prefixes: Vec<String> =
-            base_file_slice.iter().map(|&s| s.to_string()).collect();
-        if !base_file_slice.contains(&req.tool_name.as_str()) {
-            file_prefixes.push(req.tool_name.clone());
-            file_prefixes.push(format!("subagent:{}", req.tool_name));
-            file_prefixes.push(format!("self:{}", req.tool_name));
-        }
+        let custom_sub = format!("subagent:{}", req.tool_name);
+        let custom_self = format!("self:{}", req.tool_name);
+        let has_custom_prefix = !base_file_slice.contains(&req.tool_name.as_str());
 
         let clean_path = path.strip_prefix("file://").unwrap_or(path);
         let lower_path = clean_path.to_ascii_lowercase();
@@ -555,8 +557,13 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             || lower_path.starts_with("wss://");
         let mut add_path_override = |p_str: &str| {
             if !is_url {
-                for prefix in &file_prefixes {
+                for &prefix in base_file_slice {
                     permission_overrides.push(format!("{prefix}({p_str})"));
+                }
+                if has_custom_prefix {
+                    permission_overrides.push(format!("{}({p_str})", req.tool_name));
+                    permission_overrides.push(format!("{custom_sub}({p_str})"));
+                    permission_overrides.push(format!("{custom_self}({p_str})"));
                 }
             }
         };
@@ -632,6 +639,12 @@ fn encode_response(
     verdict: &JudgeVerdict,
     request: Option<&JudgeRequest>,
 ) -> String {
+    if format == AgentFormat::ClaudeCode {
+        // Claude Code has its own native auto mode and permission system.
+        // Do not alter or intercept Claude Code behavior; return empty output for silent passthrough.
+        return String::new();
+    }
+
     let decision_str = verdict.decision.as_hook_str();
     let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Deny {
         Vec::new()
@@ -641,27 +654,18 @@ fn encode_response(
             .unwrap_or_default()
     };
 
-    match format {
-        AgentFormat::Antigravity | AgentFormat::Generic => {
-            let reason_opt = if !verdict.reason.is_empty() {
-                Some(verdict.reason.as_str())
-            } else {
-                None
-            };
+    let reason_opt = if !verdict.reason.is_empty() {
+        Some(verdict.reason.as_str())
+    } else {
+        None
+    };
 
-            serde_json::to_string(&HookJsonResponse {
-                decision: decision_str,
-                reason: reason_opt,
-                permission_overrides: &permission_overrides,
-            })
-            .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
-        }
-        AgentFormat::ClaudeCode => {
-            // Claude Code has its own native auto mode and permission system.
-            // Do not alter or intercept Claude Code behavior; return empty output for silent passthrough.
-            String::new()
-        }
-    }
+    serde_json::to_string(&HookJsonResponse {
+        decision: decision_str,
+        reason: reason_opt,
+        permission_overrides: &permission_overrides,
+    })
+    .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
 }
 
 fn main() {
