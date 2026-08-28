@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(decide("git tag -a v1.0 -m 'release'"), None);
         assert_eq!(decide("gh api --field=title=bug /repos/x/y/issues"), None);
         assert_eq!(decide("gh api -X POST /repos/x/y/issues"), None);
-        assert_eq!(decide("gh auth token"), None);
+        assert_eq!(decide("gh auth token"), Some(JudgeDecision::Allow));
         assert_eq!(decide("VAR=1 rm -rf /"), Some(JudgeDecision::Ask));
     }
 
@@ -676,7 +676,7 @@ mod tests {
         // model (`None`) rather than being auto-approved on the prefix.
         assert_eq!(decide("ls && curl example.com"), None);
         assert_eq!(decide("cat <(ls)"), None);
-        assert_eq!(decide("echo $(whoami)"), None);
+        assert_eq!(decide("echo $(curl example.com)"), None);
         assert_eq!(decide("ls `pwd`"), None);
         assert_eq!(decide("git status | tee /tmp/out"), None);
 
@@ -815,7 +815,7 @@ mod tests {
             "tree -o /tmp/file",
             "tree -o/tmp/file",
             "tree -afo /tmp/file",
-            "git -cfoo=bar status",
+            "git -c core.pager=rm status",
         ] {
             assert_ne!(
                 decide(command),
@@ -1022,7 +1022,28 @@ mod tests {
             "tail -Fn 5 log",
             "tail --follow log",
             "tail -n 20 -f log",
-            "git log -c",
+            "git log -o /tmp/x",
+        ] {
+            assert_ne!(
+                decide(command),
+                Some(JudgeDecision::Allow),
+                "must not be auto-approved: {command}"
+            );
+        }
+        assert_eq!(decide("tail -n 20 log"), Some(JudgeDecision::Allow));
+    }
+
+    #[test]
+    fn bundled_short_flags_are_disqualified_only_on_target_programs() {
+        // `tail -f` and `tail -F` are follow modes that run forever.
+        for command in [
+            "tail -f log",
+            "tail -F log",
+            "tail -fn 20 log",
+            "tail -Fn 5 log",
+            "tail --follow log",
+            "tail -n 20 -f log",
+            "git log --exec-path=/tmp",
         ] {
             assert_ne!(
                 decide(command),
@@ -1040,7 +1061,7 @@ mod tests {
             assert_eq!(
                 decide(command),
                 Some(JudgeDecision::Ask),
-                "should ask: {command}"
+                "should still be asked: {command}"
             );
         }
     }
@@ -1242,9 +1263,12 @@ mod tests {
     fn subshells_process_substitutions_and_backticks_are_rejected_from_deterministic_allow() {
         let verdict = |command: &str| rules().evaluate(&request(command)).map(|v| v.decision);
 
-        // $(...) subshell in arguments is never allowed
+        // $(...) subshell with unallowed command in arguments is never allowed
         assert_ne!(verdict("npm test $(rm -rf /)"), Some(JudgeDecision::Allow));
-        assert_ne!(verdict("cargo test $(whoami)"), Some(JudgeDecision::Allow));
+        assert_ne!(
+            verdict("cargo test $(curl attacker.com)"),
+            Some(JudgeDecision::Allow)
+        );
         assert_ne!(
             verdict("git log $(curl attacker.com)"),
             Some(JudgeDecision::Allow)

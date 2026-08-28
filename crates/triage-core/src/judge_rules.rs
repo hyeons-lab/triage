@@ -22,111 +22,114 @@ pub fn normalize_tool_name(tool_name: &str) -> &str {
 
 /// True if `tool_name` is a read-only inspection, search, web, or agent coordination tool.
 pub fn is_read_only_tool(raw: &str) -> bool {
-    let lower_str = normalize_tool_name(raw).to_ascii_lowercase();
-    let lower = lower_str.as_str();
-    matches!(
-        lower,
-        "read"
-            | "view_file"
-            | "read_file"
-            | "viewfile"
-            | "readfile"
-            | "view_file_outline"
-            | "get_file_info"
-            | "read_symbol"
-            | "inspect_file"
-            | "list_dir"
-            | "listdir"
-            | "ls"
-            | "list_directory"
-            | "find_by_name"
-            | "findbyname"
-            | "list_permissions"
-            | "listpermissions"
-            | "grep_search"
-            | "grep"
-            | "grepsearch"
-            | "search_files"
-            | "search_web"
-            | "web_search"
-            | "websearch"
-            | "read_url_content"
-            | "read_url"
-            | "read_browser_page"
-            | "web_fetch"
-            | "webfetch"
-            | "ask_question"
-            | "ask_user_question"
-            | "askuserquestion"
-            | "invoke_subagent"
-            | "send_message"
-            | "manage_subagents"
-            | "define_subagent"
-            | "schedule"
-            | "task_status"
-            | "taskstatus"
-            | "get_task_status"
-            | "gettaskstatus"
-            | "list_tasks"
-            | "listtasks"
-            | "task_list"
-            | "tasklist"
-            | "tool_search"
-            | "toolsearch"
-            | "skill"
-            | "artifact"
-            | "generate_image"
-            | "detect_changes"
-            | "get_review_context"
-            | "get_impact_radius"
-            | "get_affected_flows"
-            | "query_graph"
-            | "semantic_search_nodes"
-            | "get_architecture_overview"
-            | "list_communities"
-            | "refactor_tool"
-            | "refactortool"
-    )
+    let name = normalize_tool_name(raw);
+    const READ_ONLY_TOOLS: &[&str] = &[
+        "read",
+        "view_file",
+        "read_file",
+        "viewfile",
+        "readfile",
+        "view_file_outline",
+        "get_file_info",
+        "read_symbol",
+        "inspect_file",
+        "list_dir",
+        "listdir",
+        "ls",
+        "list_directory",
+        "find_by_name",
+        "findbyname",
+        "list_permissions",
+        "listpermissions",
+        "grep_search",
+        "grep",
+        "grepsearch",
+        "search_files",
+        "search_web",
+        "web_search",
+        "websearch",
+        "read_url_content",
+        "read_url",
+        "read_browser_page",
+        "web_fetch",
+        "webfetch",
+        "ask_question",
+        "ask_user_question",
+        "askuserquestion",
+        "invoke_subagent",
+        "send_message",
+        "manage_subagents",
+        "define_subagent",
+        "schedule",
+        "task_status",
+        "taskstatus",
+        "get_task_status",
+        "gettaskstatus",
+        "list_tasks",
+        "listtasks",
+        "task_list",
+        "tasklist",
+        "tool_search",
+        "toolsearch",
+        "skill",
+        "artifact",
+        "generate_image",
+        "detect_changes",
+        "get_review_context",
+        "get_impact_radius",
+        "get_affected_flows",
+        "query_graph",
+        "semantic_search_nodes",
+        "get_architecture_overview",
+        "list_communities",
+        "refactor_tool",
+        "refactortool",
+    ];
+    READ_ONLY_TOOLS
+        .iter()
+        .any(|tool| name.eq_ignore_ascii_case(tool))
 }
 
 /// True if `tool_name` is an editing or writing tool.
 pub fn is_edit_tool(raw: &str) -> bool {
-    let lower_str = normalize_tool_name(raw).to_ascii_lowercase();
-    let lower = lower_str.as_str();
-    matches!(
-        lower,
-        "write_to_file"
-            | "replace_file_content"
-            | "edit_file"
-            | "write_file"
-            | "patch_file"
-            | "create_file"
-    )
+    let name = normalize_tool_name(raw);
+    const EDIT_TOOLS: &[&str] = &[
+        "write_to_file",
+        "replace_file_content",
+        "edit_file",
+        "write_file",
+        "patch_file",
+        "create_file",
+    ];
+    EDIT_TOOLS
+        .iter()
+        .any(|tool| name.eq_ignore_ascii_case(tool))
 }
 
 /// True if `tool_name` is a shell command execution tool.
 pub fn is_command_tool(raw: &str) -> bool {
-    let lower_str = normalize_tool_name(raw).to_ascii_lowercase();
-    let lower = lower_str.as_str();
-    matches!(
-        lower,
-        "run_command"
-            | "runcommand"
-            | "bash"
-            | "execute"
-            | "execute_command"
-            | "executecommand"
-            | "sh"
-            | "terminal"
-            | "shell"
-            | "cmd"
-            | "command"
-            | "exec"
-            | "manage_task"
-            | "manage_tasks"
-            | "managetask"
-            | "managetasks"
-    )
+    let name = normalize_tool_name(raw);
+    const COMMAND_TOOLS: &[&str] = &[
+        "run_command",
+        "runcommand",
+        "bash",
+        "execute",
+        "execute_command",
+        "executecommand",
+        "sh",
+        "terminal",
+        "shell",
+        "cmd",
+        "command",
+        "exec",
+        "manage_task",
+        "manage_tasks",
+        "managetask",
+        "managetasks",
+    ];
+    COMMAND_TOOLS
+        .iter()
+        .any(|tool| name.eq_ignore_ascii_case(tool))
 }
 
 pub const MAX_COMMAND_CHARS: usize = 8192;
@@ -295,6 +298,8 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "gh workflow list",
     "gh secret list",
     "gh auth status",
+    "gh auth token",
+    "gh auth setup-git",
     "gh stack view",
     "gh --version",
     // Utilities & Task runners.
@@ -608,11 +613,43 @@ impl JudgeRules {
         }
 
         let cleaned_cmd = strip_null_redirections(command);
-        if !has_complex_shell_metacharacters(&cleaned_cmd) {
-            let segments = pipeline_and_chain_segments(&cleaned_cmd);
+        let mut substitution_rules = Vec::new();
+        if let Some(subs) = extract_command_substitutions(&cleaned_cmd) {
+            for sub in &subs {
+                if sub.is_empty() {
+                    continue;
+                }
+                let sub_req = JudgeRequest {
+                    session_id: request.session_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    command_line: Some(sub.to_string()),
+                    path: None,
+                    cwd: request.cwd.clone(),
+                };
+                let sub_verdict = self.evaluate(&sub_req);
+                match sub_verdict {
+                    Some(JudgeVerdict {
+                        decision: JudgeDecision::Allow,
+                        reason,
+                        ..
+                    }) => {
+                        substitution_rules.push(reason);
+                    }
+                    other => return other,
+                }
+            }
+        } else {
+            return Some(JudgeVerdict::fallback(
+                "unmatched shell command substitution",
+            ));
+        }
+
+        let sanitized_cmd = sanitize_command_substitutions(&cleaned_cmd);
+        if !has_complex_shell_metacharacters(&sanitized_cmd) {
+            let segments = pipeline_and_chain_segments(&sanitized_cmd);
             if !segments.is_empty() {
                 let mut all_allowed = true;
-                let mut matched_rules = Vec::new();
+                let mut matched_rules = substitution_rules;
 
                 for segment in &segments {
                     let trimmed_seg = segment.trim();
@@ -633,7 +670,7 @@ impl JudgeRules {
                         break;
                     }
                     if let Some(rule) = self.matching_allow_rule(tokens) {
-                        matched_rules.push(rule);
+                        matched_rules.push(rule.to_string());
                     } else {
                         all_allowed = false;
                         break;
@@ -864,13 +901,12 @@ impl JudgeRules {
                     Some("gh api")
                 }
             }
-            "auth" => {
-                if sub_action == Some("status") {
-                    Some("gh auth status")
-                } else {
-                    None
-                }
-            }
+            "auth" => match sub_action {
+                Some("status") => Some("gh auth status"),
+                Some("token") => Some("gh auth token"),
+                Some("setup-git") => Some("gh auth setup-git"),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1138,30 +1174,7 @@ impl JudgeRules {
                 Some("git remote -v")
             }
             "push" => {
-                let is_dangerous = sub_args.iter().any(|arg| {
-                    if *arg == "--force-with-lease"
-                        || arg.starts_with("--force-with-lease=")
-                        || *arg == "--force-if-includes"
-                    {
-                        return false;
-                    }
-                    *arg == "-f"
-                        || *arg == "--force"
-                        || arg.starts_with("-f")
-                        || arg.starts_with("--force=")
-                        || *arg == "-d"
-                        || *arg == "--delete"
-                        || arg.starts_with("-d")
-                        || arg.starts_with("--delete=")
-                        || *arg == "--mirror"
-                        || *arg == "--prune"
-                        || *arg == "--receive-pack"
-                        || arg.starts_with("--receive-pack=")
-                        || *arg == "--exec"
-                        || arg.starts_with("--exec=")
-                        || arg.starts_with('+')
-                        || (arg.starts_with(':') && !arg.starts_with("::"))
-                });
+                let is_dangerous = sub_args.iter().any(|&arg| is_dangerous_git_push_arg(arg));
                 if is_dangerous { None } else { Some("git push") }
             }
             _ => None,
@@ -1568,12 +1581,162 @@ pub fn strip_null_redirections(command: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(result)
 }
 
+pub fn extract_command_substitutions(command: &str) -> Option<Vec<&str>> {
+    let mut substitutions = Vec::new();
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    let mut in_single_quote = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' && !in_single_quote {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+        if !in_single_quote && i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'(' {
+            let start = i + 2;
+            let mut depth = 1;
+            let mut j = start;
+            let mut inner_in_single = false;
+            let mut inner_in_double = false;
+            let mut inner_escaped = false;
+            while j < bytes.len() && depth > 0 {
+                if inner_escaped {
+                    inner_escaped = false;
+                    j += 1;
+                    continue;
+                }
+                if bytes[j] == b'\\' && !inner_in_single {
+                    inner_escaped = true;
+                    j += 1;
+                    continue;
+                }
+                if bytes[j] == b'\'' && !inner_in_double {
+                    inner_in_single = !inner_in_single;
+                    j += 1;
+                    continue;
+                }
+                if bytes[j] == b'"' && !inner_in_single {
+                    inner_in_double = !inner_in_double;
+                    j += 1;
+                    continue;
+                }
+                if !inner_in_single && !inner_in_double {
+                    if bytes[j] == b'(' {
+                        depth += 1;
+                    } else if bytes[j] == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                substitutions.push(command[start..j].trim());
+                i = j + 1;
+                continue;
+            } else {
+                return None;
+            }
+        }
+        i += 1;
+    }
+    Some(substitutions)
+}
+
+pub fn sanitize_command_substitutions(command: &str) -> String {
+    let mut result = String::with_capacity(command.len());
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    let mut in_single_quote = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        if escaped {
+            result.push(bytes[i] as char);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' && !in_single_quote {
+            result.push('\\');
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            in_single_quote = !in_single_quote;
+            result.push('\'');
+            i += 1;
+            continue;
+        }
+        if !in_single_quote && i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'(' {
+            let start = i + 2;
+            let mut depth = 1;
+            let mut j = start;
+            let mut inner_in_single = false;
+            let mut inner_in_double = false;
+            let mut inner_escaped = false;
+            while j < bytes.len() && depth > 0 {
+                if inner_escaped {
+                    inner_escaped = false;
+                    j += 1;
+                    continue;
+                }
+                if bytes[j] == b'\\' && !inner_in_single {
+                    inner_escaped = true;
+                    j += 1;
+                    continue;
+                }
+                if bytes[j] == b'\'' && !inner_in_double {
+                    inner_in_single = !inner_in_single;
+                    j += 1;
+                    continue;
+                }
+                if bytes[j] == b'"' && !inner_in_single {
+                    inner_in_double = !inner_in_double;
+                    j += 1;
+                    continue;
+                }
+                if !inner_in_single && !inner_in_double {
+                    if bytes[j] == b'(' {
+                        depth += 1;
+                    } else if bytes[j] == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                result.push_str("_subst_");
+                i = j + 1;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
 pub fn has_complex_shell_metacharacters(command: &str) -> bool {
-    if command.contains('`')
-        || command.contains("$(")
-        || command.contains("<(")
-        || command.contains(">(")
-    {
+    if command.contains('`') || command.contains("<(") || command.contains(">(") {
         return true;
     }
     let mut in_single = false;
@@ -2098,6 +2261,34 @@ pub fn parse_git_subcommand<'a>(after: &'a [&'a str]) -> Option<(&'a str, &'a [&
     Some((subcommand, sub_args))
 }
 
+pub fn is_dangerous_git_push_arg(arg: &str) -> bool {
+    if arg == "--force-with-lease"
+        || arg.starts_with("--force-with-lease=")
+        || arg == "--force-if-includes"
+    {
+        return false;
+    }
+    arg == "-f"
+        || arg == "--force"
+        || (arg.starts_with("-f") && !arg.starts_with("--"))
+        || arg.starts_with("--force=")
+        || arg == "-d"
+        || arg == "--delete"
+        || (arg.starts_with("-d") && !arg.starts_with("--"))
+        || arg.starts_with("--delete=")
+        || arg == "--mirror"
+        || arg == "--prune"
+        || arg == "--receive-pack"
+        || arg.starts_with("--receive-pack=")
+        || arg == "--exec"
+        || arg.starts_with("--exec=")
+        || arg.starts_with('+')
+        || (arg.starts_with(':') && !arg.starts_with("::"))
+        || (arg.starts_with('-')
+            && !arg.starts_with("--")
+            && is_short_flag_bundle_containing(arg, &['f', 'd']))
+}
+
 pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
     if !names_program(tokens, "git") {
         return None;
@@ -2115,35 +2306,7 @@ pub fn git_denied_operation(tokens: &[&str]) -> Option<&'static str> {
     };
 
     match subcommand {
-        "push"
-            if sub_args.iter().any(|arg| {
-                if *arg == "--force-with-lease"
-                    || arg.starts_with("--force-with-lease=")
-                    || *arg == "--force-if-includes"
-                {
-                    return false;
-                }
-                *arg == "-f"
-                    || *arg == "--force"
-                    || (arg.starts_with("-f") && !arg.starts_with("--"))
-                    || arg.starts_with("--force=")
-                    || *arg == "-d"
-                    || *arg == "--delete"
-                    || (arg.starts_with("-d") && !arg.starts_with("--"))
-                    || arg.starts_with("--delete=")
-                    || *arg == "--mirror"
-                    || *arg == "--prune"
-                    || *arg == "--receive-pack"
-                    || arg.starts_with("--receive-pack=")
-                    || *arg == "--exec"
-                    || arg.starts_with("--exec=")
-                    || arg.starts_with('+')
-                    || (arg.starts_with(':') && !arg.starts_with("::"))
-                    || (arg.starts_with('-')
-                        && !arg.starts_with("--")
-                        && is_short_flag_bundle_containing(arg, &['f', 'd']))
-            }) =>
-        {
+        "push" if sub_args.iter().any(|&arg| is_dangerous_git_push_arg(arg)) => {
             Some("destructive git push operation")
         }
         "filter-branch" => Some("git filter-branch"),
@@ -2228,7 +2391,6 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
         (
             "git",
             &[
-                "-c",
                 "-o",
                 "-p",
                 "--paginate",
@@ -2273,7 +2435,7 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
     const SHORT_FLAG_BUNDLE_PROGRAMS: &[(&str, &[char])] = &[
         ("fd", &['x', 'X']),
         ("tail", &['f', 'F']),
-        ("git", &['o', 'c', 'p']),
+        ("git", &['o', 'p']),
         ("tree", &['o', 'H']),
     ];
 
@@ -2312,11 +2474,39 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
     };
     let has_remote_helper =
         || program == "git" && arguments.iter().any(|token| token.contains("::"));
+    let has_dangerous_git_config = || {
+        if program != "git" {
+            return false;
+        }
+        arguments.iter().enumerate().any(|(i, &arg)| {
+            if arg == "-c" {
+                arguments
+                    .get(i + 1)
+                    .is_some_and(|val| is_dangerous_git_config_key(val))
+            } else if let Some(rest) = arg.strip_prefix("-c") {
+                is_dangerous_git_config_key(rest)
+            } else {
+                false
+            }
+        })
+    };
 
     has_flag()
         || has_bundled()
         || has_remote_helper()
+        || has_dangerous_git_config()
         || has_write_git_subcommand(program, arguments)
+}
+
+pub fn is_dangerous_git_config_key(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    lower.contains("core.pager")
+        || lower.contains("core.askpass")
+        || lower.contains("core.sshcommand")
+        || lower.contains("core.editor")
+        || lower.contains("sequence.editor")
+        || lower.contains("diff.external")
+        || lower.contains("credential.helper=!")
 }
 
 pub fn has_write_git_subcommand(program: &str, arguments: &[&str]) -> bool {
@@ -2723,7 +2913,7 @@ mod tests {
             Some(JudgeDecision::Allow)
         );
         assert_ne!(
-            evaluate_cmd("git -c user.name=\"x\" push origin main").map(|v| v.decision),
+            evaluate_cmd("git -c core.pager=rm push origin main").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_ne!(
@@ -3457,6 +3647,11 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("git push --force-if-includes origin main").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git -c credential.helper= push https://x-access-token:$(gh auth token)@github.com/Liquid4All/liquid-agent-mobile.git feat/mobile-demos-brain-routing --force-with-lease")
+                .map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_ne!(

@@ -175,13 +175,13 @@ fn extract_cwd(val: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_session_id(val: &serde_json::Value) -> SessionId {
-    if let Some(id) = std::env::var(SESSION_ENV)
-        .ok()
-        .and_then(|raw| SessionId::new(&raw).ok())
-    {
-        return id;
-    }
-    for key in ["session_id", "sessionId", "session"] {
+    for key in [
+        "session_id",
+        "sessionId",
+        "session",
+        "conversationId",
+        "conversation_id",
+    ] {
         if let Some(id) = val
             .get(key)
             .and_then(|v| v.as_str())
@@ -189,6 +189,12 @@ fn extract_session_id(val: &serde_json::Value) -> SessionId {
         {
             return id;
         }
+    }
+    if let Some(id) = std::env::var(SESSION_ENV)
+        .ok()
+        .and_then(|raw| SessionId::new(&raw).ok())
+    {
+        return id;
     }
     SessionId::default()
 }
@@ -686,27 +692,37 @@ fn encode_response(
         return String::new();
     }
 
-    let decision_str = verdict.decision.as_hook_str();
-    let permission_overrides = if verdict.decision == triage_core::judge::JudgeDecision::Deny {
-        Vec::new()
-    } else {
-        request
-            .map(compute_permission_overrides)
+    match verdict.decision {
+        triage_core::judge::JudgeDecision::Allow => {
+            let permission_overrides = request
+                .map(compute_permission_overrides)
+                .unwrap_or_default();
+            serde_json::to_string(&HookJsonResponse {
+                decision: "allow",
+                reason: None,
+                permission_overrides: &permission_overrides,
+            })
             .unwrap_or_default()
-    };
-
-    let reason_opt = if !verdict.reason.is_empty() {
-        Some(verdict.reason.as_str())
-    } else {
-        None
-    };
-
-    serde_json::to_string(&HookJsonResponse {
-        decision: decision_str,
-        reason: reason_opt,
-        permission_overrides: &permission_overrides,
-    })
-    .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
+        }
+        triage_core::judge::JudgeDecision::Deny => {
+            let reason_opt = if !verdict.reason.is_empty() {
+                Some(verdict.reason.as_str())
+            } else {
+                None
+            };
+            serde_json::to_string(&HookJsonResponse {
+                decision: "deny",
+                reason: reason_opt,
+                permission_overrides: &[],
+            })
+            .unwrap_or_default()
+        }
+        triage_core::judge::JudgeDecision::Ask => {
+            // Only approve or explicitly deny. Everything else falls through silently with no output
+            // so the agent handles the tool call using its own native default permissions.
+            String::new()
+        }
+    }
 }
 
 fn main() {
@@ -1070,10 +1086,18 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "ask");
-        assert_eq!(val["reason"], "command requires confirmation");
+        let ask_encoded = encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request));
+        assert_eq!(ask_encoded, "");
+
+        let allow_cmd_verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: ls".to_string(),
+        };
+        let allow_cmd_encoded =
+            encode_response(AgentFormat::Antigravity, &allow_cmd_verdict, Some(&request));
+        let val: serde_json::Value = serde_json::from_str(&allow_cmd_encoded).unwrap();
+        assert_eq!(val["decision"], "allow");
         assert!(val.get("permissionDecision").is_none());
         assert!(val.get("hookSpecificOutput").is_none());
         let overrides: Vec<&str> = val["permissionOverrides"]
@@ -1089,9 +1113,9 @@ mod tests {
     #[test]
     fn permission_overrides_for_custom_tool_name_emits_dynamic_tool_prefixes() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
-            reason: "requires confirmation".to_string(),
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: ls".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::default(),
@@ -1102,7 +1126,7 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "ask");
+        assert_eq!(val["decision"], "allow");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1115,9 +1139,9 @@ mod tests {
     #[test]
     fn permission_overrides_for_git_commands_with_global_flags_emit_bare_and_subcommand_tokens() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
-            reason: "requires confirmation".to_string(),
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: git diff".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::default(),
@@ -1128,7 +1152,7 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "ask");
+        assert_eq!(val["decision"], "allow");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1143,9 +1167,9 @@ mod tests {
     #[test]
     fn permission_overrides_for_gradlew_commands_emit_stripped_and_base_tokens() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
-            reason: "requires confirmation".to_string(),
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: gradlew".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::default(),
@@ -1156,7 +1180,7 @@ mod tests {
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "ask");
+        assert_eq!(val["decision"], "allow");
         let overrides: Vec<&str> = val["permissionOverrides"]
             .as_array()
             .unwrap()
@@ -1201,12 +1225,12 @@ mod tests {
     #[test]
     fn an_empty_reason_is_omitted_rather_than_sent_blank() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
+            decision: JudgeDecision::Deny,
+            source: triage_core::judge::JudgeSource::DenyRule,
             reason: String::new(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, None);
-        assert_eq!(encoded, r#"{"decision":"ask"}"#);
+        assert_eq!(encoded, r#"{"decision":"deny"}"#);
     }
 
     #[test]
@@ -1353,12 +1377,59 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_id_falls_back_safely_when_unspecified() {
-        let val: serde_json::Value = serde_json::json!({});
-        let extracted = extract_session_id(&val);
-        if let Some(expected) = std::env::var(SESSION_ENV)
-            .ok()
-            .and_then(|id| SessionId::new(&id).ok())
+    fn extract_session_id_prefers_explicit_session_id_field() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_id": "session-explicit-123",
+                "sessionId": "session-camel-456",
+                "conversationId": "session-conv-789"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_session_id(&payload),
+            SessionId::new("session-explicit-123").unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_session_id_camel_case() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "sessionId": "session-camel-456",
+                "conversationId": "session-conv-789"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_session_id(&payload),
+            SessionId::new("session-camel-456").unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_conversation_id() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "conversationId": "session-conv-789"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_session_id(&payload),
+            SessionId::new("session-conv-789").unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_environment_variable() {
+        let payload: serde_json::Value = serde_json::from_str("{}").unwrap();
+        let extracted = extract_session_id(&payload);
+        if let Ok(env_id) = std::env::var(SESSION_ENV)
+            && let Ok(expected) = SessionId::new(env_id)
         {
             assert_eq!(extracted, expected);
             return;
@@ -1379,9 +1450,9 @@ mod tests {
             cwd: None,
         };
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
-            reason: "requires confirmation".to_string(),
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: git log".to_string(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -1414,9 +1485,9 @@ mod tests {
             cwd: None,
         };
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
-            reason: "requires confirmation".to_string(),
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "read-only tool call: view_file".to_string(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -1520,14 +1591,14 @@ mod tests {
     #[test]
     fn generic_response_uses_camel_case_keys() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rules".to_string(),
+            decision: JudgeDecision::Deny,
+            source: triage_core::judge::JudgeSource::DenyRule,
+            reason: "destructive command blocked".to_string(),
         };
         let encoded = encode_response(AgentFormat::Generic, &verdict, None);
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        assert_eq!(val["reason"], "matched allow rules");
+        assert_eq!(val["decision"], "deny");
+        assert_eq!(val["reason"], "destructive command blocked");
     }
 
     #[test]
