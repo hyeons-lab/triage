@@ -1644,9 +1644,6 @@ pub fn has_complex_shell_metacharacters(command: &str) -> bool {
             i += 1;
             continue;
         }
-        if !in_single && !in_double && b == b'>' {
-            return true;
-        }
         i += 1;
     }
     in_single || in_double || escaped
@@ -3532,7 +3529,11 @@ mod tests {
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
-            evaluate_cmd("sleep 1.5 && $HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT exec-out screencap -p").map(|v| v.decision),
+            evaluate_cmd("sleep 1.5 && $HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT exec-out screencap -p > /tmp/s25u_popup.png").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("git -C /Users/dberrios/development/liquid-agent-mobile/worktrees/mobile-demos-brain-routing diff feat/photo-vision-capture...feat/mobile-demos-brain-routing > /Users/dberrios/.gemini/antigravity-cli/brain/31763373-0877-4673-8e1a-10802e0d0fc1/scratch/branch_review_diff.patch").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
         assert_eq!(

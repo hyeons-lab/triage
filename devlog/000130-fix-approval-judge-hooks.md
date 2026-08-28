@@ -35,8 +35,8 @@
 - **2026-08-27T07:48-0700** Added Docker, Podman, archive tools (`unzip`, `tar`, `gzip`, `zip`), and Triage workspace binaries (`triage-hook`, `triaged`, `triage`) to `BUILTIN_ALLOW_COMMANDS`, preventing false approval prompts for container builds and conversions.
 - **2026-08-27T09:11-0700** Aligned `triage-hook` response encoding with Claude Code's PreToolUse specification by emitting pure `hookSpecificOutput` with `permissionDecision: "allow" | "deny" | "ask"`, removing extraneous top-level fields (`decision: "approve"`, `permissionOverrides`) that caused Claude Code's hook parser to reject approvals and prompt the user.
 - **2026-08-27T09:23-0700** Removed `triage-hook` from Claude Code `~/.claude/settings.json` and updated `triage-hook` to act as a silent passthrough (empty output on exit 0) when Claude Code is detected, ensuring Claude Code's native auto mode handles all permissions with zero hook interference.
-- **2026-08-27T19:40-0700** Added heredoc block parser to `pipeline_and_chain_segments` so Python/Bash heredocs (`<<'PYEOF'`, `<<'PY'`) stay within a single command segment, added `-s`, `--serial`, `-t`, `-e`, `-d`, `--device` to `KNOWN_VALUE_TAKING_FLAGS`, expanded `BUILTIN_ALLOW_COMMANDS` with wildcard entries (`sleep *`, `just *`, `make *`, `./gradlew *`, `gradlew *`, `gradle *`) and comprehensive ADB / Fastboot commands (`adb *`, `adb shell *`, `adb exec-out *`, `adb push *`, `adb pull *`, `adb install *`, `adb logcat *`, `fastboot *`), and updated `has_complex_shell_metacharacters` to permit input streaming heredocs.
 - **2026-08-27T20:25-0700** Removed explicit `_focusTerminal()` focus requests from accessory bar button taps in `terminal_pane_stub.dart` and `terminal_pane_web.dart`, preventing mobile OS virtual keyboards from popping open when tapping bottom shortcuts.
+- **2026-08-27T20:34-0700** Removed raw `>` output redirection restriction from `has_complex_shell_metacharacters`, allowing standard file output redirections (e.g. `git diff ... > scratch.patch`, `adb screencap > /tmp/img.png`) to be evaluated and auto-approved under Layer 2 allowlist rules rather than falling back to model `Ask`.
 
 ## Decisions
 
@@ -67,6 +67,7 @@
 - **Heredoc Delimiter Preservation in Pipeline Segmentation**: Tracked active heredoc delimiters (`<<'EOF'`, `<<EOF`, `<<-EOF`) in `pipeline_and_chain_segments` so multiline Python/shell scripts are evaluated as a cohesive single tool call rather than being fragmented on raw newlines.
 - **Comprehensive ADB and Toolchain Flag Normalization**: Added ADB target serial and device flags (`-s`, `--serial`, `-t`, `-e`, `-d`) to `KNOWN_VALUE_TAKING_FLAGS` and added wildcard subcommands for routine Android tooling and task runners to eliminate false fallback prompt modals during automated builds, logcat queries, and device testing.
 - **Non-Focusing Mobile Accessory Bar**: Removed `_focusTerminal()` calls on accessory key sends (`_sendAccessory`) and Ctrl toggle (`_toggleCtrl`). Because `TerminalAccessoryBar` keys use raw `GestureDetector` widgets without focus nodes, tapping shortcut keys delivers keystrokes to the terminal without requesting OS keyboard focus or popping up the soft keyboard.
+- **Permit Standard Output Redirection in Deterministic Rules**: Allowed standard `>` and `>>` output redirections while preserving strict checks against command substitutions (`$(...)`, `` `...` ``), process substitutions (`<(...)`, `>(...)`), and credential/sensitive path targets, ensuring routine diff exports, screencaps, and log dumps proceed without interactive prompts.
 
 ## Commits
 
@@ -106,4 +107,5 @@
 - 994912c — fix(hook): align Claude Code PreToolUse hook response to strict schema
 - abeed64 — fix(hook): make Claude Code format silent passthrough to preserve native auto mode
 - 2ba03c5 — fix(judge): support heredoc parsing, adb serial flags, and task runner wildcards
-- HEAD — fix(client): prevent accessory bar taps from popping soft keyboard on mobile
+- 37f3579 — fix(client): prevent accessory bar taps from popping soft keyboard on mobile
+- HEAD — fix(judge): allow standard output redirection in deterministic rules

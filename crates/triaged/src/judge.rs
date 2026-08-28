@@ -675,7 +675,7 @@ mod tests {
         // that no deny rule fires, so the assertion is that they reach the
         // model (`None`) rather than being auto-approved on the prefix.
         assert_eq!(decide("ls && curl example.com"), None);
-        assert_eq!(decide("cat file > /tmp/hosts"), None);
+        assert_eq!(decide("cat <(ls)"), None);
         assert_eq!(decide("echo $(whoami)"), None);
         assert_eq!(decide("ls `pwd`"), None);
         assert_eq!(decide("git status | tee /tmp/out"), None);
