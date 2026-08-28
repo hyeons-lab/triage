@@ -656,11 +656,9 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         }
     }
 
-    let mut seen = std::collections::HashSet::with_capacity(permission_overrides.len());
     let mut deduped = Vec::with_capacity(permission_overrides.len());
     for item in permission_overrides {
-        if !seen.contains(item.as_str()) {
-            seen.insert(item.clone());
+        if !deduped.contains(&item) {
             deduped.push(item);
         }
     }

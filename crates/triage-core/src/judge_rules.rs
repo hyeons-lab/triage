@@ -882,9 +882,11 @@ impl JudgeRules {
         }
         let positional = extract_positional_tokens(tokens);
         if positional.len() < 2 {
-            if tokens.iter().skip(1).any(|t| {
-                *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h" || *t == "version"
-            }) {
+            if tokens
+                .iter()
+                .skip(1)
+                .any(|t| *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h")
+            {
                 return Some("git --version");
             }
             return None;
@@ -1170,14 +1172,10 @@ impl JudgeRules {
         }
         let positional = extract_positional_tokens(tokens);
         if positional.len() < 2 {
-            if tokens.iter().any(|t| {
-                *t == "--version"
-                    || *t == "-V"
-                    || *t == "--help"
-                    || *t == "-h"
-                    || *t == "version"
-                    || *t == "help"
-            }) {
+            if tokens
+                .iter()
+                .any(|t| *t == "--version" || *t == "-V" || *t == "--help" || *t == "-h")
+            {
                 return Some("cargo --version");
             }
             return None;
@@ -1202,6 +1200,7 @@ impl JudgeRules {
             "verify-project" => Some("cargo verify-project"),
             "report" => Some("cargo report"),
             "help" => Some("cargo help"),
+            "version" => Some("cargo --version"),
             _ => None,
         }
     }
