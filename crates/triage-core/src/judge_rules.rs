@@ -241,6 +241,9 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     // Rust build, check, test, lint, and formatting.
     "cargo check",
     "cargo build",
+    "cargo run",
+    "cargo clean",
+    "cargo bench",
     "cargo fmt",
     "cargo clippy",
     "cargo test",
@@ -257,6 +260,9 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "flutter test",
     "flutter doctor",
     "flutter build",
+    "flutter run",
+    "flutter format",
+    "flutter clean",
     "flutter pub get",
     "flutter devices",
     "flutter --version",
@@ -524,10 +530,9 @@ impl JudgeRules {
 
     pub fn evaluate(&self, request: &JudgeRequest) -> Option<JudgeVerdict> {
         let tool_name = request.tool_name.trim();
-        let lower_tool_name = tool_name.to_ascii_lowercase();
 
         // 1. Read-only inspection tools (when not carrying a command line).
-        if is_read_only_tool(&lower_tool_name) && request.command_line.is_none() {
+        if is_read_only_tool(tool_name) && request.command_line.is_none() {
             if let Some(secret) = check_target_credential_path(request) {
                 return Some(JudgeVerdict::fallback(format!(
                     "requires manual approval for credential path: {secret}"
@@ -541,7 +546,7 @@ impl JudgeRules {
         }
 
         // 2. File editing / writing tools.
-        if is_edit_tool(&lower_tool_name) {
+        if is_edit_tool(tool_name) {
             if let Some(secret) = check_target_credential_path(request) {
                 return Some(JudgeVerdict::fallback(format!(
                     "requires manual approval for credential path: {secret}"
@@ -555,7 +560,7 @@ impl JudgeRules {
         }
 
         // 3. Command execution tools.
-        if !is_command_tool(&lower_tool_name) {
+        if !is_command_tool(tool_name) {
             return Some(JudgeVerdict::fallback(format!(
                 "tool {tool_name} is not judged"
             )));

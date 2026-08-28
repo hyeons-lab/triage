@@ -46,6 +46,7 @@
 - **2026-08-27T22:04-0700** Applied Round 6 review refinements: expanded `BASE_COMMAND_PREFIXES`, `READ_FILE_PREFIXES`, and `EDIT_FILE_PREFIXES` to cover all tool names and aliases (`read`, `write`, `edit`, `shell`, `terminal`, `exec`), unconditionally emitted subagent-prefixed and self-prefixed tokens for all tools in `compute_permission_overrides`, collapsed duplicate token-matching logic into `matches_slice` helper in `matching_token_allow_rule`, streamlined trailing `--` token collection with `extend_from_slice` in `extract_positional_tokens`, and removed redundant `"dart pub get"` entry in `BUILTIN_ALLOW_COMMANDS`.
 - **2026-08-27T22:09-0700** Applied Round 7 review refinements: guarded top-level version queries in `matching_git_allow_rule` with `positional.len() < 2` to prevent argument collisions on commands with operand named `version` (e.g. `git tag -d version`), eliminated duplicate `matches_slice` check in `matching_token_allow_rule`, optimized `compute_permission_overrides` deduplication using pre-allocated `HashSet<&str>` reference lookups, and added collision tests in `judge_rules.rs`.
 - **2026-08-27T22:20-0700** Applied Round 8 review refinements: separated state-modifying tools (`manage_task`, `task_stop`) from `is_read_only_tool` while dynamically mapping `Action: "status"` and `"list"` invocations in `triage-hook` to `task_status` for immediate read auto-approval, added `cargo run` and `flutter run` subcommands to their respective allow rules, eliminated unnecessary lowercase String allocation in `is_command_tool`, and deferred `norm_sub` string allocations in `compute_permission_overrides`.
+- **2026-08-27T22:27-0700** Applied Round 9 review refinements: eliminated redundant `lower_tool_name` String allocation in `JudgeRules::evaluate`, synchronized `BUILTIN_ALLOW_COMMANDS` table with structured subcommands (`cargo run/clean/bench`, `flutter run/format/clean`), added early return on empty command/path in `compute_permission_overrides`, and verified clean test passes across workspace.
 
 ## Decisions
 
@@ -92,6 +93,7 @@
 - **Unconditional Subagent Permission Overrides**: Removed prefix suppression guards in `compute_permission_overrides` so that all file, search, and command tool calls generate explicit `subagent:<tool>(...)` and `self:<tool>(...)` overrides. This ensures Antigravity's internal subagent permission matcher resolves subagent tool calls automatically without prompting the user.
 - **Positional Guarding for Version Rule Evaluator**: Enforced `positional.len() < 2` before matching `--version`, `-v`, `--help`, or `version` in `matching_git_allow_rule` so that subcommands operating on tags or branches named `version` evaluate against their specific subcommand policies instead of false-positive auto-approval.
 - **Dynamic Multi-Action Task Mapping in Hook**: Mapped `manage_task` with query actions (`status`, `list`) to `task_status` in `triage-hook` while directing termination actions (`kill`, `stop`) to `task_stop` and command injections (`send_input`) to full command validation. This adheres strictly to the Pillar 6 state-modifying separation invariant while allowing subagents to inspect background tasks without interactive approval prompts.
+- **Static Allowlist Invariant Synchronization**: Aligned `BUILTIN_ALLOW_COMMANDS` explicitly with toolchain grammar parsers to ensure consistency between static configuration dumps and structured CLI evaluation.
 
 ## Commits
 
@@ -142,4 +144,5 @@
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
 - ea4b359 — fix(judge,hook): guard git version positional length and optimize override deduplication
-- HEAD — fix(judge,hook): separate task management actions and allowlist cargo/flutter run
+- 11729d0 — fix(judge,hook): separate task management actions and allowlist cargo/flutter run
+- HEAD — fix(judge,hook): sync allowlist tables and eliminate tool name allocations

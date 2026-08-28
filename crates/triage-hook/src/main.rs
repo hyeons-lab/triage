@@ -485,6 +485,9 @@ static EDIT_FILE_PREFIXES: &[&str] = &[
 ];
 
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
+    if req.command_line.is_none() && req.path.is_none() {
+        return Vec::new();
+    }
     let mut permission_overrides = Vec::new();
     let norm_tool = triage_core::judge_rules::normalize_tool_name(&req.tool_name);
     let custom_sub = format!("subagent:{}", req.tool_name);
