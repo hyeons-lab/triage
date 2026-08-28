@@ -35,6 +35,7 @@
 - **2026-08-27T07:48-0700** Added Docker, Podman, archive tools (`unzip`, `tar`, `gzip`, `zip`), and Triage workspace binaries (`triage-hook`, `triaged`, `triage`) to `BUILTIN_ALLOW_COMMANDS`, preventing false approval prompts for container builds and conversions.
 - **2026-08-27T09:11-0700** Aligned `triage-hook` response encoding with Claude Code's PreToolUse specification by emitting pure `hookSpecificOutput` with `permissionDecision: "allow" | "deny" | "ask"`, removing extraneous top-level fields (`decision: "approve"`, `permissionOverrides`) that caused Claude Code's hook parser to reject approvals and prompt the user.
 - **2026-08-27T09:23-0700** Removed `triage-hook` from Claude Code `~/.claude/settings.json` and updated `triage-hook` to act as a silent passthrough (empty output on exit 0) when Claude Code is detected, ensuring Claude Code's native auto mode handles all permissions with zero hook interference.
+- **2026-08-27T19:40-0700** Added heredoc block parser to `pipeline_and_chain_segments` so Python/Bash heredocs (`<<'PYEOF'`, `<<'PY'`) stay within a single command segment, added `-s`, `--serial`, `-t`, `-e`, `-d`, `--device` to `KNOWN_VALUE_TAKING_FLAGS`, expanded `BUILTIN_ALLOW_COMMANDS` with wildcard entries (`sleep *`, `just *`, `make *`, `./gradlew *`, `gradlew *`, `gradle *`) and comprehensive ADB / Fastboot commands (`adb *`, `adb shell *`, `adb exec-out *`, `adb push *`, `adb pull *`, `adb install *`, `adb logcat *`, `fastboot *`), and updated `has_complex_shell_metacharacters` to permit input streaming heredocs.
 
 ## Decisions
 
@@ -62,6 +63,8 @@
 - **Task Management and Python Allowlisting**: Added `manage_task` and `schedule` to read-only tools and allowlisted `python`, `python3`, `node`, `pytest`, and `adb` tools to eliminate false approval prompts on background task monitoring and routine agent helper scripts.
 - **Docker and Container Toolchain Allowlisting**: Auto-approved routine container operations (`docker build`, `docker run`, `docker compose`, `docker ps`, `docker images`, `docker logs`, `podman`) and archive utilities (`unzip`, `tar`, `gzip`) in Layer 2 deterministic rules so containerized builds and cross-compilations run seamlessly without prompting.
 - **Claude Code Native Auto Mode Passthrough**: Preserved Claude Code's built-in auto mode (`permissions: { defaultMode: "auto" }`) without hook interception. Removed `triage-hook` from Claude Code settings and configured `triage-hook` to return an empty response (silent exit 0) when invoked by Claude Code.
+- **Heredoc Delimiter Preservation in Pipeline Segmentation**: Tracked active heredoc delimiters (`<<'EOF'`, `<<EOF`, `<<-EOF`) in `pipeline_and_chain_segments` so multiline Python/shell scripts are evaluated as a cohesive single tool call rather than being fragmented on raw newlines.
+- **Comprehensive ADB and Toolchain Flag Normalization**: Added ADB target serial and device flags (`-s`, `--serial`, `-t`, `-e`, `-d`) to `KNOWN_VALUE_TAKING_FLAGS` and added wildcard subcommands for routine Android tooling and task runners to eliminate false fallback prompt modals during automated builds, logcat queries, and device testing.
 
 ## Commits
 
@@ -99,4 +102,5 @@
 - 8c48137 — fix(judge,hook): emit permissionOverrides for Antigravity, classify task tools, and allowlist python/scripts/adb
 - f6b6722 — feat(judge): add docker, podman, archive utilities, and triage binaries to builtin allowlist
 - 994912c — fix(hook): align Claude Code PreToolUse hook response to strict schema
-- HEAD — fix(hook): make Claude Code format silent passthrough to preserve native auto mode
+- abeed64 — fix(hook): make Claude Code format silent passthrough to preserve native auto mode
+- HEAD — fix(judge): support heredoc parsing, adb serial flags, and task runner wildcards

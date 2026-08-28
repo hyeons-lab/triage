@@ -297,8 +297,11 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "gh --version",
     // Utilities & Task runners.
     "sleep",
+    "sleep *",
     "just",
+    "just *",
     "make",
+    "make *",
     "./scripts/*",
     "scripts/*",
     "./scripts/install.sh",
@@ -306,8 +309,11 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "./scripts/bump-version.sh",
     "scripts/bump-version.sh",
     "./gradlew",
+    "./gradlew *",
     "gradlew",
+    "gradlew *",
     "gradle",
+    "gradle *",
     "dart pub get",
     "dart pub",
     "dart run",
@@ -357,10 +363,44 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "go vet *",
     "go fmt",
     "go version",
-    // Android debug bridge queries and logcat.
+    // Android debug bridge and fastboot.
+    "adb",
+    "adb *",
     "adb devices",
+    "adb devices *",
     "adb logcat",
     "adb logcat *",
+    "adb shell",
+    "adb shell *",
+    "adb exec-out",
+    "adb exec-out *",
+    "adb push",
+    "adb push *",
+    "adb pull",
+    "adb pull *",
+    "adb install",
+    "adb install *",
+    "adb uninstall",
+    "adb uninstall *",
+    "adb forward",
+    "adb forward *",
+    "adb reverse",
+    "adb reverse *",
+    "adb emu",
+    "adb emu *",
+    "adb bugreport",
+    "adb bugreport *",
+    "adb wait-for-device",
+    "adb wait-for-device *",
+    "adb connect",
+    "adb connect *",
+    "adb disconnect",
+    "adb disconnect *",
+    "adb start-server",
+    "adb kill-server",
+    "adb version",
+    "fastboot",
+    "fastboot *",
     // Docker & Container tools.
     "docker",
     "docker *",
@@ -1580,26 +1620,34 @@ pub fn has_complex_shell_metacharacters(command: &str) -> bool {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
-    for &b in command.as_bytes() {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
         if escaped {
             escaped = false;
+            i += 1;
             continue;
         }
         if b == b'\\' && !in_single {
             escaped = true;
+            i += 1;
             continue;
         }
         if b == b'\'' && !in_double {
             in_single = !in_single;
+            i += 1;
             continue;
         }
         if b == b'"' && !in_single {
             in_double = !in_double;
+            i += 1;
             continue;
         }
-        if !in_single && !in_double && (b == b'>' || b == b'<') {
+        if !in_single && !in_double && b == b'>' {
             return true;
         }
+        i += 1;
     }
     in_single || in_double || escaped
 }
@@ -1638,38 +1686,122 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut escaped = false;
+    let mut heredoc_delimiter: Option<String> = None;
+    let mut in_heredoc_body = false;
 
     let bytes = command.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
         if escaped {
             escaped = false;
+            i += 1;
             continue;
         }
         if b == b'\\' && !in_single_quote {
             escaped = true;
+            i += 1;
             continue;
         }
         if b == b'\'' && !in_double_quote {
             in_single_quote = !in_single_quote;
+            i += 1;
             continue;
         }
         if b == b'"' && !in_single_quote {
             in_double_quote = !in_double_quote;
+            i += 1;
             continue;
         }
-        if !in_single_quote
-            && !in_double_quote
-            && matches!(
-                b,
-                b';' | b'|' | b'&' | b'\n' | b'\r' | b'(' | b')' | b'{' | b'}'
-            )
-        {
-            let segment = command[start..i].trim();
-            if !segment.is_empty() {
-                segments.push(segment);
+
+        if !in_single_quote && !in_double_quote {
+            // Check for heredoc start `<<` outside of heredoc body
+            if !in_heredoc_body
+                && heredoc_delimiter.is_none()
+                && b == b'<'
+                && i + 1 < bytes.len()
+                && bytes[i + 1] == b'<'
+                && (i + 2 >= bytes.len() || bytes[i + 2] != b'<')
+            {
+                let mut d_start = i + 2;
+                if d_start < bytes.len() && bytes[d_start] == b'-' {
+                    d_start += 1;
+                }
+                while d_start < bytes.len() && (bytes[d_start] == b' ' || bytes[d_start] == b'\t') {
+                    d_start += 1;
+                }
+                let mut d_end = d_start;
+                if d_start < bytes.len() {
+                    let first_char = bytes[d_start];
+                    if first_char == b'\'' || first_char == b'"' {
+                        d_start += 1;
+                        d_end = d_start;
+                        while d_end < bytes.len() && bytes[d_end] != first_char {
+                            d_end += 1;
+                        }
+                        if d_end < bytes.len() {
+                            let delim = &command[d_start..d_end];
+                            if !delim.is_empty() {
+                                heredoc_delimiter = Some(delim.to_string());
+                            }
+                            i = d_end + 1;
+                            continue;
+                        }
+                    } else {
+                        while d_end < bytes.len()
+                            && (bytes[d_end].is_ascii_alphanumeric() || bytes[d_end] == b'_')
+                        {
+                            d_end += 1;
+                        }
+                        if d_end > d_start {
+                            let delim = &command[d_start..d_end];
+                            heredoc_delimiter = Some(delim.to_string());
+                            i = d_end;
+                            continue;
+                        }
+                    }
+                }
             }
-            start = i + 1;
+
+            // Check if upcoming line ends the heredoc
+            if let Some(ref delim) = heredoc_delimiter
+                && (b == b'\n' || b == b'\r')
+            {
+                in_heredoc_body = true;
+                let next_line_start = if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n'
+                {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                let line_rest = &command[next_line_start..];
+                let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
+                let line = line_rest[..line_end].trim();
+                if line == delim.as_str() {
+                    heredoc_delimiter = None;
+                    in_heredoc_body = false;
+                    i = next_line_start + line_end;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if !in_heredoc_body
+                && matches!(
+                    b,
+                    b';' | b'|' | b'&' | b'\n' | b'\r' | b'(' | b')' | b'{' | b'}'
+                )
+            {
+                let segment = command[start..i].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                start = i + 1;
+            }
         }
+
+        i += 1;
     }
     let tail = command[start..].trim();
     if !tail.is_empty() {
@@ -1936,6 +2068,13 @@ pub const KNOWN_VALUE_TAKING_FLAGS: &[&str] = &[
     "--dir",
     "--prefix",
     "--filter",
+    // adb / fastboot
+    "-s",
+    "--serial",
+    "-t",
+    "-e",
+    "-d",
+    "--device",
 ];
 
 pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
@@ -1959,6 +2098,7 @@ pub fn extract_positional_tokens<'a>(tokens: &'a [&'a str]) -> Vec<&'a str> {
                 || (token.starts_with("-F") && token != "-F")
                 || (token.starts_with("-d") && token != "-d")
                 || (token.starts_with("-t") && token != "-t")
+                || (token.starts_with("-s") && token != "-s")
                 || (token.starts_with("-Z") && token != "-Z")
                 || token.contains('=')
             {
@@ -3384,7 +3524,33 @@ mod tests {
             Some(JudgeDecision::Allow)
         );
         assert_eq!(
+            evaluate_cmd("$HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT logcat -t 100 -s AssistantSvc BriefOverlay GlowOverlay").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("$HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT shell \"am broadcast -n ai.liquid.lfm2/.service.DebugSignalReceiver\"").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("sleep 1.5 && $HOME/Library/Android/sdk/platform-tools/adb -s R5CXC3C2LNT exec-out screencap -p").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
             evaluate_cmd("go test ./...").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_heredoc_multiline_scripts_allowed() {
+        let script = "cd /some/dir && python3 - <<'PYEOF'\nimport io\ns = 'hello'\nprint(s)\nPYEOF\ngrep -c 'pattern' file.txt";
+        assert_eq!(
+            evaluate_cmd(script).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        let script2 = "python3 - <<'PY'\nimport re\np = 'review112.md'\nPY";
+        assert_eq!(
+            evaluate_cmd(script2).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }
