@@ -147,9 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 5604359 — feat(triaged): automatically provision and refresh agent lifecycle hooks on startup
-- HEAD — feat(triaged): auto-inject approval keystrokes into live session PTYs on allowed tool calls
+- 5445aa5 — feat(triaged): auto-inject approval keystrokes into live session PTYs on allowed tool calls
+- HEAD — revert(triaged): remove PTY input injection to prevent terminal keystroke pollution
 
 ## What Changed
-- Added automatic PTY input injection in [`crates/triaged/src/session.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/session.rs#L1100-L1140): when a tool call receives an `Allow` verdict from the judge, `triaged` resolves the matching live terminal session (via Session ID or active CWD) and asynchronously writes `1\n` into the PTY off-lock, automatically answering interactive CLI confirmation prompts without requiring manual user keystrokes.
-- Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
+- Removed asynchronous PTY keystroke injection from `crates/triaged/src/session.rs` to prevent `1` characters from polluting terminal sessions and interfering with active shells.
+- Fixed clippy lints, re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
