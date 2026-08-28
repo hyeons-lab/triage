@@ -37,7 +37,7 @@
 - **2026-08-27T09:23-0700** Removed `triage-hook` from Claude Code `~/.claude/settings.json` and updated `triage-hook` to act as a silent passthrough (empty output on exit 0) when Claude Code is detected, ensuring Claude Code's native auto mode handles all permissions with zero hook interference.
 - **2026-08-27T20:25-0700** Removed explicit `_focusTerminal()` focus requests from accessory bar button taps in `terminal_pane_stub.dart` and `terminal_pane_web.dart`, preventing mobile OS virtual keyboards from popping open when tapping bottom shortcuts.
 - **2026-08-27T20:34-0700** Removed raw `>` output redirection restriction from `has_complex_shell_metacharacters`, allowing standard file output redirections (e.g. `git diff ... > scratch.patch`, `adb screencap > /tmp/img.png`) to be evaluated and auto-approved under Layer 2 allowlist rules rather than falling back to model `Ask`.
-- **2026-08-27T20:40-0700** Omitted `permissionOverrides` on `allow` decisions for Antigravity, preventing Antigravity's permission matcher from rejecting subagent tool calls (`view_file`, `grep_search`, `run_command`) against override patterns and forcing approval prompts.
+- **2026-08-27T20:47-0700** Added comprehensive subagent and tool prefix grants (`view_file`, `grep_search`, `subagent:view_file`, `subagent:run_command`, `self:run_command`, `Bash`) to `permissionOverrides` in `triage-hook`, ensuring Antigravity's in-memory permission engine recognizes grants across all subagent lifecycle requests.
 
 ## Decisions
 
@@ -69,7 +69,7 @@
 - **Comprehensive ADB and Toolchain Flag Normalization**: Added ADB target serial and device flags (`-s`, `--serial`, `-t`, `-e`, `-d`) to `KNOWN_VALUE_TAKING_FLAGS` and added wildcard subcommands for routine Android tooling and task runners to eliminate false fallback prompt modals during automated builds, logcat queries, and device testing.
 - **Non-Focusing Mobile Accessory Bar**: Removed `_focusTerminal()` calls on accessory key sends (`_sendAccessory`) and Ctrl toggle (`_toggleCtrl`). Because `TerminalAccessoryBar` keys use raw `GestureDetector` widgets without focus nodes, tapping shortcut keys delivers keystrokes to the terminal without requesting OS keyboard focus or popping up the soft keyboard.
 - **Permit Standard Output Redirection in Deterministic Rules**: Allowed standard `>` and `>>` output redirections while preserving strict checks against command substitutions (`$(...)`, `` `...` ``), process substitutions (`<(...)`, `>(...)`), and credential/sensitive path targets, ensuring routine diff exports, screencaps, and log dumps proceed without interactive prompts.
-- **Omit Permission Overrides on Clean Allow Verdicts**: Configured `AntigravityResponse` in `triage-hook` to emit `permissionOverrides` only on `ask` verdicts (where user grants can be cached) and omit the field entirely on `allow` verdicts, ensuring Antigravity unconditionally executes subagent tool calls without running prefix pattern matching.
+- **Comprehensive Subagent and Tool Prefix Override Matrix**: Expanded `compute_permission_overrides` to emit grants for all core tool names (`view_file`, `grep_search`, `find_by_name`, `list_dir`, `read_file`, `write_to_file`, `replace_file_content`, `run_command`, `Bash`) with explicit `subagent:` and `self:` prefixes. This ensures Antigravity's internal subagent permission cache matches incoming tool calls without fallback confirmation dialogs.
 
 ## Commits
 
@@ -111,4 +111,5 @@
 - 2ba03c5 — fix(judge): support heredoc parsing, adb serial flags, and task runner wildcards
 - 37f3579 — fix(client): prevent accessory bar taps from popping soft keyboard on mobile
 - 0bf578d — fix(judge): allow standard output redirection in deterministic rules
-- HEAD — fix(hook): omit permissionOverrides on allow verdicts for Antigravity subagents
+- 358d55c — fix(hook): omit permissionOverrides on allow verdicts for Antigravity subagents
+- HEAD — fix(hook): emit comprehensive subagent and tool prefix permission overrides

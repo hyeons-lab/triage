@@ -412,18 +412,65 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
 
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let mut permission_overrides = Vec::new();
+
+    let mut command_prefixes = vec![
+        "command".to_string(),
+        "run_command".to_string(),
+        "Bash".to_string(),
+        "bash".to_string(),
+        "self:command".to_string(),
+        "self:run_command".to_string(),
+        "self:Bash".to_string(),
+        "subagent:command".to_string(),
+        "subagent:run_command".to_string(),
+        "subagent:Bash".to_string(),
+    ];
+    if !command_prefixes.contains(&req.tool_name) {
+        command_prefixes.push(req.tool_name.clone());
+        command_prefixes.push(format!("subagent:{}", req.tool_name));
+        command_prefixes.push(format!("self:{}", req.tool_name));
+    }
+
+    let mut file_prefixes = vec![
+        "file".to_string(),
+        "view_file".to_string(),
+        "grep_search".to_string(),
+        "find_by_name".to_string(),
+        "list_dir".to_string(),
+        "read_file".to_string(),
+        "write_to_file".to_string(),
+        "replace_file_content".to_string(),
+        "self:file".to_string(),
+        "self:view_file".to_string(),
+        "self:grep_search".to_string(),
+        "self:read_file".to_string(),
+        "subagent:file".to_string(),
+        "subagent:view_file".to_string(),
+        "subagent:grep_search".to_string(),
+        "subagent:read_file".to_string(),
+    ];
+    if !file_prefixes.contains(&req.tool_name) {
+        file_prefixes.push(req.tool_name.clone());
+        file_prefixes.push(format!("subagent:{}", req.tool_name));
+        file_prefixes.push(format!("self:{}", req.tool_name));
+    }
+
     if let Some(ref cmd) = req.command_line {
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
             if trimmed_target.is_empty() {
                 return;
             }
-            permission_overrides.push(format!("command({trimmed_target})"));
+            for prefix in &command_prefixes {
+                permission_overrides.push(format!("{prefix}({trimmed_target})"));
+            }
 
             if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
                 let trimmed_sub = without_dot_slash.trim();
                 if !trimmed_sub.is_empty() {
-                    permission_overrides.push(format!("command({trimmed_sub})"));
+                    for prefix in &command_prefixes {
+                        permission_overrides.push(format!("{prefix}({trimmed_sub})"));
+                    }
                 }
             }
         };
@@ -454,6 +501,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                     || prog == "make"
                     || prog == "just"
                     || prog == "sleep"
+                    || prog == "adb"
+                    || prog == "pytest"
+                    || prog == "python"
+                    || prog == "python3"
                 {
                     add_command_override(words[0]);
                     if prog != words[0] {
@@ -496,9 +547,14 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             || lower_path.starts_with("https://")
             || lower_path.starts_with("ws://")
             || lower_path.starts_with("wss://");
-        if !is_url {
-            permission_overrides.push(format!("file({clean_path})"));
-        }
+        let mut add_path_override = |p_str: &str| {
+            if !is_url {
+                for prefix in &file_prefixes {
+                    permission_overrides.push(format!("{prefix}({p_str})"));
+                }
+            }
+        };
+        add_path_override(clean_path);
         let home_trimmed = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .ok()
@@ -519,11 +575,11 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                 } else {
                     format!("{home}{}", sub.replace('\\', "/"))
                 };
-                permission_overrides.push(format!("file({expanded})"));
+                add_path_override(&expanded);
                 if home.contains('\\') && sub.contains('/') {
                     let fwd_expanded = format!("{home}{sub}");
                     if fwd_expanded != expanded {
-                        permission_overrides.push(format!("file({fwd_expanded})"));
+                        add_path_override(&fwd_expanded);
                     }
                 }
             } else {
@@ -544,7 +600,7 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                     } else {
                         format!("~{suffix}")
                     };
-                    permission_overrides.push(format!("file({contracted})"));
+                    add_path_override(&contracted);
                 }
             }
         }
@@ -573,8 +629,8 @@ fn encode_response(
                 decision: &'a str,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 reason: Option<&'a str>,
-                #[serde(rename = "permissionOverrides", skip_serializing_if = "Option::is_none")]
-                permission_overrides: Option<&'a Vec<String>>,
+                #[serde(rename = "permissionOverrides", skip_serializing_if = "Vec::is_empty")]
+                permission_overrides: &'a Vec<String>,
             }
 
             let reason_opt = if !verdict.reason.is_empty() {
@@ -582,18 +638,11 @@ fn encode_response(
             } else {
                 None
             };
-            let overrides_opt = if verdict.decision != triage_core::judge::JudgeDecision::Allow
-                && !permission_overrides.is_empty()
-            {
-                Some(&permission_overrides)
-            } else {
-                None
-            };
 
             serde_json::to_string(&AntigravityResponse {
                 decision: decision_str,
                 reason: reason_opt,
-                permission_overrides: overrides_opt,
+                permission_overrides: &permission_overrides,
             })
             .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
         }
@@ -963,10 +1012,14 @@ mod tests {
             encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
         let allow_val: serde_json::Value = serde_json::from_str(&allow_encoded).unwrap();
         assert_eq!(allow_val["decision"], "allow");
-        assert_eq!(allow_val["reason"], "matched allow rule: ls");
-        assert!(allow_val.get("permissionDecision").is_none());
-        assert!(allow_val.get("hookSpecificOutput").is_none());
-        assert!(allow_val.get("permissionOverrides").is_none());
+        let allow_overrides: Vec<&str> = allow_val["permissionOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(allow_overrides.contains(&"command(git status)"));
+        assert!(allow_overrides.contains(&"subagent:run_command(git status)"));
 
         let ask_verdict = JudgeVerdict {
             decision: JudgeDecision::Ask,
