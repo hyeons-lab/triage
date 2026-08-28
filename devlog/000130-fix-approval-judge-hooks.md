@@ -147,9 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 9c14016 — revert(triaged): remove PTY input injection to prevent terminal keystroke pollution
-- HEAD — feat(triaged): provision global permission grants in settings.json to enable zero-prompt judge execution
+- 03215d7 — feat(triaged): provision global permission grants in settings.json to enable zero-prompt judge execution
+- HEAD — fix(hook): emit hookSpecificOutput with permissionDecision for Claude Code PreToolUse
 
 ## What Changed
-- Added automatic provisioning of `globalPermissionGrants` and `permissionGrants` (`{"allow": ["command(*)"]}`) in `~/.gemini/settings.json` within `install_global_agent_hooks()`. This pre-approves command permissions at the Antigravity settings layer so `EnsurePermissions` does not display interactive confirmation prompts, while `triage-hook` (`PreToolUse`) serves as the active safety gate.
+- Updated `encode_response` in [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs#L725-L765) to emit spec-compliant `hookSpecificOutput` with `permissionDecision: "allow" | "deny"` for Claude Code (`AgentFormat::ClaudeCode`). This enables Claude Code sessions (such as `liquid-agent-mobile` running `Bash` commands) to receive automatic approvals without interactive terminal prompts.
 - Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

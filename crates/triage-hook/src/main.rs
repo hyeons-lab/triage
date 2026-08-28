@@ -726,9 +726,39 @@ fn encode_response(
     request: Option<&JudgeRequest>,
 ) -> String {
     if format == AgentFormat::ClaudeCode {
-        // Claude Code has its own native auto mode and permission system.
-        // Do not alter or intercept Claude Code behavior; return empty output for silent passthrough.
-        return String::new();
+        return match verdict.decision {
+            triage_core::judge::JudgeDecision::Allow => {
+                let reason = if !verdict.reason.is_empty() {
+                    Some(verdict.reason.as_str())
+                } else {
+                    None
+                };
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": reason
+                    }
+                })
+                .to_string()
+            }
+            triage_core::judge::JudgeDecision::Deny => {
+                let reason = if !verdict.reason.is_empty() {
+                    verdict.reason.as_str()
+                } else {
+                    "denied by triage approval judge"
+                };
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason
+                    }
+                })
+                .to_string()
+            }
+            triage_core::judge::JudgeDecision::Ask => String::new(),
+        };
     }
 
     match verdict.decision {
@@ -1206,14 +1236,25 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_format_returns_empty_string_for_silent_passthrough() {
-        let verdict = JudgeVerdict {
+    fn claude_code_format_emits_spec_compliant_hook_specific_output() {
+        let allow_verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
-        assert_eq!(encoded, "");
+        let encoded_allow = encode_response(AgentFormat::ClaudeCode, &allow_verdict, None);
+        assert_eq!(
+            encoded_allow,
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
+        );
+
+        let ask_verdict = JudgeVerdict {
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
+        };
+        let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None);
+        assert_eq!(encoded_ask, "");
     }
 
     #[test]
