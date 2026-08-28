@@ -5,9 +5,6 @@ use crate::judge::{JudgeDecision, JudgeRequest, JudgeSource, JudgeVerdict};
 /// `mcp__code_review_graph__query_graph` -> `query_graph`, `cortex:read` -> `read`).
 pub fn normalize_tool_name(tool_name: &str) -> &str {
     let mut s = tool_name.trim();
-    if let Some(rest) = s.strip_prefix("cortex_step_type_") {
-        s = rest;
-    }
     if let Some(idx) = s.rfind(':') {
         s = &s[idx + 1..];
     }
@@ -16,6 +13,9 @@ pub fn normalize_tool_name(tool_name: &str) -> &str {
     }
     if let Some(idx) = s.rfind("__") {
         s = &s[idx + 2..];
+    }
+    if let Some(rest) = s.strip_prefix("cortex_step_type_") {
+        s = rest;
     }
     s.trim()
 }
@@ -305,10 +305,6 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "make",
     "./scripts/*",
     "scripts/*",
-    "./scripts/install.sh",
-    "scripts/install.sh",
-    "./scripts/bump-version.sh",
-    "scripts/bump-version.sh",
     "./gradlew",
     "gradlew",
     "gradle",
@@ -905,10 +901,16 @@ impl JudgeRules {
         if program_name(first) != "git" {
             return None;
         }
+        if tokens.iter().skip(1).any(|t| {
+            *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h" || *t == "version"
+        }) {
+            return Some("git --version");
+        }
         let (subcommand, sub_args) = parse_git_subcommand(&tokens[1..])?;
         let sub_positionals = extract_positional_tokens(sub_args);
 
         match subcommand {
+            "version" => Some("git --version"),
             "diff" => Some("git diff"),
             "status" => Some("git status"),
             "log" => Some("git log"),
@@ -1232,7 +1234,11 @@ impl JudgeRules {
                 .iter()
                 .any(|t| *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h")
             {
-                return Some("flutter --version");
+                return Some(if prog == "dart" {
+                    "dart --version"
+                } else {
+                    "flutter --version"
+                });
             }
             return None;
         }
@@ -3568,5 +3574,14 @@ mod tests {
         let pnpm_ver = evaluate_cmd("pnpm -v").unwrap();
         assert_eq!(pnpm_ver.decision, JudgeDecision::Allow);
         assert_eq!(pnpm_ver.reason, "matched allow rule: pnpm --version");
+        let git_ver = evaluate_cmd("git --version").unwrap();
+        assert_eq!(git_ver.decision, JudgeDecision::Allow);
+        assert_eq!(git_ver.reason, "matched allow rule: git --version");
+        let git_ver_sub = evaluate_cmd("git version").unwrap();
+        assert_eq!(git_ver_sub.decision, JudgeDecision::Allow);
+        assert_eq!(git_ver_sub.reason, "matched allow rule: git --version");
+        let dart_ver = evaluate_cmd("dart --version").unwrap();
+        assert_eq!(dart_ver.decision, JudgeDecision::Allow);
+        assert_eq!(dart_ver.reason, "matched allow rule: dart --version");
     }
 }

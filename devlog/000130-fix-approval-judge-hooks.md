@@ -42,6 +42,7 @@
 - **2026-08-27T21:16-0700** Applied Round 2 review audit refinements: added path wildcard matching (`./scripts/*`, `scripts/*`) in `matching_token_allow_rule`, corrected package manager version/help flag return strings, removed dead `KNOWN_VALUE_TAKING_FLAGS` constant, consolidated duplicate JSON serialization structs in `triage-hook`, made command/file prefix allocations lazy on incoming tool payloads, eliminated duplicate trailing wildcard entries in `BUILTIN_ALLOW_COMMANDS`, and expanded benchmark coverage to non-command and namespaced tools.
 - **2026-08-27T21:26-0700** Addressed Round 3 review findings: classified internal agent coordination tools (`schedule`, `manage_task`, `task_stop`) in `is_read_only_tool` to eliminate false interactive modals during timer/background task management, removed mutating sub-actions (`create`, `edit`, `comment`, `review`) from `matching_gh_allow_rule` while adding safe PR description updates (`gh pr edit`) to `BUILTIN_ALLOW_COMMANDS`, deleted duplicate `"adb exec-out"` entry, replaced private `is_edit_file_tool` with canonical `triage_core::judge_rules::is_edit_tool`, and used slice borrows in `HookJsonResponse`.
 - **2026-08-27T21:40-0700** Applied Round 4 review refinements: scoped read-only tool auto-approval in `JudgeRules::evaluate` strictly to tool calls carrying no `command_line` payload while routing commands embedded in multi-action tools (`manage_task` with `send_input`) through full command allowlist/security checks, added `manage_task` to `is_command_tool`, added `"Input"` key extraction to `extract_command_line`, eliminated intermediate prefix vector allocations in `compute_permission_overrides`, removed redundant `cortex:` check in `normalize_tool_name`, and skipped permission override evaluation on the Claude Code passthrough path.
+- **2026-08-27T21:58-0700** Applied Round 5 review refinements: handled top-level version queries (`git --version`, `git -v`, `git version`) in `matching_git_allow_rule`, corrected `dart --version` rule return string in `matching_flutter_allow_rule`, cleaned redundant script entries in `BUILTIN_ALLOW_COMMANDS`, adjusted `normalize_tool_name` to strip `cortex_step_type_` after namespace delimiter resolution, fixed duplicate commit hash in devlog history, and expanded corpus benchmark coverage with version query test cases across all toolchains.
 
 ## Decisions
 
@@ -84,6 +85,7 @@
 - **PR Mutation Boundaries in GitHub CLI**: Strictly excluded PR/issue creation (`gh pr create`, `gh issue create`) from allowlists to require explicit user confirmation for outward-facing mutations, while auto-approving safe non-destructive updates (`gh pr edit`, `gh pr comment`, `gh pr checkout`).
 - **Command-Bearing Tool Separation in Rule Evaluation**: Structured `JudgeRules::evaluate` so that read-only classification applies strictly when `request.command_line.is_none()`. Pure status queries (`task_status`, `list_tasks`, `manage_task(Action: "status")`, timer `schedule`) auto-approve without prompts, whereas interactive command injection (`manage_task(Action: "send_input", Input: "...")`) routes through full command validation.
 - **Zero-Allocation Static Prefix Slices**: Iterated directly over static string slices (`BASE_COMMAND_PREFIXES`, `base_file_slice`) in `compute_permission_overrides`, eliminating intermediate vector allocations on every hook execution.
+- **Authoritative Toolchain Version Flag Matching**: Handled `--version`, `-v`, `--help`, and `version` subcommands in toolchain rule evaluators before requiring subcommands, ensuring top-level diagnostic and version queries auto-approve deterministically without prompting.
 
 ## Commits
 
@@ -109,7 +111,7 @@
 - 4bf2bb4 — test(hook): add namespaced tool fallback tests in triage-hook
 - 89cb78b — fix(hook): remove invalid tool() permission override and omit reason on allow verdicts
 - 3ad4013 — feat(judge): auto-approve safe non-force git push while protecting destructive force flags
-- b6147b4 — style: format code with cargo fmt across all crates
+- e93849f — style: format code with cargo fmt across all crates
 - b6147b4 — feat(judge): expand GitHub CLI allowlist for PR and issue collaboration subcommands
 - 747de5f — feat(judge): increase MAX_COMMAND_CHARS to 8192 for long PR and commit bodies
 - 3b22004 — fix(hook): emit clean decision: allow for Antigravity without permission overrides
@@ -130,4 +132,5 @@
 - 139b6ca — fix(judge,hook): apply MAX-effort review audit fixes across rules, flags, and hook protocol
 - e4c607d — fix(judge,hook): support path wildcards, clean static tables, and unify hook responses
 - 34928bc — fix(judge,hook): permit agent task coordination, secure gh pr mutations, and use canonical edit tool check
-- HEAD — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
+- 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
+- HEAD — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark

@@ -153,6 +153,12 @@ pub fn load_corpus() -> Vec<CorpusCase> {
         },
         CorpusCase {
             category: "Git",
+            command: "git --version",
+            expected: JudgeDecision::Allow,
+            description: "Git version query",
+        },
+        CorpusCase {
+            category: "Git",
             command: "git cherry-pick --continue",
             expected: JudgeDecision::Allow,
             description: "Resuming cherry-pick sequence",
@@ -377,6 +383,12 @@ pub fn load_corpus() -> Vec<CorpusCase> {
         },
         CorpusCase {
             category: "Rust/Cargo",
+            command: "cargo --version",
+            expected: JudgeDecision::Allow,
+            description: "Cargo version inspection",
+        },
+        CorpusCase {
+            category: "Rust/Cargo",
             command: "RUST_BACKTRACE=1 cargo test",
             expected: JudgeDecision::Allow,
             description: "Cargo test with environment variable prefix",
@@ -448,7 +460,25 @@ pub fn load_corpus() -> Vec<CorpusCase> {
             expected: JudgeDecision::Ask,
             description: "Publishing Dart package to pub.dev",
         },
+        CorpusCase {
+            category: "Flutter/Dart",
+            command: "flutter --version",
+            expected: JudgeDecision::Allow,
+            description: "Flutter SDK version inspection",
+        },
+        CorpusCase {
+            category: "Flutter/Dart",
+            command: "dart --version",
+            expected: JudgeDecision::Allow,
+            description: "Dart SDK version inspection",
+        },
         // ── 4. JAVASCRIPT / TYPESCRIPT PACKAGE MANAGERS ─────────────────────
+        CorpusCase {
+            category: "JS/TS PMs",
+            command: "npm --version",
+            expected: JudgeDecision::Allow,
+            description: "NPM version inspection",
+        },
         CorpusCase {
             category: "JS/TS PMs",
             command: "pnpm test",
