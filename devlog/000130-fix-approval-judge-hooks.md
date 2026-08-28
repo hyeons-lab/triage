@@ -147,10 +147,10 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- cc72c38 — fix(judge): isolate heredoc body quotes and backticks in shell metacharacter parser
-- HEAD — fix(hook): emit comprehensive permission overrides on allow decisions
+- c22688c — fix(hook): emit comprehensive permission overrides on allow decisions
+- HEAD — fix(judge): allowlist git ls-remote and narrow sensitive gh release mutations
 
 ## What Changed
-- Reconnected `compute_permission_overrides` on `Allow` hook responses to emit permission grants (`command(...)`, `run_command(...)`, `Bash(...)`, `subagent:...`) required by Antigravity's internal `EnsurePermissions` engine to bypass prompting on auto-approved tool calls.
-- Preserved silent passthrough (`""`, exit 0) for `Ask` / non-allow decisions so unapproved commands fall through cleanly to the agent's default permissions.
+- Added `git ls-remote` to `BUILTIN_ALLOW_COMMANDS` and `matching_git_allow_rule` in `crates/triage-core/src/judge_rules.rs`.
+- Narrowed `gh release` in `BUILTIN_SENSITIVE_SUBSTRINGS` to mutating subcommands (`gh release create`, `gh release delete`, `gh release upload`, `gh release edit`), allowing read-only inspection commands (`gh release view`, `gh release list`) to auto-approve.
 - Re-verified full test suite across workspace (282 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

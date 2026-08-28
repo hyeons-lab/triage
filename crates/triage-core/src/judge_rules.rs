@@ -232,6 +232,7 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "git merge --continue",
     "git merge --abort",
     "git remote -v",
+    "git ls-remote",
     "git rev-parse",
     "git rev-list",
     "git merge-base",
@@ -429,7 +430,10 @@ pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
     "npm publish",
     "gradle publish",
     "gradlew publish",
-    "gh release",
+    "gh release create",
+    "gh release delete",
+    "gh release upload",
+    "gh release edit",
     // Permission blanket-opening.
     "chmod 777",
     "chmod -r 777",
@@ -961,6 +965,7 @@ impl JudgeRules {
             "check-ignore" => Some("git check-ignore"),
             "blame" => Some("git blame"),
             "ls-files" => Some("git ls-files"),
+            "ls-remote" => Some("git ls-remote"),
             "fetch" => {
                 if sub_args
                     .iter()
