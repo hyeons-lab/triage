@@ -744,9 +744,6 @@ impl JudgeRules {
                             return true;
                         }
                     }
-                    if matches_slice(rule, &positional_tokens) {
-                        return true;
-                    }
                 }
 
                 // 1. Direct token prefix match (allowing full path on first token)
@@ -886,10 +883,14 @@ impl JudgeRules {
         if program_name(first) != "git" {
             return None;
         }
-        if tokens.iter().skip(1).any(|t| {
-            *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h" || *t == "version"
-        }) {
-            return Some("git --version");
+        let positional = extract_positional_tokens(tokens);
+        if positional.len() < 2 {
+            if tokens.iter().skip(1).any(|t| {
+                *t == "--version" || *t == "-v" || *t == "--help" || *t == "-h" || *t == "version"
+            }) {
+                return Some("git --version");
+            }
+            return None;
         }
         let (subcommand, sub_args) = parse_git_subcommand(&tokens[1..])?;
         let sub_positionals = extract_positional_tokens(sub_args);
@@ -3566,5 +3567,8 @@ mod tests {
         let dart_ver = evaluate_cmd("dart --version").unwrap();
         assert_eq!(dart_ver.decision, JudgeDecision::Allow);
         assert_eq!(dart_ver.reason, "matched allow rule: dart --version");
+        assert_eq!(evaluate_cmd("git tag -d version"), None);
+        let branch_del = evaluate_cmd("git branch -D version").unwrap();
+        assert_eq!(branch_del.decision, JudgeDecision::Ask);
     }
 }
