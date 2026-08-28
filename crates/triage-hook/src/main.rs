@@ -523,6 +523,18 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     let custom_self = format!("self:{}", req.tool_name);
 
     if let Some(ref cmd) = req.command_line {
+        for &prefix in BASE_COMMAND_PREFIXES {
+            permission_overrides.push(format!("{prefix}(*)"));
+        }
+        permission_overrides.push(format!("{}(*)", req.tool_name));
+        permission_overrides.push(format!("{custom_sub}(*)"));
+        permission_overrides.push(format!("{custom_self}(*)"));
+        if norm_tool != req.tool_name {
+            permission_overrides.push(format!("{norm_tool}(*)"));
+            permission_overrides.push(format!("subagent:{norm_tool}(*)"));
+            permission_overrides.push(format!("self:{norm_tool}(*)"));
+        }
+
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
             if trimmed_target.is_empty() {
@@ -630,6 +642,19 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             || lower_path.starts_with("https://")
             || lower_path.starts_with("ws://")
             || lower_path.starts_with("wss://");
+        if !is_url {
+            for &prefix in base_file_slice {
+                permission_overrides.push(format!("{prefix}(*)"));
+            }
+            permission_overrides.push(format!("{}(*)", req.tool_name));
+            permission_overrides.push(format!("{custom_sub}(*)"));
+            permission_overrides.push(format!("{custom_self}(*)"));
+            if norm_tool != req.tool_name {
+                permission_overrides.push(format!("{norm_tool}(*)"));
+                permission_overrides.push(format!("subagent:{norm_tool}(*)"));
+                permission_overrides.push(format!("self:{norm_tool}(*)"));
+            }
+        }
         let mut add_path_override = |p_str: &str| {
             if !is_url {
                 for &prefix in base_file_slice {
