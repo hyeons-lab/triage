@@ -1749,16 +1749,39 @@ pub fn sanitize_command_substitutions(command: &str) -> String {
 }
 
 pub fn has_complex_shell_metacharacters(command: &str) -> bool {
-    if command.contains('`') || command.contains("<(") || command.contains(">(") {
-        return true;
-    }
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
+    let mut heredoc_delimiter: Option<String> = None;
+    let mut in_heredoc_body = false;
     let bytes = command.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
+        if in_heredoc_body {
+            if let Some(ref delim) = heredoc_delimiter {
+                if b == b'\n' || b == b'\r' {
+                    let next_line_start =
+                        if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                            i + 2
+                        } else {
+                            i + 1
+                        };
+                    let line_rest = &command[next_line_start..];
+                    let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
+                    let line = line_rest[..line_end].trim();
+                    if line == delim.as_str() {
+                        heredoc_delimiter = None;
+                        in_heredoc_body = false;
+                        i = next_line_start + line_end;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+
         if escaped {
             escaped = false;
             i += 1;
@@ -1779,6 +1802,68 @@ pub fn has_complex_shell_metacharacters(command: &str) -> bool {
             i += 1;
             continue;
         }
+
+        if !in_single && !in_double {
+            if b == b'`' {
+                return true;
+            }
+            if (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                return true;
+            }
+            // Check for heredoc start `<<` outside of heredoc body
+            if heredoc_delimiter.is_none()
+                && b == b'<'
+                && i + 1 < bytes.len()
+                && bytes[i + 1] == b'<'
+                && (i + 2 >= bytes.len() || bytes[i + 2] != b'<')
+            {
+                let mut d_start = i + 2;
+                if d_start < bytes.len() && bytes[d_start] == b'-' {
+                    d_start += 1;
+                }
+                while d_start < bytes.len() && (bytes[d_start] == b' ' || bytes[d_start] == b'\t') {
+                    d_start += 1;
+                }
+                let mut d_end = d_start;
+                if d_start < bytes.len() {
+                    let first_char = bytes[d_start];
+                    if first_char == b'\'' || first_char == b'"' {
+                        d_start += 1;
+                        d_end = d_start;
+                        while d_end < bytes.len() && bytes[d_end] != first_char {
+                            d_end += 1;
+                        }
+                        if d_end < bytes.len() {
+                            let delim = &command[d_start..d_end];
+                            if !delim.is_empty() {
+                                heredoc_delimiter = Some(delim.to_string());
+                            }
+                            i = d_end + 1;
+                            continue;
+                        }
+                    } else {
+                        while d_end < bytes.len()
+                            && (bytes[d_end].is_ascii_alphanumeric() || bytes[d_end] == b'_')
+                        {
+                            d_end += 1;
+                        }
+                        if d_end > d_start {
+                            let delim = &command[d_start..d_end];
+                            heredoc_delimiter = Some(delim.to_string());
+                            i = d_end;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if heredoc_delimiter.is_some() && (b == b'\n' || b == b'\r') {
+                in_heredoc_body = true;
+                i += 1;
+                continue;
+            }
+        }
+
         i += 1;
     }
     in_single || in_double || escaped
@@ -1825,6 +1910,30 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
+        if in_heredoc_body {
+            if let Some(ref delim) = heredoc_delimiter {
+                if b == b'\n' || b == b'\r' {
+                    let next_line_start =
+                        if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                            i + 2
+                        } else {
+                            i + 1
+                        };
+                    let line_rest = &command[next_line_start..];
+                    let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
+                    let line = line_rest[..line_end].trim();
+                    if line == delim.as_str() {
+                        heredoc_delimiter = None;
+                        in_heredoc_body = false;
+                        i = next_line_start + line_end;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+
         if escaped {
             escaped = false;
             i += 1;
@@ -1895,36 +2004,17 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
                 }
             }
 
-            // Check if upcoming line ends the heredoc
-            if let Some(ref delim) = heredoc_delimiter
-                && (b == b'\n' || b == b'\r')
-            {
+            // Check if upcoming line enters the heredoc body
+            if heredoc_delimiter.is_some() && (b == b'\n' || b == b'\r') {
                 in_heredoc_body = true;
-                let next_line_start = if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n'
-                {
-                    i + 2
-                } else {
-                    i + 1
-                };
-                let line_rest = &command[next_line_start..];
-                let line_end = line_rest.find(['\n', '\r']).unwrap_or(line_rest.len());
-                let line = line_rest[..line_end].trim();
-                if line == delim.as_str() {
-                    heredoc_delimiter = None;
-                    in_heredoc_body = false;
-                    i = next_line_start + line_end;
-                    continue;
-                }
                 i += 1;
                 continue;
             }
 
-            if !in_heredoc_body
-                && matches!(
-                    b,
-                    b';' | b'|' | b'&' | b'\n' | b'\r' | b'(' | b')' | b'{' | b'}'
-                )
-            {
+            if matches!(
+                b,
+                b';' | b'|' | b'&' | b'\n' | b'\r' | b'(' | b')' | b'{' | b'}'
+            ) {
                 let segment = command[start..i].trim();
                 if !segment.is_empty() {
                     segments.push(segment);
@@ -3755,6 +3845,11 @@ mod tests {
         let script2 = "python3 - <<'PY'\nimport re\np = 'review112.md'\nPY";
         assert_eq!(
             evaluate_cmd(script2).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        let script_with_backticks = "cd /some/dir\npython3 - <<'PY'\nanchor = '''  @Test\n  fun `testWithBackticks`() {'''\nPY\necho \"done\"";
+        assert_eq!(
+            evaluate_cmd(script_with_backticks).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

@@ -147,10 +147,10 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- cb092c8 — feat(judge): allowlist gh pr create and collaboration commands
-- HEAD — fix(hook): emit clean decision allow without invalid permission overrides
+- 2beea9b — fix(hook): emit clean decision allow without invalid permission overrides
+- HEAD — fix(judge): isolate heredoc body quotes and backticks in shell metacharacter parser
 
 ## What Changed
-- Simplified `triage-hook` output for allowed decisions to pure `{"decision":"allow"}`, eliminating the generation of verbose / non-standard `permissionOverrides` arrays (which caused Antigravity's internal grammar parser to choke on nested brackets, quotes, and colons in PR titles).
-- Maintained silent passthrough (`""`, exit 0) on `Ask` / non-allow decisions so unapproved commands fall through cleanly to the agent's native permission handler.
-- Re-verified full test suite across workspace (282 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
+- Fixed `has_complex_shell_metacharacters` and `pipeline_and_chain_segments` in `crates/triage-core/src/judge_rules.rs` to isolate multiline heredoc bodies (`<<'PY'` ... `PY`). This prevents embedded quotes and Kotlin test function backticks inside inline python file-editing scripts from prematurely disqualifying deterministic allow rules.
+- Synchronized all `hooks.json` registrations (`.agents/hooks.json`, `~/.gemini/config/hooks.json`) to use the official wildcard `"matcher": "*"` and absolute binary path.
+- Updated `~/.gemini/antigravity-cli/bin/triage-hook` alongside `~/.cargo/bin/triage-hook`, re-signed both ARM64 binaries, and reloaded the daemon with zero downtime.
