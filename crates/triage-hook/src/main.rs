@@ -212,7 +212,15 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
         "input",
     ] {
         if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
-            return Some(val.to_string());
+            let trimmed = val.trim();
+            let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+            {
+                trimmed[1..trimmed.len() - 1].trim()
+            } else {
+                trimmed
+            };
+            return Some(unquoted.to_string());
         }
     }
     None
@@ -220,7 +228,15 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
 
 fn extract_path(args: &serde_json::Value) -> Option<String> {
     if let Some(s) = args.as_str() {
-        return (s != "." && s != "..").then(|| s.to_string());
+        let trimmed = s.trim();
+        let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+        {
+            trimmed[1..trimmed.len() - 1].trim()
+        } else {
+            trimmed
+        };
+        return (unquoted != "." && unquoted != "..").then(|| unquoted.to_string());
     }
     for key in [
         "AbsolutePath",
@@ -257,11 +273,16 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "Uri",
         "uri",
     ] {
-        if let Some(val) = args.get(key).and_then(|v| v.as_str())
-            && val != "."
-            && val != ".."
-        {
-            return Some(val.to_string());
+        if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
+            let trimmed = val.trim();
+            let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+            {
+                trimmed[1..trimmed.len() - 1].trim()
+            } else {
+                trimmed
+            };
+            return (unquoted != "." && unquoted != "..").then(|| unquoted.to_string());
         }
     }
     if let Some(obj) = args.as_object() {
@@ -568,6 +589,18 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                                 add_command_override(&git_with_globals);
                             }
                         }
+                    }
+                } else if prog == "gh" {
+                    if words.len() >= 3
+                        && matches!(
+                            words[1],
+                            "pr" | "issue" | "run" | "repo" | "release" | "workflow" | "api"
+                        )
+                    {
+                        add_command_override(&format!("gh {} {}", words[1], words[2]));
+                        add_command_override(&format!("gh {}", words[1]));
+                    } else if words.len() >= 2 {
+                        add_command_override(&format!("gh {}", words[1]));
                     }
                 } else if !words[1].starts_with('-')
                     && !words[1].starts_with('"')
@@ -1063,7 +1096,9 @@ mod tests {
         };
         let allow_encoded =
             encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
-        assert_eq!(allow_encoded, r#"{"decision":"allow"}"#);
+        assert!(allow_encoded.contains(r#""decision":"allow""#));
+        assert!(allow_encoded.contains(r#""permissionOverrides""#));
+        assert!(allow_encoded.contains("command(git status)"));
         let allow_overrides = compute_permission_overrides(&allow_req);
         assert!(allow_overrides.iter().any(|s| s == "command(git status)"));
         assert!(
@@ -1094,7 +1129,9 @@ mod tests {
         };
         let allow_cmd_encoded =
             encode_response(AgentFormat::Antigravity, &allow_cmd_verdict, Some(&request));
-        assert_eq!(allow_cmd_encoded, r#"{"decision":"allow"}"#);
+        assert!(allow_cmd_encoded.contains(r#""decision":"allow""#));
+        assert!(allow_cmd_encoded.contains(r#""permissionOverrides""#));
+        assert!(allow_cmd_encoded.contains("command(VAR=1 ls -la)"));
         let overrides = compute_permission_overrides(&request);
         assert!(overrides.iter().any(|s| s == "command(VAR=1 ls -la)"));
         assert!(overrides.iter().any(|s| s == "command(ls -la)"));
