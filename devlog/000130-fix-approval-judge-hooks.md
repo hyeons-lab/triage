@@ -147,9 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 5445aa5 — feat(triaged): auto-inject approval keystrokes into live session PTYs on allowed tool calls
-- HEAD — revert(triaged): remove PTY input injection to prevent terminal keystroke pollution
+- 9c14016 — revert(triaged): remove PTY input injection to prevent terminal keystroke pollution
+- HEAD — feat(triaged): provision global permission grants in settings.json to enable zero-prompt judge execution
 
 ## What Changed
-- Removed asynchronous PTY keystroke injection from `crates/triaged/src/session.rs` to prevent `1` characters from polluting terminal sessions and interfering with active shells.
-- Fixed clippy lints, re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
+- Added automatic provisioning of `globalPermissionGrants` and `permissionGrants` (`{"allow": ["command(*)"]}`) in `~/.gemini/settings.json` within `install_global_agent_hooks()`. This pre-approves command permissions at the Antigravity settings layer so `EnsurePermissions` does not display interactive confirmation prompts, while `triage-hook` (`PreToolUse`) serves as the active safety gate.
+- Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

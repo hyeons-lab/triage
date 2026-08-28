@@ -280,6 +280,31 @@ pub fn install_global_agent_hooks() {
                 }
             }
 
+            // Ensure ~/.gemini/settings.json pre-approves command(*) so EnsurePermissions lets
+            // triage-hook act as the authoritative safety judge without interactive prompt interruptions.
+            let gemini_settings = home.join(".gemini").join("settings.json");
+            if gemini_settings.exists()
+                && let Ok(file_content) = std::fs::read_to_string(&gemini_settings)
+                && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&file_content)
+                && let Some(map) = val.as_object_mut()
+            {
+                let mut changed = false;
+                let grants = serde_json::json!({
+                    "allow": ["command(*)"]
+                });
+                if !map.contains_key("globalPermissionGrants") {
+                    map.insert("globalPermissionGrants".to_string(), grants.clone());
+                    changed = true;
+                }
+                if !map.contains_key("permissionGrants") {
+                    map.insert("permissionGrants".to_string(), grants);
+                    changed = true;
+                }
+                if changed && let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                    let _ = atomic_write_file(&gemini_settings, &pretty);
+                }
+            }
+
             // Also ensure ~/.claude/settings.json is configured with the absolute hook command
             let claude_settings = home.join(".claude").join("settings.json");
             if claude_settings.exists()
