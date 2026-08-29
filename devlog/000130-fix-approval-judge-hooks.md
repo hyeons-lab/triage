@@ -147,9 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 12f171c — feat(hook): emit wildcard permission overrides for Antigravity allowed tool calls
-- HEAD — fix(hook): align HookJsonResponse strictly to PreToolHookResult protojson schema
+- 975ae7b — fix(hook): align HookJsonResponse strictly to PreToolHookResult protojson schema
+- HEAD — feat(triaged): provision global permission grants in ~/.gemini/antigravity-cli/settings.json
 
 ## What Changed
-- Removed non-protojson fields (`allowTool`, `denyReason`) from `HookJsonResponse` in [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs#L735-L750). Antigravity CLI uses Go's strict `protojson.Unmarshal` against the `PreToolHookResult` protobuf message; extraneous fields caused `protojson` to fail with unmarshal errors and discard the hook's `decision: "allow"` verdict.
+- Extended automatic permission grants provisioning in [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs#L283-L308) to configure `~/.gemini/antigravity-cli/settings.json` (the CLI's native settings file) in addition to `~/.gemini/settings.json`.
 - Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
