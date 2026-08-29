@@ -147,9 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 2039522 — fix(hook): emit hookSpecificOutput with permissionDecision for Claude Code PreToolUse
-- HEAD — feat(hook): emit wildcard permission overrides for Antigravity allowed tool calls
+- 12f171c — feat(hook): emit wildcard permission overrides for Antigravity allowed tool calls
+- HEAD — fix(hook): align HookJsonResponse strictly to PreToolHookResult protojson schema
 
 ## What Changed
-- Added wildcard permission overrides (`command(*)`, `${tool}(*)`, `file(*)`) to `compute_permission_overrides` in [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs#L520-L650) for all `Allow` verdicts. This guarantees that Antigravity CLI (`agy`) matches hook permission grants across all command syntax variants and compound pipelines without prompting the user.
+- Removed non-protojson fields (`allowTool`, `denyReason`) from `HookJsonResponse` in [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs#L735-L750). Antigravity CLI uses Go's strict `protojson.Unmarshal` against the `PreToolHookResult` protobuf message; extraneous fields caused `protojson` to fail with unmarshal errors and discard the hook's `decision: "allow"` verdict.
 - Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
