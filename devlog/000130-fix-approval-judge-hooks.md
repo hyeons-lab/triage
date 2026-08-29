@@ -147,9 +147,9 @@
 - 3b6371e — fix(judge,hook): gate command-bearing tool calls and optimize hook prefix generation
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
-- 975ae7b — fix(hook): align HookJsonResponse strictly to PreToolHookResult protojson schema
-- HEAD — feat(triaged): provision global permission grants in ~/.gemini/antigravity-cli/settings.json
+- 93d326e — feat(triaged): provision global permission grants in ~/.gemini/antigravity-cli/settings.json
+- HEAD — feat(triaged): set permissionPreset to TURBO in settings.json
 
 ## What Changed
-- Extended automatic permission grants provisioning in [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs#L283-L308) to configure `~/.gemini/antigravity-cli/settings.json` (the CLI's native settings file) in addition to `~/.gemini/settings.json`.
+- Added automatic provisioning of `permissionPreset: "AGENT_PERMISSION_PRESET_TURBO"` to `settings.json` in [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs#L283-L315). This places `agy`'s internal interactive gate in Turbo mode while relying on `PreToolUse` (`triage-hook`) as the authoritative security safety net before each tool call.
 - Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.

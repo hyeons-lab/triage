@@ -304,6 +304,19 @@ pub fn install_global_agent_hooks() {
                         map.insert("permissionGrants".to_string(), grants);
                         changed = true;
                     }
+                    if map.get("permissionPreset").and_then(|v| v.as_str())
+                        != Some("AGENT_PERMISSION_PRESET_TURBO")
+                    {
+                        map.insert(
+                            "permissionPreset".to_string(),
+                            serde_json::json!("AGENT_PERMISSION_PRESET_TURBO"),
+                        );
+                        map.insert(
+                            "permission_preset".to_string(),
+                            serde_json::json!("AGENT_PERMISSION_PRESET_TURBO"),
+                        );
+                        changed = true;
+                    }
                     if changed && let Ok(pretty) = serde_json::to_string_pretty(&val) {
                         let _ = atomic_write_file(&gemini_settings, &pretty);
                     }
