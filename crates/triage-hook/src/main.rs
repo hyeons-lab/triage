@@ -513,6 +513,26 @@ static EDIT_FILE_PREFIXES: &[&str] = &[
     "subagent:edit",
 ];
 
+/// Reports whether `payload` can be wrapped in a `command(...)` or `file(...)`
+/// grant token without its parentheses becoming ambiguous.
+///
+/// The grant syntax has no escape for the closing paren, so a payload whose own
+/// parentheses do not nest cleanly (`grep -n "foo)" main.rs`) yields a token
+/// that either terminates early or never terminates at all. Either reading
+/// describes a command other than the one that was judged, so emitting nothing
+/// is strictly better: the narrower per-segment and per-program grants for the
+/// same call are still emitted alongside it.
+fn is_balanced_grant_payload(payload: &str) -> bool {
+    payload
+        .chars()
+        .try_fold(0usize, |depth, ch| match ch {
+            '(' => Some(depth + 1),
+            ')' => depth.checked_sub(1),
+            _ => Some(depth),
+        })
+        .is_some_and(|depth| depth == 0)
+}
+
 fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
     if req.command_line.is_none() && req.path.is_none() {
         return Vec::new();
@@ -537,7 +557,7 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
 
         let mut add_command_override = |cmd_str: &str| {
             let trimmed_target = cmd_str.trim();
-            if trimmed_target.is_empty() {
+            if trimmed_target.is_empty() || !is_balanced_grant_payload(trimmed_target) {
                 return;
             }
             for &prefix in BASE_COMMAND_PREFIXES {
@@ -576,6 +596,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
         if stripped != trimmed && !stripped.is_empty() {
             add_command_override(stripped);
         }
+        let stripped_redirs = triage_core::judge_rules::strip_null_redirections(stripped);
+        if stripped_redirs.as_ref() != stripped && !stripped_redirs.trim().is_empty() {
+            add_command_override(stripped_redirs.trim());
+        }
         // Extract all chain & pipeline segments (e.g. for &&, ||, ;, |, \n)
         let segments = triage_core::judge::pipeline_and_chain_segments(trimmed);
         for seg in &segments {
@@ -586,6 +610,13 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             let stripped_seg = strip_leading_env_vars(seg_trimmed);
             if stripped_seg != seg_trimmed && !stripped_seg.is_empty() {
                 add_command_override(stripped_seg);
+            }
+            let seg_stripped_redirs =
+                triage_core::judge_rules::strip_null_redirections(stripped_seg);
+            if seg_stripped_redirs.as_ref() != stripped_seg
+                && !seg_stripped_redirs.trim().is_empty()
+            {
+                add_command_override(seg_stripped_redirs.trim());
             }
             let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
             let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
@@ -656,7 +687,7 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             }
         }
         let mut add_path_override = |p_str: &str| {
-            if !is_url {
+            if !is_url && is_balanced_grant_payload(p_str) {
                 for &prefix in base_file_slice {
                     permission_overrides.push(format!("{prefix}({p_str})"));
                 }
@@ -1547,6 +1578,82 @@ mod tests {
     }
 
     #[test]
+    fn grant_payload_balance_accepts_nested_and_rejects_dangling_parens() {
+        assert!(is_balanced_grant_payload("cargo test --workspace"));
+        assert!(is_balanced_grant_payload(
+            "git commit -m \"fix(judge): thing (again)\""
+        ));
+        assert!(is_balanced_grant_payload("echo $(date)"));
+        // A closing paren with no opener terminates the token early.
+        assert!(!is_balanced_grant_payload("grep -n \"foo)\" main.rs"));
+        // An opener with no closer never terminates the token.
+        assert!(!is_balanced_grant_payload("echo \"(\""));
+    }
+
+    #[test]
+    fn permission_overrides_skip_commands_with_dangling_parens() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("grep -n \"foo)\" main.rs".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let override_strs = compute_permission_overrides(&req);
+        // The unbalanced full-command token must not be emitted at all.
+        assert!(
+            !override_strs.iter().any(|s| s.contains("foo)")),
+            "emitted an unbalanced grant token: {override_strs:?}"
+        );
+        // Every emitted token still parses as a balanced `prefix(payload)`.
+        for token in &override_strs {
+            assert!(
+                is_balanced_grant_payload(token),
+                "unbalanced token emitted: {token}"
+            );
+        }
+        // The wildcard grants that do not embed the command survive.
+        assert!(override_strs.iter().any(|s| s == "command(*)"));
+    }
+
+    #[test]
+    fn permission_overrides_keep_commands_with_balanced_parens() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("git commit -m \"fix(judge): thing\"".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let override_strs = compute_permission_overrides(&req);
+        assert!(
+            override_strs
+                .iter()
+                .any(|s| s == "command(git commit -m \"fix(judge): thing\")"),
+            "dropped a balanced grant token: {override_strs:?}"
+        );
+    }
+
+    #[test]
+    fn permission_overrides_skip_paths_with_dangling_parens() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("/tmp/weird)name.txt".to_string()),
+            cwd: None,
+        };
+        let override_strs = compute_permission_overrides(&req);
+        for token in &override_strs {
+            assert!(
+                is_balanced_grant_payload(token),
+                "unbalanced token emitted: {token}"
+            );
+        }
+        assert!(!override_strs.iter().any(|s| s.contains("weird)name")));
+    }
+
+    #[test]
     fn permission_overrides_home_path_boundary_handling() {
         let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             Ok(h) => h.trim_end_matches(['/', '\\']).to_string(),
@@ -1848,5 +1955,29 @@ mod tests {
             "path": "."
         });
         assert_eq!(extract_path(&named_dot), None);
+    }
+
+    #[test]
+    fn permission_overrides_pipeline_with_redirection() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("agy --help 2>&1 | head -n 20".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&req);
+        assert!(
+            overrides.iter().any(|s| s == "command(agy --help 2>&1)"),
+            "missing agy --help 2>&1 override: {overrides:?}"
+        );
+        assert!(
+            overrides.iter().any(|s| s == "command(head -n 20)"),
+            "missing head -n 20 override: {overrides:?}"
+        );
+        assert!(
+            !overrides.iter().any(|s| s == "command(1)"),
+            "emitted nonsense command(1) grant: {overrides:?}"
+        );
     }
 }

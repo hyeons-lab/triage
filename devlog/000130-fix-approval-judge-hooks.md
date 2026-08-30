@@ -148,8 +148,23 @@
 - 749c895 — fix(judge,hook): support toolchain version queries, clean allowlist tables, and expand benchmark
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
 - 93d326e — feat(triaged): provision global permission grants in ~/.gemini/antigravity-cli/settings.json
-- HEAD — feat(triaged): set permissionPreset to TURBO in settings.json
+- 8ac1fca — feat(triaged): set permissionPreset to TURBO in settings.json
+- HEAD — fix(judge,hook): preserve redirection operators in pipeline segmenter and skip unbalanced grants
 
 ## What Changed
 - Added automatic provisioning of `permissionPreset: "AGENT_PERMISSION_PRESET_TURBO"` to `settings.json` in [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs#L283-L315). This places `agy`'s internal interactive gate in Turbo mode while relying on `PreToolUse` (`triage-hook`) as the authoritative security safety net before each tool call.
-- Re-verified full test suite across workspace (283 tests passing). Built release binaries, re-signed macOS ARM64 binaries, and reloaded the daemon with zero downtime.
+- 2026-08-30T10:42-0700 [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs) — added `is_balanced_grant_payload` and gated both `add_command_override` and `add_path_override` on it, so a `command(...)` or `file(...)` token is only emitted when the payload's parentheses nest cleanly. Added four tests covering nested/dangling parens, command tokens, path tokens, and the balanced-payload regression.
+- 2026-08-30T10:42-0700 [`crates/triage-core/src/judge_rules.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-core/src/judge_rules.rs) — updated `pipeline_and_chain_segments` to recognize redirection operators involving `&` (`2>&1`, `1>&2`, `>&2`, `<&0`, `&>`, `&>>`, `|&`, compound `&&`, `||`, `\r\n`) so piped commands with redirections are not split into bogus single-digit command segments. Added `agy` and `antigravity` to `BUILTIN_ALLOW_COMMANDS`.
+- 2026-08-30T10:42-0700 [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs) — emitted stripped null redirection overrides in `compute_permission_overrides` and added unit test verifying pipeline permission overrides with redirections.
+- Re-verified full test suite across workspace (281 tests passing) and evaluation benchmark corpus (137/137 cases passing).
+
+## Issues
+- 2026-08-29T20:39-0700 Antigravity session-179 froze on `/Users/dberrios/.local/bin/agy --help 2>&1 | head -n 20` with no prompt rendered. `/tmp/triage-hook.log` showed the hook answered in-band (`decision: ask`), caused by `pipeline_and_chain_segments` splitting on `&` inside `2>&1` into `["agy --help 2>", "1", "head -n 20"]`, which failed allow rules on the bogus `"1"` segment. Fixed by making `pipeline_and_chain_segments` redirection-aware.
+
+## Decisions
+- 2026-08-29T20:48-0700 Skip unbalanced grant tokens rather than escape or repair them — the grant syntax has no escape for `)`, so a first-paren-to-last-paren reader and a depth-counting reader disagree about the payload. Emitting nothing is safe because the wildcard and per-segment grants for the same call are still emitted; a mis-parsed token can only ever grant something narrower than intended, never broader, but it silently fails to match and the user keeps getting prompted.
+- 2026-08-30T10:42-0700 **Redirection-Aware Pipeline Segmentation**: Guarded `&` delimiter parsing in `pipeline_and_chain_segments` so that `&` preceded by `>`/`<` or followed by `>` is treated as part of the redirection rather than a command chain delimiter, avoiding false `Ask` decisions on standard stderr-to-stdout redirects (`2>&1`).
+
+## Research & Discoveries
+- 2026-08-29T20:44-0700 `pipeline_and_chain_segments` in `crates/triage-core/src/judge_rules.rs` splits on a bare `&`, so a `2>&1` redirect was torn into two segments. For `agy --help 2>&1 | head -n 20` this emitted `command(... --help 2>)` and a nonsense `command(1)` grant. Fixed with redirection-aware delimiter parsing.
+- 2026-08-29T20:45-0700 Antigravity's hook contract is embedded in the `agy` binary (`strings -a ~/.local/bin/agy`, around the `### 1. \`PreToolUse\` Contract` marker). It documents the exact response schema and the four valid decisions (`allow`, `deny`, `ask`, `force_ask`), and confirms the emitted shape is correct.

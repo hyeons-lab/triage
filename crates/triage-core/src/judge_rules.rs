@@ -409,6 +409,9 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "triaged",
     "triage-hook",
     "triage-mcp",
+    // Antigravity CLI & agent diagnostics.
+    "agy",
+    "antigravity",
 ];
 
 pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
@@ -2016,7 +2019,27 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
                 continue;
             }
 
-            if matches!(
+            let is_compound_delimiter = i + 1 < bytes.len()
+                && ((b == b'&' && bytes[i + 1] == b'&')
+                    || (b == b'|' && (bytes[i + 1] == b'|' || bytes[i + 1] == b'&'))
+                    || (b == b'\r' && bytes[i + 1] == b'\n'));
+
+            if is_compound_delimiter {
+                let segment = command[start..i].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+                start = i + 2;
+                i += 1;
+            } else if b == b'&'
+                && ((i > 0 && matches!(bytes[i - 1], b'>' | b'<'))
+                    || (i + 1 < bytes.len() && bytes[i + 1] == b'>'))
+            {
+                // Redirection operators involving `&`:
+                // - Preceded by `>` or `<` (e.g. `2>&1`, `1>&2`, `>&2`, `<&0`, `2>&-`)
+                // - Followed by `>` (e.g. `&>`, `&>>`)
+                // These are file descriptor / stream redirections, not command separators.
+            } else if matches!(
                 b,
                 b';' | b'|' | b'&' | b'\n' | b'\r' | b'(' | b')' | b'{' | b'}'
             ) {
@@ -3920,5 +3943,64 @@ mod tests {
         assert_eq!(evaluate_cmd("git tag -d version"), None);
         let branch_del = evaluate_cmd("git branch -D version").unwrap();
         assert_eq!(branch_del.decision, JudgeDecision::Ask);
+    }
+
+    #[test]
+    fn test_pipeline_and_chain_segments_redirections() {
+        assert_eq!(
+            pipeline_and_chain_segments("agy --help 2>&1 | head -n 20"),
+            vec!["agy --help 2>&1", "head -n 20"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("cargo test 1>&2 | cat"),
+            vec!["cargo test 1>&2", "cat"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("echo err >&2"),
+            vec!["echo err >&2"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("cat <&0 | sort"),
+            vec!["cat <&0", "sort"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("make &> build.log"),
+            vec!["make &> build.log"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("make &>> build.log"),
+            vec!["make &>> build.log"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("cargo test |& grep FAIL"),
+            vec!["cargo test", "grep FAIL"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("cargo check && cargo test || cargo clippy"),
+            vec!["cargo check", "cargo test", "cargo clippy"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("echo line1\r\necho line2"),
+            vec!["echo line1", "echo line2"]
+        );
+        assert_eq!(
+            pipeline_and_chain_segments("sleep 10 & echo done"),
+            vec!["sleep 10", "echo done"]
+        );
+    }
+
+    #[test]
+    fn test_agy_tool_and_redirection_pipeline_evaluation() {
+        let verdict = evaluate_cmd("agy --help 2>&1 | head -n 20").unwrap();
+        assert_eq!(verdict.decision, JudgeDecision::Allow);
+        assert_eq!(verdict.reason, "matched allow rules: agy && head");
+
+        let agy_doc = evaluate_cmd("agy doctor").unwrap();
+        assert_eq!(agy_doc.decision, JudgeDecision::Allow);
+        assert_eq!(agy_doc.reason, "matched allow rule: agy");
+
+        let agy_path = evaluate_cmd("/Users/dberrios/.local/bin/agy --version").unwrap();
+        assert_eq!(agy_path.decision, JudgeDecision::Allow);
+        assert_eq!(agy_path.reason, "matched allow rule: agy");
     }
 }
