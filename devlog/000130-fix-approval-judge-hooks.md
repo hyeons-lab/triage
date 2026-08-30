@@ -150,7 +150,8 @@
 - 93d326e — feat(triaged): provision global permission grants in ~/.gemini/antigravity-cli/settings.json
 - 8ac1fca — feat(triaged): set permissionPreset to TURBO in settings.json
 - 1949c97 — fix(judge,hook): preserve redirection operators in pipeline segmenter and skip unbalanced grants
-- HEAD — feat(triaged,judge): provision permissions.allow wildcards in settings and add wasm-pack allowlist
+- dc53a55 — feat(triaged,judge): provision permissions.allow wildcards in settings and add wasm-pack allowlist
+- HEAD — fix(hook): prioritize Claude Code format detection and prevent misclassification
 
 ## What Changed
 - Added automatic provisioning of `permissionPreset: "AGENT_PERMISSION_PRESET_TURBO"` to `settings.json` in [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs#L283-L315). This places `agy`'s internal interactive gate in Turbo mode while relying on `PreToolUse` (`triage-hook`) as the authoritative security safety net before each tool call.
@@ -159,14 +160,17 @@
 - 2026-08-30T10:42-0700 [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs) — emitted stripped null redirection overrides in `compute_permission_overrides` and added unit test verifying pipeline permission overrides with redirections.
 - 2026-08-30T11:11-0700 [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs) — updated settings provisioning to populate `permissions.allow` with `command(*)` and `file(*)` in addition to `permissionPreset: TURBO`.
 - 2026-08-30T11:11-0700 [`crates/triage-core/src/judge_rules.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-core/src/judge_rules.rs) — added `wasm-pack` and `wasm-opt` to `BUILTIN_ALLOW_COMMANDS` and added unit test.
-- Re-verified full test suite across workspace (281 tests passing) and evaluation benchmark corpus (137/137 cases passing).
+- 2026-08-30T12:20-0700 [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs) — prioritized Claude Code signature detection (`hook_event_name`, `hookEventName`, `tool_input`, `toolInput`, `permission_mode`, `permissionMode`) before Antigravity and removed `transcript_path` (snake_case) from Antigravity format detection, resolving a schema validation failure where Claude Code payloads with `transcript_path` were misclassified as Antigravity and received invalid top-level `decision: "allow"` responses.
+- Re-verified full test suite across workspace (281 tests passing) and evaluation benchmark corpus (145/145 cases passing).
 
 ## Issues
 - 2026-08-29T20:39-0700 Antigravity session-179 froze on `/Users/dberrios/.local/bin/agy --help 2>&1 | head -n 20` with no prompt rendered. `/tmp/triage-hook.log` showed the hook answered in-band (`decision: ask`), caused by `pipeline_and_chain_segments` splitting on `&` inside `2>&1` into `["agy --help 2>", "1", "head -n 20"]`, which failed allow rules on the bogus `"1"` segment. Fixed by making `pipeline_and_chain_segments` redirection-aware.
+- 2026-08-29T21:31-0700 Claude Code PreToolUse hook failed with `Hook JSON output validation failed: decision: Invalid option: expected one of "approve"|"block" (top-level decision is the legacy approve|block field; for "allow" use hookSpecificOutput.permissionDecision)`. Caused by Claude Code payloads containing `transcript_path` matching Antigravity format detection ahead of Claude Code detection. Fixed by prioritizing Claude Code fields in `detect_format`.
 
 ## Decisions
 - 2026-08-29T20:48-0700 Skip unbalanced grant tokens rather than escape or repair them — the grant syntax has no escape for `)`, so a first-paren-to-last-paren reader and a depth-counting reader disagree about the payload. Emitting nothing is safe because the wildcard and per-segment grants for the same call are still emitted; a mis-parsed token can only ever grant something narrower than intended, never broader, but it silently fails to match and the user keeps getting prompted.
 - 2026-08-30T10:42-0700 **Redirection-Aware Pipeline Segmentation**: Guarded `&` delimiter parsing in `pipeline_and_chain_segments` so that `&` preceded by `>`/`<` or followed by `>` is treated as part of the redirection rather than a command chain delimiter, avoiding false `Ask` decisions on standard stderr-to-stdout redirects (`2>&1`).
+- 2026-08-30T12:20-0700 **Claude Code Signature Precedence in Hook**: Placed Claude Code specific hook payload field checks before Antigravity and scoped `transcript_path` exclusively to Claude Code (since Antigravity uses camelCase `transcriptPath`), ensuring Claude Code PreToolUse hooks always receive compliant `hookSpecificOutput` with `permissionDecision: "allow"` rather than unsupported top-level `decision` fields.
 
 ## Research & Discoveries
 - 2026-08-29T20:44-0700 `pipeline_and_chain_segments` in `crates/triage-core/src/judge_rules.rs` splits on a bare `&`, so a `2>&1` redirect was torn into two segments. For `agy --help 2>&1 | head -n 20` this emitted `command(... --help 2>)` and a nonsense `command(1)` grant. Fixed with redirection-aware delimiter parsing.

@@ -333,6 +333,17 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         return AgentFormat::ClaudeCode;
     }
 
+    // Claude Code specific payload fields
+    if val.get("hook_event_name").is_some()
+        || val.get("hookEventName").is_some()
+        || val.get("tool_input").is_some()
+        || val.get("toolInput").is_some()
+        || val.get("permission_mode").is_some()
+        || val.get("permissionMode").is_some()
+    {
+        return AgentFormat::ClaudeCode;
+    }
+
     // Antigravity specific payload fields
     if val.get("conversationId").is_some()
         || val.get("stepIdx").is_some()
@@ -341,19 +352,10 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         || val.get("workspacePaths").is_some()
         || val.get("workspace_paths").is_some()
         || val.get("transcriptPath").is_some()
-        || val.get("transcript_path").is_some()
         || val.get("artifactDirectoryPath").is_some()
         || val.get("modelName").is_some()
     {
         return AgentFormat::Antigravity;
-    }
-
-    // Claude Code specific payload fields
-    if val.get("hook_event_name").is_some()
-        || val.get("hookEventName").is_some()
-        || val.get("tool_input").is_some()
-    {
-        return AgentFormat::ClaudeCode;
     }
 
     AgentFormat::Antigravity
@@ -1323,6 +1325,23 @@ mod tests {
         let hook_event_val: serde_json::Value =
             serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
         assert_eq!(detect_format(&hook_event_val), AgentFormat::ClaudeCode);
+
+        let claude_payload_with_transcript: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_id": "sess-123",
+                "transcript_path": "/path/to/transcript.jsonl",
+                "cwd": "/path/to/project",
+                "permission_mode": "default",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls -la"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_format(&claude_payload_with_transcript),
+            AgentFormat::ClaudeCode
+        );
 
         let tool_input_val: serde_json::Value =
             serde_json::from_str(r#"{"tool_name": "Bash", "tool_input": {"command": "ls"}}"#)
