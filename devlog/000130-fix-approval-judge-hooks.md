@@ -149,13 +149,16 @@
 - 414303d — fix(judge,hook): emit comprehensive subagent overrides and clean token matching
 - 93d326e — feat(triaged): provision global permission grants in ~/.gemini/antigravity-cli/settings.json
 - 8ac1fca — feat(triaged): set permissionPreset to TURBO in settings.json
-- HEAD — fix(judge,hook): preserve redirection operators in pipeline segmenter and skip unbalanced grants
+- 1949c97 — fix(judge,hook): preserve redirection operators in pipeline segmenter and skip unbalanced grants
+- HEAD — feat(triaged,judge): provision permissions.allow wildcards in settings and add wasm-pack allowlist
 
 ## What Changed
 - Added automatic provisioning of `permissionPreset: "AGENT_PERMISSION_PRESET_TURBO"` to `settings.json` in [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs#L283-L315). This places `agy`'s internal interactive gate in Turbo mode while relying on `PreToolUse` (`triage-hook`) as the authoritative security safety net before each tool call.
 - 2026-08-30T10:42-0700 [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs) — added `is_balanced_grant_payload` and gated both `add_command_override` and `add_path_override` on it, so a `command(...)` or `file(...)` token is only emitted when the payload's parentheses nest cleanly. Added four tests covering nested/dangling parens, command tokens, path tokens, and the balanced-payload regression.
 - 2026-08-30T10:42-0700 [`crates/triage-core/src/judge_rules.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-core/src/judge_rules.rs) — updated `pipeline_and_chain_segments` to recognize redirection operators involving `&` (`2>&1`, `1>&2`, `>&2`, `<&0`, `&>`, `&>>`, `|&`, compound `&&`, `||`, `\r\n`) so piped commands with redirections are not split into bogus single-digit command segments. Added `agy` and `antigravity` to `BUILTIN_ALLOW_COMMANDS`.
 - 2026-08-30T10:42-0700 [`crates/triage-hook/src/main.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-hook/src/main.rs) — emitted stripped null redirection overrides in `compute_permission_overrides` and added unit test verifying pipeline permission overrides with redirections.
+- 2026-08-30T11:11-0700 [`crates/triaged/src/service.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triaged/src/service.rs) — updated settings provisioning to populate `permissions.allow` with `command(*)` and `file(*)` in addition to `permissionPreset: TURBO`.
+- 2026-08-30T11:11-0700 [`crates/triage-core/src/judge_rules.rs`](file:///Users/dberrios/development/triage/worktrees/fix-approval-judge-hooks/crates/triage-core/src/judge_rules.rs) — added `wasm-pack` and `wasm-opt` to `BUILTIN_ALLOW_COMMANDS` and added unit test.
 - Re-verified full test suite across workspace (281 tests passing) and evaluation benchmark corpus (137/137 cases passing).
 
 ## Issues

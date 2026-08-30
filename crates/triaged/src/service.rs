@@ -301,7 +301,33 @@ pub fn install_global_agent_hooks() {
                         changed = true;
                     }
                     if !map.contains_key("permissionGrants") {
-                        map.insert("permissionGrants".to_string(), grants);
+                        map.insert("permissionGrants".to_string(), grants.clone());
+                        changed = true;
+                    }
+                    if let Some(perms) = map.get_mut("permissions").and_then(|p| p.as_object_mut())
+                    {
+                        if let Some(allow_arr) =
+                            perms.get_mut("allow").and_then(|a| a.as_array_mut())
+                        {
+                            let cmd_wildcard = serde_json::json!("command(*)");
+                            let file_wildcard = serde_json::json!("file(*)");
+                            if !allow_arr.contains(&cmd_wildcard) {
+                                allow_arr.push(cmd_wildcard);
+                                changed = true;
+                            }
+                            if !allow_arr.contains(&file_wildcard) {
+                                allow_arr.push(file_wildcard);
+                                changed = true;
+                            }
+                        } else if !perms.contains_key("allow") {
+                            perms.insert(
+                                "allow".to_string(),
+                                serde_json::json!(["command(*)", "file(*)"]),
+                            );
+                            changed = true;
+                        }
+                    } else if !map.contains_key("permissions") {
+                        map.insert("permissions".to_string(), grants);
                         changed = true;
                     }
                     if map.get("permissionPreset").and_then(|v| v.as_str())
