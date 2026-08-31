@@ -8036,9 +8036,7 @@ mod tests {
 
         let context = resolve_session_context(Some(&worktree)).expect("git session context");
 
-        let canonical = |path: &std::path::Path| {
-            std::fs::canonicalize(path).expect("canonicalize path for comparison")
-        };
+        let canonical = |path: &std::path::Path| canonicalize_path(path);
         assert_eq!(
             context.repository_root.as_deref().map(canonical),
             Some(canonical(&bare_repo))
@@ -8067,7 +8065,7 @@ mod tests {
         git_test_command(&base_dir, &["commit", "-m", "initial"]);
 
         let context = resolve_session_context(Some(&base_dir)).expect("git session context");
-        let canonical_repo = std::fs::canonicalize(&base_dir).expect("canonicalize repo");
+        let canonical_repo = canonicalize_path(&base_dir);
         assert_eq!(
             context.repository_root.as_deref(),
             Some(canonical_repo.as_path())
@@ -8109,8 +8107,8 @@ mod tests {
 
         let context =
             resolve_session_context(Some(&worktree_symlink)).expect("git session context");
-        let canonical_repo = std::fs::canonicalize(&repo).expect("canonicalize repo");
-        let canonical_worktree = std::fs::canonicalize(&worktree).expect("canonicalize worktree");
+        let canonical_repo = canonicalize_path(&repo);
+        let canonical_worktree = canonicalize_path(&worktree);
         assert_eq!(
             context.repository_root.as_deref(),
             Some(canonical_repo.as_path())

@@ -51,4 +51,5 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 - 5107f52 — fix(triaged): address PR review comments for worktree session grouping
 - 44a9add — docs(devlog): rename branch devlog to match git branch name convention
 - 033f313 — perf(triaged): refresh only branch context when cwd unchanged and remove dead state
-- HEAD — fix(triaged): robust session grouping for worktrees, detached HEAD, and Windows UNC
+- 91bf53c — fix(triaged): robust session grouping for worktrees, detached HEAD, and Windows UNC
+- HEAD — test(triaged): use canonicalize_path in unit tests for Windows compatibility
