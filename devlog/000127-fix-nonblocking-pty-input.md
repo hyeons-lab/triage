@@ -1,0 +1,34 @@
+# 000127: Fix Nonblocking PTY Input & Web Bracketed Paste
+
+**Agent:** Antigravity  
+**Intent:** Unwedge triage daemon by making PTY input writing non-blocking via a dedicated writer thread and fire-and-forget IPC, and integrate bracketed paste handling into the Flutter web client terminal.
+
+## What Changed
+
+- Made `request_write_input` in `triaged::session` fire-and-forget: sends `ActorCommand::WriteInput` without blocking on actor round-trip, preventing stuck sessions from blocking the Tokio WebSocket server.
+- Decoupled PTY writes in `triaged::session` onto a dedicated `session-actor-writer` thread so that large writes / stuck child stdin buffers never stall the `session-actor-worker` loop.
+- **2026-08-31T11:32-0700** Consolidated `session-actor-writer` initialization into `spawn_pty_writer`, bounded input buffering with `mpsc::sync_channel(128)` to prevent unbounded memory growth on stuck child processes, fixed Windows test shell invocation by using `long_running_shell()`, and added burst write order preservation tests.
+- **2026-08-31T11:44-0700** Refactored `write_input` to standard pattern matching (avoiding `let_chains`), handled `TrySendError::Disconnected` logging, added mutex poison logging in `write_pty_input`, and added `write_input_handles_queue_saturation_gracefully` unit test.
+- Routed web paste events in `flutter/triage_client/lib/widgets/terminal_pane_web.dart` through `formatPasteInput(text, bracketedPaste: ...)` and `_sendInput` to ensure Mode 2004 bracketed paste sequences and line endings are preserved.
+- **2026-08-31T13:30-0700** Addressed PR #150 review feedback: removed unused `writer` field from `ActorState`, greedily drained pending input chunks in `write_pty_input` under the mutex guard to reduce lock contention, added `session_id` tracing to buffer saturation warnings, and added `shutdown_completes_cleanly_with_pending_writer_input` unit test.
+
+## Decisions
+
+- **Dedicated PTY Writer Thread:** Placing the PTY `write_all` on a dedicated thread per active session guarantees the actor worker loop is never parked in kernel `write()`, keeping summarizer queries, resize, snapshots, and event fanout responsive at all times.
+- **Fire-and-Forget `WriteInput` with Bounded Queue:** Aligning `WriteInput` with `broadcast_event` (send without waiting on roundtrip) eliminates cross-actor blocking in the daemon's WebSocket transport layer, while bounding `writer_tx` to 128 chunks protects against memory leaks if a child process stops draining stdin.
+
+## Commits
+
+- 434234f — fix(triaged): make pty input nonblocking and support web bracketed paste
+- 9548d56 — fix(triaged): fix windows test shell path, bound pty writer channel, and consolidate writer thread
+- 6c9ef89 — fix(triaged): handle writer disconnection, add poison logging, and test queue saturation
+- HEAD — fix(triaged): address PR review comments for non-blocking pty input
+
+## Progress
+
+- [x] Identified root cause of PTY write deadlock and web paste unbracketed multi-line flooding.
+- [x] Created worktree `fix/nonblocking-pty-input`.
+- [x] Updated `crates/triaged/src/session.rs`.
+- [x] Updated `flutter/triage_client/lib/widgets/terminal_pane_web.dart`.
+- [x] Fixed Windows test shell configuration and bounded writer queue.
+- [x] Validated tests with `cargo test` and `flutter test`.

@@ -146,6 +146,7 @@ pub struct SessionActor {
     tx: Sender<ActorCommand>,
     worker: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
+    writer: Option<JoinHandle<()>>,
     /// Wall-clock of this session's most recent PTY output, as milliseconds since
     /// the Unix epoch, shared with the actor's [`ActorState`].
     ///
@@ -2084,6 +2085,8 @@ impl SessionManager {
             })
             .context("spawning session actor reader thread")?;
 
+        let (writer_tx, writer_handle) = spawn_pty_writer(writer.clone())?;
+
         let worker = thread::Builder::new()
             .name("session-actor-worker".into())
             .spawn(move || {
@@ -2092,6 +2095,7 @@ impl SessionManager {
                     child,
                     process_identity,
                     writer,
+                    writer_tx,
                     output,
                     size,
                     log_path,
@@ -2124,6 +2128,7 @@ impl SessionManager {
             tx: command_tx,
             worker: Some(worker),
             reader: Some(reader),
+            writer: Some(writer_handle),
             last_activity_ms,
         };
 
@@ -4389,6 +4394,8 @@ impl SessionActor {
 
         let (command_tx, command_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::sync_channel(64);
+        let (writer_tx, writer_handle) = spawn_pty_writer(writer.clone())?;
+
         // Seed at spawn so a session that has produced no output yet still sorts
         // by when it appeared rather than falling into the unknown-activity
         // bucket. A restored session supplies its manifest stamp here instead, so
@@ -4410,6 +4417,7 @@ impl SessionActor {
                     child,
                     process_identity,
                     writer,
+                    writer_tx,
                     output,
                     size,
                     log_path,
@@ -4441,6 +4449,7 @@ impl SessionActor {
             tx: command_tx,
             worker: Some(worker),
             reader: Some(reader),
+            writer: Some(writer_handle),
             last_activity_ms,
         })
     }
@@ -4511,9 +4520,12 @@ impl SessionActor {
         if let Some(reader) = self.reader.take() {
             join_thread_with_timeout(reader, "session actor reader");
         }
+        if let Some(writer) = self.writer.take() {
+            join_thread_with_timeout(writer, "session actor writer");
+        }
     }
 
-    /// Disarms the actor for a process handover: drops the worker/reader join
+    /// Disarms the actor for a process handover: drops the worker/reader/writer join
     /// handles WITHOUT signalling shutdown, so nothing kills the live PTY child.
     /// Killing it here (as [`Self::shutdown`] and [`Drop`] do) is exactly what
     /// tears every session down across a handover; the successor daemon already
@@ -4523,11 +4535,12 @@ impl SessionActor {
     /// future caller keeping a detached actor — and so its `Sender` — alive, which
     /// would leave the worker loop nothing to end on. Clearing the handles only
     /// gives up the right to join. The sole caller,
-    /// `SessionManager::detach_all_live_sessions`, documents what both threads do
+    /// `SessionManager::detach_all_live_sessions`, documents what threads do
     /// from here and why the PTY master closing is safe.
     fn detach(mut self) {
         self.worker = None;
         self.reader = None;
+        self.writer = None;
         // `self` drops here; the `Drop` impl is a no-op once `worker` is `None`.
     }
 }
@@ -4566,6 +4579,7 @@ struct ActorState {
     child: Box<dyn Child + Send + Sync>,
     process_identity: Option<crate::handover::HandoverProcessIdentity>,
     writer: SharedPtyWriter,
+    writer_tx: SyncSender<Vec<u8>>,
     output: OutputState,
     size: SessionSize,
     log_path: PathBuf,
@@ -4663,7 +4677,6 @@ enum ActorMessage {
 enum ActorCommand {
     WriteInput {
         bytes: Vec<u8>,
-        response: Sender<ActorResult<()>>,
     },
     Resize {
         size: SessionSize,
@@ -5037,8 +5050,8 @@ impl ActorState {
         output_rx: &Receiver<ActorMessage>,
     ) -> bool {
         match command {
-            ActorCommand::WriteInput { bytes, response } => {
-                let _ = response.send(self.write_input(&bytes));
+            ActorCommand::WriteInput { bytes } => {
+                self.write_input(bytes);
                 false
             }
             ActorCommand::Resize { size, response } => {
@@ -5102,15 +5115,26 @@ impl ActorState {
         }
     }
 
-    fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
-        ensure!(!self.exited, "session has already exited");
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow!("PTY writer lock poisoned"))?;
-        writer.write_all(bytes).context("writing input to PTY")?;
-        writer.flush().context("flushing PTY input")?;
-        Ok(())
+    fn write_input(&mut self, bytes: Vec<u8>) {
+        if self.exited {
+            return;
+        }
+        if let Err(err) = self.writer_tx.try_send(bytes) {
+            match err {
+                TrySendError::Full(_) => {
+                    tracing::warn!(
+                        session_id = ?self.event_session_id,
+                        "PTY input buffer full; dropping input for session"
+                    );
+                }
+                TrySendError::Disconnected(_) => {
+                    tracing::debug!(
+                        session_id = ?self.event_session_id,
+                        "PTY writer channel disconnected; child or writer thread terminated"
+                    );
+                }
+            }
+        }
     }
 
     fn resize(&mut self, size: SessionSize) -> Result<SessionSnapshot> {
@@ -6309,6 +6333,46 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: SyncSender<ActorMessage
     }
 }
 
+const PTY_INPUT_CHANNEL_CAPACITY: usize = 128;
+
+fn spawn_pty_writer(writer: SharedPtyWriter) -> Result<(SyncSender<Vec<u8>>, JoinHandle<()>)> {
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_CHANNEL_CAPACITY);
+    let writer_clone = writer.clone();
+    let writer_handle = thread::Builder::new()
+        .name("session-actor-writer".into())
+        .spawn(move || write_pty_input(writer_clone, writer_rx))
+        .context("spawning session actor writer thread")?;
+    Ok((writer_tx, writer_handle))
+}
+
+fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
+    while let Ok(bytes) = rx.recv() {
+        let mut guard = match writer.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("PTY writer mutex poisoned; stopping writer thread");
+                break;
+            }
+        };
+        let mut write_err = false;
+        if let Err(err) = guard.write_all(&bytes) {
+            tracing::debug!(error = %err, "PTY write error; terminating writer thread");
+            write_err = true;
+        } else {
+            while let Ok(next) = rx.try_recv() {
+                if let Err(err) = guard.write_all(&next) {
+                    tracing::debug!(error = %err, "PTY write error; terminating writer thread");
+                    write_err = true;
+                    break;
+                }
+            }
+        }
+        if write_err || guard.flush().is_err() {
+            break;
+        }
+    }
+}
+
 fn recv_actor_result<T>(rx: Receiver<ActorResult<T>>, context: &'static str) -> Result<T> {
     rx.recv()
         .with_context(|| format!("{context}: actor stopped"))?
@@ -6341,29 +6405,19 @@ fn request_summary_rows(tx: &Sender<ActorCommand>) -> Result<SummaryRowsResponse
     recv_actor_result(resp_rx, "reading session summary rows")
 }
 
-/// Writes input to a session and waits for the actor's acknowledgement. Mirrors
-/// `request_summary_rows`: clone `tx` under a brief lock, then call this OFF-LOCK.
+/// Writes input to a session asynchronously. Fire-and-forget: enqueues the input
+/// to the actor's channel and returns immediately without blocking the caller.
 ///
-/// Holding the sessions lock across this round-trip is what wedged the daemon on
-/// 2026-08-13. The actor answers only after its `write_all` to the PTY master
-/// returns, and that write blocks indefinitely when the session's child has
-/// stopped reading and the terminal's input queue is full. With the lock held,
-/// that single stuck session froze every other session operation behind
-/// `Mutex::lock`, including `serialize_active_sessions`, so the daemon could not
-/// even be handed over to a new build. Off-lock, a stuck session blocks only the
-/// client writing to it.
+/// Decoupling PTY input writes onto a dedicated writer thread and using fire-and-forget
+/// IPC prevents a session whose child stopped reading from blocking the actor worker
+/// or the WebSocket transport layer.
 fn request_write_input(tx: &Sender<ActorCommand>, bytes: Vec<u8>) -> Result<()> {
-    let (resp_tx, resp_rx) = mpsc::channel();
-    tx.send(ActorCommand::WriteInput {
-        bytes,
-        response: resp_tx,
-    })
-    .context("sending session input command")?;
-    recv_actor_result(resp_rx, "writing session input")
+    tx.send(ActorCommand::WriteInput { bytes })
+        .context("sending session input command")
 }
 
 /// Requests a resize via a cloned actor command channel. Same OFF-LOCK contract as
-/// [`request_write_input`].
+/// [`request_summary_rows`].
 fn request_resize(tx: &Sender<ActorCommand>, size: SessionSize) -> Result<SessionSnapshot> {
     let (resp_tx, resp_rx) = mpsc::channel();
     tx.send(ActorCommand::Resize {
@@ -6375,7 +6429,7 @@ fn request_resize(tx: &Sender<ActorCommand>, size: SessionSize) -> Result<Sessio
 }
 
 /// Subscribes to a session's events via a cloned actor command channel. Same
-/// OFF-LOCK contract as [`request_write_input`].
+/// OFF-LOCK contract as [`request_summary_rows`].
 fn request_subscribe_events(
     tx: &Sender<ActorCommand>,
     after_event_seq: Option<u64>,
@@ -6390,7 +6444,7 @@ fn request_subscribe_events(
 }
 
 /// Requests a styled row range via a cloned actor command channel. Same OFF-LOCK
-/// contract as [`request_write_input`].
+/// contract as [`request_summary_rows`].
 fn request_styled_rows(
     tx: &Sender<ActorCommand>,
     start: usize,
@@ -6445,9 +6499,7 @@ fn request_actor_shutdown(tx: &Sender<ActorCommand>) -> Result<CompletedSession>
 fn reject_command_during_shutdown(command: ActorCommand) {
     let error = anyhow!("session is shutting down");
     match command {
-        ActorCommand::WriteInput { response, .. } => {
-            let _ = response.send(Err(error));
-        }
+        ActorCommand::WriteInput { .. } => {}
         ActorCommand::Resize { response, .. } => {
             let _ = response.send(Err(error));
         }
@@ -10771,6 +10823,7 @@ mod tests {
                     tx,
                     worker: None,
                     reader: None,
+                    writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
                 },
                 lease,
@@ -10851,7 +10904,7 @@ mod tests {
         writer
             .join()
             .expect("writer thread")
-            .expect_err("the write should fail once its unanswered actor channel closes");
+            .expect("the write input request should succeed when enqueued");
     }
 
     /// One parked session must not cost the rest of the set their handover.
@@ -10891,6 +10944,7 @@ mod tests {
                         tx,
                         worker: None,
                         reader: None,
+                        writer: None,
                         last_activity_ms: Arc::new(AtomicU64::new(0)),
                     },
                     lease: InputLeaseState::default(),
@@ -10994,6 +11048,7 @@ mod tests {
                     tx,
                     worker: None,
                     reader: None,
+                    writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
                 },
                 lease: InputLeaseState::default(),
@@ -11580,25 +11635,30 @@ mod tests {
                 "timed out waiting for output marker {marker}; latest output: {:?}",
                 String::from_utf8_lossy(&output)
             );
-            let event = receiver
-                .recv_timeout(remaining.min(Duration::from_millis(100)))
-                .unwrap_or_else(|error| {
-                    panic!("event stream ended while waiting for output marker {marker}: {error}")
-                })
-                .event;
-            if let SessionEvent::Output {
-                session_id: event_session_id,
-                bytes,
-                ..
-            } = event
-                && &event_session_id == session_id
-            {
-                output.extend_from_slice(&bytes);
-                if output.len() > 8192 {
-                    output.drain(..output.len() - 8192);
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(envelope) => {
+                    if let SessionEvent::Output {
+                        session_id: event_session_id,
+                        bytes,
+                        ..
+                    } = envelope.event
+                        && &event_session_id == session_id
+                    {
+                        output.extend_from_slice(&bytes);
+                        if output.len() > 8192 {
+                            output.drain(..output.len() - 8192);
+                        }
+                        if String::from_utf8_lossy(&output).contains(marker) {
+                            return;
+                        }
+                    }
                 }
-                if String::from_utf8_lossy(&output).contains(marker) {
-                    return;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "event stream ended while waiting for output marker {marker}; latest output: {:?}",
+                        String::from_utf8_lossy(&output)
+                    );
                 }
             }
         }
@@ -11737,5 +11797,79 @@ mod tests {
             unsafe { libc::close(fd) };
         }
         drop(handover);
+    }
+
+    #[test]
+    fn write_input_handles_large_payload_asynchronously_without_wedging_actor() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("large-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        // Write a payload large enough to exceed standard PTY buffer limits (16KB)
+        let large_payload = vec![b'A'; 16 * 1024];
+        request_write_input(&actor.tx, large_payload).expect("write large payload");
+
+        // The actor must still answer snapshot/summary requests without hanging
+        let (rows, _, _) = request_summary_rows(&actor.tx).expect("read summary rows");
+        let _ = rows;
+
+        let snapshot = request_snapshot(&actor.tx).expect("read snapshot");
+        let _ = snapshot;
+
+        let _ = actor.shutdown();
+    }
+
+    #[test]
+    fn write_input_handles_burst_writes_order_preserved() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("burst-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        for i in 0..50 {
+            request_write_input(&actor.tx, format!("echo test_{i}\r\n").into_bytes())
+                .expect("write burst payload");
+        }
+
+        let snapshot = request_snapshot(&actor.tx).expect("read snapshot");
+        let _ = snapshot;
+
+        let _ = actor.shutdown();
+    }
+
+    #[test]
+    fn write_input_handles_queue_saturation_gracefully() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("saturation-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        // Send more than the 128-entry channel capacity rapidly to test buffer saturation
+        for i in 0..200 {
+            request_write_input(&actor.tx, format!("echo sat_{i}\r\n").into_bytes())
+                .expect("write input");
+        }
+
+        let snapshot = request_snapshot(&actor.tx).expect("read snapshot");
+        let _ = snapshot;
+
+        let _ = actor.shutdown();
+    }
+
+    #[test]
+    fn shutdown_completes_cleanly_with_pending_writer_input() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("shutdown-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        // Enqueue several inputs right before shutting down
+        for i in 0..20 {
+            let _ = request_write_input(&actor.tx, format!("echo shutdown_{i}\r\n").into_bytes());
+        }
+
+        // Shutdown must terminate cleanly without deadlock or hanging
+        assert!(actor.shutdown().is_ok());
     }
 }
