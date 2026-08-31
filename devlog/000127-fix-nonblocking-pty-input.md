@@ -9,7 +9,8 @@
 - Decoupled PTY writes in `triaged::session` onto a dedicated `session-actor-writer` thread so that large writes / stuck child stdin buffers never stall the `session-actor-worker` loop.
 - **2026-08-31T11:32-0700** Consolidated `session-actor-writer` initialization into `spawn_pty_writer`, bounded input buffering with `mpsc::sync_channel(128)` to prevent unbounded memory growth on stuck child processes, fixed Windows test shell invocation by using `long_running_shell()`, and added burst write order preservation tests.
 - **2026-08-31T11:44-0700** Refactored `write_input` to standard pattern matching (avoiding `let_chains`), handled `TrySendError::Disconnected` logging, added mutex poison logging in `write_pty_input`, and added `write_input_handles_queue_saturation_gracefully` unit test.
-- Routed web paste events in `flutter/triage_client/lib/widgets/terminal_pane_web.dart` through `xterm.paste(text)` to ensure Mode 2004 bracketed paste sequences and line endings are preserved.
+- Routed web paste events in `flutter/triage_client/lib/widgets/terminal_pane_web.dart` through `formatPasteInput(text, bracketedPaste: ...)` and `_sendInput` to ensure Mode 2004 bracketed paste sequences and line endings are preserved.
+- **2026-08-31T13:30-0700** Addressed PR #150 review feedback: removed unused `writer` field from `ActorState`, greedily drained pending input chunks in `write_pty_input` under the mutex guard to reduce lock contention, added `session_id` tracing to buffer saturation warnings, and added `shutdown_completes_cleanly_with_pending_writer_input` unit test.
 
 ## Decisions
 
@@ -18,9 +19,10 @@
 
 ## Commits
 
-- 434234f — fix: make pty input nonblocking and support web bracketed paste
+- 434234f — fix(triaged): make pty input nonblocking and support web bracketed paste
 - 9548d56 — fix(triaged): fix windows test shell path, bound pty writer channel, and consolidate writer thread
-- HEAD — fix(triaged): handle writer disconnection, add poison logging, and test queue saturation
+- 6c9ef89 — fix(triaged): handle writer disconnection, add poison logging, and test queue saturation
+- HEAD — fix(triaged): address PR review comments for non-blocking pty input
 
 ## Progress
 

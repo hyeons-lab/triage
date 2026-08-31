@@ -5122,10 +5122,14 @@ impl ActorState {
         if let Err(err) = self.writer_tx.try_send(bytes) {
             match err {
                 TrySendError::Full(_) => {
-                    tracing::warn!("PTY input buffer full; dropping input for session");
+                    tracing::warn!(
+                        session_id = ?self.event_session_id,
+                        "PTY input buffer full; dropping input for session"
+                    );
                 }
                 TrySendError::Disconnected(_) => {
                     tracing::debug!(
+                        session_id = ?self.event_session_id,
                         "PTY writer channel disconnected; child or writer thread terminated"
                     );
                 }
@@ -6329,8 +6333,10 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: SyncSender<ActorMessage
     }
 }
 
+const PTY_INPUT_CHANNEL_CAPACITY: usize = 128;
+
 fn spawn_pty_writer(writer: SharedPtyWriter) -> Result<(SyncSender<Vec<u8>>, JoinHandle<()>)> {
-    let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(128);
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_CHANNEL_CAPACITY);
     let writer_clone = writer.clone();
     let writer_handle = thread::Builder::new()
         .name("session-actor-writer".into())
@@ -6348,8 +6354,19 @@ fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
                 break;
             }
         };
-        if let Err(err) = guard.write_all(&bytes).and_then(|()| guard.flush()) {
-            tracing::debug!(error = %err, "PTY write/flush error; terminating writer thread");
+        let mut to_write = vec![bytes];
+        while let Ok(next) = rx.try_recv() {
+            to_write.push(next);
+        }
+        let mut write_err = false;
+        for chunk in to_write {
+            if let Err(err) = guard.write_all(&chunk) {
+                tracing::debug!(error = %err, "PTY write error; terminating writer thread");
+                write_err = true;
+                break;
+            }
+        }
+        if write_err || guard.flush().is_err() {
             break;
         }
     }
@@ -11832,5 +11849,21 @@ mod tests {
         let _ = snapshot;
 
         let _ = actor.shutdown();
+    }
+
+    #[test]
+    fn shutdown_completes_cleanly_with_pending_writer_input() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("shutdown-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        // Enqueue several inputs right before shutting down
+        for i in 0..20 {
+            let _ = request_write_input(&actor.tx, format!("echo shutdown_{i}\r\n").into_bytes());
+        }
+
+        // Shutdown must terminate cleanly without deadlock or hanging
+        assert!(actor.shutdown().is_ok());
     }
 }
