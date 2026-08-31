@@ -2085,12 +2085,7 @@ impl SessionManager {
             })
             .context("spawning session actor reader thread")?;
 
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
-        let writer_clone = writer.clone();
-        let writer_handle = thread::Builder::new()
-            .name("session-actor-writer".into())
-            .spawn(move || write_pty_input(writer_clone, writer_rx))
-            .context("spawning session actor writer thread")?;
+        let (writer_tx, writer_handle) = spawn_pty_writer(writer.clone())?;
 
         let worker = thread::Builder::new()
             .name("session-actor-worker".into())
@@ -4399,12 +4394,7 @@ impl SessionActor {
 
         let (command_tx, command_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::sync_channel(64);
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
-        let writer_clone = writer.clone();
-        let writer_handle = thread::Builder::new()
-            .name("session-actor-writer".into())
-            .spawn(move || write_pty_input(writer_clone, writer_rx))
-            .context("spawning session actor writer thread")?;
+        let (writer_tx, writer_handle) = spawn_pty_writer(writer.clone())?;
 
         // Seed at spawn so a session that has produced no output yet still sorts
         // by when it appeared rather than falling into the unknown-activity
@@ -4589,7 +4579,7 @@ struct ActorState {
     child: Box<dyn Child + Send + Sync>,
     process_identity: Option<crate::handover::HandoverProcessIdentity>,
     writer: SharedPtyWriter,
-    writer_tx: Sender<Vec<u8>>,
+    writer_tx: SyncSender<Vec<u8>>,
     output: OutputState,
     size: SessionSize,
     log_path: PathBuf,
@@ -5126,8 +5116,10 @@ impl ActorState {
     }
 
     fn write_input(&mut self, bytes: Vec<u8>) {
-        if !self.exited {
-            let _ = self.writer_tx.send(bytes);
+        if !self.exited
+            && let Err(TrySendError::Full(_)) = self.writer_tx.try_send(bytes)
+        {
+            tracing::warn!("PTY input buffer full; dropping input for session");
         }
     }
 
@@ -6325,6 +6317,16 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: SyncSender<ActorMessage
             }
         }
     }
+}
+
+fn spawn_pty_writer(writer: SharedPtyWriter) -> Result<(SyncSender<Vec<u8>>, JoinHandle<()>)> {
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(128);
+    let writer_clone = writer.clone();
+    let writer_handle = thread::Builder::new()
+        .name("session-actor-writer".into())
+        .spawn(move || write_pty_input(writer_clone, writer_rx))
+        .context("spawning session actor writer thread")?;
+    Ok((writer_tx, writer_handle))
 }
 
 fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
@@ -11764,7 +11766,7 @@ mod tests {
     fn write_input_handles_large_payload_asynchronously_without_wedging_actor() {
         let log_dir = unique_log_dir();
         std::fs::create_dir_all(&log_dir).expect("create log dir");
-        let config = SessionConfig::new("/bin/sh", log_dir.join("large-input.log"));
+        let config = long_running_shell(log_dir.join("large-input.log"));
         let actor = SessionActor::spawn(config).expect("spawn session actor");
 
         // Write a payload large enough to exceed standard PTY buffer limits (16KB)
@@ -11774,6 +11776,24 @@ mod tests {
         // The actor must still answer snapshot/summary requests without hanging
         let (rows, _, _) = request_summary_rows(&actor.tx).expect("read summary rows");
         let _ = rows;
+
+        let snapshot = request_snapshot(&actor.tx).expect("read snapshot");
+        let _ = snapshot;
+
+        let _ = actor.shutdown();
+    }
+
+    #[test]
+    fn write_input_handles_burst_writes_order_preserved() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("burst-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        for i in 0..50 {
+            request_write_input(&actor.tx, format!("echo test_{i}\r\n").into_bytes())
+                .expect("write burst payload");
+        }
 
         let snapshot = request_snapshot(&actor.tx).expect("read snapshot");
         let _ = snapshot;
