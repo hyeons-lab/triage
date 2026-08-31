@@ -29,6 +29,7 @@ Fix the bug where navigating/cding into a git worktree places the session in the
   - Verified and added unit tests in `session_grouping_test.dart` for worktree session grouping under parent repository.
 
 - **2026-08-31T13:48-0700** Hardened `git_repository_root` to support worktrees created from bare repositories (`repo.git`) while preserving submodule boundary separation (`.git/modules/...`), and added `session_context_resolves_bare_repository_worktree` unit test.
+- **2026-08-31T14:24-0700** Addressed PR #151 review feedback: verified submodule parentage in `is_submodule` to avoid false positives on directories named `modules`, canonicalized `repository_root` and `worktree_root` to eliminate relative path formatting discrepancies, and ensured `handle_output` triggers same-directory branch refreshes for non-OSC-7 shells.
 
 ## Decisions
 
@@ -37,5 +38,6 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 
 ## Commits
 
-- 10080c9 — fix(triaged): keep OS CWD polling active for shells and group worktrees with parent repository
-- HEAD — fix(triaged): support worktrees created from bare repositories in git_repository_root
+- f13662d — fix(triaged): keep OS CWD polling active for shells and group worktrees with parent repository
+- 6352ae1 — fix(triaged): support worktrees created from bare repositories in git_repository_root
+- HEAD — fix(triaged): address PR review comments for worktree session grouping

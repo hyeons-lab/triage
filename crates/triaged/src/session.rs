@@ -4993,16 +4993,10 @@ impl ActorState {
                         }
                         // zsh, fish, and other shells ignore PROMPT_COMMAND and
                         // never emit OSC 7, so fall back to reading the PTY child's
-                        // cwd from the kernel (throttled). If the cwd changed, apply
-                        // it immediately. If unchanged and the shell does not report
-                        // OSC 7, re-resolve so same-directory branch switches
-                        // (`git switch`/`checkout`) still refresh the side rail.
+                        // cwd from the kernel (throttled). If the cwd changed or a
+                        // branch switch occurred, apply it and refresh the side rail.
                         None => {
-                            if let Some(cwd) = self.poll_child_cwd()
-                                && (self.current_working_directory.as_deref()
-                                    != Some(cwd.as_path())
-                                    || !self.shell_reports_cwd)
-                            {
+                            if let Some(cwd) = self.poll_child_cwd() {
                                 self.apply_cwd(cwd);
                             }
                         }
@@ -6739,8 +6733,11 @@ fn child_cwd(_pid: u32) -> Option<PathBuf> {
 
 fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
     let cwd = cwd?;
-    let worktree_root = git_path_output(cwd, &["rev-parse", "--show-toplevel"]);
-    let repository_root = git_repository_root(cwd).or_else(|| worktree_root.clone());
+    let worktree_root = git_path_output(cwd, &["rev-parse", "--show-toplevel"])
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    let repository_root = git_repository_root(cwd)
+        .or_else(|| worktree_root.clone())
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let branch = git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
 
     (repository_root.is_some() || worktree_root.is_some() || branch.is_some()).then_some(
@@ -6763,12 +6760,17 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
     } else {
         common_dir
     };
+    let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
     if common_dir.file_name() == Some(OsStr::new(".git")) {
         return common_dir.parent().map(Path::to_path_buf);
     }
-    let is_submodule = common_dir
-        .ancestors()
-        .any(|a| a.file_name() == Some(OsStr::new("modules")));
+    let is_submodule = common_dir.ancestors().any(|a| {
+        a.file_name() == Some(OsStr::new("modules"))
+            && a.parent().is_some_and(|p| {
+                p.file_name() == Some(OsStr::new(".git"))
+                    || (p.is_dir() && p.join("objects").is_dir() && p.join("HEAD").is_file())
+            })
+    });
     if !is_submodule
         && common_dir.is_dir()
         && common_dir.join("objects").is_dir()
@@ -7996,6 +7998,34 @@ mod tests {
             Some(canonical(&worktree))
         );
         assert_eq!(context.branch.as_deref(), Some("feat/bare-worktree"));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn session_context_resolves_repo_inside_modules_directory() {
+        let base_dir = unique_log_dir().join("modules").join("nested-repo");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).expect("create repo in modules dir");
+        git_test_command(&base_dir, &["init"]);
+        git_test_command(
+            &base_dir,
+            &["config", "user.email", "triage@example.invalid"],
+        );
+        git_test_command(&base_dir, &["config", "user.name", "Triage Test"]);
+        std::fs::write(base_dir.join("README.md"), "modules test\n").expect("write test file");
+        git_test_command(&base_dir, &["add", "README.md"]);
+        git_test_command(&base_dir, &["commit", "-m", "initial"]);
+
+        let context = resolve_session_context(Some(&base_dir)).expect("git session context");
+        let canonical_repo = std::fs::canonicalize(&base_dir).expect("canonicalize repo");
+        assert_eq!(
+            context.repository_root.as_deref(),
+            Some(canonical_repo.as_path())
+        );
+        assert_eq!(
+            context.worktree_root.as_deref(),
+            Some(canonical_repo.as_path())
+        );
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
