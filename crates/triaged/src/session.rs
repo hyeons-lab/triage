@@ -5116,10 +5116,20 @@ impl ActorState {
     }
 
     fn write_input(&mut self, bytes: Vec<u8>) {
-        if !self.exited
-            && let Err(TrySendError::Full(_)) = self.writer_tx.try_send(bytes)
-        {
-            tracing::warn!("PTY input buffer full; dropping input for session");
+        if self.exited {
+            return;
+        }
+        if let Err(err) = self.writer_tx.try_send(bytes) {
+            match err {
+                TrySendError::Full(_) => {
+                    tracing::warn!("PTY input buffer full; dropping input for session");
+                }
+                TrySendError::Disconnected(_) => {
+                    tracing::debug!(
+                        "PTY writer channel disconnected; child or writer thread terminated"
+                    );
+                }
+            }
         }
     }
 
@@ -6333,9 +6343,13 @@ fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
     while let Ok(bytes) = rx.recv() {
         let mut guard = match writer.lock() {
             Ok(g) => g,
-            Err(_) => break,
+            Err(_) => {
+                tracing::warn!("PTY writer mutex poisoned; stopping writer thread");
+                break;
+            }
         };
-        if guard.write_all(&bytes).is_err() || guard.flush().is_err() {
+        if let Err(err) = guard.write_all(&bytes).and_then(|()| guard.flush()) {
+            tracing::debug!(error = %err, "PTY write/flush error; terminating writer thread");
             break;
         }
     }
@@ -11793,6 +11807,25 @@ mod tests {
         for i in 0..50 {
             request_write_input(&actor.tx, format!("echo test_{i}\r\n").into_bytes())
                 .expect("write burst payload");
+        }
+
+        let snapshot = request_snapshot(&actor.tx).expect("read snapshot");
+        let _ = snapshot;
+
+        let _ = actor.shutdown();
+    }
+
+    #[test]
+    fn write_input_handles_queue_saturation_gracefully() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = long_running_shell(log_dir.join("saturation-input.log"));
+        let actor = SessionActor::spawn(config).expect("spawn session actor");
+
+        // Send more than the 128-entry channel capacity rapidly to test buffer saturation
+        for i in 0..200 {
+            request_write_input(&actor.tx, format!("echo sat_{i}\r\n").into_bytes())
+                .expect("write input");
         }
 
         let snapshot = request_snapshot(&actor.tx).expect("read snapshot");

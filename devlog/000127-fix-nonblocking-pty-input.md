@@ -8,6 +8,7 @@
 - Made `request_write_input` in `triaged::session` fire-and-forget: sends `ActorCommand::WriteInput` without blocking on actor round-trip, preventing stuck sessions from blocking the Tokio WebSocket server.
 - Decoupled PTY writes in `triaged::session` onto a dedicated `session-actor-writer` thread so that large writes / stuck child stdin buffers never stall the `session-actor-worker` loop.
 - **2026-08-31T11:32-0700** Consolidated `session-actor-writer` initialization into `spawn_pty_writer`, bounded input buffering with `mpsc::sync_channel(128)` to prevent unbounded memory growth on stuck child processes, fixed Windows test shell invocation by using `long_running_shell()`, and added burst write order preservation tests.
+- **2026-08-31T11:44-0700** Refactored `write_input` to standard pattern matching (avoiding `let_chains`), handled `TrySendError::Disconnected` logging, added mutex poison logging in `write_pty_input`, and added `write_input_handles_queue_saturation_gracefully` unit test.
 - Routed web paste events in `flutter/triage_client/lib/widgets/terminal_pane_web.dart` through `xterm.paste(text)` to ensure Mode 2004 bracketed paste sequences and line endings are preserved.
 
 ## Decisions
@@ -18,7 +19,8 @@
 ## Commits
 
 - 434234f — fix: make pty input nonblocking and support web bracketed paste
-- HEAD — fix(triaged): fix windows test shell path, bound pty writer channel, and consolidate writer thread
+- 9548d56 — fix(triaged): fix windows test shell path, bound pty writer channel, and consolidate writer thread
+- HEAD — fix(triaged): handle writer disconnection, add poison logging, and test queue saturation
 
 ## Progress
 
