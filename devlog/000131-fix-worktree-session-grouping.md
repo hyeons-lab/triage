@@ -28,6 +28,8 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 - `flutter/triage_client/`:
   - Verified and added unit tests in `session_grouping_test.dart` for worktree session grouping under parent repository.
 
+- **2026-08-31T13:48-0700** Hardened `git_repository_root` to support worktrees created from bare repositories (`repo.git`) while preserving submodule boundary separation (`.git/modules/...`), and added `session_context_resolves_bare_repository_worktree` unit test.
+
 ## Decisions
 
 - Retain OSC 7 as the primary immediate CWD reporter when emitted, but do not allow a one-time OSC 7 emission to permanently disable idle OS polling.
@@ -35,4 +37,5 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 
 ## Commits
 
-- HEAD — fix(triaged): keep OS CWD polling active for shells and group worktrees with parent repository
+- 10080c9 — fix(triaged): keep OS CWD polling active for shells and group worktrees with parent repository
+- HEAD — fix(triaged): support worktrees created from bare repositories in git_repository_root

@@ -6766,6 +6766,16 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
     if common_dir.file_name() == Some(OsStr::new(".git")) {
         return common_dir.parent().map(Path::to_path_buf);
     }
+    let is_submodule = common_dir
+        .ancestors()
+        .any(|a| a.file_name() == Some(OsStr::new("modules")));
+    if !is_submodule
+        && common_dir.is_dir()
+        && common_dir.join("objects").is_dir()
+        && common_dir.join("HEAD").is_file()
+    {
+        return Some(common_dir);
+    }
     let mut ancestors = common_dir.ancestors();
     let _worktree_name = ancestors.next()?;
     let worktrees_dir = ancestors.next()?;
@@ -6773,6 +6783,9 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
         let git_dir = ancestors.next()?;
         if git_dir.file_name() == Some(OsStr::new(".git")) {
             return git_dir.parent().map(Path::to_path_buf);
+        }
+        if !is_submodule && git_dir.is_dir() && git_dir.join("objects").is_dir() {
+            return Some(git_dir.to_path_buf());
         }
     }
     None
@@ -7930,6 +7943,60 @@ mod tests {
         );
         assert_eq!(context.branch.as_deref(), Some("feat/nested-worktree"));
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn session_context_resolves_bare_repository_worktree() {
+        let base_dir = unique_log_dir();
+        let bare_repo = base_dir.join("origin.git");
+        let seed_repo = base_dir.join("seed");
+        let worktree = base_dir.join("worktrees").join("feature-bare-wt");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&seed_repo).expect("create seed repo dir");
+        git_test_command(&seed_repo, &["init"]);
+        git_test_command(
+            &seed_repo,
+            &["config", "user.email", "triage@example.invalid"],
+        );
+        git_test_command(&seed_repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(seed_repo.join("README.md"), "bare test\n").expect("write test file");
+        git_test_command(&seed_repo, &["add", "README.md"]);
+        git_test_command(&seed_repo, &["commit", "-m", "initial"]);
+        git_test_command(
+            &base_dir,
+            &[
+                "clone",
+                "--bare",
+                seed_repo.to_str().expect("utf-8 seed path"),
+                bare_repo.to_str().expect("utf-8 bare path"),
+            ],
+        );
+        git_test_command(
+            &bare_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/bare-worktree",
+                worktree.to_str().expect("utf-8 worktree path"),
+            ],
+        );
+
+        let context = resolve_session_context(Some(&worktree)).expect("git session context");
+
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path).expect("canonicalize path for comparison")
+        };
+        assert_eq!(
+            context.repository_root.as_deref().map(canonical),
+            Some(canonical(&bare_repo))
+        );
+        assert_eq!(
+            context.worktree_root.as_deref().map(canonical),
+            Some(canonical(&worktree))
+        );
+        assert_eq!(context.branch.as_deref(), Some("feat/bare-worktree"));
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
