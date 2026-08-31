@@ -2110,7 +2110,6 @@ impl SessionManager {
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
-                    shell_reports_cwd: false,
                     last_cwd_poll: Some(Instant::now()),
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
@@ -4432,7 +4431,6 @@ impl SessionActor {
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
-                    shell_reports_cwd: false,
                     // Throttle the cwd poll from spawn so the idle refresh doesn't
                     // fire before the session has settled (and races the initial
                     // snapshot); the first poll runs one interval in.
@@ -4611,14 +4609,8 @@ struct ActorState {
     /// only emitted on change, the actor re-attempts the broadcast (with the
     /// current context) on the next output event until it is delivered.
     context_resend_pending: bool,
-    /// Set once the session has reported its cwd via OSC 7 at least once, i.e.
-    /// its shell honors the injected `PROMPT_COMMAND` hook (bash). When true, we
-    /// trust OSC 7 and skip the OS-level cwd polling entirely; when it stays
-    /// false (zsh, fish, ...), the fallback poll keeps the cwd fresh.
-    shell_reports_cwd: bool,
     /// Timestamp of the last OS-level working-directory poll, used to throttle
-    /// the fallback so git context is not re-resolved on every output chunk for
-    /// shells that never emit OSC 7.
+    /// the fallback so git context is not re-resolved on every output chunk.
     last_cwd_poll: Option<Instant>,
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
@@ -4974,6 +4966,21 @@ impl ActorState {
         None
     }
 
+    /// Refreshes only the active git branch name when the working directory is
+    /// unchanged, avoiding full repository root and worktree re-discovery.
+    fn refresh_branch_context(&mut self, cwd: &PathBuf) {
+        let branch =
+            git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
+        if let Some(context) = &mut self.context {
+            if context.branch != branch {
+                context.branch = branch;
+                self.broadcast_context_update();
+            }
+        } else if branch.is_some() {
+            self.apply_cwd(cwd.clone());
+        }
+    }
+
     fn handle_output(&mut self, message: ActorMessage) {
         match message {
             ActorMessage::Output(bytes) => match self.output.ingest(&bytes) {
@@ -4988,16 +4995,20 @@ impl ActorState {
                         // bash reports its cwd via OSC 7 (the injected
                         // PROMPT_COMMAND hook), so apply it directly.
                         Some(reported) => {
-                            self.shell_reports_cwd = true;
                             self.apply_cwd(reported);
                         }
                         // zsh, fish, and other shells ignore PROMPT_COMMAND and
                         // never emit OSC 7, so fall back to reading the PTY child's
-                        // cwd from the kernel (throttled). If the cwd changed or a
-                        // branch switch occurred, apply it and refresh the side rail.
+                        // cwd from the kernel (throttled). If the cwd changed, apply
+                        // full context resolution; if unchanged, refresh only the branch.
                         None => {
                             if let Some(cwd) = self.poll_child_cwd() {
-                                self.apply_cwd(cwd);
+                                if self.current_working_directory.as_deref() != Some(cwd.as_path())
+                                {
+                                    self.apply_cwd(cwd);
+                                } else {
+                                    self.refresh_branch_context(&cwd);
+                                }
                             }
                         }
                     }
@@ -6778,18 +6789,6 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
     {
         return Some(common_dir);
     }
-    let mut ancestors = common_dir.ancestors();
-    let _worktree_name = ancestors.next()?;
-    let worktrees_dir = ancestors.next()?;
-    if worktrees_dir.file_name() == Some(OsStr::new("worktrees")) {
-        let git_dir = ancestors.next()?;
-        if git_dir.file_name() == Some(OsStr::new(".git")) {
-            return git_dir.parent().map(Path::to_path_buf);
-        }
-        if !is_submodule && git_dir.is_dir() && git_dir.join("objects").is_dir() {
-            return Some(git_dir.to_path_buf());
-        }
-    }
     None
 }
 
@@ -8026,6 +8025,50 @@ mod tests {
             context.worktree_root.as_deref(),
             Some(canonical_repo.as_path())
         );
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_context_resolves_symlinked_worktree_path() {
+        let base_dir = unique_log_dir();
+        let repo = base_dir.join("repo");
+        let worktree = base_dir.join("worktree-real");
+        let worktree_symlink = base_dir.join("worktree-link");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_test_command(&repo, &["init"]);
+        git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+        git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+        git_test_command(&repo, &["add", "README.md"]);
+        git_test_command(&repo, &["commit", "-m", "initial"]);
+        git_test_command(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/symlink-worktree",
+                worktree.to_str().expect("utf-8 worktree path"),
+            ],
+        );
+        std::os::unix::fs::symlink(&worktree, &worktree_symlink)
+            .expect("create symlink to worktree");
+
+        let context =
+            resolve_session_context(Some(&worktree_symlink)).expect("git session context");
+        let canonical_repo = std::fs::canonicalize(&repo).expect("canonicalize repo");
+        let canonical_worktree = std::fs::canonicalize(&worktree).expect("canonicalize worktree");
+        assert_eq!(
+            context.repository_root.as_deref(),
+            Some(canonical_repo.as_path())
+        );
+        assert_eq!(
+            context.worktree_root.as_deref(),
+            Some(canonical_worktree.as_path())
+        );
+        assert_eq!(context.branch.as_deref(), Some("feat/symlink-worktree"));
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
