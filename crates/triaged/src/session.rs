@@ -11635,25 +11635,30 @@ mod tests {
                 "timed out waiting for output marker {marker}; latest output: {:?}",
                 String::from_utf8_lossy(&output)
             );
-            let event = receiver
-                .recv_timeout(remaining.min(Duration::from_millis(100)))
-                .unwrap_or_else(|error| {
-                    panic!("event stream ended while waiting for output marker {marker}: {error}")
-                })
-                .event;
-            if let SessionEvent::Output {
-                session_id: event_session_id,
-                bytes,
-                ..
-            } = event
-                && &event_session_id == session_id
-            {
-                output.extend_from_slice(&bytes);
-                if output.len() > 8192 {
-                    output.drain(..output.len() - 8192);
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(envelope) => {
+                    if let SessionEvent::Output {
+                        session_id: event_session_id,
+                        bytes,
+                        ..
+                    } = envelope.event
+                        && &event_session_id == session_id
+                    {
+                        output.extend_from_slice(&bytes);
+                        if output.len() > 8192 {
+                            output.drain(..output.len() - 8192);
+                        }
+                        if String::from_utf8_lossy(&output).contains(marker) {
+                            return;
+                        }
+                    }
                 }
-                if String::from_utf8_lossy(&output).contains(marker) {
-                    return;
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "event stream ended while waiting for output marker {marker}; latest output: {:?}",
+                        String::from_utf8_lossy(&output)
+                    );
                 }
             }
         }
