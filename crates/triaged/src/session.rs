@@ -6354,16 +6354,17 @@ fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
                 break;
             }
         };
-        let mut to_write = vec![bytes];
-        while let Ok(next) = rx.try_recv() {
-            to_write.push(next);
-        }
         let mut write_err = false;
-        for chunk in to_write {
-            if let Err(err) = guard.write_all(&chunk) {
-                tracing::debug!(error = %err, "PTY write error; terminating writer thread");
-                write_err = true;
-                break;
+        if let Err(err) = guard.write_all(&bytes) {
+            tracing::debug!(error = %err, "PTY write error; terminating writer thread");
+            write_err = true;
+        } else {
+            while let Ok(next) = rx.try_recv() {
+                if let Err(err) = guard.write_all(&next) {
+                    tracing::debug!(error = %err, "PTY write error; terminating writer thread");
+                    write_err = true;
+                    break;
+                }
             }
         }
         if write_err || guard.flush().is_err() {
