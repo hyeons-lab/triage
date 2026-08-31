@@ -4932,12 +4932,11 @@ impl ActorState {
     }
 
     /// While idle (no output to drive [`Self::handle_output`]), keep the tracked
-    /// cwd fresh for shells that never emit OSC 7, so the side rail follows a
-    /// `cd` made in a nested shell or agent even when the session is quiet.
-    /// Throttled by [`Self::poll_child_cwd`]; skipped once the shell has proven
-    /// it emits OSC 7 (we then trust OSC 7) or after the child has exited.
+    /// cwd fresh from the OS, so the side rail follows a `cd` made in a nested
+    /// shell or agent even when the session is quiet. Throttled by
+    /// [`Self::poll_child_cwd`]; skipped after the child has exited.
     fn refresh_idle_cwd(&mut self) {
-        if self.shell_reports_cwd || self.exited {
+        if self.exited {
             return;
         }
         if let Some(cwd) = self.poll_child_cwd() {
@@ -4987,32 +4986,26 @@ impl ActorState {
                         .store(now_unix_millis(), Ordering::Relaxed);
                     match current_working_directory {
                         // bash reports its cwd via OSC 7 (the injected
-                        // PROMPT_COMMAND hook), so apply it directly. Mark the
-                        // shell as OSC 7-capable so we stop OS-polling for it.
+                        // PROMPT_COMMAND hook), so apply it directly.
                         Some(reported) => {
                             self.shell_reports_cwd = true;
                             self.apply_cwd(reported);
                         }
                         // zsh, fish, and other shells ignore PROMPT_COMMAND and
-                        // never emit OSC 7, so the cwd would otherwise stay stuck
-                        // at the daemon's startup directory. Until a session has
-                        // proven it emits OSC 7, fall back to reading the PTY
-                        // child's cwd from the kernel (throttled). Once OSC 7 has
-                        // been seen we trust it and skip polling, so OSC 7-capable
-                        // shells don't re-resolve git context during long output.
-                        None if !self.shell_reports_cwd => {
-                            // Output-driven: re-resolve unconditionally (throttled
-                            // by poll_child_cwd) so a same-directory branch switch
-                            // — `git switch`/`checkout`, which produces output but
-                            // no cwd change — still refreshes the side rail. The
-                            // unconditional-resolve cost is bounded here because it
-                            // only fires while the shell is actually producing
-                            // output; the idle path is the one that dedups.
-                            if let Some(cwd) = self.poll_child_cwd() {
+                        // never emit OSC 7, so fall back to reading the PTY child's
+                        // cwd from the kernel (throttled). If the cwd changed, apply
+                        // it immediately. If unchanged and the shell does not report
+                        // OSC 7, re-resolve so same-directory branch switches
+                        // (`git switch`/`checkout`) still refresh the side rail.
+                        None => {
+                            if let Some(cwd) = self.poll_child_cwd()
+                                && (self.current_working_directory.as_deref()
+                                    != Some(cwd.as_path())
+                                    || !self.shell_reports_cwd)
+                            {
                                 self.apply_cwd(cwd);
                             }
                         }
-                        None => {}
                     }
                     if let Some(session_id) = self.event_session_id.clone() {
                         // Non-blocking nudge to the summarizer; a full or dropped
@@ -6763,21 +6756,26 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
     let common_dir = git_path_output(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
+    )
+    .or_else(|| git_path_output(cwd, &["rev-parse", "--git-common-dir"]))?;
+    let common_dir = if common_dir.is_relative() {
+        cwd.join(common_dir)
+    } else {
+        common_dir
+    };
     if common_dir.file_name() == Some(OsStr::new(".git")) {
         return common_dir.parent().map(Path::to_path_buf);
     }
     let mut ancestors = common_dir.ancestors();
     let _worktree_name = ancestors.next()?;
     let worktrees_dir = ancestors.next()?;
-    if worktrees_dir.file_name() != Some(OsStr::new("worktrees")) {
-        return None;
+    if worktrees_dir.file_name() == Some(OsStr::new("worktrees")) {
+        let git_dir = ancestors.next()?;
+        if git_dir.file_name() == Some(OsStr::new(".git")) {
+            return git_dir.parent().map(Path::to_path_buf);
+        }
     }
-    let git_dir = ancestors.next()?;
-    if git_dir.file_name() != Some(OsStr::new(".git")) {
-        return None;
-    }
-    git_dir.parent().map(Path::to_path_buf)
+    None
 }
 
 fn git_raw_output(cwd: &PathBuf, args: &[&str]) -> Option<Vec<u8>> {
@@ -7892,6 +7890,46 @@ mod tests {
         assert_eq!(context.worktree_root.as_deref().map(canonical), expected);
         let _ = std::fs::remove_dir_all(super_repo);
         let _ = std::fs::remove_dir_all(submodule_repo);
+    }
+
+    #[test]
+    fn session_context_resolves_worktree_inside_repo_directory() {
+        let repo = unique_log_dir();
+        let worktree = repo.join("worktrees").join("feature-wt");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_test_command(&repo, &["init"]);
+        git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+        git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+        git_test_command(&repo, &["add", "README.md"]);
+        git_test_command(&repo, &["commit", "-m", "initial"]);
+        git_test_command(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/nested-worktree",
+                worktree.to_str().expect("utf-8 worktree path"),
+            ],
+        );
+
+        let context = resolve_session_context(Some(&worktree)).expect("git session context");
+
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path).expect("canonicalize path for comparison")
+        };
+        assert_eq!(
+            context.repository_root.as_deref().map(canonical),
+            Some(canonical(&repo))
+        );
+        assert_eq!(
+            context.worktree_root.as_deref().map(canonical),
+            Some(canonical(&worktree))
+        );
+        assert_eq!(context.branch.as_deref(), Some("feat/nested-worktree"));
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]

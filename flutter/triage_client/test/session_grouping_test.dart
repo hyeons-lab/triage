@@ -70,6 +70,27 @@ void main() {
       );
       expect(groups.single.sessionIds, ['session-2', 'session-1']);
     });
+
+    test(
+      'groups worktree session with main repo sessions sharing parent repoRoot',
+      () {
+        final groups = groupSessionsByRepo([
+          session('session-main', repo: '/Users/dev/triage', activity: 100),
+          session(
+            'session-other',
+            repo: '/Users/dev/other-repo',
+            activity: 150,
+          ),
+          session('session-wt', repo: '/Users/dev/triage', activity: 200),
+        ]);
+
+        expect(groups.length, 2);
+        expect(groups.first.repoRoot, '/Users/dev/triage');
+        expect(groups.first.sessionIds, ['session-wt', 'session-main']);
+        expect(groups.last.repoRoot, '/Users/dev/other-repo');
+        expect(groups.last.sessionIds, ['session-other']);
+      },
+    );
   });
 
   group('tie-breaking', () {
