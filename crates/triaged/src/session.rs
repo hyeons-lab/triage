@@ -2062,7 +2062,7 @@ impl SessionManager {
         let initial_working_directory = current_working_directory
             .or_else(|| h_sess.cwd.clone())
             .or_else(|| std::env::current_dir().ok());
-        let initial_context = resolve_session_context(initial_working_directory.as_ref());
+        let initial_context = resolve_session_context(initial_working_directory.as_deref());
         let last_known_cwd = initial_working_directory.clone();
 
         let (command_tx, command_rx) = mpsc::channel();
@@ -2110,6 +2110,7 @@ impl SessionManager {
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
+                    shell_reports_cwd: false,
                     last_cwd_poll: Some(Instant::now()),
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
@@ -4256,7 +4257,7 @@ impl HistoricalSession {
         .into_iter()
         .flatten()
         .find(|path| path.is_dir());
-        let context = resolve_session_context(current_working_directory.as_ref());
+        let context = resolve_session_context(current_working_directory.as_deref());
         Ok(Self {
             persisted,
             output,
@@ -4389,7 +4390,7 @@ impl SessionActor {
             current_working_directory,
         } = runtime;
         let initial_working_directory = current_working_directory.or(initial_working_directory);
-        let initial_context = resolve_session_context(initial_working_directory.as_ref());
+        let initial_context = resolve_session_context(initial_working_directory.as_deref());
 
         let (command_tx, command_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::sync_channel(64);
@@ -4431,6 +4432,7 @@ impl SessionActor {
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
+                    shell_reports_cwd: false,
                     // Throttle the cwd poll from spawn so the idle refresh doesn't
                     // fire before the session has settled (and races the initial
                     // snapshot); the first poll runs one interval in.
@@ -4609,6 +4611,11 @@ struct ActorState {
     /// only emitted on change, the actor re-attempts the broadcast (with the
     /// current context) on the next output event until it is delivered.
     context_resend_pending: bool,
+    /// Set once the session has reported its cwd via OSC 7 at least once, i.e.
+    /// its shell honors the injected `PROMPT_COMMAND` hook (bash). When true, we
+    /// trust OSC 7 and skip the OS-level cwd polling entirely; when it stays
+    /// false (zsh, fish, ...), the fallback poll keeps the cwd fresh.
+    shell_reports_cwd: bool,
     /// Timestamp of the last OS-level working-directory poll, used to throttle
     /// the fallback so git context is not re-resolved on every output chunk.
     last_cwd_poll: Option<Instant>,
@@ -4928,7 +4935,7 @@ impl ActorState {
     /// shell or agent even when the session is quiet. Throttled by
     /// [`Self::poll_child_cwd`]; skipped after the child has exited.
     fn refresh_idle_cwd(&mut self) {
-        if self.exited {
+        if self.exited || self.shell_reports_cwd {
             return;
         }
         if let Some(cwd) = self.poll_child_cwd() {
@@ -4968,16 +4975,21 @@ impl ActorState {
 
     /// Refreshes only the active git branch name when the working directory is
     /// unchanged, avoiding full repository root and worktree re-discovery.
-    fn refresh_branch_context(&mut self, cwd: &PathBuf) {
-        let branch =
-            git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
+    fn refresh_branch_context(&mut self, cwd: &Path) {
         if let Some(context) = &mut self.context {
-            if context.branch != branch {
+            let branch =
+                git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
+            if branch.is_none() && git_path_output(cwd, &["rev-parse", "--git-dir"]).is_none() {
+                // Working directory is no longer inside a git repository (e.g. `rm -rf .git`).
+                self.context = None;
+                self.broadcast_context_update();
+            } else if context.branch != branch {
                 context.branch = branch;
                 self.broadcast_context_update();
             }
-        } else if branch.is_some() {
-            self.apply_cwd(cwd.clone());
+        } else if git_path_output(cwd, &["rev-parse", "--git-dir"]).is_some() {
+            // Entered or initialized a git repository in place (e.g. `git init`).
+            self.apply_cwd(cwd.to_path_buf());
         }
     }
 
@@ -4993,14 +5005,25 @@ impl ActorState {
                         .store(now_unix_millis(), Ordering::Relaxed);
                     match current_working_directory {
                         // bash reports its cwd via OSC 7 (the injected
-                        // PROMPT_COMMAND hook), so apply it directly.
+                        // PROMPT_COMMAND hook). If the cwd is unchanged, refresh
+                        // only the branch (throttled) to avoid redundant git re-discovery.
                         Some(reported) => {
-                            self.apply_cwd(reported);
+                            self.shell_reports_cwd = true;
+                            let now = Instant::now();
+                            if self.current_working_directory.as_deref() != Some(reported.as_path())
+                            {
+                                self.last_cwd_poll = Some(now);
+                                self.apply_cwd(reported);
+                            } else if self.last_cwd_poll.is_none_or(|last| {
+                                now.saturating_duration_since(last) >= CWD_POLL_INTERVAL
+                            }) {
+                                self.last_cwd_poll = Some(now);
+                                self.refresh_branch_context(&reported);
+                            }
                         }
                         // zsh, fish, and other shells ignore PROMPT_COMMAND and
                         // never emit OSC 7, so fall back to reading the PTY child's
-                        // cwd from the kernel (throttled). If the cwd changed, apply
-                        // full context resolution; if unchanged, refresh only the branch.
+                        // cwd from the kernel (throttled).
                         None => {
                             if let Some(cwd) = self.poll_child_cwd() {
                                 if self.current_working_directory.as_deref() != Some(cwd.as_path())
@@ -6742,13 +6765,45 @@ fn child_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
+fn canonicalize_path(path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::path::{Component, Prefix};
+        let mut components = canonical.components();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            match prefix.kind() {
+                Prefix::VerbatimDisk(disk) => {
+                    let mut buf = PathBuf::from(format!("{}:", disk as char));
+                    for c in components {
+                        buf.push(c.as_os_str());
+                    }
+                    return buf;
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut unc = OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    let mut buf = PathBuf::from(unc);
+                    for c in components {
+                        buf.push(c.as_os_str());
+                    }
+                    return buf;
+                }
+                _ => {}
+            }
+        }
+    }
+    canonical
+}
+
+fn resolve_session_context(cwd: Option<&Path>) -> Option<SessionContext> {
     let cwd = cwd?;
-    let worktree_root = git_path_output(cwd, &["rev-parse", "--show-toplevel"])
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
-    let repository_root = git_repository_root(cwd)
-        .or_else(|| worktree_root.clone())
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    let worktree_root =
+        git_path_output(cwd, &["rev-parse", "--show-toplevel"]).map(|p| canonicalize_path(&p));
+    let repository_root = git_repository_root(cwd).or_else(|| worktree_root.clone());
     let branch = git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
 
     (repository_root.is_some() || worktree_root.is_some() || branch.is_some()).then_some(
@@ -6760,7 +6815,7 @@ fn resolve_session_context(cwd: Option<&PathBuf>) -> Option<SessionContext> {
     )
 }
 
-fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
+fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
     let common_dir = git_path_output(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -6771,7 +6826,7 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
     } else {
         common_dir
     };
-    let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
+    let common_dir = canonicalize_path(&common_dir);
     if common_dir.file_name() == Some(OsStr::new(".git")) {
         return common_dir.parent().map(Path::to_path_buf);
     }
@@ -6779,20 +6834,16 @@ fn git_repository_root(cwd: &PathBuf) -> Option<PathBuf> {
         a.file_name() == Some(OsStr::new("modules"))
             && a.parent().is_some_and(|p| {
                 p.file_name() == Some(OsStr::new(".git"))
-                    || (p.is_dir() && p.join("objects").is_dir() && p.join("HEAD").is_file())
+                    || (p.join("objects").is_dir() && p.join("HEAD").is_file())
             })
     });
-    if !is_submodule
-        && common_dir.is_dir()
-        && common_dir.join("objects").is_dir()
-        && common_dir.join("HEAD").is_file()
-    {
+    if !is_submodule && common_dir.join("objects").is_dir() && common_dir.join("HEAD").is_file() {
         return Some(common_dir);
     }
     None
 }
 
-fn git_raw_output(cwd: &PathBuf, args: &[&str]) -> Option<Vec<u8>> {
+fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);
     detach_from_terminal(&mut command);
@@ -6836,7 +6887,7 @@ pub(crate) fn detach_from_terminal(_command: &mut Command) {}
 
 /// Decodes git stdout as UTF-8. Use only for textual fields (e.g. branch
 /// names); paths can contain non-UTF-8 bytes and must use `git_path_output`.
-fn git_output(cwd: &PathBuf, args: &[&str]) -> Option<String> {
+fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     let value = String::from_utf8(git_raw_output(cwd, args)?).ok()?;
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
@@ -6857,7 +6908,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 /// Resolves a path-valued git command without lossy UTF-8 decoding so repos
 /// whose path contains non-UTF-8 bytes still produce a usable `PathBuf`.
 #[cfg(unix)]
-fn git_path_output(cwd: &PathBuf, args: &[&str]) -> Option<PathBuf> {
+fn git_path_output(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
     use std::ffi::OsString;
 
     let bytes = git_raw_output(cwd, args)?;
@@ -6866,7 +6917,7 @@ fn git_path_output(cwd: &PathBuf, args: &[&str]) -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn git_path_output(cwd: &PathBuf, args: &[&str]) -> Option<PathBuf> {
+fn git_path_output(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
     git_output(cwd, args).map(PathBuf::from)
 }
 
@@ -8070,6 +8121,34 @@ mod tests {
         );
         assert_eq!(context.branch.as_deref(), Some("feat/symlink-worktree"));
         let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn session_context_resolves_detached_head() {
+        let repo = unique_log_dir();
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_test_command(&repo, &["init"]);
+        git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+        git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+        git_test_command(&repo, &["add", "README.md"]);
+        git_test_command(&repo, &["commit", "-m", "initial"]);
+        let head_commit = git_output(&repo, &["rev-parse", "HEAD"]).expect("rev-parse HEAD");
+        git_test_command(&repo, &["checkout", &head_commit]);
+
+        let context = resolve_session_context(Some(&repo)).expect("git session context");
+        let canonical_repo = canonicalize_path(&repo);
+        assert_eq!(
+            context.repository_root.as_deref(),
+            Some(canonical_repo.as_path())
+        );
+        assert_eq!(
+            context.worktree_root.as_deref(),
+            Some(canonical_repo.as_path())
+        );
+        assert_eq!(context.branch, None);
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]

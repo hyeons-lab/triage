@@ -31,12 +31,18 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 - **2026-08-31T13:48-0700** Hardened `git_repository_root` to support worktrees created from bare repositories (`repo.git`) while preserving submodule boundary separation (`.git/modules/...`), and added `session_context_resolves_bare_repository_worktree` unit test.
 - **2026-08-31T14:24-0700** Addressed PR #151 review feedback: verified submodule parentage in `is_submodule` to avoid false positives on directories named `modules`, canonicalized `repository_root` and `worktree_root` to eliminate relative path formatting discrepancies, and ensured `handle_output` triggers same-directory branch refreshes for non-OSC-7 shells.
 - **2026-08-31T14:55-0700** Optimized `handle_output` with `refresh_branch_context` so unchanged CWD only runs lightweight branch refresh rather than full repository root and worktree re-discovery, removed dead `shell_reports_cwd` field, simplified `git_repository_root`, and added `session_context_resolves_symlinked_worktree_path` test.
+- **2026-08-31T16:19-0700** Completed `/review-fix-loop max` audit:
+  - Normalized Windows UNC verbatim paths using `std::path::Component::Prefix` (`Prefix::VerbatimDisk` and `Prefix::VerbatimUNC`) without lossy conversions.
+  - Refined `refresh_branch_context` and `handle_output` to properly support detached HEAD, `.git` repository removal/transition, and in-place `git init` while throttling git subprocess spawns on unchanged CWD across both OSC-7 and non-OSC-7 shells.
+  - Replaced `&PathBuf` with `&Path` across all internal git helpers to avoid unnecessary heap allocations.
+  - Added unit test `session_context_resolves_detached_head`.
 
 ## Decisions
 
 - Retain OSC 7 as the primary immediate CWD reporter when emitted, but do not allow a one-time OSC 7 emission to permanently disable idle OS polling.
 - Ensure `apply_polled_cwd` skips expensive `git` context re-resolution when `child_cwd` is unchanged, maintaining microsecond-level performance while accurately tracking directory changes.
 - In `handle_output`, only query `git branch --show-current` when CWD is unchanged, avoiding spawning multiple git processes per second during continuous output streaming.
+- Normalize Windows canonical paths via component prefix matching to prevent `\\?\` and `\\?\UNC\` prefix mismatches in workspace session grouping.
 
 ## Commits
 
@@ -44,4 +50,5 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 - 6352ae1 — fix(triaged): support worktrees created from bare repositories in git_repository_root
 - 5107f52 — fix(triaged): address PR review comments for worktree session grouping
 - 44a9add — docs(devlog): rename branch devlog to match git branch name convention
-- HEAD — perf(triaged): refresh only branch context when cwd unchanged and remove dead state
+- 033f313 — perf(triaged): refresh only branch context when cwd unchanged and remove dead state
+- HEAD — fix(triaged): robust session grouping for worktrees, detached HEAD, and Windows UNC
