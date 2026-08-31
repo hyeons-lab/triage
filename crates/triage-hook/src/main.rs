@@ -21,7 +21,7 @@
 //! It also loads no model. The resident model belongs to the daemon; this
 //! process only carries a question to it.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -175,13 +175,13 @@ fn extract_cwd(val: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_session_id(val: &serde_json::Value) -> SessionId {
-    if let Some(id) = std::env::var(SESSION_ENV)
-        .ok()
-        .and_then(|raw| SessionId::new(&raw).ok())
-    {
-        return id;
-    }
-    for key in ["session_id", "sessionId", "session"] {
+    for key in [
+        "session_id",
+        "sessionId",
+        "session",
+        "conversationId",
+        "conversation_id",
+    ] {
         if let Some(id) = val
             .get(key)
             .and_then(|v| v.as_str())
@@ -189,6 +189,12 @@ fn extract_session_id(val: &serde_json::Value) -> SessionId {
         {
             return id;
         }
+    }
+    if let Some(id) = std::env::var(SESSION_ENV)
+        .ok()
+        .and_then(|raw| SessionId::new(&raw).ok())
+    {
+        return id;
     }
     SessionId::default()
 }
@@ -202,9 +208,20 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
         "cmd",
         "script",
         "code",
+        "Input",
+        "input",
     ] {
         if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
-            return Some(val.to_string());
+            let trimmed = val.trim();
+            let unquoted =
+                if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+                {
+                    trimmed[1..trimmed.len() - 1].trim()
+                } else {
+                    trimmed
+                };
+            return Some(unquoted.to_string());
         }
     }
     None
@@ -212,7 +229,15 @@ fn extract_command_line(args: &serde_json::Value) -> Option<String> {
 
 fn extract_path(args: &serde_json::Value) -> Option<String> {
     if let Some(s) = args.as_str() {
-        return (s != "." && s != "..").then(|| s.to_string());
+        let trimmed = s.trim();
+        let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+        {
+            trimmed[1..trimmed.len() - 1].trim()
+        } else {
+            trimmed
+        };
+        return (unquoted != "." && unquoted != "..").then(|| unquoted.to_string());
     }
     for key in [
         "AbsolutePath",
@@ -249,11 +274,17 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
         "Uri",
         "uri",
     ] {
-        if let Some(val) = args.get(key).and_then(|v| v.as_str())
-            && val != "."
-            && val != ".."
-        {
-            return Some(val.to_string());
+        if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
+            let trimmed = val.trim();
+            let unquoted =
+                if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+                {
+                    trimmed[1..trimmed.len() - 1].trim()
+                } else {
+                    trimmed
+                };
+            return (unquoted != "." && unquoted != "..").then(|| unquoted.to_string());
         }
     }
     if let Some(obj) = args.as_object() {
@@ -298,12 +329,33 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         }
     }
 
-    // Auto-detect format based on characteristic payload keys
-    if val.get("conversationId").is_some() || val.get("stepIdx").is_some() {
-        return AgentFormat::Antigravity;
-    }
-    if val.get("hook_event_name").is_some() || val.get("hookEventName").is_some() {
+    if std::env::var("CLAUDE_CODE_VERSION").is_ok() || std::env::var("CLAUDE_PROJECT_DIR").is_ok() {
         return AgentFormat::ClaudeCode;
+    }
+
+    // Claude Code specific payload fields
+    if val.get("hook_event_name").is_some()
+        || val.get("hookEventName").is_some()
+        || val.get("tool_input").is_some()
+        || val.get("toolInput").is_some()
+        || val.get("permission_mode").is_some()
+        || val.get("permissionMode").is_some()
+    {
+        return AgentFormat::ClaudeCode;
+    }
+
+    // Antigravity specific payload fields
+    if val.get("conversationId").is_some()
+        || val.get("stepIdx").is_some()
+        || val.get("toolCall").is_some()
+        || val.get("tool_call").is_some()
+        || val.get("workspacePaths").is_some()
+        || val.get("workspace_paths").is_some()
+        || val.get("transcriptPath").is_some()
+        || val.get("artifactDirectoryPath").is_some()
+        || val.get("modelName").is_some()
+    {
+        return AgentFormat::Antigravity;
     }
 
     AgentFormat::Antigravity
@@ -391,204 +443,412 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     }
 }
 
+static BASE_COMMAND_PREFIXES: &[&str] = &[
+    "command",
+    "run_command",
+    "Bash",
+    "bash",
+    "exec",
+    "executecommand",
+    "shell",
+    "terminal",
+    "self:command",
+    "self:run_command",
+    "self:Bash",
+    "self:bash",
+    "self:exec",
+    "self:executecommand",
+    "self:shell",
+    "self:terminal",
+    "subagent:command",
+    "subagent:run_command",
+    "subagent:Bash",
+    "subagent:bash",
+    "subagent:exec",
+    "subagent:executecommand",
+    "subagent:shell",
+    "subagent:terminal",
+];
+
+static READ_FILE_PREFIXES: &[&str] = &[
+    "file",
+    "view_file",
+    "grep_search",
+    "find_by_name",
+    "list_dir",
+    "read_file",
+    "read",
+    "self:file",
+    "self:view_file",
+    "self:grep_search",
+    "self:find_by_name",
+    "self:list_dir",
+    "self:read_file",
+    "self:read",
+    "subagent:file",
+    "subagent:view_file",
+    "subagent:grep_search",
+    "subagent:find_by_name",
+    "subagent:list_dir",
+    "subagent:read_file",
+    "subagent:read",
+];
+
+static EDIT_FILE_PREFIXES: &[&str] = &[
+    "file",
+    "write_to_file",
+    "replace_file_content",
+    "edit_file",
+    "write",
+    "edit",
+    "self:file",
+    "self:write_to_file",
+    "self:replace_file_content",
+    "self:edit_file",
+    "self:write",
+    "self:edit",
+    "subagent:file",
+    "subagent:write_to_file",
+    "subagent:replace_file_content",
+    "subagent:edit_file",
+    "subagent:write",
+    "subagent:edit",
+];
+
+/// Reports whether `payload` can be wrapped in a `command(...)` or `file(...)`
+/// grant token without its parentheses becoming ambiguous.
+///
+/// The grant syntax has no escape for the closing paren, so a payload whose own
+/// parentheses do not nest cleanly (`grep -n "foo)" main.rs`) yields a token
+/// that either terminates early or never terminates at all. Either reading
+/// describes a command other than the one that was judged, so emitting nothing
+/// is strictly better: the narrower per-segment and per-program grants for the
+/// same call are still emitted alongside it.
+fn is_balanced_grant_payload(payload: &str) -> bool {
+    payload
+        .chars()
+        .try_fold(0usize, |depth, ch| match ch {
+            '(' => Some(depth + 1),
+            ')' => depth.checked_sub(1),
+            _ => Some(depth),
+        })
+        .is_some_and(|depth| depth == 0)
+}
+
+fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
+    if req.command_line.is_none() && req.path.is_none() {
+        return Vec::new();
+    }
+    let mut permission_overrides = Vec::new();
+    let norm_tool = triage_core::judge_rules::normalize_tool_name(&req.tool_name);
+    let custom_sub = format!("subagent:{}", req.tool_name);
+    let custom_self = format!("self:{}", req.tool_name);
+
+    if let Some(ref cmd) = req.command_line {
+        for &prefix in BASE_COMMAND_PREFIXES {
+            permission_overrides.push(format!("{prefix}(*)"));
+        }
+        permission_overrides.push(format!("{}(*)", req.tool_name));
+        permission_overrides.push(format!("{custom_sub}(*)"));
+        permission_overrides.push(format!("{custom_self}(*)"));
+        if norm_tool != req.tool_name {
+            permission_overrides.push(format!("{norm_tool}(*)"));
+            permission_overrides.push(format!("subagent:{norm_tool}(*)"));
+            permission_overrides.push(format!("self:{norm_tool}(*)"));
+        }
+
+        let mut add_command_override = |cmd_str: &str| {
+            let trimmed_target = cmd_str.trim();
+            if trimmed_target.is_empty() || !is_balanced_grant_payload(trimmed_target) {
+                return;
+            }
+            for &prefix in BASE_COMMAND_PREFIXES {
+                permission_overrides.push(format!("{prefix}({trimmed_target})"));
+            }
+            permission_overrides.push(format!("{}({trimmed_target})", req.tool_name));
+            permission_overrides.push(format!("{custom_sub}({trimmed_target})"));
+            permission_overrides.push(format!("{custom_self}({trimmed_target})"));
+            if norm_tool != req.tool_name {
+                permission_overrides.push(format!("{norm_tool}({trimmed_target})"));
+                permission_overrides.push(format!("subagent:{norm_tool}({trimmed_target})"));
+                permission_overrides.push(format!("self:{norm_tool}({trimmed_target})"));
+            }
+
+            if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
+                let trimmed_sub = without_dot_slash.trim();
+                if !trimmed_sub.is_empty() {
+                    for &prefix in BASE_COMMAND_PREFIXES {
+                        permission_overrides.push(format!("{prefix}({trimmed_sub})"));
+                    }
+                    permission_overrides.push(format!("{}({trimmed_sub})", req.tool_name));
+                    permission_overrides.push(format!("{custom_sub}({trimmed_sub})"));
+                    permission_overrides.push(format!("{custom_self}({trimmed_sub})"));
+                    if norm_tool != req.tool_name {
+                        permission_overrides.push(format!("{norm_tool}({trimmed_sub})"));
+                        permission_overrides.push(format!("subagent:{norm_tool}({trimmed_sub})"));
+                        permission_overrides.push(format!("self:{norm_tool}({trimmed_sub})"));
+                    }
+                }
+            }
+        };
+
+        let trimmed = cmd.trim();
+        add_command_override(trimmed);
+        let stripped = strip_leading_env_vars(trimmed);
+        if stripped != trimmed && !stripped.is_empty() {
+            add_command_override(stripped);
+        }
+        let stripped_redirs = triage_core::judge_rules::strip_null_redirections(stripped);
+        if stripped_redirs.as_ref() != stripped && !stripped_redirs.trim().is_empty() {
+            add_command_override(stripped_redirs.trim());
+        }
+        // Extract all chain & pipeline segments (e.g. for &&, ||, ;, |, \n)
+        let segments = triage_core::judge::pipeline_and_chain_segments(trimmed);
+        for seg in &segments {
+            let seg_trimmed = seg.trim();
+            if !seg_trimmed.is_empty() && seg_trimmed != trimmed {
+                add_command_override(seg_trimmed);
+            }
+            let stripped_seg = strip_leading_env_vars(seg_trimmed);
+            if stripped_seg != seg_trimmed && !stripped_seg.is_empty() {
+                add_command_override(stripped_seg);
+            }
+            let seg_stripped_redirs =
+                triage_core::judge_rules::strip_null_redirections(stripped_seg);
+            if seg_stripped_redirs.as_ref() != stripped_seg
+                && !seg_stripped_redirs.trim().is_empty()
+            {
+                add_command_override(seg_stripped_redirs.trim());
+            }
+            let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
+            let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
+            if words.len() >= 2 {
+                let prog = triage_core::judge_rules::program_name(words[0]);
+                if prog == "git" {
+                    if let Some((subcommand, _)) =
+                        triage_core::judge_rules::parse_git_subcommand(&words[1..])
+                    {
+                        add_command_override(&format!("git {subcommand}"));
+                        if let Some(sub_idx) = words[1..].iter().position(|&w| w == subcommand) {
+                            let prefix_words = &words[..=sub_idx + 1];
+                            let git_with_globals = prefix_words.join(" ");
+                            if git_with_globals != format!("git {subcommand}") {
+                                add_command_override(&git_with_globals);
+                            }
+                        }
+                    }
+                } else if prog == "gh" {
+                    if words.len() >= 3
+                        && matches!(
+                            words[1],
+                            "pr" | "issue" | "run" | "repo" | "release" | "workflow" | "api"
+                        )
+                    {
+                        add_command_override(&format!("gh {} {}", words[1], words[2]));
+                        add_command_override(&format!("gh {}", words[1]));
+                    } else if words.len() >= 2 {
+                        add_command_override(&format!("gh {}", words[1]));
+                    }
+                } else if !words[1].starts_with('-')
+                    && !words[1].starts_with('"')
+                    && !words[1].starts_with('\'')
+                    && !words[0].contains('=')
+                {
+                    add_command_override(&format!("{} {}", words[0], words[1]));
+                    if prog != words[0] {
+                        add_command_override(&format!("{prog} {}", words[1]));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ref path) = req.path {
+        let base_file_slice = if triage_core::judge_rules::is_edit_tool(&req.tool_name) {
+            EDIT_FILE_PREFIXES
+        } else {
+            READ_FILE_PREFIXES
+        };
+
+        let clean_path = path.strip_prefix("file://").unwrap_or(path);
+        let lower_path = clean_path.to_ascii_lowercase();
+        let is_url = lower_path.starts_with("http://")
+            || lower_path.starts_with("https://")
+            || lower_path.starts_with("ws://")
+            || lower_path.starts_with("wss://");
+        if !is_url {
+            for &prefix in base_file_slice {
+                permission_overrides.push(format!("{prefix}(*)"));
+            }
+            permission_overrides.push(format!("{}(*)", req.tool_name));
+            permission_overrides.push(format!("{custom_sub}(*)"));
+            permission_overrides.push(format!("{custom_self}(*)"));
+            if norm_tool != req.tool_name {
+                permission_overrides.push(format!("{norm_tool}(*)"));
+                permission_overrides.push(format!("subagent:{norm_tool}(*)"));
+                permission_overrides.push(format!("self:{norm_tool}(*)"));
+            }
+        }
+        let mut add_path_override = |p_str: &str| {
+            if !is_url && is_balanced_grant_payload(p_str) {
+                for &prefix in base_file_slice {
+                    permission_overrides.push(format!("{prefix}({p_str})"));
+                }
+                permission_overrides.push(format!("{}({p_str})", req.tool_name));
+                permission_overrides.push(format!("{custom_sub}({p_str})"));
+                permission_overrides.push(format!("{custom_self}({p_str})"));
+                if norm_tool != req.tool_name {
+                    permission_overrides.push(format!("{norm_tool}({p_str})"));
+                    permission_overrides.push(format!("subagent:{norm_tool}({p_str})"));
+                    permission_overrides.push(format!("self:{norm_tool}({p_str})"));
+                }
+            }
+        };
+        add_path_override(clean_path);
+        let home_trimmed = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .map(|h| h.trim_end_matches(['/', '\\']).to_string());
+        if !is_url && let Some(ref home) = home_trimmed {
+            let is_tilde_home =
+                clean_path == "~" || clean_path.starts_with("~/") || clean_path.starts_with("~\\");
+            if is_tilde_home {
+                let sub = if clean_path == "~" {
+                    ""
+                } else {
+                    &clean_path[1..]
+                };
+                let expanded = if sub.is_empty() {
+                    home.clone()
+                } else if home.contains('\\') {
+                    format!("{home}{}", sub.replace('/', "\\"))
+                } else {
+                    format!("{home}{}", sub.replace('\\', "/"))
+                };
+                add_path_override(&expanded);
+                if home.contains('\\') && sub.contains('/') {
+                    let fwd_expanded = format!("{home}{sub}");
+                    if fwd_expanded != expanded {
+                        add_path_override(&fwd_expanded);
+                    }
+                }
+            } else {
+                let norm_path = clean_path.replace('\\', "/");
+                let norm_home = home.replace('\\', "/");
+                let matches_home = if cfg!(windows) || home.contains('\\') {
+                    norm_path.eq_ignore_ascii_case(&norm_home)
+                        || norm_path
+                            .to_ascii_lowercase()
+                            .starts_with(&format!("{}/", norm_home.to_ascii_lowercase()))
+                } else {
+                    norm_path == norm_home || norm_path.starts_with(&format!("{norm_home}/"))
+                };
+                if matches_home {
+                    let suffix = &norm_path[norm_home.len()..];
+                    let contracted = if suffix.is_empty() {
+                        "~".to_string()
+                    } else {
+                        format!("~{suffix}")
+                    };
+                    add_path_override(&contracted);
+                }
+            }
+        }
+    }
+
+    let mut deduped = Vec::with_capacity(permission_overrides.len());
+    for item in permission_overrides {
+        if !deduped.contains(&item) {
+            deduped.push(item);
+        }
+    }
+    deduped
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookJsonResponse<'a> {
+    decision: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    permission_overrides: &'a [String],
+}
+
 fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
     request: Option<&JudgeRequest>,
 ) -> String {
-    let decision_str = verdict.decision.as_hook_str();
-    match format {
-        AgentFormat::Antigravity | AgentFormat::Generic => {
-            let mut permission_overrides = Vec::new();
-            if verdict.decision == triage_core::judge::JudgeDecision::Allow
-                && let Some(req) = request
-            {
-                if let Some(ref cmd) = req.command_line {
-                    let trimmed = cmd.trim();
-                    permission_overrides.push(format!("command({trimmed})"));
-                    let stripped = strip_leading_env_vars(trimmed);
-                    if stripped != trimmed && !stripped.is_empty() {
-                        permission_overrides.push(format!("command({stripped})"));
+    if format == AgentFormat::ClaudeCode {
+        return match verdict.decision {
+            triage_core::judge::JudgeDecision::Allow => {
+                let reason = if !verdict.reason.is_empty() {
+                    Some(verdict.reason.as_str())
+                } else {
+                    None
+                };
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": reason
                     }
-                    // Extract all chain & pipeline segments (e.g. for &&, ||, ;, |, \n)
-                    let segments = triage_core::judge::pipeline_and_chain_segments(trimmed);
-                    for seg in &segments {
-                        let seg_trimmed = seg.trim();
-                        if !seg_trimmed.is_empty() && seg_trimmed != trimmed {
-                            permission_overrides.push(format!("command({seg_trimmed})"));
-                        }
-                        let stripped_seg = strip_leading_env_vars(seg_trimmed);
-                        if stripped_seg != seg_trimmed && !stripped_seg.is_empty() {
-                            permission_overrides.push(format!("command({stripped_seg})"));
-                        }
-                        let word_strings = triage_core::judge_rules::tokenize_words(stripped_seg);
-                        let words: Vec<&str> = word_strings.iter().map(String::as_str).collect();
-                        if words.len() >= 2 {
-                            if triage_core::judge_rules::program_name(words[0]) == "git" {
-                                if let Some((subcommand, _)) =
-                                    triage_core::judge_rules::parse_git_subcommand(&words[1..])
-                                {
-                                    permission_overrides.push(format!("command(git {subcommand})"));
-                                }
-                            } else if !words[1].starts_with('-')
-                                && !words[1].starts_with('"')
-                                && !words[1].starts_with('\'')
-                                && !words[0].contains('=')
-                            {
-                                permission_overrides
-                                    .push(format!("command({} {})", words[0], words[1]));
-                            }
-                        }
-                    }
-                }
-                if let Some(ref path) = req.path {
-                    let clean_path = path.strip_prefix("file://").unwrap_or(path);
-                    let lower_path = clean_path.to_ascii_lowercase();
-                    let is_url = lower_path.starts_with("http://")
-                        || lower_path.starts_with("https://")
-                        || lower_path.starts_with("ws://")
-                        || lower_path.starts_with("wss://");
-                    let lower_tool = req.tool_name.to_ascii_lowercase();
-                    if !is_url {
-                        permission_overrides.push(format!("file({clean_path})"));
-                    }
-                    permission_overrides.push(format!("{}({clean_path})", req.tool_name));
-                    if lower_tool != req.tool_name {
-                        permission_overrides.push(format!("{lower_tool}({clean_path})"));
-                    }
-                    let home_trimmed = std::env::var("HOME")
-                        .or_else(|_| std::env::var("USERPROFILE"))
-                        .ok()
-                        .map(|h| h.trim_end_matches(['/', '\\']).to_string());
-                    if !is_url && let Some(ref home) = home_trimmed {
-                        let is_tilde_home = clean_path == "~"
-                            || clean_path.starts_with("~/")
-                            || clean_path.starts_with("~\\");
-                        if is_tilde_home {
-                            let sub = if clean_path == "~" {
-                                ""
-                            } else {
-                                &clean_path[1..]
-                            };
-                            let expanded = if sub.is_empty() {
-                                home.clone()
-                            } else if home.contains('\\') {
-                                format!("{home}{}", sub.replace('/', "\\"))
-                            } else {
-                                format!("{home}{}", sub.replace('\\', "/"))
-                            };
-                            permission_overrides.push(format!("file({expanded})"));
-                            permission_overrides.push(format!("{}({expanded})", req.tool_name));
-                            if lower_tool != req.tool_name {
-                                permission_overrides.push(format!("{lower_tool}({expanded})"));
-                            }
-                            if home.contains('\\') && sub.contains('/') {
-                                let fwd_expanded = format!("{home}{sub}");
-                                if fwd_expanded != expanded {
-                                    permission_overrides.push(format!("file({fwd_expanded})"));
-                                    permission_overrides
-                                        .push(format!("{}({fwd_expanded})", req.tool_name));
-                                    if lower_tool != req.tool_name {
-                                        permission_overrides
-                                            .push(format!("{lower_tool}({fwd_expanded})"));
-                                    }
-                                }
-                            }
-                        } else {
-                            let norm_path = clean_path.replace('\\', "/");
-                            let norm_home = home.replace('\\', "/");
-                            let matches_home = if cfg!(windows) || home.contains('\\') {
-                                norm_path.eq_ignore_ascii_case(&norm_home)
-                                    || norm_path.to_ascii_lowercase().starts_with(&format!(
-                                        "{}/",
-                                        norm_home.to_ascii_lowercase()
-                                    ))
-                            } else {
-                                norm_path == norm_home
-                                    || norm_path.starts_with(&format!("{norm_home}/"))
-                            };
-                            if matches_home {
-                                let suffix = &norm_path[norm_home.len()..];
-                                let contracted = if suffix.is_empty() {
-                                    "~".to_string()
-                                } else {
-                                    format!("~{suffix}")
-                                };
-                                permission_overrides.push(format!("file({contracted})"));
-                                permission_overrides
-                                    .push(format!("{}({contracted})", req.tool_name));
-                                if lower_tool != req.tool_name {
-                                    permission_overrides
-                                        .push(format!("{lower_tool}({contracted})"));
-                                }
-                            }
-                        }
-                    }
-                }
-                if triage_core::judge::is_read_only_tool(&req.tool_name.to_ascii_lowercase())
-                    || triage_core::judge::is_edit_tool(&req.tool_name.to_ascii_lowercase())
-                {
-                    permission_overrides.push(format!("tool({})", req.tool_name));
-                    permission_overrides.push(req.tool_name.clone());
-                    let lower_tool = req.tool_name.to_ascii_lowercase();
-                    if lower_tool != req.tool_name {
-                        permission_overrides.push(format!("tool({lower_tool})"));
-                        permission_overrides.push(lower_tool);
-                    }
-                }
-
-                let mut unique_overrides = Vec::with_capacity(permission_overrides.len());
-                for item in permission_overrides {
-                    if !unique_overrides.contains(&item) {
-                        unique_overrides.push(item);
-                    }
-                }
-                permission_overrides = unique_overrides;
+                })
+                .to_string()
             }
-
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct AntigravityResponse<'a> {
-                decision: &'a str,
-                #[serde(skip_serializing_if = "str::is_empty")]
-                reason: &'a str,
-                #[serde(skip_serializing_if = "Vec::is_empty")]
-                permission_overrides: Vec<String>,
+            triage_core::judge::JudgeDecision::Deny => {
+                let reason = if !verdict.reason.is_empty() {
+                    verdict.reason.as_str()
+                } else {
+                    "denied by triage approval judge"
+                };
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason
+                    }
+                })
+                .to_string()
             }
-            serde_json::to_string(&AntigravityResponse {
-                decision: decision_str,
-                reason: &verdict.reason,
-                permission_overrides,
+            triage_core::judge::JudgeDecision::Ask => String::new(),
+        };
+    }
+
+    match verdict.decision {
+        triage_core::judge::JudgeDecision::Allow => {
+            let permission_overrides = request
+                .map(compute_permission_overrides)
+                .unwrap_or_default();
+            let reason_opt = if !verdict.reason.is_empty() {
+                Some(verdict.reason.as_str())
+            } else {
+                None
+            };
+            serde_json::to_string(&HookJsonResponse {
+                decision: "allow",
+                reason: reason_opt,
+                permission_overrides: &permission_overrides,
             })
-            .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
+            .unwrap_or_default()
         }
-        AgentFormat::ClaudeCode => {
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct ClaudeHookSpecificOutput<'a> {
-                hook_event_name: &'static str,
-                permission_decision: &'a str,
-                #[serde(skip_serializing_if = "str::is_empty")]
-                permission_decision_reason: &'a str,
-            }
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct ClaudeResponse<'a> {
-                decision: &'a str,
-                #[serde(skip_serializing_if = "str::is_empty")]
-                reason: &'a str,
-                hook_specific_output: ClaudeHookSpecificOutput<'a>,
-            }
-            serde_json::to_string(&ClaudeResponse {
-                decision: decision_str,
-                reason: &verdict.reason,
-                hook_specific_output: ClaudeHookSpecificOutput {
-                    hook_event_name: "PreToolUse",
-                    permission_decision: decision_str,
-                    permission_decision_reason: &verdict.reason,
-                },
+        triage_core::judge::JudgeDecision::Deny => {
+            let reason_opt = if !verdict.reason.is_empty() {
+                Some(verdict.reason.as_str())
+            } else {
+                None
+            };
+            serde_json::to_string(&HookJsonResponse {
+                decision: "deny",
+                reason: reason_opt,
+                permission_overrides: &[],
             })
-            .unwrap_or_else(|_| r#"{"decision":"ask"}"#.to_string())
+            .unwrap_or_default()
+        }
+        triage_core::judge::JudgeDecision::Ask => {
+            // Only approve or explicitly deny. Everything else falls through silently with no output
+            // so the agent handles the tool call using its own native default permissions.
+            String::new()
         }
     }
 }
@@ -596,30 +856,63 @@ fn encode_response(
 fn main() {
     let (verdict, format, request) = decide();
     let encoded = encode_response(format, &verdict, request.as_ref());
-    let mut stdout = std::io::stdout();
-    let _ = writeln!(stdout, "{encoded}");
-    let _ = stdout.flush();
+    if !encoded.is_empty() {
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout, "{encoded}");
+        let _ = stdout.flush();
+    }
     std::process::exit(0);
 }
+
+const MAX_STDIN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Produces the verdict and detected agent format, resolving every failure to `ask`.
 fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let start_time = std::time::Instant::now();
-    // Spawn stdin reader on a background thread bounded by JUDGE_TIMEOUT.
-    // The reader thread is terminated when main() exits via std::process::exit(0).
+    // Read stdin incrementally in chunks and parse as soon as a complete JSON payload
+    // is received. This prevents blocking on open, unclosed pipes where EOF is not sent.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut reader = std::io::stdin().lock().take(2 * 1024 * 1024);
-        let res = reader.read_to_string(&mut buf).map(|_| buf);
-        let _ = tx.send(res);
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 1024];
+
+        loop {
+            match stdin.read(&mut chunk) {
+                Ok(0) => {
+                    if buf.is_empty() {
+                        let _ = tx.send(Err("empty stdin".to_string()));
+                    } else {
+                        let res = serde_json::from_slice(&buf).map_err(|e| e.to_string());
+                        let _ = tx.send(res);
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    if buf.len() + n > MAX_STDIN_BYTES {
+                        let _ = tx.send(Err("stdin payload exceeded 2MB limit".to_string()));
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                        let _ = tx.send(Ok(val));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                    break;
+                }
+            }
+        }
     });
 
-    let stdin = match rx.recv_timeout(JUDGE_TIMEOUT) {
-        Ok(Ok(content)) => content,
+    let val: serde_json::Value = match rx.recv_timeout(JUDGE_TIMEOUT) {
+        Ok(Ok(val)) => val,
         Ok(Err(error)) => {
             return (
-                JudgeVerdict::fallback(format!("could not read the hook payload: {error}")),
+                JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
                 AgentFormat::Generic,
                 None,
             );
@@ -627,16 +920,6 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
         Err(_) => {
             return (
                 JudgeVerdict::fallback("timed out waiting for stdin payload"),
-                AgentFormat::Generic,
-                None,
-            );
-        }
-    };
-    let val: serde_json::Value = match serde_json::from_str(&stdin) {
-        Ok(val) => val,
-        Err(error) => {
-            return (
-                JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
                 AgentFormat::Generic,
                 None,
             );
@@ -654,15 +937,30 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     let session_id = extract_session_id(&val);
     let cwd = extract_cwd(&val);
     let command_line = extract_command_line(&tool_args);
-    let path = if triage_core::judge::is_command_tool(&tool_name.to_ascii_lowercase()) {
+    let path = if triage_core::judge::is_command_tool(&tool_name) {
         None
     } else {
         extract_path(&tool_args)
     };
 
+    let mut effective_tool = tool_name;
+    let norm = triage_core::judge_rules::normalize_tool_name(&effective_tool);
+    if (norm == "manage_task" || norm == "manage_tasks")
+        && let Some(action) = tool_args
+            .get("Action")
+            .or_else(|| tool_args.get("action"))
+            .and_then(|v| v.as_str())
+    {
+        if action == "status" || action == "list" {
+            effective_tool = "task_status".to_string();
+        } else if action == "kill" || action == "stop" {
+            effective_tool = "task_stop".to_string();
+        }
+    }
+
     let request = JudgeRequest {
         session_id,
-        tool_name,
+        tool_name: effective_tool,
         command_line,
         path,
         cwd,
@@ -879,10 +1177,35 @@ mod tests {
 
     #[test]
     fn response_serializes_to_the_agy_contract() {
-        let verdict = JudgeVerdict {
+        let allow_verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
+        };
+        let allow_req = JudgeRequest {
+            session_id: SessionId::new("123").unwrap(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("git status".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let allow_encoded =
+            encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
+        assert!(allow_encoded.contains(r#""decision":"allow""#));
+        assert!(allow_encoded.contains(r#""permissionOverrides""#));
+        assert!(allow_encoded.contains("command(git status)"));
+        let allow_overrides = compute_permission_overrides(&allow_req);
+        assert!(allow_overrides.iter().any(|s| s == "command(git status)"));
+        assert!(
+            allow_overrides
+                .iter()
+                .any(|s| s == "subagent:run_command(git status)")
+        );
+
+        let ask_verdict = JudgeVerdict {
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "command requires confirmation".to_string(),
         };
         let request = JudgeRequest {
             session_id: SessionId::new("123").unwrap(),
@@ -891,25 +1214,102 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&request));
-        assert_eq!(
-            encoded,
-            r#"{"decision":"allow","reason":"matched allow rule: ls","permissionOverrides":["command(VAR=1 ls -la)","command(ls -la)"]}"#
-        );
-    }
+        let ask_encoded = encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request));
+        assert_eq!(ask_encoded, "");
 
-    #[test]
-    fn response_serializes_to_the_claude_contract() {
-        let verdict = JudgeVerdict {
+        let allow_cmd_verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
-        assert_eq!(
-            encoded,
-            r#"{"decision":"allow","reason":"matched allow rule: ls","hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
+        let allow_cmd_encoded =
+            encode_response(AgentFormat::Antigravity, &allow_cmd_verdict, Some(&request));
+        assert!(allow_cmd_encoded.contains(r#""decision":"allow""#));
+        assert!(allow_cmd_encoded.contains(r#""permissionOverrides""#));
+        assert!(allow_cmd_encoded.contains("command(VAR=1 ls -la)"));
+        let overrides = compute_permission_overrides(&request);
+        assert!(overrides.iter().any(|s| s == "command(VAR=1 ls -la)"));
+        assert!(overrides.iter().any(|s| s == "command(ls -la)"));
+    }
+
+    #[test]
+    fn permission_overrides_for_custom_tool_name_emits_dynamic_tool_prefixes() {
+        let request = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "ExecuteCustomCommand".to_string(),
+            command_line: Some("ls -la".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&request);
+        assert!(overrides.iter().any(|s| s == "command(ls -la)"));
+    }
+
+    #[test]
+    fn permission_overrides_for_git_commands_with_global_flags_emit_bare_and_subcommand_tokens() {
+        let request = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "Bash".to_string(),
+            command_line: Some("git --no-pager diff --stat".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&request);
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(git --no-pager diff --stat)")
         );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(git --no-pager diff)")
+        );
+        assert!(overrides.iter().any(|s| s == "command(git diff)"));
+    }
+
+    #[test]
+    fn permission_overrides_for_gradlew_commands_emit_stripped_and_base_tokens() {
+        let request = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "Bash".to_string(),
+            command_line: Some("./gradlew ktfmtFormat".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&request);
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(./gradlew ktfmtFormat)")
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "command(gradlew ktfmtFormat)")
+        );
+    }
+
+    #[test]
+    fn claude_code_format_emits_spec_compliant_hook_specific_output() {
+        let allow_verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: ls".to_string(),
+        };
+        let encoded_allow = encode_response(AgentFormat::ClaudeCode, &allow_verdict, None);
+        assert_eq!(
+            encoded_allow,
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
+        );
+
+        let ask_verdict = JudgeVerdict {
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
+        };
+        let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None);
+        assert_eq!(encoded_ask, "");
     }
 
     #[test]
@@ -918,20 +1318,46 @@ mod tests {
             serde_json::from_str(r#"{"conversationId": "123", "stepIdx": 1}"#).unwrap();
         assert_eq!(detect_format(&agy_val), AgentFormat::Antigravity);
 
-        let claude_val: serde_json::Value =
+        let tool_call_val: serde_json::Value =
+            serde_json::from_str(r#"{"toolCall": {"name": "run_command"}}"#).unwrap();
+        assert_eq!(detect_format(&tool_call_val), AgentFormat::Antigravity);
+
+        let hook_event_val: serde_json::Value =
             serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
-        assert_eq!(detect_format(&claude_val), AgentFormat::ClaudeCode);
+        assert_eq!(detect_format(&hook_event_val), AgentFormat::ClaudeCode);
+
+        let claude_payload_with_transcript: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_id": "sess-123",
+                "transcript_path": "/path/to/transcript.jsonl",
+                "cwd": "/path/to/project",
+                "permission_mode": "default",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls -la"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_format(&claude_payload_with_transcript),
+            AgentFormat::ClaudeCode
+        );
+
+        let tool_input_val: serde_json::Value =
+            serde_json::from_str(r#"{"tool_name": "Bash", "tool_input": {"command": "ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_format(&tool_input_val), AgentFormat::ClaudeCode);
     }
 
     #[test]
     fn an_empty_reason_is_omitted_rather_than_sent_blank() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Ask,
-            source: triage_core::judge::JudgeSource::Fallback,
+            decision: JudgeDecision::Deny,
+            source: triage_core::judge::JudgeSource::DenyRule,
             reason: String::new(),
         };
         let encoded = encode_response(AgentFormat::Antigravity, &verdict, None);
-        assert_eq!(encoded, r#"{"decision":"ask"}"#);
+        assert_eq!(encoded, r#"{"decision":"deny"}"#);
     }
 
     #[test]
@@ -1049,6 +1475,28 @@ mod tests {
             evaluate_in_process(&safe_req).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
+        let namespaced_view = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "default_api:view_file".to_string(),
+            command_line: None,
+            path: Some("/work/project/src/main.rs".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            evaluate_in_process(&namespaced_view).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        let namespaced_cmd = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "default_api:run_command".to_string(),
+            command_line: Some("git status".to_string()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            evaluate_in_process(&namespaced_cmd).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
         assert_ne!(
             evaluate_in_process(&destructive_req).map(|v| v.decision),
             Some(JudgeDecision::Allow)
@@ -1056,12 +1504,59 @@ mod tests {
     }
 
     #[test]
-    fn extract_session_id_falls_back_safely_when_unspecified() {
-        let val: serde_json::Value = serde_json::json!({});
-        let extracted = extract_session_id(&val);
-        if let Some(expected) = std::env::var(SESSION_ENV)
-            .ok()
-            .and_then(|id| SessionId::new(&id).ok())
+    fn extract_session_id_prefers_explicit_session_id_field() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_id": "session-explicit-123",
+                "sessionId": "session-camel-456",
+                "conversationId": "session-conv-789"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_session_id(&payload),
+            SessionId::new("session-explicit-123").unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_session_id_camel_case() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "sessionId": "session-camel-456",
+                "conversationId": "session-conv-789"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_session_id(&payload),
+            SessionId::new("session-camel-456").unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_conversation_id() {
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "conversationId": "session-conv-789"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_session_id(&payload),
+            SessionId::new("session-conv-789").unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_session_id_falls_back_to_environment_variable() {
+        let payload: serde_json::Value = serde_json::from_str("{}").unwrap();
+        let extracted = extract_session_id(&payload);
+        if let Ok(env_id) = std::env::var(SESSION_ENV)
+            && let Ok(expected) = SessionId::new(env_id)
         {
             assert_eq!(extracted, expected);
             return;
@@ -1081,24 +1576,100 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rules".to_string(),
-        };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides = val["permissionOverrides"].as_array().unwrap();
-        let override_strs: Vec<&str> = overrides.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(override_strs.contains(&"command(echo \"In origin but not local:\")"));
-        assert!(override_strs.contains(&"command(git log 1a1ab03..origin/main --oneline)"));
-        assert!(override_strs.contains(&"command(git log)"));
-        assert!(!override_strs.contains(&"tool(run_command)"));
+        let override_strs = compute_permission_overrides(&req);
+        assert!(
+            override_strs
+                .iter()
+                .any(|s| s == "command(echo \"In origin but not local:\")")
+        );
+        assert!(
+            override_strs
+                .iter()
+                .any(|s| s == "command(git log 1a1ab03..origin/main --oneline)")
+        );
+        assert!(override_strs.iter().any(|s| s == "command(git log)"));
+        assert!(!override_strs.iter().any(|s| s == "tool(run_command)"));
         // Ensure no broad single-word base executable overrides are emitted
-        assert!(!override_strs.contains(&"command(git)"));
-        assert!(!override_strs.contains(&"command(echo)"));
+        assert!(!override_strs.iter().any(|s| s == "command(git)"));
+        assert!(!override_strs.iter().any(|s| s == "command(echo)"));
         // Ensure no malformed unbalanced quotes exist
         assert!(!override_strs.iter().any(|s| s.contains("echo \"In)")));
+    }
+
+    #[test]
+    fn grant_payload_balance_accepts_nested_and_rejects_dangling_parens() {
+        assert!(is_balanced_grant_payload("cargo test --workspace"));
+        assert!(is_balanced_grant_payload(
+            "git commit -m \"fix(judge): thing (again)\""
+        ));
+        assert!(is_balanced_grant_payload("echo $(date)"));
+        // A closing paren with no opener terminates the token early.
+        assert!(!is_balanced_grant_payload("grep -n \"foo)\" main.rs"));
+        // An opener with no closer never terminates the token.
+        assert!(!is_balanced_grant_payload("echo \"(\""));
+    }
+
+    #[test]
+    fn permission_overrides_skip_commands_with_dangling_parens() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("grep -n \"foo)\" main.rs".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let override_strs = compute_permission_overrides(&req);
+        // The unbalanced full-command token must not be emitted at all.
+        assert!(
+            !override_strs.iter().any(|s| s.contains("foo)")),
+            "emitted an unbalanced grant token: {override_strs:?}"
+        );
+        // Every emitted token still parses as a balanced `prefix(payload)`.
+        for token in &override_strs {
+            assert!(
+                is_balanced_grant_payload(token),
+                "unbalanced token emitted: {token}"
+            );
+        }
+        // The wildcard grants that do not embed the command survive.
+        assert!(override_strs.iter().any(|s| s == "command(*)"));
+    }
+
+    #[test]
+    fn permission_overrides_keep_commands_with_balanced_parens() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("git commit -m \"fix(judge): thing\"".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let override_strs = compute_permission_overrides(&req);
+        assert!(
+            override_strs
+                .iter()
+                .any(|s| s == "command(git commit -m \"fix(judge): thing\")"),
+            "dropped a balanced grant token: {override_strs:?}"
+        );
+    }
+
+    #[test]
+    fn permission_overrides_skip_paths_with_dangling_parens() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some("/tmp/weird)name.txt".to_string()),
+            cwd: None,
+        };
+        let override_strs = compute_permission_overrides(&req);
+        for token in &override_strs {
+            assert!(
+                is_balanced_grant_payload(token),
+                "unbalanced token emitted: {token}"
+            );
+        }
+        assert!(!override_strs.iter().any(|s| s.contains("weird)name")));
     }
 
     #[test]
@@ -1116,23 +1687,11 @@ mod tests {
             path: Some("~literal_filename.txt".to_string()),
             cwd: None,
         };
-        let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rules".to_string(),
-        };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_tilde_file));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_tilde_file);
         // Must NOT expand ~literal_filename.txt into /Users/...literal_filename.txt
         let corrupt_expansion = format!("{home}literal_filename.txt");
         assert!(!overrides.iter().any(|s| s.contains(&corrupt_expansion)));
-        assert!(overrides.contains(&"file(~literal_filename.txt)"));
+        assert!(overrides.iter().any(|s| s == "file(~literal_filename.txt)"));
 
         // 2. Sibling user directory (e.g. /home/user_other/repo)
         let sibling_path = format!("{home}_other/repo/file.txt");
@@ -1143,17 +1702,14 @@ mod tests {
             path: Some(sibling_path.clone()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_sibling));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_sibling);
         // Must NOT contract to ~_other/repo/file.txt
         assert!(!overrides.iter().any(|s| s.contains("~_other")));
-        assert!(overrides.contains(&format!("file({sibling_path})").as_str()));
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == &format!("file({sibling_path})"))
+        );
 
         // 3. Valid home directory subpaths
         let valid_tilde = "~/repo/main.rs".to_string();
@@ -1164,17 +1720,14 @@ mod tests {
             path: Some(valid_tilde),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_valid));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_valid);
         let expected_expanded = format!("{home}/repo/main.rs");
-        assert!(overrides.contains(&format!("file({expected_expanded})").as_str()));
-        assert!(overrides.contains(&"file(~/repo/main.rs)"));
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == &format!("file({expected_expanded})"))
+        );
+        assert!(overrides.iter().any(|s| s == "file(~/repo/main.rs)"));
 
         // 4. Exact root home directory paths
         let req_root_home = JudgeRequest {
@@ -1184,22 +1737,15 @@ mod tests {
             path: Some(home.clone()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_root_home));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(overrides.contains(&"file(~)"));
-        assert!(overrides.contains(&format!("file({home})").as_str()));
+        let overrides = compute_permission_overrides(&req_root_home);
+        assert!(overrides.iter().any(|s| s == "file(~)"));
+        assert!(overrides.iter().any(|s| s == &format!("file({home})")));
         // Must NOT emit wildcard overrides for entire home or system users directory
-        assert!(!overrides.contains(&"~/*"));
-        assert!(!overrides.contains(&"file(~/*)"));
-        assert!(!overrides.contains(&format!("{home}/*").as_str()));
-        assert!(!overrides.contains(&"/Users/*"));
-        assert!(!overrides.contains(&"/home/*"));
+        assert!(!overrides.iter().any(|s| s == "~/*"));
+        assert!(!overrides.iter().any(|s| s == "file(~/*)"));
+        assert!(!overrides.iter().any(|s| s == &format!("{home}/*")));
+        assert!(!overrides.iter().any(|s| s == "/Users/*"));
+        assert!(!overrides.iter().any(|s| s == "/home/*"));
 
         // 5. URL arguments must not emit file() or dir/* overrides
         let req_url = JudgeRequest {
@@ -1209,41 +1755,22 @@ mod tests {
             path: Some("https://example.com/api/v1".to_string()),
             cwd: None,
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, Some(&req_url));
-        let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        let overrides: Vec<&str> = val["permissionOverrides"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
+        let overrides = compute_permission_overrides(&req_url);
         assert!(!overrides.iter().any(|s| s.starts_with("file(")));
         assert!(!overrides.iter().any(|s| s.contains("/*")));
     }
 
     #[test]
-    fn claude_code_response_uses_camel_case_keys() {
+    fn generic_response_uses_camel_case_keys() {
         let verdict = JudgeVerdict {
-            decision: JudgeDecision::Allow,
-            source: triage_core::judge::JudgeSource::AllowRule,
-            reason: "matched allow rules".to_string(),
+            decision: JudgeDecision::Deny,
+            source: triage_core::judge::JudgeSource::DenyRule,
+            reason: "destructive command blocked".to_string(),
         };
-        let encoded = encode_response(AgentFormat::ClaudeCode, &verdict, None);
+        let encoded = encode_response(AgentFormat::Generic, &verdict, None);
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(val["decision"], "allow");
-        assert_eq!(val["reason"], "matched allow rules");
-        assert!(val.get("hookSpecificOutput").is_some());
-        let hook_output = &val["hookSpecificOutput"];
-        assert_eq!(hook_output["hookEventName"], "PreToolUse");
-        assert_eq!(hook_output["permissionDecision"], "allow");
-        assert_eq!(
-            hook_output["permissionDecisionReason"],
-            "matched allow rules"
-        );
-        // Ensure no snake_case keys leaked
-        assert!(val.get("hook_specific_output").is_none());
-        assert!(hook_output.get("hook_event_name").is_none());
-        assert!(hook_output.get("permission_decision").is_none());
+        assert_eq!(val["decision"], "deny");
+        assert_eq!(val["reason"], "destructive command blocked");
     }
 
     #[test]
@@ -1447,5 +1974,29 @@ mod tests {
             "path": "."
         });
         assert_eq!(extract_path(&named_dot), None);
+    }
+
+    #[test]
+    fn permission_overrides_pipeline_with_redirection() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("agy --help 2>&1 | head -n 20".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&req);
+        assert!(
+            overrides.iter().any(|s| s == "command(agy --help 2>&1)"),
+            "missing agy --help 2>&1 override: {overrides:?}"
+        );
+        assert!(
+            overrides.iter().any(|s| s == "command(head -n 20)"),
+            "missing head -n 20 override: {overrides:?}"
+        );
+        assert!(
+            !overrides.iter().any(|s| s == "command(1)"),
+            "emitted nonsense command(1) grant: {overrides:?}"
+        );
     }
 }

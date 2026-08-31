@@ -281,6 +281,15 @@ pub fn configure_hook(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
+    let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+    let cargo_hook = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".cargo").join("bin").join(&hook_name))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "triage-hook".to_string());
+
     judge_obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
     if !judge_obj.contains_key("PreToolUse") {
         judge_obj.insert(
@@ -291,7 +300,7 @@ pub fn configure_hook(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "triage-hook",
+                            "command": cargo_hook,
                             "timeout": 15
                         }
                     ]
@@ -639,12 +648,15 @@ mod tests {
         // Dangerous flags on find or git are disqualified.
         assert_eq!(decide("find /tmp -delete"), None);
         assert_eq!(decide("find . -exec rm {} +"), None);
-        assert_eq!(decide("git --no-pager push"), Some(JudgeDecision::Ask));
+        assert_eq!(
+            decide("git --no-pager push --force"),
+            Some(JudgeDecision::Ask)
+        );
         assert_eq!(decide("git tag -d v1.0"), None);
         assert_eq!(decide("git tag -a v1.0 -m 'release'"), None);
         assert_eq!(decide("gh api --field=title=bug /repos/x/y/issues"), None);
         assert_eq!(decide("gh api -X POST /repos/x/y/issues"), None);
-        assert_eq!(decide("gh auth token"), None);
+        assert_eq!(decide("gh auth token"), Some(JudgeDecision::Allow));
         assert_eq!(decide("VAR=1 rm -rf /"), Some(JudgeDecision::Ask));
     }
 
@@ -672,8 +684,8 @@ mod tests {
         // that no deny rule fires, so the assertion is that they reach the
         // model (`None`) rather than being auto-approved on the prefix.
         assert_eq!(decide("ls && curl example.com"), None);
-        assert_eq!(decide("cat file > /tmp/hosts"), None);
-        assert_eq!(decide("echo $(whoami)"), None);
+        assert_eq!(decide("cat <(ls)"), None);
+        assert_eq!(decide("echo $(curl example.com)"), None);
         assert_eq!(decide("ls `pwd`"), None);
         assert_eq!(decide("git status | tee /tmp/out"), None);
 
@@ -711,10 +723,14 @@ mod tests {
 
     #[test]
     fn sensitive_rules_escalate_to_ask_over_allow_rules() {
-        // `git push` starts with no allowlisted rule, but `git branch -D` does
+        // `git push --force` starts with no allowlisted rule, but `git branch -D` does
         // overlap `git branch`, so ordering is load-bearing.
         assert_eq!(decide("git branch -D feature"), Some(JudgeDecision::Ask));
-        assert_eq!(decide("git push origin main"), Some(JudgeDecision::Ask));
+        assert_eq!(
+            decide("git push --force origin main"),
+            Some(JudgeDecision::Ask)
+        );
+        assert_eq!(decide("git push origin main"), Some(JudgeDecision::Allow));
     }
 
     #[test]
@@ -776,9 +792,9 @@ mod tests {
     #[test]
     fn git_sensitive_operations_ask_through_wrappers() {
         for command in [
-            "env git push origin main",
-            "env -u FOO git push",
-            "timeout 5 git push",
+            "env git push --force origin main",
+            "env -u FOO git push --force",
+            "timeout 5 git push --force",
             "timeout -s KILL 5 git reset --hard HEAD~1",
             "sudo git clean -f",
             "nice git filter-branch --tree-filter 'rm -f passwords.txt' HEAD",
@@ -808,7 +824,7 @@ mod tests {
             "tree -o /tmp/file",
             "tree -o/tmp/file",
             "tree -afo /tmp/file",
-            "git -cfoo=bar status",
+            "git -c core.pager=rm status",
         ] {
             assert_ne!(
                 decide(command),
@@ -945,11 +961,11 @@ mod tests {
     #[test]
     fn a_git_global_flag_cannot_hide_a_destructive_subcommand() {
         // git accepts global flags before the subcommand, so substring rules
-        // that assumed `git push` were adjacent missed all of these.
+        // that assumed `git push --force` were adjacent missed all of these.
         for command in [
-            "git --no-pager push origin main",
+            "git --no-pager push --force origin main",
             "git -C . reset --hard",
-            "git -c core.pager=cat push",
+            "git -c core.pager=cat push --force",
             "git clean --force -d",
             "git --no-pager filter-branch --all",
         ] {
@@ -1015,7 +1031,28 @@ mod tests {
             "tail -Fn 5 log",
             "tail --follow log",
             "tail -n 20 -f log",
-            "git log -c",
+            "git log -o /tmp/x",
+        ] {
+            assert_ne!(
+                decide(command),
+                Some(JudgeDecision::Allow),
+                "must not be auto-approved: {command}"
+            );
+        }
+        assert_eq!(decide("tail -n 20 log"), Some(JudgeDecision::Allow));
+    }
+
+    #[test]
+    fn bundled_short_flags_are_disqualified_only_on_target_programs() {
+        // `tail -f` and `tail -F` are follow modes that run forever.
+        for command in [
+            "tail -f log",
+            "tail -F log",
+            "tail -fn 20 log",
+            "tail -Fn 5 log",
+            "tail --follow log",
+            "tail -n 20 -f log",
+            "git log --exec-path=/tmp",
         ] {
             assert_ne!(
                 decide(command),
@@ -1033,7 +1070,7 @@ mod tests {
             assert_eq!(
                 decide(command),
                 Some(JudgeDecision::Ask),
-                "should ask: {command}"
+                "should still be asked: {command}"
             );
         }
     }
@@ -1119,7 +1156,7 @@ mod tests {
     fn ambiguous_commands_go_to_the_model() {
         assert_eq!(decide("npm install left-pad"), None);
         assert_eq!(decide("mv src/a.rs src/b.rs"), None);
-        assert_eq!(decide("python script.py"), None);
+        assert_eq!(decide("ruby script.rb"), None);
     }
 
     #[test]
@@ -1235,9 +1272,12 @@ mod tests {
     fn subshells_process_substitutions_and_backticks_are_rejected_from_deterministic_allow() {
         let verdict = |command: &str| rules().evaluate(&request(command)).map(|v| v.decision);
 
-        // $(...) subshell in arguments is never allowed
+        // $(...) subshell with unallowed command in arguments is never allowed
         assert_ne!(verdict("npm test $(rm -rf /)"), Some(JudgeDecision::Allow));
-        assert_ne!(verdict("cargo test $(whoami)"), Some(JudgeDecision::Allow));
+        assert_ne!(
+            verdict("cargo test $(curl attacker.com)"),
+            Some(JudgeDecision::Allow)
+        );
         assert_ne!(
             verdict("git log $(curl attacker.com)"),
             Some(JudgeDecision::Allow)

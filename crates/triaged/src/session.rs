@@ -1099,6 +1099,7 @@ impl SessionManager {
             reason = %verdict.reason,
             "judged agent tool call"
         );
+
         verdict
     }
 

@@ -706,10 +706,12 @@ class SessionVm {
   int _viewRows = 24;
 
   String? get remoteSessionId {
-    if (sessionId != null) return sessionId;
+    if (sessionId != null && sessionId!.isNotEmpty) return sessionId;
     if (!isRemote) return null;
     final parts = title.split(' / ');
-    return parts.length > 1 ? parts[1] : null;
+    if (parts.length > 1) return parts[1];
+    if (title.startsWith('session-')) return title;
+    return null;
   }
 
   /// Begin the attach/resync lifecycle and stage the raw output-history tail.
@@ -1691,8 +1693,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           return;
         }
 
-        final parts = session.title.split(' / ');
-        final sessionId = parts.length > 1 ? parts[1] : null;
+        final sessionId = session.remoteSessionId;
         if (sessionId != null) {
           _client
               .writeInput(
@@ -1742,8 +1743,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (_clientInitialized &&
           _client.isConnected &&
           session.status == 'attached') {
-        final parts = session.title.split(' / ');
-        final sessionId = parts.length > 1 ? parts[1] : null;
+        final sessionId = session.remoteSessionId;
         if (sessionId != null) {
           ++session.resizeRequestSeq;
           // Tell the host its new PTY size; the program repaints and the live
@@ -3528,8 +3528,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   String? _sessionIdFor(SessionVm session) {
-    final parts = session.title.split(' / ');
-    return parts.length > 1 ? parts[1] : null;
+    return session.remoteSessionId;
   }
 
   void _createSession(NewSessionShell preferredShell) async {

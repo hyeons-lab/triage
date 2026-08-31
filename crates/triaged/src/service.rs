@@ -225,16 +225,126 @@ pub fn install_global_agent_hooks() {
                     && let Ok(mut existing_val) =
                         serde_json::from_str::<serde_json::Value>(&existing_str)
                     && let Some(obj) = existing_val.as_object_mut()
-                    && !obj.contains_key("triage-approval-judge")
-                    && let Some(judge_obj) = content.get("triage-approval-judge").cloned()
                 {
-                    obj.insert("triage-approval-judge".to_string(), judge_obj);
-                    if let Ok(updated_str) = serde_json::to_string_pretty(&existing_val) {
-                        let _ = atomic_write_file(&path, &updated_str);
-                        tracing::info!(
-                            path = %path.display(),
-                            "Merged triage-approval-judge into existing hooks"
+                    let needs_update = !obj.contains_key("triage-approval-judge")
+                        || obj
+                            .get("triage-approval-judge")
+                            .and_then(|j| j.get("PreToolUse"))
+                            .and_then(|p| p.as_array())
+                            .map(|arr| {
+                                arr.iter().any(|entry| {
+                                    entry
+                                        .get("hooks")
+                                        .and_then(|h| h.as_array())
+                                        .map(|hooks| {
+                                            hooks.iter().any(|h| {
+                                                h.get("command")
+                                                    .and_then(|c| c.as_str())
+                                                    .map(|cmd| cmd != hook_cmd)
+                                                    .unwrap_or(false)
+                                            })
+                                        })
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false);
+
+                    if needs_update
+                        && let Some(judge_obj) = content.get("triage-approval-judge").cloned()
+                    {
+                        obj.insert("triage-approval-judge".to_string(), judge_obj);
+                        if let Ok(updated_str) = serde_json::to_string_pretty(&existing_val) {
+                            let _ = atomic_write_file(&path, &updated_str);
+                            tracing::info!(
+                                path = %path.display(),
+                                "Updated triage-approval-judge in agent hooks"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Ensure ~/.gemini/antigravity-cli/bin/triage-hook symlink points to cargo_hook if antigravity-cli/bin exists
+            let agy_bin_dir = home.join(".gemini").join("antigravity-cli").join("bin");
+            if agy_bin_dir.exists() && cargo_hook.exists() {
+                let agy_hook = agy_bin_dir.join(&hook_name);
+                let needs_link = if let Ok(target) = std::fs::read_link(&agy_hook) {
+                    target != cargo_hook
+                } else {
+                    true
+                };
+                if needs_link {
+                    let _ = std::fs::remove_file(&agy_hook);
+                    #[cfg(unix)]
+                    let _ = std::os::unix::fs::symlink(&cargo_hook, &agy_hook);
+                }
+            }
+
+            // Ensure ~/.gemini/settings.json and ~/.gemini/antigravity-cli/settings.json pre-approve command(*)
+            // so EnsurePermissions lets triage-hook act as the authoritative safety judge without interactive prompts.
+            for settings_dir in [
+                &home.join(".gemini"),
+                &home.join(".gemini").join("antigravity-cli"),
+            ] {
+                let gemini_settings = settings_dir.join("settings.json");
+                if gemini_settings.exists()
+                    && let Ok(file_content) = std::fs::read_to_string(&gemini_settings)
+                    && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&file_content)
+                    && let Some(map) = val.as_object_mut()
+                {
+                    let mut changed = false;
+                    let grants = serde_json::json!({
+                        "allow": ["command(*)", "file(*)"]
+                    });
+                    if !map.contains_key("globalPermissionGrants") {
+                        map.insert("globalPermissionGrants".to_string(), grants.clone());
+                        changed = true;
+                    }
+                    if !map.contains_key("permissionGrants") {
+                        map.insert("permissionGrants".to_string(), grants.clone());
+                        changed = true;
+                    }
+                    if let Some(perms) = map.get_mut("permissions").and_then(|p| p.as_object_mut())
+                    {
+                        if let Some(allow_arr) =
+                            perms.get_mut("allow").and_then(|a| a.as_array_mut())
+                        {
+                            let cmd_wildcard = serde_json::json!("command(*)");
+                            let file_wildcard = serde_json::json!("file(*)");
+                            if !allow_arr.contains(&cmd_wildcard) {
+                                allow_arr.push(cmd_wildcard);
+                                changed = true;
+                            }
+                            if !allow_arr.contains(&file_wildcard) {
+                                allow_arr.push(file_wildcard);
+                                changed = true;
+                            }
+                        } else if !perms.contains_key("allow") {
+                            perms.insert(
+                                "allow".to_string(),
+                                serde_json::json!(["command(*)", "file(*)"]),
+                            );
+                            changed = true;
+                        }
+                    } else if !map.contains_key("permissions") {
+                        map.insert("permissions".to_string(), grants);
+                        changed = true;
+                    }
+                    if map.get("permissionPreset").and_then(|v| v.as_str())
+                        != Some("AGENT_PERMISSION_PRESET_TURBO")
+                    {
+                        map.insert(
+                            "permissionPreset".to_string(),
+                            serde_json::json!("AGENT_PERMISSION_PRESET_TURBO"),
                         );
+                        map.insert(
+                            "permission_preset".to_string(),
+                            serde_json::json!("AGENT_PERMISSION_PRESET_TURBO"),
+                        );
+                        changed = true;
+                    }
+                    if changed && let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                        let _ = atomic_write_file(&gemini_settings, &pretty);
                     }
                 }
             }

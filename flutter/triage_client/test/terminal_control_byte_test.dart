@@ -6,6 +6,8 @@ void main() {
     test('maps letters to their control code, case-insensitively', () {
       expect(controlByteForChar('c'), '\x03'); // Ctrl+C -> SIGINT
       expect(controlByteForChar('C'), '\x03');
+      expect(controlByteForChar('k'), '\x0b'); // Ctrl+K
+      expect(controlByteForChar('K'), '\x0b');
       expect(controlByteForChar('a'), '\x01'); // Ctrl+A
       expect(controlByteForChar('z'), '\x1a'); // Ctrl+Z -> SIGTSTP
       expect(controlByteForChar('d'), '\x04'); // Ctrl+D -> EOF
