@@ -528,6 +528,11 @@ fn is_dangerous_git_network_arg(arg: &str) -> bool {
         || lower.contains("fd::")
         || lower.starts_with("--upload-pack")
         || lower.starts_with("--exec")
+}
+
+fn is_dangerous_git_clone_arg(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    is_dangerous_git_network_arg(arg)
         || lower == "-u"
         || (lower.starts_with("-u") && !lower.starts_with("--"))
 }
@@ -1028,7 +1033,7 @@ impl JudgeRules {
                         || lower.starts_with("--template=")
                         || lower == "--separate-git-dir"
                         || lower.starts_with("--separate-git-dir=")
-                        || is_dangerous_git_network_arg(arg)
+                        || is_dangerous_git_clone_arg(arg)
                 }) {
                     None
                 } else {

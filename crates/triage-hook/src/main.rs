@@ -871,9 +871,11 @@ fn compute_permission_overrides(req: &JudgeRequest, agent_name: Option<&str>) ->
     if req.command_line.is_none() && req.path.is_none() {
         return Vec::new();
     }
-    let mut permission_overrides = Vec::new();
     let tool_variants = generate_tool_casing_variants(&req.tool_name);
     let agent_prefixes = generate_agent_prefixes(agent_name);
+    let estimated_cap =
+        BASE_COMMAND_PREFIXES.len() + (agent_prefixes.len() * tool_variants.len() * 8);
+    let mut permission_overrides = Vec::with_capacity(estimated_cap);
 
     if let Some(ref cmd) = req.command_line {
         for &prefix in BASE_COMMAND_PREFIXES {

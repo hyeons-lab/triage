@@ -35,6 +35,11 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 - `.github/workflows/code-review.yml`:
   - Fixed action input key name from `model` to `gemini_model` for `google-github-actions/run-gemini-cli@v0.1.22` and pinned to `gemini-3.7-flash`.
 
+- `crates/triage-core/src/judge_rules.rs`:
+  - Scoped short-flag `-u` (upload-pack) check specifically to `git clone` via `is_dangerous_git_clone_arg`, ensuring standard upstream tracking pulls like `git pull -u origin main` remain allowlisted.
+- `crates/triage-hook/src/main.rs`:
+  - Pre-allocated `permission_overrides` capacity to eliminate repetitive vector growth during Cartesian product generation.
+
 ## Decisions
 
 - Background task inspection tools (`task_output`, `get_task_output`) are read-only and safe to auto-approve.
@@ -44,6 +49,7 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 - Antigravity review workflow is unified with Cera's architecture, providing interactive `@antigravity` PR comment triggers and dynamic effort configuration.
 - Agent hook permission overrides must cover all naming conventions (PascalCase, camelCase, snake_case) and subagent namespaces (`${agent}:${tool}`) to ensure seamless execution in agent permission evaluators.
 - Format detection must strictly require Claude-specific fields (`hook_event_name` / `hookEventName`) so that standard `tool_input` payloads are not misrouted to Claude Code schema.
+- Dangerous upload-pack short flag `-u` is restricted to `git clone` without impacting `git pull -u` tracking branch updates.
 
 ## Commits
 
@@ -53,6 +59,7 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 - 598d1d8 — refactor(session): optimize judge history ring buffer merge and clarify git rule invariants
 - f654abb — fix(hook): emit subagent and multi-casing permission overrides in approval judge hook
 - c92abef — fix(ci): update code review workflow model to gemini-3.7-flash
-- HEAD — fix(hook): restrict Claude format detection to hook event names to prevent Antigravity payload misdetection
+- 8c487ab — fix(hook): restrict Claude format detection to hook event names to prevent Antigravity payload misdetection
+- HEAD — fix(judge): scope -u upload-pack check to git clone and pre-allocate hook overrides
 
 
