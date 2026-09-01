@@ -1,0 +1,43 @@
+# Devlog: 000132-feat-siderail-search-and-summaries
+
+## Agent
+Antigravity
+
+## Intent
+Add a search feature to the side rail in the Flutter client to easily filter and locate sessions across repository, current working directory (cwd), worktree, session summaries (snippet & detail), title, and branch. Audit session summaries to ensure they always state the repository and worktree (when known) and retain the initial/main body of work description without losing historical context.
+
+## What Changed
+- **Flutter Siderail Search**:
+  - Added `SessionSearchInput` and `SessionVm.matchesSearch` to search across repository (`repoRoot`, `repoName`), worktree (`worktreeRoot`, `worktreeName`, `inferredWorktreeRoot`), current working directory (`cwd`), summaries (`snippet`, `snippetDetail`), titles (`title`, `displayTitle`, `railTitle`), branch (`branch`, `inferredBranch`), and `sessionId`.
+  - Converted `SessionRail` in `flutter/triage_client/lib/main.dart` to a `StatefulWidget` managing a search query input field with instant filtering, clear button, and custom "No matching sessions" empty state.
+  - Preserved accurate session selection mapping back to the master session list when tapping filtered search results.
+  - Disabled drag reordering during search filtering to prevent reorder index corruption.
+- **Session Summary Engine & Prompt Audit**:
+  - Updated `build_prompt_text` in `crates/triaged/src/summarizer.rs` to keep both initial output lines (`MAX_HEAD_ROWS = 8`) and tail output lines (`MAX_TAIL_ROWS = 16`) separated by `\n[...]\n` rather than only taking the last 20 rows, preserving the session's initial command, goal, and context across long-running scrollback.
+  - Updated summarizer system prompts (`SYSTEM_PROMPT` and `DETAIL_SYSTEM_PROMPT`) to instruct the model to describe the initial/main body of work description and current state, never degrading to a generic idle prompt.
+  - Updated `generate_detail` to accept `cwd: Option<&Path>` and fall back to the working directory leaf when outside a git repository, guaranteeing a localization header whenever the directory is known.
+  - Propagated `cwd` through `SummarizeJob` and actor `SummaryRowsResponse` in `crates/triaged/src/session.rs`.
+- **Tests**:
+  - Added Rust unit test `build_prompt_preserves_head_and_tail_on_long_output` in `crates/triaged/src/summarizer.rs`.
+  - Added Flutter unit tests for `SessionSearchInput.matchesQuery` across all fields in `flutter/triage_client/test/session_rail_layout_test.dart`.
+  - Added Flutter widget tests for `SessionRail` search filtering, result selection, non-matching query handling, and clearing search in `flutter/triage_client/test/session_rail_identity_test.dart`.
+
+## Decisions
+- Used pure Dart `SessionSearchInput.matchesQuery` in `session_rail_layout.dart` for testable filtering decoupled from Flutter UI widgets.
+- Head-and-tail prompt retention joins head lines (up to 8 non-empty lines) and tail lines (up to 16 non-empty lines) with `\n[...]\n` when total lines exceed 24, giving the LLM summarizer both the original task definition and the latest progress.
+
+## Issues
+- None.
+
+## Commits
+- HEAD — feat: add siderail search and audit session summaries
+
+## Progress
+- [x] Researched codebase and identified search requirements and summary generation pipeline.
+- [x] Implement side rail search UI and filtering logic in Flutter client.
+- [x] Enhance session prompt building and system prompts in Rust daemon (`triaged`).
+- [x] Add unit and widget tests for search filtering and summary preservation.
+- [x] Validate and run checks (`cargo test --workspace`, `flutter test`, clippy, formatting).
+
+## Next Steps
+- Commit changes and open PR.

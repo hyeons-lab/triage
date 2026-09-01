@@ -29,6 +29,70 @@ class RailItem {
   bool get isHeader => sessionId == null;
 }
 
+/// Attributes of a session that can be searched in the side rail.
+class SessionSearchInput {
+  const SessionSearchInput({
+    this.title,
+    this.displayTitle,
+    this.railTitle,
+    this.sessionId,
+    this.repoRoot,
+    this.repoName,
+    this.worktreeRoot,
+    this.worktreeName,
+    this.inferredWorktreeRoot,
+    this.inferredBranch,
+    this.branch,
+    this.cwd,
+    this.snippet,
+    this.snippetDetail,
+  });
+
+  final String? title;
+  final String? displayTitle;
+  final String? railTitle;
+  final String? sessionId;
+  final String? repoRoot;
+  final String? repoName;
+  final String? worktreeRoot;
+  final String? worktreeName;
+  final String? inferredWorktreeRoot;
+  final String? inferredBranch;
+  final String? branch;
+  final String? cwd;
+  final String? snippet;
+  final String? snippetDetail;
+
+  /// Returns true if any searchable field contains [query] (case-insensitive).
+  /// An empty or whitespace-only query matches all sessions.
+  bool matchesQuery(String query) {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return true;
+    final candidates = [
+      title,
+      displayTitle,
+      railTitle,
+      sessionId,
+      repoRoot,
+      repoName,
+      worktreeRoot,
+      worktreeName,
+      inferredWorktreeRoot,
+      inferredBranch,
+      branch,
+      cwd,
+      snippet,
+      snippetDetail,
+    ];
+    for (final candidate in candidates) {
+      if (candidate != null && candidate.toLowerCase().contains(q)) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
 /// Builds rail rows covering [sessionIds], in the order given, with a header
 /// wherever the repository changes.
 ///

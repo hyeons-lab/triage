@@ -634,6 +634,26 @@ class SessionVm {
     return leafOf(root);
   }
 
+  SessionSearchInput toSearchInput([DateTime? now]) => SessionSearchInput(
+    title: title,
+    displayTitle: displayTitle,
+    railTitle: railTitleAt(now ?? DateTime.now()),
+    sessionId: remoteSessionId ?? sessionId,
+    repoRoot: repoRoot,
+    repoName: repoName,
+    worktreeRoot: worktreeRoot,
+    worktreeName: worktreeName,
+    inferredWorktreeRoot: _inferredWorktreeRoot,
+    inferredBranch: _inferredBranch,
+    branch: branch,
+    cwd: cwd,
+    snippet: snippet,
+    snippetDetail: snippetDetail,
+  );
+
+  bool matchesSearch(String query, [DateTime? now]) =>
+      toSearchInput(now).matchesQuery(query);
+
   final String? sessionId;
   final IconData icon;
   // Plain visible rows kept for the test fallback view and demo seeding only;
@@ -4100,7 +4120,7 @@ Widget _railDragProxyDecorator(
   child: child,
 );
 
-class SessionRail extends StatelessWidget {
+class SessionRail extends StatefulWidget {
   const SessionRail({
     super.key,
     required this.sessions,
@@ -4193,8 +4213,35 @@ class SessionRail extends StatelessWidget {
   final VoidCallback onToggleCollapse;
 
   @override
+  State<SessionRail> createState() => _SessionRailState();
+}
+
+class _SessionRailState extends State<SessionRail> {
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onSearchChanged(String value) {
+    setState(() {
+      _searchQuery = value;
+    });
+  }
+
+  void _clearSearch() {
+    _searchController.clear();
+    setState(() {
+      _searchQuery = '';
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final railWidth = isCollapsed
+    final railWidth = widget.isCollapsed
         ? _sessionRailCollapsedWidth
         : _sessionRailExpandedWidth;
 
@@ -4218,13 +4265,13 @@ class SessionRail extends StatelessWidget {
           );
         },
         child: OverflowBox(
-          key: ValueKey<bool>(isCollapsed),
+          key: ValueKey<bool>(widget.isCollapsed),
           alignment: Alignment.topLeft,
           minWidth: railWidth,
           maxWidth: railWidth,
           child: SizedBox(
             width: railWidth,
-            child: isCollapsed ? _buildCollapsedRail() : _buildExpandedRail(),
+            child: widget.isCollapsed ? _buildCollapsedRail() : _buildExpandedRail(),
           ),
         ),
       ),
@@ -4232,12 +4279,12 @@ class SessionRail extends StatelessWidget {
   }
 
   Widget _buildCollapsedRail() {
-    if (isCollapsed) {
+    if (widget.isCollapsed) {
       return Column(
         children: [
           const SizedBox(height: 20),
           IconButton(
-            onPressed: onToggleCollapse,
+            onPressed: widget.onToggleCollapse,
             tooltip: 'Expand sidebar',
             icon: const Icon(
               Icons.chevron_right,
@@ -4247,28 +4294,28 @@ class SessionRail extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           _NewSessionMenu(
-            selectedShell: selectedShell,
-            shellOptions: shellOptions,
-            showShellMenu: showShellMenu,
-            onCreateSession: onCreateSession,
+            selectedShell: widget.selectedShell,
+            shellOptions: widget.shellOptions,
+            showShellMenu: widget.showShellMenu,
+            onCreateSession: widget.onCreateSession,
           ),
           const SizedBox(height: 16),
           Tooltip(
-            message: serverLabel == null
-                ? connectionStatus
-                : '$serverLabel — $connectionStatus',
+            message: widget.serverLabel == null
+                ? widget.connectionStatus
+                : '${widget.serverLabel} — ${widget.connectionStatus}',
             child: Container(
               width: 10,
               height: 10,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: connectionStatusColor,
+                color: widget.connectionStatusColor,
               ),
             ),
           ),
           const SizedBox(height: 8),
           IconButton(
-            onPressed: onOpenSettings,
+            onPressed: widget.onOpenSettings,
             tooltip: 'Daemons',
             icon: const Icon(
               Icons.settings,
@@ -4284,31 +4331,31 @@ class SessionRail extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 8),
               child: Column(
                 children: [
-                  for (final indexed in sessions.indexed)
+                  for (final indexed in widget.sessions.indexed)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),
                       child: Tooltip(
                         message: indexed.$2.displayTitle,
                         child: InkWell(
-                          onTap: () => onSelectSession(indexed.$1),
+                          onTap: () => widget.onSelectSession(indexed.$1),
                           borderRadius: BorderRadius.circular(8),
                           child: Container(
                             width: 48,
                             height: 48,
                             decoration: BoxDecoration(
-                              color: indexed.$1 == selectedIndex
+                              color: indexed.$1 == widget.selectedIndex
                                   ? const Color(0xff233033)
                                   : Colors.transparent,
                               borderRadius: BorderRadius.circular(8),
                               border: Border.all(
-                                color: indexed.$1 == selectedIndex
+                                color: indexed.$1 == widget.selectedIndex
                                     ? const Color(0xff3b5356)
                                     : Colors.transparent,
                               ),
                             ),
                             child: Icon(
                               indexed.$2.icon,
-                              color: indexed.$1 == selectedIndex
+                              color: indexed.$1 == widget.selectedIndex
                                   ? const Color(0xff7fd1c7)
                                   : const Color(0xffcdd7d6),
                               size: 22,
@@ -4334,14 +4381,25 @@ class SessionRail extends StatelessWidget {
     // lazy item builder below so grouping and titles resolve the inferred-worktree
     // window at the same instant.
     final now = DateTime.now();
-    final indistinguishable = indistinguishableRailRows(sessions, now);
+    final indistinguishable = indistinguishableRailRows(widget.sessions, now);
+    final isSearching = _searchQuery.trim().isNotEmpty;
+    final query = _searchQuery.trim();
+
+    final matchingEntries = <({int originalIndex, SessionVm session})>[];
+    for (var i = 0; i < widget.sessions.length; i++) {
+      final session = widget.sessions[i];
+      if (!isSearching || session.matchesSearch(query, now)) {
+        matchingEntries.add((originalIndex: i, session: session));
+      }
+    }
+
     // Headers and rows share one list so there is a single gesture arena;
     // `resolveRailReorder` maps a flat drop index back to the right level. Built
     // from the rail's own sessions, so a session started since the last grouping
     // still gets a row (ungrouped) rather than vanishing until the next load.
     final items = buildRailItems([
-      for (final session in sessions) _rowKeyFor(session),
-    ], sessionGroups);
+      for (final entry in matchingEntries) _rowKeyFor(entry.session),
+    ], widget.sessionGroups);
     // Rows appear in `items` in the same order as `sessions`, so the nth
     // non-header item is the nth session.
     var rowIndex = 0;
@@ -4366,7 +4424,7 @@ class SessionRail extends StatelessWidget {
                 ),
               ),
               IconButton(
-                onPressed: onToggleCollapse,
+                onPressed: widget.onToggleCollapse,
                 tooltip: 'Minimize sidebar',
                 icon: const Icon(
                   Icons.chevron_left,
@@ -4378,7 +4436,7 @@ class SessionRail extends StatelessWidget {
               ),
               const SizedBox(width: 4),
               IconButton(
-                onPressed: onOpenSettings,
+                onPressed: widget.onOpenSettings,
                 tooltip: 'Daemons',
                 icon: const Icon(
                   Icons.settings,
@@ -4390,10 +4448,10 @@ class SessionRail extends StatelessWidget {
               ),
               const SizedBox(width: 4),
               _NewSessionMenu(
-                selectedShell: selectedShell,
-                shellOptions: shellOptions,
-                showShellMenu: showShellMenu,
-                onCreateSession: onCreateSession,
+                selectedShell: widget.selectedShell,
+                shellOptions: widget.shellOptions,
+                showShellMenu: widget.showShellMenu,
+                onCreateSession: widget.onCreateSession,
               ),
             ],
           ),
@@ -4403,12 +4461,12 @@ class SessionRail extends StatelessWidget {
           // Tapping the status opens connection settings — the recovery path
           // when a connect attempt fails.
           child: InkWell(
-            onTap: onOpenSettings,
+            onTap: widget.onOpenSettings,
             borderRadius: BorderRadius.circular(8),
             child: _ConnectionStatus(
-              status: connectionStatus,
-              color: connectionStatusColor,
-              serverLabel: serverLabel,
+              status: widget.connectionStatus,
+              color: widget.connectionStatusColor,
+              serverLabel: widget.serverLabel,
             ),
           ),
         ),
@@ -4430,9 +4488,9 @@ class SessionRail extends StatelessWidget {
               ),
               // Only offered once something is actually pinned, so it doubles as
               // the signal that the rail is holding a manual order at all.
-              if (!pins.isEmpty)
+              if (!widget.pins.isEmpty && !isSearching)
                 IconButton(
-                  onPressed: onResetOrder,
+                  onPressed: widget.onResetOrder,
                   icon: const Icon(Icons.restart_alt, size: 16),
                   color: const Color(0xff7f8b8d),
                   visualDensity: VisualDensity.compact,
@@ -4447,139 +4505,191 @@ class SessionRail extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
-        Expanded(
-          // Wrapped so a drag that ends without a callback still ends the
-          // treatment. `onReorderEnd` covers a normal drop and `_regroupRail`
-          // covers a drag the rail kills itself, but the list has two more exits
-          // that raise neither callback: its own cancel path, which only resets
-          // its state, reached when the platform takes the pointer back; and
-          // `didUpdateWidget`, which calls `cancelReorder` whenever the item
-          // count changes. A session closing or a reconnect reloading the rail
-          // takes that second one, leaving the drag dead with the finger still
-          // down. Watching the raw pointer catches both, because the hit-test
-          // path is recorded at pointer-down and held until the pointer goes up.
-          // It survives this listener being unmounted with the rail, too; see
-          // [_railDragEnded].
-          //
-          // Not scoped to the pointer that started the drag: a second finger
-          // lifting mid-drag clears the dim early. That is a moment of missing
-          // feedback on a gesture that still drops correctly, chosen over a dim
-          // that outlives the drag behind it.
-          child: Listener(
-            onPointerUp: (_) => onRailDragEnd(),
-            onPointerCancel: (_) => onRailDragEnd(),
-            // `ReorderableList` rather than material's `ReorderableListView`, for
-            // its state: only this one exposes `cancelReorder`, which the rail has
-            // to call before re-grouping (see `_regroupRail`). The two are
-            // otherwise the same list, and the material extras it drops are ones
-            // the rail already replaces: `buildDefaultDragHandles` was off because
-            // rows and headers install their own listeners, and the lift shadow is
-            // supplied below.
-            child: ReorderableList(
-              key: railListKey,
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-              proxyDecorator: _railDragProxyDecorator,
-              // `onReorderItem` rather than the deprecated `onReorder`: it reports
-              // `newIndex` already adjusted for the removal at `oldIndex`, which is
-              // the space `resolveRailReorder` works in. The pre-removal
-              // coordinates `onReorder` reports had to be converted there by hand,
-              // and every index bug this rail has had was in that conversion or
-              // downstream of it.
-              onReorderItem: (oldIndex, newIndex) =>
-                  onReorderSession(items, oldIndex, newIndex),
-              // Reported so the host knows a header drag is in flight.
-              // `onReorderEnd` fires at pointer-up; a drag killed by
-              // `cancelReorder` raises neither it nor `onReorderItem`, which is
-              // why the host clears the state there as well.
-              onReorderStart: (index) => onRailDragStart(items, index),
-              onReorderEnd: (_) => onRailDragEnd(),
-              itemCount: items.length,
-              itemBuilder: (context, index) {
-                final item = items[index];
-                if (item.isHeader) {
-                  return _SessionGroupHeader(
-                    key: ValueKey<String>('group:${item.groupKey}'),
-                    index: index,
-                    label: _groupLabelFor(item.groupKey),
-                    pinned: pins.groupKeys.contains(item.groupKey),
-                    onUnpin: () => onUnpinGroup(item.groupKey),
-                    isFirst: index == 0,
-                  );
-                }
-                // `items` is built from `sessions` above, one row each, so
-                // this index is always in range.
-                final sessionIndex = rowIndexFor[index]!;
-                final session = sessions[sessionIndex];
-                final key = ValueKey<String>(_rowKeyFor(session));
-                final tile = SessionListTile(
-                  key: sessionIndex == selectedIndex ? selectedTileKey : null,
-                  selected: sessionIndex == selectedIndex,
-                  title: session.railTitleAt(now),
-                  // The repo-first name for the hover card and screen-reader
-                  // label, following the same lead the title shows (an
-                  // inferred worktree included) so the row reads consistently
-                  // everywhere.
-                  glanceTitle: session.glanceTitleAt(now),
-                  subtitle: session.status,
-                  statusColor: session.statusColor,
-                  icon: session.icon,
-                  branch: session.branch,
-                  repoName: session.repoName,
-                  worktreeName: session.worktreeName,
-                  cwd: session.cwd,
-                  snippet: session.snippet,
-                  snippetDetail: session.snippetDetail,
-                  activityAt: session.snippetUpdatedAt,
-                  pinned: pins.sessionIds.contains(session.remoteSessionId),
-                  onUnpin: session.remoteSessionId == null
-                      ? null
-                      : () => onUnpinSession(session.remoteSessionId!),
-                  indistinguishable: indistinguishable.contains(sessionIndex),
-                  judgeEffective: session.judgePolicyEffective,
-                  judgeExplicit: session.judgePolicyExplicit,
-                  onToggleJudge: onToggleJudgePolicy != null
-                      ? () => onToggleJudgePolicy!(session)
-                      : null,
-                  onTap: () => onSelectSession(sessionIndex),
-                );
-                // Its header is being dragged, so the row reads as lifted with it.
-                // Opacity rather than removing or collapsing the row: the drop
-                // targets are the row geometry, so anything that changes height
-                // here would move the landing slots out from under the gesture
-                // that is choosing between them.
-                //
-                // Wrapped unconditionally so the tree keeps its shape. Inserting
-                // the `Opacity` only while dragging puts a new element under
-                // `SessionListTile` on drag start and takes it away again on drop,
-                // remounting the tile and discarding the state it owns. At 1.0 the
-                // layer is skipped, so the ordinary case pays nothing for it.
-                final lifted =
-                    item.groupKey.isNotEmpty &&
-                    item.groupKey == draggingGroupKey;
-                final tileForDrag = Opacity(
-                  opacity: lifted ? 0.4 : 1.0,
-                  child: tile,
-                );
-                // Touch: a plain drag must scroll the list, so reordering
-                // waits for a long-press
-                // (ReorderableDelayedDragStartListener). Mouse: the whole row
-                // is an immediate drag handle; a click still selects since a
-                // tap registers no movement.
-                final isTouch = isMobilePlatform();
-                return isTouch
-                    ? ReorderableDelayedDragStartListener(
-                        key: key,
-                        index: index,
-                        child: tileForDrag,
-                      )
-                    : ReorderableDragStartListener(
-                        key: key,
-                        index: index,
-                        child: tileForDrag,
-                      );
-              },
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Container(
+            height: 34,
+            decoration: BoxDecoration(
+              color: const Color(0xff1b2327),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: isSearching
+                    ? const Color(0xff4a6266)
+                    : const Color(0xff2b373a),
+              ),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.search,
+                  size: 16,
+                  color: Color(0xff7f8b8d),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: TextField(
+                    controller: _searchController,
+                    onChanged: _onSearchChanged,
+                    style: const TextStyle(
+                      color: Color(0xffcdd7d6),
+                      fontSize: 12,
+                    ),
+                    cursorColor: const Color(0xff7fd1c7),
+                    decoration: const InputDecoration(
+                      hintText: 'Search sessions...',
+                      hintStyle: TextStyle(
+                        color: Color(0xff607073),
+                        fontSize: 12,
+                      ),
+                      border: InputBorder.none,
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(vertical: 6),
+                    ),
+                  ),
+                ),
+                if (isSearching)
+                  IconButton(
+                    onPressed: _clearSearch,
+                    icon: const Icon(Icons.close, size: 14),
+                    color: const Color(0xff7f8b8d),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    tooltip: 'Clear search',
+                  ),
+              ],
             ),
           ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: isSearching && matchingEntries.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.search_off,
+                          size: 32,
+                          color: Color(0xff526366),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'No matching sessions',
+                          style: TextStyle(
+                            color: Color(0xff8b9799),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'No session matches "$query"',
+                          textAlign: TextAlign.center,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xff607073),
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : Listener(
+                  onPointerUp: (_) =>
+                      isSearching ? null : widget.onRailDragEnd(),
+                  onPointerCancel: (_) =>
+                      isSearching ? null : widget.onRailDragEnd(),
+                  child: ReorderableList(
+                    key: widget.railListKey,
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                    proxyDecorator: _railDragProxyDecorator,
+                    onReorderItem: (oldIndex, newIndex) => isSearching
+                        ? null
+                        : widget.onReorderSession(items, oldIndex, newIndex),
+                    onReorderStart: (index) => isSearching
+                        ? null
+                        : widget.onRailDragStart(items, index),
+                    onReorderEnd: (_) =>
+                        isSearching ? null : widget.onRailDragEnd(),
+                    itemCount: items.length,
+                    itemBuilder: (context, index) {
+                      final item = items[index];
+                      if (item.isHeader) {
+                        return _SessionGroupHeader(
+                          key: ValueKey<String>('group:${item.groupKey}'),
+                          index: index,
+                          label: _groupLabelFor(item.groupKey),
+                          pinned: widget.pins.groupKeys.contains(item.groupKey),
+                          onUnpin: () => widget.onUnpinGroup(item.groupKey),
+                          isFirst: index == 0,
+                        );
+                      }
+                      final matchIndex = rowIndexFor[index]!;
+                      final entry = matchingEntries[matchIndex];
+                      final session = entry.session;
+                      final originalIndex = entry.originalIndex;
+                      final key = ValueKey<String>(_rowKeyFor(session));
+                      final tile = SessionListTile(
+                        key: originalIndex == widget.selectedIndex
+                            ? widget.selectedTileKey
+                            : null,
+                        selected: originalIndex == widget.selectedIndex,
+                        title: session.railTitleAt(now),
+                        glanceTitle: session.glanceTitleAt(now),
+                        subtitle: session.status,
+                        statusColor: session.statusColor,
+                        icon: session.icon,
+                        branch: session.branch,
+                        repoName: session.repoName,
+                        worktreeName: session.worktreeName,
+                        cwd: session.cwd,
+                        snippet: session.snippet,
+                        snippetDetail: session.snippetDetail,
+                        activityAt: session.snippetUpdatedAt,
+                        pinned: widget.pins.sessionIds
+                            .contains(session.remoteSessionId),
+                        onUnpin: session.remoteSessionId == null
+                            ? null
+                            : () =>
+                                widget.onUnpinSession(session.remoteSessionId!),
+                        indistinguishable:
+                            indistinguishable.contains(originalIndex),
+                        judgeEffective: session.judgePolicyEffective,
+                        judgeExplicit: session.judgePolicyExplicit,
+                        onToggleJudge: widget.onToggleJudgePolicy != null
+                            ? () => widget.onToggleJudgePolicy!(session)
+                            : null,
+                        onTap: () => widget.onSelectSession(originalIndex),
+                      );
+                      final lifted = item.groupKey.isNotEmpty &&
+                          item.groupKey == widget.draggingGroupKey;
+                      final tileForDrag = Opacity(
+                        opacity: lifted ? 0.4 : 1.0,
+                        child: tile,
+                      );
+                      if (isSearching) {
+                        return KeyedSubtree(key: key, child: tileForDrag);
+                      }
+                      final isTouch = isMobilePlatform();
+                      return isTouch
+                          ? ReorderableDelayedDragStartListener(
+                              key: key,
+                              index: index,
+                              child: tileForDrag,
+                            )
+                          : ReorderableDragStartListener(
+                              key: key,
+                              index: index,
+                              child: tileForDrag,
+                            );
+                    },
+                  ),
+                ),
         ),
       ],
     );

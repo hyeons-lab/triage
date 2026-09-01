@@ -1,8 +1,8 @@
-import 'package:flutter/material.dart' show Icons, MaterialApp, Scaffold;
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:triage_client/main.dart';
+import 'package:triage_client/session_grouping.dart';
 
 SessionVm _session({
   String title = 'triage / abc',
@@ -655,5 +655,143 @@ void main() {
         expect(find.text('triage'), findsOneWidget);
       },
     );
+  });
+
+  group('SessionRail search', () {
+    Widget host(Widget child) => MaterialApp(
+      home: Scaffold(
+        body: Align(
+          alignment: Alignment.topLeft,
+          child: SizedBox(width: 320, height: 800, child: child),
+        ),
+      ),
+    );
+
+    testWidgets('filters sessions by repo, cwd, worktree, summary, and title', (
+      tester,
+    ) async {
+      final s0 = _session(
+        title: 'triage / s0',
+        branch: 'main',
+        repoRoot: '/src/triage',
+        worktreeRoot: '/src/triage',
+      )..snippet = 'compiling core';
+
+      final s1 = _session(
+        title: 'triage / s1',
+        branch: 'feat/widget',
+        repoRoot: '/src/frontend',
+        worktreeRoot: '/src/frontend/worktrees/wt-search',
+      )..snippet = 'flutter test passing';
+
+      final s2 = _session(
+        title: 'triage / s2',
+        cwd: '/var/log/syslog',
+      )..snippet = 'analyzing server logs';
+
+      final sessions = [s0, s1, s2];
+      final groups = [
+        SessionGroup(
+          repoRoot: '/src/triage',
+          sessionIds: ['s0'],
+          lastActivityMs: 100,
+        ),
+        SessionGroup(
+          repoRoot: '/src/frontend',
+          sessionIds: ['s1'],
+          lastActivityMs: 200,
+        ),
+        const SessionGroup(
+          repoRoot: null,
+          sessionIds: ['s2'],
+          lastActivityMs: 50,
+        ),
+      ];
+
+      int? selectedIndex;
+
+      await tester.pumpWidget(
+        host(
+          SessionRail(
+            sessions: sessions,
+            sessionGroups: groups,
+            pins: SessionPins.none,
+            onResetOrder: () {},
+            onUnpinGroup: (_) {},
+            onUnpinSession: (_) {},
+            selectedIndex: 0,
+            onSelectSession: (index) => selectedIndex = index,
+            onReorderSession: (_, __, ___) {},
+            railListKey: GlobalKey<ReorderableListState>(),
+            onRailDragStart: (_, __) {},
+            onRailDragEnd: () {},
+            draggingGroupKey: null,
+            onCreateSession: (_) {},
+            selectedShell: NewSessionShell.defaultPosix,
+            shellOptions: const [NewSessionShell.defaultPosix],
+            showShellMenu: false,
+            connectionStatus: 'connected',
+            connectionStatusColor: const Color(0xff7fd1c7),
+            onOpenSettings: () {},
+            isCollapsed: false,
+            onToggleCollapse: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // All 3 sessions initially visible
+      expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
+
+      final searchField = find.byType(TextField);
+      expect(searchField, findsOneWidget);
+
+      // 1. Search by repo name ("frontend")
+      await tester.enterText(searchField, 'frontend');
+      await tester.pump();
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'main'), findsNothing);
+      expect(find.widgetWithText(SessionListTile, 'syslog'), findsNothing);
+
+      // Tap filtered result and verify original index (1) is selected
+      await tester.tap(find.widgetWithText(SessionListTile, 'feat/widget'));
+      expect(selectedIndex, 1);
+
+      // 2. Search by worktree name ("wt-search")
+      await tester.enterText(searchField, 'wt-search');
+      await tester.pump();
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'main'), findsNothing);
+
+      // 3. Search by cwd ("syslog")
+      await tester.enterText(searchField, 'syslog');
+      await tester.pump();
+      expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsNothing);
+
+      // 4. Search by summary snippet ("compiling core")
+      await tester.enterText(searchField, 'compiling core');
+      await tester.pump();
+      expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'syslog'), findsNothing);
+
+      // 5. Non-matching query
+      await tester.enterText(searchField, 'nonexistent query 12345');
+      await tester.pump();
+      expect(find.text('No matching sessions'), findsOneWidget);
+      expect(find.byType(SessionListTile), findsNothing);
+
+      // 6. Clear search
+      final clearButton = find.byTooltip('Clear search');
+      expect(clearButton, findsOneWidget);
+      await tester.tap(clearButton);
+      await tester.pump();
+
+      expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
+    });
   });
 }
