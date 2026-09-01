@@ -68,28 +68,25 @@ class SessionSearchInput {
   bool matchesQuery(String query) {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return true;
-    final candidates = [
-      title,
-      displayTitle,
-      railTitle,
-      sessionId,
-      repoRoot,
-      repoName,
-      worktreeRoot,
-      worktreeName,
-      inferredWorktreeRoot,
-      inferredBranch,
-      branch,
-      cwd,
-      snippet,
-      snippetDetail,
-    ];
-    for (final candidate in candidates) {
-      if (candidate != null && candidate.toLowerCase().contains(q)) {
-        return true;
-      }
-    }
-    return false;
+    return _containsIgnoreCase(title, q) ||
+        _containsIgnoreCase(displayTitle, q) ||
+        _containsIgnoreCase(railTitle, q) ||
+        _containsIgnoreCase(sessionId, q) ||
+        _containsIgnoreCase(repoRoot, q) ||
+        _containsIgnoreCase(repoName, q) ||
+        _containsIgnoreCase(worktreeRoot, q) ||
+        _containsIgnoreCase(worktreeName, q) ||
+        _containsIgnoreCase(inferredWorktreeRoot, q) ||
+        _containsIgnoreCase(inferredBranch, q) ||
+        _containsIgnoreCase(branch, q) ||
+        _containsIgnoreCase(cwd, q) ||
+        _containsIgnoreCase(snippet, q) ||
+        _containsIgnoreCase(snippetDetail, q);
+  }
+
+  static bool _containsIgnoreCase(String? target, String query) {
+    if (target == null || target.isEmpty) return false;
+    return target.toLowerCase().contains(query);
   }
 }
 

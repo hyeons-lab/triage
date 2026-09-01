@@ -933,6 +933,7 @@ pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
     const MAX_TAIL_ROWS: usize = 16;
     const MAX_COMBINED_ROWS: usize = MAX_HEAD_ROWS + MAX_TAIL_ROWS;
     const MAX_PROMPT_CHARS: usize = 1500;
+    const MAX_HEAD_CHARS: usize = 500;
 
     let kept: Vec<&str> = visible_rows
         .iter()
@@ -943,21 +944,38 @@ pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
         return None;
     }
 
-    let text = if kept.len() <= MAX_COMBINED_ROWS {
-        kept.join("\n")
+    if kept.len() <= MAX_COMBINED_ROWS {
+        let joined = kept.join("\n");
+        if joined.chars().count() <= MAX_PROMPT_CHARS {
+            return Some(joined);
+        }
+    }
+
+    let head_limit = kept.len().min(MAX_HEAD_ROWS);
+    let head_rows = &kept[..head_limit];
+    let head_text = head_rows.join("\n");
+    let head_capped: String = head_text.chars().take(MAX_HEAD_CHARS).collect();
+
+    let tail_start = kept.len().saturating_sub(MAX_TAIL_ROWS);
+    let tail_rows = &kept[tail_start.max(head_limit)..];
+    let tail_text = tail_rows.join("\n");
+
+    const SEPARATOR: &str = "\n[...]\n";
+    let sep_len = SEPARATOR.chars().count();
+    let remaining_budget = MAX_PROMPT_CHARS.saturating_sub(head_capped.chars().count() + sep_len);
+
+    let tail_capped: String = if tail_text.chars().count() > remaining_budget {
+        let skip = tail_text.chars().count() - remaining_budget;
+        tail_text.chars().skip(skip).collect()
     } else {
-        let head = &kept[..MAX_HEAD_ROWS];
-        let tail_start = kept.len().saturating_sub(MAX_TAIL_ROWS);
-        let tail = &kept[tail_start..];
-        format!("{}\n[...]\n{}", head.join("\n"), tail.join("\n"))
+        tail_text
     };
 
-    let mut text = text;
-    if text.chars().count() > MAX_PROMPT_CHARS {
-        let skip = text.chars().count() - MAX_PROMPT_CHARS;
-        text = text.chars().skip(skip).collect();
+    if tail_capped.is_empty() {
+        Some(head_capped)
+    } else {
+        Some(format!("{head_capped}{SEPARATOR}{tail_capped}"))
     }
-    Some(text)
 }
 
 #[cfg(test)]
@@ -1316,6 +1334,22 @@ mod tests {
         assert!(prompt.starts_with("$ cargo build --release\nline 1\nline 2"));
         assert!(prompt.contains("\n[...]\n"));
         assert!(prompt.ends_with("line 40\n$ echo done"));
+    }
+
+    #[test]
+    fn build_prompt_preserves_head_context_under_char_limit() {
+        let mut rows = Vec::new();
+        rows.push("$ git commit -m 'very long command line'".to_string());
+        for _ in 0..10 {
+            // Very long lines that exceed 1500 chars total
+            rows.push("x".repeat(300));
+        }
+        rows.push("$ echo completed".to_string());
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("$ git commit -m 'very long command line'"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("$ echo completed"));
+        assert!(prompt.chars().count() <= 1500);
     }
 
     // End-to-end: downloads the real LFM2 model (~1.5GB, cached) and runs

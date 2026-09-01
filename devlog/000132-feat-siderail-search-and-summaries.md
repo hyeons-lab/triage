@@ -23,15 +23,17 @@ Add a search feature to the side rail in the Flutter client to easily filter and
   - Added Flutter widget tests for `SessionRail` search filtering, result selection, non-matching query handling, and clearing search in `flutter/triage_client/test/session_rail_identity_test.dart`.
 
 ## Decisions
-- Used pure Dart `SessionSearchInput.matchesQuery` in `session_rail_layout.dart` for testable filtering decoupled from Flutter UI widgets.
-- Head-and-tail prompt retention joins head lines (up to 8 non-empty lines) and tail lines (up to 16 non-empty lines) with `\n[...]\n` when total lines exceed 24, giving the LLM summarizer both the original task definition and the latest progress.
+- Used pure Dart `SessionSearchInput.matchesQuery` in `session_rail_layout.dart` with short-circuiting comparisons for zero-allocation UI filtering.
+- Head-and-tail prompt retention budgets 500 characters guaranteed for head rows before allocating the remainder to tail rows when exceeding `MAX_PROMPT_CHARS`, preventing large outputs or wide lines from dropping the initial task launch context.
+- Group header drag listeners are disabled during search filtering (`canDrag: !isSearching`) to avoid ghost drag gestures while reordering is inactive.
 
 ## Issues
 - None.
 
 ## Commits
 - a7e68d7 — feat: add siderail search and audit session summaries
-- HEAD — feat: make siderail search toggleable from header icon
+- e07253c — feat: make siderail search toggleable from header icon
+- HEAD — fix: address PR review comments for siderail search and prompt retention
 
 ## Progress
 - [x] Researched codebase and identified search requirements and summary generation pipeline.
@@ -40,6 +42,7 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - [x] Add unit and widget tests for search filtering and summary preservation.
 - [x] Validate and run checks (`cargo test --workspace`, `flutter test`, clippy, formatting).
 - [x] Make search toggleable via header icon next to settings gear.
+- [x] Address PR review comments (head context preservation under char limits, short-circuiting search filtering, disabling group header dragging during search).
 
 ## Next Steps
-- Push commit to PR.
+- Push commit and verify CI checks on PR #153.

@@ -615,6 +615,16 @@ class SessionVm {
     return b == 'main' || b == 'master';
   }
 
+  /// Whether an inferred worktree observation is fresh and within the active repo.
+  bool _isFreshInference(DateTime now) {
+    final at = _inferredWorktreeAt;
+    final root = _inferredWorktreeRoot;
+    if (at == null || root == null) return false;
+    if (_inferredRepoRoot != repoRoot) return false;
+    if (now.difference(at) >= stickyWorktreeTtl) return false;
+    return true;
+  }
+
   /// The inferred-worktree lead — its branch (unless that is itself a default
   /// name, which says no more than the repo), else its directory leaf — but only
   /// while it is both fresh and still relevant. Null once [stickyWorktreeTtl] has
@@ -622,11 +632,9 @@ class SessionVm {
   /// different repo than the worktree belonged to, so the row reverts to its live
   /// identity instead of advertising a stale or foreign workstream.
   String? _freshInferredWorktreeLabel(DateTime now) {
-    final at = _inferredWorktreeAt;
+    if (!_isFreshInference(now)) return null;
     final root = _inferredWorktreeRoot;
-    if (at == null || root == null) return null;
-    if (_inferredRepoRoot != repoRoot) return null;
-    if (now.difference(at) >= stickyWorktreeTtl) return null;
+    if (root == null) return null;
     final inferredBranch = _inferredBranch;
     if (inferredBranch != null && !_isDefaultBranch(inferredBranch)) {
       return inferredBranch;
@@ -634,22 +642,26 @@ class SessionVm {
     return leafOf(root);
   }
 
-  SessionSearchInput toSearchInput([DateTime? now]) => SessionSearchInput(
-    title: title,
-    displayTitle: displayTitle,
-    railTitle: railTitleAt(now ?? DateTime.now()),
-    sessionId: remoteSessionId ?? sessionId,
-    repoRoot: repoRoot,
-    repoName: repoName,
-    worktreeRoot: worktreeRoot,
-    worktreeName: worktreeName,
-    inferredWorktreeRoot: _inferredWorktreeRoot,
-    inferredBranch: _inferredBranch,
-    branch: branch,
-    cwd: cwd,
-    snippet: snippet,
-    snippetDetail: snippetDetail,
-  );
+  SessionSearchInput toSearchInput([DateTime? now]) {
+    final targetTime = now ?? DateTime.now();
+    final fresh = _isFreshInference(targetTime);
+    return SessionSearchInput(
+      title: title,
+      displayTitle: displayTitle,
+      railTitle: railTitleAt(targetTime),
+      sessionId: remoteSessionId ?? sessionId,
+      repoRoot: repoRoot,
+      repoName: repoName,
+      worktreeRoot: worktreeRoot,
+      worktreeName: worktreeName,
+      inferredWorktreeRoot: fresh ? _inferredWorktreeRoot : null,
+      inferredBranch: fresh ? _inferredBranch : null,
+      branch: branch,
+      cwd: cwd,
+      snippet: snippet,
+      snippetDetail: snippetDetail,
+    );
+  }
 
   bool matchesSearch(String query, [DateTime? now]) =>
       toSearchInput(now).matchesQuery(query);
@@ -4295,100 +4307,96 @@ class _SessionRailState extends State<SessionRail> {
   }
 
   Widget _buildCollapsedRail() {
-    if (widget.isCollapsed) {
-      return Column(
-        children: [
-          const SizedBox(height: 20),
-          IconButton(
-            onPressed: widget.onToggleCollapse,
-            tooltip: 'Expand sidebar',
-            icon: const Icon(
-              Icons.chevron_right,
-              color: Color(0xff7fd1c7),
-              size: 26,
+    return Column(
+      children: [
+        const SizedBox(height: 20),
+        IconButton(
+          onPressed: widget.onToggleCollapse,
+          tooltip: 'Expand sidebar',
+          icon: const Icon(
+            Icons.chevron_right,
+            color: Color(0xff7fd1c7),
+            size: 26,
+          ),
+        ),
+        const SizedBox(height: 16),
+        _NewSessionMenu(
+          selectedShell: widget.selectedShell,
+          shellOptions: widget.shellOptions,
+          showShellMenu: widget.showShellMenu,
+          onCreateSession: widget.onCreateSession,
+        ),
+        const SizedBox(height: 16),
+        Tooltip(
+          message: widget.serverLabel == null
+              ? widget.connectionStatus
+              : '${widget.serverLabel} — ${widget.connectionStatus}',
+          child: Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: widget.connectionStatusColor,
             ),
           ),
-          const SizedBox(height: 16),
-          _NewSessionMenu(
-            selectedShell: widget.selectedShell,
-            shellOptions: widget.shellOptions,
-            showShellMenu: widget.showShellMenu,
-            onCreateSession: widget.onCreateSession,
+        ),
+        const SizedBox(height: 8),
+        IconButton(
+          onPressed: widget.onOpenSettings,
+          tooltip: 'Daemons',
+          icon: const Icon(
+            Icons.settings,
+            color: Color(0xff7f8b8d),
+            size: 20,
           ),
-          const SizedBox(height: 16),
-          Tooltip(
-            message: widget.serverLabel == null
-                ? widget.connectionStatus
-                : '${widget.serverLabel} — ${widget.connectionStatus}',
-            child: Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: widget.connectionStatusColor,
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          IconButton(
-            onPressed: widget.onOpenSettings,
-            tooltip: 'Daemons',
-            icon: const Icon(
-              Icons.settings,
-              color: Color(0xff7f8b8d),
-              size: 20,
-            ),
-          ),
-          const SizedBox(height: 12),
-          const Divider(height: 1, color: Color(0xff263033)),
-          const SizedBox(height: 8),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Column(
-                children: [
-                  for (final indexed in widget.sessions.indexed)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      child: Tooltip(
-                        message: indexed.$2.displayTitle,
-                        child: InkWell(
-                          onTap: () => widget.onSelectSession(indexed.$1),
-                          borderRadius: BorderRadius.circular(8),
-                          child: Container(
-                            width: 48,
-                            height: 48,
-                            decoration: BoxDecoration(
+        ),
+        const SizedBox(height: 12),
+        const Divider(height: 1, color: Color(0xff263033)),
+        const SizedBox(height: 8),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Column(
+              children: [
+                for (final indexed in widget.sessions.indexed)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Tooltip(
+                      message: indexed.$2.displayTitle,
+                      child: InkWell(
+                        onTap: () => widget.onSelectSession(indexed.$1),
+                        borderRadius: BorderRadius.circular(8),
+                        child: Container(
+                          width: 48,
+                          height: 48,
+                          decoration: BoxDecoration(
+                            color: indexed.$1 == widget.selectedIndex
+                                ? const Color(0xff233033)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
                               color: indexed.$1 == widget.selectedIndex
-                                  ? const Color(0xff233033)
+                                  ? const Color(0xff3b5356)
                                   : Colors.transparent,
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: indexed.$1 == widget.selectedIndex
-                                    ? const Color(0xff3b5356)
-                                    : Colors.transparent,
-                              ),
                             ),
-                            child: Icon(
-                              indexed.$2.icon,
-                              color: indexed.$1 == widget.selectedIndex
-                                  ? const Color(0xff7fd1c7)
-                                  : const Color(0xffcdd7d6),
-                              size: 22,
-                            ),
+                          ),
+                          child: Icon(
+                            indexed.$2.icon,
+                            color: indexed.$1 == widget.selectedIndex
+                                ? const Color(0xff7fd1c7)
+                                : const Color(0xffcdd7d6),
+                            size: 22,
                           ),
                         ),
                       ),
                     ),
-                ],
-              ),
+                  ),
+              ],
             ),
           ),
-        ],
-      );
-    }
-
-    return const SizedBox.shrink();
+        ),
+      ],
+    );
   }
 
   Widget _buildExpandedRail() {
@@ -4398,8 +4406,8 @@ class _SessionRailState extends State<SessionRail> {
     // window at the same instant.
     final now = DateTime.now();
     final indistinguishable = indistinguishableRailRows(widget.sessions, now);
-    final isSearching = _searchQuery.trim().isNotEmpty;
     final query = _searchQuery.trim();
+    final isSearching = query.isNotEmpty;
 
     final matchingEntries = <({int originalIndex, SessionVm session})>[];
     for (var i = 0; i < widget.sessions.length; i++) {
@@ -4659,6 +4667,7 @@ class _SessionRailState extends State<SessionRail> {
                           pinned: widget.pins.groupKeys.contains(item.groupKey),
                           onUnpin: () => widget.onUnpinGroup(item.groupKey),
                           isFirst: index == 0,
+                          canDrag: !isSearching,
                         );
                       }
                       final matchIndex = rowIndexFor[index]!;
@@ -4750,6 +4759,7 @@ class _SessionGroupHeader extends StatelessWidget {
     required this.pinned,
     required this.onUnpin,
     required this.isFirst,
+    this.canDrag = true,
   });
 
   final int index;
@@ -4766,6 +4776,9 @@ class _SessionGroupHeader extends StatelessWidget {
   /// Suppresses the leading gap on the first header, which already sits directly
   /// below the "SESSIONS" label.
   final bool isFirst;
+
+  /// Whether dragging is enabled on this header (disabled during search).
+  final bool canDrag;
 
   @override
   Widget build(BuildContext context) {
@@ -4791,6 +4804,7 @@ class _SessionGroupHeader extends StatelessWidget {
         ],
       ),
     );
+    if (!canDrag) return header;
     // Same drag-start rule as the rows: long-press on touch so a plain drag
     // still scrolls, immediate on mouse.
     return isMobilePlatform()
