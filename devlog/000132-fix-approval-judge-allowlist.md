@@ -30,9 +30,10 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
   - Added `extract_agent_name` to parse calling agent and subagent names (`subagent`, `agent`, `role`, `sender`, `source`) from nested hook payloads.
   - Implemented `generate_tool_casing_variants` and `generate_agent_prefixes` to generate PascalCase, camelCase, snake_case, flat lowercase, and synonym tool names across bare, `self:`, `subagent:`, and `${agent}:` prefixes.
   - Updated `compute_permission_overrides` and `encode_response` to emit complete multi-casing and subagent-scoped permission override tokens (e.g. `ListDir(...)`, `research:ListDir(...)`, `subagent:ListDir(...)`).
-  - Added unit test coverage for subagent tool execution with PascalCase tool calls.
+  - Fixed `detect_format` to prevent payloads with generic `tool_input` fields from misidentifying as Claude Code, ensuring Antigravity payloads receive full `permissionOverrides` responses.
+  - Added unit test coverage for subagent tool execution with PascalCase tool calls and format detection.
 - `.github/workflows/code-review.yml`:
-  - Fixed action input key name from `model` to `gemini_model` for `google-github-actions/run-gemini-cli@v0.1.22`.
+  - Fixed action input key name from `model` to `gemini_model` for `google-github-actions/run-gemini-cli@v0.1.22` and pinned to `gemini-3.7-flash`.
 
 ## Decisions
 
@@ -42,6 +43,7 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 - `judge_history` is serialized into `HandoverState` and merged in chronological order respecting ring buffer limits, preserving the audit trail across zero-downtime reloads.
 - Antigravity review workflow is unified with Cera's architecture, providing interactive `@antigravity` PR comment triggers and dynamic effort configuration.
 - Agent hook permission overrides must cover all naming conventions (PascalCase, camelCase, snake_case) and subagent namespaces (`${agent}:${tool}`) to ensure seamless execution in agent permission evaluators.
+- Format detection must strictly require Claude-specific fields (`hook_event_name` / `hookEventName`) so that standard `tool_input` payloads are not misrouted to Claude Code schema.
 
 ## Commits
 
@@ -50,5 +52,7 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 - caa2243 — fix(ci): wire ANTIGRAVITY_API_KEY secret and model parameter for code review workflow
 - 598d1d8 — refactor(session): optimize judge history ring buffer merge and clarify git rule invariants
 - f654abb — fix(hook): emit subagent and multi-casing permission overrides in approval judge hook
-- HEAD — fix(ci): update code review workflow model to gemini-3.7-flash
+- c92abef — fix(ci): update code review workflow model to gemini-3.7-flash
+- HEAD — fix(hook): restrict Claude format detection to hook event names to prevent Antigravity payload misdetection
+
 

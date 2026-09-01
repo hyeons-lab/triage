@@ -336,10 +336,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
     // Claude Code specific payload fields
     if val.get("hook_event_name").is_some()
         || val.get("hookEventName").is_some()
-        || val.get("tool_input").is_some()
-        || val.get("toolInput").is_some()
-        || val.get("permission_mode").is_some()
-        || val.get("permissionMode").is_some()
+        || val.get("transcript_path").is_some()
     {
         return AgentFormat::ClaudeCode;
     }
@@ -1684,7 +1681,7 @@ mod tests {
         let tool_input_val: serde_json::Value =
             serde_json::from_str(r#"{"tool_name": "Bash", "tool_input": {"command": "ls"}}"#)
                 .unwrap();
-        assert_eq!(detect_format(&tool_input_val), AgentFormat::ClaudeCode);
+        assert_eq!(detect_format(&tool_input_val), AgentFormat::Antigravity);
     }
 
     #[test]
