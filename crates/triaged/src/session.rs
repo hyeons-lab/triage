@@ -1922,17 +1922,12 @@ impl SessionManager {
             return;
         }
         let mut history = self.judge_history.lock().unwrap_or_else(|p| p.into_inner());
-        let existing: Vec<_> = history.drain(..).collect();
-        let total = incoming.len() + existing.len();
-        let skip_predecessor = total.saturating_sub(JUDGE_HISTORY_CAPACITY);
-        for record in incoming.into_iter().skip(skip_predecessor) {
-            history.push_back(record);
+        for record in incoming.into_iter().rev() {
+            history.push_front(record);
         }
-        for record in existing {
-            if history.len() >= JUDGE_HISTORY_CAPACITY {
-                history.pop_front();
-            }
-            history.push_back(record);
+        if history.len() > JUDGE_HISTORY_CAPACITY {
+            let surplus = history.len() - JUDGE_HISTORY_CAPACITY;
+            history.drain(..surplus);
         }
     }
 

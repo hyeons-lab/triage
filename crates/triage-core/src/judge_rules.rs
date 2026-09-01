@@ -1006,6 +1006,8 @@ impl JudgeRules {
             "worktree" if sub_positionals.first() == Some(&"list") => Some("git worktree list"),
             "worktree" if sub_positionals.first() == Some(&"add") => Some("git worktree add"),
             "stash" => Some("git stash"),
+            // Note: `--config` and `--config-env` overrides are globally blocked as
+            // disqualifying arguments under `has_disqualifying_argument` for security.
             "init" => {
                 if sub_args.iter().any(|&arg| {
                     let lower = arg.to_ascii_lowercase();
