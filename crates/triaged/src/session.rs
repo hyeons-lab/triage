@@ -1917,16 +1917,33 @@ impl SessionManager {
     }
 
     #[cfg(unix)]
+    fn merge_inherited_judge_history(&self, incoming: Vec<triage_core::judge::JudgeRecord>) {
+        if incoming.is_empty() {
+            return;
+        }
+        let mut history = self.judge_history.lock().unwrap_or_else(|p| p.into_inner());
+        let existing: Vec<_> = history.drain(..).collect();
+        let total = incoming.len() + existing.len();
+        let skip_predecessor = total.saturating_sub(JUDGE_HISTORY_CAPACITY);
+        for record in incoming.into_iter().skip(skip_predecessor) {
+            history.push_back(record);
+        }
+        for record in existing {
+            if history.len() >= JUDGE_HISTORY_CAPACITY {
+                history.pop_front();
+            }
+            history.push_back(record);
+        }
+    }
+
+    #[cfg(unix)]
     pub fn queue_handover_adoptions(
         &self,
-        state: crate::handover::HandoverState,
+        mut state: crate::handover::HandoverState,
         fds: Vec<std::os::unix::io::RawFd>,
     ) -> Result<()> {
         if !state.judge_history.is_empty() {
-            let mut history = self.judge_history.lock().unwrap_or_else(|p| p.into_inner());
-            if history.is_empty() {
-                history.extend(state.judge_history.iter().cloned());
-            }
+            self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
         }
         let mut pending = UnadoptedFds::new(fds);
         let expected = state.sessions.len();
@@ -1947,21 +1964,11 @@ impl SessionManager {
     #[cfg(unix)]
     pub fn adopt_sessions(
         &self,
-        state: crate::handover::HandoverState,
+        mut state: crate::handover::HandoverState,
         fds: Vec<std::os::unix::io::RawFd>,
     ) -> Result<()> {
         if !state.judge_history.is_empty() {
-            let mut history = self.judge_history.lock().unwrap_or_else(|p| p.into_inner());
-            if history.is_empty() {
-                history.extend(state.judge_history.iter().cloned());
-            } else {
-                for record in state.judge_history.iter().cloned() {
-                    if history.len() >= JUDGE_HISTORY_CAPACITY {
-                        history.pop_front();
-                    }
-                    history.push_back(record);
-                }
-            }
+            self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
         }
         let mut pending = UnadoptedFds::new(fds);
         let mut sessions = match self.sessions() {
@@ -12227,17 +12234,30 @@ mod tests {
 
         let manager2 = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
         manager2.start_judge(triage_core::config::JudgeConfig::default());
+
+        // Pre-populate an event in manager2 to ensure predecessor records are ordered first
+        let req3 = triage_core::judge::JudgeRequest {
+            session_id: SessionId::new("sess-2").unwrap(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("cargo test".to_string()),
+            path: None,
+            cwd: None,
+        };
+        manager2.judge_tool_call(req3);
+
         manager2
-            .adopt_sessions(state, Vec::new())
-            .expect("adopt sessions");
+            .queue_handover_adoptions(state, Vec::new())
+            .expect("queue handover adoptions");
 
         let history2 = manager2.get_judge_history().expect("get history 2");
-        assert_eq!(history2.len(), 2);
+        assert_eq!(history2.len(), 3);
         assert_eq!(history2[0].command_line.as_deref(), Some("cargo check"));
         assert_eq!(
             history2[1].command_line.as_deref(),
             Some("git push origin main")
         );
+        assert_eq!(history2[2].command_line.as_deref(), Some("cargo test"));
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     #[test]

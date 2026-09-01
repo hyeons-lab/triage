@@ -1513,6 +1513,9 @@ mod unix_impl {
             // SAFETY: any unconsumed descriptors from the fresh recovery snapshot must be closed.
             unsafe { libc::close(extra_fd) };
         }
+        if !fresh_state.judge_history.is_empty() {
+            retained_state.judge_history = fresh_state.judge_history;
+        }
         retained_state.sends_teardown_commit = fresh_state.sends_teardown_commit;
         retained_state.handover_owner_token = fresh_state.handover_owner_token;
         retained_state.handover_lineage_token = fresh_state.handover_lineage_token;
@@ -1572,6 +1575,9 @@ mod unix_impl {
             .map(|(index, session)| (recovery_session_key(session), index))
             .collect();
         for (_, mut recovered_state, recovered_fds) in recovered {
+            if state.judge_history.is_empty() && !recovered_state.judge_history.is_empty() {
+                state.judge_history = std::mem::take(&mut recovered_state.judge_history);
+            }
             let mut raw_fds = recovered_fds.into_raw();
             if recovered_state.has_tcp_listener && !raw_fds.is_empty() {
                 let listener_fd = raw_fds.remove(0);

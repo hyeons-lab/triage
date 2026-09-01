@@ -12,26 +12,30 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 
 - `crates/triage-core/src/judge_rules.rs`:
   - Added background task inspection tools (`task_output`, `get_task_output`) to `is_read_only_tool`.
-  - Added `rustfmt`, `rustc`, and `mktemp` (`mktemp`, `mktemp -d`, `mktemp -u`, `mktemp -t`) to `BUILTIN_ALLOW_COMMANDS`.
-  - Added `git init`, `git clone`, and `git config` to `BUILTIN_ALLOW_COMMANDS` and `matching_git_allow_rule`.
-  - Added comprehensive test coverage for developer tools and task tools allow evaluation.
+  - Added `rustfmt`, `rustc`, and `mktemp` to `BUILTIN_ALLOW_COMMANDS`.
+  - Hardened `git init`, `git clone`, and `git config` allow rules against hook injection (`--template`, `--separate-git-dir`, short flag `-u`), configuration execution tampering (`core.sshCommand`, `core.pager`, `core.editor`, `core.fsmonitor`, `core.hooksPath`, `core.gitproxy`, `pager.*`, `filter.*`, non-empty `credential.*.helper`), and global/file-level mutations (`--global`, `--system`, `--file`, `-f`, `--blob`).
+  - Refactored `sanitize_command_substitutions` to use UTF-8 slice boundaries and eliminate multi-byte character corruption.
+  - Added comprehensive positive and negative test coverage for safe and dangerous developer commands.
 - `crates/triaged/src/handover.rs` & `crates/triaged/src/session.rs`:
   - Added `judge_history` to `HandoverState` with `#[serde(default)]`.
-  - Transferred and adopted `judge_history` across zero-downtime handover so that `triaged reload` retains the decision history ring buffer and traffic metrics.
-  - Added unit test `handover_preserves_judge_history`.
+  - Implemented `merge_inherited_judge_history` with bounded capacity ring buffer enforcement (`JUDGE_HISTORY_CAPACITY = 2000`) and chronological ordering preservation across predecessor and successor records.
+  - Wired `judge_history` adoption in `queue_handover_adoptions`, `adopt_sessions`, and `compact_recovery_snapshot`.
+  - Added unit test `handover_preserves_judge_history` validating adoption ordering, capacity management, and temporary log directory cleanup.
 - `.github/workflows/code-review.yml` & `scripts/format_review_comment.py`:
   - Replaced legacy script-based review workflow with Cera-aligned Gemini CLI workflow using `google-github-actions/run-gemini-cli@v0.1.22`.
   - Added support for trigger types: PR opened/synchronize/labeled (`needs antigravity review`), issue/PR comments mentioning `@antigravity` (with optional effort specifier `low|medium|high|max`), and PR review comments.
-  - Added `scripts/format_review_comment.py` to handle upserting/patching review comments, timezone-aware timestamping, and output sanitization.
+  - Added `scripts/format_review_comment.py` to handle upserting/patching review comments, timezone-aware timestamping, UTF-16 surrogate handling (`errors='replace'`), and output sanitization.
 
 ## Decisions
 
 - Background task inspection tools (`task_output`, `get_task_output`) are read-only and safe to auto-approve.
 - Verification and build tools (`rustfmt`, `rustc`, `mktemp`) are included in `BUILTIN_ALLOW_COMMANDS` so multi-command test chains evaluate deterministically in Layer 1.
-- `judge_history` is serialized into `HandoverState` and adopted by the new daemon instance, preserving the audit trail across zero-downtime reloads.
+- `git config`, `git clone`, and `git init` must strictly guard against hook and subprocess injection (`--template`, `--separate-git-dir`, `-u`, executable keys).
+- `judge_history` is serialized into `HandoverState` and merged in chronological order respecting ring buffer limits, preserving the audit trail across zero-downtime reloads.
 - Antigravity review workflow is unified with Cera's architecture, providing interactive `@antigravity` PR comment triggers and dynamic effort configuration.
 
 ## Commits
 
-- HEAD — feat(judge): expand developer tool allowlist, preserve history across handover, and configure review workflow
+- 85134db — feat(judge): expand developer tool allowlist, preserve history across handover, and configure review workflow
+- HEAD — fix(judge): harden git subcommands, preserve handover history chronology, and sanitize review comments
 

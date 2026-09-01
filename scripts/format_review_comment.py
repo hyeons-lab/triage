@@ -56,7 +56,7 @@ def unescape_json_string(s: str) -> str:
     s = re.sub(r'\\(?:([\\"/bfnrt])|u([0-9a-fA-F]{4}))', _replace_match, s)
     try:
         # Re-encode and decode with surrogatepass to assemble any UTF-16 surrogate pairs into valid characters
-        return s.encode('utf-16', 'surrogatepass').decode('utf-16')
+        return s.encode('utf-16', 'surrogatepass').decode('utf-16', errors='replace')
     except Exception:
         return s
 
