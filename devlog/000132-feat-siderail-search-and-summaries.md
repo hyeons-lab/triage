@@ -30,7 +30,8 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - None.
 
 ## Commits
-- HEAD — feat: add siderail search and audit session summaries
+- a7e68d7 — feat: add siderail search and audit session summaries
+- HEAD — feat: make siderail search toggleable from header icon
 
 ## Progress
 - [x] Researched codebase and identified search requirements and summary generation pipeline.
@@ -38,6 +39,7 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - [x] Enhance session prompt building and system prompts in Rust daemon (`triaged`).
 - [x] Add unit and widget tests for search filtering and summary preservation.
 - [x] Validate and run checks (`cargo test --workspace`, `flutter test`, clippy, formatting).
+- [x] Make search toggleable via header icon next to settings gear.
 
 ## Next Steps
-- Commit changes and open PR.
+- Push commit to PR.

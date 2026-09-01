@@ -4218,11 +4218,14 @@ class SessionRail extends StatefulWidget {
 
 class _SessionRailState extends State<SessionRail> {
   final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
   String _searchQuery = '';
+  bool _searchOpen = false;
 
   @override
   void dispose() {
     _searchController.dispose();
+    _searchFocusNode.dispose();
     super.dispose();
   }
 
@@ -4232,9 +4235,22 @@ class _SessionRailState extends State<SessionRail> {
     });
   }
 
-  void _clearSearch() {
-    _searchController.clear();
+  void _toggleSearch() {
     setState(() {
+      _searchOpen = !_searchOpen;
+      if (_searchOpen) {
+        _searchFocusNode.requestFocus();
+      } else {
+        _searchController.clear();
+        _searchQuery = '';
+      }
+    });
+  }
+
+  void _closeSearch() {
+    setState(() {
+      _searchOpen = false;
+      _searchController.clear();
       _searchQuery = '';
     });
   }
@@ -4436,6 +4452,20 @@ class _SessionRailState extends State<SessionRail> {
               ),
               const SizedBox(width: 4),
               IconButton(
+                onPressed: _toggleSearch,
+                tooltip: 'Search sessions',
+                icon: Icon(
+                  Icons.search,
+                  color: _searchOpen || isSearching
+                      ? const Color(0xff7fd1c7)
+                      : const Color(0xff7f8b8d),
+                  size: 20,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
+              const SizedBox(width: 4),
+              IconButton(
                 onPressed: widget.onOpenSettings,
                 tooltip: 'Daemons',
                 icon: const Icon(
@@ -4504,63 +4534,65 @@ class _SessionRailState extends State<SessionRail> {
             ],
           ),
         ),
-        const SizedBox(height: 8),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Container(
-            height: 34,
-            decoration: BoxDecoration(
-              color: const Color(0xff1b2327),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: isSearching
-                    ? const Color(0xff4a6266)
-                    : const Color(0xff2b373a),
-              ),
-            ),
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.search,
-                  size: 16,
-                  color: Color(0xff7f8b8d),
+        if (_searchOpen || isSearching) ...[
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Container(
+              height: 34,
+              decoration: BoxDecoration(
+                color: const Color(0xff1b2327),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: isSearching
+                      ? const Color(0xff4a6266)
+                      : const Color(0xff2b373a),
                 ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: TextField(
-                    controller: _searchController,
-                    onChanged: _onSearchChanged,
-                    style: const TextStyle(
-                      color: Color(0xffcdd7d6),
-                      fontSize: 12,
-                    ),
-                    cursorColor: const Color(0xff7fd1c7),
-                    decoration: const InputDecoration(
-                      hintText: 'Search sessions...',
-                      hintStyle: TextStyle(
-                        color: Color(0xff607073),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.search,
+                    size: 16,
+                    color: Color(0xff7f8b8d),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: TextField(
+                      focusNode: _searchFocusNode,
+                      controller: _searchController,
+                      onChanged: _onSearchChanged,
+                      style: const TextStyle(
+                        color: Color(0xffcdd7d6),
                         fontSize: 12,
                       ),
-                      border: InputBorder.none,
-                      isDense: true,
-                      contentPadding: EdgeInsets.symmetric(vertical: 6),
+                      cursorColor: const Color(0xff7fd1c7),
+                      decoration: const InputDecoration(
+                        hintText: 'Search sessions...',
+                        hintStyle: TextStyle(
+                          color: Color(0xff607073),
+                          fontSize: 12,
+                        ),
+                        border: InputBorder.none,
+                        isDense: true,
+                        contentPadding: EdgeInsets.symmetric(vertical: 6),
+                      ),
                     ),
                   ),
-                ),
-                if (isSearching)
                   IconButton(
-                    onPressed: _clearSearch,
+                    onPressed: _closeSearch,
                     icon: const Icon(Icons.close, size: 14),
                     color: const Color(0xff7f8b8d),
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(),
-                    tooltip: 'Clear search',
+                    tooltip: 'Close search',
                   ),
-              ],
+                ],
+              ),
             ),
           ),
-        ),
+        ],
         const SizedBox(height: 8),
         Expanded(
           child: isSearching && matchingEntries.isEmpty

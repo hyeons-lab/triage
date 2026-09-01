@@ -740,10 +740,17 @@ void main() {
       );
       await tester.pump();
 
-      // All 3 sessions initially visible
+      // All 3 sessions initially visible; search field is hidden until search button is pressed
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
+      expect(find.byType(TextField), findsNothing);
+
+      // Tap search button next to gear icon to open search field
+      final searchButton = find.byTooltip('Search sessions');
+      expect(searchButton, findsOneWidget);
+      await tester.tap(searchButton);
+      await tester.pump();
 
       final searchField = find.byType(TextField);
       expect(searchField, findsOneWidget);
@@ -783,12 +790,13 @@ void main() {
       expect(find.text('No matching sessions'), findsOneWidget);
       expect(find.byType(SessionListTile), findsNothing);
 
-      // 6. Clear search
-      final clearButton = find.byTooltip('Clear search');
-      expect(clearButton, findsOneWidget);
-      await tester.tap(clearButton);
+      // 6. Close / Clear search
+      final closeButton = find.byTooltip('Close search');
+      expect(closeButton, findsOneWidget);
+      await tester.tap(closeButton);
       await tester.pump();
 
+      expect(find.byType(TextField), findsNothing);
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
