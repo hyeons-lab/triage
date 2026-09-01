@@ -72,17 +72,13 @@ jobs:
         id: gemini
         uses: google-github-actions/run-gemini-cli@v0.1.22
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.ANTIGRAVITY_API_KEY || secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
-          GEMINI_MODEL: 'gemini-3.7-flash'
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          settings: |
-            {
-              "model": "gemini-3.7-flash"
-            }
+          gemini_api_key: ${{ secrets.ANTIGRAVITY_API_KEY || secrets.GEMINI_API_KEY }}
+          model: 'gemini-2.5-flash'
           prompt: |
             # REVIEW TARGET
             You are reviewing Pull Request #${{ inputs.pull_number || github.event.issue.number || github.event.pull_request.number || 'current branch' }}.

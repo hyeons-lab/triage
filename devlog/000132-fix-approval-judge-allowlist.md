@@ -37,5 +37,6 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 ## Commits
 
 - 85134db — feat(judge): expand developer tool allowlist, preserve history across handover, and configure review workflow
-- HEAD — fix(judge): harden git subcommands, preserve handover history chronology, and sanitize review comments
+- 7e76de9 — fix(judge): harden git subcommands, preserve handover history chronology, and sanitize review comments
+- HEAD — fix(ci): wire ANTIGRAVITY_API_KEY secret and model parameter for code review workflow
 
