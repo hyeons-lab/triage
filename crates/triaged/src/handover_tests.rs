@@ -169,6 +169,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: Some([4; 16]),
             handover_lineage_token: Some([5; 16]),
+            judge_history: Vec::new(),
         };
         let response = serde_json::json!({"Ok": {"HandoverState": state}});
         let response = serde_json::to_vec(&response)?;
@@ -239,6 +240,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: Some([4; 16]),
             handover_lineage_token: Some([5; 16]),
+            judge_history: Vec::new(),
         };
         let response = serde_json::to_vec(&serde_json::json!({
             "Ok": {"HandoverState": state}
@@ -563,6 +565,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: None,
             handover_lineage_token: None,
+            judge_history: Vec::new(),
         };
         manager.adopt_sessions(state, vec![surplus.fd])?;
 
@@ -606,6 +609,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: None,
             handover_lineage_token: None,
+            judge_history: Vec::new(),
         };
 
         let result = manager.adopt_sessions(state, vec![in_flight.fd, queued.fd]);
@@ -704,6 +708,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([1; 16]),
+            judge_history: Vec::new(),
         };
         let mut fds = vec![old_replaced.fd, old_retained.fd];
         let recovered = crate::handover::HandoverState {
@@ -716,6 +721,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: Some([2; 16]),
             handover_lineage_token: Some([2; 16]),
+            judge_history: Vec::new(),
         };
         crate::handover::remember_recovered_handover_for_test(
             recovered,
@@ -737,6 +743,7 @@ mod tests {
                 sends_teardown_commit: true,
                 handover_owner_token: Some([3; 16]),
                 handover_lineage_token: Some([3; 16]),
+                judge_history: Vec::new(),
             },
             vec![refreshed_reused_id.fd],
         );
@@ -818,6 +825,7 @@ mod tests {
                 sends_teardown_commit: true,
                 handover_owner_token: Some([2; 16]),
                 handover_lineage_token: Some([9; 16]),
+                judge_history: Vec::new(),
             },
             Vec::new(),
         );
@@ -828,6 +836,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([9; 16]),
+            judge_history: Vec::new(),
         };
         let mut fds = vec![stale.fd];
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
@@ -868,6 +877,7 @@ mod tests {
                 sends_teardown_commit: false,
                 handover_owner_token: Some([2; 16]),
                 handover_lineage_token: Some([7; 16]),
+                judge_history: Vec::new(),
             },
             Vec::new(),
         );
@@ -878,6 +888,7 @@ mod tests {
             sends_teardown_commit: false,
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([7; 16]),
+            judge_history: Vec::new(),
         };
         let mut fds = vec![retained.fd];
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
@@ -925,6 +936,7 @@ mod tests {
                 sends_teardown_commit: true,
                 handover_owner_token: None,
                 handover_lineage_token: None,
+                judge_history: Vec::new(),
             },
             vec![stale.fd],
         );
@@ -936,6 +948,7 @@ mod tests {
                 sends_teardown_commit: true,
                 handover_owner_token: None,
                 handover_lineage_token: None,
+                judge_history: Vec::new(),
             },
             Vec::new(),
         );
@@ -946,6 +959,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: None,
             handover_lineage_token: None,
+            judge_history: Vec::new(),
         };
         let mut fds = Vec::new();
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
@@ -988,6 +1002,7 @@ mod tests {
                     sends_teardown_commit: true,
                     handover_owner_token: Some(owner_token),
                     handover_lineage_token: Some([9; 16]),
+                    judge_history: Vec::new(),
                 },
                 vec![fd],
             );
@@ -1005,6 +1020,7 @@ mod tests {
             sends_teardown_commit: true,
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([9; 16]),
+            judge_history: Vec::new(),
         };
         let mut fds = Vec::new();
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
