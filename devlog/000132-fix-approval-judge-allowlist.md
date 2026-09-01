@@ -49,5 +49,6 @@ Expand the built-in deterministic approval judge allowlist for safe developer/te
 - 7e76de9 — fix(judge): harden git subcommands, preserve handover history chronology, and sanitize review comments
 - caa2243 — fix(ci): wire ANTIGRAVITY_API_KEY secret and model parameter for code review workflow
 - 598d1d8 — refactor(session): optimize judge history ring buffer merge and clarify git rule invariants
-- HEAD — fix(hook): emit subagent and multi-casing permission overrides in approval judge hook
+- f654abb — fix(hook): emit subagent and multi-casing permission overrides in approval judge hook
+- HEAD — fix(ci): update code review workflow model to gemini-3.7-flash
 
