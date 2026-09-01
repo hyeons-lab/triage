@@ -2110,7 +2110,6 @@ impl SessionManager {
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
-                    shell_reports_cwd: false,
                     last_cwd_poll: Some(Instant::now()),
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
@@ -4432,7 +4431,6 @@ impl SessionActor {
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
-                    shell_reports_cwd: false,
                     // Throttle the cwd poll from spawn so the idle refresh doesn't
                     // fire before the session has settled (and races the initial
                     // snapshot); the first poll runs one interval in.
@@ -4611,11 +4609,6 @@ struct ActorState {
     /// only emitted on change, the actor re-attempts the broadcast (with the
     /// current context) on the next output event until it is delivered.
     context_resend_pending: bool,
-    /// Set once the session has reported its cwd via OSC 7 at least once, i.e.
-    /// its shell honors the injected `PROMPT_COMMAND` hook (bash). When true, we
-    /// trust OSC 7 and skip the OS-level cwd polling entirely; when it stays
-    /// false (zsh, fish, ...), the fallback poll keeps the cwd fresh.
-    shell_reports_cwd: bool,
     /// Timestamp of the last OS-level working-directory poll, used to throttle
     /// the fallback so git context is not re-resolved on every output chunk.
     last_cwd_poll: Option<Instant>,
@@ -4935,7 +4928,7 @@ impl ActorState {
     /// shell or agent even when the session is quiet. Throttled by
     /// [`Self::poll_child_cwd`]; skipped after the child has exited.
     fn refresh_idle_cwd(&mut self) {
-        if self.exited || self.shell_reports_cwd {
+        if self.exited {
             return;
         }
         if let Some(cwd) = self.poll_child_cwd() {
@@ -4979,12 +4972,13 @@ impl ActorState {
         if let Some(context) = &mut self.context {
             let branch =
                 git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
-            if branch.is_none() && git_path_output(cwd, &["rev-parse", "--git-dir"]).is_none() {
-                // Working directory is no longer inside a git repository (e.g. `rm -rf .git`).
-                self.context = None;
-                self.broadcast_context_update();
-            } else if context.branch != branch {
-                context.branch = branch;
+            if context.branch != branch {
+                if branch.is_none() && git_path_output(cwd, &["rev-parse", "--git-dir"]).is_none() {
+                    // Working directory is no longer inside a git repository (e.g. `rm -rf .git`).
+                    self.context = None;
+                } else {
+                    context.branch = branch;
+                }
                 self.broadcast_context_update();
             }
         } else if git_path_output(cwd, &["rev-parse", "--git-dir"]).is_some() {
@@ -5008,7 +5002,6 @@ impl ActorState {
                         // PROMPT_COMMAND hook). If the cwd is unchanged, refresh
                         // only the branch (throttled) to avoid redundant git re-discovery.
                         Some(reported) => {
-                            self.shell_reports_cwd = true;
                             let now = Instant::now();
                             if self.current_working_directory.as_deref() != Some(reported.as_path())
                             {
@@ -6775,7 +6768,9 @@ fn canonicalize_path(path: &Path) -> PathBuf {
         if let Some(Component::Prefix(prefix)) = components.next() {
             match prefix.kind() {
                 Prefix::VerbatimDisk(disk) => {
-                    let mut buf = PathBuf::from(format!("{}:", disk as char));
+                    let drive = [disk, b':'];
+                    let drive_str = std::str::from_utf8(&drive).unwrap_or("C:");
+                    let mut buf = PathBuf::from(drive_str);
                     for c in components {
                         buf.push(c.as_os_str());
                     }
@@ -8147,6 +8142,106 @@ mod tests {
         );
         assert_eq!(context.branch, None);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn session_context_clears_on_detached_head_repo_deletion() {
+        let repo = unique_log_dir();
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_test_command(&repo, &["init"]);
+        git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+        git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+        git_test_command(&repo, &["add", "README.md"]);
+        git_test_command(&repo, &["commit", "-m", "initial"]);
+        let head_commit = git_output(&repo, &["rev-parse", "HEAD"]).expect("rev-parse HEAD");
+        git_test_command(&repo, &["checkout", &head_commit]);
+
+        let context = resolve_session_context(Some(&repo)).expect("git session context");
+        assert_eq!(context.branch, None);
+
+        // Delete .git directory while in detached HEAD state
+        let _ = std::fs::remove_dir_all(repo.join(".git"));
+        assert!(resolve_session_context(Some(&repo)).is_none());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn session_context_resolves_submodule_linked_worktree_root() {
+        let base_dir = unique_log_dir();
+        let super_repo = base_dir.join("super");
+        let submodule_repo = base_dir.join("submodule-remote");
+        let worktree = base_dir.join("submodule-wt");
+        let _ = std::fs::remove_dir_all(&base_dir);
+
+        std::fs::create_dir_all(&submodule_repo).expect("create submodule remote dir");
+        git_test_command(&submodule_repo, &["init"]);
+        git_test_command(
+            &submodule_repo,
+            &["config", "user.email", "triage@example.invalid"],
+        );
+        git_test_command(&submodule_repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(submodule_repo.join("README.md"), "submodule\n")
+            .expect("write submodule file");
+        git_test_command(&submodule_repo, &["add", "README.md"]);
+        git_test_command(&submodule_repo, &["commit", "-m", "initial submodule"]);
+
+        std::fs::create_dir_all(&super_repo).expect("create super repo dir");
+        git_test_command(&super_repo, &["init"]);
+        git_test_command(
+            &super_repo,
+            &["config", "user.email", "triage@example.invalid"],
+        );
+        git_test_command(&super_repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(super_repo.join("README.md"), "super\n").expect("write super file");
+        git_test_command(&super_repo, &["add", "README.md"]);
+        git_test_command(&super_repo, &["commit", "-m", "initial super"]);
+
+        git_test_command(
+            &super_repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule_repo.to_str().expect("utf-8 submodule repo path"),
+                "vendor/submodule",
+            ],
+        );
+        git_test_command(&super_repo, &["commit", "-m", "add submodule"]);
+
+        let submodule_checkout = super_repo.join("vendor/submodule");
+        git_test_command(
+            &submodule_checkout,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/submodule-wt",
+                worktree.to_str().expect("utf-8 worktree path"),
+            ],
+        );
+
+        let context = resolve_session_context(Some(&worktree)).expect("git session context");
+        let canonical_super = canonicalize_path(&super_repo);
+        let canonical_wt = canonicalize_path(&worktree);
+        // Submodule worktree must not escape to superproject repository root
+        assert_ne!(
+            context.repository_root.as_deref(),
+            Some(canonical_super.as_path())
+        );
+        assert_eq!(
+            context.repository_root.as_deref(),
+            Some(canonical_wt.as_path())
+        );
+        assert_eq!(
+            context.worktree_root.as_deref(),
+            Some(canonical_wt.as_path())
+        );
+        assert_eq!(context.branch.as_deref(), Some("feat/submodule-wt"));
+
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]

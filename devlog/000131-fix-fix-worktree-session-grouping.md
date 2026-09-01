@@ -36,6 +36,10 @@ Fix the bug where navigating/cding into a git worktree places the session in the
   - Refined `refresh_branch_context` and `handle_output` to properly support detached HEAD, `.git` repository removal/transition, and in-place `git init` while throttling git subprocess spawns on unchanged CWD across both OSC-7 and non-OSC-7 shells.
   - Replaced `&PathBuf` with `&Path` across all internal git helpers to avoid unnecessary heap allocations.
   - Added unit test `session_context_resolves_detached_head`.
+- **2026-08-31T17:29-0700** Addressed automated and review bot feedback on PR #151:
+  - Removed `shell_reports_cwd` completely so initial OSC 7 startup sequence never disables idle OS CWD polling for interactive shells (zsh/fish).
+  - Optimized `Prefix::VerbatimDisk` in `canonicalize_path` to avoid heap allocations.
+  - Added unit tests `session_context_clears_on_detached_head_repo_deletion` and `session_context_resolves_submodule_linked_worktree_root`.
 
 ## Decisions
 
@@ -52,4 +56,5 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 - 44a9add — docs(devlog): rename branch devlog to match git branch name convention
 - 033f313 — perf(triaged): refresh only branch context when cwd unchanged and remove dead state
 - 91bf53c — fix(triaged): robust session grouping for worktrees, detached HEAD, and Windows UNC
-- HEAD — test(triaged): use canonicalize_path in unit tests for Windows compatibility
+- a155dff — test(triaged): use canonicalize_path in unit tests for Windows compatibility
+- HEAD — fix(triaged): address PR review comments for idle polling, detached HEAD, and submodules
