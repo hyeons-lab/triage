@@ -40,6 +40,11 @@ Fix the bug where navigating/cding into a git worktree places the session in the
   - Removed `shell_reports_cwd` completely so initial OSC 7 startup sequence never disables idle OS CWD polling for interactive shells (zsh/fish).
   - Optimized `Prefix::VerbatimDisk` in `canonicalize_path` to avoid heap allocations.
   - Added unit tests `session_context_clears_on_detached_head_repo_deletion` and `session_context_resolves_submodule_linked_worktree_root`.
+- **2026-08-31T21:46-0700** Completed `/antigravity-local-review` loop:
+  - Refactored `refresh_branch_context` to match directly on `git_raw_output(cwd, &["branch", "--show-current"])` exit status, eliminating extra subprocess spawns on detached HEAD and cleanly detecting `.git` deletion.
+  - Hardened `git_repository_root` with hierarchy-aware submodule detection to prevent false positives when projects reside in paths named `modules`.
+  - Simplified `git_repository_root` bare repository resolution without redundant directory climbing.
+  - Normalized Windows drive letters to uppercase to ensure cross-platform key consistency.
 
 ## Decisions
 
@@ -57,4 +62,5 @@ Fix the bug where navigating/cding into a git worktree places the session in the
 - 033f313 — perf(triaged): refresh only branch context when cwd unchanged and remove dead state
 - 91bf53c — fix(triaged): robust session grouping for worktrees, detached HEAD, and Windows UNC
 - a155dff — test(triaged): use canonicalize_path in unit tests for Windows compatibility
-- HEAD — fix(triaged): address PR review comments for idle polling, detached HEAD, and submodules
+- 171b5a0 — fix(triaged): address PR review comments for idle polling, detached HEAD, and submodules
+- HEAD — fix(triaged): optimize branch context exit status matching and submodule hierarchy detection

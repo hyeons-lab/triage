@@ -4969,21 +4969,27 @@ impl ActorState {
     /// Refreshes only the active git branch name when the working directory is
     /// unchanged, avoiding full repository root and worktree re-discovery.
     fn refresh_branch_context(&mut self, cwd: &Path) {
-        if let Some(context) = &mut self.context {
-            let branch =
-                git_output(cwd, &["branch", "--show-current"]).filter(|branch| !branch.is_empty());
-            if context.branch != branch {
-                if branch.is_none() && git_path_output(cwd, &["rev-parse", "--git-dir"]).is_none() {
-                    // Working directory is no longer inside a git repository (e.g. `rm -rf .git`).
-                    self.context = None;
-                } else {
-                    context.branch = branch;
-                }
+        let branch_raw = git_raw_output(cwd, &["branch", "--show-current"]);
+        match (branch_raw, self.context.as_mut()) {
+            (None, Some(_)) => {
+                // Directory is no longer inside a git repository (e.g. `rm -rf .git`).
+                self.context = None;
                 self.broadcast_context_update();
             }
-        } else if git_path_output(cwd, &["rev-parse", "--git-dir"]).is_some() {
-            // Entered or initialized a git repository in place (e.g. `git init`).
-            self.apply_cwd(cwd.to_path_buf());
+            (Some(raw), Some(context)) => {
+                let value = String::from_utf8(raw).unwrap_or_default();
+                let branch_name = value.trim().to_string();
+                let branch_name = (!branch_name.is_empty()).then_some(branch_name);
+                if context.branch != branch_name {
+                    context.branch = branch_name;
+                    self.broadcast_context_update();
+                }
+            }
+            (Some(_), None) => {
+                // Entered or initialized a git repository in place (e.g. `git init`).
+                self.apply_cwd(cwd.to_path_buf());
+            }
+            (None, None) => {}
         }
     }
 
@@ -6768,7 +6774,7 @@ fn canonicalize_path(path: &Path) -> PathBuf {
         if let Some(Component::Prefix(prefix)) = components.next() {
             match prefix.kind() {
                 Prefix::VerbatimDisk(disk) => {
-                    let drive = [disk, b':'];
+                    let drive = [disk.to_ascii_uppercase(), b':'];
                     let drive_str = std::str::from_utf8(&drive).unwrap_or("C:");
                     let mut buf = PathBuf::from(drive_str);
                     for c in components {
@@ -6825,17 +6831,23 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
     if common_dir.file_name() == Some(OsStr::new(".git")) {
         return common_dir.parent().map(Path::to_path_buf);
     }
+
+    // Submodule administrative directories (`.git/modules/...` or `<bare.git>/modules/...`): do not climb to superproject.
     let is_submodule = common_dir.ancestors().any(|a| {
         a.file_name() == Some(OsStr::new("modules"))
             && a.parent().is_some_and(|p| {
                 p.file_name() == Some(OsStr::new(".git"))
-                    || (p.join("objects").is_dir() && p.join("HEAD").is_file())
+                    || p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".git"))
             })
     });
-    if !is_submodule && common_dir.join("objects").is_dir() && common_dir.join("HEAD").is_file() {
-        return Some(common_dir);
+    if is_submodule {
+        return None;
     }
-    None
+
+    // Bare repository or bare worktree common directory.
+    Some(common_dir)
 }
 
 fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
