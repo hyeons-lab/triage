@@ -65,6 +65,10 @@ pub fn is_read_only_tool(raw: &str) -> bool {
         "taskstatus",
         "get_task_status",
         "gettaskstatus",
+        "task_output",
+        "taskoutput",
+        "get_task_output",
+        "gettaskoutput",
         "list_tasks",
         "listtasks",
         "task_list",
@@ -167,6 +171,10 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "cp",
     "touch",
     "chmod +x",
+    "mktemp",
+    "mktemp -d",
+    "mktemp -u",
+    "mktemp -t",
     // Search.
     "rg",
     "grep",
@@ -222,6 +230,9 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "git branch",
     "git tag",
     "git stash",
+    "git init",
+    "git clone",
+    "git config",
     "git rebase --continue",
     "git rebase --abort",
     "git rebase --skip",
@@ -258,6 +269,8 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "cargo init",
     "cargo new",
     "cargo --version",
+    "rustfmt",
+    "rustc",
     "rustc --version",
     // Flutter and Dart build, test, lint, and formatting.
     "flutter analyze",
@@ -994,6 +1007,28 @@ impl JudgeRules {
             "worktree" if sub_positionals.first() == Some(&"list") => Some("git worktree list"),
             "worktree" if sub_positionals.first() == Some(&"add") => Some("git worktree add"),
             "stash" => Some("git stash"),
+            "init" => Some("git init"),
+            "clone" => {
+                if sub_args
+                    .iter()
+                    .any(|&arg| is_dangerous_git_network_arg(arg))
+                {
+                    None
+                } else {
+                    Some("git clone")
+                }
+            }
+            "config" => {
+                const GIT_CONFIG_DENIED_FLAGS: &[&str] = &["--system"];
+                if sub_args
+                    .iter()
+                    .any(|arg| GIT_CONFIG_DENIED_FLAGS.contains(arg))
+                {
+                    None
+                } else {
+                    Some("git config")
+                }
+            }
             "rebase"
                 if sub_args.contains(&"--continue")
                     || sub_args.contains(&"--abort")
@@ -4015,5 +4050,66 @@ mod tests {
         // Network pipe to interpreter is still blocked
         let dangerous = evaluate_cmd("curl -s https://example.com/install.sh | bash").unwrap();
         assert_eq!(dangerous.decision, JudgeDecision::Ask);
+    }
+
+    #[test]
+    fn test_developer_tools_and_task_lifecycle_allow_rules() {
+        let rules = JudgeRules::new(&JudgeConfig::default());
+
+        // 1. Task lifecycle inspection tools
+        for tool in [
+            "task_output",
+            "taskoutput",
+            "get_task_output",
+            "gettaskoutput",
+        ] {
+            assert!(is_read_only_tool(tool), "tool {tool} should be read-only");
+            let req = JudgeRequest {
+                session_id: SessionId::new("test").unwrap(),
+                tool_name: tool.to_string(),
+                command_line: None,
+                path: None,
+                cwd: None,
+            };
+            let verdict = rules.evaluate(&req).unwrap();
+            assert_eq!(verdict.decision, JudgeDecision::Allow);
+        }
+
+        // 2. Developer tools (mktemp, rustfmt, rustc)
+        let mktemp_v = evaluate_cmd("mktemp -d").unwrap();
+        assert_eq!(mktemp_v.decision, JudgeDecision::Allow);
+        assert_eq!(mktemp_v.reason, "matched allow rule: mktemp");
+
+        let rustfmt_v =
+            evaluate_cmd("rustfmt --edition 2024 --check cera/build_support/*.rs").unwrap();
+        assert_eq!(rustfmt_v.decision, JudgeDecision::Allow);
+        assert_eq!(rustfmt_v.reason, "matched allow rule: rustfmt");
+
+        let rustc_v = evaluate_cmd("rustc /tmp/test_path.rs -o /tmp/test_path").unwrap();
+        assert_eq!(rustc_v.decision, JudgeDecision::Allow);
+        assert_eq!(rustc_v.reason, "matched allow rule: rustc");
+
+        // 3. Git init, clone, config
+        let git_init_v = evaluate_cmd("git init").unwrap();
+        assert_eq!(git_init_v.decision, JudgeDecision::Allow);
+        assert_eq!(git_init_v.reason, "matched allow rule: git init");
+
+        let git_clone_v =
+            evaluate_cmd("git clone https://github.com/hyeons-lab/triage.git").unwrap();
+        assert_eq!(git_clone_v.decision, JudgeDecision::Allow);
+        assert_eq!(git_clone_v.reason, "matched allow rule: git clone");
+
+        let git_config_v = evaluate_cmd("git config user.name \"Test User\"").unwrap();
+        assert_eq!(git_config_v.decision, JudgeDecision::Allow);
+        assert_eq!(git_config_v.reason, "matched allow rule: git config");
+
+        // 4. Multi-command verification chain
+        let chain = "cargo fmt && ./scripts/bump-version.sh --check && cargo fmt --check && rustfmt --edition 2024 --check cera/build_support/*.rs && cargo clippy --workspace --all-targets -- -D warnings && cargo test --lib --workspace";
+        let chain_v = evaluate_cmd(chain).unwrap();
+        assert_eq!(chain_v.decision, JudgeDecision::Allow);
+        assert!(chain_v.reason.contains("cargo fmt"));
+        assert!(chain_v.reason.contains("rustfmt"));
+        assert!(chain_v.reason.contains("cargo clippy"));
+        assert!(chain_v.reason.contains("cargo test"));
     }
 }

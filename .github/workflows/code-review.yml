@@ -1,0 +1,165 @@
+name: Code Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: 'Pull Request number to review (leave blank to review current branch/commit)'
+        required: false
+        type: string
+      effort:
+        description: 'Review effort level'
+        required: false
+        default: 'high'
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - max
+  pull_request:
+    types: [opened, synchronize, labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-review:
+    name: Antigravity Code Review
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ format('code-review-{0}', inputs.pull_number || github.event.pull_request.number || github.event.issue.number || github.ref) }}
+      cancel-in-progress: true
+    if: |
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'pull_request' && (github.event.action == 'opened' || contains(github.event.pull_request.labels.*.name, 'needs antigravity review')) && (github.event.pull_request.head.repo.full_name == github.repository)) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && (contains(github.event.comment.body, '@antigravity') || contains(github.event.comment.body, '@Antigravity')) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' && (contains(github.event.comment.body, '@antigravity') || contains(github.event.comment.body, '@Antigravity')) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ (inputs.pull_number || github.event.issue.number || github.event.pull_request.number) && format('refs/pull/{0}/head', inputs.pull_number || github.event.issue.number || github.event.pull_request.number) || github.ref }}
+
+      - name: Determine Review Effort
+        id: review_config
+        env:
+          INPUT_EFFORT: ${{ github.event_name == 'workflow_dispatch' && inputs.effort || '' }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          EFFORT="high"
+          if [ -n "$INPUT_EFFORT" ]; then
+            EFFORT="$INPUT_EFFORT"
+          else
+            shopt -s nocasematch
+            if [[ "$COMMENT_BODY" =~ @antigravity([[:space:]]|[:,;-])+(low|medium|high|max) ]]; then
+              RAW_EFFORT="${BASH_REMATCH[2]}"
+              EFFORT="${RAW_EFFORT,,}"
+            fi
+          fi
+          echo "effort=$EFFORT" >> "$GITHUB_OUTPUT"
+          echo "Selected review effort: $EFFORT"
+
+      - name: Run Antigravity Review
+        id: gemini
+        uses: google-github-actions/run-gemini-cli@v0.1.22
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
+          GEMINI_MODEL: 'gemini-3.7-flash'
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          settings: |
+            {
+              "model": "gemini-3.7-flash"
+            }
+          prompt: |
+            # REVIEW TARGET
+            You are reviewing Pull Request #${{ inputs.pull_number || github.event.issue.number || github.event.pull_request.number || 'current branch' }}.
+            Before beginning your analysis, inspect the changes using `gh pr diff ${{ inputs.pull_number || github.event.issue.number || github.event.pull_request.number }}` or `git diff origin/main...HEAD`.
+
+            # EFFORT LEVEL: ${{ steps.review_config.outputs.effort }}
+            Apply the "${{ steps.review_config.outputs.effort }}" review depth:
+            - low: Shallow scan for high-impact correctness bugs, broken invariants, and obvious leftover debug clutter.
+            - medium: Thorough audit of correctness, edge cases, project guidelines, and simplification opportunities.
+            - high: Deep reasoning audit of correctness, low-level memory safety, cross-platform portability, concurrency lifecycles, and complexity reduction.
+            - max: Exhaustive audit across all 8 Core Thematic Pillars (memory safety, concurrency/cancellation lifecycles, error propagation, multiplatform drift, numerical robustness, pipeline completeness, terminal/PTY correctness, and deep refactoring).
+
+            You are Antigravity, a Senior Principal Systems & Multiplatform Architect conducting a thorough, rigorous, production-grade code review for the Triage repository.
+
+            About Triage:
+            Triage is an attention-routing terminal supervisor: a long-running Rust daemon (`triaged`), a Ratatui local TUI (`triage`), an embedded Flutter remote client (web / desktop / mobile), a local IPC wire protocol with zero-downtime process handover (`SCM_RIGHTS`), an approval judge for agent tool calls, and an MCP server.
+
+            Repository Guidelines & Rules:
+            Follow all instructions, conventions, and invariants in GEMINI.md, AGENTS.md, and ~/.gemini/review-refinements.md.
+
+            Review Objective & Standard:
+            Provide a rigorous, deep-dive code review that matches or exceeds the depth, precision, and actionable quality of top-tier reviewers. Do NOT write superficial or generic summaries. Every finding must be specific, backed by exact file paths, line references or code snippets, and include a concrete fix proposal.
+
+            Audit Checklist:
+            1. Architectural & Cross-Platform Integrity:
+               - Clean abstractions, minimal coupling, proper workspace crate boundaries (`triage-core`, `triaged`, `triage`, `triage-transport-ws`, `triage-mcp`, `triage-hook`).
+               - Cross-platform differences (macOS vs Linux vs Windows named pipes / verbatim disk prefixes, desktop vs web).
+               - Compatibility across Flutter versions, FlatBuffers bindings, and terminal escape emulators.
+            2. Concurrency, Cancellation & Process Lifecycles:
+               - PTY master descriptor ownership, atomic ordering, non-blocking I/O queues, deadlocks.
+               - Zero-downtime process handover (`SCM_RIGHTS` descriptor passing, adoption retries, handover token lineage).
+               - Stream subscriptions, broadcast channels, client connection teardown without leaking reader threads.
+            3. Terminal & PTY Output Correctness:
+               - Raw newline preservation, bracketed paste safety, OSC 7 CWD reporting, synchronized output sequences.
+               - Terminal resize event debouncing, cursor state restoration, scrolling buffer boundaries.
+            4. Correctness, Edge Cases & Error Domains:
+               - Out-of-bounds slicing, unhandled IO errors, unclosed file descriptors.
+               - Strict no-panic invariant in daemon and library code.
+               - Graceful error propagation across IPC boundaries instead of silent failure or daemon crashes.
+            5. Tool Approval Judge & Security Guardrails:
+               - Deterministic allowlist evaluation, AST metacharacter boundary checks, credential path filters.
+               - In-process offline fallback resilience, thread safety of history buffers and rule mutations.
+            6. Test Coverage & Regression Prevention:
+               - Missing unit/integration tests for new code paths, unverified edge cases, untested failure branches.
+
+            Output Structure:
+            ### 1. Executive Summary & Impact Analysis
+            - Concise technical synthesis of what the PR changes, architectural implications, and readiness for merge.
+
+            ### 2. 🚨 Critical / Blocking Issues
+            *(If none, explicitly state "None identified.")*
+            - Severe bugs, memory/concurrency violations, unhandled panics/exceptions, or breaking regressions.
+            - Include exact `file_path:line_number`, explanation of the hazard, and a concrete before/after code diff fix.
+
+            ### 3. ⚠️ Warnings & Correctness Risks
+            - Edge cases, error handling gaps, resource leaks, cross-platform caveats, or subtle logical flaws.
+            - Include exact `file_path:line_number`, explanation, and actionable code diff recommendations.
+
+            ### 4. 💡 Suggestions & Optimization Opportunities
+            - Non-blocking improvements: cleaner idioms, performance optimizations in hot paths, documentation comments, or refactoring opportunities.
+            - Include exact `file_path:line_number` and concise code proposals.
+
+            ### 5. 🧪 Test Coverage & Edge Cases to Consider
+            - Specific scenarios or test cases that should be verified.
+
+            ### 6. 🌟 Architecture Highlights
+            - Acknowledge well-crafted patterns, elegant abstractions, and robust implementations in the PR.
+
+            Be direct, highly technical, actionable, and precise.
+
+      - name: Post Review Comment
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pull_number || github.event.issue.number || github.event.pull_request.number }}
+          RESPONSE: ${{ steps.gemini.outputs.gemini_response || steps.gemini.outputs.response }}
+          EFFORT_LEVEL: ${{ steps.review_config.outputs.effort }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+        run: |
+          python3 scripts/format_review_comment.py

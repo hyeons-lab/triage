@@ -38,7 +38,7 @@ pub struct HandoverSession {
     pub judge_override: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HandoverState {
     pub sessions: Vec<HandoverSession>,
     pub has_tcp_listener: bool,
@@ -61,6 +61,10 @@ pub struct HandoverState {
     /// stalled successor can recognize a newer authoritative snapshot.
     #[serde(default)]
     pub handover_lineage_token: Option<[u8; 16]>,
+    /// Preserved judge history records so decision history and dashboard analytics
+    /// persist across zero-downtime reloads.
+    #[serde(default)]
+    pub judge_history: Vec<triage_core::judge::JudgeRecord>,
 }
 
 /// Result of asking a running daemon to hand over (Phase 1, before the successor
