@@ -443,17 +443,311 @@ fn strip_leading_env_vars(mut cmd: &str) -> &str {
     }
 }
 
+fn extract_agent_name(val: &serde_json::Value) -> Option<String> {
+    for key in [
+        "subagent_name",
+        "subagentName",
+        "subagent_type",
+        "subagentType",
+        "subagent",
+        "agent_name",
+        "agentName",
+        "agent_type",
+        "agentType",
+        "agent",
+        "role",
+        "sender",
+        "source",
+        "caller",
+    ] {
+        if let Some(s) = val.get(key).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty()
+                && !matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "user" | "model" | "assistant" | "system" | "agent" | "unknown"
+                )
+            {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(obj) = val.as_object() {
+        for child_key in [
+            "context",
+            "metadata",
+            "hookSpecificInput",
+            "hook_specific_input",
+            "tool_call",
+            "toolCall",
+        ] {
+            if let Some(child) = obj.get(child_key)
+                && let Some(found) = extract_agent_name(child)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn generate_tool_casing_variants(tool_name: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    let raw = tool_name.trim();
+    if raw.is_empty() {
+        return variants;
+    }
+    variants.push(raw.to_string());
+
+    let base = raw.rsplit(':').next().unwrap_or(raw);
+    if base != raw {
+        variants.push(base.to_string());
+    }
+
+    let mut words: Vec<String> = Vec::new();
+    for part in base.split(['_', '-']) {
+        if part.is_empty() {
+            continue;
+        }
+        let mut cur = String::new();
+        for ch in part.chars() {
+            if ch.is_uppercase() && !cur.is_empty() {
+                words.push(cur.to_lowercase());
+                cur = String::new();
+            }
+            cur.push(ch.to_ascii_lowercase());
+        }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+    }
+
+    if !words.is_empty() {
+        let snake = words.join("_");
+        if !variants.contains(&snake) {
+            variants.push(snake);
+        }
+        let kebab = words.join("-");
+        if !variants.contains(&kebab) {
+            variants.push(kebab);
+        }
+        let pascal = words
+            .iter()
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            })
+            .collect::<String>();
+        if !variants.contains(&pascal) {
+            variants.push(pascal.clone());
+        }
+        if let Some((first, rest)) = words.split_first() {
+            let camel = first.to_lowercase()
+                + &rest
+                    .iter()
+                    .map(|w| {
+                        let mut c = w.chars();
+                        match c.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        }
+                    })
+                    .collect::<String>();
+            if !variants.contains(&camel) {
+                variants.push(camel);
+            }
+        }
+        let flat = words.concat();
+        if !variants.contains(&flat) {
+            variants.push(flat);
+        }
+    }
+
+    let norm = triage_core::judge_rules::normalize_tool_name(base);
+    match norm {
+        "list_dir" | "listdir" | "list_directory" => {
+            for alias in [
+                "list_dir",
+                "ListDir",
+                "listDir",
+                "listdir",
+                "list_directory",
+                "ListDirectory",
+                "listDirectory",
+                "ls",
+                "file",
+                "File",
+                "read",
+                "Read",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        "view_file" | "read_file" | "read" => {
+            for alias in [
+                "view_file",
+                "ViewFile",
+                "viewFile",
+                "read_file",
+                "ReadFile",
+                "readFile",
+                "read",
+                "Read",
+                "file",
+                "File",
+                "inspect_file",
+                "InspectFile",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        "grep_search" | "grep" => {
+            for alias in [
+                "grep_search",
+                "GrepSearch",
+                "grepSearch",
+                "grep",
+                "Grep",
+                "search_files",
+                "SearchFiles",
+                "file",
+                "File",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        "find_by_name" | "find" => {
+            for alias in [
+                "find_by_name",
+                "FindByName",
+                "findByName",
+                "find_files",
+                "FindFiles",
+                "find",
+                "file",
+                "File",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        "run_command" | "bash" | "exec" => {
+            for alias in [
+                "run_command",
+                "RunCommand",
+                "runCommand",
+                "command",
+                "Command",
+                "bash",
+                "Bash",
+                "exec",
+                "Exec",
+                "terminal",
+                "Terminal",
+                "shell",
+                "Shell",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        "write_to_file" | "write" => {
+            for alias in [
+                "write_to_file",
+                "WriteToFile",
+                "writeToFile",
+                "write",
+                "Write",
+                "edit",
+                "Edit",
+                "file",
+                "File",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        "replace_file_content" | "edit_file" => {
+            for alias in [
+                "replace_file_content",
+                "ReplaceFileContent",
+                "replaceFileContent",
+                "edit_file",
+                "EditFile",
+                "editFile",
+                "edit",
+                "Edit",
+                "write",
+                "Write",
+                "file",
+                "File",
+            ] {
+                if !variants.iter().any(|v| v == alias) {
+                    variants.push(alias.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    variants
+}
+
+fn generate_agent_prefixes(agent_name: Option<&str>) -> Vec<String> {
+    let mut prefixes = vec!["".to_string(), "self:".to_string(), "subagent:".to_string()];
+    if let Some(agent) = agent_name {
+        let trimmed = agent.trim();
+        if !trimmed.is_empty() {
+            let direct = format!("{trimmed}:");
+            if !prefixes.contains(&direct) {
+                prefixes.push(direct);
+            }
+            let sub_direct = format!("subagent:{trimmed}:");
+            if !prefixes.contains(&sub_direct) {
+                prefixes.push(sub_direct);
+            }
+            let self_direct = format!("self:{trimmed}:");
+            if !prefixes.contains(&self_direct) {
+                prefixes.push(self_direct);
+            }
+        }
+    }
+    prefixes
+}
+
 static BASE_COMMAND_PREFIXES: &[&str] = &[
     "command",
+    "Command",
     "run_command",
+    "runCommand",
+    "RunCommand",
+    "runcommand",
     "Bash",
     "bash",
     "exec",
+    "Exec",
     "executecommand",
+    "ExecuteCommand",
+    "execute_command",
     "shell",
+    "Shell",
     "terminal",
+    "Terminal",
     "self:command",
     "self:run_command",
+    "self:RunCommand",
     "self:Bash",
     "self:bash",
     "self:exec",
@@ -462,6 +756,7 @@ static BASE_COMMAND_PREFIXES: &[&str] = &[
     "self:terminal",
     "subagent:command",
     "subagent:run_command",
+    "subagent:RunCommand",
     "subagent:Bash",
     "subagent:bash",
     "subagent:exec",
@@ -472,58 +767,98 @@ static BASE_COMMAND_PREFIXES: &[&str] = &[
 
 static READ_FILE_PREFIXES: &[&str] = &[
     "file",
+    "File",
     "view_file",
+    "viewFile",
+    "ViewFile",
+    "viewfile",
     "grep_search",
+    "grepSearch",
+    "GrepSearch",
+    "grepsearch",
     "find_by_name",
+    "findByName",
+    "FindByName",
+    "findbyname",
     "list_dir",
+    "listDir",
+    "ListDir",
+    "listdir",
+    "list_directory",
+    "ListDirectory",
     "read_file",
+    "readFile",
+    "ReadFile",
+    "readfile",
     "read",
+    "Read",
     "self:file",
     "self:view_file",
+    "self:ViewFile",
     "self:grep_search",
+    "self:GrepSearch",
     "self:find_by_name",
+    "self:FindByName",
     "self:list_dir",
+    "self:ListDir",
     "self:read_file",
+    "self:ReadFile",
     "self:read",
     "subagent:file",
     "subagent:view_file",
+    "subagent:ViewFile",
     "subagent:grep_search",
+    "subagent:GrepSearch",
     "subagent:find_by_name",
+    "subagent:FindByName",
     "subagent:list_dir",
+    "subagent:ListDir",
     "subagent:read_file",
+    "subagent:ReadFile",
     "subagent:read",
 ];
 
 static EDIT_FILE_PREFIXES: &[&str] = &[
     "file",
+    "File",
     "write_to_file",
+    "writeToFile",
+    "WriteToFile",
+    "writetofile",
     "replace_file_content",
+    "replaceFileContent",
+    "ReplaceFileContent",
+    "replacefilecontent",
     "edit_file",
+    "editFile",
+    "EditFile",
+    "editfile",
     "write",
+    "Write",
     "edit",
+    "Edit",
     "self:file",
     "self:write_to_file",
+    "self:WriteToFile",
     "self:replace_file_content",
+    "self:ReplaceFileContent",
     "self:edit_file",
+    "self:EditFile",
     "self:write",
     "self:edit",
     "subagent:file",
     "subagent:write_to_file",
+    "subagent:WriteToFile",
     "subagent:replace_file_content",
+    "subagent:ReplaceFileContent",
     "subagent:edit_file",
+    "subagent:EditFile",
     "subagent:write",
     "subagent:edit",
 ];
 
 /// Reports whether `payload` can be wrapped in a `command(...)` or `file(...)`
 /// grant token without its parentheses becoming ambiguous.
-///
-/// The grant syntax has no escape for the closing paren, so a payload whose own
-/// parentheses do not nest cleanly (`grep -n "foo)" main.rs`) yields a token
-/// that either terminates early or never terminates at all. Either reading
-/// describes a command other than the one that was judged, so emitting nothing
-/// is strictly better: the narrower per-segment and per-program grants for the
-/// same call are still emitted alongside it.
 fn is_balanced_grant_payload(payload: &str) -> bool {
     payload
         .chars()
@@ -535,26 +870,22 @@ fn is_balanced_grant_payload(payload: &str) -> bool {
         .is_some_and(|depth| depth == 0)
 }
 
-fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
+fn compute_permission_overrides(req: &JudgeRequest, agent_name: Option<&str>) -> Vec<String> {
     if req.command_line.is_none() && req.path.is_none() {
         return Vec::new();
     }
     let mut permission_overrides = Vec::new();
-    let norm_tool = triage_core::judge_rules::normalize_tool_name(&req.tool_name);
-    let custom_sub = format!("subagent:{}", req.tool_name);
-    let custom_self = format!("self:{}", req.tool_name);
+    let tool_variants = generate_tool_casing_variants(&req.tool_name);
+    let agent_prefixes = generate_agent_prefixes(agent_name);
 
     if let Some(ref cmd) = req.command_line {
         for &prefix in BASE_COMMAND_PREFIXES {
             permission_overrides.push(format!("{prefix}(*)"));
         }
-        permission_overrides.push(format!("{}(*)", req.tool_name));
-        permission_overrides.push(format!("{custom_sub}(*)"));
-        permission_overrides.push(format!("{custom_self}(*)"));
-        if norm_tool != req.tool_name {
-            permission_overrides.push(format!("{norm_tool}(*)"));
-            permission_overrides.push(format!("subagent:{norm_tool}(*)"));
-            permission_overrides.push(format!("self:{norm_tool}(*)"));
+        for ap in &agent_prefixes {
+            for tv in &tool_variants {
+                permission_overrides.push(format!("{ap}{tv}(*)"));
+            }
         }
 
         let mut add_command_override = |cmd_str: &str| {
@@ -565,13 +896,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             for &prefix in BASE_COMMAND_PREFIXES {
                 permission_overrides.push(format!("{prefix}({trimmed_target})"));
             }
-            permission_overrides.push(format!("{}({trimmed_target})", req.tool_name));
-            permission_overrides.push(format!("{custom_sub}({trimmed_target})"));
-            permission_overrides.push(format!("{custom_self}({trimmed_target})"));
-            if norm_tool != req.tool_name {
-                permission_overrides.push(format!("{norm_tool}({trimmed_target})"));
-                permission_overrides.push(format!("subagent:{norm_tool}({trimmed_target})"));
-                permission_overrides.push(format!("self:{norm_tool}({trimmed_target})"));
+            for ap in &agent_prefixes {
+                for tv in &tool_variants {
+                    permission_overrides.push(format!("{ap}{tv}({trimmed_target})"));
+                }
             }
 
             if let Some(without_dot_slash) = trimmed_target.strip_prefix("./") {
@@ -580,13 +908,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                     for &prefix in BASE_COMMAND_PREFIXES {
                         permission_overrides.push(format!("{prefix}({trimmed_sub})"));
                     }
-                    permission_overrides.push(format!("{}({trimmed_sub})", req.tool_name));
-                    permission_overrides.push(format!("{custom_sub}({trimmed_sub})"));
-                    permission_overrides.push(format!("{custom_self}({trimmed_sub})"));
-                    if norm_tool != req.tool_name {
-                        permission_overrides.push(format!("{norm_tool}({trimmed_sub})"));
-                        permission_overrides.push(format!("subagent:{norm_tool}({trimmed_sub})"));
-                        permission_overrides.push(format!("self:{norm_tool}({trimmed_sub})"));
+                    for ap in &agent_prefixes {
+                        for tv in &tool_variants {
+                            permission_overrides.push(format!("{ap}{tv}({trimmed_sub})"));
+                        }
                     }
                 }
             }
@@ -679,13 +1004,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
             for &prefix in base_file_slice {
                 permission_overrides.push(format!("{prefix}(*)"));
             }
-            permission_overrides.push(format!("{}(*)", req.tool_name));
-            permission_overrides.push(format!("{custom_sub}(*)"));
-            permission_overrides.push(format!("{custom_self}(*)"));
-            if norm_tool != req.tool_name {
-                permission_overrides.push(format!("{norm_tool}(*)"));
-                permission_overrides.push(format!("subagent:{norm_tool}(*)"));
-                permission_overrides.push(format!("self:{norm_tool}(*)"));
+            for ap in &agent_prefixes {
+                for tv in &tool_variants {
+                    permission_overrides.push(format!("{ap}{tv}(*)"));
+                }
             }
         }
         let mut add_path_override = |p_str: &str| {
@@ -693,13 +1015,10 @@ fn compute_permission_overrides(req: &JudgeRequest) -> Vec<String> {
                 for &prefix in base_file_slice {
                     permission_overrides.push(format!("{prefix}({p_str})"));
                 }
-                permission_overrides.push(format!("{}({p_str})", req.tool_name));
-                permission_overrides.push(format!("{custom_sub}({p_str})"));
-                permission_overrides.push(format!("{custom_self}({p_str})"));
-                if norm_tool != req.tool_name {
-                    permission_overrides.push(format!("{norm_tool}({p_str})"));
-                    permission_overrides.push(format!("subagent:{norm_tool}({p_str})"));
-                    permission_overrides.push(format!("self:{norm_tool}({p_str})"));
+                for ap in &agent_prefixes {
+                    for tv in &tool_variants {
+                        permission_overrides.push(format!("{ap}{tv}({p_str})"));
+                    }
                 }
             }
         };
@@ -778,6 +1097,7 @@ fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
     request: Option<&JudgeRequest>,
+    agent_name: Option<&str>,
 ) -> String {
     if format == AgentFormat::ClaudeCode {
         return match verdict.decision {
@@ -818,7 +1138,7 @@ fn encode_response(
     match verdict.decision {
         triage_core::judge::JudgeDecision::Allow => {
             let permission_overrides = request
-                .map(compute_permission_overrides)
+                .map(|req| compute_permission_overrides(req, agent_name))
                 .unwrap_or_default();
             let reason_opt = if !verdict.reason.is_empty() {
                 Some(verdict.reason.as_str())
@@ -854,8 +1174,8 @@ fn encode_response(
 }
 
 fn main() {
-    let (verdict, format, request) = decide();
-    let encoded = encode_response(format, &verdict, request.as_ref());
+    let (verdict, format, request, agent_name) = decide();
+    let encoded = encode_response(format, &verdict, request.as_ref(), agent_name.as_deref());
     if !encoded.is_empty() {
         let mut stdout = std::io::stdout();
         let _ = writeln!(stdout, "{encoded}");
@@ -867,7 +1187,12 @@ fn main() {
 const MAX_STDIN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Produces the verdict and detected agent format, resolving every failure to `ask`.
-fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
+fn decide() -> (
+    JudgeVerdict,
+    AgentFormat,
+    Option<JudgeRequest>,
+    Option<String>,
+) {
     let start_time = std::time::Instant::now();
     // Read stdin incrementally in chunks and parse as soon as a complete JSON payload
     // is received. This prevents blocking on open, unclosed pipes where EOF is not sent.
@@ -915,6 +1240,7 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
                 JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
                 AgentFormat::Generic,
                 None,
+                None,
             );
         }
         Err(_) => {
@@ -922,15 +1248,18 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
                 JudgeVerdict::fallback("timed out waiting for stdin payload"),
                 AgentFormat::Generic,
                 None,
+                None,
             );
         }
     };
     let format = detect_format(&val);
+    let agent_name = extract_agent_name(&val);
     let Some((tool_name, tool_args)) = extract_tool_info(&val) else {
         return (
             JudgeVerdict::fallback("hook payload carried no tool call"),
             format,
             None,
+            agent_name,
         );
     };
 
@@ -967,7 +1296,7 @@ fn decide() -> (JudgeVerdict, AgentFormat, Option<JudgeRequest>) {
     };
     let remaining_timeout = JUDGE_TIMEOUT.saturating_sub(start_time.elapsed());
     let verdict = ask_daemon(request.clone(), remaining_timeout);
-    (verdict, format, Some(request))
+    (verdict, format, Some(request), agent_name)
 }
 
 /// Evaluates deterministic Layer 1 deny and Layer 2 allow rules in-process using
@@ -1189,12 +1518,16 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let allow_encoded =
-            encode_response(AgentFormat::Antigravity, &allow_verdict, Some(&allow_req));
+        let allow_encoded = encode_response(
+            AgentFormat::Antigravity,
+            &allow_verdict,
+            Some(&allow_req),
+            None,
+        );
         assert!(allow_encoded.contains(r#""decision":"allow""#));
         assert!(allow_encoded.contains(r#""permissionOverrides""#));
         assert!(allow_encoded.contains("command(git status)"));
-        let allow_overrides = compute_permission_overrides(&allow_req);
+        let allow_overrides = compute_permission_overrides(&allow_req, None);
         assert!(allow_overrides.iter().any(|s| s == "command(git status)"));
         assert!(
             allow_overrides
@@ -1214,7 +1547,8 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let ask_encoded = encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request));
+        let ask_encoded =
+            encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request), None);
         assert_eq!(ask_encoded, "");
 
         let allow_cmd_verdict = JudgeVerdict {
@@ -1222,12 +1556,16 @@ mod tests {
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
-        let allow_cmd_encoded =
-            encode_response(AgentFormat::Antigravity, &allow_cmd_verdict, Some(&request));
+        let allow_cmd_encoded = encode_response(
+            AgentFormat::Antigravity,
+            &allow_cmd_verdict,
+            Some(&request),
+            None,
+        );
         assert!(allow_cmd_encoded.contains(r#""decision":"allow""#));
         assert!(allow_cmd_encoded.contains(r#""permissionOverrides""#));
         assert!(allow_cmd_encoded.contains("command(VAR=1 ls -la)"));
-        let overrides = compute_permission_overrides(&request);
+        let overrides = compute_permission_overrides(&request, None);
         assert!(overrides.iter().any(|s| s == "command(VAR=1 ls -la)"));
         assert!(overrides.iter().any(|s| s == "command(ls -la)"));
     }
@@ -1241,7 +1579,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&request);
+        let overrides = compute_permission_overrides(&request, None);
         assert!(overrides.iter().any(|s| s == "command(ls -la)"));
     }
 
@@ -1254,7 +1592,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&request);
+        let overrides = compute_permission_overrides(&request, None);
         assert!(
             overrides
                 .iter()
@@ -1277,7 +1615,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&request);
+        let overrides = compute_permission_overrides(&request, None);
         assert!(
             overrides
                 .iter()
@@ -1297,7 +1635,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
-        let encoded_allow = encode_response(AgentFormat::ClaudeCode, &allow_verdict, None);
+        let encoded_allow = encode_response(AgentFormat::ClaudeCode, &allow_verdict, None, None);
         assert_eq!(
             encoded_allow,
             r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
@@ -1308,7 +1646,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::Fallback,
             reason: "requires confirmation".to_string(),
         };
-        let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None);
+        let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None, None);
         assert_eq!(encoded_ask, "");
     }
 
@@ -1356,7 +1694,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::DenyRule,
             reason: String::new(),
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, None);
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, None, None);
         assert_eq!(encoded, r#"{"decision":"deny"}"#);
     }
 
@@ -1576,7 +1914,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let override_strs = compute_permission_overrides(&req);
+        let override_strs = compute_permission_overrides(&req, None);
         assert!(
             override_strs
                 .iter()
@@ -1618,7 +1956,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let override_strs = compute_permission_overrides(&req);
+        let override_strs = compute_permission_overrides(&req, None);
         // The unbalanced full-command token must not be emitted at all.
         assert!(
             !override_strs.iter().any(|s| s.contains("foo)")),
@@ -1644,7 +1982,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let override_strs = compute_permission_overrides(&req);
+        let override_strs = compute_permission_overrides(&req, None);
         assert!(
             override_strs
                 .iter()
@@ -1662,7 +2000,7 @@ mod tests {
             path: Some("/tmp/weird)name.txt".to_string()),
             cwd: None,
         };
-        let override_strs = compute_permission_overrides(&req);
+        let override_strs = compute_permission_overrides(&req, None);
         for token in &override_strs {
             assert!(
                 is_balanced_grant_payload(token),
@@ -1687,7 +2025,7 @@ mod tests {
             path: Some("~literal_filename.txt".to_string()),
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&req_tilde_file);
+        let overrides = compute_permission_overrides(&req_tilde_file, None);
         // Must NOT expand ~literal_filename.txt into /Users/...literal_filename.txt
         let corrupt_expansion = format!("{home}literal_filename.txt");
         assert!(!overrides.iter().any(|s| s.contains(&corrupt_expansion)));
@@ -1702,7 +2040,7 @@ mod tests {
             path: Some(sibling_path.clone()),
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&req_sibling);
+        let overrides = compute_permission_overrides(&req_sibling, None);
         // Must NOT contract to ~_other/repo/file.txt
         assert!(!overrides.iter().any(|s| s.contains("~_other")));
         assert!(
@@ -1720,7 +2058,7 @@ mod tests {
             path: Some(valid_tilde),
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&req_valid);
+        let overrides = compute_permission_overrides(&req_valid, None);
         let expected_expanded = format!("{home}/repo/main.rs");
         assert!(
             overrides
@@ -1737,7 +2075,7 @@ mod tests {
             path: Some(home.clone()),
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&req_root_home);
+        let overrides = compute_permission_overrides(&req_root_home, None);
         assert!(overrides.iter().any(|s| s == "file(~)"));
         assert!(overrides.iter().any(|s| s == &format!("file({home})")));
         // Must NOT emit wildcard overrides for entire home or system users directory
@@ -1755,7 +2093,7 @@ mod tests {
             path: Some("https://example.com/api/v1".to_string()),
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&req_url);
+        let overrides = compute_permission_overrides(&req_url, None);
         assert!(!overrides.iter().any(|s| s.starts_with("file(")));
         assert!(!overrides.iter().any(|s| s.contains("/*")));
     }
@@ -1767,7 +2105,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::DenyRule,
             reason: "destructive command blocked".to_string(),
         };
-        let encoded = encode_response(AgentFormat::Generic, &verdict, None);
+        let encoded = encode_response(AgentFormat::Generic, &verdict, None, None);
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(val["decision"], "deny");
         assert_eq!(val["reason"], "destructive command blocked");
@@ -1985,7 +2323,7 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let overrides = compute_permission_overrides(&req);
+        let overrides = compute_permission_overrides(&req, None);
         assert!(
             overrides.iter().any(|s| s == "command(agy --help 2>&1)"),
             "missing agy --help 2>&1 override: {overrides:?}"
@@ -1997,6 +2335,57 @@ mod tests {
         assert!(
             !overrides.iter().any(|s| s == "command(1)"),
             "emitted nonsense command(1) grant: {overrides:?}"
+        );
+    }
+
+    #[test]
+    fn permission_overrides_for_subagent_with_pascal_case_tool_generates_all_variants() {
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "list_dir".to_string(),
+            command_line: None,
+            path: Some("~/development/cera/.git/worktrees/dspark-sidecar".to_string()),
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&req, Some("research"));
+        // PascalCase and bare tool variants
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "ListDir(~/development/cera/.git/worktrees/dspark-sidecar)"),
+            "missing bare PascalCase override: {overrides:?}"
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "research:ListDir(~/development/cera/.git/worktrees/dspark-sidecar)"),
+            "missing agent-qualified PascalCase override: {overrides:?}"
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "subagent:ListDir(~/development/cera/.git/worktrees/dspark-sidecar)"),
+            "missing subagent PascalCase override: {overrides:?}"
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "list_dir(~/development/cera/.git/worktrees/dspark-sidecar)"),
+            "missing snake_case override: {overrides:?}"
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == "research:list_dir(~/development/cera/.git/worktrees/dspark-sidecar)"),
+            "missing agent-qualified snake_case override: {overrides:?}"
+        );
+        assert!(
+            overrides.iter().any(|s| s == "ListDir(*)"),
+            "missing wildcard PascalCase override: {overrides:?}"
+        );
+        assert!(
+            overrides.iter().any(|s| s == "research:ListDir(*)"),
+            "missing agent wildcard PascalCase override: {overrides:?}"
         );
     }
 }
