@@ -69,7 +69,7 @@ class SessionSearchInput {
   bool matchesQuery(String query, {bool queryIsNormalized = false}) {
     final q = queryIsNormalized ? query : query.trim().toLowerCase();
     if (q.isEmpty) return true;
-    final isAsciiQuery = !q.codeUnits.any((u) => u > 127);
+    final isAsciiQuery = _isAsciiOnly(q);
     return _containsIgnoreCase(title, q, isAsciiQuery) ||
         _containsIgnoreCase(displayTitle, q, isAsciiQuery) ||
         _containsIgnoreCase(railTitle, q, isAsciiQuery) ||
@@ -84,6 +84,13 @@ class SessionSearchInput {
         _containsIgnoreCase(cwd, q, isAsciiQuery) ||
         _containsIgnoreCase(snippet, q, isAsciiQuery) ||
         _containsIgnoreCase(snippetDetail, q, isAsciiQuery);
+  }
+
+  static bool _isAsciiOnly(String s) {
+    for (var i = 0; i < s.length; i++) {
+      if (s.codeUnitAt(i) > 127) return false;
+    }
+    return true;
   }
 
   static bool _containsIgnoreCase(

@@ -558,6 +558,16 @@ void main() {
       expect(unicodeSample.matchesQuery('münchen'), isTrue);
     });
 
+    test('matches emoji and surrogate pair queries', () {
+      const emojiSample = SessionSearchInput(
+        title: 'deploy 🚀 rocket',
+        snippet: 'global sync 🌍 active',
+      );
+      expect(emojiSample.matchesQuery('🚀'), isTrue);
+      expect(emojiSample.matchesQuery('🌍'), isTrue);
+      expect(emojiSample.matchesQuery('rocket'), isTrue);
+    });
+
     test('returns false for non-matching query', () {
       expect(sample.matchesQuery('nonexistent-term-xyz'), isFalse);
     });
