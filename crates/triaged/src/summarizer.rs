@@ -956,16 +956,23 @@ pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
     let head_text = head_rows.join("\n");
     let head_capped: String = head_text.chars().take(MAX_HEAD_CHARS).collect();
 
-    let tail_start = kept.len().saturating_sub(MAX_TAIL_ROWS);
-    let tail_rows = &kept[tail_start.max(head_limit)..];
+    // If kept has more than 1 line, ensure the tail captures recent lines
+    // even when kept.len() <= MAX_HEAD_ROWS.
+    let tail_start = if kept.len() > MAX_HEAD_ROWS {
+        kept.len().saturating_sub(MAX_TAIL_ROWS).max(head_limit)
+    } else {
+        1.min(kept.len())
+    };
+    let tail_rows = &kept[tail_start..];
     let tail_text = tail_rows.join("\n");
 
     const SEPARATOR: &str = "\n[...]\n";
     let sep_len = SEPARATOR.chars().count();
     let remaining_budget = MAX_PROMPT_CHARS.saturating_sub(head_capped.chars().count() + sep_len);
 
-    let tail_capped: String = if tail_text.chars().count() > remaining_budget {
-        let skip = tail_text.chars().count() - remaining_budget;
+    let tail_count = tail_text.chars().count();
+    let tail_capped: String = if tail_count > remaining_budget {
+        let skip = tail_count - remaining_budget;
         tail_text.chars().skip(skip).collect()
     } else {
         tail_text
@@ -1349,6 +1356,22 @@ mod tests {
         assert!(prompt.starts_with("$ git commit -m 'very long command line'"));
         assert!(prompt.contains("\n[...]\n"));
         assert!(prompt.ends_with("$ echo completed"));
+        assert!(prompt.chars().count() <= 1500);
+    }
+
+    #[test]
+    fn build_prompt_preserves_head_and_tail_when_few_lines_exceed_char_cap() {
+        let rows = vec![
+            "$ ./run_big_task.sh".to_string(),
+            "output line 1 ".repeat(40),
+            "output line 2 ".repeat(40),
+            "output line 3 ".repeat(40),
+            "ERROR: fatal exception on step 4".to_string(),
+        ];
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("$ ./run_big_task.sh"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("ERROR: fatal exception on step 4"));
         assert!(prompt.chars().count() <= 1500);
     }
 

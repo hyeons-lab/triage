@@ -25,6 +25,7 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 ## Decisions
 - Used pure Dart `SessionSearchInput.matchesQuery` in `session_rail_layout.dart` with short-circuiting comparisons for zero-allocation UI filtering.
 - Head-and-tail prompt retention budgets 500 characters guaranteed for head rows before allocating the remainder to tail rows when exceeding `MAX_PROMPT_CHARS`, preventing large outputs or wide lines from dropping the initial task launch context.
+- Ensured tail output retention in `build_prompt_text` even when total line count is small (`<= 8` lines) but individual lines exceed character caps.
 - Group header drag listeners are disabled during search filtering (`canDrag: !isSearching`) to avoid ghost drag gestures while reordering is inactive.
 
 ## Issues
@@ -33,7 +34,8 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 ## Commits
 - a7e68d7 — feat: add siderail search and audit session summaries
 - e07253c — feat: make siderail search toggleable from header icon
-- HEAD — fix: address PR review comments for siderail search and prompt retention
+- 616fa36 — fix: address PR review comments for siderail search and prompt retention
+- HEAD — fix: preserve prompt tail on short line-count outputs and enable search autofocus
 
 ## Progress
 - [x] Researched codebase and identified search requirements and summary generation pipeline.
@@ -43,6 +45,7 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - [x] Validate and run checks (`cargo test --workspace`, `flutter test`, clippy, formatting).
 - [x] Make search toggleable via header icon next to settings gear.
 - [x] Address PR review comments (head context preservation under char limits, short-circuiting search filtering, disabling group header dragging during search).
+- [x] Add prompt tail preservation test for short line-count outputs and autofocus search field on open.
 
 ## Next Steps
-- Push commit and verify CI checks on PR #153.
+- Push commit to PR #153.

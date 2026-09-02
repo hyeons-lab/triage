@@ -4570,6 +4570,7 @@ class _SessionRailState extends State<SessionRail> {
                     child: TextField(
                       focusNode: _searchFocusNode,
                       controller: _searchController,
+                      autofocus: true,
                       onChanged: _onSearchChanged,
                       style: const TextStyle(
                         color: Color(0xffcdd7d6),
