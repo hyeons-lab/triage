@@ -4315,7 +4315,7 @@ class _SessionRailState extends State<SessionRail> {
             alignment: Alignment.topLeft,
             children: [
               ...previousChildren,
-              ?currentChild,
+              if (currentChild != null) currentChild,
             ],
           );
         },
@@ -7850,7 +7850,7 @@ String? _homeAbbreviatedPath(String path) {
   final normalized = trimTrailingSlash(localHomeDir());
   if (normalized == null) return null;
   if (path == normalized) return '~';
-  if (path.startsWith('$normalized/')) {
+  if (path.startsWith('$normalized/') || path.startsWith('$normalized\\')) {
     return '~${path.substring(normalized.length)}';
   }
   return null;
