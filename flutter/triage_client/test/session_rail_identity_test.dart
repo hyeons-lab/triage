@@ -722,9 +722,9 @@ void main() {
             onUnpinSession: (_) {},
             selectedIndex: 0,
             onSelectSession: (index) => selectedIndex = index,
-            onReorderSession: (_, __, ___) {},
+            onReorderSession: (items, oldIdx, newIdx) {},
             railListKey: GlobalKey<ReorderableListState>(),
-            onRailDragStart: (_, __) {},
+            onRailDragStart: (group, offset) {},
             onRailDragEnd: () {},
             draggingGroupKey: null,
             onCreateSession: (_) {},
@@ -815,6 +815,80 @@ void main() {
       expect(find.byType(TextField), findsNothing);
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+
+      // 8. Open search, type query, and verify collapsing the sidebar resets search
+      await tester.tap(searchButton);
+      await tester.pump();
+      expect(find.byType(TextField), findsOneWidget);
+      await tester.enterText(find.byType(TextField), 'frontend');
+      await tester.pump();
+      expect(find.widgetWithText(SessionListTile, 'main'), findsNothing);
+
+      // Re-pump with isCollapsed = true
+      await tester.pumpWidget(
+        host(
+          SessionRail(
+            sessions: sessions,
+            sessionGroups: groups,
+            pins: SessionPins.none,
+            onResetOrder: () {},
+            onUnpinGroup: (_) {},
+            onUnpinSession: (_) {},
+            selectedIndex: 0,
+            onSelectSession: (index) => selectedIndex = index,
+            onReorderSession: (items, oldIdx, newIdx) {},
+            railListKey: GlobalKey<ReorderableListState>(),
+            onRailDragStart: (group, offset) {},
+            onRailDragEnd: () {},
+            draggingGroupKey: null,
+            onCreateSession: (_) {},
+            selectedShell: NewSessionShell.defaultPosix,
+            shellOptions: const [NewSessionShell.defaultPosix],
+            showShellMenu: false,
+            connectionStatus: 'connected',
+            connectionStatusColor: const Color(0xff7fd1c7),
+            onOpenSettings: () {},
+            isCollapsed: true,
+            onToggleCollapse: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // Re-expand sidebar: search should be closed and all sessions visible
+      await tester.pumpWidget(
+        host(
+          SessionRail(
+            sessions: sessions,
+            sessionGroups: groups,
+            pins: SessionPins.none,
+            onResetOrder: () {},
+            onUnpinGroup: (_) {},
+            onUnpinSession: (_) {},
+            selectedIndex: 0,
+            onSelectSession: (index) => selectedIndex = index,
+            onReorderSession: (items, oldIdx, newIdx) {},
+            railListKey: GlobalKey<ReorderableListState>(),
+            onRailDragStart: (group, offset) {},
+            onRailDragEnd: () {},
+            draggingGroupKey: null,
+            onCreateSession: (_) {},
+            selectedShell: NewSessionShell.defaultPosix,
+            shellOptions: const [NewSessionShell.defaultPosix],
+            showShellMenu: false,
+            connectionStatus: 'connected',
+            connectionStatusColor: const Color(0xff7fd1c7),
+            onOpenSettings: () {},
+            isCollapsed: false,
+            onToggleCollapse: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(find.byType(TextField), findsNothing);
+      expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
     });
   });
 }

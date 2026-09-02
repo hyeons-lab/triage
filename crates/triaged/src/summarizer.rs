@@ -934,6 +934,7 @@ pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
     const MAX_COMBINED_ROWS: usize = MAX_HEAD_ROWS + MAX_TAIL_ROWS;
     const MAX_PROMPT_CHARS: usize = 1500;
     const MAX_HEAD_CHARS: usize = 500;
+    const SEPARATOR: &str = "\n[...]\n";
 
     let kept: Vec<&str> = visible_rows
         .iter()
@@ -951,24 +952,43 @@ pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
         }
     }
 
-    let head_limit = kept.len().min(MAX_HEAD_ROWS);
-    let head_rows = &kept[..head_limit];
+    let sep_len = SEPARATOR.chars().count();
+
+    // If kept is a single long line, split the line itself across the separator
+    // so the entire 1500-char budget is utilized.
+    if kept.len() == 1 {
+        let single = kept[0];
+        let total = single.chars().count();
+        if total <= MAX_PROMPT_CHARS {
+            return Some(single.to_string());
+        }
+        let head: String = single.chars().take(MAX_HEAD_CHARS).collect();
+        let head_len = head.chars().count();
+        let rem = MAX_PROMPT_CHARS.saturating_sub(head_len + sep_len);
+        let tail: String = single.chars().skip(total.saturating_sub(rem)).collect();
+        return Some(format!("{head}{SEPARATOR}{tail}"));
+    }
+
+    // Partition into strictly non-overlapping head and tail row slices.
+    let head_row_count = if kept.len() <= MAX_HEAD_ROWS {
+        1
+    } else {
+        MAX_HEAD_ROWS
+    };
+    let head_rows = &kept[..head_row_count];
     let head_text = head_rows.join("\n");
     let head_capped: String = head_text.chars().take(MAX_HEAD_CHARS).collect();
+    let head_len = head_capped.chars().count();
 
-    // If kept has more than 1 line, ensure the tail captures recent lines
-    // even when kept.len() <= MAX_HEAD_ROWS.
-    let tail_start = if kept.len() > MAX_HEAD_ROWS {
-        kept.len().saturating_sub(MAX_TAIL_ROWS).max(head_limit)
+    let tail_start = if kept.len() > MAX_COMBINED_ROWS {
+        kept.len().saturating_sub(MAX_TAIL_ROWS).max(head_row_count)
     } else {
-        1.min(kept.len())
+        head_row_count
     };
     let tail_rows = &kept[tail_start..];
     let tail_text = tail_rows.join("\n");
 
-    const SEPARATOR: &str = "\n[...]\n";
-    let sep_len = SEPARATOR.chars().count();
-    let remaining_budget = MAX_PROMPT_CHARS.saturating_sub(head_capped.chars().count() + sep_len);
+    let remaining_budget = MAX_PROMPT_CHARS.saturating_sub(head_len + sep_len);
 
     let tail_count = tail_text.chars().count();
     let tail_capped: String = if tail_count > remaining_budget {
@@ -1373,6 +1393,37 @@ mod tests {
         assert!(prompt.contains("\n[...]\n"));
         assert!(prompt.ends_with("ERROR: fatal exception on step 4"));
         assert!(prompt.chars().count() <= 1500);
+    }
+
+    #[test]
+    fn build_prompt_splits_single_long_line_across_separator() {
+        let rows = vec![format!("START{}END", "x".repeat(3000))];
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("START"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("END"));
+        assert_eq!(prompt.chars().count(), 1500);
+    }
+
+    #[test]
+    fn localization_header_fallback_uses_cwd_leaf_or_none_for_root() {
+        let root = std::path::Path::new("/");
+        let leaf = triage_core::session::path_leaf_name(root);
+        assert_eq!(leaf, None);
+
+        let sub_dir = std::path::Path::new("/var/log/syslog");
+        let leaf = triage_core::session::path_leaf_name(sub_dir);
+        assert_eq!(leaf, Some("syslog".to_string()));
+    }
+
+    #[test]
+    fn detail_header_falls_back_to_cwd_leaf() {
+        let context = None;
+        let cwd = Some(std::path::Path::new("/Users/developer/scratch"));
+        let header = context
+            .and_then(SessionContext::localization_label)
+            .or_else(|| cwd.and_then(triage_core::session::path_leaf_name));
+        assert_eq!(header, Some("scratch".to_string()));
     }
 
     // End-to-end: downloads the real LFM2 model (~1.5GB, cached) and runs

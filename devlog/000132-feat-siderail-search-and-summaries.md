@@ -37,7 +37,8 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - e07253c — feat: make siderail search toggleable from header icon
 - 616fa36 — fix: address PR review comments for siderail search and prompt retention
 - 497e2ce — fix: preserve prompt tail on short line-count outputs and enable search autofocus
-- HEAD — fix: support Escape key dismissal and optimize query normalization in search filtering
+- 69e74ce — fix: support Escape key dismissal and optimize query normalization in search filtering
+- HEAD — fix: reset search on collapse, optimize ASCII scanning, and partition prompt headroom
 
 ## Progress
 - [x] Researched codebase and identified search requirements and summary generation pipeline.
@@ -49,6 +50,7 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - [x] Address PR review comments (head context preservation under char limits, short-circuiting search filtering, disabling group header dragging during search).
 - [x] Add prompt tail preservation test for short line-count outputs and autofocus search field on open.
 - [x] Add Escape key search dismissal and per-frame query normalization with widget tests.
+- [x] Add didUpdateWidget to clear search on collapse, optimize zero-allocation ASCII query scanning, and add prompt partitioning tests.
 
 ## Next Steps
 - Push commit to PR #153.

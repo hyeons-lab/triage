@@ -547,6 +547,17 @@ void main() {
       expect(sample.matchesQuery('feat/inferred'), isTrue);
     });
 
+    test('matches non-ASCII Unicode characters case-insensitively', () {
+      const unicodeSample = SessionSearchInput(
+        branch: 'feat/café-ui',
+        repoName: 'münchen-app',
+      );
+      expect(unicodeSample.matchesQuery('CAFÉ'), isTrue);
+      expect(unicodeSample.matchesQuery('café'), isTrue);
+      expect(unicodeSample.matchesQuery('MÜNCHEN'), isTrue);
+      expect(unicodeSample.matchesQuery('münchen'), isTrue);
+    });
+
     test('returns false for non-matching query', () {
       expect(sample.matchesQuery('nonexistent-term-xyz'), isFalse);
     });

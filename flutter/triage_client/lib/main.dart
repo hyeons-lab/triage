@@ -4254,6 +4254,14 @@ class _SessionRailState extends State<SessionRail> {
   }
 
   @override
+  void didUpdateWidget(SessionRail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isCollapsed && !oldWidget.isCollapsed) {
+      _closeSearch();
+    }
+  }
+
+  @override
   void dispose() {
     _searchController.dispose();
     _searchFocusNode.dispose();
@@ -4307,7 +4315,7 @@ class _SessionRailState extends State<SessionRail> {
             alignment: Alignment.topLeft,
             children: [
               ...previousChildren,
-              if (currentChild != null) currentChild,
+              ?currentChild,
             ],
           );
         },

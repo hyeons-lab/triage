@@ -69,25 +69,62 @@ class SessionSearchInput {
   bool matchesQuery(String query, {bool queryIsNormalized = false}) {
     final q = queryIsNormalized ? query : query.trim().toLowerCase();
     if (q.isEmpty) return true;
-    return _containsIgnoreCase(title, q) ||
-        _containsIgnoreCase(displayTitle, q) ||
-        _containsIgnoreCase(railTitle, q) ||
-        _containsIgnoreCase(sessionId, q) ||
-        _containsIgnoreCase(repoRoot, q) ||
-        _containsIgnoreCase(repoName, q) ||
-        _containsIgnoreCase(worktreeRoot, q) ||
-        _containsIgnoreCase(worktreeName, q) ||
-        _containsIgnoreCase(inferredWorktreeRoot, q) ||
-        _containsIgnoreCase(inferredBranch, q) ||
-        _containsIgnoreCase(branch, q) ||
-        _containsIgnoreCase(cwd, q) ||
-        _containsIgnoreCase(snippet, q) ||
-        _containsIgnoreCase(snippetDetail, q);
+    final isAsciiQuery = !q.codeUnits.any((u) => u > 127);
+    return _containsIgnoreCase(title, q, isAsciiQuery) ||
+        _containsIgnoreCase(displayTitle, q, isAsciiQuery) ||
+        _containsIgnoreCase(railTitle, q, isAsciiQuery) ||
+        _containsIgnoreCase(sessionId, q, isAsciiQuery) ||
+        _containsIgnoreCase(repoRoot, q, isAsciiQuery) ||
+        _containsIgnoreCase(repoName, q, isAsciiQuery) ||
+        _containsIgnoreCase(worktreeRoot, q, isAsciiQuery) ||
+        _containsIgnoreCase(worktreeName, q, isAsciiQuery) ||
+        _containsIgnoreCase(inferredWorktreeRoot, q, isAsciiQuery) ||
+        _containsIgnoreCase(inferredBranch, q, isAsciiQuery) ||
+        _containsIgnoreCase(branch, q, isAsciiQuery) ||
+        _containsIgnoreCase(cwd, q, isAsciiQuery) ||
+        _containsIgnoreCase(snippet, q, isAsciiQuery) ||
+        _containsIgnoreCase(snippetDetail, q, isAsciiQuery);
   }
 
-  static bool _containsIgnoreCase(String? target, String query) {
+  static bool _containsIgnoreCase(
+    String? target,
+    String lowerQuery,
+    bool isAsciiQuery,
+  ) {
     if (target == null || target.isEmpty) return false;
-    return target.toLowerCase().contains(query);
+    if (lowerQuery.isEmpty) return true;
+    if (lowerQuery.length > target.length) return false;
+
+    // Fall back to standard Unicode case folding if query contains non-ASCII characters.
+    if (!isAsciiQuery) {
+      return target.toLowerCase().contains(lowerQuery);
+    }
+
+    final qLen = lowerQuery.length;
+    final maxOffset = target.length - qLen;
+    final firstChar = lowerQuery.codeUnitAt(0);
+
+    for (var i = 0; i <= maxOffset; i++) {
+      if (_toLowerAscii(target.codeUnitAt(i)) == firstChar) {
+        var match = true;
+        for (var j = 1; j < qLen; j++) {
+          if (_toLowerAscii(target.codeUnitAt(i + j)) !=
+              lowerQuery.codeUnitAt(j)) {
+            match = false;
+            break;
+          }
+        }
+        if (match) return true;
+      }
+    }
+    return false;
+  }
+
+  static int _toLowerAscii(int codeUnit) {
+    if (codeUnit >= 65 && codeUnit <= 90) {
+      return codeUnit + 32;
+    }
+    return codeUnit;
   }
 }
 
