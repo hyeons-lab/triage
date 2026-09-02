@@ -478,7 +478,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       } else {
         js_util.callMethod(_term, 'focus', []);
       }
-      js_util.callMethod(_term, 'scrollToBottom', []);
     } catch (_) {}
   }
 
@@ -1066,7 +1065,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
         js_util.callMethod(_fitAddon, 'fit', []);
-        js_util.callMethod(_term, 'scrollToBottom', []);
         _activateTerminal();
         final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
         final fittedColsNum = js_util.getProperty(_term, 'cols') as num;

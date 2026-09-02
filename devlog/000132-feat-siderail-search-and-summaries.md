@@ -40,7 +40,8 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - 69e74ce — fix: support Escape key dismissal and optimize query normalization in search filtering
 - c1b3562 — fix: reset search on collapse, optimize ASCII scanning, and partition prompt headroom
 - 0d343cd — fix: optimize ASCII query detection and add emoji surrogate search tests
-- HEAD — fix: restore collection-if in layoutBuilder and support Windows home paths
+- 1ac1ff0 — fix: restore collection-if in layoutBuilder and support Windows home paths
+- HEAD — fix(web): prevent terminal tapping from scrolling history to bottom
 
 ## Progress
 - [x] Researched codebase and identified search requirements and summary generation pipeline.
@@ -55,6 +56,7 @@ Add a search feature to the side rail in the Flutter client to easily filter and
 - [x] Add didUpdateWidget to clear search on collapse, optimize zero-allocation ASCII query scanning, and add prompt partitioning tests.
 - [x] Optimize ASCII query detection loop and add emoji surrogate pair unit tests.
 - [x] Restore collection-if syntax in layoutBuilder and support Windows path separators in _homeAbbreviatedPath.
+- [x] Fix terminal history tapping snapping to bottom by removing unconditional scrollToBottom in web pane.
 
 ## Next Steps
 - Push commit to PR #153.
