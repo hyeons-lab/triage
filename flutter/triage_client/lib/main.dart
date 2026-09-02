@@ -663,8 +663,14 @@ class SessionVm {
     );
   }
 
-  bool matchesSearch(String query, [DateTime? now]) =>
-      toSearchInput(now).matchesQuery(query);
+  bool matchesSearch(
+    String query, [
+    DateTime? now,
+    bool queryIsNormalized = false,
+  ]) => toSearchInput(now).matchesQuery(
+    query,
+    queryIsNormalized: queryIsNormalized,
+  );
 
   final String? sessionId;
   final IconData icon;
@@ -4235,6 +4241,19 @@ class _SessionRailState extends State<SessionRail> {
   bool _searchOpen = false;
 
   @override
+  void initState() {
+    super.initState();
+    _searchFocusNode.onKeyEvent = (node, event) {
+      if (event is KeyDownEvent &&
+          event.logicalKey == LogicalKeyboardKey.escape) {
+        _closeSearch();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    };
+  }
+
+  @override
   void dispose() {
     _searchController.dispose();
     _searchFocusNode.dispose();
@@ -4406,13 +4425,14 @@ class _SessionRailState extends State<SessionRail> {
     // window at the same instant.
     final now = DateTime.now();
     final indistinguishable = indistinguishableRailRows(widget.sessions, now);
-    final query = _searchQuery.trim();
+    final rawQuery = _searchQuery.trim();
+    final query = rawQuery.toLowerCase();
     final isSearching = query.isNotEmpty;
 
     final matchingEntries = <({int originalIndex, SessionVm session})>[];
     for (var i = 0; i < widget.sessions.length; i++) {
       final session = widget.sessions[i];
-      if (!isSearching || session.matchesSearch(query, now)) {
+      if (!isSearching || session.matchesSearch(query, now, true)) {
         matchingEntries.add((originalIndex: i, session: session));
       }
     }
@@ -4627,7 +4647,7 @@ class _SessionRailState extends State<SessionRail> {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          'No session matches "$query"',
+                          'No session matches "$rawQuery"',
                           textAlign: TextAlign.center,
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,

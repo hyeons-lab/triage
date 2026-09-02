@@ -65,8 +65,9 @@ class SessionSearchInput {
 
   /// Returns true if any searchable field contains [query] (case-insensitive).
   /// An empty or whitespace-only query matches all sessions.
-  bool matchesQuery(String query) {
-    final q = query.trim().toLowerCase();
+  /// If [queryIsNormalized] is true, [query] is assumed to be already trimmed and lowercased.
+  bool matchesQuery(String query, {bool queryIsNormalized = false}) {
+    final q = queryIsNormalized ? query : query.trim().toLowerCase();
     if (q.isEmpty) return true;
     return _containsIgnoreCase(title, q) ||
         _containsIgnoreCase(displayTitle, q) ||

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:triage_client/main.dart';
@@ -800,6 +801,20 @@ void main() {
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
+
+      // 7. Open search, type query, and press Escape to close
+      await tester.tap(searchButton);
+      await tester.pump();
+      expect(find.byType(TextField), findsOneWidget);
+      await tester.enterText(find.byType(TextField), 'frontend');
+      await tester.pump();
+      expect(find.widgetWithText(SessionListTile, 'main'), findsNothing);
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pump();
+      expect(find.byType(TextField), findsNothing);
+      expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
     });
   });
 }
