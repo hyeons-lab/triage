@@ -35,7 +35,9 @@ const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// Instruction given to the model. Kept terse; the model only needs to label.
 const SYSTEM_PROMPT: &str = "You label terminal sessions. Reply with a terse description of what \
-the session is doing, at most 8 words, no trailing punctuation, no quotes. Output only the label.";
+the session's primary task or main work is (and its status if active), at most 8 words, no \
+trailing punctuation, no quotes. Preserve the main body of work even if currently waiting at a \
+prompt. Output only the label.";
 
 /// Instruction for the longer-form detail summary shown in the hover popover and
 /// used as the future session-search corpus. The repo/branch/worktree the
@@ -43,12 +45,14 @@ the session is doing, at most 8 words, no trailing punctuation, no quotes. Outpu
 /// model can't see them and must not invent them), so this prompt only asks for
 /// the activity. Length is generous — enough sentences to localize the user.
 const DETAIL_SYSTEM_PROMPT: &str = "You summarize terminal sessions so a developer can tell which \
-of many sessions this is and what it needs. Describe what the session is doing: the task, the \
-commands or tools running, the files or components involved, and the current state (building, \
-tests passing/failing, an error and its message, or waiting at a prompt for input). Use as many \
-short sentences as the activity needs — up to about five — but no filler. Be concrete and factual; \
-prefer specifics (command names, file paths, error text) over generalities. Do not guess the git \
-repository, branch, or directory. No markdown, no quotes, no preamble — output only the summary.";
+of many sessions this is, what work it was created for, and what it currently needs. Describe the \
+initial/main body of work (the primary task, command, or goal initiated in the session) along with \
+the current state (building, tests passing/failing, an error and its message, or finished/waiting \
+at a prompt for input). Even if the session is currently waiting at a prompt, describe the main \
+work that was performed or started. Use as many short sentences as the activity needs — up to \
+about five — but no filler. Be concrete and factual; prefer specifics (command names, file paths, \
+error text) over generalities. Do not guess the git repository, branch, or directory. No markdown, \
+no quotes, no preamble — output only the summary.";
 
 /// Cap on the sanitized snippet length (characters), before the ellipsis a
 /// truncation adds, so a cut label renders one character over this.
@@ -87,6 +91,9 @@ pub struct SummarizeJob {
     /// deterministic localization header on the detail summary. `None` when the
     /// session isn't inside a git repo.
     pub context: Option<SessionContext>,
+    /// Working directory for this session, used as fallback localization when
+    /// the session is not inside a git repo.
+    pub cwd: Option<PathBuf>,
 }
 
 /// A produced snippet, delivered to the `on_result` callback on the worker thread.
@@ -430,6 +437,7 @@ fn run_summarize_job(
                     queue,
                     &job.prompt_text,
                     job.context.as_ref(),
+                    job.cwd.as_deref(),
                 )
                 .unwrap_or_else(|error| {
                     if error
@@ -538,14 +546,16 @@ fn generate_one_line(
 
 /// Runs one inference for the longer-form detail summary and returns it
 /// sanitized, with a deterministic `repo · branch · worktree` header prepended
-/// so the reader can localize the session at a glance. Returns `None` only when
-/// neither the model nor the git context produced anything usable.
+/// (or directory fallback) so the reader can localize the session at a glance.
+/// Returns `None` only when neither the model nor the location produced
+/// anything usable.
 fn generate_detail(
     engine: &cera::CeraEngine,
     config: &SummarizerConfig,
     queue: &JobQueue,
     prompt_text: &str,
     context: Option<&SessionContext>,
+    cwd: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<String>> {
     let mut session = engine.new_session(cera::SessionConfig::default())?;
     let cancel = session.cancel_handle();
@@ -576,7 +586,9 @@ fn generate_detail(
         return Ok(None);
     }
 
-    let header = context.and_then(SessionContext::localization_label);
+    let header = context
+        .and_then(SessionContext::localization_label)
+        .or_else(|| cwd.and_then(triage_core::session::path_leaf_name));
     let summary = sanitize_detail(&sink.text, sink.cut_short());
     Ok(match (header, summary) {
         (Some(header), Some(summary)) => Some(format!("{header}\n{summary}")),
@@ -911,12 +923,18 @@ fn cap_chars(text: &str, max_chars: usize) -> Option<(String, bool)> {
     (!capped.is_empty()).then(|| (capped.to_string(), truncated))
 }
 
-/// Builds the prompt text fed to the model from a session's visible rows: the
-/// last `MAX_PROMPT_ROWS` non-blank rows, right-trimmed, capped at
-/// `MAX_PROMPT_CHARS`. Returns `None` when the screen is effectively empty.
+/// Builds the prompt text fed to the model from a session's visible rows:
+/// captures initial rows (preserving the session's launch command, main task, or
+/// initial body of work) and recent activity rows (capturing current state and
+/// progress), capped at `MAX_PROMPT_CHARS`. Returns `None` when the screen is
+/// effectively empty.
 pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
-    const MAX_PROMPT_ROWS: usize = 20;
+    const MAX_HEAD_ROWS: usize = 8;
+    const MAX_TAIL_ROWS: usize = 16;
+    const MAX_COMBINED_ROWS: usize = MAX_HEAD_ROWS + MAX_TAIL_ROWS;
     const MAX_PROMPT_CHARS: usize = 1500;
+    const MAX_HEAD_CHARS: usize = 500;
+    const SEPARATOR: &str = "\n[...]\n";
 
     let kept: Vec<&str> = visible_rows
         .iter()
@@ -926,14 +944,65 @@ pub fn build_prompt_text(visible_rows: &[String]) -> Option<String> {
     if kept.is_empty() {
         return None;
     }
-    let start = kept.len().saturating_sub(MAX_PROMPT_ROWS);
-    let mut text = kept[start..].join("\n");
-    if text.chars().count() > MAX_PROMPT_CHARS {
-        // Keep the tail (most recent activity) within the char budget.
-        let skip = text.chars().count() - MAX_PROMPT_CHARS;
-        text = text.chars().skip(skip).collect();
+
+    if kept.len() <= MAX_COMBINED_ROWS {
+        let joined = kept.join("\n");
+        if joined.chars().count() <= MAX_PROMPT_CHARS {
+            return Some(joined);
+        }
     }
-    Some(text)
+
+    let sep_len = SEPARATOR.chars().count();
+
+    // If kept is a single long line, split the line itself across the separator
+    // so the entire 1500-char budget is utilized.
+    if kept.len() == 1 {
+        let single = kept[0];
+        let total = single.chars().count();
+        if total <= MAX_PROMPT_CHARS {
+            return Some(single.to_string());
+        }
+        let head: String = single.chars().take(MAX_HEAD_CHARS).collect();
+        let head_len = head.chars().count();
+        let rem = MAX_PROMPT_CHARS.saturating_sub(head_len + sep_len);
+        let tail: String = single.chars().skip(total.saturating_sub(rem)).collect();
+        return Some(format!("{head}{SEPARATOR}{tail}"));
+    }
+
+    // Partition into strictly non-overlapping head and tail row slices.
+    let head_row_count = if kept.len() <= MAX_HEAD_ROWS {
+        1
+    } else {
+        MAX_HEAD_ROWS
+    };
+    let head_rows = &kept[..head_row_count];
+    let head_text = head_rows.join("\n");
+    let head_capped: String = head_text.chars().take(MAX_HEAD_CHARS).collect();
+    let head_len = head_capped.chars().count();
+
+    let tail_start = if kept.len() > MAX_COMBINED_ROWS {
+        kept.len().saturating_sub(MAX_TAIL_ROWS).max(head_row_count)
+    } else {
+        head_row_count
+    };
+    let tail_rows = &kept[tail_start..];
+    let tail_text = tail_rows.join("\n");
+
+    let remaining_budget = MAX_PROMPT_CHARS.saturating_sub(head_len + sep_len);
+
+    let tail_count = tail_text.chars().count();
+    let tail_capped: String = if tail_count > remaining_budget {
+        let skip = tail_count - remaining_budget;
+        tail_text.chars().skip(skip).collect()
+    } else {
+        tail_text
+    };
+
+    if tail_capped.is_empty() {
+        Some(head_capped)
+    } else {
+        Some(format!("{head_capped}{SEPARATOR}{tail_capped}"))
+    }
 }
 
 #[cfg(test)]
@@ -956,6 +1025,7 @@ mod tests {
             prompt_text: format!("screen at {output_seq}"),
             output_seq,
             context: None,
+            cwd: None,
         }
     }
 
@@ -1279,6 +1349,83 @@ mod tests {
         assert_eq!(build_prompt_text(&["".to_string(), "  ".to_string()]), None);
     }
 
+    #[test]
+    fn build_prompt_preserves_head_and_tail_on_long_output() {
+        let mut rows = Vec::new();
+        rows.push("$ cargo build --release".to_string());
+        for i in 1..=40 {
+            rows.push(format!("line {i}"));
+        }
+        rows.push("$ echo done".to_string());
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("$ cargo build --release\nline 1\nline 2"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("line 40\n$ echo done"));
+    }
+
+    #[test]
+    fn build_prompt_preserves_head_context_under_char_limit() {
+        let mut rows = Vec::new();
+        rows.push("$ git commit -m 'very long command line'".to_string());
+        for _ in 0..10 {
+            // Very long lines that exceed 1500 chars total
+            rows.push("x".repeat(300));
+        }
+        rows.push("$ echo completed".to_string());
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("$ git commit -m 'very long command line'"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("$ echo completed"));
+        assert!(prompt.chars().count() <= 1500);
+    }
+
+    #[test]
+    fn build_prompt_preserves_head_and_tail_when_few_lines_exceed_char_cap() {
+        let rows = vec![
+            "$ ./run_big_task.sh".to_string(),
+            "output line 1 ".repeat(40),
+            "output line 2 ".repeat(40),
+            "output line 3 ".repeat(40),
+            "ERROR: fatal exception on step 4".to_string(),
+        ];
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("$ ./run_big_task.sh"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("ERROR: fatal exception on step 4"));
+        assert!(prompt.chars().count() <= 1500);
+    }
+
+    #[test]
+    fn build_prompt_splits_single_long_line_across_separator() {
+        let rows = vec![format!("START{}END", "x".repeat(3000))];
+        let prompt = build_prompt_text(&rows).expect("non-empty");
+        assert!(prompt.starts_with("START"));
+        assert!(prompt.contains("\n[...]\n"));
+        assert!(prompt.ends_with("END"));
+        assert_eq!(prompt.chars().count(), 1500);
+    }
+
+    #[test]
+    fn localization_header_fallback_uses_cwd_leaf_or_none_for_root() {
+        let root = std::path::Path::new("/");
+        let leaf = triage_core::session::path_leaf_name(root);
+        assert_eq!(leaf, None);
+
+        let sub_dir = std::path::Path::new("/var/log/syslog");
+        let leaf = triage_core::session::path_leaf_name(sub_dir);
+        assert_eq!(leaf, Some("syslog".to_string()));
+    }
+
+    #[test]
+    fn detail_header_falls_back_to_cwd_leaf() {
+        let context = None;
+        let cwd = Some(std::path::Path::new("/Users/developer/scratch"));
+        let header = context
+            .and_then(SessionContext::localization_label)
+            .or_else(|| cwd.and_then(triage_core::session::path_leaf_name));
+        assert_eq!(header, Some("scratch".to_string()));
+    }
+
     // End-to-end: downloads the real LFM2 model (~1.5GB, cached) and runs
     // inference. Ignored so CI never pays the download; run manually with:
     //   cargo test -p triaged --release -- --ignored end_to_end --nocapture
@@ -1323,6 +1470,7 @@ mod tests {
                 worktree_root: Some("/home/dev/triage/worktrees/feat-summary".into()),
                 branch: Some("feat/summary".to_string()),
             }),
+            cwd: None,
         }));
 
         // First call downloads the model, so allow a generous timeout.

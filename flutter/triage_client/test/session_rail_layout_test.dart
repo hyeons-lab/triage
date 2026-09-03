@@ -494,4 +494,82 @@ void main() {
     final reset = groupSessionsByRepo(sessions, pins: SessionPins.none);
     expect(reset.map((g) => g.repoRoot), ['/b', '/a']);
   });
+
+  group('SessionSearchInput.matchesQuery', () {
+    const sample = SessionSearchInput(
+      title: 'triage / session-1',
+      displayTitle: 'triage · feat/search',
+      railTitle: 'feat/search',
+      sessionId: 'session-1',
+      repoRoot: '/Users/developer/code/triage',
+      repoName: 'triage',
+      worktreeRoot: '/Users/developer/code/triage/worktrees/feat-search',
+      worktreeName: 'feat-search',
+      inferredWorktreeRoot: '/Users/developer/code/triage/worktrees/inferred-wt',
+      inferredBranch: 'feat/inferred',
+      branch: 'feat/search',
+      cwd: '/Users/developer/code/triage/crates/triaged',
+      snippet: 'cargo test passing',
+      snippetDetail: 'Running cargo test on triaged crate with all tests passing',
+    );
+
+    test('empty or whitespace query matches everything', () {
+      expect(sample.matchesQuery(''), isTrue);
+      expect(sample.matchesQuery('   '), isTrue);
+    });
+
+    test('matches on repository root or name', () {
+      expect(sample.matchesQuery('triage'), isTrue);
+      expect(sample.matchesQuery('/code/triage'), isTrue);
+      expect(sample.matchesQuery('TRIAGE'), isTrue);
+    });
+
+    test('matches on current working directory', () {
+      expect(sample.matchesQuery('crates/triaged'), isTrue);
+      expect(sample.matchesQuery('TRIAGED'), isTrue);
+    });
+
+    test('matches on worktree root or name', () {
+      expect(sample.matchesQuery('feat-search'), isTrue);
+      expect(sample.matchesQuery('worktrees/feat-search'), isTrue);
+      expect(sample.matchesQuery('inferred-wt'), isTrue);
+    });
+
+    test('matches on snippet and snippetDetail', () {
+      expect(sample.matchesQuery('cargo test'), isTrue);
+      expect(sample.matchesQuery('all tests passing'), isTrue);
+      expect(sample.matchesQuery('triaged crate'), isTrue);
+    });
+
+    test('matches on title, branch, and sessionId', () {
+      expect(sample.matchesQuery('session-1'), isTrue);
+      expect(sample.matchesQuery('feat/search'), isTrue);
+      expect(sample.matchesQuery('feat/inferred'), isTrue);
+    });
+
+    test('matches non-ASCII Unicode characters case-insensitively', () {
+      const unicodeSample = SessionSearchInput(
+        branch: 'feat/café-ui',
+        repoName: 'münchen-app',
+      );
+      expect(unicodeSample.matchesQuery('CAFÉ'), isTrue);
+      expect(unicodeSample.matchesQuery('café'), isTrue);
+      expect(unicodeSample.matchesQuery('MÜNCHEN'), isTrue);
+      expect(unicodeSample.matchesQuery('münchen'), isTrue);
+    });
+
+    test('matches emoji and surrogate pair queries', () {
+      const emojiSample = SessionSearchInput(
+        title: 'deploy 🚀 rocket',
+        snippet: 'global sync 🌍 active',
+      );
+      expect(emojiSample.matchesQuery('🚀'), isTrue);
+      expect(emojiSample.matchesQuery('🌍'), isTrue);
+      expect(emojiSample.matchesQuery('rocket'), isTrue);
+    });
+
+    test('returns false for non-matching query', () {
+      expect(sample.matchesQuery('nonexistent-term-xyz'), isFalse);
+    });
+  });
 }

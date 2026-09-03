@@ -1316,13 +1316,14 @@ impl SessionManager {
         let mut enqueued = 0usize;
         let mut skipped_blank = 0usize;
         for session_id in session_ids {
-            if let Some((rows, output_seq, context)) = self.summary_rows(&session_id) {
+            if let Some((rows, output_seq, context, cwd)) = self.summary_rows(&session_id) {
                 if let Some(prompt_text) = build_prompt_text(&rows) {
                     if summarizer.try_enqueue(SummarizeJob {
                         session_id,
                         prompt_text,
                         output_seq,
                         context,
+                        cwd,
                     }) {
                         enqueued += 1;
                     }
@@ -3776,7 +3777,7 @@ fn run_debounce_loop(
 
             // Off-lock cheap snapshot: never holds the global sessions mutex
             // during the actor round-trip, so it can't starve interactive ops.
-            let Some((rows, _output_seq, context)) = manager.summary_rows(&session_id) else {
+            let Some((rows, _, context, cwd)) = manager.summary_rows(&session_id) else {
                 // Session likely gone; drop tracking state for it.
                 last_enqueue.remove(&session_id);
                 last_summarized_seq.remove(&session_id);
@@ -3799,6 +3800,7 @@ fn run_debounce_loop(
                 prompt_text,
                 output_seq: pd.last_output_seq,
                 context,
+                cwd,
             }) {
                 last_enqueue.insert(session_id.clone(), now);
                 last_prompt_hash.insert(session_id.clone(), hash);
@@ -4685,9 +4687,9 @@ struct OutputState {
     pending_escape_buffer: Vec<u8>,
 }
 
-/// Visible rows + output sequence + git context, returned by the actor's
+/// Visible rows + output sequence + git context + cwd, returned by the actor's
 /// cheap `SummaryRows` snapshot for the summarizer.
-type SummaryRowsResponse = (Vec<String>, u64, Option<SessionContext>);
+type SummaryRowsResponse = (Vec<String>, u64, Option<SessionContext>, Option<PathBuf>);
 
 enum ActorMessage {
     Output(Vec<u8>),
@@ -5112,7 +5114,12 @@ impl ActorState {
             }
             ActorCommand::SummaryRows { response } => {
                 let rows = visible_rows(&self.output.terminal);
-                let _ = response.send(Ok((rows, self.output.output_seq, self.context.clone())));
+                let _ = response.send(Ok((
+                    rows,
+                    self.output.output_seq,
+                    self.context.clone(),
+                    self.current_working_directory.clone(),
+                )));
                 false
             }
             ActorCommand::Context { response } => {
@@ -12267,7 +12274,7 @@ mod tests {
         request_write_input(&actor.tx, large_payload).expect("write large payload");
 
         // The actor must still answer snapshot/summary requests without hanging
-        let (rows, _, _) = request_summary_rows(&actor.tx).expect("read summary rows");
+        let (rows, _, _, _) = request_summary_rows(&actor.tx).expect("read summary rows");
         let _ = rows;
 
         let snapshot = request_snapshot(&actor.tx).expect("read snapshot");

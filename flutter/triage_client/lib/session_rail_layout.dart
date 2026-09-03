@@ -29,6 +29,112 @@ class RailItem {
   bool get isHeader => sessionId == null;
 }
 
+/// Attributes of a session that can be searched in the side rail.
+class SessionSearchInput {
+  const SessionSearchInput({
+    this.title,
+    this.displayTitle,
+    this.railTitle,
+    this.sessionId,
+    this.repoRoot,
+    this.repoName,
+    this.worktreeRoot,
+    this.worktreeName,
+    this.inferredWorktreeRoot,
+    this.inferredBranch,
+    this.branch,
+    this.cwd,
+    this.snippet,
+    this.snippetDetail,
+  });
+
+  final String? title;
+  final String? displayTitle;
+  final String? railTitle;
+  final String? sessionId;
+  final String? repoRoot;
+  final String? repoName;
+  final String? worktreeRoot;
+  final String? worktreeName;
+  final String? inferredWorktreeRoot;
+  final String? inferredBranch;
+  final String? branch;
+  final String? cwd;
+  final String? snippet;
+  final String? snippetDetail;
+
+  /// Returns true if any searchable field contains [query] (case-insensitive).
+  /// An empty or whitespace-only query matches all sessions.
+  /// If [queryIsNormalized] is true, [query] is assumed to be already trimmed and lowercased.
+  bool matchesQuery(String query, {bool queryIsNormalized = false}) {
+    final q = queryIsNormalized ? query : query.trim().toLowerCase();
+    if (q.isEmpty) return true;
+    final isAsciiQuery = _isAsciiOnly(q);
+    return _containsIgnoreCase(title, q, isAsciiQuery) ||
+        _containsIgnoreCase(displayTitle, q, isAsciiQuery) ||
+        _containsIgnoreCase(railTitle, q, isAsciiQuery) ||
+        _containsIgnoreCase(sessionId, q, isAsciiQuery) ||
+        _containsIgnoreCase(repoRoot, q, isAsciiQuery) ||
+        _containsIgnoreCase(repoName, q, isAsciiQuery) ||
+        _containsIgnoreCase(worktreeRoot, q, isAsciiQuery) ||
+        _containsIgnoreCase(worktreeName, q, isAsciiQuery) ||
+        _containsIgnoreCase(inferredWorktreeRoot, q, isAsciiQuery) ||
+        _containsIgnoreCase(inferredBranch, q, isAsciiQuery) ||
+        _containsIgnoreCase(branch, q, isAsciiQuery) ||
+        _containsIgnoreCase(cwd, q, isAsciiQuery) ||
+        _containsIgnoreCase(snippet, q, isAsciiQuery) ||
+        _containsIgnoreCase(snippetDetail, q, isAsciiQuery);
+  }
+
+  static bool _isAsciiOnly(String s) {
+    for (var i = 0; i < s.length; i++) {
+      if (s.codeUnitAt(i) > 127) return false;
+    }
+    return true;
+  }
+
+  static bool _containsIgnoreCase(
+    String? target,
+    String lowerQuery,
+    bool isAsciiQuery,
+  ) {
+    if (target == null || target.isEmpty) return false;
+    if (lowerQuery.isEmpty) return true;
+    if (lowerQuery.length > target.length) return false;
+
+    // Fall back to standard Unicode case folding if query contains non-ASCII characters.
+    if (!isAsciiQuery) {
+      return target.toLowerCase().contains(lowerQuery);
+    }
+
+    final qLen = lowerQuery.length;
+    final maxOffset = target.length - qLen;
+    final firstChar = lowerQuery.codeUnitAt(0);
+
+    for (var i = 0; i <= maxOffset; i++) {
+      if (_toLowerAscii(target.codeUnitAt(i)) == firstChar) {
+        var match = true;
+        for (var j = 1; j < qLen; j++) {
+          if (_toLowerAscii(target.codeUnitAt(i + j)) !=
+              lowerQuery.codeUnitAt(j)) {
+            match = false;
+            break;
+          }
+        }
+        if (match) return true;
+      }
+    }
+    return false;
+  }
+
+  static int _toLowerAscii(int codeUnit) {
+    if (codeUnit >= 65 && codeUnit <= 90) {
+      return codeUnit + 32;
+    }
+    return codeUnit;
+  }
+}
+
 /// Builds rail rows covering [sessionIds], in the order given, with a header
 /// wherever the repository changes.
 ///
