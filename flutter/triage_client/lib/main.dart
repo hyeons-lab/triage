@@ -3978,19 +3978,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         PopupMenuItem<String>(
           value: 'edit_label',
           height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 14),
           child: Row(
-            mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
                 hasLabel ? Icons.edit_outlined : Icons.label_outline,
                 size: 16,
                 color: const Color(0xff7fd1c7),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 10),
               Expanded(
                 child: Text(
                   hasLabel ? 'Edit custom label...' : 'Assign custom label...',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     color: Color(0xffcdd7d6),
                     fontSize: 13,
@@ -4004,19 +4005,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           PopupMenuItem<String>(
             value: 'clear_label',
             height: 38,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 14),
             child: const Row(
-              mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
                   Icons.label_off_outlined,
                   size: 16,
                   color: Color(0xffe06c75),
                 ),
-                SizedBox(width: 8),
+                SizedBox(width: 10),
                 Expanded(
                   child: Text(
                     'Clear custom label',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: Color(0xffcdd7d6),
                       fontSize: 13,
@@ -4039,111 +4041,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   Future<void> _openCustomLabelDialog(SessionVm session) async {
-    final controller =
-        TextEditingController(text: session.customLabel ?? '');
-    controller.selection = TextSelection(
-      baseOffset: 0,
-      extentOffset: controller.text.length,
-    );
-    final hasExisting =
-        session.customLabel != null && session.customLabel!.trim().isNotEmpty;
     final result = await showDialog<String>(
       context: context,
       barrierColor: Colors.black.withValues(alpha: 0.55),
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: const Color(0xff161b1d),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xff2a3437)),
-          ),
-          title: Text(
-            hasExisting ? 'Edit Custom Label' : 'Assign Custom Label',
-            style: const TextStyle(
-              color: Color(0xffcdd7d6),
-              fontSize: 18,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-          content: SizedBox(
-            width: 380,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Set a custom label to easily differentiate this session in the side rail.',
-                  style: TextStyle(
-                    color: Color(0xff8b9799),
-                    fontSize: 13,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: controller,
-                  autofocus: true,
-                  style: const TextStyle(
-                    color: Color(0xffcdd7d6),
-                    fontSize: 14,
-                  ),
-                  decoration: InputDecoration(
-                    hintText:
-                        'e.g. Frontend Server, Build Agent, DB Migration',
-                    hintStyle: const TextStyle(color: Color(0xff607073)),
-                    filled: true,
-                    fillColor: const Color(0xff111517),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: const BorderSide(color: Color(0xff2a3437)),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: const BorderSide(color: Color(0xff2a3437)),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: const BorderSide(color: Color(0xff7fd1c7)),
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                  ),
-                  onSubmitted: (value) =>
-                      Navigator.of(dialogContext).pop(value),
-                ),
-              ],
-            ),
-          ),
-          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          actions: [
-            if (hasExisting)
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(''),
-                style: TextButton.styleFrom(
-                  foregroundColor: const Color(0xffe06c75),
-                ),
-                child: const Text('Clear'),
-              ),
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(null),
-              style: TextButton.styleFrom(
-                foregroundColor: const Color(0xff7f8b8d),
-              ),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () =>
-                  Navigator.of(dialogContext).pop(controller.text),
-              style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xff7fd1c7),
-                foregroundColor: const Color(0xff111517),
-              ),
-              child: const Text('Save'),
-            ),
-          ],
-        );
-      },
+      builder: (dialogContext) => _CustomLabelDialog(
+        initialLabel: session.customLabel,
+      ),
     );
 
     if (!mounted || result == null) return;
@@ -7597,6 +7500,130 @@ class _NewSessionMenu extends StatelessWidget {
             checked: shell == selectedShell,
             child: Text('${shell.label} (${shell.command})'),
           ),
+      ],
+    );
+  }
+}
+
+class _CustomLabelDialog extends StatefulWidget {
+  const _CustomLabelDialog({this.initialLabel});
+
+  final String? initialLabel;
+
+  @override
+  State<_CustomLabelDialog> createState() => _CustomLabelDialogState();
+}
+
+class _CustomLabelDialogState extends State<_CustomLabelDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialLabel ?? '');
+    _controller.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _controller.text.length,
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasExisting =
+        widget.initialLabel != null && widget.initialLabel!.trim().isNotEmpty;
+    return AlertDialog(
+      backgroundColor: const Color(0xff161b1d),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: const BorderSide(color: Color(0xff2a3437)),
+      ),
+      title: Text(
+        hasExisting ? 'Edit Custom Label' : 'Assign Custom Label',
+        style: const TextStyle(
+          color: Color(0xffcdd7d6),
+          fontSize: 18,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      content: SizedBox(
+        width: 380,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Set a custom label to easily differentiate this session in the side rail.',
+              style: TextStyle(
+                color: Color(0xff8b9799),
+                fontSize: 13,
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _controller,
+              autofocus: true,
+              style: const TextStyle(
+                color: Color(0xffcdd7d6),
+                fontSize: 14,
+              ),
+              decoration: InputDecoration(
+                hintText: 'e.g. Frontend Server, Build Agent, DB Migration',
+                hintStyle: const TextStyle(color: Color(0xff607073)),
+                filled: true,
+                fillColor: const Color(0xff111517),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xff2a3437)),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xff2a3437)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xff7fd1c7)),
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+              ),
+              onSubmitted: (value) => Navigator.of(context).pop(value),
+            ),
+          ],
+        ),
+      ),
+      actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      actions: [
+        if (hasExisting)
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(''),
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xffe06c75),
+            ),
+            child: const Text('Clear'),
+          ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(null),
+          style: TextButton.styleFrom(
+            foregroundColor: const Color(0xff7f8b8d),
+          ),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_controller.text),
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xff7fd1c7),
+            foregroundColor: const Color(0xff111517),
+          ),
+          child: const Text('Save'),
+        ),
       ],
     );
   }

@@ -3501,6 +3501,14 @@ void main() {
       String selectedId = 'work-laptop',
     }) async {
       final client = FakeTriageWebSocketClient();
+      client.sessionContexts.addAll({
+        'flutter-spike': (
+          repositoryRoot: '/work/alpha',
+          worktreeRoot: '/work/alpha',
+          branch: 'experiment/flutter-spike',
+          lastActivityMs: 1000,
+        ),
+      });
       await tester.pumpWidget(
         TriageClientApp(
           client: client,
