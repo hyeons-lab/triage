@@ -673,8 +673,9 @@ fn sampling_opts_from_defaults(
                 return opts;
             }
         }
-        // Both fall through to greedy, for different reasons. `Audio` carries no
-        // text sampling params at all. `Other` holds the raw
+        // Both fall through to greedy, for different reasons. `Audio` manifests
+        // belong to speech models whose text sampling is bypassed in favor of
+        // deterministic greedy summarization. `Other` holds the raw
         // `generation_time_parameters` JSON of an inference type cera does not
         // model, which *may* contain them: reading them would mean guessing at
         // the shape of a manifest written for something this daemon does not

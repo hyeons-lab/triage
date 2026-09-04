@@ -31,8 +31,10 @@ Allow users to right-click a session in the side rail to assign a custom label f
 - 2026-09-04T00:09-0700 `flutter/triage_client/test/widget_test.dart`: added end-to-end widget tests for assigning, editing, clearing, and persisting custom labels.
 - 2026-09-04T00:20-0700 `flutter/triage_client/lib/main.dart`: encapsulated custom label dialog into `_CustomLabelDialog` StatefulWidget to safely manage controller lifecycle and wrapped popup menu items in Expanded to prevent flex overflow.
 - 2026-09-04T00:20-0700 `flutter/triage_client/test/widget_test.dart`: added sessionContexts to test pumpApp harness and validated end-to-end custom label lifecycle and server scoping.
+- 2026-09-04T00:39-0700 `crates/triaged/src/summarizer.rs`: updated comment regarding `GenerationDefaults::Audio` to clarify intentional greedy fallback during text summarization.
 
 **Commits:**
 - 486ac8e: feat: support siderail custom session labels and bump cera to 0.5.2
-- HEAD: fix: resolve popup menu text constraints and lifecycle in custom label dialog
+- 3861e73: fix: resolve popup menu text constraints and lifecycle in custom label dialog
+- HEAD: docs(summarizer): clarify greedy fallback rationale for audio generation defaults
 
