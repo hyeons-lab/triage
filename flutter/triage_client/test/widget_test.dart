@@ -3664,4 +3664,116 @@ void main() {
       expect(find.text('Work Task'), findsNothing);
     });
   });
+
+  group('webapp back navigation guard', () {
+    testWidgets('handlePopRoute displays Exit Triage dialog and Stay dismisses it', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final handled = await tester.binding.handlePopRoute();
+      expect(handled, isTrue);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Exit Triage?'), findsOneWidget);
+      expect(find.text('Stay'), findsOneWidget);
+      expect(find.text('Leave'), findsOneWidget);
+
+      await tester.tap(find.text('Stay'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Exit Triage?'), findsNothing);
+    });
+
+    testWidgets('handlePopRoute Leave confirms exit', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+
+      expect(find.text('Exit Triage?'), findsOneWidget);
+
+      await tester.tap(find.text('Leave'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Exit Triage?'), findsNothing);
+    });
+  });
+
+  group('session scroll preservation', () {
+    testWidgets('switching away from scrolled-up session preserves scroll offset', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      client.snapshotVisibleRows['flutter-spike'] =
+          List.generate(100, (i) => 'Log line $i');
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      expect(scrollViewFinder, findsOneWidget);
+
+      final controller =
+          tester.widget<SingleChildScrollView>(scrollViewFinder).controller!;
+      expect(controller.hasClients, isTrue);
+      expect(controller.position.maxScrollExtent, greaterThan(100.0));
+
+      // Scroll up away from bottom
+      controller.jumpTo(60.0);
+      await tester.pumpAndSettle();
+      expect(controller.position.pixels, 60.0);
+
+      // Switch to another session
+      await tester.tap(find.text('triage / main').first);
+      await tester.pumpAndSettle();
+
+      // Switch back to flutter-spike
+      await tester.tap(find.text('triage / flutter-spike').first);
+      await tester.pumpAndSettle();
+
+      // Scroll position should be preserved at 60.0
+      final restoredController =
+          tester.widget<SingleChildScrollView>(scrollViewFinder).controller!;
+      expect(restoredController.position.pixels, 60.0);
+    });
+
+    testWidgets('sending input while scrolled up resets scroll to bottom', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      client.snapshotVisibleRows['flutter-spike'] =
+          List.generate(100, (i) => 'Log line $i');
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final controller =
+          tester.widget<SingleChildScrollView>(scrollViewFinder).controller!;
+
+      // Scroll up away from bottom
+      controller.jumpTo(60.0);
+      await tester.pumpAndSettle();
+      expect(controller.position.pixels, 60.0);
+
+      // Send terminal input
+      final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+      pane.terminal.onOutput?.call('clear\n');
+      await tester.pumpAndSettle();
+
+      expect(controller.position.pixels, controller.position.maxScrollExtent);
+    });
+  });
 }
+

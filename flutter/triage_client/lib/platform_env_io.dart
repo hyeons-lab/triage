@@ -38,3 +38,7 @@ bool runningUnderFlutterTest() {
     return false;
   }
 }
+
+/// No-op on native platforms. Overridden on web to set window._allowUnload.
+void allowWebExit() {}
+

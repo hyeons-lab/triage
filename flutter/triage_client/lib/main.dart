@@ -345,7 +345,7 @@ class SessionVm {
     this.isExited = false,
   }) : terminalController = TerminalController() {
     terminal = xt.Terminal(
-      maxLines: 10000,
+      maxLines: 50000,
       // Re-wrap the whole buffer on resize, like a real terminal — otherwise
       // scrollback keeps its old wrap points and a full-screen TUI's in-place
       // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
@@ -3287,6 +3287,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     String sessionId,
     Map<String, dynamic> snapshot, {
     (int, int)? renderSize,
+    bool replayHistory = true,
   }) async {
     // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
     // _loadDaemonSessions) while the refresh was in flight — applying to a
@@ -3317,10 +3318,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
 
-    // Replay history through the single write path — raw PTY bytes, not the
-    // lossy styled-row reconstruction. The store clears and re-emulates, then
-    // resumes live (de-duplicating by output_seq).
-    session.applyHistory(rawOutput, throughOutputSeq: snapshotOutputSeq);
+    // Replay history through the single write path: raw PTY bytes, not the
+    // lossy styled-row reconstruction. When re-selecting an already-loaded live
+    // session, avoid clearing and re-emulating the buffer so scroll position and
+    // existing scrollback are preserved.
+    if (replayHistory || !session.loaded) {
+      session.applyHistory(rawOutput, throughOutputSeq: snapshotOutputSeq);
+    }
     final bracketedPaste =
         snapshot['bracketed_paste_enabled'] as bool? ?? false;
     session.setBracketedPasteEnabled(bracketedPaste);
@@ -3514,8 +3518,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
     if (session.hasFitted) {
-      // Already fitted: refresh now at the known real size.
-      unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+      // Already fitted: refresh metadata without clearing and replaying history.
+      unawaited(_refreshSessionSnapshot(session, includeHistory: false));
     } else {
       // Not yet fitted: the first view-fit issues the initial refresh at the
       // real size; refreshing here too would race it with an estimated size.
@@ -3554,9 +3558,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (snapshot != null && !_disposed) {
         var finalSnapshot = snapshot;
         final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-        final replayTargetSize = includeHistory
-            ? _currentReplayTerminalSize(session, sizeObj)
-            : null;
+        final replayTargetSize = _currentReplayTerminalSize(session, sizeObj);
         // The size the host actually ends this call at, which is not the same
         // as `replayTargetSize`: that is only the size we would like. When the
         // foreground gate below declines to resize, nothing drove the host, and
@@ -3569,8 +3571,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           debugPrint(
             'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
           );
-          final restoreSize =
-              replayTargetSize ?? _savedOrEstimatedTerminalRestoreSize(sizeObj);
+          final restoreSize = replayTargetSize;
           try {
             final restoredSnapshot = _snapshotFromResponse(
               await _client.restoreSession(
@@ -3600,8 +3601,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             final freshSnapshot =
                 freshResponseObj?['snapshot'] as Map<String, dynamic>?;
             if (freshSnapshot != null) {
-              if (replayTargetSize == null ||
-                  _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
+              if (_snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
                 finalSnapshot = freshSnapshot;
               }
             }
@@ -3610,8 +3610,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               'Failed to restore session $sessionId during refresh: ${e.toString()}',
             );
           }
-        } else if (replayTargetSize != null &&
-            _clientForeground &&
+        } else if (_clientForeground &&
             !_snapshotSizeMatches(snapshot, replayTargetSize)) {
           // Resize the host so its program repaints at our width, but keep the
           // history-bearing attach snapshot for rendering. The resize response
@@ -3638,6 +3637,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId,
           finalSnapshot,
           renderSize: drivenSize,
+          replayHistory: includeHistory,
         );
       }
     } catch (_) {
@@ -4054,10 +4054,79 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _setSessionCustomLabel(session, trimmed.isEmpty ? null : trimmed);
   }
 
+  bool _allowExit = false;
+
+  Future<void> _handlePopInvoked(bool didPop, dynamic result) async {
+    if (didPop || _allowExit) return;
+    final shouldLeave = await _showExitConfirmationDialog();
+    if (shouldLeave == true && mounted) {
+      setState(() => _allowExit = true);
+      allowWebExit();
+      await SystemNavigator.pop();
+      Future.delayed(const Duration(seconds: 1), () {
+        if (mounted) {
+          setState(() => _allowExit = false);
+        }
+      });
+    }
+  }
+
+  Future<bool?> _showExitConfirmationDialog() {
+    return showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.55),
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xff161b1d),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: Color(0xff2a3437)),
+        ),
+        title: const Text(
+          'Exit Triage?',
+          style: TextStyle(
+            color: Color(0xffcdd7d6),
+            fontSize: 18,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        content: const SizedBox(
+          width: 360,
+          child: Text(
+            'Are you sure you want to leave Triage and go back to the previous page?',
+            style: TextStyle(
+              color: Color(0xff8b9799),
+              fontSize: 14,
+              height: 1.4,
+            ),
+          ),
+        ),
+        actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xff7f8b8d),
+            ),
+            child: const Text('Stay'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xffe06c75),
+              foregroundColor: const Color(0xff111517),
+            ),
+            child: const Text('Leave'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    Widget content;
     if (_needsConnectionConfig) {
-      return Scaffold(
+      content = Scaffold(
         body: Center(
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(24),
@@ -4073,10 +4142,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ),
         ),
       );
-    }
-
-    if (_needsPairing) {
-      return Scaffold(
+    } else if (_needsPairing) {
+      content = Scaffold(
         body: Center(
           child: SingleChildScrollView(
             child: Container(
@@ -4121,192 +4188,185 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ),
         ),
       );
-    }
+    } else {
+      final isMobile = isMobilePlatform();
+      final hasSelectedSession =
+          _selectedIndex >= 0 && _selectedIndex < _sessions.length;
+      if (!hasSelectedSession) {
+        if (_sessions.isNotEmpty) {
+          _selectedIndex = 0;
+        }
+      }
 
-    // On a phone the rail can't sit beside the workspace — it would squeeze the
-    // terminal to a sliver. Mobile shows a full-screen workspace with the rail
-    // as a scrim-backed overlay that dismisses on select; desktop keeps the
-    // side-by-side layout.
-    final isMobile = isMobilePlatform();
+      void collapseRail() {
+        if (!_sidebarCollapsed) setState(() => _sidebarCollapsed = true);
+      }
 
-    void collapseRail() {
-      if (!_sidebarCollapsed) setState(() => _sidebarCollapsed = true);
-    }
-
-    void openRail() {
-      if (!_sidebarCollapsed) return;
-      setState(() => _sidebarCollapsed = false);
-      // Bring the session you're in to the top of the freshly-opened rail.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final tileContext = _selectedTileKey.currentContext;
-        if (tileContext == null) return;
-        Scrollable.ensureVisible(
-          tileContext,
-          alignment: 0, // 0 = align to the top of the viewport
-          duration: _sessionRailAnimationDuration,
-          curve: Curves.easeOutCubic,
-        );
-      });
-    }
-
-    final rail = SessionRail(
-      sessions: _sessions,
-      sessionGroups: _sessionGroups,
-      pins: _pins,
-      onResetOrder: _resetRailOrder,
-      onUnpinGroup: _unpinGroup,
-      onUnpinSession: _unpinSession,
-      onSessionContextMenu: _showSessionContextMenu,
-      selectedIndex: _selectedIndex,
-      selectedTileKey: _selectedTileKey,
-      // On mobile, selecting or creating a session dismisses the overlay so the
-      // terminal takes the full screen.
-      onSelectSession: (index) {
-        _selectSession(index);
-        if (isMobile) collapseRail();
-      },
-      onReorderSession: _reorderRail,
-      railListKey: _railListKey,
-      onRailDragStart: _railDragStarted,
-      onRailDragEnd: _railDragEnded,
-      draggingGroupKey: _draggingRailGroup,
-      onCreateSession: (shell) {
-        _createSession(shell);
-        if (isMobile) collapseRail();
-      },
-      selectedShell: _newSessionShell,
-      shellOptions: newSessionShellMenuOrderForPlatform(defaultTargetPlatform),
-      showShellMenu: showNewSessionShellMenuForPlatform(defaultTargetPlatform),
-      connectionStatus: _connectionStatus,
-      connectionStatusColor: _connectionStatusColor,
-      serverLabel: _activeServer?.label,
-      onOpenSettings: _openConnectionSettings,
-      onToggleJudgePolicy: _toggleSessionJudgePolicy,
-      // Mobile: the rail always shows full content (the overlay slide handles
-      // show/hide) and its collapse button closes the overlay. Desktop: the
-      // button shrinks the rail to its icon strip in place.
-      isCollapsed: isMobile ? false : _sidebarCollapsed,
-      onToggleCollapse: isMobile
-          ? collapseRail
-          : () {
-              setState(() {
-                _sidebarCollapsed = !_sidebarCollapsed;
-              });
-            },
-    );
-
-    const emptyWorkspace = Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.terminal, size: 64, color: Color(0xff263033)),
-          SizedBox(height: 16),
-          Text(
-            'No active sessions',
-            style: TextStyle(
-              fontSize: 18,
-              color: Color(0xff7f8b8d),
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          SizedBox(height: 8),
-          Text(
-            'Create a new session by clicking the "+" button on the sidebar.',
-            style: TextStyle(fontSize: 14, color: Color(0xff7f8b8d)),
-          ),
-        ],
-      ),
-    );
-
-    final workspace = _sessions.isEmpty
-        ? emptyWorkspace
-        : SessionWorkspace(
-            session: _selectedSession,
-            onCloseSession: () => _closeSession(_selectedSession),
-            onViewFit: (cols, rows) =>
-                _onSessionViewFit(_selectedSession, cols, rows),
-            onToggleJudge: () => _toggleSessionJudgePolicy(_selectedSession),
-            // The header's menu button reopens the overlay on mobile only.
-            onOpenRail: isMobile ? openRail : null,
-            // Manual escape hatch for reclaiming the shared PTY size when
-            // switching back to this device (auto-refit only fires on resume).
-            onRefit: _refitAndFocusActiveSession,
+      void openRail() {
+        if (!_sidebarCollapsed) return;
+        setState(() => _sidebarCollapsed = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final tileContext = _selectedTileKey.currentContext;
+          if (tileContext == null) return;
+          Scrollable.ensureVisible(
+            tileContext,
+            alignment: 0,
+            duration: _sessionRailAnimationDuration,
+            curve: Curves.easeOutCubic,
           );
+        });
+      }
 
-    if (isMobile) {
-      final screenWidth = MediaQuery.of(context).size.width;
-      final overlayWidth = screenWidth < _sessionRailExpandedWidth
-          ? screenWidth
-          : _sessionRailExpandedWidth;
-      return Scaffold(
-        body: SafeArea(
-          // The rail and scrim stay mounted and animate on the collapsed flag
-          // (slide + fade) rather than popping in/out, so open/close is smooth.
-          child: Stack(
-            children: [
-              Positioned.fill(child: workspace),
-              // A menu affordance when the rail is dismissed and there is no
-              // workspace header to host one (no sessions yet).
-              if (_sidebarCollapsed && _sessions.isEmpty)
-                Positioned(
-                  top: 4,
-                  left: 4,
-                  child: IconButton(
-                    icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
-                    tooltip: 'Sessions',
-                    onPressed: openRail,
+      final rail = SessionRail(
+        sessions: _sessions,
+        sessionGroups: _sessionGroups,
+        pins: _pins,
+        onResetOrder: _resetRailOrder,
+        onUnpinGroup: _unpinGroup,
+        onUnpinSession: _unpinSession,
+        onSessionContextMenu: _showSessionContextMenu,
+        selectedIndex: _selectedIndex,
+        selectedTileKey: _selectedTileKey,
+        onSelectSession: (index) {
+          _selectSession(index);
+          if (isMobile) collapseRail();
+        },
+        onReorderSession: _reorderRail,
+        railListKey: _railListKey,
+        onRailDragStart: _railDragStarted,
+        onRailDragEnd: _railDragEnded,
+        draggingGroupKey: _draggingRailGroup,
+        onCreateSession: (shell) {
+          _createSession(shell);
+          if (isMobile) collapseRail();
+        },
+        selectedShell: _newSessionShell,
+        shellOptions: newSessionShellMenuOrderForPlatform(defaultTargetPlatform),
+        showShellMenu: showNewSessionShellMenuForPlatform(defaultTargetPlatform),
+        connectionStatus: _connectionStatus,
+        connectionStatusColor: _connectionStatusColor,
+        serverLabel: _activeServer?.label,
+        onOpenSettings: _openConnectionSettings,
+        onToggleJudgePolicy: _toggleSessionJudgePolicy,
+        isCollapsed: isMobile ? false : _sidebarCollapsed,
+        onToggleCollapse: isMobile
+            ? collapseRail
+            : () {
+                setState(() {
+                  _sidebarCollapsed = !_sidebarCollapsed;
+                });
+              },
+      );
+
+      const emptyWorkspace = Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.terminal, size: 64, color: Color(0xff263033)),
+            SizedBox(height: 16),
+            Text(
+              'No active sessions',
+              style: TextStyle(
+                fontSize: 18,
+                color: Color(0xff7f8b8d),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'Create a new session by clicking the "+" button on the sidebar.',
+              style: TextStyle(fontSize: 14, color: Color(0xff7f8b8d)),
+            ),
+          ],
+        ),
+      );
+
+      final workspace = _sessions.isEmpty
+          ? emptyWorkspace
+          : SessionWorkspace(
+              session: _selectedSession,
+              onCloseSession: () => _closeSession(_selectedSession),
+              onViewFit: (cols, rows) =>
+                  _onSessionViewFit(_selectedSession, cols, rows),
+              onToggleJudge: () => _toggleSessionJudgePolicy(_selectedSession),
+              onOpenRail: isMobile ? openRail : null,
+              onRefit: _refitAndFocusActiveSession,
+            );
+
+      if (isMobile) {
+        final screenWidth = MediaQuery.of(context).size.width;
+        final overlayWidth = screenWidth < _sessionRailExpandedWidth
+            ? screenWidth
+            : _sessionRailExpandedWidth;
+        content = Scaffold(
+          body: SafeArea(
+            child: Stack(
+              children: [
+                Positioned.fill(child: workspace),
+                if (_sidebarCollapsed && _sessions.isEmpty)
+                  Positioned(
+                    top: 4,
+                    left: 4,
+                    child: IconButton(
+                      icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
+                      tooltip: 'Sessions',
+                      onPressed: openRail,
+                    ),
                   ),
-                ),
-              // Scrim: fades in with the rail; ignores taps while collapsed so
-              // input passes through to the terminal.
-              Positioned.fill(
-                child: IgnorePointer(
-                  ignoring: _sidebarCollapsed,
-                  child: AnimatedOpacity(
-                    opacity: _sidebarCollapsed ? 0.0 : 1.0,
-                    duration: _sessionRailAnimationDuration,
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: collapseRail,
-                      child: const ColoredBox(color: Color(0x99000000)),
+                Positioned.fill(
+                  child: IgnorePointer(
+                    ignoring: _sidebarCollapsed,
+                    child: AnimatedOpacity(
+                      opacity: _sidebarCollapsed ? 0.0 : 1.0,
+                      duration: _sessionRailAnimationDuration,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: collapseRail,
+                        child: const ColoredBox(color: Color(0x99000000)),
+                      ),
                     ),
                   ),
                 ),
-              ),
-              // Rail: slides in from the left edge.
-              AnimatedPositioned(
-                duration: _sessionRailAnimationDuration,
-                curve: Curves.easeOutCubic,
-                top: 0,
-                bottom: 0,
-                left: _sidebarCollapsed ? -overlayWidth : 0,
-                width: overlayWidth,
-                child: Material(
-                  elevation: 16,
-                  color: const Color(0xff0d1113),
-                  child: rail,
+                AnimatedPositioned(
+                  duration: _sessionRailAnimationDuration,
+                  curve: Curves.easeOutCubic,
+                  top: 0,
+                  bottom: 0,
+                  left: _sidebarCollapsed ? -overlayWidth : 0,
+                  width: overlayWidth,
+                  child: Material(
+                    elevation: 16,
+                    color: const Color(0xff0d1113),
+                    child: rail,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
-      );
+        );
+      } else {
+        content = Scaffold(
+          body: SafeArea(
+            child: Row(
+              children: [
+                rail,
+                const VerticalDivider(
+                  width: 1,
+                  thickness: 1,
+                  color: Color(0xff263033),
+                ),
+                Expanded(child: workspace),
+              ],
+            ),
+          ),
+        );
+      }
     }
 
-    return Scaffold(
-      body: SafeArea(
-        child: Row(
-          children: [
-            rail,
-            const VerticalDivider(
-              width: 1,
-              thickness: 1,
-              color: Color(0xff263033),
-            ),
-            Expanded(child: workspace),
-          ],
-        ),
-      ),
+    return PopScope(
+      canPop: _allowExit,
+      onPopInvokedWithResult: _handlePopInvoked,
+      child: content,
     );
   }
 }

@@ -72,6 +72,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionFitAddons = {};
   static final Map<String, dynamic> _sessionOnDataSubscriptions = {};
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
+  static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
+  static final Map<String, int?> _sessionSavedViewportY = {};
   static final TerminalSessionInputRouter _sessionInputRouter =
       TerminalSessionInputRouter();
   static final Set<String> _registeredViewTypes = {};
@@ -93,6 +95,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   static void _discardCachedSession(String sanitizedId) {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
+    _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
     // would only strand a dead `State` in a static map.
@@ -122,6 +125,14 @@ class _TerminalPaneState extends State<TerminalPane> {
         js_util.callMethod(onResize, 'dispose', []);
       } catch (_) {}
     }
+    final onScroll = _TerminalPaneState._sessionOnScrollSubscriptions.remove(
+      sanitizedId,
+    );
+    if (onScroll != null) {
+      try {
+        js_util.callMethod(onScroll, 'dispose', []);
+      } catch (_) {}
+    }
   }
 
   late final String _viewType;
@@ -132,6 +143,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final dynamic _fitAddon;
   dynamic _onDataSubscription;
   dynamic _onResizeSubscription;
+  dynamic _onScrollSubscription;
   dynamic _resizeObserver;
   late Object _inputRouteToken;
   late final FocusNode _focusNode;
@@ -215,7 +227,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindTerminalSubscriptions();
       _bindContainerEvents();
       if (widget.focusCursorRevision > 0) {
-        _focusCursorNowAndAfterReplay();
+        _restoreScrollPosition(requestFocus: true);
       }
     } else {
       _container = html.DivElement()
@@ -406,6 +418,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _sendInput(String data) {
+    _sessionSavedViewportY[_sanitizedId] = null;
+    try {
+      js_util.callMethod(_term, 'scrollToBottom', []);
+    } catch (_) {}
     _sessionInputRouter.sendInput(_sanitizedId, data);
     _focusTerminal();
   }
@@ -517,6 +533,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         "'JetBrains Mono', Consolas, 'Courier New', monospace",
       );
       js_util.setProperty(options, 'fontSize', 15);
+      js_util.setProperty(options, 'scrollback', 50000);
       js_util.setProperty(options, 'cursorStyle', 'block');
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
@@ -575,7 +592,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
       _triggerFitWithDelayedRetries();
       if (widget.focusCursorRevision > 0) {
-        _focusCursorNowAndAfterReplay();
+        _restoreScrollPosition(requestFocus: true);
       }
 
       try {
@@ -674,6 +691,33 @@ class _TerminalPaneState extends State<TerminalPane> {
         onResizeCallback,
       ]);
       _sessionOnResizeSubscriptions[_sanitizedId] = _onResizeSubscription;
+    }
+
+    _onScrollSubscription = _sessionOnScrollSubscriptions[_sanitizedId];
+    if (_onScrollSubscription == null) {
+      final sessionId = _sanitizedId;
+      final onScrollCallback = js_util.allowInterop((
+        dynamic newY, [
+        dynamic _,
+      ]) {
+        try {
+          final term = _sessionTerms[sessionId];
+          if (term == null) return;
+          final buffer = js_util.getProperty(term, 'buffer');
+          final active = js_util.getProperty(buffer, 'active');
+          final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+          final viewportY = (js_util.getProperty(active, 'viewportY') as num).toInt();
+          if (viewportY >= baseY) {
+            _sessionSavedViewportY[sessionId] = null;
+          } else {
+            _sessionSavedViewportY[sessionId] = viewportY;
+          }
+        } catch (_) {}
+      });
+      _onScrollSubscription = js_util.callMethod(_term, 'onScroll', [
+        onScrollCallback,
+      ]);
+      _sessionOnScrollSubscriptions[_sanitizedId] = _onScrollSubscription;
     }
 
     try {
@@ -1161,11 +1205,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursor(requestFocus: true);
   }
 
-  void _scrollToCursor({required bool requestFocus}) {
+  void _restoreScrollPosition({required bool requestFocus}) {
     void jump() {
       if (!mounted || !_initialized) return;
+      final savedY = _sessionSavedViewportY[_sanitizedId];
       try {
-        js_util.callMethod(_term, 'scrollToBottom', []);
+        if (savedY != null) {
+          js_util.callMethod(_term, 'scrollToLine', [savedY]);
+        } else {
+          js_util.callMethod(_term, 'scrollToBottom', []);
+        }
       } catch (_) {}
       if (requestFocus) {
         _activateTerminal();
@@ -1176,6 +1225,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer?.cancel();
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
   }
+
+  void _scrollToCursor({required bool requestFocus}) =>
+      _restoreScrollPosition(requestFocus: requestFocus);
 
   void _updateCursorOptions() {
     final options = js_util.getProperty(_term, 'options');

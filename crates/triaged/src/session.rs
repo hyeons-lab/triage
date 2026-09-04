@@ -6136,16 +6136,9 @@ fn snapshot_from_output(
     }
 }
 
-/// Maximum bytes of raw output history carried in a snapshot for client-side
-/// re-emulation. Bounded because a repainting TUI (e.g. Claude Code) self-heals
-/// its whole viewport within one frame; the Phase 0 spike confirmed a small tail
-/// reconstructs the screen exactly (a 64 KiB tail matched full replay). 1 MiB
-/// gives generous headroom for full-screen TUIs run inside a session.
-const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
-
 /// Size at which a live session log is trimmed back to
 /// [`SESSION_LOG_RETAIN_BYTES`]. Without this a long-lived session grows without
-/// bound — logs of ~100 MB, and gigabytes across a session directory, are what
+/// bound: logs of ~100 MB, and gigabytes across a session directory, are what
 /// motivated the cap.
 const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -6153,6 +6146,11 @@ const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 /// the two bounds is what makes trimming amortised: one rewrite buys
 /// `MAX_SESSION_LOG_BYTES - SESSION_LOG_RETAIN_BYTES` of further output.
 const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
+
+/// Maximum bytes of raw output history carried in a snapshot for client-side
+/// re-emulation. Set to the full retained session log size so connecting
+/// clients have access to complete scrollback history.
+const RAW_OUTPUT_TAIL_CAP: u64 = MAX_SESSION_LOG_BYTES;
 
 /// Maximum bytes of a session log replayed through the terminal emulator when a
 /// session is adopted, restored, or reflowed after a resize.

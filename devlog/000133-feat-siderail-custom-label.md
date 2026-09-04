@@ -14,10 +14,20 @@ Allow users to right-click a session in the side rail to assign a custom label f
 - [x] Persist and restore custom labels in `SharedPreferences`
 - [x] Add comprehensive tests for custom labels in Flutter test suite
 - [x] Verify formatting, clippy, and full test suite
+- [x] Prevent accidental back navigation and overscroll gesture navigation on web
+- [x] Intercept back navigation with an exit confirmation dialog in webapp
+- [x] Expand daemon raw output tail cap to full session log size (16 MiB)
+- [x] Increase client scrollback buffers to 50,000 lines
+- [x] Preserve scroll position per session across session switches and avoid buffer wipes on live sessions
+- [x] Reset scroll offset to bottom when user sends input
+- [x] Add automated widget tests for back navigation prompt and scroll preservation
 
 **Decisions:**
 - 2026-09-03T23:57-0700 Use `SharedPreferences` per active daemon server (`session_custom_labels_v1_$serverId`) to persist session labels keyed by stable session id.
 - 2026-09-03T23:57-0700 Promote `customLabel` to lead `railTitle`, `displayTitle`, and `glanceTitle`, while preserving repo and branch context on the tile's secondary meta line.
+- 2026-09-04T01:23-0700 Use CSS `overscroll-behavior: none` and Flutter `PopScope` to protect web users from accidental history back navigation while retaining confirmation before exit.
+- 2026-09-04T01:23-0700 Expand daemon snapshot output tail cap to match `MAX_SESSION_LOG_BYTES` (16 MiB) and client terminal scrollback to 50,000 lines for deep scrollback inspection.
+- 2026-09-04T01:23-0700 Preserve per-session scroll position across session switches and avoid re-emulating live session buffers, while scrolling to bottom when the user sends terminal input.
 
 **What Changed:**
 - 2026-09-03T23:57-0700 `Cargo.toml`: switched `cera` from git main to published crates.io version `0.5.2`.
@@ -32,9 +42,22 @@ Allow users to right-click a session in the side rail to assign a custom label f
 - 2026-09-04T00:20-0700 `flutter/triage_client/lib/main.dart`: encapsulated custom label dialog into `_CustomLabelDialog` StatefulWidget to safely manage controller lifecycle and wrapped popup menu items in Expanded to prevent flex overflow.
 - 2026-09-04T00:20-0700 `flutter/triage_client/test/widget_test.dart`: added sessionContexts to test pumpApp harness and validated end-to-end custom label lifecycle and server scoping.
 - 2026-09-04T00:39-0700 `crates/triaged/src/summarizer.rs`: updated comment regarding `GenerationDefaults::Audio` to clarify intentional greedy fallback during text summarization.
+- 2026-09-04T01:23-0700 `crates/triaged/src/session.rs`: increased `RAW_OUTPUT_TAIL_CAP` to `MAX_SESSION_LOG_BYTES` (16 MiB).
+- 2026-09-04T01:23-0700 `flutter/triage_client/web/index.html`: set `overscroll-behavior: none` on `html, body` and added `beforeunload` guard.
+- 2026-09-04T01:23-0700 `flutter/triage_client/web/xterm.css`: set `overscroll-behavior: none` on `.xterm .xterm-viewport`.
+- 2026-09-04T01:23-0700 `flutter/triage_client/lib/platform_env_io.dart`: added `allowWebExit()` stub for non-web targets.
+- 2026-09-04T01:23-0700 `flutter/triage_client/lib/platform_env_web.dart`: implemented `allowWebExit()` via JS interop to unarm `beforeunload`.
+- 2026-09-04T01:23-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`: increased xterm scrollback to 50,000 lines, tracked `onScroll` per session, restored saved scroll position on switch, and reset to bottom on input.
+- 2026-09-04T01:23-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: tracked saved scroll offset per session, attached scroll controller to test fallback view, restored saved scroll position on switch, and reset to bottom on terminal output.
+- 2026-09-04T01:23-0700 `flutter/triage_client/lib/main.dart`: wrapped root scaffold in `PopScope` with exit confirmation dialog, increased `SessionVm.terminal` `maxLines` to 50,000 lines, avoided wiping live terminal buffers on session re-select, and reclaimed PTY size reliably.
+- 2026-09-04T01:23-0700 `flutter/triage_client/test/widget_test.dart`: added widget tests for back navigation exit confirmation and session scroll preservation across session switching and user input.
+- 2026-09-04T01:23-0700 `devlog/plans/000133-02-prevent-accidental-back-navigation.md`: recorded plan for webapp back navigation protection.
+- 2026-09-04T01:23-0700 `devlog/plans/000133-03-preserve-session-scroll-and-expand-scrollback.md`: recorded plan for scroll preservation and scrollback expansion.
 
 **Commits:**
 - 486ac8e: feat: support siderail custom session labels and bump cera to 0.5.2
 - 3861e73: fix: resolve popup menu text constraints and lifecycle in custom label dialog
-- HEAD: docs(summarizer): clarify greedy fallback rationale for audio generation defaults
+- 059afa2: docs(summarizer): clarify greedy fallback rationale for audio generation defaults
+- HEAD: feat: prevent accidental webapp back navigation and preserve session scroll
+
 

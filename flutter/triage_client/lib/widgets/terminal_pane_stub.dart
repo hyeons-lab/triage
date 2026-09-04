@@ -59,7 +59,7 @@ class TerminalPane extends StatefulWidget {
   final bool isExited;
 
   static void destroySession(String terminalId) {
-    // Native implementation doesn't cache session DOM nodes.
+    _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
   }
 
   static void setBracketedPasteMode(String terminalId, bool enabled) {
@@ -71,6 +71,7 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
+  static final Map<String, double?> _sessionSavedScrollOffsets = {};
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
@@ -249,6 +250,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
     if (!identical(oldWidget.terminal, widget.terminal)) {
+      if (_scrollController.hasClients) {
+        final pos = _scrollController.position;
+        if (pos.pixels < pos.maxScrollExtent - 2.0) {
+          _sessionSavedScrollOffsets[oldWidget.terminalId] = pos.pixels;
+        } else {
+          _sessionSavedScrollOffsets[oldWidget.terminalId] = null;
+        }
+      }
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
       // The anchor and any in-flight shift-click/drag referenced the previous
@@ -561,13 +570,18 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalOutput(String data) {
+    _sessionSavedScrollOffsets[widget.terminalId] = null;
+    _scrollAnchor.clear();
+    if (_scrollController.hasClients) {
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+    }
     // Sticky Ctrl (accessory bar): fold the armed Ctrl into the next single
     // character before it reaches the session, so e.g. arming Ctrl then typing
     // "c" on the soft keyboard sends 0x03 (SIGINT) instead of a literal "c".
     if (_ctrlArmed) {
       // Disarm on the very next chunk regardless of its length; only fold Ctrl
       // into a lone character. A multi-character IME chunk (paste, suggestion
-      // commit) still consumes the armed Ctrl — untransformed — so a latched
+      // commit) still consumes the armed Ctrl (untransformed) so a latched
       // Ctrl can never linger into a later keystroke.
       final ctrl = data.length == 1 ? controlByteForChar(data) : null;
       _disarmCtrl();
@@ -713,9 +727,14 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _captureScrollAnchor() {
     if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (position.pixels < position.maxScrollExtent - 2.0) {
+      _sessionSavedScrollOffsets[widget.terminalId] = position.pixels;
+    } else {
+      _sessionSavedScrollOffsets[widget.terminalId] = null;
+    }
     final lineHeight = _lineHeight();
     if (lineHeight == null) return;
-    final position = _scrollController.position;
     _scrollAnchor.capture(
       buffer: _terminal.buffer,
       pixels: position.pixels,
@@ -806,7 +825,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted) return;
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
-        position.jumpTo(position.maxScrollExtent);
+        final saved = _sessionSavedScrollOffsets[widget.terminalId];
+        if (saved != null) {
+          position.jumpTo(saved.clamp(0.0, position.maxScrollExtent));
+        } else {
+          position.jumpTo(position.maxScrollExtent);
+        }
       }
       if (requestFocus) {
         _focusNode.requestFocus();
@@ -1106,6 +1130,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         color: const Color(0xff0d1113),
         alignment: Alignment.topLeft,
         child: SingleChildScrollView(
+          controller: _scrollController,
           padding: const EdgeInsets.all(22),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

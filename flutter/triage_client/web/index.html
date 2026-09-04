@@ -38,6 +38,17 @@
   <!-- Bundled terminal font for xterm.js (browser font system, separate from
        Flutter). Served from the Flutter font assets declared in pubspec.yaml. -->
   <style>
+    html, body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      overscroll-behavior-y: none;
+      overscroll-behavior-x: none;
+      background-color: #101416;
+    }
     @font-face {
       font-family: 'JetBrains Mono';
       src: url('assets/fonts/JetBrainsMono-Regular.ttf') format('truetype');
@@ -59,6 +70,14 @@
       font-weight: 700; font-style: italic; font-display: block;
     }
   </style>
+  <script>
+    window._allowUnload = false;
+    window.addEventListener('beforeunload', function (e) {
+      if (window._allowUnload) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
+  </script>
 </head>
 <body>
   <!--
