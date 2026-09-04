@@ -6148,9 +6148,10 @@ const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Maximum bytes of raw output history carried in a snapshot for client-side
-/// re-emulation. Set to the full retained session log size so connecting
-/// clients have access to complete scrollback history.
-const RAW_OUTPUT_TAIL_CAP: u64 = MAX_SESSION_LOG_BYTES;
+/// re-emulation. 4 MiB matches a 50,000-line terminal scrollback buffer while
+/// remaining safely within WebSocket frame and memory limits during snapshot
+/// serialization.
+const RAW_OUTPUT_TAIL_CAP: u64 = 4 * 1024 * 1024;
 
 /// Maximum bytes of a session log replayed through the terminal emulator when a
 /// session is adopted, restored, or reflowed after a resize.

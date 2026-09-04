@@ -22,3 +22,10 @@ void allowWebExit() {
     _allowUnload = true;
   } catch (_) {}
 }
+
+/// Resets the web exit flag if navigation was cancelled or did not unload.
+void resetWebExit() {
+  try {
+    _allowUnload = false;
+  } catch (_) {}
+}

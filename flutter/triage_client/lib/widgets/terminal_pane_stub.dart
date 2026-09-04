@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/gestures.dart' show kPrimaryButton;
@@ -20,6 +19,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
+import 'package:triage_client/platform_env_io.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
@@ -71,7 +71,7 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
-  static final Map<String, double?> _sessionSavedScrollOffsets = {};
+  static final Map<String, double> _sessionSavedScrollOffsets = {};
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
@@ -250,14 +250,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
     if (!identical(oldWidget.terminal, widget.terminal)) {
-      if (_scrollController.hasClients) {
-        final pos = _scrollController.position;
-        if (pos.pixels < pos.maxScrollExtent - 2.0) {
-          _sessionSavedScrollOffsets[oldWidget.terminalId] = pos.pixels;
-        } else {
-          _sessionSavedScrollOffsets[oldWidget.terminalId] = null;
-        }
-      }
+      _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
       // The anchor and any in-flight shift-click/drag referenced the previous
@@ -295,6 +288,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void dispose() {
     widget.onTerminalResizeBind?.call(null);
+    _saveScrollOffset();
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
     _xtermController.removeListener(_recordSelectionAnchor);
@@ -570,7 +564,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalOutput(String data) {
-    _sessionSavedScrollOffsets[widget.terminalId] = null;
+    _sessionSavedScrollOffsets.remove(widget.terminalId);
     _scrollAnchor.clear();
     if (_scrollController.hasClients) {
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
@@ -725,20 +719,26 @@ class _TerminalPaneState extends State<TerminalPane> {
     _captureScrollAnchor();
   }
 
-  void _captureScrollAnchor() {
+  void _saveScrollOffset([String? terminalId]) {
     if (!_scrollController.hasClients) return;
+    final id = terminalId ?? widget.terminalId;
     final position = _scrollController.position;
     if (position.pixels < position.maxScrollExtent - 2.0) {
-      _sessionSavedScrollOffsets[widget.terminalId] = position.pixels;
+      _sessionSavedScrollOffsets[id] = position.pixels;
     } else {
-      _sessionSavedScrollOffsets[widget.terminalId] = null;
+      _sessionSavedScrollOffsets.remove(id);
     }
+  }
+
+  void _captureScrollAnchor() {
+    if (!_scrollController.hasClients) return;
+    _saveScrollOffset();
     final lineHeight = _lineHeight();
     if (lineHeight == null) return;
     _scrollAnchor.capture(
       buffer: _terminal.buffer,
-      pixels: position.pixels,
-      maxScrollExtent: position.maxScrollExtent,
+      pixels: _scrollController.position.pixels,
+      maxScrollExtent: _scrollController.position.maxScrollExtent,
       lineHeight: lineHeight,
     );
   }
@@ -1124,7 +1124,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   Widget build(BuildContext context) {
     // Detect if we are running inside a widget test environment to preserve
     // finder-based assertions on the plain fallback rows.
-    final isTest = Platform.environment.containsKey('FLUTTER_TEST');
+    final isTest = runningUnderFlutterTest();
     if (isTest) {
       return Container(
         color: const Color(0xff0d1113),

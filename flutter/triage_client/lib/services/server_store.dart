@@ -40,7 +40,7 @@ String pinnedSessionsPrefKeyFor(String serverId) =>
     'pinned_sessions_v1_$serverId';
 
 /// shared_preferences key holding one server's custom session labels, as a JSON-encoded
-/// map of session id to custom label.
+/// map of session identity key (remote session id, local session id, or title) to custom label.
 String sessionCustomLabelsPrefKeyFor(String serverId) =>
     'session_custom_labels_v1_$serverId';
 
@@ -246,19 +246,25 @@ Future<void> migrateRailPins(String fromId, String toId) async {
   if (fromId == toId) return;
   try {
     final prefs = await SharedPreferences.getInstance();
-    for (final key in [
-      pinnedGroupsPrefKeyFor,
-      pinnedSessionsPrefKeyFor,
-      sessionCustomLabelsPrefKeyFor,
-    ]) {
-      final value = prefs.get(key(fromId));
-      if (value == null) continue;
-      if (value is List<String>) {
-        await prefs.setStringList(key(toId), value);
-      } else if (value is String) {
-        await prefs.setString(key(toId), value);
-      }
-      await prefs.remove(key(fromId));
+
+    final pinnedGroups = prefs.getStringList(pinnedGroupsPrefKeyFor(fromId));
+    if (pinnedGroups != null) {
+      await prefs.setStringList(pinnedGroupsPrefKeyFor(toId), pinnedGroups);
+      await prefs.remove(pinnedGroupsPrefKeyFor(fromId));
+    }
+
+    final pinnedSessions =
+        prefs.getStringList(pinnedSessionsPrefKeyFor(fromId));
+    if (pinnedSessions != null) {
+      await prefs.setStringList(pinnedSessionsPrefKeyFor(toId), pinnedSessions);
+      await prefs.remove(pinnedSessionsPrefKeyFor(fromId));
+    }
+
+    final customLabels =
+        prefs.getString(sessionCustomLabelsPrefKeyFor(fromId));
+    if (customLabels != null) {
+      await prefs.setString(sessionCustomLabelsPrefKeyFor(toId), customLabels);
+      await prefs.remove(sessionCustomLabelsPrefKeyFor(fromId));
     }
   } catch (_) {}
 }

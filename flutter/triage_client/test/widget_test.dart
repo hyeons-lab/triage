@@ -340,7 +340,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required int rows,
   }) async {
     restoreSessionCalls.add(sessionId);
-    restoreSessionSizes[sessionId] = '${cols}x${rows}';
+    restoreSessionSizes[sessionId] = '${cols}x$rows';
     exitedSessionIds.remove(sessionId);
     return {
       'snapshot': {

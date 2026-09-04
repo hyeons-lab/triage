@@ -509,14 +509,20 @@ class SessionVm {
     return leafOf(wt);
   }
 
+  /// Returns [customLabel] trimmed if non-empty, or null.
+  String? get trimmedCustomLabel {
+    final trimmed = customLabel?.trim();
+    return (trimmed != null && trimmed.isNotEmpty) ? trimmed : null;
+  }
+
   /// Human-facing name for the rail/header, so sessions are identifiable at a
   /// glance instead of all reading "triage / session-NN". Prefers
   /// [customLabel] when assigned, then "repo · worktree", falls back to "repo · branch"
   /// when there is no distinct worktree, then the working-directory leaf, then the stable
-  /// [title] ("triage / <id>"). Distinct from [title], which stays an identity key.
+  /// [title] (`triage / <id>`). Distinct from [title], which stays an identity key.
   String get displayTitle {
-    final custom = customLabel?.trim();
-    if (custom != null && custom.isNotEmpty) return custom;
+    final custom = trimmedCustomLabel;
+    if (custom != null) return custom;
     final repo = repoName;
     if (repo != null) {
       final wt = worktreeName;
@@ -561,16 +567,16 @@ class SessionVm {
   /// expiry of the inferred worktree is testable.
   ///
   /// Prefers an explicit [customLabel] if assigned.
-  /// Otherwise, a row whose *live* context already names a workstream — a distinct current
-  /// worktree, or any branch that isn't the default — uses it directly. Only a
+  /// Otherwise, a row whose *live* context already names a workstream: a distinct current
+  /// worktree, or any branch that isn't the default: uses it directly. Only a
   /// row that is inside a repo but reads as its root (no distinct worktree, and
   /// no branch or just `main`) would otherwise show the same uninformative word
   /// as every other root session, so it defers to the last worktree this session
   /// was seen driving in *this same repo*. The inference never overrides ground
   /// truth, and reverts once it goes stale.
   String railTitleAt(DateTime now) {
-    final custom = customLabel?.trim();
-    if (custom != null && custom.isNotEmpty) return custom;
+    final custom = trimmedCustomLabel;
+    if (custom != null) return custom;
     final inferred = _activeInferredLead(now);
     if (inferred != null) return inferred;
     final b = branch?.trim();
@@ -585,14 +591,14 @@ class SessionVm {
 
   /// Repo-first name for the hover card and screen-reader label, following the
   /// same lead the rail shows: when an inferred worktree is leading the row it
-  /// reads "repo · <worktree>", so the visible line, the card heading, and the
+  /// reads `repo · <worktree>`, so the visible line, the card heading, and the
   /// screen reader never disagree and two inferred rows stay distinguishable to
   /// assistive tech. Otherwise it is the plain [displayTitle]. The workspace
-  /// header keeps its own [displayTitle] — only the rail's card/label follow the
+  /// header keeps its own [displayTitle]: only the rail's card/label follow the
   /// inference.
   String glanceTitleAt(DateTime now) {
-    final custom = customLabel?.trim();
-    if (custom != null && custom.isNotEmpty) return custom;
+    final custom = trimmedCustomLabel;
+    if (custom != null) return custom;
     final inferred = _activeInferredLead(now);
     if (inferred != null) {
       final repo = repoName;
@@ -2465,6 +2471,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   String _keyForSession(SessionVm session) =>
       session.remoteSessionId ?? session.sessionId ?? session.title;
 
+  String? _lookupCustomLabel(String id) =>
+      _customLabels[id] ?? _customLabels['triage / $id'];
+
   /// Restores this server's custom session labels in the background and applies
   /// them to any matching sessions currently loaded.
   Future<void> _restoreCustomLabels() async {
@@ -2473,22 +2482,24 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final prefs = await SharedPreferences.getInstance();
       if (_disposed || serverId != _activeServerId) return;
       final raw = prefs.getString(sessionCustomLabelsPrefKeyFor(serverId));
+      Map<String, String> labels = {};
       if (raw != null && raw.isNotEmpty) {
         final decoded = jsonDecode(raw);
         if (decoded is Map) {
-          _customLabels = {
+          labels = {
             for (final entry in decoded.entries)
-              entry.key.toString(): entry.value.toString(),
+              if (entry.value != null &&
+                  entry.value.toString().trim().isNotEmpty)
+                entry.key.toString(): entry.value.toString().trim(),
           };
-          for (final session in _sessions) {
-            final key = _keyForSession(session);
-            if (_customLabels.containsKey(key)) {
-              session.customLabel = _customLabels[key];
-            }
-          }
-          if (mounted) setState(() {});
         }
       }
+      _customLabels = labels;
+      for (final session in _sessions) {
+        final key = _keyForSession(session);
+        session.customLabel = _lookupCustomLabel(key);
+      }
+      if (mounted) setState(() {});
     } catch (_) {
       // Custom labels are a best-effort convenience; ignore load failures.
     }
@@ -2515,6 +2526,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _setSessionCustomLabel(SessionVm session, String? label) {
     final key = _keyForSession(session);
     final trimmed = label?.trim();
+    _customLabels.remove('triage / $key');
     if (trimmed != null && trimmed.isNotEmpty) {
       session.customLabel = trimmed;
       _customLabels[key] = trimmed;
@@ -2735,8 +2747,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // sessions not yet opened — a muted row that carries only rail metadata until
   // the user selects it, at which point `_loadDaemonSessionInto` attaches it.
   SessionVm _loadingDaemonSession(String sessionId, {bool loading = true}) {
-    final label =
-        _customLabels[sessionId] ?? _customLabels['triage / $sessionId'];
+    final label = _lookupCustomLabel(sessionId);
     return SessionVm(
       title: 'triage / $sessionId',
       sessionId: sessionId,
@@ -2954,8 +2965,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final exited = snapshot?['exited'] as bool? ?? false;
       final outputSeq = snapshot?['output_seq'] as int? ?? 0;
 
-      final customLabel =
-          _customLabels[sid] ?? _customLabels['triage / $sid'];
+      final customLabel = _lookupCustomLabel(sid);
       final session = SessionVm(
         title: 'triage / $sid',
         sessionId: sid,
@@ -3637,7 +3647,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId,
           finalSnapshot,
           renderSize: drivenSize,
-          replayHistory: includeHistory,
+          replayHistory: includeHistory || snapshot['exited'] == true,
         );
       }
     } catch (_) {
@@ -3964,8 +3974,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       Offset.zero & overlay.size,
     );
 
-    final hasLabel =
-        session.customLabel != null && session.customLabel!.trim().isNotEmpty;
+    final hasLabel = session.trimmedCustomLabel != null;
     final result = await showMenu<String>(
       context: context,
       position: rect,
@@ -4050,20 +4059,27 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     );
 
     if (!mounted || result == null) return;
-    final trimmed = result.trim();
-    _setSessionCustomLabel(session, trimmed.isEmpty ? null : trimmed);
+    _setSessionCustomLabel(session, result);
   }
 
   bool _allowExit = false;
+  bool _exitDialogInFlight = false;
 
   Future<void> _handlePopInvoked(bool didPop, dynamic result) async {
-    if (didPop || _allowExit) return;
-    final shouldLeave = await _showExitConfirmationDialog();
+    if (didPop || _allowExit || _exitDialogInFlight || !mounted) return;
+    _exitDialogInFlight = true;
+    final bool? shouldLeave;
+    try {
+      shouldLeave = await _showExitConfirmationDialog();
+    } finally {
+      _exitDialogInFlight = false;
+    }
     if (shouldLeave == true && mounted) {
       setState(() => _allowExit = true);
       allowWebExit();
       await SystemNavigator.pop();
       Future.delayed(const Duration(seconds: 1), () {
+        resetWebExit();
         if (mounted) {
           setState(() => _allowExit = false);
         }
@@ -4089,11 +4105,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             fontWeight: FontWeight.w700,
           ),
         ),
-        content: const SizedBox(
+        content: SizedBox(
           width: 360,
           child: Text(
-            'Are you sure you want to leave Triage and go back to the previous page?',
-            style: TextStyle(
+            kIsWeb
+                ? 'Are you sure you want to leave Triage and go back to the previous page?'
+                : 'Are you sure you want to exit Triage?',
+            style: const TextStyle(
               color: Color(0xff8b9799),
               fontSize: 14,
               height: 1.4,
@@ -4496,6 +4514,7 @@ class _SessionRailState extends State<SessionRail> {
   final FocusNode _searchFocusNode = FocusNode();
   String _searchQuery = '';
   bool _searchOpen = false;
+  Offset _lastTapDownPosition = Offset.zero;
 
   @override
   void initState() {
@@ -4649,6 +4668,10 @@ class _SessionRailState extends State<SessionRail> {
                       message: indexed.$2.displayTitle,
                       child: InkWell(
                         onTap: () => widget.onSelectSession(indexed.$1),
+                        onTapDown: widget.onSessionContextMenu != null
+                            ? (details) =>
+                                _lastTapDownPosition = details.globalPosition
+                            : null,
                         onSecondaryTapDown: widget.onSessionContextMenu != null
                             ? (details) => widget.onSessionContextMenu!(
                                   indexed.$2,
@@ -4658,7 +4681,7 @@ class _SessionRailState extends State<SessionRail> {
                         onLongPress: widget.onSessionContextMenu != null
                             ? () => widget.onSessionContextMenu!(
                                   indexed.$2,
-                                  Offset.zero,
+                                  _lastTapDownPosition,
                                 )
                             : null,
                         borderRadius: BorderRadius.circular(8),
@@ -5000,7 +5023,7 @@ class _SessionRailState extends State<SessionRail> {
                             indistinguishable.contains(originalIndex),
                         judgeEffective: session.judgePolicyEffective,
                         judgeExplicit: session.judgePolicyExplicit,
-                        customLabel: session.customLabel,
+                        customLabel: session.trimmedCustomLabel,
                         onToggleJudge: widget.onToggleJudgePolicy != null
                             ? () => widget.onToggleJudgePolicy!(session)
                             : null,
@@ -7768,6 +7791,18 @@ class SessionListTile extends StatefulWidget {
 class _SessionListTileState extends State<SessionListTile> {
   final OverlayPortalController _popover = OverlayPortalController();
   final LayerLink _link = LayerLink();
+  Offset _lastTapDownPosition = Offset.zero;
+
+  Offset _contextMenuPosition() {
+    if (_lastTapDownPosition != Offset.zero) {
+      return _lastTapDownPosition;
+    }
+    final box = context.findRenderObject() as RenderBox?;
+    if (box != null && box.hasSize) {
+      return box.localToGlobal(box.size.center(Offset.zero));
+    }
+    return Offset.zero;
+  }
 
   /// Context line beneath the title: the repo, plus the worktree when it says
   /// something the title has not already said.
@@ -7778,10 +7813,12 @@ class _SessionListTileState extends State<SessionListTile> {
   /// Nothing is lost by omitting a component: the hover glance card states
   /// repo, branch, worktree and cwd in full.
   String? get _gitMeta {
+    final hasCustom =
+        widget.customLabel != null && widget.customLabel!.trim().isNotEmpty;
     final parts = <String>[
       if (widget.repoName != null && widget.repoName != widget.title)
         widget.repoName!,
-      if (widget.customLabel != null &&
+      if (hasCustom &&
           widget.branch != null &&
           widget.branch != widget.title &&
           widget.branch != widget.repoName)
@@ -7862,11 +7899,14 @@ class _SessionListTileState extends State<SessionListTile> {
             label: widget.glanceTitle ?? widget.title,
             child: InkWell(
               onTap: widget.onTap,
+              onTapDown: widget.onContextMenu != null
+                  ? (details) => _lastTapDownPosition = details.globalPosition
+                  : null,
               onSecondaryTapDown: widget.onContextMenu != null
                   ? (details) => widget.onContextMenu!(details.globalPosition)
                   : null,
               onLongPress: widget.onContextMenu != null
-                  ? () => widget.onContextMenu!(Offset.zero)
+                  ? () => widget.onContextMenu!(_contextMenuPosition())
                   : null,
               borderRadius: BorderRadius.circular(8),
               child: Container(
@@ -8043,6 +8083,17 @@ class _SessionGlanceCard extends StatelessWidget {
         : (snippet != null && snippet!.isNotEmpty
               ? snippet!
               : 'No summary yet.');
+    final custom = customLabel?.trim();
+    final hasCustomLabel = custom != null && custom.isNotEmpty;
+    final hasBranch = branch != null && branch!.isNotEmpty;
+    final hasWorktree = worktreeName != null && worktreeName != branch;
+    final hasCwd = cwd != null && cwd!.isNotEmpty;
+    final showCustomLabelRow = hasCustomLabel && title != custom;
+    final hasDetails = showCustomLabelRow ||
+        repoName != null ||
+        hasBranch ||
+        hasWorktree ||
+        hasCwd;
     return Material(
       color: Colors.transparent,
       child: Container(
@@ -8095,27 +8146,23 @@ class _SessionGlanceCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 10),
-            if (customLabel != null && customLabel!.isNotEmpty)
-              _GlanceRow(icon: Icons.label_outline, label: customLabel!),
+            if (showCustomLabelRow)
+              _GlanceRow(icon: Icons.label_outline, label: custom),
             if (repoName != null)
               _GlanceRow(icon: Icons.folder_outlined, label: repoName!),
-            if (branch != null && branch!.isNotEmpty)
+            if (hasBranch)
               _GlanceRow(icon: Icons.account_tree_outlined, label: branch!),
-            if (worktreeName != null && worktreeName != branch)
+            if (hasWorktree)
               _GlanceRow(icon: Icons.alt_route, label: worktreeName!),
             // The full working directory, wrapping across lines so the whole
             // path is readable here even when the rail line had to truncate it.
-            if (cwd != null && cwd!.isNotEmpty)
+            if (hasCwd)
               _GlanceRow(
                 icon: Icons.subdirectory_arrow_right,
                 label: cwd!,
                 wrap: true,
               ),
-            if ((customLabel != null && customLabel!.isNotEmpty) ||
-                repoName != null ||
-                (branch != null && branch!.isNotEmpty) ||
-                worktreeName != null ||
-                (cwd != null && cwd!.isNotEmpty))
+            if (hasDetails)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 8),
                 child: Divider(height: 1, color: Color(0xff2b363a)),
@@ -8559,23 +8606,20 @@ class WorkspaceHeader extends StatelessWidget {
     final branch = session.branch;
     final inRepo = session.repoName != null;
     final hasBranch = branch != null && branch.trim().isNotEmpty;
+    final fallbackCwd = (cwd != null && cwd.isNotEmpty)
+        ? (_homeAbbreviatedPath(cwd) ?? cwd)
+        : '';
     final String headerMeta;
-    if (session.customLabel != null && session.customLabel!.trim().isNotEmpty) {
+    if (session.trimmedCustomLabel != null) {
       if (inRepo && hasBranch) {
         headerMeta = '${session.repoName!}  ·  $branch';
       } else if (inRepo) {
         headerMeta = session.repoName!;
       } else {
-        headerMeta = cwd != null && cwd.isNotEmpty
-            ? (_homeAbbreviatedPath(cwd) ?? cwd)
-            : '';
+        headerMeta = fallbackCwd;
       }
     } else {
-      headerMeta = hasBranch
-          ? branch
-          : (cwd != null && cwd.isNotEmpty
-              ? (_homeAbbreviatedPath(cwd) ?? cwd)
-              : '');
+      headerMeta = hasBranch ? branch : fallbackCwd;
     }
     return Container(
       height: 68,

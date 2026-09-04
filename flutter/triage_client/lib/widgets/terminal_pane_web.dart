@@ -73,7 +73,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionOnDataSubscriptions = {};
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
-  static final Map<String, int?> _sessionSavedViewportY = {};
+  static final Map<String, int> _sessionSavedViewportY = {};
   static final TerminalSessionInputRouter _sessionInputRouter =
       TerminalSessionInputRouter();
   static final Set<String> _registeredViewTypes = {};
@@ -141,9 +141,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   late final html.DivElement _terminalWrapper;
   late final dynamic _term;
   late final dynamic _fitAddon;
-  dynamic _onDataSubscription;
-  dynamic _onResizeSubscription;
-  dynamic _onScrollSubscription;
   dynamic _resizeObserver;
   late Object _inputRouteToken;
   late final FocusNode _focusNode;
@@ -418,7 +415,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _sendInput(String data) {
-    _sessionSavedViewportY[_sanitizedId] = null;
+    _sessionSavedViewportY.remove(_sanitizedId);
     try {
       js_util.callMethod(_term, 'scrollToBottom', []);
     } catch (_) {}
@@ -644,12 +641,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       widget.controller,
     );
 
-    _onDataSubscription = _sessionOnDataSubscriptions[_sanitizedId];
-    if (_onDataSubscription == null) {
+    var onDataSubscription = _sessionOnDataSubscriptions[_sanitizedId];
+    if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+        _sessionSavedViewportY.remove(sessionId);
+        try {
+          final term = _sessionTerms[sessionId];
+          if (term != null) {
+            js_util.callMethod(term, 'scrollToBottom', []);
+          }
+        } catch (_) {}
         // Sticky Ctrl (accessory bar): fold an armed Ctrl into the next single
-        // character before it reaches the session — arming Ctrl then typing "c"
+        // character before it reaches the session: arming Ctrl then typing "c"
         // on the soft keyboard sends 0x03 (SIGINT), not a literal "c". A
         // multi-character chunk (paste, IME commit) still consumes the armed
         // Ctrl untransformed, so a latched Ctrl can never linger. State is keyed
@@ -666,14 +670,14 @@ class _TerminalPaneState extends State<TerminalPane> {
         }
         _sessionInputRouter.sendInput(sessionId, data);
       });
-      _onDataSubscription = js_util.callMethod(_term, 'onData', [
+      onDataSubscription = js_util.callMethod(_term, 'onData', [
         onDataCallback,
       ]);
-      _sessionOnDataSubscriptions[_sanitizedId] = _onDataSubscription;
+      _sessionOnDataSubscriptions[_sanitizedId] = onDataSubscription;
     }
 
-    _onResizeSubscription = _sessionOnResizeSubscriptions[_sanitizedId];
-    if (_onResizeSubscription == null) {
+    var onResizeSubscription = _sessionOnResizeSubscriptions[_sanitizedId];
+    if (onResizeSubscription == null) {
       final onResizeCallback = js_util.allowInterop((
         dynamic size, [
         dynamic _,
@@ -687,14 +691,14 @@ class _TerminalPaneState extends State<TerminalPane> {
         final rows = rowsNum.toInt();
         _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
       });
-      _onResizeSubscription = js_util.callMethod(_term, 'onResize', [
+      onResizeSubscription = js_util.callMethod(_term, 'onResize', [
         onResizeCallback,
       ]);
-      _sessionOnResizeSubscriptions[_sanitizedId] = _onResizeSubscription;
+      _sessionOnResizeSubscriptions[_sanitizedId] = onResizeSubscription;
     }
 
-    _onScrollSubscription = _sessionOnScrollSubscriptions[_sanitizedId];
-    if (_onScrollSubscription == null) {
+    var onScrollSubscription = _sessionOnScrollSubscriptions[_sanitizedId];
+    if (onScrollSubscription == null) {
       final sessionId = _sanitizedId;
       final onScrollCallback = js_util.allowInterop((
         dynamic newY, [
@@ -708,16 +712,16 @@ class _TerminalPaneState extends State<TerminalPane> {
           final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
           final viewportY = (js_util.getProperty(active, 'viewportY') as num).toInt();
           if (viewportY >= baseY) {
-            _sessionSavedViewportY[sessionId] = null;
+            _sessionSavedViewportY.remove(sessionId);
           } else {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
         } catch (_) {}
       });
-      _onScrollSubscription = js_util.callMethod(_term, 'onScroll', [
+      onScrollSubscription = js_util.callMethod(_term, 'onScroll', [
         onScrollCallback,
       ]);
-      _sessionOnScrollSubscriptions[_sanitizedId] = _onScrollSubscription;
+      _sessionOnScrollSubscriptions[_sanitizedId] = onScrollSubscription;
     }
 
     try {
@@ -1196,13 +1200,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     final shouldFocus = _focusCursorAfterReplay;
     if (initialReplay || shouldFocus) {
       _focusCursorAfterReplay = false;
-      _scrollToCursor(requestFocus: true);
+      _restoreScrollPosition(requestFocus: true);
     }
   }
 
   void _focusCursorNowAndAfterReplay() {
     _focusCursorAfterReplay = true;
-    _scrollToCursor(requestFocus: true);
+    _restoreScrollPosition(requestFocus: true);
   }
 
   void _restoreScrollPosition({required bool requestFocus}) {
@@ -1225,9 +1229,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer?.cancel();
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
   }
-
-  void _scrollToCursor({required bool requestFocus}) =>
-      _restoreScrollPosition(requestFocus: requestFocus);
 
   void _updateCursorOptions() {
     final options = js_util.getProperty(_term, 'options');
@@ -1303,16 +1304,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     _focusNode.dispose();
     _unbindController();
     // Everything above releases only what this pane holds. The cached session is
-    // shared, so it is torn down only by the pane that still owns it: a rebuild
-    // mounts the replacement before disposing the pane it replaces, and that
-    // successor has already adopted this container, terminal and input route.
-    // Discarding unconditionally would dispose the xterm instance out from under
-    // a pane that mounted a frame ago, leaving a live session showing a dead
-    // grid. Ending the session itself goes through `TerminalPane.destroySession`
-    // instead, which is not conditional on any pane.
+    // shared across panes and survives switching sessions so its DOM container,
+    // xterm instance, and scroll position remain preserved. Ending the session
+    // itself goes through `TerminalPane.destroySession` instead.
     if (identical(_containerEventOwners[_sanitizedId], this)) {
       _containerEventOwners.remove(_sanitizedId);
-      _discardCachedSession(_sanitizedId);
     }
     super.dispose();
   }

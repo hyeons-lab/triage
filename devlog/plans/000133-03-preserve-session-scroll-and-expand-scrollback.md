@@ -27,7 +27,7 @@ Users switching between sessions in the Triage client experience erratic scroll 
 ### Solution
 
 1. **Expand History and Scrollback Capacity**:
-   - In `crates/triaged/src/session.rs`, increase `RAW_OUTPUT_TAIL_CAP` to `MAX_SESSION_LOG_BYTES` (16 MiB) so clients can receive the full retained log from disk.
+   - In `crates/triaged/src/session.rs`, increase `RAW_OUTPUT_TAIL_CAP` to 4 MiB (`4 * 1024 * 1024`) so clients can receive up to 50,000 lines of scrollback history while keeping snapshot serialization safely within WebSocket frame limits.
    - In `flutter/triage_client/lib/widgets/terminal_pane_web.dart`, configure `options.scrollback = 50000;`.
    - In `flutter/triage_client/lib/main.dart`, increase `SessionVm.terminal` `maxLines` to `50000`.
 
@@ -48,7 +48,7 @@ Users switching between sessions in the Triage client experience erratic scroll 
 ## Plan
 
 1. **Update Daemon History Cap**:
-   - In `crates/triaged/src/session.rs`, set `RAW_OUTPUT_TAIL_CAP = MAX_SESSION_LOG_BYTES`.
+   - In `crates/triaged/src/session.rs`, set `RAW_OUTPUT_TAIL_CAP = 4 * 1024 * 1024`.
 
 2. **Update Web and Stub Terminal Limits**:
    - In `flutter/triage_client/lib/widgets/terminal_pane_web.dart`, set `scrollback: 50000` in xterm options.
