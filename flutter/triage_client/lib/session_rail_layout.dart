@@ -35,6 +35,7 @@ class SessionSearchInput {
     this.title,
     this.displayTitle,
     this.railTitle,
+    this.customLabel,
     this.sessionId,
     this.repoRoot,
     this.repoName,
@@ -51,6 +52,7 @@ class SessionSearchInput {
   final String? title;
   final String? displayTitle;
   final String? railTitle;
+  final String? customLabel;
   final String? sessionId;
   final String? repoRoot;
   final String? repoName;
@@ -73,6 +75,7 @@ class SessionSearchInput {
     return _containsIgnoreCase(title, q, isAsciiQuery) ||
         _containsIgnoreCase(displayTitle, q, isAsciiQuery) ||
         _containsIgnoreCase(railTitle, q, isAsciiQuery) ||
+        _containsIgnoreCase(customLabel, q, isAsciiQuery) ||
         _containsIgnoreCase(sessionId, q, isAsciiQuery) ||
         _containsIgnoreCase(repoRoot, q, isAsciiQuery) ||
         _containsIgnoreCase(repoName, q, isAsciiQuery) ||

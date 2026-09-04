@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, debugDefaultTargetPlatformOverride;
-import 'package:flutter/gestures.dart' show PointerDeviceKind;
+import 'package:flutter/gestures.dart'
+    show PointerDeviceKind, kSecondaryMouseButton;
 import 'package:flutter/material.dart'
     show CheckedPopupMenuItem, FilledButton, Icons, MaterialApp, Scaffold, Switch, TextField;
 import 'package:flutter/widgets.dart';
@@ -3480,6 +3481,179 @@ void main() {
       await tester.tap(addDenyBtn);
       await tester.pumpAndSettle();
       expect(client.fakeJudgeRules.customDenySubstrings, contains('drop database'));
+    });
+  });
+
+  group('siderail custom label', () {
+    const workLaptop = DaemonServer(
+      id: 'work-laptop',
+      label: 'Work laptop',
+      address: '10.0.0.5:7777',
+    );
+    const homeMac = DaemonServer(
+      id: 'home-mac',
+      label: 'Home Mac',
+      address: 'home-mac.local:7777',
+    );
+
+    Future<FakeTriageWebSocketClient> pumpApp(
+      WidgetTester tester, {
+      String selectedId = 'work-laptop',
+    }) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(
+        TriageClientApp(
+          client: client,
+          initialServers: ServerConfig(
+            servers: const [workLaptop, homeMac],
+            selectedId: selectedId,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      return client;
+    }
+
+    testWidgets('right click on session rail tile assigns custom label and persists it', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      await pumpApp(tester);
+
+      // Verify sessions are listed with default titles
+      expect(find.text('experiment/flutter-spike'), findsWidgets);
+
+      // Right-click the first session tile
+      final firstTile = find.widgetWithText(SessionListTile, 'experiment/flutter-spike');
+      expect(firstTile, findsOneWidget);
+      await tester.tap(firstTile, buttons: kSecondaryMouseButton);
+      await tester.pumpAndSettle();
+
+      // Verify context menu appears with "Assign custom label..."
+      expect(find.text('Assign custom label...'), findsOneWidget);
+
+      // Tap the menu item
+      await tester.tap(find.text('Assign custom label...'));
+      await tester.pumpAndSettle();
+
+      // Verify dialog appears
+      expect(find.text('Assign Custom Label'), findsOneWidget);
+      final labelField = find.byType(TextField);
+      expect(labelField, findsOneWidget);
+
+      // Enter a custom label and save
+      await tester.enterText(labelField, 'Web Client Spike');
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      // Verify tile and header updated with custom label
+      expect(find.text('Web Client Spike'), findsWidgets);
+
+      // Verify SharedPreferences persisted the custom label
+      final prefs = await SharedPreferences.getInstance();
+      final key = sessionCustomLabelsPrefKeyFor('work-laptop');
+      final raw = prefs.getString(key);
+      expect(raw, isNotNull);
+      final decoded = jsonDecode(raw!) as Map<String, dynamic>;
+      expect(decoded['flutter-spike'], 'Web Client Spike');
+    });
+
+    testWidgets('right click on session with custom label allows editing and clearing', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        sessionCustomLabelsPrefKeyFor('work-laptop'): jsonEncode({
+          'flutter-spike': 'Web Client Spike',
+        }),
+      });
+      await pumpApp(tester);
+
+      // Verify custom label is restored on startup
+      expect(find.text('Web Client Spike'), findsWidgets);
+
+      // Right-click the session tile
+      final customTile = find.widgetWithText(SessionListTile, 'Web Client Spike');
+      expect(customTile, findsOneWidget);
+      await tester.tap(customTile, buttons: kSecondaryMouseButton);
+      await tester.pumpAndSettle();
+
+      // Verify context menu has both "Edit custom label..." and "Clear custom label"
+      expect(find.text('Edit custom label...'), findsOneWidget);
+      expect(find.text('Clear custom label'), findsOneWidget);
+
+      // Clear the custom label via context menu
+      await tester.tap(find.text('Clear custom label'));
+      await tester.pumpAndSettle();
+
+      // Verify custom label is removed and title reverts to default
+      expect(find.text('Web Client Spike'), findsNothing);
+      expect(find.text('experiment/flutter-spike'), findsWidgets);
+
+      // Verify SharedPreferences updated
+      final prefs = await SharedPreferences.getInstance();
+      final key = sessionCustomLabelsPrefKeyFor('work-laptop');
+      final raw = prefs.getString(key);
+      final decoded = raw == null ? {} : jsonDecode(raw) as Map<String, dynamic>;
+      expect(decoded['flutter-spike'], isNull);
+    });
+
+    testWidgets('clearing custom label via dialog Clear button', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        sessionCustomLabelsPrefKeyFor('work-laptop'): jsonEncode({
+          'flutter-spike': 'Temporary Task',
+        }),
+      });
+      await pumpApp(tester);
+
+      expect(find.text('Temporary Task'), findsWidgets);
+
+      // Right click and open edit dialog
+      await tester.tap(
+        find.widgetWithText(SessionListTile, 'Temporary Task'),
+        buttons: kSecondaryMouseButton,
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Edit custom label...'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Edit Custom Label'), findsOneWidget);
+      expect(find.text('Clear'), findsOneWidget);
+
+      // Tap Clear in dialog
+      await tester.tap(find.text('Clear'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Temporary Task'), findsNothing);
+      expect(find.text('experiment/flutter-spike'), findsWidgets);
+    });
+
+    testWidgets('custom labels are scoped per daemon server', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        sessionCustomLabelsPrefKeyFor('work-laptop'): jsonEncode({
+          'flutter-spike': 'Work Task',
+        }),
+        sessionCustomLabelsPrefKeyFor('home-mac'): jsonEncode({
+          'flutter-spike': 'Home Task',
+        }),
+      });
+
+      await pumpApp(tester, selectedId: 'work-laptop');
+      expect(find.text('Work Task'), findsWidgets);
+      expect(find.text('Home Task'), findsNothing);
+
+      // Switch to Home Mac
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Home Mac'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Home Task'), findsWidgets);
+      expect(find.text('Work Task'), findsNothing);
     });
   });
 }

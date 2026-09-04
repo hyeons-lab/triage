@@ -7,6 +7,7 @@ import 'package:triage_client/session_grouping.dart';
 
 SessionVm _session({
   String title = 'triage / abc',
+  String? customLabel,
   String? branch,
   String? repoRoot,
   String? worktreeRoot,
@@ -14,6 +15,7 @@ SessionVm _session({
 }) {
   return SessionVm(
     title: title,
+    customLabel: customLabel,
     status: 'attached',
     statusColor: const Color(0xff7fd1c7),
     icon: Icons.terminal,
@@ -889,6 +891,121 @@ void main() {
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
+    });
+  });
+
+  group('customLabel', () {
+    test('outranks branch, worktree, repo and cwd in railTitle and displayTitle', () {
+      final session = _session(
+        customLabel: 'Primary Web Worker',
+        branch: 'feat/rail-identity',
+        repoRoot: '/Users/me/dev/triage',
+        worktreeRoot: '/Users/me/dev/triage/worktrees/rail-identity',
+        cwd: '/Users/me/dev/triage',
+      );
+      expect(session.railTitle, 'Primary Web Worker');
+      expect(session.displayTitle, 'Primary Web Worker');
+      expect(session.glanceTitleAt(DateTime.now()), 'Primary Web Worker');
+    });
+
+    test('whitespace-only customLabel is treated as absent', () {
+      final session = _session(
+        customLabel: '   ',
+        branch: 'feat/rail-identity',
+        repoRoot: '/Users/me/dev/triage',
+      );
+      expect(session.railTitle, 'feat/rail-identity');
+      expect(session.displayTitle, 'triage · feat/rail-identity');
+    });
+
+    test('matchesSearch matches on customLabel', () {
+      final session = _session(
+        customLabel: 'Worker Pool Alpha',
+        branch: 'main',
+        repoRoot: '/Users/me/dev/triage',
+      );
+      expect(session.matchesSearch('worker', DateTime.now(), true), isTrue);
+      expect(session.matchesSearch('POOL'), isTrue);
+      expect(session.matchesSearch('alpha', DateTime.now(), true), isTrue);
+      expect(session.matchesSearch('beta'), isFalse);
+    });
+
+    testWidgets('session rail search finds sessions by their customLabel', (tester) async {
+      tester.view.physicalSize = const Size(1200, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final session1 = _session(
+        title: 'session-1',
+        customLabel: 'Frontend Dev Server',
+        branch: 'main',
+        repoRoot: '/Users/me/dev/frontend',
+      );
+      final session2 = _session(
+        title: 'session-2',
+        customLabel: 'Database Migration',
+        branch: 'feat/migration',
+        repoRoot: '/Users/me/dev/backend',
+      );
+      final sessions = [session1, session2];
+      const groups = [
+        SessionGroup(
+          repoRoot: '/Users/me/dev/frontend',
+          sessionIds: ['session-1'],
+          lastActivityMs: 100,
+        ),
+        SessionGroup(
+          repoRoot: '/Users/me/dev/backend',
+          sessionIds: ['session-2'],
+          lastActivityMs: 50,
+        ),
+      ];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SessionRail(
+              sessions: sessions,
+              sessionGroups: groups,
+              pins: SessionPins.none,
+              onResetOrder: () {},
+              onUnpinGroup: (_) {},
+              onUnpinSession: (_) {},
+              selectedIndex: 0,
+              onSelectSession: (_) {},
+              onReorderSession: (_, __, ___) {},
+              railListKey: GlobalKey<ReorderableListState>(),
+              onRailDragStart: (_, __) {},
+              onRailDragEnd: () {},
+              draggingGroupKey: null,
+              onCreateSession: (_) {},
+              selectedShell: NewSessionShell.defaultPosix,
+              shellOptions: const [NewSessionShell.defaultPosix],
+              showShellMenu: false,
+              connectionStatus: 'connected',
+              connectionStatusColor: const Color(0xff7fd1c7),
+              onOpenSettings: () {},
+              isCollapsed: false,
+              onToggleCollapse: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.widgetWithText(SessionListTile, 'Frontend Dev Server'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'Database Migration'), findsOneWidget);
+
+      final searchButton = find.byTooltip('Search sessions');
+      await tester.tap(searchButton);
+      await tester.pump();
+
+      await tester.enterText(find.byType(TextField), 'Migration');
+      await tester.pump();
+
+      expect(find.widgetWithText(SessionListTile, 'Database Migration'), findsOneWidget);
+      expect(find.widgetWithText(SessionListTile, 'Frontend Dev Server'), findsNothing);
     });
   });
 }

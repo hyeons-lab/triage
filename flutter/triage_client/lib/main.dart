@@ -49,6 +49,8 @@ const List<IconData> _kRequiredIcons = <IconData>[
   Icons.integration_instructions_outlined,
   Icons.warning_amber_rounded,
   Icons.check_circle_outline,
+  Icons.label_outline,
+  Icons.label_off_outlined,
 ];
 
 void main() async {
@@ -334,6 +336,7 @@ class SessionVm {
     required this.icon,
     required this.rows,
     this.sessionId,
+    this.customLabel,
     this.branch,
     this.repoRoot,
     this.worktreeRoot,
@@ -372,6 +375,8 @@ class SessionVm {
   }
 
   final String title;
+  /// Optional user-assigned label that overrides the automatic workstream title.
+  String? customLabel;
   // Git context for this session, from the snapshot context and refreshed live
   // via `session_context_updated` pushes. All null when the session isn't in a
   // git repo (or the host is too old to report context).
@@ -506,10 +511,12 @@ class SessionVm {
 
   /// Human-facing name for the rail/header, so sessions are identifiable at a
   /// glance instead of all reading "triage / session-NN". Prefers
-  /// "repo · worktree", falls back to "repo · branch" when there is no distinct
-  /// worktree, then the working-directory leaf, then the stable [title]
-  /// ("triage / <id>"). Distinct from [title], which stays an identity key.
+  /// [customLabel] when assigned, then "repo · worktree", falls back to "repo · branch"
+  /// when there is no distinct worktree, then the working-directory leaf, then the stable
+  /// [title] ("triage / <id>"). Distinct from [title], which stays an identity key.
   String get displayTitle {
+    final custom = customLabel?.trim();
+    if (custom != null && custom.isNotEmpty) return custom;
     final repo = repoName;
     if (repo != null) {
       final wt = worktreeName;
@@ -553,7 +560,8 @@ class SessionVm {
   /// [railTitle] resolved against an explicit clock, so the [stickyWorktreeTtl]
   /// expiry of the inferred worktree is testable.
   ///
-  /// A row whose *live* context already names a workstream — a distinct current
+  /// Prefers an explicit [customLabel] if assigned.
+  /// Otherwise, a row whose *live* context already names a workstream — a distinct current
   /// worktree, or any branch that isn't the default — uses it directly. Only a
   /// row that is inside a repo but reads as its root (no distinct worktree, and
   /// no branch or just `main`) would otherwise show the same uninformative word
@@ -561,6 +569,8 @@ class SessionVm {
   /// was seen driving in *this same repo*. The inference never overrides ground
   /// truth, and reverts once it goes stale.
   String railTitleAt(DateTime now) {
+    final custom = customLabel?.trim();
+    if (custom != null && custom.isNotEmpty) return custom;
     final inferred = _activeInferredLead(now);
     if (inferred != null) return inferred;
     final b = branch?.trim();
@@ -581,6 +591,8 @@ class SessionVm {
   /// header keeps its own [displayTitle] — only the rail's card/label follow the
   /// inference.
   String glanceTitleAt(DateTime now) {
+    final custom = customLabel?.trim();
+    if (custom != null && custom.isNotEmpty) return custom;
     final inferred = _activeInferredLead(now);
     if (inferred != null) {
       final repo = repoName;
@@ -649,6 +661,7 @@ class SessionVm {
       title: title,
       displayTitle: displayTitle,
       railTitle: railTitleAt(targetTime),
+      customLabel: customLabel,
       sessionId: remoteSessionId ?? sessionId,
       repoRoot: repoRoot,
       repoName: repoName,
@@ -898,6 +911,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Groups and sessions the user placed by hand, which hold their slot instead
   // of flowing with activity. Loaded per server alongside the session list.
   SessionPins _pins = SessionPins.none;
+  // User-assigned custom labels for sessions, keyed by session id. Loaded per server.
+  Map<String, String> _customLabels = {};
   // Reaches the rail list's state so a re-group can cancel a drag in progress
   // before it reorders the rows out from under it. See [_regroupRail].
   final GlobalKey<ReorderableListState> _railListKey =
@@ -1009,9 +1024,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // order below is stored per server.
     _servers = List.of(widget.initialServers.servers);
     _selectedServerId = widget.initialServers.selectedId;
-    // Prime this server's pins in the background; the load path reads the cache
-    // synchronously rather than awaiting prefs.
+    // Prime this server's pins and custom labels in the background; the load path
+    // reads the cache synchronously rather than awaiting prefs.
     unawaited(_restorePins());
+    unawaited(_restoreCustomLabels());
     _lastWatchdogTick = DateTime.now();
     _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
       final now = DateTime.now();
@@ -1112,6 +1128,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               migrateRailPins(staleServerId, originId).then((_) async {
                 if (_disposed || _activeServerId != originId) return;
                 await _restorePins();
+                await _restoreCustomLabels();
               }),
             );
           }),
@@ -1156,6 +1173,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // previous launch's `saveServers` did not land, which is exactly when
       // there are already pins stored under this id.
       unawaited(_restorePins());
+      unawaited(_restoreCustomLabels());
       _connectWebSocket();
     } else {
       // First run on native: no daemon yet, so ask for one instead of dialing a
@@ -1218,6 +1236,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // connecting, or the first load after a switch would come up unpinned and a
     // later drag would then overwrite the good stored pins.
     await _restorePins();
+    await _restoreCustomLabels();
     if (_disposed) return;
     unawaited(_connectWebSocket());
   }
@@ -1258,6 +1277,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // outgoing daemon's would briefly pin the incoming daemon's rail by paths
     // and ids that mean nothing on that machine.
     _pins = SessionPins.none;
+    _customLabels = {};
   }
 
   /// Renames a daemon or re-points it at a new address.
@@ -1298,6 +1318,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Same reason as _selectServer: the purge cleared the in-memory pins and
       // this server's id is unchanged, so reload them before reconnecting.
       await _restorePins();
+      await _restoreCustomLabels();
       if (_disposed) return;
       unawaited(_connectWebSocket());
     }
@@ -2435,9 +2456,74 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(pinnedGroupsPrefKeyFor(serverId));
       await prefs.remove(pinnedSessionsPrefKeyFor(serverId));
+      await prefs.remove(sessionCustomLabelsPrefKeyFor(serverId));
     } catch (_) {
       // Best-effort; ignore removal failures.
     }
+  }
+
+  String _keyForSession(SessionVm session) =>
+      session.remoteSessionId ?? session.sessionId ?? session.title;
+
+  /// Restores this server's custom session labels in the background and applies
+  /// them to any matching sessions currently loaded.
+  Future<void> _restoreCustomLabels() async {
+    final serverId = _activeServerId;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_disposed || serverId != _activeServerId) return;
+      final raw = prefs.getString(sessionCustomLabelsPrefKeyFor(serverId));
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          _customLabels = {
+            for (final entry in decoded.entries)
+              entry.key.toString(): entry.value.toString(),
+          };
+          for (final session in _sessions) {
+            final key = _keyForSession(session);
+            if (_customLabels.containsKey(key)) {
+              session.customLabel = _customLabels[key];
+            }
+          }
+          if (mounted) setState(() {});
+        }
+      }
+    } catch (_) {
+      // Custom labels are a best-effort convenience; ignore load failures.
+    }
+  }
+
+  Future<void> _persistCustomLabels() async {
+    final serverId = _activeServerId;
+    if (_sessionsServerId != serverId) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_customLabels.isEmpty) {
+        await prefs.remove(sessionCustomLabelsPrefKeyFor(serverId));
+      } else {
+        await prefs.setString(
+          sessionCustomLabelsPrefKeyFor(serverId),
+          jsonEncode(_customLabels),
+        );
+      }
+    } catch (_) {
+      // Custom labels are a best-effort convenience; ignore persistence failures.
+    }
+  }
+
+  void _setSessionCustomLabel(SessionVm session, String? label) {
+    final key = _keyForSession(session);
+    final trimmed = label?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) {
+      session.customLabel = trimmed;
+      _customLabels[key] = trimmed;
+    } else {
+      session.customLabel = null;
+      _customLabels.remove(key);
+    }
+    _persistCustomLabels();
+    if (mounted) setState(() {});
   }
 
   /// The rail's sessions as grouping inputs, read back off the view models so a
@@ -2649,9 +2735,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // sessions not yet opened — a muted row that carries only rail metadata until
   // the user selects it, at which point `_loadDaemonSessionInto` attaches it.
   SessionVm _loadingDaemonSession(String sessionId, {bool loading = true}) {
+    final label =
+        _customLabels[sessionId] ?? _customLabels['triage / $sessionId'];
     return SessionVm(
       title: 'triage / $sessionId',
       sessionId: sessionId,
+      customLabel: label,
       status: loading ? 'loading' : 'idle',
       statusColor: loading ? const Color(0xffffc857) : const Color(0xff7f8b8d),
       icon: Icons.terminal,
@@ -2865,9 +2954,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final exited = snapshot?['exited'] as bool? ?? false;
       final outputSeq = snapshot?['output_seq'] as int? ?? 0;
 
+      final customLabel =
+          _customLabels[sid] ?? _customLabels['triage / $sid'];
       final session = SessionVm(
         title: 'triage / $sid',
         sessionId: sid,
+        customLabel: customLabel,
         branch: branch,
         repoRoot: repoRoot,
         worktreeRoot: worktreeRoot,
@@ -3860,6 +3952,205 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _showSessionContextMenu(
+    SessionVm session,
+    Offset position,
+  ) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+    final rect = RelativeRect.fromRect(
+      position & Size.zero,
+      Offset.zero & overlay.size,
+    );
+
+    final hasLabel =
+        session.customLabel != null && session.customLabel!.trim().isNotEmpty;
+    final result = await showMenu<String>(
+      context: context,
+      position: rect,
+      color: const Color(0xff1b2327),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: const BorderSide(color: Color(0xff334044)),
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'edit_label',
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                hasLabel ? Icons.edit_outlined : Icons.label_outline,
+                size: 16,
+                color: const Color(0xff7fd1c7),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  hasLabel ? 'Edit custom label...' : 'Assign custom label...',
+                  style: const TextStyle(
+                    color: Color(0xffcdd7d6),
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (hasLabel)
+          PopupMenuItem<String>(
+            value: 'clear_label',
+            height: 38,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: const Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.label_off_outlined,
+                  size: 16,
+                  color: Color(0xffe06c75),
+                ),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Clear custom label',
+                    style: TextStyle(
+                      color: Color(0xffcdd7d6),
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+
+    if (!mounted || result == null) return;
+
+    if (result == 'edit_label') {
+      await _openCustomLabelDialog(session);
+    } else if (result == 'clear_label') {
+      _setSessionCustomLabel(session, null);
+    }
+  }
+
+  Future<void> _openCustomLabelDialog(SessionVm session) async {
+    final controller =
+        TextEditingController(text: session.customLabel ?? '');
+    controller.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: controller.text.length,
+    );
+    final hasExisting =
+        session.customLabel != null && session.customLabel!.trim().isNotEmpty;
+    final result = await showDialog<String>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.55),
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xff161b1d),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xff2a3437)),
+          ),
+          title: Text(
+            hasExisting ? 'Edit Custom Label' : 'Assign Custom Label',
+            style: const TextStyle(
+              color: Color(0xffcdd7d6),
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Set a custom label to easily differentiate this session in the side rail.',
+                  style: TextStyle(
+                    color: Color(0xff8b9799),
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  style: const TextStyle(
+                    color: Color(0xffcdd7d6),
+                    fontSize: 14,
+                  ),
+                  decoration: InputDecoration(
+                    hintText:
+                        'e.g. Frontend Server, Build Agent, DB Migration',
+                    hintStyle: const TextStyle(color: Color(0xff607073)),
+                    filled: true,
+                    fillColor: const Color(0xff111517),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Color(0xff2a3437)),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Color(0xff2a3437)),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Color(0xff7fd1c7)),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                  ),
+                  onSubmitted: (value) =>
+                      Navigator.of(dialogContext).pop(value),
+                ),
+              ],
+            ),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          actions: [
+            if (hasExisting)
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(''),
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xffe06c75),
+                ),
+                child: const Text('Clear'),
+              ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(null),
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xff7f8b8d),
+              ),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(controller.text),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xff7fd1c7),
+                foregroundColor: const Color(0xff111517),
+              ),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || result == null) return;
+    final trimmed = result.trim();
+    _setSessionCustomLabel(session, trimmed.isEmpty ? null : trimmed);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_needsConnectionConfig) {
@@ -3962,6 +4253,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       onResetOrder: _resetRailOrder,
       onUnpinGroup: _unpinGroup,
       onUnpinSession: _unpinSession,
+      onSessionContextMenu: _showSessionContextMenu,
       selectedIndex: _selectedIndex,
       selectedTileKey: _selectedTileKey,
       // On mobile, selecting or creating a session dismisses the overlay so the
@@ -4164,6 +4456,7 @@ class SessionRail extends StatefulWidget {
     required this.isCollapsed,
     required this.onToggleCollapse,
     this.onToggleJudgePolicy,
+    this.onSessionContextMenu,
     this.serverLabel,
     this.selectedTileKey,
   });
@@ -4227,6 +4520,7 @@ class SessionRail extends StatefulWidget {
   // (the injected-client test path).
   final String? serverLabel;
   final VoidCallback onOpenSettings;
+  final void Function(SessionVm session, Offset position)? onSessionContextMenu;
   final bool isCollapsed;
   final VoidCallback onToggleCollapse;
 
@@ -4392,6 +4686,18 @@ class _SessionRailState extends State<SessionRail> {
                       message: indexed.$2.displayTitle,
                       child: InkWell(
                         onTap: () => widget.onSelectSession(indexed.$1),
+                        onSecondaryTapDown: widget.onSessionContextMenu != null
+                            ? (details) => widget.onSessionContextMenu!(
+                                  indexed.$2,
+                                  details.globalPosition,
+                                )
+                            : null,
+                        onLongPress: widget.onSessionContextMenu != null
+                            ? () => widget.onSessionContextMenu!(
+                                  indexed.$2,
+                                  Offset.zero,
+                                )
+                            : null,
                         borderRadius: BorderRadius.circular(8),
                         child: Container(
                           width: 48,
@@ -4731,10 +5037,17 @@ class _SessionRailState extends State<SessionRail> {
                             indistinguishable.contains(originalIndex),
                         judgeEffective: session.judgePolicyEffective,
                         judgeExplicit: session.judgePolicyExplicit,
+                        customLabel: session.customLabel,
                         onToggleJudge: widget.onToggleJudgePolicy != null
                             ? () => widget.onToggleJudgePolicy!(session)
                             : null,
                         onTap: () => widget.onSelectSession(originalIndex),
+                        onContextMenu: widget.onSessionContextMenu != null
+                            ? (position) => widget.onSessionContextMenu!(
+                                  session,
+                                  position,
+                                )
+                            : null,
                       );
                       final lifted = item.groupKey.isNotEmpty &&
                           item.groupKey == widget.draggingGroupKey;
@@ -7297,6 +7610,7 @@ class SessionListTile extends StatefulWidget {
     required this.statusColor,
     required this.icon,
     required this.onTap,
+    this.customLabel,
     this.glanceTitle,
     this.branch,
     this.repoName,
@@ -7311,12 +7625,16 @@ class SessionListTile extends StatefulWidget {
     this.judgeEffective = false,
     this.judgeExplicit,
     this.onToggleJudge,
+    this.onContextMenu,
     this.selected = false,
   });
 
   /// Leading line: the workstream (branch/worktree), not the repo — see
   /// [SessionVm.railTitle].
   final String title;
+
+  /// Custom label assigned to this session by the user, if any.
+  final String? customLabel;
 
   /// Repo-first name for the hover card, which describes the session rather
   /// than distinguishing it from its siblings. Falls back to [title].
@@ -7353,6 +7671,7 @@ class SessionListTile extends StatefulWidget {
   final bool judgeEffective;
   final bool? judgeExplicit;
   final VoidCallback? onToggleJudge;
+  final ValueChanged<Offset>? onContextMenu;
   final bool selected;
 
   @override
@@ -7375,6 +7694,11 @@ class _SessionListTileState extends State<SessionListTile> {
     final parts = <String>[
       if (widget.repoName != null && widget.repoName != widget.title)
         widget.repoName!,
+      if (widget.customLabel != null &&
+          widget.branch != null &&
+          widget.branch != widget.title &&
+          widget.branch != widget.repoName)
+        widget.branch!,
       if (widget.worktreeName != null &&
           widget.worktreeName != widget.title &&
           !worktreeEchoesBranch(widget.worktreeName!, widget.branch))
@@ -7430,6 +7754,7 @@ class _SessionListTileState extends State<SessionListTile> {
               child: IgnorePointer(
                 child: _SessionGlanceCard(
                   title: widget.glanceTitle ?? widget.title,
+                  customLabel: widget.customLabel,
                   status: widget.subtitle,
                   statusColor: widget.statusColor,
                   repoName: widget.repoName,
@@ -7450,6 +7775,12 @@ class _SessionListTileState extends State<SessionListTile> {
             label: widget.glanceTitle ?? widget.title,
             child: InkWell(
               onTap: widget.onTap,
+              onSecondaryTapDown: widget.onContextMenu != null
+                  ? (details) => widget.onContextMenu!(details.globalPosition)
+                  : null,
+              onLongPress: widget.onContextMenu != null
+                  ? () => widget.onContextMenu!(Offset.zero)
+                  : null,
               borderRadius: BorderRadius.circular(8),
               child: Container(
                 margin: const EdgeInsets.only(bottom: 8),
@@ -7604,9 +7935,11 @@ class _SessionGlanceCard extends StatelessWidget {
     required this.cwd,
     required this.snippet,
     required this.detail,
+    this.customLabel,
   });
 
   final String title;
+  final String? customLabel;
   final String status;
   final Color statusColor;
   final String? repoName;
@@ -7675,6 +8008,8 @@ class _SessionGlanceCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 10),
+            if (customLabel != null && customLabel!.isNotEmpty)
+              _GlanceRow(icon: Icons.label_outline, label: customLabel!),
             if (repoName != null)
               _GlanceRow(icon: Icons.folder_outlined, label: repoName!),
             if (branch != null && branch!.isNotEmpty)
@@ -7689,7 +8024,8 @@ class _SessionGlanceCard extends StatelessWidget {
                 label: cwd!,
                 wrap: true,
               ),
-            if (repoName != null ||
+            if ((customLabel != null && customLabel!.isNotEmpty) ||
+                repoName != null ||
                 (branch != null && branch!.isNotEmpty) ||
                 worktreeName != null ||
                 (cwd != null && cwd!.isNotEmpty))
@@ -8130,15 +8466,30 @@ class WorkspaceHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     // Header subtitle: the branch when in a repo, else the working directory
     // (home-abbreviated), so a non-repo session still shows where it is.
+    // When a custom label is active, show repo and branch so full git context
+    // remains visible under the custom title.
     final cwd = session.cwd;
     final branch = session.branch;
-    // Treat an empty/whitespace branch as absent (the daemon may send "") so the
-    // subtitle falls back to the cwd instead of going blank.
-    final headerMeta = (branch != null && branch.trim().isNotEmpty)
-        ? branch
-        : (cwd != null && cwd.isNotEmpty
+    final inRepo = session.repoName != null;
+    final hasBranch = branch != null && branch.trim().isNotEmpty;
+    final String headerMeta;
+    if (session.customLabel != null && session.customLabel!.trim().isNotEmpty) {
+      if (inRepo && hasBranch) {
+        headerMeta = '${session.repoName!}  ·  $branch';
+      } else if (inRepo) {
+        headerMeta = session.repoName!;
+      } else {
+        headerMeta = cwd != null && cwd.isNotEmpty
+            ? (_homeAbbreviatedPath(cwd) ?? cwd)
+            : '';
+      }
+    } else {
+      headerMeta = hasBranch
+          ? branch
+          : (cwd != null && cwd.isNotEmpty
               ? (_homeAbbreviatedPath(cwd) ?? cwd)
               : '');
+    }
     return Container(
       height: 68,
       padding: const EdgeInsets.symmetric(horizontal: 22),

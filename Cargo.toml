@@ -50,13 +50,7 @@ shlex = "1.3"
 # Local LLM inference engine for session snippets (LFM2/LFM2.5 GGUF). The
 # `remote` feature pulls in the HuggingFace bundle downloader; `mmap` (default)
 # memory-maps GGUF weights.
-#
-# Tracks git main rather than the published 0.4.0: the release is well behind
-# what the judge needs. Cargo.lock pins the exact commit, so this is
-# reproducible; `cargo update -p cera` is what moves it. Publishing any crate in
-# this workspace to crates.io requires switching back to a version requirement,
-# which is the plan once cera cuts its next release.
-cera = { git = "https://github.com/hyeons-lab/cera", branch = "main", features = [
+cera = { version = "0.5.2", features = [
     "remote",
 ] }
 

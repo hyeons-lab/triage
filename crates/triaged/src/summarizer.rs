@@ -493,6 +493,7 @@ fn load_engine(config: &SummarizerConfig) -> Result<cera::CeraEngine, cera::sess
         context_size: config.context_size as usize,
         backend: cera::BackendPreference::Auto,
         bundle_repo: Some(repo),
+        draft_model: None,
     };
     cera::CeraEngine::from_bundle_id(&config.bundle_id, &config.quant, engine_config)
 }
@@ -1547,6 +1548,13 @@ mod tests {
         // both generative passes stay greedy.
         let opts = sampling_opts_from_defaults(
             &GenerationDefaults::Audio {
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                repetition_penalty: None,
+                audio_temperature: None,
+                audio_top_k: None,
                 number_of_decoding_threads: None,
             },
             32,

@@ -39,6 +39,11 @@ String pinnedGroupsPrefKeyFor(String serverId) => 'pinned_groups_v1_$serverId';
 String pinnedSessionsPrefKeyFor(String serverId) =>
     'pinned_sessions_v1_$serverId';
 
+/// shared_preferences key holding one server's custom session labels, as a JSON-encoded
+/// map of session id to custom label.
+String sessionCustomLabelsPrefKeyFor(String serverId) =>
+    'session_custom_labels_v1_$serverId';
+
 /// The known daemons plus which one to connect to.
 class ServerConfig {
   const ServerConfig({required this.servers, required this.selectedId});
@@ -241,10 +246,18 @@ Future<void> migrateRailPins(String fromId, String toId) async {
   if (fromId == toId) return;
   try {
     final prefs = await SharedPreferences.getInstance();
-    for (final key in [pinnedGroupsPrefKeyFor, pinnedSessionsPrefKeyFor]) {
-      final value = prefs.getStringList(key(fromId));
+    for (final key in [
+      pinnedGroupsPrefKeyFor,
+      pinnedSessionsPrefKeyFor,
+      sessionCustomLabelsPrefKeyFor,
+    ]) {
+      final value = prefs.get(key(fromId));
       if (value == null) continue;
-      await prefs.setStringList(key(toId), value);
+      if (value is List<String>) {
+        await prefs.setStringList(key(toId), value);
+      } else if (value is String) {
+        await prefs.setString(key(toId), value);
+      }
       await prefs.remove(key(fromId));
     }
   } catch (_) {}

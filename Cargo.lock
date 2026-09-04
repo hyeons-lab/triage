@@ -343,8 +343,9 @@ dependencies = [
 
 [[package]]
 name = "cera"
-version = "0.4.0"
-source = "git+https://github.com/hyeons-lab/cera?branch=main#b0a55c96df389a9b280c201393c9c4b57a3d4367"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e68c6818986cd4fa149c24f9920057304315fd2cbdd31cc9a4f7e86def4d027"
 dependencies = [
  "anyhow",
  "bytemuck",
