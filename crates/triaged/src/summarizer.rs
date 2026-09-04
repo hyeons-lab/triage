@@ -493,6 +493,7 @@ fn load_engine(config: &SummarizerConfig) -> Result<cera::CeraEngine, cera::sess
         context_size: config.context_size as usize,
         backend: cera::BackendPreference::Auto,
         bundle_repo: Some(repo),
+        draft_model: None,
     };
     cera::CeraEngine::from_bundle_id(&config.bundle_id, &config.quant, engine_config)
 }
@@ -672,8 +673,9 @@ fn sampling_opts_from_defaults(
                 return opts;
             }
         }
-        // Both fall through to greedy, for different reasons. `Audio` carries no
-        // text sampling params at all. `Other` holds the raw
+        // Both fall through to greedy, for different reasons. `Audio` manifests
+        // belong to speech models whose text sampling is bypassed in favor of
+        // deterministic greedy summarization. `Other` holds the raw
         // `generation_time_parameters` JSON of an inference type cera does not
         // model, which *may* contain them: reading them would mean guessing at
         // the shape of a manifest written for something this daemon does not
@@ -1547,6 +1549,13 @@ mod tests {
         // both generative passes stay greedy.
         let opts = sampling_opts_from_defaults(
             &GenerationDefaults::Audio {
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                repetition_penalty: None,
+                audio_temperature: None,
+                audio_top_k: None,
                 number_of_decoding_threads: None,
             },
             32,

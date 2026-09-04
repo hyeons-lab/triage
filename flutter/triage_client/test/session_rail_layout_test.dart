@@ -547,6 +547,18 @@ void main() {
       expect(sample.matchesQuery('feat/inferred'), isTrue);
     });
 
+    test('matches on customLabel', () {
+      const customSample = SessionSearchInput(
+        title: 'session-2',
+        customLabel: 'Backend API Server',
+        branch: 'main',
+      );
+      expect(customSample.matchesQuery('backend'), isTrue);
+      expect(customSample.matchesQuery('API'), isTrue);
+      expect(customSample.matchesQuery('server'), isTrue);
+      expect(customSample.matchesQuery('frontend'), isFalse);
+    });
+
     test('matches non-ASCII Unicode characters case-insensitively', () {
       const unicodeSample = SessionSearchInput(
         branch: 'feat/café-ui',

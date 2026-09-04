@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/gestures.dart' show kPrimaryButton;
@@ -20,6 +19,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
+import 'package:triage_client/platform_env_io.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
@@ -59,7 +59,7 @@ class TerminalPane extends StatefulWidget {
   final bool isExited;
 
   static void destroySession(String terminalId) {
-    // Native implementation doesn't cache session DOM nodes.
+    _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
   }
 
   static void setBracketedPasteMode(String terminalId, bool enabled) {
@@ -71,6 +71,7 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
+  static final Map<String, double> _sessionSavedScrollOffsets = {};
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
@@ -249,6 +250,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
     if (!identical(oldWidget.terminal, widget.terminal)) {
+      _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
       // The anchor and any in-flight shift-click/drag referenced the previous
@@ -286,6 +288,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void dispose() {
     widget.onTerminalResizeBind?.call(null);
+    _saveScrollOffset();
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
     _xtermController.removeListener(_recordSelectionAnchor);
@@ -561,13 +564,18 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalOutput(String data) {
+    _sessionSavedScrollOffsets.remove(widget.terminalId);
+    _scrollAnchor.clear();
+    if (_scrollController.hasClients) {
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+    }
     // Sticky Ctrl (accessory bar): fold the armed Ctrl into the next single
     // character before it reaches the session, so e.g. arming Ctrl then typing
     // "c" on the soft keyboard sends 0x03 (SIGINT) instead of a literal "c".
     if (_ctrlArmed) {
       // Disarm on the very next chunk regardless of its length; only fold Ctrl
       // into a lone character. A multi-character IME chunk (paste, suggestion
-      // commit) still consumes the armed Ctrl — untransformed — so a latched
+      // commit) still consumes the armed Ctrl (untransformed) so a latched
       // Ctrl can never linger into a later keystroke.
       final ctrl = data.length == 1 ? controlByteForChar(data) : null;
       _disarmCtrl();
@@ -711,15 +719,26 @@ class _TerminalPaneState extends State<TerminalPane> {
     _captureScrollAnchor();
   }
 
+  void _saveScrollOffset([String? terminalId]) {
+    if (!_scrollController.hasClients) return;
+    final id = terminalId ?? widget.terminalId;
+    final position = _scrollController.position;
+    if (position.pixels < position.maxScrollExtent - 2.0) {
+      _sessionSavedScrollOffsets[id] = position.pixels;
+    } else {
+      _sessionSavedScrollOffsets.remove(id);
+    }
+  }
+
   void _captureScrollAnchor() {
     if (!_scrollController.hasClients) return;
+    _saveScrollOffset();
     final lineHeight = _lineHeight();
     if (lineHeight == null) return;
-    final position = _scrollController.position;
     _scrollAnchor.capture(
       buffer: _terminal.buffer,
-      pixels: position.pixels,
-      maxScrollExtent: position.maxScrollExtent,
+      pixels: _scrollController.position.pixels,
+      maxScrollExtent: _scrollController.position.maxScrollExtent,
       lineHeight: lineHeight,
     );
   }
@@ -806,7 +825,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted) return;
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
-        position.jumpTo(position.maxScrollExtent);
+        final saved = _sessionSavedScrollOffsets[widget.terminalId];
+        if (saved != null) {
+          position.jumpTo(saved.clamp(0.0, position.maxScrollExtent));
+        } else {
+          position.jumpTo(position.maxScrollExtent);
+        }
       }
       if (requestFocus) {
         _focusNode.requestFocus();
@@ -1100,12 +1124,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   Widget build(BuildContext context) {
     // Detect if we are running inside a widget test environment to preserve
     // finder-based assertions on the plain fallback rows.
-    final isTest = Platform.environment.containsKey('FLUTTER_TEST');
+    final isTest = runningUnderFlutterTest();
     if (isTest) {
       return Container(
         color: const Color(0xff0d1113),
         alignment: Alignment.topLeft,
         child: SingleChildScrollView(
+          controller: _scrollController,
           padding: const EdgeInsets.all(22),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

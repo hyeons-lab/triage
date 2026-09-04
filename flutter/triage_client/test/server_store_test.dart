@@ -408,10 +408,11 @@ void main() {
   });
 
   group('migrateRailPins', () {
-    test('moves the pins onto the new id and deletes the old keys', () async {
+    test('moves pins and custom labels onto the new id and deletes old keys', () async {
       SharedPreferences.setMockInitialValues({
         pinnedGroupsPrefKeyFor('web-127.0.0.1-7777'): ['/repo'],
         pinnedSessionsPrefKeyFor('web-127.0.0.1-7777'): ['session-2'],
+        sessionCustomLabelsPrefKeyFor('web-127.0.0.1-7777'): '{"s1":"Label 1"}',
       });
 
       await migrateRailPins('web-127.0.0.1-7777', 'web-proxy.example.com-443');
@@ -429,7 +430,13 @@ void main() {
         ),
         ['session-2'],
       );
-      // The stale keys do not linger once their pins have moved.
+      expect(
+        prefs.getString(
+          sessionCustomLabelsPrefKeyFor('web-proxy.example.com-443'),
+        ),
+        '{"s1":"Label 1"}',
+      );
+      // The stale keys do not linger once their pins and labels have moved.
       expect(
         prefs.getStringList(pinnedGroupsPrefKeyFor('web-127.0.0.1-7777')),
         isNull,
@@ -438,6 +445,25 @@ void main() {
         prefs.getStringList(pinnedSessionsPrefKeyFor('web-127.0.0.1-7777')),
         isNull,
       );
+      expect(
+        prefs.getString(sessionCustomLabelsPrefKeyFor('web-127.0.0.1-7777')),
+        isNull,
+      );
+    });
+
+    test('moves custom labels even when no pins exist', () async {
+      SharedPreferences.setMockInitialValues({
+        sessionCustomLabelsPrefKeyFor('web-a-1'): '{"s1":"My Label"}',
+      });
+
+      await migrateRailPins('web-a-1', 'web-b-2');
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getString(sessionCustomLabelsPrefKeyFor('web-b-2')),
+        '{"s1":"My Label"}',
+      );
+      expect(prefs.getString(sessionCustomLabelsPrefKeyFor('web-a-1')), isNull);
     });
 
     test('does nothing when the source has no saved pins', () async {
