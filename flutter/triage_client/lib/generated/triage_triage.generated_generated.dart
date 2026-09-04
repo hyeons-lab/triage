@@ -145,7 +145,10 @@ enum ClientRequestPayloadTypeId {
   AddJudgeAllowCommandRequest(25),
   RemoveJudgeAllowCommandRequest(26),
   AddJudgeDenySubstringRequest(27),
-  RemoveJudgeDenySubstringRequest(28);
+  RemoveJudgeDenySubstringRequest(28),
+  GetRailLayoutRequest(29),
+  SetRailPinsRequest(30),
+  SetSessionCustomLabelRequest(31);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -181,6 +184,9 @@ enum ClientRequestPayloadTypeId {
       case 26: return ClientRequestPayloadTypeId.RemoveJudgeAllowCommandRequest;
       case 27: return ClientRequestPayloadTypeId.AddJudgeDenySubstringRequest;
       case 28: return ClientRequestPayloadTypeId.RemoveJudgeDenySubstringRequest;
+      case 29: return ClientRequestPayloadTypeId.GetRailLayoutRequest;
+      case 30: return ClientRequestPayloadTypeId.SetRailPinsRequest;
+      case 31: return ClientRequestPayloadTypeId.SetSessionCustomLabelRequest;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -189,7 +195,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 28;
+  static const int maxValue = 31;
   static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
@@ -224,7 +230,8 @@ enum ServerResultPayloadTypeId {
   SessionJudgePoliciesResult(16),
   JudgeHookStatusResult(17),
   JudgeHistoryResult(18),
-  JudgeRulesResult(19);
+  JudgeRulesResult(19),
+  RailLayoutResult(20);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
@@ -251,6 +258,7 @@ enum ServerResultPayloadTypeId {
       case 17: return ServerResultPayloadTypeId.JudgeHookStatusResult;
       case 18: return ServerResultPayloadTypeId.JudgeHistoryResult;
       case 19: return ServerResultPayloadTypeId.JudgeRulesResult;
+      case 20: return ServerResultPayloadTypeId.RailLayoutResult;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -259,7 +267,7 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 19;
+  static const int maxValue = 20;
   static const fb.Reader<ServerResultPayloadTypeId> reader = _ServerResultPayloadTypeIdReader();
 }
 
@@ -325,7 +333,9 @@ enum ServerMessagePayloadTypeId {
   SessionSnippetUpdatedPayload(5),
   SessionContextUpdatedPayload(6),
   UpdateAvailablePayload(7),
-  SessionJudgePolicyUpdatedPayload(8);
+  SessionJudgePolicyUpdatedPayload(8),
+  RailPinsUpdatedPayload(9),
+  SessionCustomLabelUpdatedPayload(10);
 
   final int value;
   const ServerMessagePayloadTypeId(this.value);
@@ -341,6 +351,8 @@ enum ServerMessagePayloadTypeId {
       case 6: return ServerMessagePayloadTypeId.SessionContextUpdatedPayload;
       case 7: return ServerMessagePayloadTypeId.UpdateAvailablePayload;
       case 8: return ServerMessagePayloadTypeId.SessionJudgePolicyUpdatedPayload;
+      case 9: return ServerMessagePayloadTypeId.RailPinsUpdatedPayload;
+      case 10: return ServerMessagePayloadTypeId.SessionCustomLabelUpdatedPayload;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -349,7 +361,7 @@ enum ServerMessagePayloadTypeId {
       value == null ? null : ServerMessagePayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 8;
+  static const int maxValue = 10;
   static const fb.Reader<ServerMessagePayloadTypeId> reader = _ServerMessagePayloadTypeIdReader();
 }
 
@@ -3789,6 +3801,229 @@ class RemoveJudgeDenySubstringRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class GetRailLayoutRequest {
+  GetRailLayoutRequest._(this._bc, this._bcOffset);
+  factory GetRailLayoutRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<GetRailLayoutRequest> reader = _GetRailLayoutRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'GetRailLayoutRequest{}';
+  }
+}
+
+class _GetRailLayoutRequestReader extends fb.TableReader<GetRailLayoutRequest> {
+  const _GetRailLayoutRequestReader();
+
+  @override
+  GetRailLayoutRequest createObject(fb.BufferContext bc, int offset) => 
+    GetRailLayoutRequest._(bc, offset);
+}
+
+class GetRailLayoutRequestObjectBuilder extends fb.ObjectBuilder {
+
+  GetRailLayoutRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SetRailPinsRequest {
+  SetRailPinsRequest._(this._bc, this._bcOffset);
+  factory SetRailPinsRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SetRailPinsRequest> reader = _SetRailPinsRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<String>? get groupKeys => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 4);
+  List<String>? get sessionIds => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 6);
+
+  @override
+  String toString() {
+    return 'SetRailPinsRequest{groupKeys: ${groupKeys}, sessionIds: ${sessionIds}}';
+  }
+}
+
+class _SetRailPinsRequestReader extends fb.TableReader<SetRailPinsRequest> {
+  const _SetRailPinsRequestReader();
+
+  @override
+  SetRailPinsRequest createObject(fb.BufferContext bc, int offset) => 
+    SetRailPinsRequest._(bc, offset);
+}
+
+class SetRailPinsRequestBuilder {
+  SetRailPinsRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addGroupKeysOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSessionIdsOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SetRailPinsRequestObjectBuilder extends fb.ObjectBuilder {
+  final List<String>? _groupKeys;
+  final List<String>? _sessionIds;
+
+  SetRailPinsRequestObjectBuilder({
+    List<String>? groupKeys,
+    List<String>? sessionIds,
+  })
+      : _groupKeys = groupKeys,
+        _sessionIds = sessionIds;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? groupKeysOffset = _groupKeys == null ? null
+        : fbBuilder.writeList(_groupKeys!.map(fbBuilder.writeString).toList());
+    final int? sessionIdsOffset = _sessionIds == null ? null
+        : fbBuilder.writeList(_sessionIds!.map(fbBuilder.writeString).toList());
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, groupKeysOffset);
+    fbBuilder.addOffset(1, sessionIdsOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SetSessionCustomLabelRequest {
+  SetSessionCustomLabelRequest._(this._bc, this._bcOffset);
+  factory SetSessionCustomLabelRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SetSessionCustomLabelRequest> reader = _SetSessionCustomLabelRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get label => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  bool get hasLabel => const fb.BoolReader().vTableGet(_bc, _bcOffset, 8, false);
+
+  @override
+  String toString() {
+    return 'SetSessionCustomLabelRequest{sessionId: ${sessionId}, label: ${label}, hasLabel: ${hasLabel}}';
+  }
+}
+
+class _SetSessionCustomLabelRequestReader extends fb.TableReader<SetSessionCustomLabelRequest> {
+  const _SetSessionCustomLabelRequestReader();
+
+  @override
+  SetSessionCustomLabelRequest createObject(fb.BufferContext bc, int offset) => 
+    SetSessionCustomLabelRequest._(bc, offset);
+}
+
+class SetSessionCustomLabelRequestBuilder {
+  SetSessionCustomLabelRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(3);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addLabelOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addHasLabel(bool? hasLabel) {
+    fbBuilder.addBool(2, hasLabel);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SetSessionCustomLabelRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _label;
+  final bool? _hasLabel;
+
+  SetSessionCustomLabelRequestObjectBuilder({
+    String? sessionId,
+    String? label,
+    bool? hasLabel,
+  })
+      : _sessionId = sessionId,
+        _label = label,
+        _hasLabel = hasLabel;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? labelOffset = _label == null ? null
+        : fbBuilder.writeString(_label!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, labelOffset);
+    fbBuilder.addBool(2, _hasLabel);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ClientMessage {
   ClientMessage._(this._bc, this._bcOffset);
   factory ClientMessage(List<int> bytes) {
@@ -3833,6 +4068,9 @@ class ClientMessage {
       case 26: return RemoveJudgeAllowCommandRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 27: return AddJudgeDenySubstringRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 28: return RemoveJudgeDenySubstringRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 29: return GetRailLayoutRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 30: return SetRailPinsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 31: return SetSessionCustomLabelRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -5764,6 +6002,185 @@ class JudgeRulesResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class CustomLabelEntry {
+  CustomLabelEntry._(this._bc, this._bcOffset);
+  factory CustomLabelEntry(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<CustomLabelEntry> reader = _CustomLabelEntryReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get label => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+
+  @override
+  String toString() {
+    return 'CustomLabelEntry{sessionId: ${sessionId}, label: ${label}}';
+  }
+}
+
+class _CustomLabelEntryReader extends fb.TableReader<CustomLabelEntry> {
+  const _CustomLabelEntryReader();
+
+  @override
+  CustomLabelEntry createObject(fb.BufferContext bc, int offset) => 
+    CustomLabelEntry._(bc, offset);
+}
+
+class CustomLabelEntryBuilder {
+  CustomLabelEntryBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addLabelOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class CustomLabelEntryObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _label;
+
+  CustomLabelEntryObjectBuilder({
+    String? sessionId,
+    String? label,
+  })
+      : _sessionId = sessionId,
+        _label = label;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? labelOffset = _label == null ? null
+        : fbBuilder.writeString(_label!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, labelOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class RailLayoutResult {
+  RailLayoutResult._(this._bc, this._bcOffset);
+  factory RailLayoutResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<RailLayoutResult> reader = _RailLayoutResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<String>? get groupKeys => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 4);
+  List<String>? get sessionIds => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 6);
+  List<CustomLabelEntry>? get customLabels => const fb.ListReader<CustomLabelEntry>(CustomLabelEntry.reader).vTableGetNullable(_bc, _bcOffset, 8);
+
+  @override
+  String toString() {
+    return 'RailLayoutResult{groupKeys: ${groupKeys}, sessionIds: ${sessionIds}, customLabels: ${customLabels}}';
+  }
+}
+
+class _RailLayoutResultReader extends fb.TableReader<RailLayoutResult> {
+  const _RailLayoutResultReader();
+
+  @override
+  RailLayoutResult createObject(fb.BufferContext bc, int offset) => 
+    RailLayoutResult._(bc, offset);
+}
+
+class RailLayoutResultBuilder {
+  RailLayoutResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(3);
+  }
+
+  int addGroupKeysOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSessionIdsOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addCustomLabelsOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class RailLayoutResultObjectBuilder extends fb.ObjectBuilder {
+  final List<String>? _groupKeys;
+  final List<String>? _sessionIds;
+  final List<CustomLabelEntryObjectBuilder>? _customLabels;
+
+  RailLayoutResultObjectBuilder({
+    List<String>? groupKeys,
+    List<String>? sessionIds,
+    List<CustomLabelEntryObjectBuilder>? customLabels,
+  })
+      : _groupKeys = groupKeys,
+        _sessionIds = sessionIds,
+        _customLabels = customLabels;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? groupKeysOffset = _groupKeys == null ? null
+        : fbBuilder.writeList(_groupKeys!.map(fbBuilder.writeString).toList());
+    final int? sessionIdsOffset = _sessionIds == null ? null
+        : fbBuilder.writeList(_sessionIds!.map(fbBuilder.writeString).toList());
+    final int? customLabelsOffset = _customLabels == null ? null
+        : fbBuilder.writeList(_customLabels!.map((b) => b.getOrCreateOffset(fbBuilder)).toList());
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, groupKeysOffset);
+    fbBuilder.addOffset(1, sessionIdsOffset);
+    fbBuilder.addOffset(2, customLabelsOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ResponsePayload {
   ResponsePayload._(this._bc, this._bcOffset);
   factory ResponsePayload(List<int> bytes) {
@@ -5799,6 +6216,7 @@ class ResponsePayload {
       case 17: return JudgeHookStatusResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 18: return JudgeHistoryResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 19: return JudgeRulesResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 20: return RailLayoutResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -6996,6 +7414,183 @@ class SessionJudgePolicyUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class RailPinsUpdatedPayload {
+  RailPinsUpdatedPayload._(this._bc, this._bcOffset);
+  factory RailPinsUpdatedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<RailPinsUpdatedPayload> reader = _RailPinsUpdatedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  List<String>? get groupKeys => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 4);
+  List<String>? get sessionIds => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 6);
+
+  @override
+  String toString() {
+    return 'RailPinsUpdatedPayload{groupKeys: ${groupKeys}, sessionIds: ${sessionIds}}';
+  }
+}
+
+class _RailPinsUpdatedPayloadReader extends fb.TableReader<RailPinsUpdatedPayload> {
+  const _RailPinsUpdatedPayloadReader();
+
+  @override
+  RailPinsUpdatedPayload createObject(fb.BufferContext bc, int offset) => 
+    RailPinsUpdatedPayload._(bc, offset);
+}
+
+class RailPinsUpdatedPayloadBuilder {
+  RailPinsUpdatedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addGroupKeysOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSessionIdsOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class RailPinsUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final List<String>? _groupKeys;
+  final List<String>? _sessionIds;
+
+  RailPinsUpdatedPayloadObjectBuilder({
+    List<String>? groupKeys,
+    List<String>? sessionIds,
+  })
+      : _groupKeys = groupKeys,
+        _sessionIds = sessionIds;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? groupKeysOffset = _groupKeys == null ? null
+        : fbBuilder.writeList(_groupKeys!.map(fbBuilder.writeString).toList());
+    final int? sessionIdsOffset = _sessionIds == null ? null
+        : fbBuilder.writeList(_sessionIds!.map(fbBuilder.writeString).toList());
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, groupKeysOffset);
+    fbBuilder.addOffset(1, sessionIdsOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SessionCustomLabelUpdatedPayload {
+  SessionCustomLabelUpdatedPayload._(this._bc, this._bcOffset);
+  factory SessionCustomLabelUpdatedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionCustomLabelUpdatedPayload> reader = _SessionCustomLabelUpdatedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get label => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  bool get hasLabel => const fb.BoolReader().vTableGet(_bc, _bcOffset, 8, false);
+
+  @override
+  String toString() {
+    return 'SessionCustomLabelUpdatedPayload{sessionId: ${sessionId}, label: ${label}, hasLabel: ${hasLabel}}';
+  }
+}
+
+class _SessionCustomLabelUpdatedPayloadReader extends fb.TableReader<SessionCustomLabelUpdatedPayload> {
+  const _SessionCustomLabelUpdatedPayloadReader();
+
+  @override
+  SessionCustomLabelUpdatedPayload createObject(fb.BufferContext bc, int offset) => 
+    SessionCustomLabelUpdatedPayload._(bc, offset);
+}
+
+class SessionCustomLabelUpdatedPayloadBuilder {
+  SessionCustomLabelUpdatedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(3);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addLabelOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addHasLabel(bool? hasLabel) {
+    fbBuilder.addBool(2, hasLabel);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionCustomLabelUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _label;
+  final bool? _hasLabel;
+
+  SessionCustomLabelUpdatedPayloadObjectBuilder({
+    String? sessionId,
+    String? label,
+    bool? hasLabel,
+  })
+      : _sessionId = sessionId,
+        _label = label,
+        _hasLabel = hasLabel;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? labelOffset = _label == null ? null
+        : fbBuilder.writeString(_label!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, labelOffset);
+    fbBuilder.addBool(2, _hasLabel);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ServerMessage {
   ServerMessage._(this._bc, this._bcOffset);
   factory ServerMessage(List<int> bytes) {
@@ -7019,6 +7614,8 @@ class ServerMessage {
       case 6: return SessionContextUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 7: return UpdateAvailablePayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 8: return SessionJudgePolicyUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 9: return RailPinsUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 10: return SessionCustomLabelUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       default: return null;
     }
   }

@@ -247,6 +247,19 @@ table RemoveJudgeDenySubstringRequest {
     substring: string;
 }
 
+table GetRailLayoutRequest {}
+
+table SetRailPinsRequest {
+    group_keys: [string];
+    session_ids: [string];
+}
+
+table SetSessionCustomLabelRequest {
+    session_id: string;
+    label: string;
+    has_label: bool;
+}
+
 union ClientRequestPayload {
     HelloRequest,
     PairRequest,
@@ -275,7 +288,10 @@ union ClientRequestPayload {
     AddJudgeAllowCommandRequest,
     RemoveJudgeAllowCommandRequest,
     AddJudgeDenySubstringRequest,
-    RemoveJudgeDenySubstringRequest
+    RemoveJudgeDenySubstringRequest,
+    GetRailLayoutRequest,
+    SetRailPinsRequest,
+    SetSessionCustomLabelRequest
 }
 
 table ClientMessage {
@@ -406,6 +422,17 @@ table JudgeRulesResult {
     custom_deny_substrings: [string];
 }
 
+table CustomLabelEntry {
+    session_id: string;
+    label: string;
+}
+
+table RailLayoutResult {
+    group_keys: [string];
+    session_ids: [string];
+    custom_labels: [CustomLabelEntry];
+}
+
 union ServerResultPayload {
     UnitResult,
     HelloResult,
@@ -425,7 +452,8 @@ union ServerResultPayload {
     SessionJudgePoliciesResult,
     JudgeHookStatusResult,
     JudgeHistoryResult,
-    JudgeRulesResult
+    JudgeRulesResult,
+    RailLayoutResult
 }
 
 table ResponsePayload {
@@ -527,6 +555,17 @@ table SessionJudgePolicyUpdatedPayload {
     effective: bool;
 }
 
+table RailPinsUpdatedPayload {
+    group_keys: [string];
+    session_ids: [string];
+}
+
+table SessionCustomLabelUpdatedPayload {
+    session_id: string;
+    label: string;
+    has_label: bool;
+}
+
 union ServerMessagePayload {
     ResponsePayload,
     ErrorPayload,
@@ -535,7 +574,9 @@ union ServerMessagePayload {
     SessionSnippetUpdatedPayload,
     SessionContextUpdatedPayload,
     UpdateAvailablePayload,
-    SessionJudgePolicyUpdatedPayload
+    SessionJudgePolicyUpdatedPayload,
+    RailPinsUpdatedPayload,
+    SessionCustomLabelUpdatedPayload
 }
 
 table ServerMessage {

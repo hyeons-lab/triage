@@ -65,6 +65,12 @@ pub struct HandoverState {
     /// persist across zero-downtime reloads.
     #[serde(default)]
     pub judge_history: Vec<triage_core::judge::JudgeRecord>,
+    /// Preserved session rail pins (custom ordering and pinned items).
+    #[serde(default)]
+    pub pins: triage_core::session::SessionPins,
+    /// Preserved session custom labels.
+    #[serde(default)]
+    pub custom_labels: std::collections::HashMap<String, String>,
 }
 
 /// Result of asking a running daemon to hand over (Phase 1, before the successor

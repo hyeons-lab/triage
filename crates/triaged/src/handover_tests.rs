@@ -170,6 +170,7 @@ mod tests {
             handover_owner_token: Some([4; 16]),
             handover_lineage_token: Some([5; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let response = serde_json::json!({"Ok": {"HandoverState": state}});
         let response = serde_json::to_vec(&response)?;
@@ -241,6 +242,7 @@ mod tests {
             handover_owner_token: Some([4; 16]),
             handover_lineage_token: Some([5; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let response = serde_json::to_vec(&serde_json::json!({
             "Ok": {"HandoverState": state}
@@ -566,6 +568,7 @@ mod tests {
             handover_owner_token: None,
             handover_lineage_token: None,
             judge_history: Vec::new(),
+            ..Default::default()
         };
         manager.adopt_sessions(state, vec![surplus.fd])?;
 
@@ -610,6 +613,7 @@ mod tests {
             handover_owner_token: None,
             handover_lineage_token: None,
             judge_history: Vec::new(),
+            ..Default::default()
         };
 
         let result = manager.adopt_sessions(state, vec![in_flight.fd, queued.fd]);
@@ -709,6 +713,7 @@ mod tests {
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([1; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let mut fds = vec![old_replaced.fd, old_retained.fd];
         let recovered = crate::handover::HandoverState {
@@ -722,6 +727,7 @@ mod tests {
             handover_owner_token: Some([2; 16]),
             handover_lineage_token: Some([2; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         crate::handover::remember_recovered_handover_for_test(
             recovered,
@@ -744,6 +750,7 @@ mod tests {
                 handover_owner_token: Some([3; 16]),
                 handover_lineage_token: Some([3; 16]),
                 judge_history: Vec::new(),
+                ..Default::default()
             },
             vec![refreshed_reused_id.fd],
         );
@@ -826,6 +833,7 @@ mod tests {
                 handover_owner_token: Some([2; 16]),
                 handover_lineage_token: Some([9; 16]),
                 judge_history: Vec::new(),
+                ..Default::default()
             },
             Vec::new(),
         );
@@ -837,6 +845,7 @@ mod tests {
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([9; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let mut fds = vec![stale.fd];
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
@@ -878,6 +887,7 @@ mod tests {
                 handover_owner_token: Some([2; 16]),
                 handover_lineage_token: Some([7; 16]),
                 judge_history: Vec::new(),
+                ..Default::default()
             },
             Vec::new(),
         );
@@ -889,6 +899,7 @@ mod tests {
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([7; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let mut fds = vec![retained.fd];
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
@@ -937,6 +948,7 @@ mod tests {
                 handover_owner_token: None,
                 handover_lineage_token: None,
                 judge_history: Vec::new(),
+                ..Default::default()
             },
             vec![stale.fd],
         );
@@ -949,6 +961,7 @@ mod tests {
                 handover_owner_token: None,
                 handover_lineage_token: None,
                 judge_history: Vec::new(),
+                ..Default::default()
             },
             Vec::new(),
         );
@@ -960,6 +973,7 @@ mod tests {
             handover_owner_token: None,
             handover_lineage_token: None,
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let mut fds = Vec::new();
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);
@@ -1003,6 +1017,7 @@ mod tests {
                     handover_owner_token: Some(owner_token),
                     handover_lineage_token: Some([9; 16]),
                     judge_history: Vec::new(),
+                    ..Default::default()
                 },
                 vec![fd],
             );
@@ -1021,6 +1036,7 @@ mod tests {
             handover_owner_token: Some([1; 16]),
             handover_lineage_token: Some([9; 16]),
             judge_history: Vec::new(),
+            ..Default::default()
         };
         let mut fds = Vec::new();
         crate::handover::merge_recovered_handovers(&mut state, &mut fds);

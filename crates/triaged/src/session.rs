@@ -29,11 +29,11 @@ use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSi
 use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    InputLeaseState, LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi,
-    SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope, SessionEventReceiver,
-    SessionId, SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
-    StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
-    TerminalStyle, WriteInputRequest,
+    InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest,
+    SessionApi, SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope,
+    SessionEventReceiver, SessionId, SessionPins, SessionSize, SessionSnapshot,
+    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
+    SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
 };
 use triage_transport_ws::ServerMessage;
 use unicode_width::UnicodeWidthStr;
@@ -299,6 +299,8 @@ pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
+    pins: Mutex<SessionPins>,
+    custom_labels: Mutex<HashMap<String, String>>,
     pairing_challenges: Mutex<HashMap<String, PendingPairingChallenge>>,
     paired_devices: Mutex<HashMap<ClientId, String>>,
     require_pairing: bool,
@@ -501,11 +503,17 @@ struct HistoricalSession {
 struct SessionManifest {
     version: u32,
     sessions: Vec<PersistedSession>,
+    #[serde(default)]
+    pins: SessionPins,
+    #[serde(default)]
+    custom_labels: HashMap<String, String>,
 }
 
 fn encode_manifest(
     sessions: &HashMap<SessionId, ManagedSession>,
     excluded: Option<&SessionId>,
+    pins: &SessionPins,
+    custom_labels: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
     let mut persisted_sessions = sessions
         .iter()
@@ -516,6 +524,8 @@ fn encode_manifest(
     serde_json::to_vec_pretty(&SessionManifest {
         version: 1,
         sessions: persisted_sessions,
+        pins: pins.clone(),
+        custom_labels: custom_labels.clone(),
     })
     .context("encoding session manifest")
 }
@@ -591,9 +601,9 @@ impl PersistedSessionLaunch {
 
 impl SessionManager {
     pub fn new(config: SessionManagerConfig) -> Self {
-        let sessions = restore_sessions(&config).unwrap_or_else(|error| {
+        let (sessions, pins, custom_labels) = restore_sessions(&config).unwrap_or_else(|error| {
             tracing::warn!(error = ?error, "failed to restore persisted sessions");
-            HashMap::new()
+            (HashMap::new(), SessionPins::default(), HashMap::new())
         });
         let next_session = next_session_sequence(sessions.keys());
         let paired_devices = load_paired_devices(&config.log_dir);
@@ -612,6 +622,8 @@ impl SessionManager {
             config,
             next_session: AtomicU64::new(next_session),
             sessions: Mutex::new(sessions),
+            pins: Mutex::new(pins),
+            custom_labels: Mutex::new(custom_labels),
             pairing_challenges: Mutex::new(HashMap::new()),
             paired_devices: Mutex::new(paired_devices),
             require_pairing,
@@ -1413,6 +1425,18 @@ impl SessionManager {
             .map_err(|_| anyhow!("session manager lock poisoned"))
     }
 
+    fn pins(&self) -> Result<std::sync::MutexGuard<'_, SessionPins>> {
+        self.pins
+            .lock()
+            .map_err(|_| anyhow!("session pins lock poisoned"))
+    }
+
+    fn custom_labels(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, String>>> {
+        self.custom_labels
+            .lock()
+            .map_err(|_| anyhow!("custom labels lock poisoned"))
+    }
+
     fn pairing_challenges(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<String, PendingPairingChallenge>>> {
@@ -1428,7 +1452,9 @@ impl SessionManager {
     }
 
     fn persist_manifest(&self, sessions: &HashMap<SessionId, ManagedSession>) -> Result<()> {
-        let json = encode_manifest(sessions, None)?;
+        let pins = self.pins()?;
+        let custom_labels = self.custom_labels()?;
+        let json = encode_manifest(sessions, None, &pins, &custom_labels)?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
@@ -1445,7 +1471,9 @@ impl SessionManager {
         sessions: &HashMap<SessionId, ManagedSession>,
         session_id: &SessionId,
     ) -> Result<PathBuf> {
-        let json = encode_manifest(sessions, Some(session_id))?;
+        let pins = self.pins()?;
+        let custom_labels = self.custom_labels()?;
+        let json = encode_manifest(sessions, Some(session_id), &pins, &custom_labels)?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
@@ -1835,6 +1863,9 @@ impl SessionManager {
             history.iter().cloned().collect()
         };
 
+        let pins = self.pins()?.clone();
+        let custom_labels = self.custom_labels()?.clone();
+
         let state = crate::handover::HandoverState {
             sessions: handover_sessions,
             has_tcp_listener: false,
@@ -1844,6 +1875,8 @@ impl SessionManager {
             handover_owner_token: None,
             handover_lineage_token: None,
             judge_history: history_records,
+            pins,
+            custom_labels,
         };
 
         Ok((state, fds))
@@ -1941,6 +1974,16 @@ impl SessionManager {
         if !state.judge_history.is_empty() {
             self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
         }
+        if !state.pins.is_empty()
+            && let Ok(mut pins) = self.pins.lock()
+        {
+            *pins = std::mem::take(&mut state.pins);
+        }
+        if !state.custom_labels.is_empty()
+            && let Ok(mut labels) = self.custom_labels.lock()
+        {
+            labels.extend(std::mem::take(&mut state.custom_labels));
+        }
         let mut pending = UnadoptedFds::new(fds);
         let expected = state.sessions.len();
         let retained: Vec<_> = state
@@ -1965,6 +2008,16 @@ impl SessionManager {
     ) -> Result<()> {
         if !state.judge_history.is_empty() {
             self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
+        }
+        if !state.pins.is_empty()
+            && let Ok(mut pins) = self.pins.lock()
+        {
+            *pins = std::mem::take(&mut state.pins);
+        }
+        if !state.custom_labels.is_empty()
+            && let Ok(mut labels) = self.custom_labels.lock()
+        {
+            labels.extend(std::mem::take(&mut state.custom_labels));
         }
         let mut pending = UnadoptedFds::new(fds);
         let mut sessions = match self.sessions() {
@@ -2295,6 +2348,7 @@ impl SessionManager {
                 handover_owner_token: None,
                 handover_lineage_token: None,
                 judge_history: Vec::new(),
+                ..Default::default()
             };
             if let Err(error) = self.adopt_sessions(state, fds) {
                 tracing::warn!(
@@ -3444,6 +3498,64 @@ impl SessionApi for SessionManager {
         })
     }
 
+    fn get_rail_layout(&self) -> Result<RailLayout> {
+        let pins = self.pins()?.clone();
+        let custom_labels = self.custom_labels()?.clone();
+        Ok(RailLayout {
+            group_keys: pins.group_keys,
+            session_ids: pins.session_ids,
+            custom_labels,
+        })
+    }
+
+    fn set_rail_pins(&self, group_keys: Vec<String>, session_ids: Vec<String>) -> Result<()> {
+        {
+            let mut guard = self.pins()?;
+            guard.group_keys = group_keys.clone();
+            guard.session_ids = session_ids.clone();
+        }
+        let sessions = self.sessions()?;
+        self.persist_manifest(&sessions)?;
+        drop(sessions);
+
+        self.broadcast_global(ServerMessage::RailPinsUpdated {
+            group_keys,
+            session_ids,
+        });
+        Ok(())
+    }
+
+    fn set_session_custom_label(
+        &self,
+        session_id: SessionId,
+        custom_label: Option<String>,
+    ) -> Result<()> {
+        let trimmed = custom_label.and_then(|label| {
+            let t = label.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+        {
+            let mut guard = self.custom_labels()?;
+            match &trimmed {
+                Some(label) => {
+                    guard.insert(session_id.as_str().to_string(), label.clone());
+                }
+                None => {
+                    guard.remove(session_id.as_str());
+                }
+            }
+        }
+        let sessions = self.sessions()?;
+        self.persist_manifest(&sessions)?;
+        drop(sessions);
+
+        self.broadcast_global(ServerMessage::SessionCustomLabelUpdated {
+            session_id,
+            custom_label: trimmed,
+        });
+        Ok(())
+    }
+
     fn server_update_info(&self) -> triage_core::session::ServerUpdateInfo {
         let status = self.update_status();
         triage_core::session::ServerUpdateInfo {
@@ -3871,10 +3983,16 @@ fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> R
     Ok(())
 }
 
-fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, ManagedSession>> {
+type RestoredSessions = (
+    HashMap<SessionId, ManagedSession>,
+    SessionPins,
+    HashMap<String, String>,
+);
+
+fn restore_sessions(config: &SessionManagerConfig) -> Result<RestoredSessions> {
     let manifest_path = config.manifest_path();
     if !manifest_path.exists() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), SessionPins::default(), HashMap::new()));
     }
 
     let manifest: SessionManifest = serde_json::from_slice(
@@ -3905,7 +4023,7 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<HashMap<SessionId, 
             }
         }
     }
-    Ok(sessions)
+    Ok((sessions, manifest.pins, manifest.custom_labels))
 }
 
 /// Deletes the output log of a session that has just been removed from the
@@ -7344,6 +7462,7 @@ mod tests {
                     handover_owner_token: None,
                     handover_lineage_token: None,
                     judge_history: Vec::new(),
+                    ..Default::default()
                 },
                 vec![fd],
             )
@@ -9305,6 +9424,7 @@ mod tests {
                 last_known_cwd: None,
                 last_activity_ms: 0,
             }],
+            ..Default::default()
         };
         std::fs::write(
             SessionManagerConfig::new(log_dir.clone()).manifest_path(),
@@ -11870,6 +11990,7 @@ mod tests {
         let manifest = SessionManifest {
             version: 1,
             sessions: vec![persisted],
+            ..Default::default()
         };
         std::fs::write(
             SessionManagerConfig::new(log_dir.clone()).manifest_path(),
@@ -12177,6 +12298,7 @@ mod tests {
                     handover_owner_token: None,
                     handover_lineage_token: None,
                     judge_history: Vec::new(),
+                    ..Default::default()
                 },
                 vec![fd],
             )
@@ -12333,5 +12455,161 @@ mod tests {
 
         // Shutdown must terminate cleanly without deadlock or hanging
         assert!(actor.shutdown().is_ok());
+    }
+
+    #[test]
+    fn rail_layout_set_pins_persists_and_broadcasts() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let rx = manager.register_global_receiver();
+
+        let group_keys = vec!["repo-1".to_string(), "repo-2".to_string()];
+        let session_ids = vec!["session-1".to_string()];
+
+        manager
+            .set_rail_pins(group_keys.clone(), session_ids.clone())
+            .expect("set rail pins");
+
+        let layout = manager.get_rail_layout().expect("get layout");
+        assert_eq!(layout.group_keys, group_keys);
+        assert_eq!(layout.session_ids, session_ids);
+
+        let msg = rx.try_recv().expect("receive broadcast");
+        match msg {
+            ServerMessage::RailPinsUpdated {
+                group_keys: recv_gk,
+                session_ids: recv_si,
+            } => {
+                assert_eq!(recv_gk, group_keys);
+                assert_eq!(recv_si, session_ids);
+            }
+            other => panic!("expected RailPinsUpdated, got {other:?}"),
+        }
+
+        // Verify persistence across cold restart
+        let manager2 = SessionManager::new(config);
+        let layout2 = manager2.get_rail_layout().expect("get layout 2");
+        assert_eq!(layout2.group_keys, group_keys);
+        assert_eq!(layout2.session_ids, session_ids);
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_custom_label_persists_and_broadcasts() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let rx = manager.register_global_receiver();
+
+        let s1 = SessionId::new("session-1").expect("session id");
+
+        manager
+            .set_session_custom_label(s1.clone(), Some("  Dev Server  ".to_string()))
+            .expect("set custom label");
+
+        let layout = manager.get_rail_layout().expect("get layout");
+        assert_eq!(
+            layout.custom_labels.get("session-1"),
+            Some(&"Dev Server".to_string())
+        );
+
+        let msg = rx.try_recv().expect("receive broadcast");
+        match msg {
+            ServerMessage::SessionCustomLabelUpdated {
+                session_id,
+                custom_label,
+            } => {
+                assert_eq!(session_id, s1);
+                assert_eq!(custom_label, Some("Dev Server".to_string()));
+            }
+            other => panic!("expected SessionCustomLabelUpdated, got {other:?}"),
+        }
+
+        // Test clearing custom label
+        manager
+            .set_session_custom_label(s1.clone(), Some("   ".to_string()))
+            .expect("clear custom label");
+        let layout_cleared = manager.get_rail_layout().expect("get layout cleared");
+        assert!(!layout_cleared.custom_labels.contains_key("session-1"));
+
+        let msg2 = rx.try_recv().expect("receive clear broadcast");
+        match msg2 {
+            ServerMessage::SessionCustomLabelUpdated {
+                session_id,
+                custom_label,
+            } => {
+                assert_eq!(session_id, s1);
+                assert_eq!(custom_label, None);
+            }
+            other => panic!("expected SessionCustomLabelUpdated with None, got {other:?}"),
+        }
+
+        // Set again and test cold restart
+        manager
+            .set_session_custom_label(s1.clone(), Some("Worker Node".to_string()))
+            .expect("set custom label again");
+
+        let manager2 = SessionManager::new(config);
+        let layout2 = manager2.get_rail_layout().expect("get layout 2");
+        assert_eq!(
+            layout2.custom_labels.get("session-1"),
+            Some(&"Worker Node".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handover_preserves_rail_pins_and_custom_labels() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config1 = SessionManagerConfig::new(log_dir.clone());
+        let manager1 = SessionManager::new(config1);
+
+        let group_keys = vec!["group-a".to_string()];
+        let session_ids = vec!["session-x".to_string()];
+        manager1
+            .set_rail_pins(group_keys.clone(), session_ids.clone())
+            .expect("set pins");
+
+        let s1 = SessionId::new("session-x").expect("session id");
+        manager1
+            .set_session_custom_label(s1, Some("Custom X".to_string()))
+            .expect("set label");
+
+        let (state, fds) = manager1
+            .serialize_active_sessions()
+            .expect("extract handover state");
+        assert_eq!(state.pins.group_keys, group_keys);
+        assert_eq!(state.pins.session_ids, session_ids);
+        assert_eq!(
+            state.custom_labels.get("session-x"),
+            Some(&"Custom X".to_string())
+        );
+
+        let log_dir2 = unique_log_dir();
+        std::fs::create_dir_all(&log_dir2).expect("create log dir 2");
+        let config2 = SessionManagerConfig::new(log_dir2.clone());
+        let manager2 = SessionManager::new(config2);
+
+        manager2
+            .queue_handover_adoptions(state, fds)
+            .expect("queue adoptions");
+
+        let layout = manager2.get_rail_layout().expect("get layout 2");
+        assert_eq!(layout.group_keys, group_keys);
+        assert_eq!(layout.session_ids, session_ids);
+        assert_eq!(
+            layout.custom_labels.get("session-x"),
+            Some(&"Custom X".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&log_dir2);
     }
 }
