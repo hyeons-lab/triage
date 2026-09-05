@@ -72,8 +72,16 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
         std::collections::BTreeMap::new();
 
     for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
         if !file_type.is_file() {
             continue;
         }
@@ -82,7 +90,14 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
         let file_name_str = file_name.to_string_lossy();
         if let Some((index, is_compressed)) = parse_segment_index(&file_name_str) {
             let path = entry.path();
-            let file_size = entry.metadata()?.len();
+            let file_size = match entry.metadata() {
+                Ok(m) => m.len(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("getting metadata for {}", path.display()));
+                }
+            };
 
             let info = SegmentFileInfo {
                 index,
@@ -588,7 +603,8 @@ pub fn strip_ansi_escapes(input: &[u8]) -> String {
         i += 1;
     }
 
-    String::from_utf8_lossy(&output_bytes).into_owned()
+    String::from_utf8(output_bytes)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 /// A search hit found in a session segment.

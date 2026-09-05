@@ -34,6 +34,10 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T08:23-0700 `crates/triaged/src/storage_tests.rs`: Added comprehensive unit tests for empty query search, active segment resolution with historical uncompressed segments, tail clamping on concurrent compression, ASCII query matching on mixed Unicode lines, and `MAX_SEARCH_HITS` capping.
 - 2026-09-05T08:23-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Safeguarded rows/cols cast with null-safe property access and fallback sizing.
 - 2026-09-05T08:23-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`: Preserved UTF-16 surrogate pairs when slicing trailing scan tail buffer.
+- 2026-09-05T10:10-0700 `crates/triaged/src/storage.rs`: Guarded `list_session_segments` against concurrent `NotFound` races during file iteration; optimized `strip_ansi_escapes` to consume valid UTF-8 buffers directly without re-allocation.
+- 2026-09-05T10:10-0700 `crates/triaged/src/handover.rs`: Hardened `rename_recovered_session` staging copy loop against concurrent unlinking races by using `list_session_segments` with compressed counterpart fallback.
+- 2026-09-05T10:10-0700 `crates/triaged/src/session.rs`: Extracted `run_command_with_timeout` helper from `git_raw_output` and added unit test verifying termination of hanging child processes.
+- 2026-09-05T10:10-0700 `crates/triaged/src/storage_tests.rs`: Added unit test covering emoji and multibyte search queries across compressed and uncompressed segment boundaries.
 
 ## Decisions
 - 2026-09-04T20:16-0700 8 MiB Segment Size: Rotate session log files at 8 MiB boundaries to balance mmap/IO performance, low file count, and fast decompression times.
@@ -52,6 +56,7 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T08:23-0700 Monotonic Handover Adoption: Initialize `output_seq` and `bytes_logged` directly from `HandoverSession` in `spawn_adopted_pty_runtime` so sequence counters remain strictly monotonic across daemon handovers.
 - 2026-09-05T08:23-0700 Search Sizing Upper Bound: Impose a global 10,000 hit ceiling (`MAX_SEARCH_HITS`) across both segmented and legacy log search to protect supervisor daemon memory from high-cardinality queries.
 - 2026-09-05T08:23-0700 Non-Truncating Segment Rotation: Open newly rotated active segments in append mode instead of truncate mode to safeguard historical output if an index collision occurs.
+- 2026-09-05T10:10-0700 Concurrent Segment Listing Invariant: Catch and skip NotFound errors on entry, file type, and metadata queries during segment listing and handover staging, gracefully accommodating background compression worker unlinking.
 
 ## Progress
 - [x] Create worktree `worktrees/segmented-session-history` and branch `feat/segmented-session-history`
@@ -66,11 +71,13 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - [x] Execute 4-round review-fix loop until diff is verified clean and approved for merge
 - [x] Address PR #158 review feedback and resolve review threads
 - [x] Diagnose and fix recovery duplicate cascade, raised fd limit, and restored muse-triage session
+- [x] Harden segment listing and handover copy against concurrent unlinking races and bound child processes
 
 ## Commits
 - d4866a7: feat(storage): implement rolling 8 MiB segment logs with background zstd compression
 - 1042317: fix(storage): harden segment rotation, atomic migration, and zero-allocation search
 - 39b468b: fix(storage): optimize uncompressed segment tail reads and address review feedback
 - b1357ea: fix(daemon): resolve handover recovery duplication, raise file descriptor limits, and bound git timeouts
-- HEAD: fix(storage): harden segment rotation, search limits, and adoption sequence monotonicity
+- 1015dbb: fix(storage): harden segment rotation, search limits, and adoption sequence monotonicity
+- HEAD: fix(storage): eliminate segment listing races and optimize utf8 escape stripping
 

@@ -7562,9 +7562,7 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
     Some(common_dir)
 }
 
-fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut command = Command::new("git");
-    command.arg("--no-pager").arg("-C").arg(cwd).args(args);
+fn run_command_with_timeout(mut command: Command, timeout: std::time::Duration) -> Option<Vec<u8>> {
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::null());
     detach_from_terminal(&mut command);
@@ -7580,7 +7578,6 @@ fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
     });
 
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_millis(1500);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -7608,6 +7605,12 @@ fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
             }
         }
     }
+}
+
+fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.arg("--no-pager").arg("-C").arg(cwd).args(args);
+    run_command_with_timeout(command, std::time::Duration::from_millis(1500))
 }
 
 /// Puts a helper child in its own session so no terminal can job-control it.
@@ -7999,6 +8002,18 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_terminates_hanging_process() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("10");
+        let start = Instant::now();
+        let res = run_command_with_timeout(cmd, Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(res.is_none());
+        assert!(elapsed < Duration::from_millis(1000));
+    }
 
     /// A directory that cannot be listed must not be mistaken for one holding no
     /// segments. Answering "no" reroutes a segmented session to the legacy

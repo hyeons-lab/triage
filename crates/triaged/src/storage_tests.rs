@@ -651,3 +651,41 @@ fn search_session_segments_hit_cap() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn search_session_segments_multibyte_across_compressed_and_uncompressed() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("sessions").join("session-multibyte");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+
+    // Segment 1: compressed with emojis and CJK characters
+    let seg1_path = session_dir.join("segment-000001.tlog");
+    let comp1_path = session_dir.join("segment-000001.tlog.zst");
+    let seg1_data =
+        "line 1: standard ascii\nline 2: 🚀 Rocket launch in progress\nline 3: こんにちは 世界\n";
+    fs::write(&seg1_path, seg1_data).expect("write seg1");
+    compress_segment_file(&seg1_path, &comp1_path).expect("compress seg1");
+
+    // Segment 2: raw uncompressed with matching emojis and Unicode symbols
+    let seg2_path = session_dir.join("segment-000002.tlog");
+    let seg2_data = "line 4: ✨ Sparkles and 🚀 Rocket landing\nline 5: plain line\n";
+    fs::write(&seg2_path, seg2_data).expect("write seg2");
+
+    // Search for emoji query
+    let hits = search_session_segments(&session_dir, "🚀", false).expect("search emoji");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].segment_index, 1);
+    assert_eq!(hits[0].line_number, 2);
+    assert!(hits[0].line_text.contains("Rocket launch"));
+    assert_eq!(hits[1].segment_index, 2);
+    assert_eq!(hits[1].line_number, 1);
+    assert!(hits[1].line_text.contains("Rocket landing"));
+
+    // Search for CJK characters
+    let cjk_hits = search_session_segments(&session_dir, "こんにちは", false).expect("search CJK");
+    assert_eq!(cjk_hits.len(), 1);
+    assert_eq!(cjk_hits[0].segment_index, 1);
+    assert_eq!(cjk_hits[0].line_number, 3);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

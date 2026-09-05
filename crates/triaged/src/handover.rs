@@ -938,14 +938,30 @@ mod unix_impl {
 
                 let copy_res = (|| -> io::Result<()> {
                     if session_dir.is_dir() {
-                        for entry in std::fs::read_dir(&session_dir)? {
-                            let entry = entry?;
-                            let path = entry.path();
-                            if path.is_file()
-                                && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                                && crate::storage::parse_segment_index(file_name).is_some()
+                        let segments = crate::storage::list_session_segments(&session_dir)
+                            .map_err(io::Error::other)?;
+                        for segment in segments {
+                            let file_name = segment.path.file_name().ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "invalid file name")
+                            })?;
+                            if let Err(err) =
+                                std::fs::copy(&segment.path, staging_dir.join(file_name))
                             {
-                                std::fs::copy(&path, staging_dir.join(file_name))?;
+                                if err.kind() != io::ErrorKind::NotFound {
+                                    return Err(err);
+                                }
+                                if !segment.is_compressed {
+                                    let compressed_name =
+                                        crate::storage::compressed_segment_file_name(segment.index);
+                                    let compressed_path = session_dir.join(&compressed_name);
+                                    if let Err(e) = std::fs::copy(
+                                        &compressed_path,
+                                        staging_dir.join(&compressed_name),
+                                    ) && e.kind() != io::ErrorKind::NotFound
+                                    {
+                                        return Err(e);
+                                    }
+                                }
                             }
                         }
                     }
