@@ -449,9 +449,6 @@ class SessionVm {
       terminal.setBracketedPasteMode(enabled);
     } catch (_) {}
     TerminalPane.setBracketedPasteMode(title, enabled);
-    if (sessionId != null && sessionId != title) {
-      TerminalPane.setBracketedPasteMode(sessionId!, enabled);
-    }
   }
 
   void applyJudgePolicy({
@@ -8718,6 +8715,7 @@ class SessionWorkspace extends StatelessWidget {
             onViewFit: (cols, rows) =>
                 (onViewFit ?? session.noteViewFit)(cols, rows),
             focusCursorRevision: session.focusCursorRevision,
+            bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
           ),
         ),

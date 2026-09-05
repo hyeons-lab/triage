@@ -1,0 +1,88 @@
+# 000136: Safe Multi-Line Paste and Bracketed Paste Synchronization
+
+- **Agent:** Antigravity (gemini-3-8-flash) @ triage branch fix/safe-multiline-paste
+- **Intent:** Prevent terminal wedging and accidental multi-command execution when pasting multi-line text by properly synchronizing DEC Mode 2004 (bracketed paste) across Flutter web, native desktop, and mobile touch IME clients, and adding a safety confirmation dialog when pasting multi-line text into sessions without bracketed paste.
+
+## What Changed
+
+- **2026-09-04T20:18-0700** Rebased worktree onto latest origin/main (`655b7d3`) and initialized plan file (`devlog/plans/000136-01-safe-multiline-paste.md`).
+- **2026-09-04T20:25-0700** flutter/triage_client/lib/terminal/terminal_paste.dart: Added `isMultiLine`, `flattenToSingleLine`, and `lineCount` utility functions to inspect and normalize multi-line paste payloads.
+- **2026-09-04T20:25-0700** flutter/triage_client/lib/widgets/multiline_paste_dialog.dart: Added `showMultiLinePasteDialog` confirmation modal with line count preview and options to Cancel, Paste as Single Line, or Paste (Execute Commands).
+- **2026-09-04T20:25-0700** flutter/triage_client/lib/widgets/terminal_pane_stub.dart: Added `bracketedPasteEnabled` property, `_isBracketedPasteEnabled()`, and `_handlePaste()`. Intercepted multi-line IME input (`data.length > 1 && isMultiLine(data)`) in `_onTerminalOutput` so mobile Gboard clipboard pastes are bracketed or confirmed instead of executing line by line.
+- **2026-09-04T20:25-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: Added `bracketedPasteEnabled` property, synchronized initial bracketed paste mode to xterm.js, and integrated `_handlePaste()` with confirmation dialog.
+- **2026-09-04T20:25-0700** flutter/triage_client/lib/main.dart: Forwarded `bracketedPasteEnabled: session.bracketedPasteEnabled` to `TerminalPane`.
+- **2026-09-04T20:25-0700** flutter/triage_client/test/terminal/terminal_paste_test.dart: Added unit tests for multi-line utilities and widget tests for `showMultiLinePasteDialog`.
+- **2026-09-04T20:25-0700** Built release APK with Flutter and installed directly to the connected Pixel 10 Pro Fold via ADB (`adb-58291FDCG001G8-b6KQdx._adb-tls-connect._tcp`).
+- **2026-09-04T21:07-0700** devlog/plans/000136-02-address-review-feedback.md: created implementation plan for addressing PR #157 review feedback.
+- **2026-09-04T21:11-0700** flutter/triage_client/lib/terminal/terminal_paste.dart: added library directive, exported newlinePattern, and converted lineCount to zero-allocation character scan with trailing command newline handling.
+- **2026-09-04T21:11-0700** flutter/triage_client/lib/widgets/multiline_paste_dialog.dart: lazily extracted first 6 preview lines, bounded preview line width to 200 characters, and added MB threshold formatting.
+- **2026-09-04T21:11-0700** flutter/triage_client/lib/widgets/terminal_pane_stub.dart: added _isPasteDialogShowing re-entrancy lock, exempted single CRLF from multi-line interception in _onTerminalOutput, added post-await session exit checks, and synchronized bracketedPasteEnabled in didUpdateWidget.
+- **2026-09-04T21:11-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: added _isPasteDialogShowing re-entrancy lock, intercepted multi-line IME data in onDataCallback, restored DOM focus via _activateTerminal post-dialog, and synchronized bracketedPasteEnabled in didUpdateWidget.
+- **2026-09-04T21:11-0700** flutter/triage_client/lib/main.dart: simplified SessionVm.setBracketedPasteEnabled to key TerminalPane.setBracketedPasteMode by session title only.
+- **2026-09-04T21:11-0700** flutter/triage_client/test/terminal/terminal_paste_test.dart: added unit tests for lineCount edge cases and widget tests for truncated snippet and KB size formatting.
+- **2026-09-05T08:01-0700** devlog/plans/000136-03-address-ci-review-feedback.md: created implementation plan for addressing PR #157 automated CI review comments.
+- **2026-09-05T08:01-0700** flutter/triage_client/lib/terminal/terminal_paste.dart: implemented zero-allocation estimateUtf8Bytes scanning ASCII, multi-byte Unicode, and surrogate pairs without heap buffer allocation.
+- **2026-09-05T08:01-0700** flutter/triage_client/lib/widgets/multiline_paste_dialog.dart: protected title Row with Expanded and TextOverflow.ellipsis, added actionsAlignment and actionsOverflowButtonSpacing: 8 for mobile action button wrapping, enabled scrollable: true on AlertDialog to prevent vertical overflow on small screens, added _truncatePreviewLine to prevent UTF-16 surrogate-pair splitting at truncation boundary, and wired estimateUtf8Bytes for accurate payload sizing.
+- **2026-09-05T08:01-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: cleared xterm.js visual selection on paste via js_util.callMethod(_term, 'clearSelection', []) matching native desktop and mobile behavior.
+- **2026-09-05T08:01-0700** flutter/triage_client/test/terminal/terminal_paste_test.dart: added unit tests for estimateUtf8Bytes across ASCII, Latin, Greek, CJK, and emojis, added widget test verifying safe surrogate-pair truncation, and added widget test asserting overflow-free rendering on constrained portrait mobile screen.
+- **2026-09-05T08:01-0700** ~/.gemini/review-refinements.md: synthesized lessons learned into Core Thematic Pillars 3, 4, and 7.
+- **2026-09-05T08:22-0700** flutter/triage_client/lib/widgets/terminal_pane_stub.dart: guarded mounted at entry of _handlePaste, added _xtermController.clearSelection on fast path, and restored _focusNode focus in finally block.
+- **2026-09-05T08:22-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: guarded mounted at entry of _handlePaste, added modal route check in pasteListener and onDataCallback to prevent paste leakage during active modal dialogs.
+- **2026-09-05T08:22-0700** flutter/triage_client/lib/widgets/multiline_paste_dialog.dart: added maxLength <= 0 guard in _truncatePreviewLine and fixed singular grammar in line count and remaining lines preview.
+- **2026-09-05T08:22-0700** flutter/triage_client/lib/terminal/terminal_paste.dart: updated estimateUtf8Bytes to classify lone unpaired surrogates as 3 bytes matching standard UTF-8 encoders.
+- **2026-09-05T08:22-0700** flutter/triage_client/test/terminal/terminal_paste_test.dart: added unit tests for unpaired surrogates, widget tests for singular grammar, and widget tests for constrained landscape mobile viewports.
+- **2026-09-05T08:22-0700** renumbered devlog and plans from 000135 to 000136 to prevent sequence collision with PR #159 on main.
+
+## Decisions
+
+- **Direct Bracketed Paste Mode Propagation**: Pass `bracketedPasteEnabled` directly as a typed boolean property from `SessionVm` into `TerminalPane` on both Web and Native platforms, eliminating reflection and `js_util.getProperty` failures on minified Dart objects.
+- **Mobile Soft Keyboard (IME) Multi-Line Interception**: In `terminal_pane_stub.dart`, intercept `data.length > 1 && isMultiLine(data)` in `_onTerminalOutput` so multi-line text committed via Gboard or soft keyboard clipboard chips is routed through `_handlePaste` rather than leaked as raw unbracketed newlines that execute commands line by line.
+- **Safety Intercept for Unbracketed Multi-Line Pastes**: When bracketed paste mode is inactive and pasted text contains newlines, present an inline confirmation dialog showing line count and snippet preview with options to "Paste (Execute Commands)", "Paste as Single Line", or "Cancel", matching modern terminal emulators.
+- **Re-entrancy Guard on Multi-Line Dialogs**: Track an active dialog lock via `_isPasteDialogShowing` across Web and Native, dropping or ignoring duplicate paste requests until the active confirmation dialog resolves.
+- **Post-Await Session Exit Validation**: Verify `!widget.isExited` both at the entry of `_handlePaste` and after the asynchronous confirmation dialog resolves, preventing writes to terminated sessions or closed PTYs.
+- **Exemption of Single CRLF Keystrokes**: Exclude `data == '\r\n'` in multi-line IME interception so standard Enter keystrokes from mobile or Bluetooth keyboards execute immediately without warning dialogs.
+- **Reactive Bracketed Mode Propagation in didUpdateWidget**: Synchronize `bracketedPasteEnabled` to the underlying emulator and static session maps during `didUpdateWidget`, preventing stale modes from locking permanently.
+- **Zero-Allocation Character Scanning for Line Counts**: Replace regular expression `allMatches` matching in `lineCount` with a single-pass ASCII code unit scan over `text.codeUnitAt(i)`, reducing heap allocations to zero and eliminating UI GC spikes on large clipboard buffers.
+- **UTF-16 Surrogate Pair Truncation Safety**: When truncating preview lines at 200 code units, detect if the slice boundary falls between a surrogate pair (code unit at index 199 is between 0xD800 and 0xDBFF) and back up by one code unit, avoiding dangling high surrogates that corrupt downstream text rendering.
+- **Mobile Dialog Responsiveness and Overflow Prevention**: Ensure multi-action dialogs wrap header titles in Expanded, enable OverflowBar vertical action button stacking with spacing, and mark AlertDialog as scrollable to prevent layout exceptions across small or portrait mobile viewports.
+- **Zero-Allocation UTF-8 Byte Counting**: Replace text.length in clipboard size indicators with a single-pass zero-allocation code-unit scan that accurately classifies 1-byte, 2-byte, 3-byte, and 4-byte surrogate pairs, eliminating misleading size indicators on non-ASCII buffers while preventing transient GC heap allocations.
+- **Cross-Platform Selection Clearing Symmetry**: Symmetrically clear xterm.js selection after executing paste input on Web, matching native xterm controller selection clearing behavior.
+- **Modal Route Isolation for Web Paste**: Guard DOM paste listeners and xterm onDataCallback against inactive routes (_currentRoute?.isCurrent == false), ensuring background terminals never capture paste events or prompt confirmation dialogs when modal overlays (such as Settings or worktree pickers) are active.
+- **Symmetrical Focus and Selection Lifecycle on Native**: Mirror Web terminal behavior on Native by clearing selections on fast-path pastes and explicitly restoring FocusNode focus upon dismissing confirmation dialogs.
+- **Devlog Sequence Collision Resolution**: Renumber devlog and plan files from 000135 to 000136 in accordance with repository conventions to cleanly integrate with origin/main.
+
+## Commits
+
+- 19ed977: fix(client): synchronize bracketed paste and add safe multiline paste confirmation
+- 544e606: fix(client): address PR #157 review feedback for safe multiline paste
+- ebe8be9: fix(client): address review comments for safe multiline paste
+- HEAD: fix(client): address local review feedback and renumber devlog
+
+## Progress
+
+- [x] Worktree rebased onto origin/main and plan documented
+- [x] Implement multi-line paste utilities and confirmation dialog
+- [x] Update `terminal_pane_stub.dart` and `terminal_pane_web.dart`
+- [x] Update `main.dart` to pass `bracketedPasteEnabled` to `TerminalPane`
+- [x] Add unit and widget tests
+- [x] Run flutter tests and verify clean workspace
+- [x] Build Android APK and install to Pixel 10 Pro Fold
+- [x] Address PR #157 code review feedback
+- [x] Add re-entrancy guards and session exit checks
+- [x] Exempt single CRLF from multi-line interception
+- [x] Implement multi-line IME interception and DOM refocus on Web
+- [x] Synchronize bracketedPasteEnabled in didUpdateWidget on Web and Native
+- [x] Optimize lineCount with zero-allocation character scan
+- [x] Extend test suite with edge cases and widget test coverage
+- [x] Add zero-allocation UTF-8 byte estimator
+- [x] Prevent surrogate pair splitting on line truncation
+- [x] Add mobile overflow protection and scrollable dialog
+- [x] Symmetrically clear selection on Web paste
+- [x] Add unit and widget tests for mobile constraints and surrogate handling
+- [x] Resolve Copilot review thread via GraphQL
+- [x] Add mounted guards to async paste handlers
+- [x] Guard Web DOM paste and onData against background modal routes
+- [x] Symmetrically clear native fast-path selection and restore desktop focus
+- [x] Guard non-positive maxLength and fix singular pluralization
+- [x] Classify lone unpaired surrogates in estimateUtf8Bytes
+- [x] Renumber devlog sequence to 000136 to avoid collision with main

@@ -1,6 +1,76 @@
 /// Terminal paste utilities and bracketed paste formatting.
+library;
 
 final _pasteEscapeInjectionPattern = RegExp(r'\x1b\[201~|\x9b201~');
+
+/// Matches CRLF, CR, or LF newline sequences.
+final newlinePattern = RegExp(r'\r\n|\r|\n');
+
+/// Reports whether [text] contains newlines (`\n` or `\r`).
+bool isMultiLine(String text) {
+  return text.contains('\n') || text.contains('\r');
+}
+
+/// Flattens [text] to a single line by replacing all newline sequences (`\r\n`, `\r`, `\n`)
+/// with a single space.
+String flattenToSingleLine(String text) {
+  return text.replaceAll(newlinePattern, ' ');
+}
+
+/// Counts the number of lines in [text] with a zero-allocation single-pass scan.
+int lineCount(String text) {
+  if (text.isEmpty) return 0;
+  var newlineCount = 0;
+  final len = text.length;
+  var endsWithNewline = false;
+
+  for (var i = 0; i < len; i++) {
+    final code = text.codeUnitAt(i);
+    if (code == 0x0A) {
+      newlineCount++;
+      endsWithNewline = (i == len - 1);
+    } else if (code == 0x0D) {
+      newlineCount++;
+      if (i + 1 < len && text.codeUnitAt(i + 1) == 0x0A) {
+        i++;
+      }
+      endsWithNewline = (i == len - 1);
+    }
+  }
+
+  if (newlineCount == 0) return 1;
+  return endsWithNewline ? newlineCount : newlineCount + 1;
+}
+
+/// Computes the exact UTF-8 byte count of [text] in a zero-allocation single-pass scan.
+///
+/// Handles ASCII (1 byte), multi-byte Unicode (2 or 3 bytes), and UTF-16 surrogate pairs
+/// (4 bytes) without allocating byte buffers on the heap.
+int estimateUtf8Bytes(String text) {
+  var bytes = 0;
+  final len = text.length;
+  for (var i = 0; i < len; i++) {
+    final value = text.codeUnitAt(i);
+    if (value < 0x80) {
+      bytes += 1;
+    } else if (value < 0x800) {
+      bytes += 2;
+    } else if (value >= 0xd800 && value <= 0xdbff) {
+      if (i + 1 < len) {
+        final next = text.codeUnitAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          bytes += 4;
+          i++;
+          continue;
+        }
+      }
+      bytes += 3;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
 
 /// Formats text for insertion into a terminal session as a paste operation.
 ///
