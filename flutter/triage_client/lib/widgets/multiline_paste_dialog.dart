@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 
 String _truncatePreviewLine(String line, [int maxLength = 200]) {
+  if (maxLength <= 0) return '...';
   if (line.length <= maxLength) return line;
   var end = maxLength;
   final lastUnit = line.codeUnitAt(end - 1);
@@ -42,7 +43,9 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
 
   final remainingLines = lines - previewLines.length;
   final previewSnippet = previewLines.join('\n') +
-      (remainingLines > 0 ? '\n... ($remainingLines more lines)' : '');
+      (remainingLines > 0
+          ? '\n... (${remainingLines == 1 ? '1 more line' : '$remainingLines more lines'})'
+          : '');
 
   final byteCount = estimateUtf8Bytes(text);
   final sizeLabel = byteCount < 1024
@@ -81,7 +84,7 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'The active shell does not have bracketed paste enabled. Pasting $lines lines ($sizeLabel) will execute commands line by line.',
+              'The active shell does not have bracketed paste enabled. Pasting ${lines == 1 ? '1 line' : '$lines lines'} ($sizeLabel) will execute commands line by line.',
               style: const TextStyle(color: Color(0xffa2b4b1), fontSize: 13),
             ),
             const SizedBox(height: 12),

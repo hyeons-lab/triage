@@ -56,13 +56,15 @@ int estimateUtf8Bytes(String text) {
     } else if (value < 0x800) {
       bytes += 2;
     } else if (value >= 0xd800 && value <= 0xdbff) {
-      bytes += 4;
       if (i + 1 < len) {
         final next = text.codeUnitAt(i + 1);
         if (next >= 0xdc00 && next <= 0xdfff) {
+          bytes += 4;
           i++;
+          continue;
         }
       }
+      bytes += 3;
     } else {
       bytes += 3;
     }

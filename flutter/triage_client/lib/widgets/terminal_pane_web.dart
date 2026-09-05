@@ -676,6 +676,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
         }
         if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
+          if (_currentRoute?.isCurrent == false) return;
           final activePane = _containerEventOwners[sessionId] ?? this;
           unawaited(activePane._handlePaste(data));
           return;
@@ -932,7 +933,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (event is html.ClipboardEvent) {
         event.preventDefault();
         event.stopPropagation();
-        if (_isPasteDialogShowing || widget.isExited) return;
+        if (_currentRoute?.isCurrent == false ||
+            _isPasteDialogShowing ||
+            widget.isExited) {
+          return;
+        }
         final clipboardData = event.clipboardData;
         final text = clipboardData?.getData('text/plain') ?? '';
         if (text.isNotEmpty) {
@@ -946,7 +951,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   Future<void> _handlePaste(String text) async {
-    if (text.isEmpty || widget.isExited) return;
+    if (!mounted || text.isEmpty || widget.isExited) return;
     final isBracketed = _isBracketedPasteEnabled();
     if (isBracketed || !isMultiLine(text)) {
       _sendInput(formatPasteInput(text, isBracketed));

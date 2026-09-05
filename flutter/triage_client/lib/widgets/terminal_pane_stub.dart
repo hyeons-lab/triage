@@ -1111,11 +1111,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   Future<void> _handlePaste(String text) async {
-    if (text.isEmpty || widget.isExited) return;
+    if (!mounted || text.isEmpty || widget.isExited) return;
     final isBracketed = _isBracketedPasteEnabled();
     if (isBracketed || !isMultiLine(text)) {
       final formatted = formatPasteInput(text, isBracketed);
       widget.controller.sendInput(formatted);
+      _xtermController.clearSelection();
       return;
     }
 
@@ -1132,6 +1133,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       debugPrint('TerminalPane: failed to handle paste: $e');
     } finally {
       _isPasteDialogShowing = false;
+      if (mounted && !widget.isExited) {
+        _focusNode.requestFocus();
+      }
     }
   }
 

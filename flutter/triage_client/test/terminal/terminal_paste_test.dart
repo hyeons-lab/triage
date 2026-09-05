@@ -215,6 +215,13 @@ void main() {
       const mixed = 'git commit -m "feat(web): ¡añadir soporte UTF-8! 🚀 世界"';
       expect(estimateUtf8Bytes(mixed), utf8.encode(mixed).length);
     });
+
+    test('matches utf8.encode length for unpaired surrogates', () {
+      const loneHigh = 'prefix\uD800suffix';
+      const loneLow = 'prefix\uDC00suffix';
+      expect(estimateUtf8Bytes(loneHigh), utf8.encode(loneHigh).length);
+      expect(estimateUtf8Bytes(loneLow), utf8.encode(loneLow).length);
+    });
   });
 
   group('showMultiLinePasteDialog widget tests', () {
@@ -462,6 +469,97 @@ void main() {
         );
 
         await tester.tap(find.text('Open Dialog'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
+        expect(find.text('Cancel'), findsOneWidget);
+        expect(find.text('Paste as Single Line'), findsOneWidget);
+        expect(find.text('Paste (Execute Commands)'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'uses singular grammar for 1 line and 1 more line',
+      (tester) async {
+        // 7 lines: 6 preview lines + 1 remaining line -> "... (1 more line)"
+        final sevenLines = List.generate(7, (i) => 'Line ${i + 1}').join('\n');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () => showMultiLinePasteDialog(context, sevenLines),
+                  child: const Text('Open 7 Lines'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open 7 Lines'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('... (1 more line)'), findsOneWidget);
+
+        // Dismiss dialog
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+
+        // 1 line with trailing newline
+        const singleCommand = 'cargo test\n';
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () =>
+                      showMultiLinePasteDialog(context, singleCommand),
+                  child: const Text('Open 1 Line'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open 1 Line'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('Pasting 1 line'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'renders without layout overflow on constrained landscape mobile screen',
+      (tester) async {
+        tester.view.physicalSize = const Size(568, 320);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+        });
+
+        const testPayload =
+            'echo "line 1"\necho "line 2"\necho "line 3"\necho "line 4"';
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () => showMultiLinePasteDialog(
+                    context,
+                    testPayload,
+                  ),
+                  child: const Text('Open Landscape'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open Landscape'));
         await tester.pumpAndSettle();
 
         expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
