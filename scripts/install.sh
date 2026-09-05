@@ -159,10 +159,22 @@ if os.path.exists(path):
 if not isinstance(data, dict):
     data = {}
 hooks = data.setdefault('hooks', {})
-pre = hooks.setdefault('PreToolUse', [])
+if not isinstance(hooks, dict):
+    hooks = {}
+    data['hooks'] = hooks
+pre = hooks.get('PreToolUse', [])
+if not isinstance(pre, list):
+    pre = []
+hooks['PreToolUse'] = pre
 has_hook = any(
-    any(h.get('command') == cmd or 'triage-hook' in str(h.get('command', '')) for h in entry.get('hooks', []))
-    for entry in pre if isinstance(entry, dict)
+    isinstance(entry, dict)
+    and isinstance(entry.get('hooks'), list)
+    and any(
+        isinstance(h, dict)
+        and (h.get('command') == cmd or 'triage-hook' in str(h.get('command', '')))
+        for h in entry.get('hooks', [])
+    )
+    for entry in pre
 )
 if not has_hook:
     pre.append({

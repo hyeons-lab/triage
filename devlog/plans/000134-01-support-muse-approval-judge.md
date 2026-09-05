@@ -17,7 +17,7 @@ Reverse-engineering and live experimentation with the installed `muse` binary (`
              "hooks": [
                {
                  "type": "command",
-                 "command": "/Users/dberrios/.cargo/bin/triage-hook",
+                 "command": "~/.cargo/bin/triage-hook",
                  "timeout": 15
                }
              ]

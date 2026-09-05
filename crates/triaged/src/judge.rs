@@ -533,7 +533,7 @@ fn resolve_claude_settings_path(workspace_path: Option<&str>) -> std::path::Path
     resolve_workspace_config_path(workspace_path, ".claude/settings.json")
 }
 
-fn resolve_muse_settings_path(workspace_path: Option<&str>) -> std::path::PathBuf {
+pub fn resolve_muse_settings_path(workspace_path: Option<&str>) -> std::path::PathBuf {
     if let Some(ws) = workspace_path.filter(|s| !s.trim().is_empty()) {
         let p = std::path::PathBuf::from(ws);
         let root = find_git_root(&p).unwrap_or(p);
@@ -1421,6 +1421,56 @@ mod tests {
 
         let checked_disabled = get_hook_status(Some(ws));
         assert!(!checked_disabled.enabled);
+
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    #[test]
+    fn configure_hook_handles_malformed_muse_settings() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "triage-test-muse-malformed-{}",
+            rand::random::<u64>()
+        ));
+        let muse_dir = temp_path.join(".muse");
+        std::fs::create_dir_all(&muse_dir).expect("create muse dir");
+        let ws = temp_path.to_str().unwrap();
+
+        let muse_file = temp_path.join(".muse/settings.json");
+        // Write malformed non-object JSON and non-array PreToolUse
+        std::fs::write(&muse_file, r#"{"hooks": "not-an-object"}"#)
+            .expect("write malformed settings");
+
+        let configured = configure_hook(Some(ws), true).expect("configure");
+        assert!(configured.enabled);
+
+        let content = std::fs::read_to_string(&muse_file).expect("read muse settings");
+        assert!(content.contains("triage-hook"));
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+        assert!(parsed.is_object());
+        assert!(parsed.get("hooks").and_then(|h| h.as_object()).is_some());
+        assert!(
+            parsed
+                .get("hooks")
+                .and_then(|h| h.get("PreToolUse"))
+                .and_then(|p| p.as_array())
+                .is_some()
+        );
+
+        // Also verify recovery when hooks is an object but PreToolUse is not an array
+        std::fs::write(&muse_file, r#"{"hooks": {"PreToolUse": "invalid"}}"#)
+            .expect("write invalid pretooluse");
+        let reconfigured = configure_hook(Some(ws), true).expect("reconfigure");
+        assert!(reconfigured.enabled);
+
+        let content2 = std::fs::read_to_string(&muse_file).expect("read muse settings");
+        let parsed2: serde_json::Value = serde_json::from_str(&content2).expect("valid json");
+        assert!(
+            parsed2
+                .get("hooks")
+                .and_then(|h| h.get("PreToolUse"))
+                .and_then(|p| p.as_array())
+                .is_some()
+        );
 
         let _ = std::fs::remove_dir_all(&temp_path);
     }

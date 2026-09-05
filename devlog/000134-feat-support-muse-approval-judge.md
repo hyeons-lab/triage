@@ -12,6 +12,10 @@
 - **2026-09-04T17:51-0700** `crates/triaged/src/service.rs`: Updated `install_global_agent_hooks` to configure `~/.config/muse/settings.json` when the configuration directory exists.
 - **2026-09-04T17:51-0700** `scripts/install.sh`: Added hook provisioning for `~/.config/muse/settings.json`.
 - **2026-09-04T17:51-0700** `docs/approval-judge.md`: Added documentation for Meta Muse CLI hook configuration and payload conventions.
+- **2026-09-04T19:28-0700** `devlog/plans/000134-01-support-muse-approval-judge.md`: Sanitized machine-specific personal filesystem paths to home-relative tilde paths (`~/.cargo/bin/triage-hook`).
+- **2026-09-04T19:28-0700** `scripts/install.sh`: Hardened inline Python configuration to defensively normalize non-dict `hooks` and non-list `PreToolUse` entries in Muse settings before appending hooks.
+- **2026-09-04T19:28-0700** `crates/triaged/src/judge.rs`: Exported `pub fn resolve_muse_settings_path` for reuse across the crate, and added unit test `configure_hook_handles_malformed_muse_settings` verifying safe recovery and normalization from malformed settings files.
+- **2026-09-04T19:28-0700** `crates/triaged/src/service.rs`: Replaced duplicated path resolution with `crate::judge::resolve_muse_settings_path(None)`, and added `muse_cli_available()` PATH and `~/.local/bin/muse` probing to ensure lifecycle hooks are provisioned upon daemon launch even before `~/.config/muse/` exists.
 
 ## Decisions
 
@@ -22,7 +26,8 @@
 
 ## Commits
 
-- HEAD: feat(judge): support Meta Muse CLI in auto approval judge
+- c833c5b: feat(judge): support Meta Muse CLI in auto approval judge
+- HEAD: fix(judge): address PR review comments for Meta Muse CLI support
 
 ## Progress
 
@@ -34,3 +39,4 @@
 - [x] Unit tests in `triage-core`, `triage-hook`, and `triaged`
 - [x] Workspace check, clippy, fmt, and test suite pass
 - [x] Live verification with `muse`
+- [x] Address PR review feedback: sanitize paths, defensive hook normalization, deduplicate settings resolver, add PATH probe, and add malformed config recovery unit test
