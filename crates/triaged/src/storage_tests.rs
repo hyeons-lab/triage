@@ -445,3 +445,110 @@ fn line_matches_query_ascii_and_unicode() {
         true
     ));
 }
+
+#[test]
+fn read_segment_tail_uncompressed_seeking() {
+    let temp_dir = unique_test_dir();
+    let file_path = temp_dir.join("segment-000001.tlog");
+
+    // Create 10_000 bytes with distinct head and tail patterns
+    let mut data = vec![b'A'; 9_900];
+    let tail_marker = b"TAIL_100_BYTES_END_MARKER_FOR_TESTING_SEEK_READS_0123456789abcdefghijklmnopqrstuvwxyz0123456789abcde";
+    assert_eq!(tail_marker.len(), 100);
+    data.extend_from_slice(tail_marker);
+    assert_eq!(data.len(), 10_000);
+    fs::write(&file_path, &data).expect("write data");
+
+    let info = SegmentFileInfo {
+        index: 1,
+        path: file_path,
+        is_compressed: false,
+        file_size: 10_000,
+    };
+
+    // Seek read the trailing 100 bytes
+    let tail = read_segment_tail_uncompressed(&info, 100).expect("read tail");
+    assert_eq!(tail.len(), 100);
+    assert_eq!(tail, &data[9_900..]);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn search_session_segments_multibyte_utf8() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-multibyte-search");
+    fs::create_dir_all(&session_dir).expect("mkdir");
+
+    // Segment 1 (uncompressed): contains emojis and Japanese
+    let seg1_path = session_dir.join("segment-000001.tlog");
+    fs::write(
+        &seg1_path,
+        "Line 1: \x1b[32m🚀 Starting engine\x1b[0m\nLine 2: 🦀 Rust 1.85 release\nLine 3: 日本語のログ出力\n",
+    )
+    .expect("write seg1");
+
+    // Segment 2 (compressed): contains Unicode symbols and French
+    let seg2_raw = session_dir.join("segment-000002.tlog");
+    fs::write(
+        &seg2_raw,
+        "Line 4: ✨ Sparkles and stars\nLine 5: Café au lait\nLine 6: 🚀 Second launch\n",
+    )
+    .expect("write seg2 raw");
+    let seg2_comp = session_dir.join("segment-000002.tlog.zst");
+    compress_segment_file(&seg2_raw, &seg2_comp).expect("compress seg2");
+
+    // Search for emoji
+    let rocket_hits = search_session_segments(&session_dir, "🚀", false).expect("search rocket");
+    assert_eq!(rocket_hits.len(), 2);
+    assert_eq!(rocket_hits[0].segment_index, 1);
+    assert_eq!(rocket_hits[0].line_number, 1);
+    assert!(rocket_hits[0].line_text.contains("🚀 Starting engine"));
+    assert_eq!(rocket_hits[1].segment_index, 2);
+    assert_eq!(rocket_hits[1].line_number, 3);
+    assert!(rocket_hits[1].line_text.contains("🚀 Second launch"));
+
+    // Search for crab emoji
+    let crab_hits = search_session_segments(&session_dir, "🦀", false).expect("search crab");
+    assert_eq!(crab_hits.len(), 1);
+    assert_eq!(crab_hits[0].segment_index, 1);
+    assert_eq!(crab_hits[0].line_number, 2);
+    assert!(crab_hits[0].line_text.contains("🦀 Rust 1.85 release"));
+
+    // Search for Japanese characters
+    let jp_hits = search_session_segments(&session_dir, "日本語", false).expect("search japanese");
+    assert_eq!(jp_hits.len(), 1);
+    assert_eq!(jp_hits[0].segment_index, 1);
+    assert_eq!(jp_hits[0].line_number, 3);
+    assert!(jp_hits[0].line_text.contains("日本語のログ出力"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn legacy_log_migration_cleans_up_on_error() {
+    let temp_dir = unique_test_dir();
+    let legacy_log = temp_dir.join("session-err-123.log");
+    fs::write(&legacy_log, b"some initial content").expect("write log");
+
+    let session_dir = temp_dir.join("sessions").join("session-err");
+
+    // Zero segment size should error immediately
+    let res = migrate_legacy_session_log(&legacy_log, &session_dir, 0);
+    assert!(res.is_err());
+
+    // Verify no stray .tmp-migrate directories were leaked in parent directory
+    let parent = session_dir.parent().unwrap();
+    if parent.exists() {
+        for entry in fs::read_dir(parent).expect("read parent") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".tmp-migrate-"),
+                "stray temp migration dir found: {name}"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

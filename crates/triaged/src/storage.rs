@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -270,6 +270,49 @@ pub fn read_segment_uncompressed(info: &SegmentFileInfo) -> Result<Vec<u8>> {
     }
 }
 
+/// Reads up to `tail_bytes` from the tail of an uncompressed `.tlog` segment file using `Seek`.
+pub fn read_segment_tail_uncompressed(
+    info: &SegmentFileInfo,
+    tail_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut file = match File::open(&info.path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // If the segment was concurrently compressed by the worker, fall back to decompressing
+            return read_segment_uncompressed(info);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("opening segment file {}", info.path.display()));
+        }
+    };
+
+    let file_size = file.metadata()?.len();
+    let to_read = (tail_bytes as u64).min(file_size) as usize;
+    let start_offset = file_size.saturating_sub(to_read as u64);
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut buffer = vec![0u8; to_read];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
+/// Reads up to `tail_bytes` from the tail of a segment.
+///
+/// For uncompressed `.tlog` files, seeks directly to the end of the file on disk and reads
+/// only the requested trailing slice, avoiding loading the entire segment into memory.
+/// For compressed `.tlog.zst` files, decompresses the segment and takes the trailing slice.
+pub fn read_segment_tail(info: &SegmentFileInfo, tail_bytes: usize) -> Result<Vec<u8>> {
+    if !info.is_compressed {
+        return read_segment_tail_uncompressed(info, tail_bytes);
+    }
+    let mut buffer = read_segment_uncompressed(info)?;
+    if buffer.len() > tail_bytes {
+        let skip = buffer.len() - tail_bytes;
+        buffer.drain(..skip);
+    }
+    Ok(buffer)
+}
+
 /// Reads the trailing `cap` bytes across the chronological chain of segments in a session directory.
 ///
 /// Returns `(start_offset, combined_bytes)` where `start_offset` is the absolute byte offset
@@ -311,7 +354,8 @@ pub fn read_multi_segment_tail(
             break;
         }
 
-        match read_segment_uncompressed(segment) {
+        let remaining_needed = needed_bytes - accumulated_len;
+        match read_segment_tail(segment, remaining_needed) {
             Ok(bytes) => {
                 accumulated_len += bytes.len();
                 collected_chunks.push(bytes);
@@ -320,7 +364,7 @@ pub fn read_multi_segment_tail(
                 tracing::warn!(
                     path = %segment.path.display(),
                     ?err,
-                    "failed to read segment uncompressed"
+                    "failed to read segment tail"
                 );
             }
         }
@@ -352,24 +396,24 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
         return Ok((0, Vec::new()));
     }
 
+    // Compute total uncompressed stream length across all segments in O(1) time per segment
+    let mut total_uncompressed_len = 0u64;
+    for segment in &segments {
+        total_uncompressed_len += get_segment_uncompressed_size(segment)?;
+    }
+
     let cap_usize = cap as usize;
     let mut collected_chunks: Vec<Vec<u8>> = Vec::new();
     let mut accumulated_tail_len = 0;
-    let mut remaining_older_segments = 0;
 
-    for (i, segment) in segments.iter().rev().enumerate() {
+    for segment in segments.iter().rev() {
         if accumulated_tail_len >= cap_usize {
-            remaining_older_segments = segments.len() - i;
             break;
         }
-        let bytes = read_segment_uncompressed(segment)?;
+        let remaining_needed = cap_usize - accumulated_tail_len;
+        let bytes = read_segment_tail(segment, remaining_needed)?;
         accumulated_tail_len += bytes.len();
         collected_chunks.push(bytes);
-    }
-
-    let mut older_bytes = 0u64;
-    for segment in &segments[..remaining_older_segments] {
-        older_bytes += get_segment_uncompressed_size(segment)?;
     }
 
     collected_chunks.reverse();
@@ -383,7 +427,6 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
         combined.drain(..skip);
     }
 
-    let total_uncompressed_len = older_bytes + accumulated_tail_len as u64;
     Ok((total_uncompressed_len, combined))
 }
 
@@ -628,6 +671,8 @@ pub fn migrate_legacy_session_log(
     if !legacy_log_path.exists() {
         return Ok(0);
     }
+
+    ensure!(segment_size > 0, "segment size must be greater than zero");
 
     let file = File::open(legacy_log_path)
         .with_context(|| format!("opening legacy log {}", legacy_log_path.display()))?;
