@@ -351,19 +351,27 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         return AgentFormat::ClaudeCode;
     }
 
-    // Claude Code passes transcript_path in all tool hook payloads
-    if val.get("transcript_path").is_some() {
-        return AgentFormat::ClaudeCode;
-    }
-
-    // Muse specific payload fields
+    // Muse specific payload fields:
+    // Muse's PreToolUse payload always carries `tool_use_id` (or `toolUseId`),
+    // or `turn_id`, or a model containing "muse".
     let is_muse_model = val
         .get("model")
         .and_then(|v| v.as_str())
         .map(|m| m.to_ascii_lowercase().contains("muse"))
         .unwrap_or(false);
-    if val.get("turn_id").is_some() || val.get("turnId").is_some() || is_muse_model {
+    if val.get("tool_use_id").is_some()
+        || val.get("toolUseId").is_some()
+        || val.get("turn_id").is_some()
+        || val.get("turnId").is_some()
+        || is_muse_model
+        || std::env::var("MUSE_TOOL_USE_ID").is_ok()
+    {
         return AgentFormat::Muse;
+    }
+
+    // Claude Code passes transcript_path in all tool hook payloads
+    if val.get("transcript_path").is_some() {
+        return AgentFormat::ClaudeCode;
     }
 
     // Claude Code specific payload fields
@@ -1123,14 +1131,22 @@ fn encode_response(
                 } else {
                     None
                 };
-                serde_json::json!({
+                let mut out = serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
                         "permissionDecisionReason": reason
                     }
-                })
-                .to_string()
+                });
+                // Uses Rust nightly let_chains (pinned via rust-toolchain.toml).
+                if let Some(args) = raw_args
+                    && let Some(obj) = out
+                        .get_mut("hookSpecificOutput")
+                        .and_then(|o| o.as_object_mut())
+                {
+                    obj.insert("updatedInput".to_string(), args.clone());
+                }
+                out.to_string()
             }
             triage_core::judge::JudgeDecision::Deny => {
                 let reason = if !verdict.reason.is_empty() {
@@ -1720,6 +1736,20 @@ mod tests {
         };
         let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None, None, None);
         assert_eq!(encoded_ask, "");
+
+        let tool_args = serde_json::json!({"command": "ls -la"});
+        let encoded_with_args = encode_response(
+            AgentFormat::ClaudeCode,
+            &allow_verdict,
+            None,
+            None,
+            Some(&tool_args),
+        );
+        let val: serde_json::Value = serde_json::from_str(&encoded_with_args).unwrap();
+        assert_eq!(
+            val["hookSpecificOutput"]["updatedInput"]["command"],
+            "ls -la"
+        );
     }
 
     #[test]
@@ -1801,6 +1831,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detect_format(&muse_turn_payload), AgentFormat::Muse);
+
+        let muse_tool_use_id_payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "hook_event_name": "PreToolUse",
+                "tool_name": "bash",
+                "tool_input": {"command": "echo 1"},
+                "tool_use_id": "call_01a06fa330f87441857ef7dca54b7082"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(detect_format(&muse_tool_use_id_payload), AgentFormat::Muse);
+
+        let muse_camel_tool_use_id_payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "hook_event_name": "PreToolUse",
+                "tool_name": "read_file",
+                "tool_input": {"path": "foo.txt"},
+                "toolUseId": "call_123"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_format(&muse_camel_tool_use_id_payload),
+            AgentFormat::Muse
+        );
     }
 
     #[test]
