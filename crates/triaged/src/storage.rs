@@ -242,9 +242,9 @@ pub fn get_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<u64> {
         return Ok(size);
     }
 
-    let fallback_file = File::open(&info.path)
-        .with_context(|| format!("opening fallback segment file {}", info.path.display()))?;
-    let mut decoder = zstd::stream::Decoder::new(BufReader::new(fallback_file))
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewinding segment file {}", info.path.display()))?;
+    let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))
         .with_context(|| format!("decoding zstd segment {}", info.path.display()))?;
     let count = std::io::copy(&mut decoder, &mut std::io::sink())?;
     Ok(count)
@@ -252,8 +252,8 @@ pub fn get_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<u64> {
 
 /// Reads the entire uncompressed content of a segment.
 pub fn read_segment_uncompressed(info: &SegmentFileInfo) -> Result<Vec<u8>> {
-    let (file, is_compressed) = match File::open(&info.path) {
-        Ok(f) => (f, info.is_compressed),
+    let (mut file, is_compressed, file_path) = match File::open(&info.path) {
+        Ok(f) => (f, info.is_compressed, info.path.clone()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && !info.is_compressed => {
             let compressed_path = info
                 .path
@@ -264,7 +264,7 @@ pub fn read_segment_uncompressed(info: &SegmentFileInfo) -> Result<Vec<u8>> {
                     compressed_path.display()
                 )
             })?;
-            (f, true)
+            (f, true, compressed_path)
         }
         Err(err) => {
             return Err(err)
@@ -273,9 +273,21 @@ pub fn read_segment_uncompressed(info: &SegmentFileInfo) -> Result<Vec<u8>> {
     };
 
     if is_compressed {
+        let mut header_buf = [0u8; 256];
+        let target_cap = if let Ok(n) = file.read(&mut header_buf)
+            && let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&header_buf[..n])
+            && size > 0
+            && size <= DEFAULT_SEGMENT_SIZE_BYTES * 2
+        {
+            size as usize
+        } else {
+            DEFAULT_SEGMENT_SIZE_BYTES as usize
+        };
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("rewinding segment file {}", file_path.display()))?;
         let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))
-            .with_context(|| format!("decoding zstd segment {}", info.path.display()))?;
-        let mut buffer = Vec::with_capacity(DEFAULT_SEGMENT_SIZE_BYTES as usize);
+            .with_context(|| format!("decoding zstd segment {}", file_path.display()))?;
+        let mut buffer = Vec::with_capacity(target_cap);
         decoder.read_to_end(&mut buffer)?;
         Ok(buffer)
     } else {
@@ -386,15 +398,17 @@ pub fn read_multi_segment_tail(
 
     // Reconstruct chunks in chronological order
     collected_chunks.reverse();
-    let mut combined: Vec<u8> = Vec::with_capacity(accumulated_len);
+    if accumulated_len > needed_bytes && !collected_chunks.is_empty() {
+        let excess = accumulated_len - needed_bytes;
+        if excess < collected_chunks[0].len() {
+            collected_chunks[0].drain(..excess);
+        } else {
+            collected_chunks[0].clear();
+        }
+    }
+    let mut combined: Vec<u8> = Vec::with_capacity(needed_bytes);
     for chunk in collected_chunks {
         combined.extend_from_slice(&chunk);
-    }
-
-    // Slice to the requested tail
-    if combined.len() > needed_bytes {
-        let skip = combined.len() - needed_bytes;
-        combined.drain(..skip);
     }
 
     let start_offset = total_uncompressed_bytes.saturating_sub(combined.len() as u64);
@@ -431,14 +445,17 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
     }
 
     collected_chunks.reverse();
+    if accumulated_tail_len > cap_usize && !collected_chunks.is_empty() {
+        let excess = accumulated_tail_len - cap_usize;
+        if excess < collected_chunks[0].len() {
+            collected_chunks[0].drain(..excess);
+        } else {
+            collected_chunks[0].clear();
+        }
+    }
     let mut combined = Vec::with_capacity(accumulated_tail_len.min(cap_usize));
     for chunk in collected_chunks {
         combined.extend_from_slice(&chunk);
-    }
-
-    if combined.len() > cap_usize {
-        let skip = combined.len() - cap_usize;
-        combined.drain(..skip);
     }
 
     Ok((total_uncompressed_len, combined))
@@ -675,10 +692,10 @@ pub fn line_matches_query(
     if !case_insensitive {
         return line.contains(query);
     }
-    if line.len() < query.len() {
-        return false;
-    }
     if query.is_ascii() {
+        if line.len() < query.len() {
+            return false;
+        }
         let line_bytes = line.as_bytes();
         let query_bytes = query_lower.as_bytes();
         line_bytes
@@ -735,7 +752,7 @@ pub fn migrate_legacy_session_log(
         let mut reader = BufReader::new(file);
         let mut segment_index: u32 = 1;
         let mut bytes_remaining = total_len;
-        let mut buffer = vec![0u8; segment_size as usize];
+        let mut buffer = vec![0u8; total_len.min(segment_size) as usize];
 
         while bytes_remaining > 0 {
             let chunk_size = bytes_remaining.min(segment_size) as usize;

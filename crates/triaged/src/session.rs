@@ -2203,7 +2203,10 @@ impl SessionManager {
         let id_str = id.as_str();
         let belongs = |p: &Path| -> bool {
             if let Some(file_name) = p.file_name().and_then(|n| n.to_str())
-                && file_name.starts_with(id_str)
+                && let Some(remainder) = file_name.strip_prefix(id_str)
+                && (remainder == ".log"
+                    || remainder.starts_with("-recovered-")
+                    || remainder.starts_with(".log.migrated"))
             {
                 return true;
             }
@@ -2212,7 +2215,9 @@ impl SessionManager {
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 && (parent == id_str
-                    || parent.starts_with(&format!("{id_str}-recovered-"))
+                    || parent
+                        .strip_prefix(id_str)
+                        .is_some_and(|rem| rem.starts_with("-recovered-"))
                     || SessionId::new(parent)
                         .map(|sid| Self::original_session_id(&sid) == *id)
                         .unwrap_or(false))
@@ -7563,6 +7568,7 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn run_command_with_timeout(mut command: Command, timeout: std::time::Duration) -> Option<Vec<u8>> {
+    command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::null());
     detach_from_terminal(&mut command);
@@ -8013,6 +8019,72 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(res.is_none());
         assert!(elapsed < Duration::from_millis(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_null_stdin_does_not_block() {
+        let cmd = Command::new("cat");
+        let start = Instant::now();
+        let res = run_command_with_timeout(cmd, Duration::from_millis(1500));
+        let elapsed = start.elapsed();
+        assert!(res.is_some());
+        assert!(elapsed < Duration::from_millis(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_belong_to_same_session_boundary_separation() {
+        let id1 = SessionId::new("session-1").unwrap();
+        let p_exact = Path::new("/var/log/session-1.log");
+        let p_recovered = Path::new("/var/log/session-1-recovered-42.log");
+        let p_migrated = Path::new("/var/log/session-1.log.migrated");
+        let p_segmented = Path::new("/var/log/sessions/session-1/segment-000001.tlog");
+
+        // These belong to session-1
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact, p_exact, &id1
+        ));
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_recovered,
+            &id1
+        ));
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact, p_migrated, &id1
+        ));
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_segmented,
+            &id1
+        ));
+
+        // Prefix collision paths must NOT belong to session-1
+        let p_colliding10 = Path::new("/var/log/session-10.log");
+        let p_colliding100 = Path::new("/var/log/session-100.log");
+        let p_colliding11_rec = Path::new("/var/log/session-11-recovered-1.log");
+        let p_colliding_seg = Path::new("/var/log/sessions/session-10/segment-000001.tlog");
+
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding10,
+            &id1
+        ));
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding100,
+            &id1
+        ));
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding11_rec,
+            &id1
+        ));
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding_seg,
+            &id1
+        ));
     }
 
     /// A directory that cannot be listed must not be mistaken for one holding no
