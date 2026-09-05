@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/main.dart';
@@ -182,6 +183,40 @@ void main() {
     });
   });
 
+  group('estimateUtf8Bytes', () {
+    test('returns 0 for empty string', () {
+      expect(estimateUtf8Bytes(''), 0);
+    });
+
+    test('matches utf8.encode length for ASCII strings', () {
+      const ascii = 'echo "hello world" | grep -v test';
+      expect(estimateUtf8Bytes(ascii), utf8.encode(ascii).length);
+    });
+
+    test('matches utf8.encode length for 2-byte UTF-8 characters', () {
+      const latinAndGreek = '¡Hola! ¿Cómo estás? Ελληνικά';
+      expect(
+        estimateUtf8Bytes(latinAndGreek),
+        utf8.encode(latinAndGreek).length,
+      );
+    });
+
+    test('matches utf8.encode length for 3-byte CJK and symbols', () {
+      const cjk = '日本語 简体中文 한국어 ⚡';
+      expect(estimateUtf8Bytes(cjk), utf8.encode(cjk).length);
+    });
+
+    test('matches utf8.encode length for 4-byte emojis and surrogate pairs', () {
+      const emojis = '🚀 👨‍👩‍👧‍👦 🛰️ ✨ 🎉';
+      expect(estimateUtf8Bytes(emojis), utf8.encode(emojis).length);
+    });
+
+    test('matches utf8.encode length for mixed multi-byte payloads', () {
+      const mixed = 'git commit -m "feat(web): ¡añadir soporte UTF-8! 🚀 世界"';
+      expect(estimateUtf8Bytes(mixed), utf8.encode(mixed).length);
+    });
+  });
+
   group('showMultiLinePasteDialog widget tests', () {
     testWidgets(
       'renders dialog with line count, snippet preview, and action buttons',
@@ -338,6 +373,104 @@ void main() {
 
       expect(find.textContaining('2.0 KB'), findsOneWidget);
     });
+
+    testWidgets(
+      'formats size accurately for multi-byte UTF-8 payloads in KB',
+      (tester) async {
+        // 512 2-byte characters = 1024 bytes -> 1.0 KB
+        final multiBytePayload = '${'£' * 512}\nline 2';
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () => showMultiLinePasteDialog(
+                    context,
+                    multiBytePayload,
+                  ),
+                  child: const Text('Open Dialog'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open Dialog'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('1.0 KB'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'truncates preview line safely when surrogate pair borders truncation boundary',
+      (tester) async {
+        // 199 ASCII characters + 🚀 (surrogate pair) + trailing text
+        final lineWithBorderSurrogate = '${'x' * 199}🚀trailing\nline 2';
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () => showMultiLinePasteDialog(
+                    context,
+                    lineWithBorderSurrogate,
+                  ),
+                  child: const Text('Open Dialog'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open Dialog'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
+        // Truncation should cut before the surrogate pair at 199 without splitting units
+        expect(find.textContaining('${'x' * 199}...'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'renders without layout overflow on constrained portrait mobile screen',
+      (tester) async {
+        tester.view.physicalSize = const Size(320, 568);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+        });
+
+        const testPayload =
+            'echo "step 1"\necho "step 2 with a relatively long line"\necho "step 3"';
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () => showMultiLinePasteDialog(
+                    context,
+                    testPayload,
+                  ),
+                  child: const Text('Open Dialog'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open Dialog'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
+        expect(find.text('Cancel'), findsOneWidget);
+        expect(find.text('Paste as Single Line'), findsOneWidget);
+        expect(find.text('Paste (Execute Commands)'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
   });
 
   group('SessionVm bracketed paste state', () {

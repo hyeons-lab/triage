@@ -42,6 +42,34 @@ int lineCount(String text) {
   return endsWithNewline ? newlineCount : newlineCount + 1;
 }
 
+/// Computes the exact UTF-8 byte count of [text] in a zero-allocation single-pass scan.
+///
+/// Handles ASCII (1 byte), multi-byte Unicode (2 or 3 bytes), and UTF-16 surrogate pairs
+/// (4 bytes) without allocating byte buffers on the heap.
+int estimateUtf8Bytes(String text) {
+  var bytes = 0;
+  final len = text.length;
+  for (var i = 0; i < len; i++) {
+    final value = text.codeUnitAt(i);
+    if (value < 0x80) {
+      bytes += 1;
+    } else if (value < 0x800) {
+      bytes += 2;
+    } else if (value >= 0xd800 && value <= 0xdbff) {
+      bytes += 4;
+      if (i + 1 < len) {
+        final next = text.codeUnitAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i++;
+        }
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
 /// Formats text for insertion into a terminal session as a paste operation.
 ///
 /// When [bracketedPasteEnabled] is true (DEC Mode 2004), the pasted text is wrapped

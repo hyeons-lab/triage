@@ -20,6 +20,12 @@
 - **2026-09-04T21:11-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: added _isPasteDialogShowing re-entrancy lock, intercepted multi-line IME data in onDataCallback, restored DOM focus via _activateTerminal post-dialog, and synchronized bracketedPasteEnabled in didUpdateWidget.
 - **2026-09-04T21:11-0700** flutter/triage_client/lib/main.dart: simplified SessionVm.setBracketedPasteEnabled to key TerminalPane.setBracketedPasteMode by session title only.
 - **2026-09-04T21:11-0700** flutter/triage_client/test/terminal/terminal_paste_test.dart: added unit tests for lineCount edge cases and widget tests for truncated snippet and KB size formatting.
+- **2026-09-05T08:01-0700** devlog/plans/000135-03-address-ci-review-feedback.md: created implementation plan for addressing PR #157 automated CI review comments.
+- **2026-09-05T08:01-0700** flutter/triage_client/lib/terminal/terminal_paste.dart: implemented zero-allocation estimateUtf8Bytes scanning ASCII, multi-byte Unicode, and surrogate pairs without heap buffer allocation.
+- **2026-09-05T08:01-0700** flutter/triage_client/lib/widgets/multiline_paste_dialog.dart: protected title Row with Expanded and TextOverflow.ellipsis, added actionsAlignment and actionsOverflowButtonSpacing: 8 for mobile action button wrapping, enabled scrollable: true on AlertDialog to prevent vertical overflow on small screens, added _truncatePreviewLine to prevent UTF-16 surrogate-pair splitting at truncation boundary, and wired estimateUtf8Bytes for accurate payload sizing.
+- **2026-09-05T08:01-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: cleared xterm.js visual selection on paste via js_util.callMethod(_term, 'clearSelection', []) matching native desktop and mobile behavior.
+- **2026-09-05T08:01-0700** flutter/triage_client/test/terminal/terminal_paste_test.dart: added unit tests for estimateUtf8Bytes across ASCII, Latin, Greek, CJK, and emojis, added widget test verifying safe surrogate-pair truncation, and added widget test asserting overflow-free rendering on constrained portrait mobile screen.
+- **2026-09-05T08:01-0700** ~/.gemini/review-refinements.md: synthesized lessons learned into Core Thematic Pillars 3, 4, and 7.
 
 ## Decisions
 
@@ -31,11 +37,16 @@
 - **Exemption of Single CRLF Keystrokes**: Exclude `data == '\r\n'` in multi-line IME interception so standard Enter keystrokes from mobile or Bluetooth keyboards execute immediately without warning dialogs.
 - **Reactive Bracketed Mode Propagation in didUpdateWidget**: Synchronize `bracketedPasteEnabled` to the underlying emulator and static session maps during `didUpdateWidget`, preventing stale modes from locking permanently.
 - **Zero-Allocation Character Scanning for Line Counts**: Replace regular expression `allMatches` matching in `lineCount` with a single-pass ASCII code unit scan over `text.codeUnitAt(i)`, reducing heap allocations to zero and eliminating UI GC spikes on large clipboard buffers.
+- **UTF-16 Surrogate Pair Truncation Safety**: When truncating preview lines at 200 code units, detect if the slice boundary falls between a surrogate pair (code unit at index 199 is between 0xD800 and 0xDBFF) and back up by one code unit, avoiding dangling high surrogates that corrupt downstream text rendering.
+- **Mobile Dialog Responsiveness and Overflow Prevention**: Ensure multi-action dialogs wrap header titles in Expanded, enable OverflowBar vertical action button stacking with spacing, and mark AlertDialog as scrollable to prevent layout exceptions across small or portrait mobile viewports.
+- **Zero-Allocation UTF-8 Byte Counting**: Replace text.length in clipboard size indicators with a single-pass zero-allocation code-unit scan that accurately classifies 1-byte, 2-byte, 3-byte, and 4-byte surrogate pairs, eliminating misleading size indicators on non-ASCII buffers while preventing transient GC heap allocations.
+- **Cross-Platform Selection Clearing Symmetry**: Symmetrically clear xterm.js selection after executing paste input on Web, matching native xterm controller selection clearing behavior.
 
 ## Commits
 
 - 19ed977: fix(client): synchronize bracketed paste and add safe multiline paste confirmation
-- HEAD: fix(client): address PR #157 review feedback for safe multiline paste
+- 544e606: fix(client): address PR #157 review feedback for safe multiline paste
+- HEAD: fix(client): address review comments for safe multiline paste
 
 ## Progress
 
@@ -53,3 +64,9 @@
 - [x] Synchronize bracketedPasteEnabled in didUpdateWidget on Web and Native
 - [x] Optimize lineCount with zero-allocation character scan
 - [x] Extend test suite with edge cases and widget test coverage
+- [x] Add zero-allocation UTF-8 byte estimator
+- [x] Prevent surrogate pair splitting on line truncation
+- [x] Add mobile overflow protection and scrollable dialog
+- [x] Symmetrically clear selection on Web paste
+- [x] Add unit and widget tests for mobile constraints and surrogate handling
+- [x] Resolve Copilot review thread via GraphQL

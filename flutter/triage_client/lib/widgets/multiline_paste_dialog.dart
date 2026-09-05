@@ -1,6 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 
+String _truncatePreviewLine(String line, [int maxLength = 200]) {
+  if (line.length <= maxLength) return line;
+  var end = maxLength;
+  final lastUnit = line.codeUnitAt(end - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) {
+    end--;
+  }
+  return '${line.substring(0, end)}...';
+}
+
 /// Shows a confirmation dialog when pasting multi-line text into a session where
 /// bracketed paste mode is disabled.
 ///
@@ -18,7 +28,7 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
     final code = text.codeUnitAt(i);
     if (code == 0x0A || code == 0x0D) {
       final line = text.substring(start, i);
-      previewLines.add(line.length > 200 ? '${line.substring(0, 200)}...' : line);
+      previewLines.add(_truncatePreviewLine(line));
       if (code == 0x0D && i + 1 < len && text.codeUnitAt(i + 1) == 0x0A) {
         i++;
       }
@@ -27,14 +37,14 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
   }
   if (previewLines.length < 6 && start < len) {
     final line = text.substring(start);
-    previewLines.add(line.length > 200 ? '${line.substring(0, 200)}...' : line);
+    previewLines.add(_truncatePreviewLine(line));
   }
 
   final remainingLines = lines - previewLines.length;
   final previewSnippet = previewLines.join('\n') +
       (remainingLines > 0 ? '\n... ($remainingLines more lines)' : '');
 
-  final byteCount = text.length;
+  final byteCount = estimateUtf8Bytes(text);
   final sizeLabel = byteCount < 1024
       ? '$byteCount B'
       : byteCount < 1024 * 1024
@@ -44,18 +54,22 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
   return showDialog<String>(
     context: context,
     builder: (context) => AlertDialog(
+      scrollable: true,
       backgroundColor: const Color(0xff161b1d),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       title: const Row(
         children: [
           Icon(Icons.warning_amber_rounded, color: Color(0xffffb86c), size: 22),
           SizedBox(width: 8),
-          Text(
-            'Multi-Line Paste Warning',
-            style: TextStyle(
-              color: Color(0xffd9e5e3),
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
+          Expanded(
+            child: Text(
+              'Multi-Line Paste Warning',
+              style: TextStyle(
+                color: Color(0xffd9e5e3),
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
+              overflow: TextOverflow.ellipsis,
             ),
           ),
         ],
@@ -93,6 +107,8 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
           ],
         ),
       ),
+      actionsAlignment: MainAxisAlignment.end,
+      actionsOverflowButtonSpacing: 8,
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(null),

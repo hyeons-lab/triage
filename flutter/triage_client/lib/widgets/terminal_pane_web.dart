@@ -950,6 +950,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     final isBracketed = _isBracketedPasteEnabled();
     if (isBracketed || !isMultiLine(text)) {
       _sendInput(formatPasteInput(text, isBracketed));
+      try {
+        js_util.callMethod(_term, 'clearSelection', []);
+      } catch (_) {}
       return;
     }
 
@@ -959,6 +962,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       final chosenText = await showMultiLinePasteDialog(context, text);
       if (chosenText != null && mounted && !widget.isExited) {
         _sendInput(formatPasteInput(chosenText, false));
+        try {
+          js_util.callMethod(_term, 'clearSelection', []);
+        } catch (_) {}
       }
     } catch (e) {
       debugPrint('TerminalPane: failed to handle web paste: $e');
