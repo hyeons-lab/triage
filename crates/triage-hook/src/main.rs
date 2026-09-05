@@ -1138,6 +1138,7 @@ fn encode_response(
                         "permissionDecisionReason": reason
                     }
                 });
+                // Uses Rust nightly let_chains (pinned via rust-toolchain.toml).
                 if let Some(args) = raw_args
                     && let Some(obj) = out
                         .get_mut("hookSpecificOutput")

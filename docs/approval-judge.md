@@ -118,7 +118,7 @@ For Meta Muse CLI (`muse`), hooks are configured in `~/.config/muse/settings.jso
 }
 ```
 
-When `muse` executes a tool call, `triage-hook` automatically detects Muse's PreToolUse payload signature and formats responses to match Muse's protocol, including `updatedInput` on auto-approval and `permissionDecisionReason` on denial.
+When `muse` executes a tool call, `triage-hook` automatically detects Muse's PreToolUse payload signature (via `tool_use_id` / `toolUseId` or the `MUSE_TOOL_USE_ID` environment variable) and formats responses to match Muse's protocol, including `updatedInput` on auto-approval and `permissionDecisionReason` on denial. Explicit format overrides can also be passed via `--format=muse` or `TRIAGE_HOOK_FORMAT=muse`.
 
 Restart `triaged` so it picks up the config, or run `triaged reload`. When started
 inside a Triage session, judging honors that session's policy override (toggleable via
