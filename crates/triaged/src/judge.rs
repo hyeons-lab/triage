@@ -170,13 +170,15 @@ fn parse_decision(raw: &str) -> Option<JudgeDecision> {
     }
 }
 
-/// Inspects the status of the `.agents/hooks.json` or `.claude/settings.json` file in the workspace or home directory.
+/// Inspects the status of the `.agents/hooks.json`, `.claude/settings.json`, or Muse `settings.json` file in the workspace or home directory.
 pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
     let path = resolve_hooks_json_path(workspace_path);
     let gemini_path = resolve_gemini_hooks_json_path(workspace_path);
     let claude_path = resolve_claude_settings_path(workspace_path);
+    let muse_path = resolve_muse_settings_path(workspace_path);
 
-    let exists = path.is_file() || gemini_path.is_file() || claude_path.is_file();
+    let exists =
+        path.is_file() || gemini_path.is_file() || claude_path.is_file() || muse_path.is_file();
     let read_agents_enabled = |p: &std::path::Path| -> bool {
         if !p.is_file() {
             return false;
@@ -190,8 +192,11 @@ pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
     };
     let agents_enabled = read_agents_enabled(&path) || read_agents_enabled(&gemini_path);
 
-    let claude_enabled = if claude_path.is_file() {
-        std::fs::read_to_string(&claude_path)
+    let check_pre_tool_use = |p: &std::path::Path| -> bool {
+        if !p.is_file() {
+            return false;
+        }
+        std::fs::read_to_string(p)
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|json| json.get("hooks").cloned())
@@ -214,15 +219,20 @@ pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
                 })
             })
             .unwrap_or(false)
-    } else {
-        false
     };
 
-    let enabled = agents_enabled || claude_enabled;
+    let claude_enabled = check_pre_tool_use(&claude_path);
+    let muse_enabled = check_pre_tool_use(&muse_path);
+
+    let enabled = agents_enabled || claude_enabled || muse_enabled;
     let shim_installed = check_shim_installed();
     JudgeHookStatus {
         path: if gemini_path.is_file() && !path.is_file() {
             gemini_path.to_string_lossy().into_owned()
+        } else if !path.is_file() && claude_path.is_file() {
+            claude_path.to_string_lossy().into_owned()
+        } else if !path.is_file() && muse_path.is_file() {
+            muse_path.to_string_lossy().into_owned()
         } else {
             path.to_string_lossy().into_owned()
         },
@@ -396,6 +406,87 @@ pub fn configure_hook(
         let _ = atomic_write_file(&claude_path, &pretty_claude);
     }
 
+    // Also configure Muse settings.json if present or muse config dir exists
+    let muse_path = resolve_muse_settings_path(workspace_path);
+    let should_configure_muse =
+        muse_path.is_file() || muse_path.parent().map(|p| p.is_dir()).unwrap_or(false);
+    if should_configure_muse {
+        if let Some(parent) = muse_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut muse_json = if muse_path.is_file() {
+            let content = std::fs::read_to_string(&muse_path).unwrap_or_default();
+            serde_json::from_str::<serde_json::Value>(&content)
+                .unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+        if !muse_json.is_object() {
+            muse_json = serde_json::json!({});
+        }
+        let muse_map = muse_json.as_object_mut().expect("must be object");
+        let mut hooks_obj = muse_map
+            .get("hooks")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+
+        if enabled {
+            let mut pre_arr = hooks_obj
+                .get("PreToolUse")
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default();
+            let already_has = pre_arr.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|cmd| {
+                            cmd.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.contains("triage-hook"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if !already_has {
+                pre_arr.push(serde_json::json!({
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": cargo_hook,
+                            "timeout": 15
+                        }
+                    ]
+                }));
+            }
+            hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
+        } else if let Some(pre_arr) = hooks_obj
+            .get_mut("PreToolUse")
+            .and_then(|v| v.as_array_mut())
+        {
+            pre_arr.retain(|entry| {
+                !entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|cmd| {
+                            cmd.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.contains("triage-hook"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+        }
+        muse_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
+        if let Ok(pretty_muse) = serde_json::to_string_pretty(&muse_json) {
+            let _ = atomic_write_file(&muse_path, &pretty_muse);
+        }
+    }
+
     let shim_installed = check_shim_installed();
     Ok(JudgeHookStatus {
         path: path.to_string_lossy().into_owned(),
@@ -440,6 +531,38 @@ fn resolve_gemini_hooks_json_path(workspace_path: Option<&str>) -> std::path::Pa
 
 fn resolve_claude_settings_path(workspace_path: Option<&str>) -> std::path::PathBuf {
     resolve_workspace_config_path(workspace_path, ".claude/settings.json")
+}
+
+fn resolve_muse_settings_path(workspace_path: Option<&str>) -> std::path::PathBuf {
+    if let Some(ws) = workspace_path.filter(|s| !s.trim().is_empty()) {
+        let p = std::path::PathBuf::from(ws);
+        let root = find_git_root(&p).unwrap_or(p);
+        return root.join(".muse/settings.json");
+    }
+
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(root) = find_git_root(&cwd)
+    {
+        let ws_muse = root.join(".muse/settings.json");
+        if ws_muse.is_file() || root.join(".muse").is_dir() {
+            return ws_muse;
+        }
+    }
+
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.trim().is_empty()
+    {
+        return std::path::PathBuf::from(xdg).join("muse/settings.json");
+    }
+
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        return home.join(".config/muse/settings.json");
+    }
+
+    std::path::PathBuf::from(".config/muse/settings.json")
 }
 
 fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1263,6 +1386,40 @@ mod tests {
 
         let checked_disabled = get_hook_status(Some(ws));
         assert!(checked_disabled.exists);
+        assert!(!checked_disabled.enabled);
+
+        let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    #[test]
+    fn configure_and_query_muse_hook_status() {
+        let temp_path =
+            std::env::temp_dir().join(format!("triage-test-muse-{}", rand::random::<u64>()));
+        let muse_dir = temp_path.join(".muse");
+        std::fs::create_dir_all(&muse_dir).expect("create muse dir");
+        let ws = temp_path.to_str().unwrap();
+
+        let initial_status = get_hook_status(Some(ws));
+        assert!(!initial_status.enabled);
+
+        let configured = configure_hook(Some(ws), true).expect("configure");
+        assert!(configured.enabled);
+
+        let muse_file = temp_path.join(".muse/settings.json");
+        assert!(muse_file.is_file());
+        let content = std::fs::read_to_string(&muse_file).expect("read muse settings");
+        assert!(content.contains("triage-hook"));
+
+        let checked = get_hook_status(Some(ws));
+        assert!(checked.exists);
+        assert!(checked.enabled);
+
+        let disabled = configure_hook(Some(ws), false).expect("disable");
+        assert!(!disabled.enabled);
+        let disabled_content = std::fs::read_to_string(&muse_file).expect("read muse settings");
+        assert!(!disabled_content.contains("triage-hook"));
+
+        let checked_disabled = get_hook_status(Some(ws));
         assert!(!checked_disabled.enabled);
 
         let _ = std::fs::remove_dir_all(&temp_path);

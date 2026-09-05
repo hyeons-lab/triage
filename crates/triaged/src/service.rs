@@ -400,6 +400,68 @@ pub fn install_global_agent_hooks() {
                     }
                 }
             }
+
+            // Also ensure Muse settings.json is configured with the absolute hook command
+            let muse_settings = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+                && !xdg.trim().is_empty()
+            {
+                std::path::PathBuf::from(xdg)
+                    .join("muse")
+                    .join("settings.json")
+            } else {
+                home.join(".config").join("muse").join("settings.json")
+            };
+            let file_content =
+                std::fs::read_to_string(&muse_settings).unwrap_or_else(|_| "{}".to_string());
+            if (muse_settings.exists()
+                || muse_settings.parent().map(|p| p.is_dir()).unwrap_or(false))
+                && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&file_content)
+                && let Some(muse_map) = val.as_object_mut()
+            {
+                let mut hooks_obj = muse_map
+                    .get("hooks")
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let mut pre_arr = hooks_obj
+                    .get("PreToolUse")
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                let already_has = pre_arr.iter().any(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|cmd| {
+                                cmd.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.contains("triage-hook"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                if !already_has {
+                    pre_arr.push(serde_json::json!({
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": hook_cmd,
+                                "timeout": 15
+                            }
+                        ]
+                    }));
+                    hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
+                    muse_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
+                    if let Ok(updated) = serde_json::to_string_pretty(&val) {
+                        let _ = atomic_write_file(&muse_settings, &updated);
+                        tracing::info!(
+                            path = %muse_settings.display(),
+                            "Configured Muse hooks"
+                        );
+                    }
+                }
+            }
         }
     }
 }

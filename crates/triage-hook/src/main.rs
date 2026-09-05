@@ -305,6 +305,7 @@ fn extract_path(args: &serde_json::Value) -> Option<String> {
 enum AgentFormat {
     Antigravity,
     ClaudeCode,
+    Muse,
     Generic,
 }
 
@@ -313,6 +314,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         match fmt.to_lowercase().as_str() {
             "claude" | "claude_code" | "claudecode" => return AgentFormat::ClaudeCode,
             "antigravity" | "gemini" | "agy" => return AgentFormat::Antigravity,
+            "muse" => return AgentFormat::Muse,
             "generic" => return AgentFormat::Generic,
             _ => {}
         }
@@ -324,21 +326,12 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         if arg == "--format=antigravity" || arg == "--format=gemini" || arg == "--format=agy" {
             return AgentFormat::Antigravity;
         }
+        if arg == "--format=muse" {
+            return AgentFormat::Muse;
+        }
         if arg == "--format=generic" {
             return AgentFormat::Generic;
         }
-    }
-
-    if std::env::var("CLAUDE_CODE_VERSION").is_ok() || std::env::var("CLAUDE_PROJECT_DIR").is_ok() {
-        return AgentFormat::ClaudeCode;
-    }
-
-    // Claude Code specific payload fields
-    if val.get("hook_event_name").is_some()
-        || val.get("hookEventName").is_some()
-        || val.get("transcript_path").is_some()
-    {
-        return AgentFormat::ClaudeCode;
     }
 
     // Antigravity specific payload fields
@@ -348,11 +341,34 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         || val.get("tool_call").is_some()
         || val.get("workspacePaths").is_some()
         || val.get("workspace_paths").is_some()
-        || val.get("transcriptPath").is_some()
         || val.get("artifactDirectoryPath").is_some()
         || val.get("modelName").is_some()
     {
         return AgentFormat::Antigravity;
+    }
+
+    if std::env::var("CLAUDE_CODE_VERSION").is_ok() || std::env::var("CLAUDE_PROJECT_DIR").is_ok() {
+        return AgentFormat::ClaudeCode;
+    }
+
+    // Claude Code passes transcript_path in all tool hook payloads
+    if val.get("transcript_path").is_some() {
+        return AgentFormat::ClaudeCode;
+    }
+
+    // Muse specific payload fields
+    let is_muse_model = val
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|m| m.to_ascii_lowercase().contains("muse"))
+        .unwrap_or(false);
+    if val.get("turn_id").is_some() || val.get("turnId").is_some() || is_muse_model {
+        return AgentFormat::Muse;
+    }
+
+    // Claude Code specific payload fields
+    if val.get("hook_event_name").is_some() || val.get("hookEventName").is_some() {
+        return AgentFormat::ClaudeCode;
     }
 
     AgentFormat::Antigravity
@@ -1097,6 +1113,7 @@ fn encode_response(
     verdict: &JudgeVerdict,
     request: Option<&JudgeRequest>,
     agent_name: Option<&str>,
+    raw_args: Option<&serde_json::Value>,
 ) -> String {
     if format == AgentFormat::ClaudeCode {
         return match verdict.decision {
@@ -1111,6 +1128,44 @@ fn encode_response(
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
                         "permissionDecisionReason": reason
+                    }
+                })
+                .to_string()
+            }
+            triage_core::judge::JudgeDecision::Deny => {
+                let reason = if !verdict.reason.is_empty() {
+                    verdict.reason.as_str()
+                } else {
+                    "denied by triage approval judge"
+                };
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason
+                    }
+                })
+                .to_string()
+            }
+            triage_core::judge::JudgeDecision::Ask => String::new(),
+        };
+    }
+
+    if format == AgentFormat::Muse {
+        return match verdict.decision {
+            triage_core::judge::JudgeDecision::Allow => {
+                let reason = if !verdict.reason.is_empty() {
+                    Some(verdict.reason.as_str())
+                } else {
+                    None
+                };
+                let updated_input = raw_args.cloned().unwrap_or_else(|| serde_json::json!({}));
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": reason,
+                        "updatedInput": updated_input
                     }
                 })
                 .to_string()
@@ -1173,8 +1228,14 @@ fn encode_response(
 }
 
 fn main() {
-    let (verdict, format, request, agent_name) = decide();
-    let encoded = encode_response(format, &verdict, request.as_ref(), agent_name.as_deref());
+    let (verdict, format, request, agent_name, raw_args) = decide();
+    let encoded = encode_response(
+        format,
+        &verdict,
+        request.as_ref(),
+        agent_name.as_deref(),
+        raw_args.as_ref(),
+    );
     if !encoded.is_empty() {
         let mut stdout = std::io::stdout();
         let _ = writeln!(stdout, "{encoded}");
@@ -1191,6 +1252,7 @@ fn decide() -> (
     AgentFormat,
     Option<JudgeRequest>,
     Option<String>,
+    Option<serde_json::Value>,
 ) {
     let start_time = std::time::Instant::now();
     // Read stdin incrementally in chunks and parse as soon as a complete JSON payload
@@ -1240,12 +1302,14 @@ fn decide() -> (
                 AgentFormat::Generic,
                 None,
                 None,
+                None,
             );
         }
         Err(_) => {
             return (
                 JudgeVerdict::fallback("timed out waiting for stdin payload"),
                 AgentFormat::Generic,
+                None,
                 None,
                 None,
             );
@@ -1259,6 +1323,7 @@ fn decide() -> (
             format,
             None,
             agent_name,
+            None,
         );
     };
 
@@ -1295,7 +1360,7 @@ fn decide() -> (
     };
     let remaining_timeout = JUDGE_TIMEOUT.saturating_sub(start_time.elapsed());
     let verdict = ask_daemon(request.clone(), remaining_timeout);
-    (verdict, format, Some(request), agent_name)
+    (verdict, format, Some(request), agent_name, Some(tool_args))
 }
 
 /// Evaluates deterministic Layer 1 deny and Layer 2 allow rules in-process using
@@ -1522,6 +1587,7 @@ mod tests {
             &allow_verdict,
             Some(&allow_req),
             None,
+            None,
         );
         assert!(allow_encoded.contains(r#""decision":"allow""#));
         assert!(allow_encoded.contains(r#""permissionOverrides""#));
@@ -1546,8 +1612,13 @@ mod tests {
             path: None,
             cwd: None,
         };
-        let ask_encoded =
-            encode_response(AgentFormat::Antigravity, &ask_verdict, Some(&request), None);
+        let ask_encoded = encode_response(
+            AgentFormat::Antigravity,
+            &ask_verdict,
+            Some(&request),
+            None,
+            None,
+        );
         assert_eq!(ask_encoded, "");
 
         let allow_cmd_verdict = JudgeVerdict {
@@ -1559,6 +1630,7 @@ mod tests {
             AgentFormat::Antigravity,
             &allow_cmd_verdict,
             Some(&request),
+            None,
             None,
         );
         assert!(allow_cmd_encoded.contains(r#""decision":"allow""#));
@@ -1634,7 +1706,8 @@ mod tests {
             source: triage_core::judge::JudgeSource::AllowRule,
             reason: "matched allow rule: ls".to_string(),
         };
-        let encoded_allow = encode_response(AgentFormat::ClaudeCode, &allow_verdict, None, None);
+        let encoded_allow =
+            encode_response(AgentFormat::ClaudeCode, &allow_verdict, None, None, None);
         assert_eq!(
             encoded_allow,
             r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"matched allow rule: ls"}}"#
@@ -1645,8 +1718,89 @@ mod tests {
             source: triage_core::judge::JudgeSource::Fallback,
             reason: "requires confirmation".to_string(),
         };
-        let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None, None);
+        let encoded_ask = encode_response(AgentFormat::ClaudeCode, &ask_verdict, None, None, None);
         assert_eq!(encoded_ask, "");
+    }
+
+    #[test]
+    fn muse_format_emits_spec_compliant_hook_specific_output_with_updated_input() {
+        let allow_verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "matched allow rule: ls".to_string(),
+        };
+        let tool_args = serde_json::json!({"command": "ls -la"});
+        let encoded_allow = encode_response(
+            AgentFormat::Muse,
+            &allow_verdict,
+            None,
+            None,
+            Some(&tool_args),
+        );
+        let allow_val: serde_json::Value = serde_json::from_str(&encoded_allow).unwrap();
+        assert_eq!(
+            allow_val["hookSpecificOutput"]["hookEventName"],
+            "PreToolUse"
+        );
+        assert_eq!(
+            allow_val["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
+        assert_eq!(
+            allow_val["hookSpecificOutput"]["permissionDecisionReason"],
+            "matched allow rule: ls"
+        );
+        assert_eq!(
+            allow_val["hookSpecificOutput"]["updatedInput"]["command"],
+            "ls -la"
+        );
+
+        let deny_verdict = JudgeVerdict {
+            decision: JudgeDecision::Deny,
+            source: triage_core::judge::JudgeSource::DenyRule,
+            reason: "destructive command blocked".to_string(),
+        };
+        let encoded_deny = encode_response(AgentFormat::Muse, &deny_verdict, None, None, None);
+        let deny_val: serde_json::Value = serde_json::from_str(&encoded_deny).unwrap();
+        assert_eq!(deny_val["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            deny_val["hookSpecificOutput"]["permissionDecisionReason"],
+            "destructive command blocked"
+        );
+
+        let ask_verdict = JudgeVerdict {
+            decision: JudgeDecision::Ask,
+            source: triage_core::judge::JudgeSource::Fallback,
+            reason: "requires confirmation".to_string(),
+        };
+        let encoded_ask = encode_response(AgentFormat::Muse, &ask_verdict, None, None, None);
+        assert_eq!(encoded_ask, "");
+    }
+
+    #[test]
+    fn detects_muse_signatures() {
+        let muse_model_payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_id": "sess-muse",
+                "model": "muse-spark-1.3-contributor",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "bash",
+                "tool_input": {"command": "echo 1"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(detect_format(&muse_model_payload), AgentFormat::Muse);
+
+        let muse_turn_payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "turn_id": "turn-42",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "read_file",
+                "tool_input": {"path": "foo.txt"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(detect_format(&muse_turn_payload), AgentFormat::Muse);
     }
 
     #[test]
@@ -1693,7 +1847,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::DenyRule,
             reason: String::new(),
         };
-        let encoded = encode_response(AgentFormat::Antigravity, &verdict, None, None);
+        let encoded = encode_response(AgentFormat::Antigravity, &verdict, None, None, None);
         assert_eq!(encoded, r#"{"decision":"deny"}"#);
     }
 
@@ -2104,7 +2258,7 @@ mod tests {
             source: triage_core::judge::JudgeSource::DenyRule,
             reason: "destructive command blocked".to_string(),
         };
-        let encoded = encode_response(AgentFormat::Generic, &verdict, None, None);
+        let encoded = encode_response(AgentFormat::Generic, &verdict, None, None, None);
         let val: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(val["decision"], "deny");
         assert_eq!(val["reason"], "destructive command blocked");
