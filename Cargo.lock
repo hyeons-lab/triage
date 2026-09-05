@@ -4026,6 +4026,7 @@ dependencies = [
  "triage-core",
  "triage-transport-ws",
  "unicode-width 0.2.0",
+ "zstd",
 ]
 
 [[package]]
