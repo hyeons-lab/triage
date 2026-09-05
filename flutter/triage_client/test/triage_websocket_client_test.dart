@@ -955,5 +955,132 @@ void main() {
       // Absent rather than null, matching the daemon's `skip_serializing_if`.
       expect(await future, isNot(contains('latest_version')));
     });
+
+    test('decodes RailPinsUpdatedPayload push broadcast', () async {
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-flatbuffers',
+      );
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await client.connect();
+
+      final events = <Map<String, dynamic>>[];
+      client.events.listen(events.add);
+
+      channel.addIncoming(
+        fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.RailPinsUpdatedPayload,
+          payload: fbs.RailPinsUpdatedPayloadObjectBuilder(
+            groupKeys: ['/repo/a'],
+            sessionIds: ['session-1', 'session-2'],
+          ),
+        ).toBytes(),
+      );
+
+      await pumpEventQueue();
+      expect(events, hasLength(1));
+      expect(events.first, {
+        'type': 'rail_pins_updated',
+        'group_keys': ['/repo/a'],
+        'session_ids': ['session-1', 'session-2'],
+      });
+    });
+
+    test(
+      'decodes SessionCustomLabelUpdatedPayload with label and cleared label',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final events = <Map<String, dynamic>>[];
+        client.events.listen(events.add);
+
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType:
+                fbs.ServerMessagePayloadTypeId.SessionCustomLabelUpdatedPayload,
+            payload: fbs.SessionCustomLabelUpdatedPayloadObjectBuilder(
+              sessionId: 's-42',
+              label: 'Worker Node',
+              hasLabel: true,
+            ),
+          ).toBytes(),
+        );
+
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType:
+                fbs.ServerMessagePayloadTypeId.SessionCustomLabelUpdatedPayload,
+            payload: fbs.SessionCustomLabelUpdatedPayloadObjectBuilder(
+              sessionId: 's-42',
+              label: null,
+              hasLabel: false,
+            ),
+          ).toBytes(),
+        );
+
+        await pumpEventQueue();
+        expect(events, hasLength(2));
+        expect(events[0], {
+          'type': 'session_custom_label_updated',
+          'session_id': 's-42',
+          'custom_label': 'Worker Node',
+        });
+        expect(events[1], {
+          'type': 'session_custom_label_updated',
+          'session_id': 's-42',
+          'custom_label': null,
+        });
+      },
+    );
+
+    test('getRailLayout decodes FlatBuffers RailLayoutResult', () async {
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-flatbuffers',
+      );
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await client.connect();
+
+      final future = client.getRailLayout();
+      channel.addIncoming(
+        fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.RailLayoutResult,
+            result: fbs.RailLayoutResultObjectBuilder(
+              groupKeys: ['/repo/main'],
+              sessionIds: ['session-x'],
+              customLabels: [
+                fbs.CustomLabelEntryObjectBuilder(
+                  sessionId: 'session-x',
+                  label: 'Primary Task',
+                ),
+              ],
+            ),
+          ),
+        ).toBytes(),
+      );
+
+      final layout = await future;
+      expect(layout, isNotNull);
+      expect(layout!.groupKeys, ['/repo/main']);
+      expect(layout.sessionIds, ['session-x']);
+      expect(layout.customLabels, {'session-x': 'Primary Task'});
+    });
   });
 }

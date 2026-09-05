@@ -501,11 +501,23 @@ pub fn parse_client_message(
             })?;
             let group_keys = req
                 .group_keys()
-                .map(|v| v.iter().map(|s| s.to_string()).collect())
+                .map(|v| {
+                    let mut vec = Vec::with_capacity(v.len());
+                    for s in v.iter() {
+                        vec.push(s.to_string());
+                    }
+                    vec
+                })
                 .unwrap_or_default();
             let session_ids = req
                 .session_ids()
-                .map(|v| v.iter().map(|s| s.to_string()).collect())
+                .map(|v| {
+                    let mut vec = Vec::with_capacity(v.len());
+                    for s in v.iter() {
+                        vec.push(s.to_string());
+                    }
+                    vec
+                })
                 .unwrap_or_default();
             ClientRequest::SetRailPins {
                 group_keys,
@@ -1425,8 +1437,10 @@ pub fn build_server_message<'a>(
                         .map(|s| builder.create_string(s))
                         .collect();
                     let sid_vec = builder.create_vector(&sid_offsets);
-                    let mut cl_offsets = Vec::with_capacity(custom_labels.len());
-                    for (sid, label) in custom_labels {
+                    let mut sorted_labels: Vec<_> = custom_labels.iter().collect();
+                    sorted_labels.sort_by(|a, b| a.0.cmp(b.0));
+                    let mut cl_offsets = Vec::with_capacity(sorted_labels.len());
+                    for (sid, label) in sorted_labels {
                         let sid_str = builder.create_string(sid);
                         let label_str = builder.create_string(label);
                         cl_offsets.push(fb::CustomLabelEntry::create(
@@ -2004,11 +2018,16 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         .custom_labels()
                         .map(|v| {
                             v.iter()
-                                .map(|entry| {
-                                    (
-                                        entry.session_id().unwrap_or(""),
-                                        entry.label().unwrap_or(""),
-                                    )
+                                .filter_map(|entry| {
+                                    let sid = entry.session_id()?.trim();
+                                    if sid.is_empty() {
+                                        return None;
+                                    }
+                                    let label = entry.label()?.trim();
+                                    if label.is_empty() {
+                                        return None;
+                                    }
+                                    Some((sid, label))
                                 })
                                 .collect()
                         })
@@ -2210,8 +2229,11 @@ pub fn parse_fb_server_message_borrowed<'a>(
             } else {
                 None
             };
+            let session_id = payload.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
             Ok(ServerMessageBorrowed::SessionCustomLabelUpdated {
-                session_id: payload.session_id().unwrap_or(""),
+                session_id,
                 custom_label,
             })
         }

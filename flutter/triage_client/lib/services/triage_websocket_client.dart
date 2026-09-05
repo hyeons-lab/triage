@@ -1045,7 +1045,7 @@ class TriageWebSocketClient {
       return {
         'type': 'session_custom_label_updated',
         'session_id': updated.sessionId,
-        'custom_label': updated.customLabel,
+        'custom_label': updated.hasLabel ? updated.label : null,
       };
     }
     // Reached for `NONE`, or for a union member the bindings know but the

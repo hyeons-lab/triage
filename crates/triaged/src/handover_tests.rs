@@ -1050,6 +1050,45 @@ mod tests {
     }
 
     #[test]
+    fn recovered_handover_merges_pins_and_custom_labels() {
+        let mut custom_labels = std::collections::HashMap::new();
+        custom_labels.insert("s-recovered".to_string(), "Recovered Label".to_string());
+        let recovered = crate::handover::HandoverState {
+            sessions: Vec::new(),
+            has_tcp_listener: false,
+            sends_teardown_commit: false,
+            handover_owner_token: Some([2; 16]),
+            handover_lineage_token: Some([9; 16]),
+            judge_history: Vec::new(),
+            pins: triage_core::session::SessionPins {
+                group_keys: vec!["recovered-group".to_string()],
+                session_ids: vec!["s-recovered".to_string()],
+            },
+            custom_labels,
+        };
+        crate::handover::remember_recovered_handover_for_test(recovered, Vec::new());
+
+        let mut state = crate::handover::HandoverState {
+            sessions: Vec::new(),
+            has_tcp_listener: false,
+            sends_teardown_commit: false,
+            handover_owner_token: Some([1; 16]),
+            handover_lineage_token: Some([9; 16]),
+            judge_history: Vec::new(),
+            ..Default::default()
+        };
+        let mut fds = Vec::new();
+        crate::handover::merge_recovered_handovers(&mut state, &mut fds);
+
+        assert_eq!(state.pins.group_keys, vec!["recovered-group"]);
+        assert_eq!(state.pins.session_ids, vec!["s-recovered"]);
+        assert_eq!(
+            state.custom_labels.get("s-recovered"),
+            Some(&"Recovered Label".to_string())
+        );
+    }
+
+    #[test]
     fn tokenless_recovery_treats_zero_foreground_group_as_stale() {
         assert!(crate::handover::tokenless_pty_foreground_is_live_for_test(
             42, None

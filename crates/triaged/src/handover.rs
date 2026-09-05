@@ -1584,6 +1584,14 @@ mod unix_impl {
             if state.judge_history.is_empty() && !recovered_state.judge_history.is_empty() {
                 state.judge_history = std::mem::take(&mut recovered_state.judge_history);
             }
+            if state.pins.is_empty() && !recovered_state.pins.is_empty() {
+                state.pins = std::mem::take(&mut recovered_state.pins);
+            }
+            if !recovered_state.custom_labels.is_empty() {
+                for (sid, label) in std::mem::take(&mut recovered_state.custom_labels) {
+                    state.custom_labels.entry(sid).or_insert(label);
+                }
+            }
             let mut raw_fds = recovered_fds.into_raw();
             if recovered_state.has_tcp_listener && !raw_fds.is_empty() {
                 let listener_fd = raw_fds.remove(0);

@@ -509,23 +509,33 @@ struct SessionManifest {
     custom_labels: HashMap<String, String>,
 }
 
+#[derive(Serialize)]
+struct SessionManifestBorrowed<'a> {
+    version: u32,
+    sessions: Vec<PersistedSession>,
+    pins: &'a SessionPins,
+    custom_labels: &'a HashMap<String, String>,
+}
+
 fn encode_manifest(
     sessions: &HashMap<SessionId, ManagedSession>,
     excluded: Option<&SessionId>,
     pins: &SessionPins,
     custom_labels: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
-    let mut persisted_sessions = sessions
-        .iter()
-        .filter(|(session_id, _)| excluded != Some(*session_id))
-        .map(|(session_id, session)| session.persisted(session_id.clone()))
-        .collect::<Vec<_>>();
+    let mut persisted_sessions = Vec::with_capacity(sessions.len());
+    for (session_id, session) in sessions {
+        if excluded == Some(session_id) {
+            continue;
+        }
+        persisted_sessions.push(session.persisted(session_id.clone()));
+    }
     persisted_sessions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    serde_json::to_vec_pretty(&SessionManifest {
+    serde_json::to_vec_pretty(&SessionManifestBorrowed {
         version: 1,
         sessions: persisted_sessions,
-        pins: pins.clone(),
-        custom_labels: custom_labels.clone(),
+        pins,
+        custom_labels,
     })
     .context("encoding session manifest")
 }
@@ -1451,10 +1461,13 @@ impl SessionManager {
             .map_err(|_| anyhow!("paired devices lock poisoned"))
     }
 
-    fn persist_manifest(&self, sessions: &HashMap<SessionId, ManagedSession>) -> Result<()> {
-        let pins = self.pins()?;
-        let custom_labels = self.custom_labels()?;
-        let json = encode_manifest(sessions, None, &pins, &custom_labels)?;
+    fn persist_manifest_with_layout(
+        &self,
+        sessions: &HashMap<SessionId, ManagedSession>,
+        pins: &SessionPins,
+        custom_labels: &HashMap<String, String>,
+    ) -> Result<()> {
+        let json = encode_manifest(sessions, None, pins, custom_labels)?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
@@ -1464,6 +1477,12 @@ impl SessionManager {
             .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
         replace_manifest(&temp_path, &manifest_path)?;
         Ok(())
+    }
+
+    fn persist_manifest(&self, sessions: &HashMap<SessionId, ManagedSession>) -> Result<()> {
+        let pins = self.pins()?;
+        let custom_labels = self.custom_labels()?;
+        self.persist_manifest_with_layout(sessions, &pins, &custom_labels)
     }
 
     fn prepare_shutdown_manifest(
@@ -1965,6 +1984,23 @@ impl SessionManager {
         }
     }
 
+    fn adopt_inherited_layout(&self, state: &mut crate::handover::HandoverState) {
+        if !state.pins.is_empty() {
+            let mut pins = self
+                .pins
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *pins = std::mem::take(&mut state.pins);
+        }
+        if !state.custom_labels.is_empty() {
+            let mut labels = self
+                .custom_labels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            labels.extend(std::mem::take(&mut state.custom_labels));
+        }
+    }
+
     #[cfg(unix)]
     pub fn queue_handover_adoptions(
         &self,
@@ -1974,16 +2010,7 @@ impl SessionManager {
         if !state.judge_history.is_empty() {
             self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
         }
-        if !state.pins.is_empty()
-            && let Ok(mut pins) = self.pins.lock()
-        {
-            *pins = std::mem::take(&mut state.pins);
-        }
-        if !state.custom_labels.is_empty()
-            && let Ok(mut labels) = self.custom_labels.lock()
-        {
-            labels.extend(std::mem::take(&mut state.custom_labels));
-        }
+        self.adopt_inherited_layout(&mut state);
         let mut pending = UnadoptedFds::new(fds);
         let expected = state.sessions.len();
         let retained: Vec<_> = state
@@ -2009,16 +2036,7 @@ impl SessionManager {
         if !state.judge_history.is_empty() {
             self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
         }
-        if !state.pins.is_empty()
-            && let Ok(mut pins) = self.pins.lock()
-        {
-            *pins = std::mem::take(&mut state.pins);
-        }
-        if !state.custom_labels.is_empty()
-            && let Ok(mut labels) = self.custom_labels.lock()
-        {
-            labels.extend(std::mem::take(&mut state.custom_labels));
-        }
+        self.adopt_inherited_layout(&mut state);
         let mut pending = UnadoptedFds::new(fds);
         let mut sessions = match self.sessions() {
             Ok(sessions) => sessions,
@@ -3509,14 +3527,20 @@ impl SessionApi for SessionManager {
     }
 
     fn set_rail_pins(&self, group_keys: Vec<String>, session_ids: Vec<String>) -> Result<()> {
+        let candidate_pins = SessionPins {
+            group_keys: group_keys.clone(),
+            session_ids: session_ids.clone(),
+        };
         {
-            let mut guard = self.pins()?;
-            guard.group_keys = group_keys.clone();
-            guard.session_ids = session_ids.clone();
+            let sessions = self.sessions()?;
+            let mut pins = self.pins()?;
+            if *pins == candidate_pins {
+                return Ok(());
+            }
+            let custom_labels = self.custom_labels()?;
+            self.persist_manifest_with_layout(&sessions, &candidate_pins, &custom_labels)?;
+            *pins = candidate_pins;
         }
-        let sessions = self.sessions()?;
-        self.persist_manifest(&sessions)?;
-        drop(sessions);
 
         self.broadcast_global(ServerMessage::RailPinsUpdated {
             group_keys,
@@ -3535,19 +3559,27 @@ impl SessionApi for SessionManager {
             if t.is_empty() { None } else { Some(t) }
         });
         {
-            let mut guard = self.custom_labels()?;
+            let sessions = self.sessions()?;
+            let pins = self.pins()?;
+            let mut labels = self.custom_labels()?;
+            let mut candidate_labels = labels.clone();
             match &trimmed {
                 Some(label) => {
-                    guard.insert(session_id.as_str().to_string(), label.clone());
+                    if labels.get(session_id.as_str()) == Some(label) {
+                        return Ok(());
+                    }
+                    candidate_labels.insert(session_id.as_str().to_string(), label.clone());
                 }
                 None => {
-                    guard.remove(session_id.as_str());
+                    if !labels.contains_key(session_id.as_str()) {
+                        return Ok(());
+                    }
+                    candidate_labels.remove(session_id.as_str());
                 }
             }
+            self.persist_manifest_with_layout(&sessions, &pins, &candidate_labels)?;
+            *labels = candidate_labels;
         }
-        let sessions = self.sessions()?;
-        self.persist_manifest(&sessions)?;
-        drop(sessions);
 
         self.broadcast_global(ServerMessage::SessionCustomLabelUpdated {
             session_id,
