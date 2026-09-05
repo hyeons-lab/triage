@@ -101,14 +101,16 @@ fn multi_segment_tail_assembly() {
     let total_bytes: u64 = 1000 + 1000 + 500; // 2500
 
     // Request tail of 800 bytes: should get 300 bytes of 'B' + 500 bytes of 'C'
-    let (start_offset, tail) = read_multi_segment_tail(&session_dir, total_bytes, 800);
+    let (start_offset, tail) =
+        read_multi_segment_tail(&session_dir, total_bytes, 800).expect("read tail");
     assert_eq!(start_offset, 1700);
     assert_eq!(tail.len(), 800);
     assert_eq!(&tail[..300], &vec![b'B'; 300][..]);
     assert_eq!(&tail[300..], &vec![b'C'; 500][..]);
 
     // Request tail of 2000 bytes: should get 500 bytes of 'A', 1000 bytes of 'B', 500 bytes of 'C'
-    let (start_offset, tail) = read_multi_segment_tail(&session_dir, total_bytes, 2000);
+    let (start_offset, tail) =
+        read_multi_segment_tail(&session_dir, total_bytes, 2000).expect("read tail");
     assert_eq!(start_offset, 500);
     assert_eq!(tail.len(), 2000);
     assert_eq!(&tail[..500], &vec![b'A'; 500][..]);
@@ -211,7 +213,7 @@ fn legacy_log_migration() {
     assert_eq!(segments[2].index, 3);
     assert!(!segments[2].is_compressed); // segment 3 is active uncompressed
 
-    let tail = read_multi_segment_tail(&session_dir, 2560, 2560);
+    let tail = read_multi_segment_tail(&session_dir, 2560, 2560).expect("read tail");
     assert_eq!(tail.0, 0);
     assert_eq!(tail.1.len(), 2560);
     assert_eq!(&tail.1[..1024], &chunk_a[..]);
@@ -378,12 +380,13 @@ fn get_segment_uncompressed_size_and_tail_offset() {
     assert_eq!(size, 500);
 
     // Request tail larger than available content: start_offset must equal total_uncompressed_bytes - combined.len()
-    let (start_offset, tail) = read_multi_segment_tail(&session_dir, 500, 1000);
+    let (start_offset, tail) = read_multi_segment_tail(&session_dir, 500, 1000).expect("read tail");
     assert_eq!(start_offset, 0);
     assert_eq!(tail.len(), 500);
 
     // Request tail smaller than available content
-    let (start_offset2, tail2) = read_multi_segment_tail(&session_dir, 500, 100);
+    let (start_offset2, tail2) =
+        read_multi_segment_tail(&session_dir, 500, 100).expect("read tail");
     assert_eq!(start_offset2, 400);
     assert_eq!(tail2.len(), 100);
 

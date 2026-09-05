@@ -636,6 +636,11 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
     <integer>{throttle}</integer>
     <key>ExitTimeOut</key>
     <integer>{stop_grace}</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>{max_files}</integer>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
@@ -648,6 +653,7 @@ fn plist_contents(exe: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
         throttle = THROTTLE_INTERVAL_SECS,
+        max_files = crate::handover::DAEMON_MAX_OPEN_FILES,
         stop_grace = LAUNCHD_STOP_GRACE_SECS,
         stdout = xml_escape(&stdout_log.display().to_string()),
         stderr = xml_escape(&stderr_log.display().to_string()),
@@ -1115,9 +1121,39 @@ mod tests {
         assert!(body.contains("<key>KeepAlive</key>"));
     }
 
+    /// launchd hands a job a soft `RLIMIT_NOFILE` of 256, which a daemon holding
+    /// one PTY master per session exhausts at a few dozen sessions. The daemon
+    /// also raises the limit itself, but only the plist covers the window before
+    /// that call runs.
+    #[test]
+    fn plist_requests_a_file_descriptor_ceiling_above_the_launchd_default() {
+        let body = plist_contents(
+            Path::new("/usr/local/bin/triaged"),
+            Path::new("/tmp/out.log"),
+            Path::new("/tmp/err.log"),
+        );
+
+        // The value must belong to the NumberOfFiles key nested under
+        // SoftResourceLimits, not merely appear somewhere in the plist.
+        assert!(
+            body.contains(&format!(
+                "<key>SoftResourceLimits</key>\n    <dict>\n        \
+                 <key>NumberOfFiles</key>\n        <integer>{}</integer>",
+                crate::handover::DAEMON_MAX_OPEN_FILES
+            )),
+            "SoftResourceLimits must request NumberOfFiles: {body}"
+        );
+        const {
+            assert!(
+                crate::handover::DAEMON_MAX_OPEN_FILES > 256,
+                "the requested ceiling must exceed launchd's 256 default"
+            )
+        };
+    }
+
     /// The daemon must stay supervised unconditionally, but a binary launchd
-    /// cannot start — one macOS SIGKILLs for an invalid code signature after an
-    /// in-place upgrade — must not be retried at launchd's 10s default forever.
+    /// cannot start (one macOS SIGKILLs for an invalid code signature after an
+    /// in-place upgrade) must not be retried at launchd's 10s default forever.
     #[test]
     fn plist_keeps_alive_unconditionally_and_throttles_respawns() {
         let body = plist_contents(

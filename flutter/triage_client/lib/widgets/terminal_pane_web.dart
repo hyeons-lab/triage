@@ -220,12 +220,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       _initialized = true;
       _initialContentWritten = true;
       _styleSheetLoaded = true;
+      try {
+        final rowsNum = js_util.getProperty(_term, 'rows') as num?;
+        final colsNum = js_util.getProperty(_term, 'cols') as num?;
+        if (rowsNum != null && colsNum != null) {
+          _lastFittedRows = rowsNum.toInt();
+          _lastFittedCols = colsNum.toInt();
+        }
+      } catch (_) {}
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
-      if (widget.focusCursorRevision > 0) {
-        _restoreScrollPosition(requestFocus: true);
-      }
+      _restoreScrollPosition(requestFocus: widget.focusCursorRevision > 0);
+      _triggerFitWithDelayedRetries();
     } else {
       _container = html.DivElement()
         ..style.width = '100%'
@@ -291,7 +298,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
+      if (mounted && _initialized) {
+        if (cachedContainer != null) {
+          _writeInitialContent();
+        }
         _activateTerminal();
       }
     });
@@ -1075,8 +1085,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onClear() {
-    if (!_initialized) return;
-    js_util.callMethod(_term, 'clear', []);
+    _resetTerminalSafe();
   }
 
   void _onResize(int cols, int rows) {

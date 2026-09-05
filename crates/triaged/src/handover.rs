@@ -260,6 +260,18 @@ const _: () = assert!(
      swaps that were about to succeed"
 );
 
+/// Soft `RLIMIT_NOFILE` the daemon raises itself to, and the value the macOS
+/// LaunchAgent requests via `SoftResourceLimits`.
+///
+/// The daemon holds one PTY master per live session for its whole lifetime, and
+/// handover briefly doubles that while it dups every master to send. Against
+/// launchd's default soft limit of 256 that ceiling is reached at a few dozen
+/// sessions, and the first symptom is not a clean error: segment listings fail
+/// with `EMFILE` and sessions render with empty scrollback. Well under
+/// `kern.maxfilesperproc`, so the raise is bounded by the hard limit in
+/// practice, never by this constant alone.
+pub const DAEMON_MAX_OPEN_FILES: u64 = 10_240;
+
 #[cfg(unix)]
 pub use unix_impl::*;
 
@@ -753,6 +765,30 @@ mod unix_impl {
             }
         }
         Ok(())
+    }
+
+    /// Raises the process file descriptor limit (RLIMIT_NOFILE) up to the hard
+    /// limit (capped at 10240) so the daemon does not exhaust file descriptors
+    /// when supervising many live sessions and segment logs.
+    pub fn raise_fd_limit() {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
+        // SAFETY: `limit` points to writable storage for getrlimit.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return;
+        }
+        // SAFETY: getrlimit succeeded and initialized the structure.
+        let mut limit = unsafe { limit.assume_init() };
+        let desired = limit
+            .rlim_max
+            .min(super::DAEMON_MAX_OPEN_FILES as libc::rlim_t);
+        if desired > limit.rlim_cur {
+            limit.rlim_cur = desired;
+            // SAFETY: `limit` was returned by getrlimit and only its soft value was
+            // raised, never beyond the reported hard limit.
+            unsafe {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
     }
 
     fn ensure_fd_capacity(additional: usize) -> io::Result<()> {
@@ -2473,4 +2509,6 @@ mod fallback_impl {
     ) -> Result<TeardownOutcome> {
         Ok(TeardownOutcome::Adopt)
     }
+
+    pub fn raise_fd_limit() {}
 }
