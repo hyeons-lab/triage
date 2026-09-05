@@ -34,6 +34,10 @@ fn main() -> anyhow::Result<()> {
         Invocation::Service(_) | Invocation::Daemon { .. } => {}
     }
 
+    // Raise file descriptor capacity so supervising dozens of sessions and logs
+    // does not exhaust the default soft limit (e.g. 256 on macOS).
+    triaged::handover::raise_fd_limit();
+
     // Before any handover work: make job control unable to stop us, and make a
     // terminating signal something we can answer rather than die on. Both are set up
     // here, ahead of the long startup, because from the moment this process adopts a

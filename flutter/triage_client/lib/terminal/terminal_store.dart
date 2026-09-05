@@ -565,11 +565,21 @@ class TerminalStore extends ChangeNotifier {
     if (!s.contains('\x1b')) {
       return s;
     }
-    final partial = _partialEscapeSequence.firstMatch(s);
+    var tailStart = s.length > _kMaxCarryEscapeLength
+        ? s.length - _kMaxCarryEscapeLength
+        : 0;
+    if (tailStart > 0 && tailStart < s.length) {
+      final unit = s.codeUnitAt(tailStart);
+      if (unit >= 0xDC00 && unit <= 0xDFFF) {
+        tailStart -= 1;
+      }
+    }
+    final scanTail = s.substring(tailStart);
+    final partial = _partialEscapeSequence.firstMatch(scanTail);
     // Only hold a bounded partial; otherwise let it flush to avoid unbounded
     // growth on a stream that never completes the sequence.
-    if (partial != null && (s.length - partial.start) <= _kMaxCarryEscapeLength) {
-      var carryStart = partial.start;
+    if (partial != null) {
+      var carryStart = (s.length - scanTail.length) + partial.start;
       // If the partial escape sequence is immediately preceded by a bare LF,
       // include the LF in the carry so newline translation isn't prematurely
       // evaluated without its following escape sequence across chunk boundaries.

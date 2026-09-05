@@ -383,6 +383,7 @@ pub struct SessionManager {
     /// Guards [`Self::start_activity_persistence`] so a second call cannot spawn a
     /// second flush thread, both racing to rewrite the same manifest.
     activity_persistence_started: AtomicBool,
+    _compression_worker: Arc<crate::storage::CompressionWorker>,
 }
 
 /// Channel an actor uses to report a working-directory change to the manager's
@@ -628,6 +629,7 @@ impl SessionManager {
         } else {
             true
         };
+        let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
             next_session: AtomicU64::new(next_session),
@@ -661,6 +663,7 @@ impl SessionManager {
             session_shutdowns_in_flight: AtomicU64::new(0),
             session_lifecycle_ids: Mutex::new(HashSet::new()),
             activity_persistence_started: AtomicBool::new(false),
+            _compression_worker: compression_worker,
         }
     }
 
@@ -1358,7 +1361,85 @@ impl SessionManager {
     }
 
     fn log_path(&self, session_id: &SessionId) -> PathBuf {
-        self.config.log_dir.join(format!("{session_id}.log"))
+        self.config
+            .log_dir
+            .join("sessions")
+            .join(session_id.as_str())
+            .join(crate::storage::segment_file_name(1))
+    }
+
+    pub fn compression_tx(&self) -> Option<Sender<crate::storage::WorkerMessage>> {
+        self._compression_worker.sender()
+    }
+
+    pub fn search_session_logs(
+        &self,
+        session_id: &SessionId,
+        query: &str,
+        case_insensitive: bool,
+    ) -> Result<Vec<crate::storage::SearchHit>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let session_dir = self
+            .config
+            .log_dir
+            .join("sessions")
+            .join(session_id.as_str());
+        if session_dir.is_dir() {
+            crate::storage::search_session_segments(&session_dir, query, case_insensitive)
+        } else {
+            let legacy_log = self.config.log_dir.join(format!("{session_id}.log"));
+            if legacy_log.is_file() {
+                let bytes = fs::read(&legacy_log)?;
+                let text = crate::storage::strip_ansi_escapes(&bytes);
+                let query_lower = query.to_lowercase();
+                let mut hits = Vec::new();
+                for (idx, line) in text.lines().enumerate() {
+                    if crate::storage::line_matches_query(
+                        line,
+                        query,
+                        &query_lower,
+                        case_insensitive,
+                    ) {
+                        hits.push(crate::storage::SearchHit {
+                            segment_index: 1,
+                            line_number: idx + 1,
+                            line_text: line.to_string(),
+                        });
+                        if hits.len() >= crate::storage::MAX_SEARCH_HITS {
+                            break;
+                        }
+                    }
+                }
+                Ok(hits)
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    pub fn search_all_sessions(
+        &self,
+        query: &str,
+        case_insensitive: bool,
+    ) -> Result<HashMap<SessionId, Vec<crate::storage::SearchHit>>> {
+        let sessions = self.sessions()?;
+        let session_ids: Vec<SessionId> = sessions.keys().cloned().collect();
+        drop(sessions);
+
+        let mut all_hits = HashMap::new();
+        for session_id in session_ids {
+            if let Some(hits) = self
+                .search_session_logs(&session_id, query, case_insensitive)
+                .ok()
+                .filter(|h| !h.is_empty())
+            {
+                all_hits.insert(session_id, hits);
+            }
+        }
+        Ok(all_hits)
     }
 
     /// Reclaims session logs that nothing refers to any more.
@@ -1839,7 +1920,7 @@ impl SessionManager {
                 args: launch.args,
                 cwd: launch.cwd,
                 size: launch.size,
-                log_path: launch.log_path,
+                log_path: ext.log_path,
                 output_seq: ext.output_seq,
                 bytes_logged: ext.bytes_logged,
                 pid: ext.pid,
@@ -2104,19 +2185,86 @@ impl SessionManager {
     }
 
     #[cfg(unix)]
+    fn original_session_id(id: &SessionId) -> SessionId {
+        let id_str = id.as_str();
+        if let Some((base, _)) = id_str.split_once("-recovered-")
+            && let Ok(cand) = SessionId::new(base)
+        {
+            return cand;
+        }
+        id.clone()
+    }
+
+    #[cfg(unix)]
+    fn logs_belong_to_same_session(persisted: &Path, inherited: &Path, id: &SessionId) -> bool {
+        if persisted == inherited {
+            return true;
+        }
+        let id_str = id.as_str();
+        let belongs = |p: &Path| -> bool {
+            if let Some(file_name) = p.file_name().and_then(|n| n.to_str())
+                && let Some(remainder) = file_name.strip_prefix(id_str)
+                && (remainder == ".log"
+                    || remainder.starts_with("-recovered-")
+                    || remainder.starts_with(".log.migrated"))
+            {
+                return true;
+            }
+            if let Some(parent) = p
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                && (parent == id_str
+                    || parent
+                        .strip_prefix(id_str)
+                        .is_some_and(|rem| rem.starts_with("-recovered-"))
+                    || SessionId::new(parent)
+                        .map(|sid| Self::original_session_id(&sid) == *id)
+                        .unwrap_or(false))
+            {
+                return true;
+            }
+            false
+        };
+        belongs(persisted) && belongs(inherited)
+    }
+
+    #[cfg(unix)]
     fn adopt_one_session(
         &self,
         sessions: &mut HashMap<SessionId, ManagedSession>,
         h_sess: &mut crate::handover::HandoverSession,
         fd: std::os::unix::io::RawFd,
     ) -> Result<()> {
+        let canonical_id = Self::original_session_id(&h_sess.id);
+        if canonical_id != h_sess.id {
+            match sessions.get(&canonical_id) {
+                None | Some(ManagedSession::Historical { .. }) => {
+                    let log_dir = &self.config.log_dir;
+                    let canonical_dir = log_dir.join("sessions").join(canonical_id.as_str());
+                    if canonical_dir.is_dir()
+                        && let Ok((active_seg, _, _)) =
+                            crate::storage::resolve_active_segment(&canonical_dir)
+                    {
+                        h_sess.log_path = active_seg;
+                    }
+                    h_sess.id = canonical_id;
+                }
+                _ => {}
+            }
+        }
+
         let conflicts_with_existing =
             sessions
                 .get(&h_sess.id)
                 .is_some_and(|existing| match existing {
                     ManagedSession::Live { .. } | ManagedSession::Restoring { .. } => true,
                     ManagedSession::Historical { session, .. } => {
-                        session.persisted.log_path != h_sess.log_path
+                        !Self::logs_belong_to_same_session(
+                            &session.persisted.log_path,
+                            &h_sess.log_path,
+                            &h_sess.id,
+                        )
                     }
                 });
         if conflicts_with_existing {
@@ -2126,7 +2274,8 @@ impl SessionManager {
             .with_context(|| format!("reserving a distinct log for session {}", h_sess.id))?;
         }
 
-        let runtime = spawn_adopted_pty_runtime(h_sess, fd)?;
+        let mut runtime = spawn_adopted_pty_runtime(h_sess, fd)?;
+        runtime.output.compression_tx = self.compression_tx();
 
         if let Some(sequence) = generated_session_sequence(&h_sess.id) {
             self.next_session
@@ -2138,7 +2287,7 @@ impl SessionManager {
             args: h_sess.args.clone(),
             cwd: h_sess.cwd.clone(),
             size: h_sess.size.clone(),
-            log_path: h_sess.log_path.clone(),
+            log_path: runtime.output.log_path.clone(),
         };
 
         let event_session_id = Some(h_sess.id.clone());
@@ -2154,7 +2303,6 @@ impl SessionManager {
             writer,
             output,
             size,
-            log_path,
             current_working_directory,
         } = runtime;
 
@@ -2197,7 +2345,6 @@ impl SessionManager {
                     writer_tx,
                     output,
                     size,
-                    log_path,
                     exited: false,
                     output_closed: false,
                     exit_broadcasted: false,
@@ -2239,6 +2386,14 @@ impl SessionManager {
                 last_known_cwd,
             },
         );
+
+        // Purge any stale historical placeholders whose IDs were generated from
+        // intermediate recovery renames of this session (e.g. session-195-recovered-<pid>).
+        let stale_prefix = format!("{}-recovered-", h_sess.id);
+        sessions.retain(|id, session| {
+            !(id.as_str().starts_with(&stale_prefix)
+                && matches!(session, ManagedSession::Historical { .. }))
+        });
 
         if let Some(explicit) = h_sess.judge_override {
             let mut overrides = self
@@ -2476,23 +2631,49 @@ fn spawn_adopted_pty_runtime(
     let writer = shared_pty_writer(master.take_writer().context("taking PTY writer")?);
 
     let terminal = terminal_with_writer(&h_sess.size, writer.clone());
+    let (target_log_path, active_segment_index, active_segment_bytes) =
+        if let Some(session_dir) = resolve_segment_session_dir(&h_sess.log_path) {
+            crate::storage::resolve_active_segment(&session_dir)?
+        } else {
+            let (active_segment_index, _) = h_sess
+                .log_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .unwrap_or((1, false));
+            let active_segment_bytes = fs::metadata(&h_sess.log_path).map(|m| m.len()).unwrap_or(0);
+            (
+                h_sess.log_path.clone(),
+                active_segment_index,
+                active_segment_bytes,
+            )
+        };
+
+    if let Some(parent) = target_log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
     let log = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
-        .open(&h_sess.log_path)
-        .with_context(|| format!("opening session log {}", h_sess.log_path.display()))?;
+        .open(&target_log_path)
+        .with_context(|| format!("opening session log {}", target_log_path.display()))?;
 
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
-        log_path: h_sess.log_path.clone(),
+        log_path: target_log_path,
         trim_disabled: false,
         max_log_bytes: MAX_SESSION_LOG_BYTES,
         retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
+        segment_size_bytes: crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+        active_segment_index,
+        active_segment_bytes,
+        compression_tx: None,
         terminal,
         cwd_sequence_buffer: Vec::new(),
-        bytes_logged: 0,
-        output_seq: 0,
+        bytes_logged: h_sess.bytes_logged,
+        output_seq: h_sess.output_seq,
         log_cache: None,
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
@@ -2519,7 +2700,6 @@ fn spawn_adopted_pty_runtime(
         writer,
         output,
         size: h_sess.size.clone(),
-        log_path: h_sess.log_path.clone(),
         current_working_directory,
     })
 }
@@ -2664,6 +2844,7 @@ impl SessionApi for SessionManager {
             self.dirty_tx(),
             self.cwd_update_tx(),
             Some(self.global_senders()),
+            self.compression_tx(),
         )?;
 
         let mut sessions = self.sessions()?;
@@ -2974,6 +3155,7 @@ impl SessionApi for SessionManager {
             self.dirty_tx(),
             self.cwd_update_tx(),
             Some(self.global_senders()),
+            self.compression_tx(),
         ) {
             Ok(actor) => actor,
             Err(error) => {
@@ -4040,6 +4222,25 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<RestoredSessions> {
 
     let mut sessions = HashMap::new();
     for persisted in manifest.sessions {
+        if let Some(_name) = persisted
+            .log_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|name| {
+                persisted.log_path.is_file()
+                    && name.ends_with(".log")
+                    && crate::storage::parse_segment_index(name).is_none()
+            })
+        {
+            let session_dir = config.log_dir.join("sessions").join(persisted.id.as_str());
+            if !session_dir.exists() {
+                let _ = crate::storage::migrate_legacy_session_log(
+                    &persisted.log_path,
+                    &session_dir,
+                    crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+                );
+            }
+        }
         match HistoricalSession::restore(persisted) {
             Ok(session) => {
                 sessions.insert(
@@ -4059,37 +4260,64 @@ fn restore_sessions(config: &SessionManagerConfig) -> Result<RestoredSessions> {
 }
 
 /// Deletes the output log of a session that has just been removed from the
-/// manifest. Best-effort: a failure leaks one log file, which must not turn a
+/// manifest. Best-effort: a failure leaks log files, which must not turn a
 /// successful shutdown into an error.
-///
-/// The path comes from the manifest or a handover payload, so it is *data*, not
-/// something this process derived. Before unlinking, require it to be named
-/// `{session_id}.log`: a corrupted manifest — or a future bug recording the
-/// wrong path — would otherwise make this delete an arbitrary file. Leaking a
-/// stray log is recoverable; deleting the wrong file is not.
-///
-/// Only the basename is constrained, not the directory, so this narrows the hole
-/// rather than closing it. That is deliberate: a session adopted from a
-/// predecessor with a different `log_dir` carries that directory in its path,
-/// and rejecting it would leak exactly the logs this is meant to reclaim. The
-/// basename is the part that never legitimately varies.
 fn remove_session_log(session_id: &SessionId, log_path: &Path) {
+    if let Some(session_dir) = resolve_segment_session_dir(log_path)
+        .filter(|dir| dir.file_name().and_then(|n| n.to_str()) == Some(session_id.as_str()))
+    {
+        match fs::remove_dir_all(&session_dir) {
+            Ok(()) => tracing::info!(
+                session_id = %session_id,
+                session_dir = %session_dir.display(),
+                "removed session log directory for shut-down session"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                session_id = %session_id,
+                session_dir = %session_dir.display(),
+                ?error,
+                "failed to remove session directory for shut-down session"
+            ),
+        }
+        if let Some(sessions_dir) = session_dir.parent() {
+            let parent = if sessions_dir.file_name().and_then(|n| n.to_str()) == Some("sessions") {
+                sessions_dir.parent().unwrap_or(sessions_dir)
+            } else {
+                sessions_dir
+            };
+            let legacy_log = parent.join(format!("{session_id}.log"));
+            let _ = fs::remove_file(&legacy_log);
+            let _ = fs::remove_file(legacy_log.with_extension("log.migrated"));
+        }
+        return;
+    }
+
     let expected = format!("{session_id}.log");
     if log_path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
         tracing::warn!(
             session_id = %session_id,
             log_path = %log_path.display(),
-            "refusing to remove a session log whose name does not match the session; \
-             leaving it in place"
+            "refusing to remove a session log whose name does not match the session; leaving it in place"
         );
         return;
     }
     match fs::remove_file(log_path) {
-        Ok(()) => tracing::info!(
-            session_id = %session_id,
-            log_path = %log_path.display(),
-            "removed session log for shut-down session"
-        ),
+        Ok(()) => {
+            tracing::info!(
+                session_id = %session_id,
+                log_path = %log_path.display(),
+                "removed session log for shut-down session"
+            );
+            let migrated = log_path.with_extension("log.migrated");
+            let _ = fs::remove_file(migrated);
+            if let Some(parent) = log_path.parent() {
+                let session_dir = parent.join("sessions").join(session_id.as_str());
+                if session_dir.is_dir() {
+                    let _ = fs::remove_dir_all(session_dir);
+                }
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(
             session_id = %session_id,
@@ -4102,33 +4330,15 @@ fn remove_session_log(session_id: &SessionId, log_path: &Path) {
 
 /// Grace period before an unreferenced session log is deleted.
 ///
-/// Reference checking is the real safety property — [`SessionManager::purge_orphaned_logs`]
+/// Reference checking is the real safety property: [`SessionManager::purge_orphaned_logs`]
 /// runs only once every session this daemon owns is in the map, and unions that
 /// with the manifest. This age check is a second, weaker line: it bounds the
-/// damage if that picture is ever wrong (a manifest written mid-change, a
-/// session created by a path not yet considered). It is emphatically *not* a
-/// guarantee on its own — an idle shell can sit at a prompt for weeks without
-/// writing a byte — so it is applied in addition to reference checking, never
-/// instead of it.
+/// damage if that picture is ever wrong.
 const ORPHANED_LOG_RETENTION: std::time::Duration =
     std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Deletes session logs in `log_dir` that are absent from `referenced` and have
 /// not been written to for `retention`.
-///
-/// Before session shutdown learned to delete its own log, every shut-down
-/// session leaked one; this reclaims that backlog and anything a failed deletion
-/// leaves behind. Best-effort throughout — this runs on the startup path and
-/// must never prevent the daemon from coming up.
-///
-/// Matching is by *file name*, not by full path. A manifest records the absolute
-/// `log_path` a session was created with and keeps it for the session's whole
-/// life, while the scanned paths are rebuilt from the current `log_dir`; the two
-/// can spell the same location differently (a symlinked `$HOME`, macOS's
-/// `/var` → `/private/var`, a re-pointed `XDG_STATE_HOME`). Comparing whole
-/// paths would then match nothing and classify *every* referenced log as an
-/// orphan — and since historical sessions are exactly the ones untouched for
-/// weeks, the age guard would not save them.
 fn purge_orphaned_session_logs(
     log_dir: &Path,
     referenced: &HashSet<PathBuf>,
@@ -4137,6 +4347,16 @@ fn purge_orphaned_session_logs(
     let referenced_names: HashSet<&std::ffi::OsStr> = referenced
         .iter()
         .filter_map(|path| path.file_name())
+        .collect();
+    let referenced_stems: HashSet<std::ffi::OsString> = referenced
+        .iter()
+        .filter_map(|path| {
+            if let Some(session_dir) = resolve_segment_session_dir(path) {
+                session_dir.file_name().map(|s| s.to_os_string())
+            } else {
+                path.file_stem().map(|s| s.to_os_string())
+            }
+        })
         .collect();
 
     let entries = match fs::read_dir(log_dir) {
@@ -4155,39 +4375,159 @@ fn purge_orphaned_session_logs(
     let (mut removed, mut reclaimed) = (0_u64, 0_u64);
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
-            continue;
-        }
-        if path
-            .file_name()
-            .is_some_and(|name| referenced_names.contains(name))
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with(".tmp-")
         {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let stale = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= retention);
-        if !stale {
-            continue;
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                removed += 1;
-                reclaimed += metadata.len();
+            if let Ok(metadata) = entry.metadata() {
+                let stale = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= retention);
+                if stale {
+                    if path.is_dir() {
+                        let _ = fs::remove_dir_all(&path);
+                    } else {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
             }
-            Err(error) => tracing::warn!(
-                log_path = %path.display(),
-                ?error,
-                "failed to remove orphaned session log"
-            ),
+            continue;
+        }
+        if path.is_file() {
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            let is_log = file_name.ends_with(".log");
+            let is_migrated = file_name.ends_with(".log.migrated");
+            if !is_log && !is_migrated {
+                continue;
+            }
+            if referenced_names.contains(std::ffi::OsStr::new(file_name)) {
+                continue;
+            }
+            if is_migrated && let Some(stem) = file_name.strip_suffix(".log.migrated") {
+                let log_name = format!("{stem}.log");
+                if referenced_names.contains(std::ffi::OsStr::new(&log_name))
+                    || referenced_stems.contains(std::ffi::OsStr::new(stem))
+                {
+                    continue;
+                }
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let stale = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= retention);
+            if !stale {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    reclaimed += metadata.len();
+                }
+                Err(error) => tracing::warn!(
+                    log_path = %path.display(),
+                    ?error,
+                    "failed to remove orphaned session log"
+                ),
+            }
+        }
+    }
+
+    let sessions_dir = log_dir.join("sessions");
+    if let Ok(entries) = fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name_str) = path.file_name().and_then(|n| n.to_str())
+                && name_str.starts_with(".tmp-")
+            {
+                if let Ok(metadata) = entry.metadata() {
+                    let is_stale = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .is_some_and(|age| age >= retention);
+                    if is_stale {
+                        if path.is_dir() {
+                            let _ = fs::remove_dir_all(&path);
+                        } else {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(dir_name) = path.file_name().filter(|_| path.is_dir()) {
+                if referenced_stems.contains(dir_name) || referenced_names.contains(dir_name) {
+                    continue;
+                }
+                let mut dir_stale = true;
+                let mut dir_bytes = 0u64;
+                let mut inner_count = 0usize;
+                match fs::read_dir(&path) {
+                    Ok(inner_entries) => {
+                        for inner in inner_entries {
+                            let inner = match inner {
+                                Ok(i) => i,
+                                Err(_) => {
+                                    dir_stale = false;
+                                    break;
+                                }
+                            };
+                            inner_count += 1;
+                            match inner.metadata() {
+                                Ok(meta) => {
+                                    dir_bytes += meta.len();
+                                    let is_recent = match meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|m| now.duration_since(m).ok())
+                                    {
+                                        Some(age) => age < retention,
+                                        None => true,
+                                    };
+                                    if is_recent {
+                                        dir_stale = false;
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    dir_stale = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        dir_stale = false;
+                    }
+                }
+                if inner_count == 0 && dir_stale {
+                    if let Ok(metadata) = entry.metadata() {
+                        let stale = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|modified| now.duration_since(modified).ok())
+                            .is_some_and(|age| age >= retention);
+                        dir_stale = stale;
+                    } else {
+                        dir_stale = false;
+                    }
+                }
+                if !dir_stale {
+                    continue;
+                }
+                if fs::remove_dir_all(&path).is_ok() {
+                    removed += 1;
+                    reclaimed += dir_bytes;
+                }
+            }
         }
     }
 
@@ -4393,9 +4733,10 @@ fn closed_session_event_receiver() -> SessionEventReceiver {
 }
 
 impl HistoricalSession {
-    fn restore(persisted: PersistedSession) -> Result<Self> {
+    fn restore(mut persisted: PersistedSession) -> Result<Self> {
         let size = persisted.size.clone();
         let mut output = output_state_for_log(&persisted.log_path, persisted.size.clone())?;
+        persisted.log_path = output.log_path.clone();
         let (log_len, log) = read_replay_tail(&persisted.log_path)?;
         // Always replay to rebuild the terminal screen; its OSC 7 cwd result is a
         // by-product used as one cwd candidate below. Guarded on the reported
@@ -4499,6 +4840,7 @@ impl SessionActor {
             None,
             None,
             None,
+            None,
             LogInitialization::Truncate,
         )
     }
@@ -4509,6 +4851,7 @@ impl SessionActor {
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
@@ -4517,6 +4860,7 @@ impl SessionActor {
             dirty_tx,
             cwd_update_tx,
             global_senders,
+            compression_tx,
             LogInitialization::Truncate,
         )
     }
@@ -4534,6 +4878,7 @@ impl SessionActor {
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
@@ -4542,10 +4887,12 @@ impl SessionActor {
             dirty_tx,
             cwd_update_tx,
             global_senders,
+            compression_tx,
             LogInitialization::ReplayExisting,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with_events(
         config: SessionConfig,
         event_session_id: Option<SessionId>,
@@ -4553,10 +4900,12 @@ impl SessionActor {
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
         log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
-        let runtime = spawn_pty_runtime(config, log_initialization)?;
+        let mut runtime = spawn_pty_runtime(config, log_initialization)?;
+        runtime.output.compression_tx = compression_tx;
         let PtyRuntime {
             master,
             child,
@@ -4565,7 +4914,6 @@ impl SessionActor {
             writer,
             output,
             size,
-            log_path,
             current_working_directory,
         } = runtime;
         let initial_working_directory = current_working_directory.or(initial_working_directory);
@@ -4599,7 +4947,6 @@ impl SessionActor {
                     writer_tx,
                     output,
                     size,
-                    log_path,
                     exited: false,
                     output_closed: false,
                     exit_broadcasted: false,
@@ -4760,7 +5107,6 @@ struct ActorState {
     writer_tx: SyncSender<Vec<u8>>,
     output: OutputState,
     size: SessionSize,
-    log_path: PathBuf,
     exited: bool,
     output_closed: bool,
     exit_broadcasted: bool,
@@ -4810,15 +5156,13 @@ struct PtyRuntime {
     writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
-    log_path: PathBuf,
     current_working_directory: Option<PathBuf>,
 }
 
 struct OutputState {
     log: File,
-    /// Path of `log`, retained so the log can be trimmed once it outgrows
-    /// [`MAX_SESSION_LOG_BYTES`]. Trimming rewrites the file through a separate
-    /// non-append handle, which has to be opened by path.
+    /// Path of `log`, retained so the log can be trimmed or rotated once it outgrows
+    /// its limit.
     log_path: PathBuf,
     /// Set after a trim fails, to stop retrying it on every subsequent write.
     trim_disabled: bool,
@@ -4828,6 +5172,10 @@ struct OutputState {
     /// without writing megabytes.
     max_log_bytes: u64,
     retain_log_bytes: u64,
+    segment_size_bytes: u64,
+    active_segment_index: u32,
+    active_segment_bytes: u64,
+    compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     terminal: Terminal,
     cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
@@ -4913,6 +5261,7 @@ pub struct ExtractedHandover {
     pub fd: std::os::unix::io::OwnedFd,
     pub pid: u32,
     pub process_identity: Option<crate::handover::HandoverProcessIdentity>,
+    pub log_path: PathBuf,
     pub output_seq: u64,
     pub bytes_logged: u64,
 }
@@ -4997,6 +5346,7 @@ impl ActorState {
             fd: unsafe { std::os::unix::io::FromRawFd::from_raw_fd(dup_fd) },
             pid,
             process_identity: self.process_identity,
+            log_path: self.output.log_path.clone(),
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
         })
@@ -5373,7 +5723,11 @@ impl ActorState {
     /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
     /// the plain [`Self::snapshot`] so they never carry history.
     fn snapshot_with_history(&self) -> SessionSnapshot {
-        overlay_raw_output_history(self.snapshot(), &self.log_path, self.output.bytes_logged)
+        overlay_raw_output_history(
+            self.snapshot(),
+            &self.output.log_path,
+            self.output.bytes_logged,
+        )
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -5804,8 +6158,13 @@ impl OutputState {
             .write_all(bytes)
             .context("writing PTY output log")?;
         self.bytes_logged += bytes.len() as u64;
+        self.active_segment_bytes += bytes.len() as u64;
         self.output_seq += 1;
-        self.trim_log_if_oversized();
+        if self.is_segmented_log() {
+            self.rotate_segment_if_oversized();
+        } else {
+            self.trim_log_if_oversized();
+        }
         if let Some(cache) = &mut self.log_cache {
             if cache.len() + bytes.len() <= 1024 * 1024 {
                 cache.extend_from_slice(bytes);
@@ -5816,6 +6175,77 @@ impl OutputState {
         let current_working_directory = self.extract_current_working_directory(bytes);
         self.advance_translated_bytes(bytes);
         Ok(current_working_directory)
+    }
+
+    fn is_segmented_log(&self) -> bool {
+        self.log_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::storage::parse_segment_index)
+            .is_some()
+    }
+
+    fn rotate_segment_if_oversized(&mut self) {
+        if self.segment_size_bytes == 0 || self.active_segment_bytes < self.segment_size_bytes {
+            return;
+        }
+
+        let Some((current_idx, _)) = self
+            .log_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::storage::parse_segment_index)
+        else {
+            return;
+        };
+
+        let Some(session_dir) = self.log_path.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+
+        let _ = self.log.flush();
+
+        let next_idx = current_idx + 1;
+        let new_segment_name = crate::storage::segment_file_name(next_idx);
+        let new_segment_path = session_dir.join(&new_segment_name);
+
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&new_segment_path)
+        {
+            Ok(new_log) => {
+                let initial_bytes = new_log.metadata().map(|m| m.len()).unwrap_or(0);
+                let old_segment_path = std::mem::replace(&mut self.log_path, new_segment_path);
+                self.log = new_log;
+                self.active_segment_index = next_idx;
+                self.active_segment_bytes = initial_bytes;
+
+                if let Some(tx) = &self.compression_tx {
+                    let compressed_name = crate::storage::compressed_segment_file_name(current_idx);
+                    let compressed_path = session_dir.join(compressed_name);
+                    if let Err(err) = tx.send(crate::storage::WorkerMessage::Job(
+                        crate::storage::CompressionJob {
+                            raw_path: old_segment_path.clone(),
+                            compressed_path,
+                        },
+                    )) {
+                        tracing::warn!(
+                            path = %old_segment_path.display(),
+                            ?err,
+                            "failed to queue rotated segment for background compression"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %new_segment_path.display(),
+                    ?err,
+                    "failed to rotate session segment file"
+                );
+            }
+        }
     }
 
     /// Trims the log back to [`SESSION_LOG_RETAIN_BYTES`] once it grows past
@@ -6114,12 +6544,22 @@ fn spawn_pty_runtime(
         LogInitialization::Truncate => {
             let writer = shared_pty_writer(pair.master.take_writer().context("taking PTY writer")?);
             let terminal = terminal_with_writer(&config.size, writer.clone());
+            if let Some(parent) = config.log_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             let log = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&config.log_path)
                 .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+            let (active_segment_index, _) = config
+                .log_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .unwrap_or((1, false));
+            let active_segment_bytes = fs::metadata(&config.log_path).map(|m| m.len()).unwrap_or(0);
             Ok(PtyRuntime {
                 master: pair.master,
                 child,
@@ -6132,6 +6572,10 @@ fn spawn_pty_runtime(
                     trim_disabled: false,
                     max_log_bytes: MAX_SESSION_LOG_BYTES,
                     retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
+                    segment_size_bytes: crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+                    active_segment_index,
+                    active_segment_bytes,
+                    compression_tx: None,
                     terminal,
                     cwd_sequence_buffer: Vec::new(),
                     bytes_logged: 0,
@@ -6141,25 +6585,38 @@ fn spawn_pty_runtime(
                     pending_escape_buffer: Vec::new(),
                 },
                 size: config.size,
-                log_path: config.log_path,
                 current_working_directory: None,
             })
         }
         LogInitialization::ReplayExisting => {
             let (writer, replay_gate) = replay_gated_pty_writer();
             let terminal = terminal_with_writer(&config.size, writer.clone());
+            if let Some(parent) = config.log_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             let log = OpenOptions::new()
                 .create(true)
                 .read(true)
                 .append(true)
                 .open(&config.log_path)
                 .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+            let (active_segment_index, _) = config
+                .log_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .unwrap_or((1, false));
+            let active_segment_bytes = fs::metadata(&config.log_path).map(|m| m.len()).unwrap_or(0);
             let mut output = OutputState {
                 log: log.try_clone().context("cloning restored session log")?,
                 log_path: config.log_path.clone(),
                 trim_disabled: false,
                 max_log_bytes: MAX_SESSION_LOG_BYTES,
                 retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
+                segment_size_bytes: crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+                active_segment_index,
+                active_segment_bytes,
+                compression_tx: None,
                 terminal,
                 cwd_sequence_buffer: Vec::new(),
                 bytes_logged: 0,
@@ -6189,7 +6646,6 @@ fn spawn_pty_runtime(
                 writer,
                 output,
                 size: config.size,
-                log_path: config.log_path,
                 current_working_directory,
             })
         }
@@ -6199,13 +6655,13 @@ fn spawn_pty_runtime(
 #[cfg(unix)]
 fn build_pty_command(
     config: &SessionConfig,
-    reset_job_control: bool,
+    needs_job_control_reset: bool,
     current_exe: Option<&Path>,
 ) -> Result<CommandBuilder> {
-    let mut command = if reset_job_control {
-        let current_exe = current_exe
+    let mut command = if needs_job_control_reset {
+        let exe = current_exe
             .context("resolving the triaged executable for the PTY child job-control reset shim")?;
-        let mut command = CommandBuilder::new(current_exe);
+        let mut command = CommandBuilder::new(exe);
         command.arg(PTY_CHILD_EXEC_ARG);
         command.arg(&config.command);
         command
@@ -6219,17 +6675,40 @@ fn build_pty_command(
 }
 
 fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputState> {
+    let (target_log_path, active_segment_index, active_segment_bytes) =
+        if let Some(session_dir) = resolve_segment_session_dir(log_path) {
+            crate::storage::resolve_active_segment(&session_dir)?
+        } else {
+            let (active_segment_index, _) = log_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .unwrap_or((1, false));
+            let active_segment_bytes = fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);
+            (log_path.clone(), active_segment_index, active_segment_bytes)
+        };
+
+    if let Some(parent) = target_log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
     let log = OpenOptions::new()
+        .create(true)
         .read(true)
         .append(true)
-        .open(log_path)
-        .with_context(|| format!("opening session log {}", log_path.display()))?;
+        .open(&target_log_path)
+        .with_context(|| format!("opening session log {}", target_log_path.display()))?;
+
     Ok(OutputState {
         log,
-        log_path: log_path.clone(),
+        log_path: target_log_path,
         trim_disabled: false,
         max_log_bytes: MAX_SESSION_LOG_BYTES,
         retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
+        segment_size_bytes: crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+        active_segment_index,
+        active_segment_bytes,
+        compression_tx: None,
         terminal: terminal_with_writer(&size, shared_pty_writer(Box::new(std::io::sink()))),
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: 0,
@@ -6353,15 +6832,77 @@ fn overlay_raw_output_history(
     snapshot
 }
 
+/// Reports whether `dir` holds segment files, resolving a listing failure to
+/// "yes" rather than "no".
+///
+/// [`crate::storage::list_session_segments`] already answers a missing directory
+/// with an empty list, so an `Err` means the directory exists but could not be
+/// read (a transient condition such as `EMFILE`). Treating that as "no segments"
+/// demotes a segmented session to the legacy single-log path, whose file
+/// migration has already renamed to `*.log.migrated`: readers then serve an
+/// empty history for a session whose segments are intact on disk, and
+/// [`output_state_for_log`] reopens the legacy path with `create(true)`,
+/// stranding subsequent output in a file outside the segment chain. Failing
+/// toward "segmented" keeps the error on the read itself, where it is visible
+/// and recoverable, instead of silently rerouting the session.
+fn has_session_segments(dir: &Path) -> bool {
+    match crate::storage::list_session_segments(dir) {
+        Ok(segments) => !segments.is_empty(),
+        Err(_) => true,
+    }
+}
+
+fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
+    if let Some(file_name) = log_path.file_name().and_then(|n| n.to_str()) {
+        if crate::storage::parse_segment_index(file_name).is_some() {
+            log_path.parent().map(|p| p.to_path_buf())
+        } else if let Some(stem) = file_name.strip_suffix(".log") {
+            if let Some(parent) = log_path.parent() {
+                let candidate = parent.join("sessions").join(stem);
+                if candidate.is_dir() && has_session_segments(&candidate) {
+                    return Some(candidate);
+                }
+            }
+            None
+        } else if log_path.is_dir() && has_session_segments(log_path) {
+            Some(log_path.to_path_buf())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 /// Reads the last `cap` bytes of the raw output log, returning the byte offset of
 /// the first returned byte (`raw_output_start`) and the bytes. These are the
-/// untranslated PTY bytes — byte-identical to the live Output stream — so client
+/// untranslated PTY bytes, byte-identical to the live Output stream, so client
 /// history and live writes are consistent and de-duplicate cleanly by
 /// `output_seq`. `File` writes are unbuffered, so the on-disk tail is current.
 fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, Vec<u8>) {
     if bytes_logged == 0 {
         return (0, Vec::new());
     }
+
+    if let Some(session_dir) = resolve_segment_session_dir(log_path) {
+        return match crate::storage::read_multi_segment_tail(&session_dir, bytes_logged, cap) {
+            Ok(tail) => tail,
+            // Falling back to the legacy single-log read below would be wrong:
+            // migration renamed that file to `*.log.migrated`, so it would report
+            // "no history" for a session whose segments are intact. Log loudly
+            // and return empty here instead, so the cause is attributable rather
+            // than looking like an ordinary empty session.
+            Err(err) => {
+                tracing::error!(
+                    session_dir = %session_dir.display(),
+                    ?err,
+                    "failed to read segmented output tail; serving empty history"
+                );
+                (0, Vec::new())
+            }
+        };
+    }
+
     let start = bytes_logged.saturating_sub(cap);
     let read = (|| -> std::io::Result<Vec<u8>> {
         let mut file = File::open(log_path)?;
@@ -6390,19 +6931,11 @@ fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, V
 /// becomes `bytes_logged`, which must stay equal to the on-disk file length so
 /// the absolute offsets in [`read_raw_output_tail`] keep addressing the right
 /// bytes.
-///
-/// Deliberately *not* built on [`read_raw_output_tail`], which reports an
-/// unreadable log as empty history. That is the right call when serving a
-/// snapshot, but here it would leave `bytes_logged` at zero while the file holds
-/// data — silently breaking the invariant above — so I/O errors propagate.
-///
-/// The offset and the length come from a single open handle rather than a
-/// stat-then-reopen pair, which can disagree because a session log is still
-/// being written during a handover adoption. The reported length is the read's
-/// own end position, clamped to the file's post-read size: `start` is derived
-/// from the *pre*-read length, so a log trimmed below it in between would
-/// otherwise have this report a length past EOF.
 fn read_replay_tail(log_path: &Path) -> Result<(u64, Vec<u8>)> {
+    if let Some(session_dir) = resolve_segment_session_dir(log_path) {
+        return crate::storage::read_multi_segment_replay_tail(&session_dir, REPLAY_TAIL_CAP);
+    }
+
     let mut file = File::open(log_path)
         .with_context(|| format!("opening session log {}", log_path.display()))?;
     let len = file
@@ -7034,12 +7567,56 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
     Some(common_dir)
 }
 
+fn run_command_with_timeout(mut command: Command, timeout: std::time::Duration) -> Option<Vec<u8>> {
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    detach_from_terminal(&mut command);
+    let mut child = command.spawn().ok()?;
+    let stdout_handle = child.stdout.take();
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stdout_handle {
+            use std::io::Read;
+            let _ = stream.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let stdout = reader_thread.join().unwrap_or_default();
+                    return Some(stdout);
+                }
+                let _ = reader_thread.join();
+                return None;
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader_thread.join();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_thread.join();
+                return None;
+            }
+        }
+    }
+}
+
 fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(cwd).args(args);
-    detach_from_terminal(&mut command);
-    let output = command.output().ok()?;
-    output.status.success().then_some(output.stdout)
+    command.arg("--no-pager").arg("-C").arg(cwd).args(args);
+    run_command_with_timeout(command, std::time::Duration::from_millis(1500))
 }
 
 /// Puts a helper child in its own session so no terminal can job-control it.
@@ -7431,6 +8008,134 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_terminates_hanging_process() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("10");
+        let start = Instant::now();
+        let res = run_command_with_timeout(cmd, Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(res.is_none());
+        assert!(elapsed < Duration::from_millis(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_null_stdin_does_not_block() {
+        let cmd = Command::new("cat");
+        let start = Instant::now();
+        let res = run_command_with_timeout(cmd, Duration::from_millis(1500));
+        let elapsed = start.elapsed();
+        assert!(res.is_some());
+        assert!(elapsed < Duration::from_millis(1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_belong_to_same_session_boundary_separation() {
+        let id1 = SessionId::new("session-1").unwrap();
+        let p_exact = Path::new("/var/log/session-1.log");
+        let p_recovered = Path::new("/var/log/session-1-recovered-42.log");
+        let p_migrated = Path::new("/var/log/session-1.log.migrated");
+        let p_segmented = Path::new("/var/log/sessions/session-1/segment-000001.tlog");
+
+        // These belong to session-1
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact, p_exact, &id1
+        ));
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_recovered,
+            &id1
+        ));
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact, p_migrated, &id1
+        ));
+        assert!(SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_segmented,
+            &id1
+        ));
+
+        // Prefix collision paths must NOT belong to session-1
+        let p_colliding10 = Path::new("/var/log/session-10.log");
+        let p_colliding100 = Path::new("/var/log/session-100.log");
+        let p_colliding11_rec = Path::new("/var/log/session-11-recovered-1.log");
+        let p_colliding_seg = Path::new("/var/log/sessions/session-10/segment-000001.tlog");
+
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding10,
+            &id1
+        ));
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding100,
+            &id1
+        ));
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding11_rec,
+            &id1
+        ));
+        assert!(!SessionManager::logs_belong_to_same_session(
+            p_exact,
+            p_colliding_seg,
+            &id1
+        ));
+    }
+
+    /// A directory that cannot be listed must not be mistaken for one holding no
+    /// segments. Answering "no" reroutes a segmented session to the legacy
+    /// single-log path that migration has already renamed away, which serves an
+    /// empty history for intact on-disk segments and lets `output_state_for_log`
+    /// recreate the legacy log outside the segment chain.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_session_directory_still_counts_as_segmented() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "triage-unreadable-segments-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temp).expect("create session dir");
+        std::fs::write(temp.join("segment-000001.tlog"), b"history").expect("write segment");
+
+        // Sanity: readable, so the segment is found the ordinary way.
+        assert!(has_session_segments(&temp));
+
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o000))
+            .expect("make dir unreadable");
+        let unreadable = has_session_segments(&temp);
+        // Restore before asserting so a failure still cleans up.
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        std::fs::remove_dir_all(&temp).ok();
+
+        assert!(
+            unreadable,
+            "a listing failure must resolve to `segmented`, never to `no segments`"
+        );
+    }
+
+    /// A directory that genuinely holds no segments is still the legacy case, so
+    /// the fix above must not make every path look segmented.
+    #[test]
+    fn an_empty_session_directory_is_not_segmented() {
+        let temp = std::env::temp_dir().join(format!(
+            "triage-empty-segments-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temp).expect("create session dir");
+        let empty = has_session_segments(&temp);
+        std::fs::remove_dir_all(&temp).ok();
+        assert!(!empty);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -9193,7 +9898,10 @@ mod tests {
 
         // Read the log before shutting down: shutdown removes the session from
         // the manifest and reclaims its log, so it is gone afterwards.
-        let log_path = log_dir.join(format!("{session_id}.log"));
+        let log_path = log_dir
+            .join("sessions")
+            .join(session_id.as_str())
+            .join("segment-000001.tlog");
         let logged = std::fs::read(&log_path).expect("read managed session log");
         let completed = manager
             .shutdown_session(session_id.clone())
@@ -9301,7 +10009,10 @@ mod tests {
             .expect("persisted session");
         assert_eq!(
             persisted.log_path,
-            log_dir.join(format!("{session_id}.log"))
+            log_dir
+                .join("sessions")
+                .join(session_id.as_str())
+                .join("segment-000001.tlog")
         );
         assert!(!persisted.exited);
 
@@ -9522,7 +10233,11 @@ mod tests {
         let log_dir = unique_log_dir();
         std::fs::create_dir_all(&log_dir).expect("create log dir");
         let session_id = SessionId::new("session-7").expect("session id");
-        let log_path = log_dir.join("session-7.log");
+        let log_path = log_dir
+            .join("sessions")
+            .join("session-7")
+            .join("segment-000001.tlog");
+        std::fs::create_dir_all(log_path.parent().unwrap()).expect("create session log dir");
         std::fs::write(&log_path, b"history-before-restore\r\n").expect("write session log");
         write_manifest(
             &log_dir,
@@ -10986,6 +11701,10 @@ mod tests {
             trim_disabled: false,
             max_log_bytes: MAX_SESSION_LOG_BYTES,
             retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
+            segment_size_bytes: crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+            active_segment_index: 1,
+            active_segment_bytes: 0,
+            compression_tx: None,
             terminal: terminal_with_writer(&SessionSize::default(), writer.clone()),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
@@ -11251,8 +11970,16 @@ mod tests {
 
         let orphan = dir.join("session-1.log");
         let referenced = dir.join("session-2.log");
+        let orphan_migrated = dir.join("session-3.log.migrated");
+        let referenced_migrated = dir.join("session-2.log.migrated");
         let unrelated = dir.join("sessions.json");
-        for path in [&orphan, &referenced, &unrelated] {
+        for path in [
+            &orphan,
+            &referenced,
+            &orphan_migrated,
+            &referenced_migrated,
+            &unrelated,
+        ] {
             fs::write(path, b"x").expect("write test file");
         }
 
@@ -11270,12 +11997,24 @@ mod tests {
         // Nothing is stale yet, so even the orphan survives.
         purge_orphaned_session_logs(&dir, &manifest_paths, std::time::Duration::from_secs(3600));
         assert!(orphan.exists(), "fresh orphan must be kept");
+        assert!(
+            orphan_migrated.exists(),
+            "fresh migrated orphan must be kept"
+        );
 
         // With no grace period the orphan goes; the referenced log and the
         // non-.log manifest must both survive.
         purge_orphaned_session_logs(&dir, &manifest_paths, std::time::Duration::ZERO);
         assert!(!orphan.exists(), "stale orphan must be removed");
+        assert!(
+            !orphan_migrated.exists(),
+            "stale migrated orphan must be removed"
+        );
         assert!(referenced.exists(), "referenced log must never be removed");
+        assert!(
+            referenced_migrated.exists(),
+            "referenced migrated log must never be removed"
+        );
         assert!(unrelated.exists(), "non-log files must be left alone");
 
         let _ = fs::remove_dir_all(&dir);
@@ -11303,6 +12042,10 @@ mod tests {
             trim_disabled: false,
             max_log_bytes: MAX_SESSION_LOG_BYTES,
             retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
+            segment_size_bytes: crate::storage::DEFAULT_SEGMENT_SIZE_BYTES,
+            active_segment_index: 1,
+            active_segment_bytes: 0,
+            compression_tx: None,
             terminal: terminal_with_writer(&size, writer),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
@@ -11525,12 +12268,13 @@ mod tests {
                     else {
                         return;
                     };
-                    let file = std::fs::File::create(probe).expect("open probe");
+                    let file = std::fs::File::create(&probe).expect("open probe");
                     let _ = response.send(Ok(ExtractedHandover {
                         // Safety: `file` gives up its descriptor and nothing else holds it.
                         fd: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(file.into_raw_fd()) },
                         pid: std::process::id(),
                         process_identity: None,
+                        log_path: probe,
                         output_seq: 7,
                         bytes_logged: 11,
                     }));
@@ -12643,5 +13387,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&log_dir2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_logs_belong_to_same_session_with_recovered_suffixes() {
+        let sid = SessionId::new("session-195").unwrap();
+        let path1 = Path::new("/var/log/triage/sessions/session-195/segment-000001.tlog");
+        let path2 =
+            Path::new("/var/log/triage/sessions/session-195-recovered-42/segment-000001.tlog");
+        assert!(SessionManager::logs_belong_to_same_session(
+            path1, path2, &sid
+        ));
+
+        let legacy1 = Path::new("/var/log/triage/session-195.log");
+        let legacy2 = Path::new("/var/log/triage/session-195-recovered-42.log");
+        assert!(SessionManager::logs_belong_to_same_session(
+            legacy1, legacy2, &sid
+        ));
+
+        let other_sid = SessionId::new("session-196").unwrap();
+        assert!(!SessionManager::logs_belong_to_same_session(
+            path1, path2, &other_sid
+        ));
     }
 }

@@ -25,6 +25,7 @@ mod tests {
     }
 
     fn handover_state_lock() -> MutexGuard<'static, ()> {
+        crate::handover::raise_fd_limit();
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
@@ -36,6 +37,7 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
 
+        let _handover_lock = handover_state_lock();
         let (sender, receiver) = UnixStream::pair()?;
         let file = std::fs::File::open("/dev/null")?;
         let raw_fds = vec![file.as_raw_fd(); crate::handover::MAX_HANDOVER_FDS + 1];

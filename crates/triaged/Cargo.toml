@@ -51,6 +51,7 @@ rust-embed = { version = "8", features = ["compression"] }
 bytes = "1"
 http = "1"
 flate2 = "1"
+zstd = { workspace = true }
 
 [lints]
 workspace = true
