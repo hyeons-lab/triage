@@ -852,6 +852,45 @@ mod unix_impl {
             if id_unavailable(&candidate_id) {
                 continue;
             }
+            let is_segmented = original_log
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .is_some()
+                || original_log
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(session.id.as_str());
+
+            if is_segmented {
+                let session_dir = if original_log.is_dir() {
+                    original_log.clone()
+                } else {
+                    original_log.parent().unwrap_or(&original_log).to_path_buf()
+                };
+                let sessions_parent = session_dir.parent().unwrap_or(&session_dir);
+                let candidate_dir = sessions_parent.join(candidate_id.as_str());
+                if candidate_dir.exists() {
+                    continue;
+                }
+                std::fs::create_dir_all(&candidate_dir)?;
+                if let Ok(entries) = std::fs::read_dir(&session_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if let Some(file_name) = path.file_name().filter(|_| path.is_file()) {
+                            let _ = std::fs::copy(&path, candidate_dir.join(file_name));
+                        }
+                    }
+                }
+                let active_segment = crate::storage::resolve_active_segment(&candidate_dir)
+                    .map(|(path, _, _)| path)
+                    .unwrap_or_else(|_| candidate_dir.join(crate::storage::segment_file_name(1)));
+                session.id = candidate_id;
+                session.log_path = active_segment;
+                return Ok(());
+            }
+
             let candidate_log = original_log.with_file_name(format!("{candidate_id}.log"));
             let mut destination = match std::fs::OpenOptions::new()
                 .write(true)
