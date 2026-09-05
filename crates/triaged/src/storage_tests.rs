@@ -689,3 +689,44 @@ fn search_session_segments_multibyte_across_compressed_and_uncompressed() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn burst_write_oversized_segment_compression_and_reading() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join("segment-000001.tlog");
+    let comp_path = temp_dir.join("segment-000001.tlog.zst");
+
+    // Write a burst of data that slightly exceeds 8 MiB (8 MiB + 64 KiB = 8,454,144 bytes)
+    let extra_bytes = 64 * 1024;
+    let total_size = (DEFAULT_SEGMENT_SIZE_BYTES as usize) + extra_bytes;
+    let pattern = b"0123456789abcdef";
+    let full_data = pattern
+        .iter()
+        .copied()
+        .cycle()
+        .take(total_size)
+        .collect::<Vec<u8>>();
+
+    fs::write(&raw_path, &full_data).expect("write oversized raw segment");
+    compress_segment_file(&raw_path, &comp_path).expect("compress oversized segment");
+
+    let info = SegmentFileInfo {
+        index: 1,
+        path: comp_path.clone(),
+        is_compressed: true,
+        file_size: fs::metadata(&comp_path).expect("meta").len(),
+    };
+
+    let discovered_size = get_segment_uncompressed_size(&info).expect("discovered size");
+    assert_eq!(discovered_size, total_size as u64);
+
+    let decompressed = read_segment_uncompressed(&info).expect("decompressed");
+    assert_eq!(decompressed.len(), total_size);
+    assert_eq!(decompressed, full_data);
+
+    let tail_slice = read_segment_tail(&info, 128).expect("read tail");
+    assert_eq!(tail_slice.len(), 128);
+    assert_eq!(tail_slice, &full_data[total_size - 128..]);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

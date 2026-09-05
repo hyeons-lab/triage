@@ -684,11 +684,13 @@ fn systemd_unit_contents(exe: &Path) -> String {
          RestartSec=2\n\
          TimeoutStopSec={stop_grace}\n\
          KillMode=process\n\
+         LimitNOFILE={max_files}\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
         exe = exe.display(),
         stop_grace = SYSTEMD_STOP_GRACE_SECS,
+        max_files = crate::handover::DAEMON_MAX_OPEN_FILES,
     )
 }
 
@@ -1241,6 +1243,10 @@ mod tests {
         let unit = systemd_unit_contents(Path::new("/home/me/.cargo/bin/triaged"));
         assert!(unit.contains("ExecStart=\"/home/me/.cargo/bin/triaged\""));
         assert!(unit.contains("Restart=always"));
+        assert!(unit.contains(&format!(
+            "LimitNOFILE={}",
+            crate::handover::DAEMON_MAX_OPEN_FILES
+        )));
         assert!(unit.contains("WantedBy=default.target"));
     }
 

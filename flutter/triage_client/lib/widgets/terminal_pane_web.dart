@@ -491,6 +491,12 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _activateTerminal() {
     if (!_initialized || widget.isExited) return;
+    final active = html.document.activeElement;
+    if (active is html.InputElement ||
+        (active is html.TextAreaElement && !_container.contains(active)) ||
+        (active != null && active.isContentEditable == true)) {
+      return;
+    }
     try {
       final textarea = _cachedTextarea ??=
           _container.querySelector('textarea') as html.TextAreaElement?;
@@ -630,11 +636,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     // store unsized, which suppresses the live-output flush. The re-replay path
     // (content already written, layout settled) passes nothing and reads the
     // real current size, which is what it wants.
-    final fittedRows = overrideRows ??
+    final fittedRows =
+        overrideRows ??
         ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
             _lastFittedRows ??
             24);
-    final fittedCols = overrideCols ??
+    final fittedCols =
+        overrideCols ??
         ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
             _lastFittedCols ??
             80);
@@ -724,7 +732,8 @@ class _TerminalPaneState extends State<TerminalPane> {
           final buffer = js_util.getProperty(term, 'buffer');
           final active = js_util.getProperty(buffer, 'active');
           final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-          final viewportY = (js_util.getProperty(active, 'viewportY') as num).toInt();
+          final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+              .toInt();
           if (viewportY >= baseY) {
             _sessionSavedViewportY.remove(sessionId);
           } else {

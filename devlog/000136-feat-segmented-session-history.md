@@ -38,6 +38,11 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T10:10-0700 `crates/triaged/src/handover.rs`: Hardened `rename_recovered_session` staging copy loop against concurrent unlinking races by using `list_session_segments` with compressed counterpart fallback.
 - 2026-09-05T10:10-0700 `crates/triaged/src/session.rs`: Extracted `run_command_with_timeout` helper from `git_raw_output` and added unit test verifying termination of hanging child processes.
 - 2026-09-05T10:10-0700 `crates/triaged/src/storage_tests.rs`: Added unit test covering emoji and multibyte search queries across compressed and uncompressed segment boundaries.
+- 2026-09-05T10:29-0700 `crates/triaged/src/session.rs`: Hardened `logs_belong_to_same_session` against session prefix collisions using delimiter boundary checks and zero-allocation parent prefix inspection; piped null stdin to child processes in `run_command_with_timeout`; added unit tests for boundary separation and non-blocking null stdin.
+- 2026-09-05T10:29-0700 `crates/triaged/src/storage.rs`: Sliced oldest tail chunks in-place via `.drain(..excess)` before concatenating in `read_multi_segment_tail` and `read_multi_segment_replay_tail`; relaxed compressed frame header size ceiling to 16 MiB (`DEFAULT_SEGMENT_SIZE_BYTES * 2`) to handle write bursts; sized legacy migration scratch buffer to `total_len.min(segment_size)`; guarded fast-path search query length check behind ASCII verification.
+- 2026-09-05T10:29-0700 `crates/triaged/src/service.rs`: Set `LimitNOFILE=10240` in Linux systemd service unit template and updated unit tests.
+- 2026-09-05T10:29-0700 `crates/triaged/src/storage_tests.rs`: Added unit test `burst_write_oversized_segment_compression_and_reading` for oversized burst write decompression and tail slicing.
+- 2026-09-05T10:29-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Prevented terminal focus stealing in `_activateTerminal` when active DOM element is an input, non-container textarea, or has `isContentEditable == true`.
 
 ## Decisions
 - 2026-09-04T20:16-0700 8 MiB Segment Size: Rotate session log files at 8 MiB boundaries to balance mmap/IO performance, low file count, and fast decompression times.
@@ -57,6 +62,8 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T08:23-0700 Search Sizing Upper Bound: Impose a global 10,000 hit ceiling (`MAX_SEARCH_HITS`) across both segmented and legacy log search to protect supervisor daemon memory from high-cardinality queries.
 - 2026-09-05T08:23-0700 Non-Truncating Segment Rotation: Open newly rotated active segments in append mode instead of truncate mode to safeguard historical output if an index collision occurs.
 - 2026-09-05T10:10-0700 Concurrent Segment Listing Invariant: Catch and skip NotFound errors on entry, file type, and metadata queries during segment listing and handover staging, gracefully accommodating background compression worker unlinking.
+- 2026-09-05T10:29-0700 In-Place Oldest Tail Slicing: In multi-segment tail stitching, drain excess bytes from the oldest chunk before pre-allocating the final buffer, avoiding temporary multi-megabyte oversized buffers and full-vector drain operations.
+- 2026-09-05T10:29-0700 Headroom for PTY Burst Writes: Allow up to 16 MiB (`DEFAULT_SEGMENT_SIZE_BYTES * 2`) in compressed segment frame sizing to handle large atomic writes crossing the 8 MiB boundary prior to rotation.
 
 ## Progress
 - [x] Create worktree `worktrees/segmented-session-history` and branch `feat/segmented-session-history`
@@ -72,6 +79,7 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - [x] Address PR #158 review feedback and resolve review threads
 - [x] Diagnose and fix recovery duplicate cascade, raised fd limit, and restored muse-triage session
 - [x] Harden segment listing and handover copy against concurrent unlinking races and bound child processes
+- [x] Execute local review-fix loop across 3 rounds until clean stop condition is satisfied
 
 ## Commits
 - d4866a7: feat(storage): implement rolling 8 MiB segment logs with background zstd compression
@@ -79,5 +87,6 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 39b468b: fix(storage): optimize uncompressed segment tail reads and address review feedback
 - b1357ea: fix(daemon): resolve handover recovery duplication, raise file descriptor limits, and bound git timeouts
 - 1015dbb: fix(storage): harden segment rotation, search limits, and adoption sequence monotonicity
-- HEAD: fix(storage): eliminate segment listing races and optimize utf8 escape stripping
+- 2a4afb2: fix(storage): eliminate segment listing races and optimize utf8 escape stripping
+- HEAD: fix(storage): optimize tail assembly slicing and harden session boundary checks
 
