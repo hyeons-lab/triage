@@ -97,6 +97,29 @@ The hook configuration lives in `~/.agents/hooks.json` globally (or `~/.gemini/c
 }
 ```
 
+For Meta Muse CLI (`muse`), hooks are configured in `~/.config/muse/settings.json` (or `$XDG_CONFIG_HOME/muse/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "triage-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+When `muse` executes a tool call, `triage-hook` automatically detects Muse's PreToolUse payload signature and formats responses to match Muse's protocol, including `updatedInput` on auto-approval and `permissionDecisionReason` on denial.
+
 Restart `triaged` so it picks up the config, or run `triaged reload`. When started
 inside a Triage session, judging honors that session's policy override (toggleable via
 **`a`** in the TUI or the Auto-Approval switch in Flutter). Agent sessions running outside

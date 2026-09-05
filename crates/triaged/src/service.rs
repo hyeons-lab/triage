@@ -400,8 +400,94 @@ pub fn install_global_agent_hooks() {
                     }
                 }
             }
+
+            // Also ensure Muse settings.json is configured with the absolute hook command
+            let muse_settings = crate::judge::resolve_muse_settings_path(None);
+            let should_configure_muse = muse_settings.is_file()
+                || muse_settings.parent().map(|p| p.is_dir()).unwrap_or(false)
+                || muse_cli_available();
+            if should_configure_muse {
+                let file_content =
+                    std::fs::read_to_string(&muse_settings).unwrap_or_else(|_| "{}".to_string());
+                let mut val = serde_json::from_str::<serde_json::Value>(&file_content)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if !val.is_object() {
+                    val = serde_json::json!({});
+                }
+                if let Some(muse_map) = val.as_object_mut() {
+                    let mut hooks_obj = muse_map
+                        .get("hooks")
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default();
+                    let mut pre_arr = hooks_obj
+                        .get("PreToolUse")
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default();
+                    let already_has = pre_arr.iter().any(|entry| {
+                        entry
+                            .get("hooks")
+                            .and_then(|h| h.as_array())
+                            .map(|inner| {
+                                inner.iter().any(|cmd| {
+                                    cmd.get("command")
+                                        .and_then(|c| c.as_str())
+                                        .map(|s| s.contains("triage-hook"))
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+                    if !already_has {
+                        pre_arr.push(serde_json::json!({
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": hook_cmd,
+                                    "timeout": 15
+                                }
+                            ]
+                        }));
+                        hooks_obj
+                            .insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
+                        muse_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
+                        if let Ok(updated) = serde_json::to_string_pretty(&val) {
+                            let _ = atomic_write_file(&muse_settings, &updated);
+                            tracing::info!(
+                                path = %muse_settings.display(),
+                                "Configured Muse hooks"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+fn muse_cli_available() -> bool {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&paths) {
+            let candidate = path.join("muse");
+            if candidate.is_file() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                if path.join("muse.exe").is_file() || path.join("muse.cmd").is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        && home.join(".local/bin/muse").is_file()
+    {
+        return true;
+    }
+    false
 }
 
 fn atomic_write_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {

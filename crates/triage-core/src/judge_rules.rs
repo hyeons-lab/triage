@@ -76,6 +76,9 @@ pub fn is_read_only_tool(raw: &str) -> bool {
         "tool_search",
         "toolsearch",
         "skill",
+        "read_skill",
+        "readskill",
+        "search",
         "artifact",
         "generate_image",
         "detect_changes",
@@ -420,9 +423,11 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "triaged",
     "triage-hook",
     "triage-mcp",
-    // Antigravity CLI & agent diagnostics.
+    // Antigravity & Muse agent CLIs & diagnostics.
     "agy",
     "antigravity",
+    "muse",
+    "muse *",
 ];
 
 pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
@@ -473,6 +478,8 @@ pub const CREDENTIAL_PATHS: &[&str] = &[
     ".config/gcloud",
     ".claude.json",
     ".claude/settings.json",
+    ".config/muse/auth.json",
+    "muse/auth.json",
     ".env",
     ".envrc",
     ".bashrc",
@@ -4320,5 +4327,66 @@ mod tests {
         assert!(chain_v.reason.contains("rustfmt"));
         assert!(chain_v.reason.contains("cargo clippy"));
         assert!(chain_v.reason.contains("cargo test"));
+    }
+
+    #[test]
+    fn tests_muse_tool_and_command_recognition() {
+        assert!(is_read_only_tool("read_skill"));
+        assert!(is_read_only_tool("readskill"));
+        assert!(is_read_only_tool("search"));
+        assert!(is_read_only_tool("default_api:read_skill"));
+        assert!(is_read_only_tool("mcp__search"));
+
+        let rules = JudgeRules::new(&JudgeConfig::default());
+
+        // Read-only tool calls
+        let read_skill_req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "read_skill".to_string(),
+            command_line: None,
+            path: Some("skills/manage-settings/SKILL.md".to_string()),
+            cwd: None,
+        };
+        let v = rules.evaluate(&read_skill_req).unwrap();
+        assert_eq!(v.decision, JudgeDecision::Allow);
+        assert!(v.reason.contains("read-only tool call: read_skill"));
+
+        let search_req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "search".to_string(),
+            command_line: None,
+            path: None,
+            cwd: None,
+        };
+        let v = rules.evaluate(&search_req).unwrap();
+        assert_eq!(v.decision, JudgeDecision::Allow);
+
+        // Muse CLI command allowlisting
+        let evaluate_cmd = |cmd: &str| {
+            rules.evaluate(&JudgeRequest {
+                session_id: SessionId::default(),
+                tool_name: "run_command".to_string(),
+                command_line: Some(cmd.to_string()),
+                path: None,
+                cwd: None,
+            })
+        };
+        let muse_v = evaluate_cmd("muse --help").unwrap();
+        assert_eq!(muse_v.decision, JudgeDecision::Allow);
+
+        let muse_exec_v = evaluate_cmd("muse exec --provider echo \"test\"").unwrap();
+        assert_eq!(muse_exec_v.decision, JudgeDecision::Allow);
+
+        // Credential path protection for Muse auth.json
+        let auth_req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "read_file".to_string(),
+            command_line: None,
+            path: Some("/Users/test/.config/muse/auth.json".to_string()),
+            cwd: None,
+        };
+        let v = rules.evaluate(&auth_req).unwrap();
+        assert_eq!(v.decision, JudgeDecision::Ask);
+        assert!(v.reason.contains("credential path"));
     }
 }

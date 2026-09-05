@@ -139,6 +139,78 @@ for hook_path in "${HOOK_DESTINATIONS[@]}"; do
   fi
 done
 
+# Configure Meta Muse CLI hooks if Muse directory exists or muse is on PATH
+MUSE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/muse"
+if [[ -d "$MUSE_CONFIG_DIR" ]] || command -v muse >/dev/null 2>&1; then
+  mkdir -p "$MUSE_CONFIG_DIR"
+  MUSE_SETTINGS="$MUSE_CONFIG_DIR/settings.json"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import json, os, sys
+path = sys.argv[1]
+cmd = sys.argv[2]
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+hooks = data.setdefault('hooks', {})
+if not isinstance(hooks, dict):
+    hooks = {}
+    data['hooks'] = hooks
+pre = hooks.get('PreToolUse', [])
+if not isinstance(pre, list):
+    pre = []
+hooks['PreToolUse'] = pre
+has_hook = any(
+    isinstance(entry, dict)
+    and isinstance(entry.get('hooks'), list)
+    and any(
+        isinstance(h, dict)
+        and (h.get('command') == cmd or 'triage-hook' in str(h.get('command', '')))
+        for h in entry.get('hooks', [])
+    )
+    for entry in pre
+)
+if not has_hook:
+    pre.append({
+        'matcher': '.*',
+        'hooks': [{'type': 'command', 'command': cmd, 'timeout': 15}]
+    })
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+    os.replace(tmp, path)
+    print('==> Configured Muse hooks in ' + path)
+" "$MUSE_SETTINGS" "$BIN_DIR/triage-hook"
+  elif [[ ! -f "$MUSE_SETTINGS" ]]; then
+    cat <<EOF > "$MUSE_SETTINGS"
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$BIN_DIR/triage-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+    echo "==> Created $MUSE_SETTINGS"
+  fi
+fi
+
 echo
 echo "To reload and adopt this build with zero downtime, run:"
 echo "    $BIN_DIR/triaged reload"
