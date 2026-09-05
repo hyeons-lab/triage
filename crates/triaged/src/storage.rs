@@ -17,6 +17,9 @@ pub const COMPRESSED_SEGMENT_EXT: &str = "tlog.zst";
 const COMPRESSED_SUFFIX: &str = ".tlog.zst";
 const UNCOMPRESSED_SUFFIX: &str = ".tlog";
 
+/// Maximum number of search hits returned by a search query to prevent unbounded memory growth.
+pub const MAX_SEARCH_HITS: usize = 10_000;
+
 /// Information about a discovered segment file on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFileInfo {
@@ -107,23 +110,21 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
     Ok(segments_by_index.into_values().collect())
 }
 
-/// Resolves the active uncompressed segment for a session directory.
+/// Resolves the active segment for a session directory.
 ///
-/// If uncompressed segments exist, returns the latest uncompressed segment.
-/// If all existing segments are compressed, targets the next sequential segment index with 0 bytes.
+/// Only the latest segment can be active. If it is uncompressed, returns it with its current size.
+/// If the latest segment is compressed, targets the next sequential segment index with 0 bytes.
 /// If no segments exist, returns the initial segment index (1) with 0 bytes.
 pub fn resolve_active_segment(session_dir: &Path) -> Result<(PathBuf, u32, u64)> {
     let segments = list_session_segments(session_dir)?;
-    if let Some(uncompressed) = segments.iter().rev().find(|s| !s.is_compressed) {
-        Ok((
-            uncompressed.path.clone(),
-            uncompressed.index,
-            uncompressed.file_size,
-        ))
-    } else if let Some(last) = segments.last() {
-        let next_idx = last.index + 1;
-        let next_path = session_dir.join(segment_file_name(next_idx));
-        Ok((next_path, next_idx, 0))
+    if let Some(last) = segments.last() {
+        if !last.is_compressed {
+            Ok((last.path.clone(), last.index, last.file_size))
+        } else {
+            let next_idx = last.index + 1;
+            let next_path = session_dir.join(segment_file_name(next_idx));
+            Ok((next_path, next_idx, 0))
+        }
     } else {
         let first_path = session_dir.join(segment_file_name(1));
         Ok((first_path, 1, 0))
@@ -279,7 +280,12 @@ pub fn read_segment_tail_uncompressed(
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // If the segment was concurrently compressed by the worker, fall back to decompressing
-            return read_segment_uncompressed(info);
+            let mut buf = read_segment_uncompressed(info)?;
+            if buf.len() > tail_bytes {
+                let skip = buf.len() - tail_bytes;
+                buf.drain(..skip);
+            }
+            return Ok(buf);
         }
         Err(err) => {
             return Err(err)
@@ -446,16 +452,25 @@ pub struct CompressionWorker {
 impl CompressionWorker {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::channel::<WorkerMessage>();
-        let handle = thread::Builder::new()
+        match thread::Builder::new()
             .name("triage-compression-worker".into())
             .spawn(move || {
                 Self::run_worker(rx);
-            })
-            .expect("spawn compression worker");
-
-        Self {
-            tx: Some(tx),
-            handle: Some(handle),
+            }) {
+            Ok(handle) => Self {
+                tx: Some(tx),
+                handle: Some(handle),
+            },
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to spawn background compression worker; compression disabled"
+                );
+                Self {
+                    tx: None,
+                    handle: None,
+                }
+            }
         }
     }
 
@@ -621,6 +636,9 @@ pub fn search_session_segments(
                     line_number: line_idx + 1,
                     line_text: line.to_string(),
                 });
+                if hits.len() >= MAX_SEARCH_HITS {
+                    return Ok(hits);
+                }
             }
         }
     }
@@ -635,13 +653,16 @@ pub fn line_matches_query(
     query_lower: &str,
     case_insensitive: bool,
 ) -> bool {
+    if query.is_empty() {
+        return true;
+    }
     if !case_insensitive {
         return line.contains(query);
     }
     if line.len() < query.len() {
         return false;
     }
-    if line.is_ascii() && query.is_ascii() {
+    if query.is_ascii() {
         let line_bytes = line.as_bytes();
         let query_bytes = query_lower.as_bytes();
         line_bytes

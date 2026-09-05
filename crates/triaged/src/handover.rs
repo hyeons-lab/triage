@@ -897,28 +897,76 @@ mod unix_impl {
                     .parent()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
-                    == Some(session.id.as_str());
+                    == Some(session.id.as_str())
+                || original_log
+                    .parent()
+                    .map(|p| p.join("sessions").join(session.id.as_str()).is_dir())
+                    .unwrap_or(false);
 
             if is_segmented {
                 let session_dir = if original_log.is_dir() {
                     original_log.clone()
-                } else {
+                } else if original_log
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(session.id.as_str())
+                {
                     original_log.parent().unwrap_or(&original_log).to_path_buf()
+                } else if let Some(parent) = original_log.parent() {
+                    let cand = parent.join("sessions").join(session.id.as_str());
+                    if cand.is_dir() {
+                        cand
+                    } else {
+                        parent.to_path_buf()
+                    }
+                } else {
+                    original_log.clone()
                 };
                 let sessions_parent = session_dir.parent().unwrap_or(&session_dir);
                 let candidate_dir = sessions_parent.join(candidate_id.as_str());
                 if candidate_dir.exists() {
                     continue;
                 }
-                std::fs::create_dir_all(&candidate_dir)?;
-                if let Ok(entries) = std::fs::read_dir(&session_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if let Some(file_name) = path.file_name().filter(|_| path.is_file()) {
-                            let _ = std::fs::copy(&path, candidate_dir.join(file_name));
+                let staging_dir = sessions_parent.join(format!(
+                    ".tmp-copy-{}-{}",
+                    std::process::id(),
+                    candidate_id.as_str()
+                ));
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                std::fs::create_dir_all(&staging_dir)?;
+
+                let copy_res = (|| -> io::Result<()> {
+                    if session_dir.is_dir() {
+                        for entry in std::fs::read_dir(&session_dir)? {
+                            let entry = entry?;
+                            let path = entry.path();
+                            if path.is_file()
+                                && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                                && crate::storage::parse_segment_index(file_name).is_some()
+                            {
+                                std::fs::copy(&path, staging_dir.join(file_name))?;
+                            }
                         }
                     }
+                    if candidate_dir.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "candidate directory already exists",
+                        ));
+                    }
+                    std::fs::rename(&staging_dir, &candidate_dir)?;
+                    Ok(())
+                })();
+
+                if let Err(error) = copy_res {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        continue;
+                    }
+                    return Err(error);
                 }
+
                 let active_segment = crate::storage::resolve_active_segment(&candidate_dir)
                     .map(|(path, _, _)| path)
                     .unwrap_or_else(|_| candidate_dir.join(crate::storage::segment_file_name(1)));

@@ -1408,6 +1408,9 @@ impl SessionManager {
                             line_number: idx + 1,
                             line_text: line.to_string(),
                         });
+                        if hits.len() >= crate::storage::MAX_SEARCH_HITS {
+                            break;
+                        }
                     }
                 }
                 Ok(hits)
@@ -2208,7 +2211,11 @@ impl SessionManager {
                 .parent()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
-                && parent == id_str
+                && (parent == id_str
+                    || parent.starts_with(&format!("{id_str}-recovered-"))
+                    || SessionId::new(parent)
+                        .map(|sid| Self::original_session_id(&sid) == *id)
+                        .unwrap_or(false))
             {
                 return true;
             }
@@ -2275,7 +2282,7 @@ impl SessionManager {
             args: h_sess.args.clone(),
             cwd: h_sess.cwd.clone(),
             size: h_sess.size.clone(),
-            log_path: h_sess.log_path.clone(),
+            log_path: runtime.output.log_path.clone(),
         };
 
         let event_session_id = Some(h_sess.id.clone());
@@ -2637,6 +2644,10 @@ fn spawn_adopted_pty_runtime(
             )
         };
 
+    if let Some(parent) = target_log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
     let log = OpenOptions::new()
         .create(true)
         .read(true)
@@ -2656,8 +2667,8 @@ fn spawn_adopted_pty_runtime(
         compression_tx: None,
         terminal,
         cwd_sequence_buffer: Vec::new(),
-        bytes_logged: 0,
-        output_seq: 0,
+        bytes_logged: h_sess.bytes_logged,
+        output_seq: h_sess.output_seq,
         log_cache: None,
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
@@ -4264,7 +4275,12 @@ fn remove_session_log(session_id: &SessionId, log_path: &Path) {
                 "failed to remove session directory for shut-down session"
             ),
         }
-        if let Some(parent) = session_dir.parent().and_then(|p| p.parent()) {
+        if let Some(sessions_dir) = session_dir.parent() {
+            let parent = if sessions_dir.file_name().and_then(|n| n.to_str()) == Some("sessions") {
+                sessions_dir.parent().unwrap_or(sessions_dir)
+            } else {
+                sessions_dir
+            };
             let legacy_log = parent.join(format!("{session_id}.log"));
             let _ = fs::remove_file(&legacy_log);
             let _ = fs::remove_file(legacy_log.with_extension("log.migrated"));
@@ -4354,6 +4370,25 @@ fn purge_orphaned_session_logs(
     let (mut removed, mut reclaimed) = (0_u64, 0_u64);
     for entry in entries.flatten() {
         let path = entry.path();
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with(".tmp-")
+        {
+            if let Ok(metadata) = entry.metadata() {
+                let stale = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= retention);
+                if stale {
+                    if path.is_dir() {
+                        let _ = fs::remove_dir_all(&path);
+                    } else {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+            continue;
+        }
         if path.is_file() {
             let file_name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(name) => name,
@@ -4404,6 +4439,25 @@ fn purge_orphaned_session_logs(
     if let Ok(entries) = fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
+            if let Some(name_str) = path.file_name().and_then(|n| n.to_str())
+                && name_str.starts_with(".tmp-")
+            {
+                if let Ok(metadata) = entry.metadata() {
+                    let is_stale = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .is_some_and(|age| age >= retention);
+                    if is_stale {
+                        if path.is_dir() {
+                            let _ = fs::remove_dir_all(&path);
+                        } else {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(dir_name) = path.file_name().filter(|_| path.is_dir()) {
                 if referenced_stems.contains(dir_name) || referenced_names.contains(dir_name) {
                     continue;
@@ -4411,23 +4465,45 @@ fn purge_orphaned_session_logs(
                 let mut dir_stale = true;
                 let mut dir_bytes = 0u64;
                 let mut inner_count = 0usize;
-                if let Ok(inner_entries) = fs::read_dir(&path) {
-                    for inner in inner_entries.flatten() {
-                        inner_count += 1;
-                        if let Ok(meta) = inner.metadata() {
-                            dir_bytes += meta.len();
-                            if meta
-                                .modified()
-                                .ok()
-                                .and_then(|m| now.duration_since(m).ok())
-                                .is_some_and(|age| age < retention)
-                            {
-                                dir_stale = false;
+                match fs::read_dir(&path) {
+                    Ok(inner_entries) => {
+                        for inner in inner_entries {
+                            let inner = match inner {
+                                Ok(i) => i,
+                                Err(_) => {
+                                    dir_stale = false;
+                                    break;
+                                }
+                            };
+                            inner_count += 1;
+                            match inner.metadata() {
+                                Ok(meta) => {
+                                    dir_bytes += meta.len();
+                                    let is_recent = match meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|m| now.duration_since(m).ok())
+                                    {
+                                        Some(age) => age < retention,
+                                        None => true,
+                                    };
+                                    if is_recent {
+                                        dir_stale = false;
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    dir_stale = false;
+                                    break;
+                                }
                             }
                         }
                     }
+                    Err(_) => {
+                        dir_stale = false;
+                    }
                 }
-                if inner_count == 0 {
+                if inner_count == 0 && dir_stale {
                     if let Ok(metadata) = entry.metadata() {
                         let stale = metadata
                             .modified()
@@ -6130,15 +6206,15 @@ impl OutputState {
 
         match OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(true)
+            .append(true)
             .open(&new_segment_path)
         {
             Ok(new_log) => {
+                let initial_bytes = new_log.metadata().map(|m| m.len()).unwrap_or(0);
                 let old_segment_path = std::mem::replace(&mut self.log_path, new_segment_path);
                 self.log = new_log;
                 self.active_segment_index = next_idx;
-                self.active_segment_bytes = 0;
+                self.active_segment_bytes = initial_bytes;
 
                 if let Some(tx) = &self.compression_tx {
                     let compressed_name = crate::storage::compressed_segment_file_name(current_idx);
@@ -7488,20 +7564,19 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
 
 fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(cwd).args(args);
+    command.arg("--no-pager").arg("-C").arg(cwd).args(args);
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::null());
     detach_from_terminal(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout_handle = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut stream) = stdout_handle {
             use std::io::Read;
-            let _ = stream.read_to_end(&mut buf);
+            let _ = stream.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
         }
-        let _ = tx.send(buf);
+        buf
     });
 
     let start = std::time::Instant::now();
@@ -7510,10 +7585,7 @@ fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
-                    let stdout = rx
-                        .recv_timeout(std::time::Duration::from_millis(200))
-                        .unwrap_or_default();
-                    let _ = reader_thread.join();
+                    let stdout = reader_thread.join().unwrap_or_default();
                     return Some(stdout);
                 }
                 let _ = reader_thread.join();
@@ -13228,5 +13300,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&log_dir2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_logs_belong_to_same_session_with_recovered_suffixes() {
+        let sid = SessionId::new("session-195").unwrap();
+        let path1 = Path::new("/var/log/triage/sessions/session-195/segment-000001.tlog");
+        let path2 =
+            Path::new("/var/log/triage/sessions/session-195-recovered-42/segment-000001.tlog");
+        assert!(SessionManager::logs_belong_to_same_session(
+            path1, path2, &sid
+        ));
+
+        let legacy1 = Path::new("/var/log/triage/session-195.log");
+        let legacy2 = Path::new("/var/log/triage/session-195-recovered-42.log");
+        assert!(SessionManager::logs_belong_to_same_session(
+            legacy1, legacy2, &sid
+        ));
+
+        let other_sid = SessionId::new("session-196").unwrap();
+        assert!(!SessionManager::logs_belong_to_same_session(
+            path1, path2, &other_sid
+        ));
     }
 }

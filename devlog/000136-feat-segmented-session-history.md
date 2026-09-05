@@ -1,4 +1,4 @@
-# 000135: feat/segmented-session-history
+# 000136: feat/segmented-session-history
 
 **Agent:** Antigravity (gemini-3.7-flash) @ triage branch feat/segmented-session-history
 **Agent (2026-09-04T21:31-0700):** Antigravity (gemini-3.8-flash) @ triage branch feat/segmented-session-history
@@ -28,6 +28,12 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T07:30-0700 `crates/triaged/src/storage_tests.rs`: Updated unit test callers of `read_multi_segment_tail` to handle `Result`.
 - 2026-09-05T07:30-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Restored view-fit notifications (`widget.onViewFit`) for cached web terminal containers, triggered initial content write in post-frame callback, and safe terminal reset on clear.
 - 2026-09-05T07:30-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`: Bounded regex matching for unsupported private CSI escape sequences to the tail buffer slice, preventing regex stalls on multi-megabyte payloads.
+- 2026-09-05T08:23-0700 `crates/triaged/src/storage.rs`: Resolved active segment targeting by strictly inspecting `segments.last()`; clamped concurrent compression fallback buffer to `tail_bytes`; guarded `line_matches_query` against zero-length windows on empty queries; added fast-path ASCII matching on mixed Unicode lines; defined `MAX_SEARCH_HITS` (10,000) and capped return vectors; added non-panicking compression worker thread spawn.
+- 2026-09-05T08:23-0700 `crates/triaged/src/handover.rs`: Added atomic directory staging (`.tmp-copy-<pid>-<candidate_id>`) with selective segment filtering; recognized migrated directory layout when `log_path` points to a legacy `.log` file; called `raise_fd_limit()` in `handover_state_lock()`.
+- 2026-09-05T08:23-0700 `crates/triaged/src/session.rs`: Preserved `output_seq` and `bytes_logged` across zero-downtime adoption; created parent directory backstop in `spawn_adopted_pty_runtime`; used append mode instead of truncate on active segment rotation; extended `logs_belong_to_same_session` to recognize recovered session suffixes; capped legacy log search hits to `MAX_SEARCH_HITS`; joined `reader_thread` before receiving stdout in `git_raw_output` without channel overhead; hardened `remove_session_log` parent traversal; purged stale `.tmp-` files and directories in both root `log_dir` and `sessions/`.
+- 2026-09-05T08:23-0700 `crates/triaged/src/storage_tests.rs`: Added comprehensive unit tests for empty query search, active segment resolution with historical uncompressed segments, tail clamping on concurrent compression, ASCII query matching on mixed Unicode lines, and `MAX_SEARCH_HITS` capping.
+- 2026-09-05T08:23-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Safeguarded rows/cols cast with null-safe property access and fallback sizing.
+- 2026-09-05T08:23-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`: Preserved UTF-16 surrogate pairs when slicing trailing scan tail buffer.
 
 ## Decisions
 - 2026-09-04T20:16-0700 8 MiB Segment Size: Rotate session log files at 8 MiB boundaries to balance mmap/IO performance, low file count, and fast decompression times.
@@ -43,6 +49,9 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T07:30-0700 Canonical Session Recovery Reclaiming: When an inherited session bears a `-recovered-<pid>` suffix and the canonical base session is either historical or missing, adopt it directly under its canonical ID so persistent user custom labels and live shell attachments survive daemon handovers seamlessly.
 - 2026-09-05T07:30-0700 Proactive Soft File Limit Elevation: Raise the soft `RLIMIT_NOFILE` to 10240 both at daemon startup and immediately upon receiving handover requests, ensuring `dup_cloexec` never fails with `EMFILE` when duplicating dozens of master PTYs during zero-downtime transfers.
 - 2026-09-05T07:30-0700 Bounded Git Context Probing: Execute Git child commands with a strict 1500ms timeout and explicit kill/wait reap logic so that inaccessible directories or hung filesystems cannot wedge the supervisor event loop.
+- 2026-09-05T08:23-0700 Monotonic Handover Adoption: Initialize `output_seq` and `bytes_logged` directly from `HandoverSession` in `spawn_adopted_pty_runtime` so sequence counters remain strictly monotonic across daemon handovers.
+- 2026-09-05T08:23-0700 Search Sizing Upper Bound: Impose a global 10,000 hit ceiling (`MAX_SEARCH_HITS`) across both segmented and legacy log search to protect supervisor daemon memory from high-cardinality queries.
+- 2026-09-05T08:23-0700 Non-Truncating Segment Rotation: Open newly rotated active segments in append mode instead of truncate mode to safeguard historical output if an index collision occurs.
 
 ## Progress
 - [x] Create worktree `worktrees/segmented-session-history` and branch `feat/segmented-session-history`
@@ -59,8 +68,9 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - [x] Diagnose and fix recovery duplicate cascade, raised fd limit, and restored muse-triage session
 
 ## Commits
-- 72a25aa: feat(storage): implement rolling 8 MiB segment logs with background zstd compression
-- e674167: fix(storage): harden segment rotation, atomic migration, and zero-allocation search
-- 540955b: fix(storage): optimize uncompressed segment tail reads and address review feedback
-- HEAD: fix(daemon): resolve handover recovery duplication, raise file descriptor limits, and bound git timeouts
+- d4866a7: feat(storage): implement rolling 8 MiB segment logs with background zstd compression
+- 1042317: fix(storage): harden segment rotation, atomic migration, and zero-allocation search
+- 39b468b: fix(storage): optimize uncompressed segment tail reads and address review feedback
+- b1357ea: fix(daemon): resolve handover recovery duplication, raise file descriptor limits, and bound git timeouts
+- HEAD: fix(storage): harden segment rotation, search limits, and adoption sequence monotonicity
 

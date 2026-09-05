@@ -555,3 +555,99 @@ fn legacy_log_migration_cleans_up_on_error() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn line_matches_query_empty_query_no_panic() {
+    assert!(line_matches_query("hello world", "", "", false));
+    assert!(line_matches_query("hello world", "", "", true));
+    assert!(line_matches_query("日本語", "", "", false));
+    assert!(line_matches_query("日本語", "", "", true));
+    assert!(line_matches_query("", "", "", false));
+    assert!(line_matches_query("", "", "", true));
+}
+
+#[test]
+fn resolve_active_segment_ignores_historical_uncompressed() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("sessions").join("session-active-test");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+
+    // Segment 1 is uncompressed
+    let seg1_path = session_dir.join("segment-000001.tlog");
+    fs::write(&seg1_path, b"historical uncompressed").expect("write seg1");
+
+    // Segment 2 is compressed
+    let seg2_raw = session_dir.join("segment-000002.tlog");
+    fs::write(&seg2_raw, b"historical segment 2").expect("write seg2 raw");
+    let seg2_comp = session_dir.join("segment-000002.tlog.zst");
+    compress_segment_file(&seg2_raw, &seg2_comp).expect("compress seg2");
+
+    // Since the latest segment (2) is compressed, active segment must be 3 with 0 bytes
+    let (active_path, index, bytes) =
+        resolve_active_segment(&session_dir).expect("resolve active segment");
+    assert_eq!(index, 3);
+    assert_eq!(bytes, 0);
+    assert_eq!(active_path, session_dir.join("segment-000003.tlog"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn read_segment_tail_uncompressed_fallback_clamping() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join("segment-000001.tlog");
+    let comp_path = temp_dir.join("segment-000001.tlog.zst");
+
+    let test_data = b"0123456789".repeat(100); // 1000 bytes
+    fs::write(&raw_path, &test_data).expect("write raw");
+    compress_segment_file(&raw_path, &comp_path).expect("compress");
+
+    // Construct SegmentFileInfo pointing to raw_path (marked uncompressed),
+    // simulating concurrent compression where the raw file was removed.
+    let info = SegmentFileInfo {
+        index: 1,
+        path: raw_path.clone(),
+        is_compressed: false,
+        file_size: test_data.len() as u64,
+    };
+    assert!(!raw_path.exists());
+    assert!(comp_path.exists());
+
+    // Request tail of 25 bytes
+    let tail = read_segment_tail_uncompressed(&info, 25).expect("read tail");
+    assert_eq!(tail.len(), 25);
+    assert_eq!(tail, &test_data[test_data.len() - 25..]);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn line_matches_query_ascii_on_mixed_unicode_line() {
+    let mixed_line = "┌── [OK] 🚀 error occurred ──┐";
+    assert!(line_matches_query(mixed_line, "error", "error", false));
+    assert!(line_matches_query(mixed_line, "ERROR", "error", true));
+    assert!(line_matches_query(mixed_line, "ok", "ok", true));
+    assert!(!line_matches_query(mixed_line, "missing", "missing", true));
+}
+
+#[test]
+fn search_session_segments_hit_cap() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("sessions").join("session-cap");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+
+    // Create 12,000 lines of matching text
+    let mut data = Vec::new();
+    for i in 0..12_000 {
+        data.extend_from_slice(format!("match line {i}\n").as_bytes());
+    }
+    let seg1_path = session_dir.join("segment-000001.tlog");
+    fs::write(&seg1_path, &data).expect("write seg1");
+
+    let hits = search_session_segments(&session_dir, "match", false).expect("search");
+    assert_eq!(hits.len(), MAX_SEARCH_HITS);
+    assert_eq!(hits[0].line_number, 1);
+    assert_eq!(hits[MAX_SEARCH_HITS - 1].line_number, MAX_SEARCH_HITS);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

@@ -627,13 +627,17 @@ class _TerminalPaneState extends State<TerminalPane> {
     // the force-finalize backstop) pass it in so we don't re-read `_term` here:
     // during the size churn the backstop guards against, `_term` can momentarily
     // sit below the minimum grid, and signaling that too-narrow size leaves the
-    // store unsized — which suppresses the live-output flush. The re-replay path
+    // store unsized, which suppresses the live-output flush. The re-replay path
     // (content already written, layout settled) passes nothing and reads the
     // real current size, which is what it wants.
-    final fittedRows =
-        overrideRows ?? (js_util.getProperty(_term, 'rows') as num).toInt();
-    final fittedCols =
-        overrideCols ?? (js_util.getProperty(_term, 'cols') as num).toInt();
+    final fittedRows = overrideRows ??
+        ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
+            _lastFittedRows ??
+            24);
+    final fittedCols = overrideCols ??
+        ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
+            _lastFittedCols ??
+            80);
     widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
