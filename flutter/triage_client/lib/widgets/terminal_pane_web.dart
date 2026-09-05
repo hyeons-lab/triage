@@ -232,6 +232,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       _initialized = true;
       _initialContentWritten = true;
       _styleSheetLoaded = true;
+      try {
+        final rowsNum = js_util.getProperty(_term, 'rows') as num?;
+        final colsNum = js_util.getProperty(_term, 'cols') as num?;
+        if (rowsNum != null && colsNum != null) {
+          _lastFittedRows = rowsNum.toInt();
+          _lastFittedCols = colsNum.toInt();
+        }
+      } catch (_) {}
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
@@ -304,7 +312,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
+      if (mounted && _initialized) {
+        if (cachedContainer != null) {
+          _writeInitialContent();
+        }
         _activateTerminal();
       }
     });

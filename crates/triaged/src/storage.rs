@@ -321,28 +321,24 @@ pub fn read_multi_segment_tail(
     session_dir: &Path,
     total_uncompressed_bytes: u64,
     cap: u64,
-) -> (u64, Vec<u8>) {
+) -> Result<(u64, Vec<u8>)> {
     if total_uncompressed_bytes == 0 || cap == 0 {
-        return (0, Vec::new());
+        return Ok((0, Vec::new()));
     }
 
     let start_offset = total_uncompressed_bytes.saturating_sub(cap);
     let needed_bytes = (total_uncompressed_bytes - start_offset) as usize;
 
-    let segments = match list_session_segments(session_dir) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(
-                session_dir = %session_dir.display(),
-                ?err,
-                "failed to list segments; returning empty tail"
-            );
-            return (0, Vec::new());
-        }
-    };
+    // A listing failure is reported, never folded into the empty tail that a
+    // session with no segments returns. The two are indistinguishable to a
+    // caller, so swallowing the error renders intact on-disk history as empty
+    // scrollback; and because the condition is usually transient (`EMFILE`
+    // against the daemon's descriptor ceiling), it looks like data loss rather
+    // than the retryable I/O error it is.
+    let segments = list_session_segments(session_dir)?;
 
     if segments.is_empty() {
-        return (0, Vec::new());
+        return Ok((0, Vec::new()));
     }
 
     // Read all segments in reverse order until we have accumulated at least `needed_bytes`
@@ -355,19 +351,16 @@ pub fn read_multi_segment_tail(
         }
 
         let remaining_needed = needed_bytes - accumulated_len;
-        match read_segment_tail(segment, remaining_needed) {
-            Ok(bytes) => {
-                accumulated_len += bytes.len();
-                collected_chunks.push(bytes);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %segment.path.display(),
-                    ?err,
-                    "failed to read segment tail"
-                );
-            }
-        }
+        // Skipping a failed segment is not a safe degradation: `start_offset` is
+        // derived below from the *length* of what was collected, so dropping a
+        // segment from the middle of the chain silently relabels the surviving
+        // bytes with offsets that belong to the missing ones. Clients index live
+        // writes against those offsets, so the result is misaligned scrollback
+        // rather than a short read. Fail instead, and let the caller retry.
+        let bytes = read_segment_tail(segment, remaining_needed)
+            .with_context(|| format!("reading segment tail {}", segment.path.display()))?;
+        accumulated_len += bytes.len();
+        collected_chunks.push(bytes);
     }
 
     // Reconstruct chunks in chronological order
@@ -384,7 +377,7 @@ pub fn read_multi_segment_tail(
     }
 
     let start_offset = total_uncompressed_bytes.saturating_sub(combined.len() as u64);
-    (start_offset, combined)
+    Ok((start_offset, combined))
 }
 
 /// Reads the trailing `cap` bytes of a session directory for terminal replay during restore or resize.

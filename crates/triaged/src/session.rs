@@ -2182,19 +2182,77 @@ impl SessionManager {
     }
 
     #[cfg(unix)]
+    fn original_session_id(id: &SessionId) -> SessionId {
+        let id_str = id.as_str();
+        if let Some((base, _)) = id_str.split_once("-recovered-")
+            && let Ok(cand) = SessionId::new(base)
+        {
+            return cand;
+        }
+        id.clone()
+    }
+
+    #[cfg(unix)]
+    fn logs_belong_to_same_session(persisted: &Path, inherited: &Path, id: &SessionId) -> bool {
+        if persisted == inherited {
+            return true;
+        }
+        let id_str = id.as_str();
+        let belongs = |p: &Path| -> bool {
+            if let Some(file_name) = p.file_name().and_then(|n| n.to_str())
+                && file_name.starts_with(id_str)
+            {
+                return true;
+            }
+            if let Some(parent) = p
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                && parent == id_str
+            {
+                return true;
+            }
+            false
+        };
+        belongs(persisted) && belongs(inherited)
+    }
+
+    #[cfg(unix)]
     fn adopt_one_session(
         &self,
         sessions: &mut HashMap<SessionId, ManagedSession>,
         h_sess: &mut crate::handover::HandoverSession,
         fd: std::os::unix::io::RawFd,
     ) -> Result<()> {
+        let canonical_id = Self::original_session_id(&h_sess.id);
+        if canonical_id != h_sess.id {
+            match sessions.get(&canonical_id) {
+                None | Some(ManagedSession::Historical { .. }) => {
+                    let log_dir = &self.config.log_dir;
+                    let canonical_dir = log_dir.join("sessions").join(canonical_id.as_str());
+                    if canonical_dir.is_dir()
+                        && let Ok((active_seg, _, _)) =
+                            crate::storage::resolve_active_segment(&canonical_dir)
+                    {
+                        h_sess.log_path = active_seg;
+                    }
+                    h_sess.id = canonical_id;
+                }
+                _ => {}
+            }
+        }
+
         let conflicts_with_existing =
             sessions
                 .get(&h_sess.id)
                 .is_some_and(|existing| match existing {
                     ManagedSession::Live { .. } | ManagedSession::Restoring { .. } => true,
                     ManagedSession::Historical { session, .. } => {
-                        session.persisted.log_path != h_sess.log_path
+                        !Self::logs_belong_to_same_session(
+                            &session.persisted.log_path,
+                            &h_sess.log_path,
+                            &h_sess.id,
+                        )
                     }
                 });
         if conflicts_with_existing {
@@ -2316,6 +2374,14 @@ impl SessionManager {
                 last_known_cwd,
             },
         );
+
+        // Purge any stale historical placeholders whose IDs were generated from
+        // intermediate recovery renames of this session (e.g. session-195-recovered-<pid>).
+        let stale_prefix = format!("{}-recovered-", h_sess.id);
+        sessions.retain(|id, session| {
+            !(id.as_str().starts_with(&stale_prefix)
+                && matches!(session, ManagedSession::Historical { .. }))
+        });
 
         if let Some(explicit) = h_sess.judge_override {
             let mut overrides = self
@@ -6685,6 +6751,26 @@ fn overlay_raw_output_history(
     snapshot
 }
 
+/// Reports whether `dir` holds segment files, resolving a listing failure to
+/// "yes" rather than "no".
+///
+/// [`crate::storage::list_session_segments`] already answers a missing directory
+/// with an empty list, so an `Err` means the directory exists but could not be
+/// read (a transient condition such as `EMFILE`). Treating that as "no segments"
+/// demotes a segmented session to the legacy single-log path, whose file
+/// migration has already renamed to `*.log.migrated`: readers then serve an
+/// empty history for a session whose segments are intact on disk, and
+/// [`output_state_for_log`] reopens the legacy path with `create(true)`,
+/// stranding subsequent output in a file outside the segment chain. Failing
+/// toward "segmented" keeps the error on the read itself, where it is visible
+/// and recoverable, instead of silently rerouting the session.
+fn has_session_segments(dir: &Path) -> bool {
+    match crate::storage::list_session_segments(dir) {
+        Ok(segments) => !segments.is_empty(),
+        Err(_) => true,
+    }
+}
+
 fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
     if let Some(file_name) = log_path.file_name().and_then(|n| n.to_str()) {
         if crate::storage::parse_segment_index(file_name).is_some() {
@@ -6692,20 +6778,12 @@ fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
         } else if let Some(stem) = file_name.strip_suffix(".log") {
             if let Some(parent) = log_path.parent() {
                 let candidate = parent.join("sessions").join(stem);
-                if candidate.is_dir()
-                    && !crate::storage::list_session_segments(&candidate)
-                        .unwrap_or_default()
-                        .is_empty()
-                {
+                if candidate.is_dir() && has_session_segments(&candidate) {
                     return Some(candidate);
                 }
             }
             None
-        } else if log_path.is_dir()
-            && !crate::storage::list_session_segments(log_path)
-                .unwrap_or_default()
-                .is_empty()
-        {
+        } else if log_path.is_dir() && has_session_segments(log_path) {
             Some(log_path.to_path_buf())
         } else {
             None
@@ -6726,7 +6804,22 @@ fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, V
     }
 
     if let Some(session_dir) = resolve_segment_session_dir(log_path) {
-        return crate::storage::read_multi_segment_tail(&session_dir, bytes_logged, cap);
+        return match crate::storage::read_multi_segment_tail(&session_dir, bytes_logged, cap) {
+            Ok(tail) => tail,
+            // Falling back to the legacy single-log read below would be wrong:
+            // migration renamed that file to `*.log.migrated`, so it would report
+            // "no history" for a session whose segments are intact. Log loudly
+            // and return empty here instead, so the cause is attributable rather
+            // than looking like an ordinary empty session.
+            Err(err) => {
+                tracing::error!(
+                    session_dir = %session_dir.display(),
+                    ?err,
+                    "failed to read segmented output tail; serving empty history"
+                );
+                (0, Vec::new())
+            }
+        };
     }
 
     let start = bytes_logged.saturating_sub(cap);
@@ -7396,9 +7489,53 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
 fn git_raw_output(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
     detach_from_terminal(&mut command);
-    let output = command.output().ok()?;
-    output.status.success().then_some(output.stdout)
+    let mut child = command.spawn().ok()?;
+    let stdout_handle = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stream) = stdout_handle {
+            use std::io::Read;
+            let _ = stream.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let stdout = rx
+                        .recv_timeout(std::time::Duration::from_millis(200))
+                        .unwrap_or_default();
+                    let _ = reader_thread.join();
+                    return Some(stdout);
+                }
+                let _ = reader_thread.join();
+                return None;
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader_thread.join();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_thread.join();
+                return None;
+            }
+        }
+    }
 }
 
 /// Puts a helper child in its own session so no terminal can job-control it.
@@ -7790,6 +7927,56 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A directory that cannot be listed must not be mistaken for one holding no
+    /// segments. Answering "no" reroutes a segmented session to the legacy
+    /// single-log path that migration has already renamed away, which serves an
+    /// empty history for intact on-disk segments and lets `output_state_for_log`
+    /// recreate the legacy log outside the segment chain.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_session_directory_still_counts_as_segmented() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "triage-unreadable-segments-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temp).expect("create session dir");
+        std::fs::write(temp.join("segment-000001.tlog"), b"history").expect("write segment");
+
+        // Sanity: readable, so the segment is found the ordinary way.
+        assert!(has_session_segments(&temp));
+
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o000))
+            .expect("make dir unreadable");
+        let unreadable = has_session_segments(&temp);
+        // Restore before asserting so a failure still cleans up.
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        std::fs::remove_dir_all(&temp).ok();
+
+        assert!(
+            unreadable,
+            "a listing failure must resolve to `segmented`, never to `no segments`"
+        );
+    }
+
+    /// A directory that genuinely holds no segments is still the legacy case, so
+    /// the fix above must not make every path look segmented.
+    #[test]
+    fn an_empty_session_directory_is_not_segmented() {
+        let temp = std::env::temp_dir().join(format!(
+            "triage-empty-segments-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temp).expect("create session dir");
+        let empty = has_session_segments(&temp);
+        std::fs::remove_dir_all(&temp).ok();
+        assert!(!empty);
+    }
 
     #[cfg(unix)]
     #[test]
