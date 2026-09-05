@@ -8718,6 +8718,7 @@ class SessionWorkspace extends StatelessWidget {
             onViewFit: (cols, rows) =>
                 (onViewFit ?? session.noteViewFit)(cols, rows),
             focusCursorRevision: session.focusCursorRevision,
+            bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
           ),
         ),

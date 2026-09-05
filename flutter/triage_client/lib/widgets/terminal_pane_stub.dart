@@ -21,6 +21,7 @@ import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/platform_env_io.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
+import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
 
@@ -38,12 +39,14 @@ class TerminalPane extends StatefulWidget {
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
     this.onViewFit,
+    this.bracketedPasteEnabled = false,
     this.isExited = false,
   });
 
   final String terminalId;
   final TerminalController controller;
   final xt.Terminal terminal;
+  final bool bracketedPasteEnabled;
 
   /// Plain rows rendered only by the FLUTTER_TEST fallback view.
   final List<StyledRow> fallbackRows;
@@ -58,12 +61,15 @@ class TerminalPane extends StatefulWidget {
   final int focusCursorRevision;
   final bool isExited;
 
+  static final Map<String, bool> _sessionBracketedPasteModes = {};
+
   static void destroySession(String terminalId) {
     _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
+    _sessionBracketedPasteModes.remove(terminalId);
   }
 
   static void setBracketedPasteMode(String terminalId, bool enabled) {
-    // Native uses widget.terminal.setBracketedPasteMode directly.
+    _sessionBracketedPasteModes[terminalId] = enabled;
   }
 
   @override
@@ -584,6 +590,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         return;
       }
     }
+    // Multi-line IME text input (such as pasting from soft keyboard clipboard chips
+    // or Gboard on mobile). Intercept so multi-line text is formatted with bracketed
+    // paste or verified with the confirmation dialog rather than executing line by line.
+    if (data.length > 1 && isMultiLine(data)) {
+      unawaited(_handlePaste(data));
+      return;
+    }
     widget.controller.sendInput(data);
   }
 
@@ -850,7 +863,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   // with the gap spaces restored. Returning `ignored` for everything else
   // leaves xterm's normal key handling — including Ctrl+C -> SIGINT — untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
-    if (ModalRoute.of(context)?.isCurrent == false) return KeyEventResult.ignored;
+    if (ModalRoute.of(context)?.isCurrent == false) {
+      return KeyEventResult.ignored;
+    }
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
@@ -1082,6 +1097,30 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  bool _isBracketedPasteEnabled() {
+    return widget.bracketedPasteEnabled ||
+        (TerminalPane._sessionBracketedPasteModes[widget.terminalId] ??
+            false) ||
+        _terminal.bracketedPasteMode;
+  }
+
+  Future<void> _handlePaste(String text) async {
+    if (text.isEmpty) return;
+    final isBracketed = _isBracketedPasteEnabled();
+    if (isBracketed || !isMultiLine(text)) {
+      final formatted = formatPasteInput(text, isBracketed);
+      widget.controller.sendInput(formatted);
+      return;
+    }
+
+    final chosenText = await showMultiLinePasteDialog(context, text);
+    if (chosenText != null && mounted) {
+      final formatted = formatPasteInput(chosenText, false);
+      widget.controller.sendInput(formatted);
+      _xtermController.clearSelection();
+    }
+  }
+
   Future<void> _pasteFromClipboard() async {
     if (_isPasting) return;
     _isPasting = true;
@@ -1090,8 +1129,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted) return;
       final text = data?.text;
       if (text != null && text.isNotEmpty) {
-        final formatted = formatPasteInput(text, _terminal.bracketedPasteMode);
-        widget.controller.sendInput(formatted);
+        await _handlePaste(text);
         _xtermController.clearSelection();
       }
     } catch (e) {

@@ -1,6 +1,23 @@
-/// Terminal paste utilities and bracketed paste formatting.
-
 final _pasteEscapeInjectionPattern = RegExp(r'\x1b\[201~|\x9b201~');
+final _newlinePattern = RegExp(r'\r\n|\r|\n');
+
+/// Reports whether [text] contains newlines (`\n` or `\r`).
+bool isMultiLine(String text) {
+  return text.contains('\n') || text.contains('\r');
+}
+
+/// Flattens [text] to a single line by replacing all newline sequences (`\r\n`, `\r`, `\n`)
+/// with a single space.
+String flattenToSingleLine(String text) {
+  return text.replaceAll(_newlinePattern, ' ');
+}
+
+/// Counts the number of lines in [text].
+int lineCount(String text) {
+  if (text.isEmpty) return 0;
+  final matches = _newlinePattern.allMatches(text);
+  return matches.length + 1;
+}
 
 /// Formats text for insertion into a terminal session as a paste operation.
 ///

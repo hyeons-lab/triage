@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
+import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'terminal_pane.dart';
 
@@ -23,12 +24,14 @@ class TerminalPane extends StatefulWidget {
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
     this.onViewFit,
+    this.bracketedPasteEnabled = false,
     this.isExited = false,
   });
 
   final String terminalId;
   final TerminalController controller;
   final dynamic terminal;
+  final bool bracketedPasteEnabled;
 
   /// Plain rows; unused by the live web view but kept for parity with native.
   final List<StyledRow> fallbackRows;
@@ -46,11 +49,13 @@ class TerminalPane extends StatefulWidget {
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _TerminalPaneState._sessionBracketedPasteModes.remove(sanitizedId);
     _TerminalPaneState._discardCachedSession(sanitizedId);
   }
 
   static void setBracketedPasteMode(String terminalId, bool enabled) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _TerminalPaneState._sessionBracketedPasteModes[sanitizedId] = enabled;
     final term = _TerminalPaneState._sessionTerms[sanitizedId];
     if (term != null) {
       try {
@@ -67,6 +72,7 @@ class TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
+  static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
   static final Map<String, dynamic> _sessionTerms = {};
   static final Map<String, dynamic> _sessionFitAddons = {};
@@ -710,7 +716,8 @@ class _TerminalPaneState extends State<TerminalPane> {
           final buffer = js_util.getProperty(term, 'buffer');
           final active = js_util.getProperty(buffer, 'active');
           final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-          final viewportY = (js_util.getProperty(active, 'viewportY') as num).toInt();
+          final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+              .toInt();
           if (viewportY >= baseY) {
             _sessionSavedViewportY.remove(sessionId);
           } else {
@@ -847,7 +854,9 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _syncInitialBracketedPasteMode() {
     try {
-      final isEnabled = widget.terminal?.bracketedPasteMode ?? false;
+      final isEnabled =
+          widget.bracketedPasteEnabled ||
+          (_sessionBracketedPasteModes[_sanitizedId] ?? false);
       if (_term != null) {
         final modes = js_util.getProperty(_term, 'modes');
         if (modes != null) {
@@ -858,6 +867,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   bool _isBracketedPasteEnabled() {
+    if (widget.bracketedPasteEnabled) return true;
+    if (_sessionBracketedPasteModes[_sanitizedId] == true) return true;
     try {
       if (_term != null) {
         final modes = js_util.getProperty(_term, 'modes');
@@ -865,13 +876,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           final val = js_util.getProperty(modes, 'bracketedPasteMode');
           if (val == true) return true;
         }
-      }
-    } catch (_) {}
-    try {
-      final dynTerm = widget.terminal;
-      if (dynTerm != null) {
-        final val = js_util.getProperty(dynTerm, 'bracketedPasteMode');
-        if (val == true) return true;
       }
     } catch (_) {}
     return false;
@@ -925,14 +929,27 @@ class _TerminalPaneState extends State<TerminalPane> {
         final clipboardData = event.clipboardData;
         final text = clipboardData?.getData('text/plain') ?? '';
         if (text.isNotEmpty) {
-          final isBracketed = _isBracketedPasteEnabled();
-          _sendInput(formatPasteInput(text, isBracketed));
+          _handlePaste(text);
         }
       }
     }
 
     _containerPasteListener = pasteListener;
     _container.addEventListener('paste', pasteListener, true);
+  }
+
+  Future<void> _handlePaste(String text) async {
+    if (text.isEmpty) return;
+    final isBracketed = _isBracketedPasteEnabled();
+    if (isBracketed || !isMultiLine(text)) {
+      _sendInput(formatPasteInput(text, isBracketed));
+      return;
+    }
+
+    final chosenText = await showMultiLinePasteDialog(context, text);
+    if (chosenText != null && mounted) {
+      _sendInput(formatPasteInput(chosenText, false));
+    }
   }
 
   /// Releases the listeners [_bindContainerEvents] attached, and is safe to call
