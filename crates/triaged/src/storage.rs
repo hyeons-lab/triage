@@ -14,6 +14,8 @@ pub const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 pub const SEGMENT_EXT: &str = "tlog";
 pub const COMPRESSED_SEGMENT_EXT: &str = "tlog.zst";
+const COMPRESSED_SUFFIX: &str = ".tlog.zst";
+const UNCOMPRESSED_SUFFIX: &str = ".tlog";
 
 /// Information about a discovered segment file on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +43,9 @@ pub fn parse_segment_index(file_name: &str) -> Option<(u32, bool)> {
         return None;
     }
     let remainder = &file_name[prefix.len()..];
-    if let Some(num_str) = remainder.strip_suffix(&format!(".{COMPRESSED_SEGMENT_EXT}")) {
+    if let Some(num_str) = remainder.strip_suffix(COMPRESSED_SUFFIX) {
         num_str.parse::<u32>().ok().map(|idx| (idx, true))
-    } else if let Some(num_str) = remainder.strip_suffix(&format!(".{SEGMENT_EXT}")) {
+    } else if let Some(num_str) = remainder.strip_suffix(UNCOMPRESSED_SUFFIX) {
         num_str.parse::<u32>().ok().map(|idx| (idx, false))
     } else {
         None
@@ -52,8 +54,9 @@ pub fn parse_segment_index(file_name: &str) -> Option<(u32, bool)> {
 
 /// Lists all segment files in a session directory, sorted in ascending chronological order by index.
 ///
-/// If both an uncompressed and a compressed file exist for the same segment index (e.g. compression
-/// was in-flight or interrupted), the uncompressed `.tlog` takes precedence unless it is zero-sized.
+/// If both an uncompressed and a compressed file exist for the same segment index, the compressed
+/// `.tlog.zst` takes precedence if valid, as the uncompressed file may be in flight to be unlinked
+/// by the background compression worker.
 pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>> {
     if !session_dir.exists() {
         return Ok(Vec::new());
@@ -87,8 +90,8 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
 
             match segments_by_index.get(&index) {
                 Some(existing) => {
-                    // Prefer uncompressed if valid, otherwise prefer compressed
-                    if (!is_compressed && file_size > 0)
+                    // Prefer compressed if valid: uncompressed may be in flight to be unlinked
+                    if (is_compressed && file_size > 0)
                         || (existing.file_size == 0 && file_size > 0)
                     {
                         segments_by_index.insert(index, info);
@@ -104,17 +107,49 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
     Ok(segments_by_index.into_values().collect())
 }
 
+/// Resolves the active uncompressed segment for a session directory.
+///
+/// If uncompressed segments exist, returns the latest uncompressed segment.
+/// If all existing segments are compressed, targets the next sequential segment index with 0 bytes.
+/// If no segments exist, returns the initial segment index (1) with 0 bytes.
+pub fn resolve_active_segment(session_dir: &Path) -> Result<(PathBuf, u32, u64)> {
+    let segments = list_session_segments(session_dir)?;
+    if let Some(uncompressed) = segments.iter().rev().find(|s| !s.is_compressed) {
+        Ok((
+            uncompressed.path.clone(),
+            uncompressed.index,
+            uncompressed.file_size,
+        ))
+    } else if let Some(last) = segments.last() {
+        let next_idx = last.index + 1;
+        let next_path = session_dir.join(segment_file_name(next_idx));
+        Ok((next_path, next_idx, 0))
+    } else {
+        let first_path = session_dir.join(segment_file_name(1));
+        Ok((first_path, 1, 0))
+    }
+}
+
 /// Compresses a raw `.tlog` segment file to `.tlog.zst` using zstd.
 ///
-/// Writes to a temporary file (`.tlog.zst.tmp`) first, then atomically renames to the final
+/// Writes to a PID-isolated temporary file first, then atomically renames to the final
 /// compressed path, and finally unlinks the raw file.
 pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<u64> {
     ensure!(raw_path.exists(), "raw segment path does not exist");
 
-    let tmp_path = compressed_path.with_extension("tmp");
-    {
+    let tmp_name = format!(
+        "{}.tmp.{}",
+        compressed_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("segment"),
+        std::process::id()
+    );
+    let tmp_path = compressed_path.with_file_name(tmp_name);
+    let encode_res = (|| -> Result<()> {
         let raw_file = File::open(raw_path)
             .with_context(|| format!("opening raw segment {}", raw_path.display()))?;
+        let raw_len = raw_file.metadata()?.len();
         let mut reader = BufReader::new(raw_file);
 
         let tmp_file = OpenOptions::new()
@@ -125,18 +160,31 @@ pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<
             .with_context(|| format!("creating temp compressed segment {}", tmp_path.display()))?;
         let writer = BufWriter::new(tmp_file);
 
-        zstd::stream::copy_encode(&mut reader, writer, ZSTD_COMPRESSION_LEVEL)
-            .with_context(|| format!("compressing segment to {}", tmp_path.display()))?;
+        let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;
+        encoder.set_pledged_src_size(Some(raw_len))?;
+        std::io::copy(&mut reader, &mut encoder)?;
+        let mut writer = encoder.finish()?;
+        writer.flush()?;
+        drop(writer);
+        Ok(())
+    })();
+
+    if let Err(err) = encode_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
 
     // Atomic rename
-    fs::rename(&tmp_path, compressed_path).with_context(|| {
-        format!(
-            "renaming {} to {}",
-            tmp_path.display(),
-            compressed_path.display()
-        )
-    })?;
+    if let Err(err) = fs::rename(&tmp_path, compressed_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                tmp_path.display(),
+                compressed_path.display()
+            )
+        });
+    }
 
     let compressed_len = fs::metadata(compressed_path)?.len();
 
@@ -146,15 +194,72 @@ pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<
     Ok(compressed_len)
 }
 
+/// Returns the uncompressed byte length of a segment.
+///
+/// For uncompressed `.tlog` files, returns `info.file_size`.
+/// For compressed `.tlog.zst` files, inspects the zstd frame header for the pledged
+/// uncompressed frame size in O(1) time without decompressing. If the frame header
+/// does not store the content size, falls back to decoding the stream into `io::sink()`.
+pub fn get_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<u64> {
+    if !info.is_compressed {
+        return Ok(info.file_size);
+    }
+
+    let mut file = match File::open(&info.path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let uncompressed_path = info.path.with_file_name(segment_file_name(info.index));
+            if let Ok(meta) = fs::metadata(&uncompressed_path) {
+                return Ok(meta.len());
+            }
+            return Err(err).with_context(|| format!("opening segment {}", info.path.display()));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("opening segment {}", info.path.display()));
+        }
+    };
+
+    let mut header_buf = [0u8; 256];
+    if let Ok(n) = file.read(&mut header_buf)
+        && let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&header_buf[..n])
+    {
+        return Ok(size);
+    }
+
+    let fallback_file = File::open(&info.path)
+        .with_context(|| format!("opening fallback segment file {}", info.path.display()))?;
+    let mut decoder = zstd::stream::Decoder::new(BufReader::new(fallback_file))
+        .with_context(|| format!("decoding zstd segment {}", info.path.display()))?;
+    let count = std::io::copy(&mut decoder, &mut std::io::sink())?;
+    Ok(count)
+}
+
 /// Reads the entire uncompressed content of a segment.
 pub fn read_segment_uncompressed(info: &SegmentFileInfo) -> Result<Vec<u8>> {
-    let file = File::open(&info.path)
-        .with_context(|| format!("opening segment file {}", info.path.display()))?;
+    let (file, is_compressed) = match File::open(&info.path) {
+        Ok(f) => (f, info.is_compressed),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !info.is_compressed => {
+            let compressed_path = info
+                .path
+                .with_file_name(compressed_segment_file_name(info.index));
+            let f = File::open(&compressed_path).with_context(|| {
+                format!(
+                    "opening fallback compressed segment {}",
+                    compressed_path.display()
+                )
+            })?;
+            (f, true)
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("opening segment file {}", info.path.display()));
+        }
+    };
 
-    if info.is_compressed {
+    if is_compressed {
         let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))
             .with_context(|| format!("decoding zstd segment {}", info.path.display()))?;
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(DEFAULT_SEGMENT_SIZE_BYTES as usize);
         decoder.read_to_end(&mut buffer)?;
         Ok(buffer)
     } else {
@@ -234,63 +339,77 @@ pub fn read_multi_segment_tail(
         combined.drain(..skip);
     }
 
+    let start_offset = total_uncompressed_bytes.saturating_sub(combined.len() as u64);
     (start_offset, combined)
 }
 
 /// Reads the trailing `cap` bytes of a session directory for terminal replay during restore or resize.
 ///
-/// Returns `(total_uncompressed_len, tail_bytes)`.
+/// Returns `(total_uncompressed_len, tail_bytes)`. Memory usage is bounded strictly by `cap`.
 pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u64, Vec<u8>)> {
     let segments = list_session_segments(session_dir)?;
     if segments.is_empty() {
         return Ok((0, Vec::new()));
     }
 
-    let mut total_uncompressed_len: u64 = 0;
-    let mut uncompressed_segments: Vec<Vec<u8>> = Vec::new();
+    let cap_usize = cap as usize;
+    let mut collected_chunks: Vec<Vec<u8>> = Vec::new();
+    let mut accumulated_tail_len = 0;
+    let mut remaining_older_segments = 0;
 
-    for segment in &segments {
-        let bytes = read_segment_uncompressed(segment)?;
-        total_uncompressed_len += bytes.len() as u64;
-        uncompressed_segments.push(bytes);
-    }
-
-    let needed_bytes = (total_uncompressed_len.min(cap)) as usize;
-    let mut combined = Vec::with_capacity(needed_bytes);
-
-    let start_offset = total_uncompressed_len.saturating_sub(cap) as usize;
-    let mut current_offset: usize = 0;
-
-    for chunk in uncompressed_segments {
-        let chunk_len = chunk.len();
-        let chunk_end = current_offset + chunk_len;
-
-        if chunk_end > start_offset {
-            let slice_start = start_offset.saturating_sub(current_offset);
-            combined.extend_from_slice(&chunk[slice_start..]);
+    for (i, segment) in segments.iter().rev().enumerate() {
+        if accumulated_tail_len >= cap_usize {
+            remaining_older_segments = segments.len() - i;
+            break;
         }
-        current_offset = chunk_end;
+        let bytes = read_segment_uncompressed(segment)?;
+        accumulated_tail_len += bytes.len();
+        collected_chunks.push(bytes);
     }
 
+    let mut older_bytes = 0u64;
+    for segment in &segments[..remaining_older_segments] {
+        older_bytes += get_segment_uncompressed_size(segment)?;
+    }
+
+    collected_chunks.reverse();
+    let mut combined = Vec::with_capacity(accumulated_tail_len.min(cap_usize));
+    for chunk in collected_chunks {
+        combined.extend_from_slice(&chunk);
+    }
+
+    if combined.len() > cap_usize {
+        let skip = combined.len() - cap_usize;
+        combined.drain(..skip);
+    }
+
+    let total_uncompressed_len = older_bytes + accumulated_tail_len as u64;
     Ok((total_uncompressed_len, combined))
 }
 
 /// A job sent to the background compression worker.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompressionJob {
     pub raw_path: PathBuf,
     pub compressed_path: PathBuf,
 }
 
+/// Message sent across the worker channel.
+#[derive(Debug)]
+pub enum WorkerMessage {
+    Job(CompressionJob),
+    Stop,
+}
+
 /// Handle to the background segment compression worker thread.
 pub struct CompressionWorker {
-    tx: Option<Sender<CompressionJob>>,
+    tx: Option<Sender<WorkerMessage>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl CompressionWorker {
     pub fn start() -> Self {
-        let (tx, rx) = mpsc::channel::<CompressionJob>();
+        let (tx, rx) = mpsc::channel::<WorkerMessage>();
         let handle = thread::Builder::new()
             .name("triage-compression-worker".into())
             .spawn(move || {
@@ -304,12 +423,31 @@ impl CompressionWorker {
         }
     }
 
-    pub fn sender(&self) -> Option<Sender<CompressionJob>> {
+    pub fn sender(&self) -> Option<Sender<WorkerMessage>> {
         self.tx.clone()
     }
 
-    fn run_worker(rx: Receiver<CompressionJob>) {
-        while let Ok(job) = rx.recv() {
+    fn run_worker(rx: Receiver<WorkerMessage>) {
+        while let Ok(msg) = rx.recv() {
+            let job = match msg {
+                WorkerMessage::Job(job) => job,
+                WorkerMessage::Stop => {
+                    while let Ok(WorkerMessage::Job(pending_job)) = rx.try_recv() {
+                        if let Err(err) = compress_segment_file(
+                            &pending_job.raw_path,
+                            &pending_job.compressed_path,
+                        ) {
+                            tracing::warn!(
+                                raw_path = %pending_job.raw_path.display(),
+                                compressed_path = %pending_job.compressed_path.display(),
+                                ?err,
+                                "failed to compress segment file during worker teardown"
+                            );
+                        }
+                    }
+                    break;
+                }
+            };
             if let Err(err) = compress_segment_file(&job.raw_path, &job.compressed_path) {
                 tracing::warn!(
                     raw_path = %job.raw_path.display(),
@@ -330,7 +468,9 @@ impl CompressionWorker {
 
 impl Drop for CompressionWorker {
     fn drop(&mut self) {
-        drop(self.tx.take());
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(WorkerMessage::Stop);
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -339,7 +479,7 @@ impl Drop for CompressionWorker {
 
 /// Strips standard ANSI and VT100 escape sequences from byte streams for plain-text search.
 pub fn strip_ansi_escapes(input: &[u8]) -> String {
-    let mut output = String::with_capacity(input.len());
+    let mut output_bytes = Vec::with_capacity(input.len());
     let mut in_escape = false;
     let mut in_csi = false;
     let mut in_osc = false;
@@ -391,13 +531,13 @@ pub fn strip_ansi_escapes(input: &[u8]) -> String {
 
         // Keep printable ASCII, newlines, tabs, and valid UTF-8 sequences
         if b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x20 {
-            output.push(b as char);
+            output_bytes.push(b);
         }
 
         i += 1;
     }
 
-    output
+    String::from_utf8_lossy(&output_bytes).into_owned()
 }
 
 /// A search hit found in a session segment.
@@ -439,13 +579,7 @@ pub fn search_session_segments(
         let clean_text = strip_ansi_escapes(&uncompressed);
 
         for (line_idx, line) in clean_text.lines().enumerate() {
-            let matches = if case_insensitive {
-                line.to_lowercase().contains(&query_lower)
-            } else {
-                line.contains(query)
-            };
-
-            if matches {
+            if line_matches_query(line, query, &query_lower, case_insensitive) {
                 hits.push(SearchHit {
                     segment_index: segment.index,
                     line_number: line_idx + 1,
@@ -456,6 +590,30 @@ pub fn search_session_segments(
     }
 
     Ok(hits)
+}
+
+/// Matches a line of text against a query string with minimal heap allocations.
+pub fn line_matches_query(
+    line: &str,
+    query: &str,
+    query_lower: &str,
+    case_insensitive: bool,
+) -> bool {
+    if !case_insensitive {
+        return line.contains(query);
+    }
+    if line.len() < query.len() {
+        return false;
+    }
+    if line.is_ascii() && query.is_ascii() {
+        let line_bytes = line.as_bytes();
+        let query_bytes = query_lower.as_bytes();
+        line_bytes
+            .windows(query_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(query_bytes))
+    } else {
+        line.to_lowercase().contains(query_lower)
+    }
 }
 
 /// Migrates a legacy unsegmented `session-*.log` file into 8 MiB segments in `session_dir`.
@@ -475,51 +633,90 @@ pub fn migrate_legacy_session_log(
         .with_context(|| format!("opening legacy log {}", legacy_log_path.display()))?;
     let total_len = file.metadata()?.len();
 
-    fs::create_dir_all(session_dir).with_context(|| {
-        format!(
-            "creating session directory for migration: {}",
-            session_dir.display()
-        )
-    })?;
+    let parent = session_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating parent directory {}", parent.display()))?;
 
-    if total_len == 0 {
-        let active_path = session_dir.join(segment_file_name(1));
-        File::create(&active_path)?;
-        let migrated_path = legacy_log_path.with_extension("log.migrated");
-        let _ = fs::rename(legacy_log_path, migrated_path);
-        return Ok(0);
-    }
+    let tmp_dir_name = format!(
+        ".tmp-migrate-{}-{}",
+        std::process::id(),
+        session_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("session")
+    );
+    let tmp_dir = parent.join(tmp_dir_name);
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("creating temp migration dir {}", tmp_dir.display()))?;
 
-    let mut reader = BufReader::new(file);
-    let mut segment_index: u32 = 1;
-    let mut bytes_remaining = total_len;
-
-    while bytes_remaining > 0 {
-        let chunk_size = bytes_remaining.min(segment_size) as usize;
-        let mut buffer = vec![0u8; chunk_size];
-        reader.read_exact(&mut buffer)?;
-
-        let is_last_segment = bytes_remaining <= segment_size;
-        let segment_path = session_dir.join(segment_file_name(segment_index));
-
-        if is_last_segment {
-            // Write active segment uncompressed
-            let mut seg_file = File::create(&segment_path)?;
-            seg_file.write_all(&buffer)?;
-        } else {
-            // Compress closed segment immediately
-            let compressed_path = session_dir.join(compressed_segment_file_name(segment_index));
-            let tmp_compressed_path = compressed_path.with_extension("tmp");
-
-            let tmp_file = File::create(&tmp_compressed_path)?;
-            let writer = BufWriter::new(tmp_file);
-
-            zstd::stream::copy_encode(&buffer[..], writer, ZSTD_COMPRESSION_LEVEL)?;
-            fs::rename(&tmp_compressed_path, &compressed_path)?;
+    let migrate_res = (|| -> Result<()> {
+        if total_len == 0 {
+            let active_path = tmp_dir.join(segment_file_name(1));
+            File::create(&active_path)?;
+            return Ok(());
         }
 
-        bytes_remaining -= chunk_size as u64;
-        segment_index += 1;
+        let mut reader = BufReader::new(file);
+        let mut segment_index: u32 = 1;
+        let mut bytes_remaining = total_len;
+        let mut buffer = vec![0u8; segment_size as usize];
+
+        while bytes_remaining > 0 {
+            let chunk_size = bytes_remaining.min(segment_size) as usize;
+            let chunk_slice = &mut buffer[..chunk_size];
+            reader.read_exact(chunk_slice)?;
+
+            let is_last_segment = bytes_remaining <= segment_size;
+
+            if is_last_segment {
+                let segment_path = tmp_dir.join(segment_file_name(segment_index));
+                let mut seg_file = File::create(&segment_path)?;
+                seg_file.write_all(chunk_slice)?;
+                seg_file.flush()?;
+                drop(seg_file);
+            } else {
+                let compressed_path = tmp_dir.join(compressed_segment_file_name(segment_index));
+                let tmp_compressed_name =
+                    format!("segment-{segment_index:06}.tmp.{}", std::process::id());
+                let tmp_compressed_path = tmp_dir.join(tmp_compressed_name);
+
+                let tmp_file = File::create(&tmp_compressed_path)?;
+                let writer = BufWriter::new(tmp_file);
+
+                let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;
+                encoder.set_pledged_src_size(Some(chunk_size as u64))?;
+                std::io::copy(&mut &*chunk_slice, &mut encoder)?;
+                let mut writer = encoder.finish()?;
+                writer.flush()?;
+                drop(writer);
+
+                fs::rename(&tmp_compressed_path, &compressed_path)?;
+            }
+
+            bytes_remaining -= chunk_size as u64;
+            segment_index += 1;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = migrate_res {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Err(err);
+    }
+
+    if session_dir.exists() {
+        let _ = fs::remove_dir_all(session_dir);
+    }
+    if let Err(err) = fs::rename(&tmp_dir, session_dir) {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Err(err).with_context(|| {
+            format!(
+                "renaming migration temp dir {} to {}",
+                tmp_dir.display(),
+                session_dir.display()
+            )
+        });
     }
 
     // Rename legacy file to .migrated

@@ -1368,7 +1368,7 @@ impl SessionManager {
             .join(crate::storage::segment_file_name(1))
     }
 
-    pub fn compression_tx(&self) -> Option<Sender<crate::storage::CompressionJob>> {
+    pub fn compression_tx(&self) -> Option<Sender<crate::storage::WorkerMessage>> {
         self._compression_worker.sender()
     }
 
@@ -1378,6 +1378,10 @@ impl SessionManager {
         query: &str,
         case_insensitive: bool,
     ) -> Result<Vec<crate::storage::SearchHit>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
         let session_dir = self
             .config
             .log_dir
@@ -1393,12 +1397,12 @@ impl SessionManager {
                 let query_lower = query.to_lowercase();
                 let mut hits = Vec::new();
                 for (idx, line) in text.lines().enumerate() {
-                    let matches = if case_insensitive {
-                        line.to_lowercase().contains(&query_lower)
-                    } else {
-                        line.contains(query)
-                    };
-                    if matches {
+                    if crate::storage::line_matches_query(
+                        line,
+                        query,
+                        &query_lower,
+                        case_insensitive,
+                    ) {
                         hits.push(crate::storage::SearchHit {
                             segment_index: 1,
                             line_number: idx + 1,
@@ -1913,7 +1917,7 @@ impl SessionManager {
                 args: launch.args,
                 cwd: launch.cwd,
                 size: launch.size,
-                log_path: launch.log_path,
+                log_path: ext.log_path,
                 output_seq: ext.output_seq,
                 bytes_logged: ext.bytes_logged,
                 pid: ext.pid,
@@ -2229,7 +2233,6 @@ impl SessionManager {
             writer,
             output,
             size,
-            log_path,
             current_working_directory,
         } = runtime;
 
@@ -2272,7 +2275,6 @@ impl SessionManager {
                     writer_tx,
                     output,
                     size,
-                    log_path,
                     exited: false,
                     output_closed: false,
                     exit_broadcasted: false,
@@ -2551,24 +2553,34 @@ fn spawn_adopted_pty_runtime(
     let writer = shared_pty_writer(master.take_writer().context("taking PTY writer")?);
 
     let terminal = terminal_with_writer(&h_sess.size, writer.clone());
+    let (target_log_path, active_segment_index, active_segment_bytes) =
+        if let Some(session_dir) = resolve_segment_session_dir(&h_sess.log_path) {
+            crate::storage::resolve_active_segment(&session_dir)?
+        } else {
+            let (active_segment_index, _) = h_sess
+                .log_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .unwrap_or((1, false));
+            let active_segment_bytes = fs::metadata(&h_sess.log_path).map(|m| m.len()).unwrap_or(0);
+            (
+                h_sess.log_path.clone(),
+                active_segment_index,
+                active_segment_bytes,
+            )
+        };
+
     let log = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
-        .open(&h_sess.log_path)
-        .with_context(|| format!("opening session log {}", h_sess.log_path.display()))?;
-
-    let (active_segment_index, _) = h_sess
-        .log_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(crate::storage::parse_segment_index)
-        .unwrap_or((1, false));
-    let active_segment_bytes = fs::metadata(&h_sess.log_path).map(|m| m.len()).unwrap_or(0);
+        .open(&target_log_path)
+        .with_context(|| format!("opening session log {}", target_log_path.display()))?;
 
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
-        log_path: h_sess.log_path.clone(),
+        log_path: target_log_path,
         trim_disabled: false,
         max_log_bytes: MAX_SESSION_LOG_BYTES,
         retain_log_bytes: SESSION_LOG_RETAIN_BYTES,
@@ -2606,7 +2618,6 @@ fn spawn_adopted_pty_runtime(
         writer,
         output,
         size: h_sess.size.clone(),
-        log_path: h_sess.log_path.clone(),
         current_working_directory,
     })
 }
@@ -4278,14 +4289,25 @@ fn purge_orphaned_session_logs(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            let is_log = file_name.ends_with(".log");
+            let is_migrated = file_name.ends_with(".log.migrated");
+            if !is_log && !is_migrated {
                 continue;
             }
-            if path
-                .file_name()
-                .is_some_and(|name| referenced_names.contains(name))
-            {
+            if referenced_names.contains(std::ffi::OsStr::new(file_name)) {
                 continue;
+            }
+            if is_migrated && let Some(stem) = file_name.strip_suffix(".log.migrated") {
+                let log_name = format!("{stem}.log");
+                if referenced_names.contains(std::ffi::OsStr::new(&log_name))
+                    || referenced_stems.contains(std::ffi::OsStr::new(stem))
+                {
+                    continue;
+                }
             }
             let Ok(metadata) = entry.metadata() else {
                 continue;
@@ -4320,19 +4342,44 @@ fn purge_orphaned_session_logs(
                 if referenced_stems.contains(dir_name) || referenced_names.contains(dir_name) {
                     continue;
                 }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                let stale = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_some_and(|age| age >= retention);
-                if !stale {
+                let mut dir_stale = true;
+                let mut dir_bytes = 0u64;
+                let mut inner_count = 0usize;
+                if let Ok(inner_entries) = fs::read_dir(&path) {
+                    for inner in inner_entries.flatten() {
+                        inner_count += 1;
+                        if let Ok(meta) = inner.metadata() {
+                            dir_bytes += meta.len();
+                            if meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| now.duration_since(m).ok())
+                                .is_some_and(|age| age < retention)
+                            {
+                                dir_stale = false;
+                            }
+                        }
+                    }
+                }
+                if inner_count == 0 {
+                    if let Ok(metadata) = entry.metadata() {
+                        let stale = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|modified| now.duration_since(modified).ok())
+                            .is_some_and(|age| age >= retention);
+                        dir_stale = stale;
+                    } else {
+                        dir_stale = false;
+                    }
+                }
+                if !dir_stale {
                     continue;
                 }
-                let _ = fs::remove_dir_all(&path);
-                removed += 1;
+                if fs::remove_dir_all(&path).is_ok() {
+                    removed += 1;
+                    reclaimed += dir_bytes;
+                }
             }
         }
     }
@@ -4657,7 +4704,7 @@ impl SessionActor {
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
-        compression_tx: Option<Sender<crate::storage::CompressionJob>>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
@@ -4684,7 +4731,7 @@ impl SessionActor {
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
-        compression_tx: Option<Sender<crate::storage::CompressionJob>>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
@@ -4706,7 +4753,7 @@ impl SessionActor {
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
-        compression_tx: Option<Sender<crate::storage::CompressionJob>>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
         log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
@@ -4720,7 +4767,6 @@ impl SessionActor {
             writer,
             output,
             size,
-            log_path,
             current_working_directory,
         } = runtime;
         let initial_working_directory = current_working_directory.or(initial_working_directory);
@@ -4754,7 +4800,6 @@ impl SessionActor {
                     writer_tx,
                     output,
                     size,
-                    log_path,
                     exited: false,
                     output_closed: false,
                     exit_broadcasted: false,
@@ -4915,7 +4960,6 @@ struct ActorState {
     writer_tx: SyncSender<Vec<u8>>,
     output: OutputState,
     size: SessionSize,
-    log_path: PathBuf,
     exited: bool,
     output_closed: bool,
     exit_broadcasted: bool,
@@ -4965,7 +5009,6 @@ struct PtyRuntime {
     writer: SharedPtyWriter,
     output: OutputState,
     size: SessionSize,
-    log_path: PathBuf,
     current_working_directory: Option<PathBuf>,
 }
 
@@ -4985,7 +5028,7 @@ struct OutputState {
     segment_size_bytes: u64,
     active_segment_index: u32,
     active_segment_bytes: u64,
-    compression_tx: Option<Sender<crate::storage::CompressionJob>>,
+    compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     terminal: Terminal,
     cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
@@ -5071,6 +5114,7 @@ pub struct ExtractedHandover {
     pub fd: std::os::unix::io::OwnedFd,
     pub pid: u32,
     pub process_identity: Option<crate::handover::HandoverProcessIdentity>,
+    pub log_path: PathBuf,
     pub output_seq: u64,
     pub bytes_logged: u64,
 }
@@ -5155,6 +5199,7 @@ impl ActorState {
             fd: unsafe { std::os::unix::io::FromRawFd::from_raw_fd(dup_fd) },
             pid,
             process_identity: self.process_identity,
+            log_path: self.output.log_path.clone(),
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
         })
@@ -5531,7 +5576,11 @@ impl ActorState {
     /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
     /// the plain [`Self::snapshot`] so they never carry history.
     fn snapshot_with_history(&self) -> SessionSnapshot {
-        overlay_raw_output_history(self.snapshot(), &self.log_path, self.output.bytes_logged)
+        overlay_raw_output_history(
+            self.snapshot(),
+            &self.output.log_path,
+            self.output.bytes_logged,
+        )
     }
 
     fn styled_rows(&self, start: usize, end: usize) -> Result<StyledRowsResponse> {
@@ -6028,10 +6077,18 @@ impl OutputState {
                 if let Some(tx) = &self.compression_tx {
                     let compressed_name = crate::storage::compressed_segment_file_name(current_idx);
                     let compressed_path = session_dir.join(compressed_name);
-                    let _ = tx.send(crate::storage::CompressionJob {
-                        raw_path: old_segment_path,
-                        compressed_path,
-                    });
+                    if let Err(err) = tx.send(crate::storage::WorkerMessage::Job(
+                        crate::storage::CompressionJob {
+                            raw_path: old_segment_path.clone(),
+                            compressed_path,
+                        },
+                    )) {
+                        tracing::warn!(
+                            path = %old_segment_path.display(),
+                            ?err,
+                            "failed to queue rotated segment for background compression"
+                        );
+                    }
                 }
             }
             Err(err) => {
@@ -6381,7 +6438,6 @@ fn spawn_pty_runtime(
                     pending_escape_buffer: Vec::new(),
                 },
                 size: config.size,
-                log_path: config.log_path,
                 current_working_directory: None,
             })
         }
@@ -6443,7 +6499,6 @@ fn spawn_pty_runtime(
                 writer,
                 output,
                 size: config.size,
-                log_path: config.log_path,
                 current_working_directory,
             })
         }
@@ -6456,7 +6511,9 @@ fn build_pty_command(
     needs_job_control_reset: bool,
     current_exe: Option<&Path>,
 ) -> Result<CommandBuilder> {
-    let mut command = if let (true, Some(exe)) = (needs_job_control_reset, current_exe) {
+    let mut command = if needs_job_control_reset {
+        let exe = current_exe
+            .context("resolving the triaged executable for the PTY child job-control reset shim")?;
         let mut command = CommandBuilder::new(exe);
         command.arg(PTY_CHILD_EXEC_ARG);
         command.arg(&config.command);
@@ -6473,19 +6530,7 @@ fn build_pty_command(
 fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputState> {
     let (target_log_path, active_segment_index, active_segment_bytes) =
         if let Some(session_dir) = resolve_segment_session_dir(log_path) {
-            let segments = crate::storage::list_session_segments(&session_dir)?;
-            if let Some(last) = segments.last() {
-                if !last.is_compressed {
-                    (last.path.clone(), last.index, last.file_size)
-                } else {
-                    let next_idx = last.index + 1;
-                    let next_path = session_dir.join(crate::storage::segment_file_name(next_idx));
-                    (next_path, next_idx, 0)
-                }
-            } else {
-                let p = session_dir.join(crate::storage::segment_file_name(1));
-                (p, 1, 0)
-            }
+            crate::storage::resolve_active_segment(&session_dir)?
         } else {
             let (active_segment_index, _) = log_path
                 .file_name()
@@ -6641,9 +6686,7 @@ fn overlay_raw_output_history(
 }
 
 fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
-    if log_path.is_dir() {
-        Some(log_path.to_path_buf())
-    } else if let Some(file_name) = log_path.file_name().and_then(|n| n.to_str()) {
+    if let Some(file_name) = log_path.file_name().and_then(|n| n.to_str()) {
         if crate::storage::parse_segment_index(file_name).is_some() {
             log_path.parent().map(|p| p.to_path_buf())
         } else if let Some(stem) = file_name.strip_suffix(".log") {
@@ -6658,6 +6701,12 @@ fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
                 }
             }
             None
+        } else if log_path.is_dir()
+            && !crate::storage::list_session_segments(log_path)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            Some(log_path.to_path_buf())
         } else {
             None
         }
@@ -11575,8 +11624,16 @@ mod tests {
 
         let orphan = dir.join("session-1.log");
         let referenced = dir.join("session-2.log");
+        let orphan_migrated = dir.join("session-3.log.migrated");
+        let referenced_migrated = dir.join("session-2.log.migrated");
         let unrelated = dir.join("sessions.json");
-        for path in [&orphan, &referenced, &unrelated] {
+        for path in [
+            &orphan,
+            &referenced,
+            &orphan_migrated,
+            &referenced_migrated,
+            &unrelated,
+        ] {
             fs::write(path, b"x").expect("write test file");
         }
 
@@ -11594,12 +11651,24 @@ mod tests {
         // Nothing is stale yet, so even the orphan survives.
         purge_orphaned_session_logs(&dir, &manifest_paths, std::time::Duration::from_secs(3600));
         assert!(orphan.exists(), "fresh orphan must be kept");
+        assert!(
+            orphan_migrated.exists(),
+            "fresh migrated orphan must be kept"
+        );
 
         // With no grace period the orphan goes; the referenced log and the
         // non-.log manifest must both survive.
         purge_orphaned_session_logs(&dir, &manifest_paths, std::time::Duration::ZERO);
         assert!(!orphan.exists(), "stale orphan must be removed");
+        assert!(
+            !orphan_migrated.exists(),
+            "stale migrated orphan must be removed"
+        );
         assert!(referenced.exists(), "referenced log must never be removed");
+        assert!(
+            referenced_migrated.exists(),
+            "referenced migrated log must never be removed"
+        );
         assert!(unrelated.exists(), "non-log files must be left alone");
 
         let _ = fs::remove_dir_all(&dir);
@@ -11853,12 +11922,13 @@ mod tests {
                     else {
                         return;
                     };
-                    let file = std::fs::File::create(probe).expect("open probe");
+                    let file = std::fs::File::create(&probe).expect("open probe");
                     let _ = response.send(Ok(ExtractedHandover {
                         // Safety: `file` gives up its descriptor and nothing else holds it.
                         fd: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(file.into_raw_fd()) },
                         pid: std::process::id(),
                         process_identity: None,
+                        log_path: probe,
                         output_seq: 7,
                         bytes_logged: 11,
                     }));

@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -63,6 +63,12 @@ fn segment_compression_and_decompression() {
 
     let decompressed = read_segment_uncompressed(&segment_info).expect("read decompressed");
     assert_eq!(decompressed, test_data);
+
+    let mut f = File::open(&segment_info.path).expect("open compressed");
+    let mut header_buf = [0u8; 256];
+    let n = f.read(&mut header_buf).expect("read header");
+    let frame_size = zstd::zstd_safe::get_frame_content_size(&header_buf[..n]);
+    assert_eq!(frame_size.ok().flatten(), Some(raw_len));
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -226,10 +232,10 @@ fn compression_worker_background_processing() {
     let worker = CompressionWorker::start();
     let tx = worker.sender().expect("sender");
 
-    tx.send(CompressionJob {
+    tx.send(WorkerMessage::Job(CompressionJob {
         raw_path: raw_path.clone(),
         compressed_path: compressed_path.clone(),
-    })
+    }))
     .expect("send job");
 
     // Wait for worker to finish job
@@ -241,5 +247,201 @@ fn compression_worker_background_processing() {
     assert!(compressed_path.exists());
     assert!(!raw_path.exists());
 
+    // Drop worker and verify thread joins cleanly
+    drop(worker);
+
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn strip_ansi_escapes_preserves_multibyte_utf8() {
+    let unicode_text = "✨ \x1b[1;34mTerminal\x1b[0m 🚀 \x1b[32m日本語\x1b[0m ┌─┐\n";
+    let stripped = strip_ansi_escapes(unicode_text.as_bytes());
+    assert_eq!(stripped, "✨ Terminal 🚀 日本語 ┌─┐\n");
+}
+
+#[test]
+fn replay_tail_memory_bounded_across_many_segments() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-many-segments");
+    fs::create_dir_all(&session_dir).expect("mkdir");
+
+    // Create 10 segments of 1000 bytes each (10,000 bytes total)
+    for i in 1..=10 {
+        let seg_name = segment_file_name(i);
+        let raw_path = session_dir.join(&seg_name);
+        let pattern = format!("SEGMENT_{:06}_\n", i);
+        let data = pattern.repeat(100); // 1500 bytes
+        fs::write(&raw_path, &data).expect("write segment");
+
+        if i < 10 {
+            let comp_name = compressed_segment_file_name(i);
+            compress_segment_file(&raw_path, &session_dir.join(comp_name))
+                .expect("compress segment");
+        }
+    }
+
+    // Request tail of 2000 bytes: total bytes must reflect the entire stream, while returned tail is capped
+    let (total_len, tail) =
+        read_multi_segment_replay_tail(&session_dir, 2000).expect("read replay tail");
+    assert_eq!(total_len, 1600 * 10);
+    assert_eq!(tail.len(), 2000);
+    assert!(String::from_utf8_lossy(&tail).contains("SEGMENT_000010_"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn read_segment_uncompressed_fallback_on_deleted_raw() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join("segment-000005.tlog");
+    let compressed_path = temp_dir.join("segment-000005.tlog.zst");
+
+    fs::write(&raw_path, b"Segment content to compress").expect("write raw");
+    compress_segment_file(&raw_path, &compressed_path).expect("compress");
+
+    // Raw file was deleted by compress_segment_file.
+    // Simulate SegmentFileInfo pointing to raw_path but is_compressed false (TOCTOU race)
+    let info = SegmentFileInfo {
+        index: 5,
+        path: raw_path,
+        is_compressed: false,
+        file_size: 27,
+    };
+
+    let content = read_segment_uncompressed(&info).expect("read fallback");
+    assert_eq!(content, b"Segment content to compress");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn resolve_active_segment_cases() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-active-seg");
+    fs::create_dir_all(&session_dir).expect("mkdir");
+
+    // Case 1: empty dir -> segment-000001.tlog, index 1, len 0
+    let (path, idx, len) = resolve_active_segment(&session_dir).expect("empty dir");
+    assert_eq!(idx, 1);
+    assert_eq!(len, 0);
+    assert_eq!(path, session_dir.join("segment-000001.tlog"));
+
+    // Case 2: uncompressed segment 1 exists
+    fs::write(&path, b"hello").expect("write seg1");
+    let (path2, idx2, len2) = resolve_active_segment(&session_dir).expect("uncompressed seg");
+    assert_eq!(idx2, 1);
+    assert_eq!(len2, 5);
+    assert_eq!(path2, path);
+
+    // Case 3: segment 1 is compressed; no uncompressed segment exists -> segment-000002.tlog
+    let comp1 = session_dir.join("segment-000001.tlog.zst");
+    compress_segment_file(&path, &comp1).expect("compress");
+    let (path3, idx3, len3) = resolve_active_segment(&session_dir).expect("all compressed");
+    assert_eq!(idx3, 2);
+    assert_eq!(len3, 0);
+    assert_eq!(path3, session_dir.join("segment-000002.tlog"));
+
+    // Case 4: uncompressed segment 2 created
+    fs::write(&path3, b"world!").expect("write seg2");
+    let (path4, idx4, len4) = resolve_active_segment(&session_dir).expect("seg 2 active");
+    assert_eq!(idx4, 2);
+    assert_eq!(len4, 6);
+    assert_eq!(path4, path3);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn get_segment_uncompressed_size_and_tail_offset() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-tail-offset");
+    fs::create_dir_all(&session_dir).expect("mkdir");
+
+    let raw_path = session_dir.join("segment-000001.tlog");
+    let comp_path = session_dir.join("segment-000001.tlog.zst");
+    let payload = b"1234567890".repeat(50); // 500 bytes
+    fs::write(&raw_path, &payload).expect("write payload");
+
+    compress_segment_file(&raw_path, &comp_path).expect("compress");
+
+    let info = SegmentFileInfo {
+        index: 1,
+        path: comp_path,
+        is_compressed: true,
+        file_size: fs::metadata(session_dir.join("segment-000001.tlog.zst"))
+            .expect("meta")
+            .len(),
+    };
+
+    let size = get_segment_uncompressed_size(&info).expect("get size");
+    assert_eq!(size, 500);
+
+    // Request tail larger than available content: start_offset must equal total_uncompressed_bytes - combined.len()
+    let (start_offset, tail) = read_multi_segment_tail(&session_dir, 500, 1000);
+    assert_eq!(start_offset, 0);
+    assert_eq!(tail.len(), 500);
+
+    // Request tail smaller than available content
+    let (start_offset2, tail2) = read_multi_segment_tail(&session_dir, 500, 100);
+    assert_eq!(start_offset2, 400);
+    assert_eq!(tail2.len(), 100);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn get_segment_uncompressed_size_fallback_to_uncompressed() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-fallback-size");
+    fs::create_dir_all(&session_dir).expect("mkdir");
+
+    let raw_path = session_dir.join("segment-000001.tlog");
+    fs::write(&raw_path, b"fallback uncompressed content").expect("write raw");
+
+    // Point info to compressed path that does not exist on disk
+    let comp_path = session_dir.join("segment-000001.tlog.zst");
+    assert!(!comp_path.exists());
+
+    let info = SegmentFileInfo {
+        index: 1,
+        path: comp_path,
+        is_compressed: true,
+        file_size: 0,
+    };
+
+    let size = get_segment_uncompressed_size(&info).expect("fallback size");
+    assert_eq!(size, 29);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn line_matches_query_ascii_and_unicode() {
+    // Exact case match
+    assert!(line_matches_query("Hello World", "World", "world", false));
+    assert!(!line_matches_query("Hello World", "world", "world", false));
+
+    // ASCII case insensitive match
+    assert!(line_matches_query("Hello World", "WORLD", "world", true));
+    assert!(line_matches_query(
+        "cargo build --release",
+        "BUILD",
+        "build",
+        true
+    ));
+    assert!(!line_matches_query(
+        "short",
+        "longer query",
+        "longer query",
+        true
+    ));
+
+    // Unicode case insensitive match
+    assert!(line_matches_query(
+        "Grüße aus Berlin",
+        "GRÜSSE",
+        "grüße",
+        true
+    ));
 }
