@@ -166,6 +166,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _initialized = false;
   bool _initialContentWritten = false;
   bool _styleSheetLoaded = false;
+  bool _isPasteDialogShowing = false;
   final List<String> _pendingLiveWriteBuffer = [];
 
   double? _lastWidth;
@@ -674,6 +675,11 @@ class _TerminalPaneState extends State<TerminalPane> {
             return;
           }
         }
+        if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
+          final activePane = _containerEventOwners[sessionId] ?? this;
+          unawaited(activePane._handlePaste(data));
+          return;
+        }
         _sessionInputRouter.sendInput(sessionId, data);
       });
       onDataSubscription = js_util.callMethod(_term, 'onData', [
@@ -926,10 +932,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (event is html.ClipboardEvent) {
         event.preventDefault();
         event.stopPropagation();
+        if (_isPasteDialogShowing || widget.isExited) return;
         final clipboardData = event.clipboardData;
         final text = clipboardData?.getData('text/plain') ?? '';
         if (text.isNotEmpty) {
-          _handlePaste(text);
+          unawaited(_handlePaste(text));
         }
       }
     }
@@ -939,16 +946,29 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   Future<void> _handlePaste(String text) async {
-    if (text.isEmpty) return;
+    if (text.isEmpty || widget.isExited) return;
     final isBracketed = _isBracketedPasteEnabled();
     if (isBracketed || !isMultiLine(text)) {
       _sendInput(formatPasteInput(text, isBracketed));
       return;
     }
 
-    final chosenText = await showMultiLinePasteDialog(context, text);
-    if (chosenText != null && mounted) {
-      _sendInput(formatPasteInput(chosenText, false));
+    if (_isPasteDialogShowing) return;
+    _isPasteDialogShowing = true;
+    try {
+      final chosenText = await showMultiLinePasteDialog(context, text);
+      if (chosenText != null && mounted && !widget.isExited) {
+        _sendInput(formatPasteInput(chosenText, false));
+      }
+    } catch (e) {
+      debugPrint('TerminalPane: failed to handle web paste: $e');
+    } finally {
+      _isPasteDialogShowing = false;
+      if (mounted && _initialized) {
+        try {
+          _activateTerminal();
+        } catch (_) {}
+      }
     }
   }
 
@@ -1281,6 +1301,21 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.bracketedPasteEnabled != widget.bracketedPasteEnabled) {
+      _sessionBracketedPasteModes[_sanitizedId] = widget.bracketedPasteEnabled;
+      if (_term != null) {
+        try {
+          final modes = js_util.getProperty(_term, 'modes');
+          if (modes != null) {
+            js_util.setProperty(
+              modes,
+              'bracketedPasteMode',
+              widget.bracketedPasteEnabled,
+            );
+          }
+        } catch (_) {}
+      }
+    }
     if (oldWidget.isExited != widget.isExited) {
       if (_initialized) {
         try {

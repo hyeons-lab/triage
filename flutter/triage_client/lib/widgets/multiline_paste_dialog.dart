@@ -1,4 +1,3 @@
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 
@@ -11,18 +10,36 @@ import 'package:triage_client/terminal/terminal_paste.dart';
 /// - `null` if the user cancels or dismisses the dialog.
 Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
   final lines = lineCount(text);
-  final previewLines = text.split(RegExp(r'\r\n|\r|\n'));
-  final displayCount = math.min(previewLines.length, 6);
-  final previewSnippet =
-      previewLines.take(displayCount).join('\n') +
-      (previewLines.length > displayCount
-          ? '\n... (${previewLines.length - displayCount} more lines)'
-          : '');
+  final previewLines = <String>[];
+  var start = 0;
+  final len = text.length;
+
+  for (var i = 0; i < len && previewLines.length < 6; i++) {
+    final code = text.codeUnitAt(i);
+    if (code == 0x0A || code == 0x0D) {
+      final line = text.substring(start, i);
+      previewLines.add(line.length > 200 ? '${line.substring(0, 200)}...' : line);
+      if (code == 0x0D && i + 1 < len && text.codeUnitAt(i + 1) == 0x0A) {
+        i++;
+      }
+      start = i + 1;
+    }
+  }
+  if (previewLines.length < 6 && start < len) {
+    final line = text.substring(start);
+    previewLines.add(line.length > 200 ? '${line.substring(0, 200)}...' : line);
+  }
+
+  final remainingLines = lines - previewLines.length;
+  final previewSnippet = previewLines.join('\n') +
+      (remainingLines > 0 ? '\n... ($remainingLines more lines)' : '');
 
   final byteCount = text.length;
   final sizeLabel = byteCount < 1024
       ? '$byteCount B'
-      : '${(byteCount / 1024).toStringAsFixed(1)} KB';
+      : byteCount < 1024 * 1024
+          ? '${(byteCount / 1024).toStringAsFixed(1)} KB'
+          : '${(byteCount / (1024 * 1024)).toStringAsFixed(1)} MB';
 
   return showDialog<String>(
     context: context,

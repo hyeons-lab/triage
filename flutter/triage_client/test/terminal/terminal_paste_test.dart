@@ -148,6 +148,12 @@ void main() {
       );
       expect(flattenToSingleLine('command1\ncommand2\n'), 'command1 command2 ');
     });
+
+    test('handles empty string and consecutive newlines', () {
+      expect(flattenToSingleLine(''), '');
+      expect(flattenToSingleLine('line1\n\nline2'), 'line1  line2');
+      expect(flattenToSingleLine('\r\n'), ' ');
+    });
   });
 
   group('lineCount', () {
@@ -162,7 +168,17 @@ void main() {
     test('returns correct count for multiline strings', () {
       expect(lineCount('line 1\nline 2'), 2);
       expect(lineCount('line 1\r\nline 2\r\nline 3'), 3);
-      expect(lineCount('line 1\nline 2\nline 3\nline 4\n'), 5);
+      expect(lineCount('line 1\nline 2\nline 3\nline 4\n'), 4);
+    });
+
+    test('handles edge cases, mixed line endings, and trailing newlines', () {
+      expect(lineCount('\n'), 1);
+      expect(lineCount('\r\n'), 1);
+      expect(lineCount('\r'), 1);
+      expect(lineCount('\n\n\n'), 3);
+      expect(lineCount('trailing CR\r'), 1);
+      expect(lineCount('a\rb\nc\r\nd'), 4);
+      expect(lineCount('a\rb\nc\r\nd\n'), 4);
     });
   });
 
@@ -269,6 +285,58 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(result, isNull);
+    });
+
+    testWidgets(
+      'renders truncated snippet when lines exceed display limit',
+      (tester) async {
+        final multiline = List.generate(10, (i) => 'Line ${i + 1}').join('\n');
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) => ElevatedButton(
+                  onPressed: () => showMultiLinePasteDialog(context, multiline),
+                  child: const Text('Open Dialog'),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open Dialog'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
+        expect(find.textContaining('10 lines'), findsOneWidget);
+        expect(find.textContaining('... (4 more lines)'), findsOneWidget);
+        expect(find.textContaining('Line 1'), findsOneWidget);
+        expect(find.textContaining('Line 6'), findsOneWidget);
+        expect(find.textContaining('Line 7'), findsNothing);
+      },
+    );
+
+    testWidgets('formats size in KB for payloads >= 1024 bytes', (
+      tester,
+    ) async {
+      final largePayload = '${'a' * 2048}\n${'b' * 10}';
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => ElevatedButton(
+                onPressed: () => showMultiLinePasteDialog(context, largePayload),
+                child: const Text('Open Dialog'),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('Open Dialog'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('2.0 KB'), findsOneWidget);
     });
   });
 

@@ -449,9 +449,6 @@ class SessionVm {
       terminal.setBracketedPasteMode(enabled);
     } catch (_) {}
     TerminalPane.setBracketedPasteMode(title, enabled);
-    if (sessionId != null && sessionId != title) {
-      TerminalPane.setBracketedPasteMode(sessionId!, enabled);
-    }
   }
 
   void applyJudgePolicy({
