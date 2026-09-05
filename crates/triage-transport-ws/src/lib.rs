@@ -475,6 +475,25 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 let rules = self.api.remove_judge_deny_substring(substring)?;
                 Ok(ServerResult::JudgeRules { rules })
             }
+            ClientRequest::GetRailLayout => {
+                let layout = self.api.get_rail_layout()?;
+                Ok(ServerResult::RailLayout {
+                    group_keys: layout.group_keys,
+                    session_ids: layout.session_ids,
+                    custom_labels: layout.custom_labels,
+                })
+            }
+            ClientRequest::SetRailPins {
+                group_keys,
+                session_ids,
+            } => {
+                self.api.set_rail_pins(group_keys, session_ids)?;
+                Ok(ServerResult::Unit)
+            }
+            ClientRequest::SetSessionCustomLabel { session_id, label } => {
+                self.api.set_session_custom_label(session_id, label)?;
+                Ok(ServerResult::Unit)
+            }
         }
     }
 
@@ -593,6 +612,16 @@ pub enum ClientRequest {
     RemoveJudgeDenySubstring {
         substring: String,
     },
+    GetRailLayout,
+    SetRailPins {
+        group_keys: Vec<String>,
+        session_ids: Vec<String>,
+    },
+    SetSessionCustomLabel {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
 }
 
 /// One session's current snippet, as carried in [`ServerResult::SessionSnippets`].
@@ -699,6 +728,17 @@ pub enum ServerMessage {
         session_id: SessionId,
         policy: SessionJudgePolicy,
     },
+    /// Connection-wide push: rail pins changed.
+    RailPinsUpdated {
+        group_keys: Vec<String>,
+        session_ids: Vec<String>,
+    },
+    /// Connection-wide push: a session's custom label changed.
+    SessionCustomLabelUpdated {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,6 +808,11 @@ pub enum ServerResult {
     },
     JudgeRules {
         rules: triage_core::judge::JudgeRulesInfo,
+    },
+    RailLayout {
+        group_keys: Vec<String>,
+        session_ids: Vec<String>,
+        custom_labels: HashMap<String, String>,
     },
 }
 
@@ -1066,11 +1111,17 @@ mod tests {
         }
     }
 
+    type SetPinsCalls = Arc<Mutex<Vec<(Vec<String>, Vec<String>)>>>;
+    type SetCustomLabelCalls = Arc<Mutex<Vec<(SessionId, Option<String>)>>>;
+
     #[derive(Default)]
     struct FakeSessionApi {
         sessions: Mutex<Vec<SessionId>>,
         written: Arc<Mutex<Vec<WriteInputRequest>>>,
         next_subscription: Arc<Mutex<Option<SessionEventReceiver>>>,
+        rail_layout: Mutex<triage_core::session::RailLayout>,
+        set_pins_calls: SetPinsCalls,
+        set_custom_label_calls: SetCustomLabelCalls,
     }
 
     impl SessionApi for FakeSessionApi {
@@ -1181,6 +1232,39 @@ mod tests {
                 bytes_logged: 0,
                 visible_rows: Vec::new(),
             })
+        }
+
+        fn get_rail_layout(&self) -> Result<triage_core::session::RailLayout> {
+            Ok(self.rail_layout.lock().unwrap().clone())
+        }
+
+        fn set_rail_pins(&self, group_keys: Vec<String>, session_ids: Vec<String>) -> Result<()> {
+            self.set_pins_calls
+                .lock()
+                .unwrap()
+                .push((group_keys.clone(), session_ids.clone()));
+            let mut layout = self.rail_layout.lock().unwrap();
+            layout.group_keys = group_keys;
+            layout.session_ids = session_ids;
+            Ok(())
+        }
+
+        fn set_session_custom_label(
+            &self,
+            session_id: SessionId,
+            label: Option<String>,
+        ) -> Result<()> {
+            self.set_custom_label_calls
+                .lock()
+                .unwrap()
+                .push((session_id.clone(), label.clone()));
+            let mut layout = self.rail_layout.lock().unwrap();
+            if let Some(lbl) = label {
+                layout.custom_labels.insert(session_id.to_string(), lbl);
+            } else {
+                layout.custom_labels.remove(session_id.as_str());
+            }
+            Ok(())
         }
     }
 
@@ -1710,6 +1794,165 @@ mod tests {
                 repository_root: None,
                 worktree_root: None,
                 branch: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rail_layout_routes_to_session_api() {
+        let api = FakeSessionApi::default();
+        {
+            let mut layout = api.rail_layout.lock().unwrap();
+            layout.group_keys = vec!["/repo/a".to_string()];
+            layout.session_ids = vec!["s1".to_string(), "s2".to_string()];
+            layout
+                .custom_labels
+                .insert("s1".to_string(), "Agent One".to_string());
+        }
+        let mut connection = WebSocketSessionConnection::new(api);
+        let response =
+            connection.handle_text_message(r#"{"id":"layout-1","type":"get_rail_layout"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Response {
+                id: Some(id),
+                result:
+                    ServerResult::RailLayout {
+                        group_keys,
+                        session_ids,
+                        custom_labels,
+                    },
+            } => {
+                assert_eq!(id, json!("layout-1"));
+                assert_eq!(group_keys, vec!["/repo/a"]);
+                assert_eq!(session_ids, vec!["s1", "s2"]);
+                assert_eq!(custom_labels.get("s1"), Some(&"Agent One".to_string()));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_rail_pins_and_custom_label_route_to_session_api() {
+        let api = FakeSessionApi::default();
+        let set_pins_calls = Arc::clone(&api.set_pins_calls);
+        let set_custom_label_calls = Arc::clone(&api.set_custom_label_calls);
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        let pins_resp = connection.handle_text_message(
+            r#"{"id":"pins-1","type":"set_rail_pins","group_keys":["/repo/b"],"session_ids":["s3"]}"#,
+        );
+        let decoded_pins: ServerMessage = serde_json::from_str(&pins_resp).unwrap();
+        assert_eq!(
+            decoded_pins,
+            ServerMessage::Response {
+                id: Some(json!("pins-1")),
+                result: ServerResult::Unit,
+            }
+        );
+        assert_eq!(
+            *set_pins_calls.lock().unwrap(),
+            vec![(vec!["/repo/b".to_string()], vec!["s3".to_string()])]
+        );
+
+        let label_resp = connection.handle_text_message(
+            r#"{"id":"label-1","type":"set_session_custom_label","session_id":"s3","label":"My Worker"}"#,
+        );
+        let decoded_label: ServerMessage = serde_json::from_str(&label_resp).unwrap();
+        assert_eq!(
+            decoded_label,
+            ServerMessage::Response {
+                id: Some(json!("label-1")),
+                result: ServerResult::Unit,
+            }
+        );
+        assert_eq!(
+            *set_custom_label_calls.lock().unwrap(),
+            vec![(SessionId::new("s3").unwrap(), Some("My Worker".to_string()))]
+        );
+    }
+
+    #[test]
+    fn flatbuffers_rail_layout_roundtrip() {
+        let api = FakeSessionApi::default();
+        {
+            let mut layout = api.rail_layout.lock().unwrap();
+            layout.group_keys = vec!["/repo/wt".to_string()];
+            layout.session_ids = vec!["s-10".to_string()];
+            layout
+                .custom_labels
+                .insert("s-10".to_string(), "Reviewer".to_string());
+        }
+        let mut connection = WebSocketSessionConnection::new(api);
+        let request = ClientMessage {
+            id: Some(json!("layout-fb")),
+            request: ClientRequest::GetRailLayout,
+        };
+        let client_bytes = flatbuffers_proto::serialize_client_message(&request);
+        let response_bytes = connection.handle_binary_message(&client_bytes);
+
+        let borrowed =
+            flatbuffers_proto::parse_fb_server_message_borrowed(&response_bytes).unwrap();
+        match borrowed {
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some(id),
+                result:
+                    flatbuffers_proto::ServerResultBorrowed::RailLayout {
+                        group_keys,
+                        session_ids,
+                        custom_labels,
+                    },
+            } => {
+                assert_eq!(id, "layout-fb");
+                assert_eq!(group_keys, vec!["/repo/wt"]);
+                assert_eq!(session_ids, vec!["s-10"]);
+                assert_eq!(custom_labels, vec![("s-10", "Reviewer")]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatbuffers_rail_pins_updated_roundtrip() {
+        let msg = ServerMessage::RailPinsUpdated {
+            group_keys: vec!["/repo/x".to_string()],
+            session_ids: vec!["s-1".to_string(), "s-2".to_string()],
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::RailPinsUpdated {
+                group_keys: vec!["/repo/x"],
+                session_ids: vec!["s-1", "s-2"],
+            }
+        );
+    }
+
+    #[test]
+    fn flatbuffers_session_custom_label_updated_roundtrip() {
+        let set_msg = ServerMessage::SessionCustomLabelUpdated {
+            session_id: SessionId::new("s-1").unwrap(),
+            custom_label: Some("Primary Task".to_string()),
+        };
+        let bytes_set = flatbuffers_proto::serialize_server_message(&set_msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes_set).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::SessionCustomLabelUpdated {
+                session_id: "s-1",
+                custom_label: Some("Primary Task"),
+            }
+        );
+
+        let clear_msg = ServerMessage::SessionCustomLabelUpdated {
+            session_id: SessionId::new("s-1").unwrap(),
+            custom_label: None,
+        };
+        let bytes_clear = flatbuffers_proto::serialize_server_message(&clear_msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes_clear).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::SessionCustomLabelUpdated {
+                session_id: "s-1",
+                custom_label: None,
             }
         );
     }

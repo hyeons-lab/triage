@@ -161,6 +161,32 @@ pub struct SessionContextRow {
     pub last_activity_ms: u64,
 }
 
+/// User-defined pinning configuration for the session rail.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPins {
+    #[serde(default)]
+    pub group_keys: Vec<String>,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
+impl SessionPins {
+    pub fn is_empty(&self) -> bool {
+        self.group_keys.is_empty() && self.session_ids.is_empty()
+    }
+}
+
+/// Synchronized layout state for the session rail, combining pinning and custom labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RailLayout {
+    #[serde(default)]
+    pub group_keys: Vec<String>,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub custom_labels: std::collections::HashMap<String, String>,
+}
+
 /// Separator between the parts of [`SessionContext::localization_label`].
 const LABEL_SEPARATOR: &str = "  ·  ";
 
@@ -649,6 +675,20 @@ pub trait SessionApi {
             latest_version: None,
         }
     }
+    /// Returns the synchronized session rail layout (pins and custom labels).
+    fn get_rail_layout(&self) -> Result<RailLayout> {
+        Ok(RailLayout::default())
+    }
+    /// Updates the pinned group and session ordering on the session rail.
+    fn set_rail_pins(&self, group_keys: Vec<String>, session_ids: Vec<String>) -> Result<()> {
+        let _ = (group_keys, session_ids);
+        Ok(())
+    }
+    /// Sets or clears a custom human-readable label for a session.
+    fn set_session_custom_label(&self, session_id: SessionId, label: Option<String>) -> Result<()> {
+        let _ = (session_id, label);
+        Ok(())
+    }
 }
 
 impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
@@ -757,6 +797,15 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     }
     fn server_update_info(&self) -> ServerUpdateInfo {
         (**self).server_update_info()
+    }
+    fn get_rail_layout(&self) -> Result<RailLayout> {
+        (**self).get_rail_layout()
+    }
+    fn set_rail_pins(&self, group_keys: Vec<String>, session_ids: Vec<String>) -> Result<()> {
+        (**self).set_rail_pins(group_keys, session_ids)
+    }
+    fn set_session_custom_label(&self, session_id: SessionId, label: Option<String>) -> Result<()> {
+        (**self).set_session_custom_label(session_id, label)
     }
 }
 

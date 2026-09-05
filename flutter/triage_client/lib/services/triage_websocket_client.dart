@@ -100,6 +100,13 @@ typedef JudgeRulesRecord = ({
   List<String> customDenySubstrings,
 });
 
+/// Rail layout state containing pinned group keys, pinned session IDs, and custom session labels.
+typedef RailLayoutRecord = ({
+  List<String> groupKeys,
+  List<String> sessionIds,
+  Map<String, String> customLabels,
+});
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
@@ -276,6 +283,12 @@ class TriageWebSocketClient {
       } else if (type == 'session_judge_policy_updated') {
         // Connection-wide push: a session's tool-call judge policy changed.
         // Forward so the rail / sidebar badge updates in real-time.
+        _eventController.add(message);
+      } else if (type == 'rail_pins_updated') {
+        // Connection-wide push: rail pins or rail order changed.
+        _eventController.add(message);
+      } else if (type == 'session_custom_label_updated') {
+        // Connection-wide push: a session's custom label changed.
         _eventController.add(message);
       }
       // No branch for `update_available`: this client has never forwarded that
@@ -726,6 +739,57 @@ class TriageWebSocketClient {
     }
   }
 
+  /// Fetches the synchronized rail layout (pins and custom labels) from the daemon.
+  Future<RailLayoutRecord?> getRailLayout() async {
+    try {
+      final response = await _send('get_rail_layout');
+      final groupKeys = (response['group_keys'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          <String>[];
+      final sessionIds = (response['session_ids'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          <String>[];
+      final rawLabels =
+          response['custom_labels'] as Map<String, dynamic>? ?? {};
+      final customLabels = <String, String>{
+        for (final entry in rawLabels.entries)
+          entry.key: entry.value.toString(),
+      };
+      return (
+        groupKeys: groupKeys,
+        sessionIds: sessionIds,
+        customLabels: customLabels,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Updates the pinned group and session ordering on the daemon.
+  Future<void> setRailPins({
+    required List<String> groupKeys,
+    required List<String> sessionIds,
+  }) async {
+    await _send('set_rail_pins', {
+      'group_keys': groupKeys,
+      'session_ids': sessionIds,
+    });
+  }
+
+  /// Sets or clears a custom label for a session on the daemon.
+  Future<void> setSessionCustomLabel({
+    required String sessionId,
+    String? customLabel,
+  }) async {
+    await _send('set_session_custom_label', {
+      'session_id': sessionId,
+      'label': customLabel,
+      'has_label': customLabel != null,
+    });
+  }
+
   Future<Map<String, dynamic>> attachSession({
     required String sessionId,
     required String clientId,
@@ -967,6 +1031,22 @@ class TriageWebSocketClient {
         'pinned': updated.pinned,
         'effective': updated.effective,
       };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.RailPinsUpdatedPayload) {
+      final updated = payload as fbs.RailPinsUpdatedPayload;
+      return {
+        'type': 'rail_pins_updated',
+        'group_keys': updated.groupKeys ?? [],
+        'session_ids': updated.sessionIds ?? [],
+      };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.SessionCustomLabelUpdatedPayload) {
+      final updated = payload as fbs.SessionCustomLabelUpdatedPayload;
+      return {
+        'type': 'session_custom_label_updated',
+        'session_id': updated.sessionId,
+        'custom_label': updated.hasLabel ? updated.label : null,
+      };
     }
     // Reached for `NONE`, or for a union member the bindings know but the
     // branches above have not been taught — which is exactly how the missing
@@ -1163,6 +1243,18 @@ class TriageWebSocketClient {
             'custom_allow_commands': rules.customAllowCommands ?? [],
             'builtin_deny_substrings': rules.builtinDenySubstrings ?? [],
             'custom_deny_substrings': rules.customDenySubstrings ?? [],
+          },
+        };
+      case 20: // RailLayoutResult
+        final layout = result as fbs.RailLayoutResult;
+        return {
+          'result': 'rail_layout',
+          'group_keys': layout.groupKeys ?? [],
+          'session_ids': layout.sessionIds ?? [],
+          'custom_labels': {
+            for (final entry in layout.customLabels ?? <fbs.CustomLabelEntry>[])
+              if (entry.sessionId != null && entry.label != null)
+                entry.sessionId!: entry.label!,
           },
         };
       default:
@@ -1597,6 +1689,39 @@ class TriageWebSocketClient {
             fbs.ClientRequestPayloadTypeId.RemoveJudgeDenySubstringRequest;
         payload = fbs.RemoveJudgeDenySubstringRequestObjectBuilder(
           substring: extra?['substring'] as String?,
+        );
+        break;
+
+      case 'get_rail_layout':
+        payloadType = fbs.ClientRequestPayloadTypeId.GetRailLayoutRequest;
+        payload = fbs.GetRailLayoutRequestObjectBuilder();
+        break;
+
+      case 'set_rail_pins':
+        payloadType = fbs.ClientRequestPayloadTypeId.SetRailPinsRequest;
+        final rawGroupKeys = extra?['group_keys'];
+        final groupKeys = (rawGroupKeys is List)
+            ? rawGroupKeys.map((e) => e.toString()).toList()
+            : <String>[];
+        final rawSessionIds = extra?['session_ids'];
+        final sessionIds = (rawSessionIds is List)
+            ? rawSessionIds.map((e) => e.toString()).toList()
+            : <String>[];
+        payload = fbs.SetRailPinsRequestObjectBuilder(
+          groupKeys: groupKeys,
+          sessionIds: sessionIds,
+        );
+        break;
+
+      case 'set_session_custom_label':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.SetSessionCustomLabelRequest;
+        final label = extra?['label'] as String?;
+        final hasLabel = extra?['has_label'] as bool? ?? (label != null);
+        payload = fbs.SetSessionCustomLabelRequestObjectBuilder(
+          sessionId: extra?['session_id'] as String?,
+          label: label,
+          hasLabel: hasLabel,
         );
         break;
 

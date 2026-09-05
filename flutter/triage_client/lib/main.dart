@@ -3,7 +3,12 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform, kIsWeb, visibleForTesting;
+    show
+        TargetPlatform,
+        defaultTargetPlatform,
+        kIsWeb,
+        listEquals,
+        visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -2176,8 +2181,56 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Fetched together rather than in sequence: each `await` here is a window
       // in which a reconnect can bump the generation and a second load can
       // interleave, so the load path keeps its number of suspension points down.
-      final contexts = await _fetchSessionContexts();
+      final contextsFuture = _fetchSessionContexts();
+      final layoutFuture = _client.getRailLayout();
+      final contexts = await contextsFuture;
+      final layout = await layoutFuture;
       if (_disposed || generation != _connectGeneration) return;
+
+      if (layout != null) {
+        final daemonHasPins =
+            layout.groupKeys.isNotEmpty || layout.sessionIds.isNotEmpty;
+        final daemonHasLabels = layout.customLabels.isNotEmpty;
+
+        if (daemonHasPins) {
+          _pins = SessionPins(
+            groupKeys: layout.groupKeys,
+            sessionIds: layout.sessionIds,
+          );
+          unawaited(_persistPins(_pins));
+        } else if (!_pins.isEmpty) {
+          unawaited(
+            _client
+                .setRailPins(
+                  groupKeys: _pins.groupKeys,
+                  sessionIds: _pins.sessionIds,
+                )
+                .catchError((_) {}),
+          );
+        }
+
+        if (daemonHasLabels) {
+          _customLabels = Map.of(layout.customLabels);
+          unawaited(_persistCustomLabels());
+        } else if (_customLabels.isNotEmpty) {
+          for (final entry in _customLabels.entries) {
+            var rawId = entry.key;
+            if (rawId.startsWith('triage / ')) {
+              rawId = rawId.substring('triage / '.length);
+            }
+            if (rawId.trim().isEmpty) continue;
+            unawaited(
+              _client
+                  .setSessionCustomLabel(
+                    sessionId: rawId,
+                    customLabel: entry.value,
+                  )
+                  .catchError((_) {}),
+            );
+          }
+        }
+      }
+
       // Read from the cache primed when the server resolved; never await prefs
       // on this path. `SharedPreferences.getInstance()` does not complete until
       // its platform channel answers, which stalls the whole load behind it.
@@ -2427,8 +2480,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // would compute its prefix against the wrong list and drop pins. Re-group
       // instead, without persisting, since this is what storage already says.
       if (!restored.isEmpty && _sessionsServerId == serverId) {
-        _applyPins(restored, persist: false);
-      } else {
+        _applyPins(restored, persist: false, syncToDaemon: false);
+      } else if (_pins.isEmpty) {
         _pins = restored;
       }
     } catch (_) {
@@ -2468,8 +2521,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  String _keyForSession(SessionVm session) =>
-      session.remoteSessionId ?? session.sessionId ?? session.title;
+  String _keyForSession(SessionVm session) {
+    final raw = session.remoteSessionId ?? session.sessionId ?? session.title;
+    return raw.startsWith('triage / ')
+        ? raw.substring('triage / '.length)
+        : raw;
+  }
 
   String? _lookupCustomLabel(String id) =>
       _customLabels[id] ?? _customLabels['triage / $id'];
@@ -2490,16 +2547,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             for (final entry in decoded.entries)
               if (entry.value != null &&
                   entry.value.toString().trim().isNotEmpty)
-                entry.key.toString(): entry.value.toString().trim(),
+                (entry.key.toString().startsWith('triage / ')
+                    ? entry.key.toString().substring('triage / '.length)
+                    : entry.key.toString()): entry.value.toString().trim(),
           };
         }
       }
-      _customLabels = labels;
-      for (final session in _sessions) {
-        final key = _keyForSession(session);
-        session.customLabel = _lookupCustomLabel(key);
+      if (_customLabels.isEmpty) {
+        _customLabels = labels;
+        for (final session in _sessions) {
+          final key = _keyForSession(session);
+          session.customLabel = _lookupCustomLabel(key);
+        }
+        if (mounted) setState(() {});
       }
-      if (mounted) setState(() {});
     } catch (_) {
       // Custom labels are a best-effort convenience; ignore load failures.
     }
@@ -2535,6 +2596,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _customLabels.remove(key);
     }
     _persistCustomLabels();
+    if (session.remoteSessionId != null &&
+        _clientInitialized &&
+        _client.isConnected) {
+      unawaited(
+        _client
+            .setSessionCustomLabel(
+              sessionId: session.remoteSessionId!,
+              customLabel:
+                  trimmed != null && trimmed.isNotEmpty ? trimmed : null,
+            )
+            .catchError((_) {}),
+      );
+    }
     if (mounted) setState(() {});
   }
 
@@ -2649,7 +2723,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   ///
   /// [persist] is false when the caller is applying pins it just read back from
   /// storage, which has nothing to write.
-  void _applyPins(SessionPins pins, {bool persist = true}) {
+  void _applyPins(
+    SessionPins pins, {
+    bool persist = true,
+    bool syncToDaemon = true,
+  }) {
     final groups = groupSessionsByRepo(_orderingInputs(), pins: pins);
     final order = flattenGroups(groups);
     final byId = <String, SessionVm>{
@@ -2680,6 +2758,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
     });
     if (persist) unawaited(_persistPins(pins));
+    if (syncToDaemon && _clientInitialized && _client.isConnected) {
+      unawaited(
+        _client
+            .setRailPins(
+              groupKeys: pins.groupKeys,
+              sessionIds: pins.sessionIds,
+            )
+            .catchError((_) {}),
+      );
+    }
   }
 
   /// Interprets a rail drag: the moved group or row is pinned where it was put,
@@ -3210,6 +3298,50 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } else {
         apply();
       }
+      return;
+    }
+
+    if (type == 'rail_pins_updated') {
+      final rawGroupKeys = message['group_keys'];
+      final groupKeys = (rawGroupKeys is List)
+          ? rawGroupKeys.map((e) => e.toString()).toList()
+          : <String>[];
+      final rawSessionIds = message['session_ids'];
+      final sessionIds = (rawSessionIds is List)
+          ? rawSessionIds.map((e) => e.toString()).toList()
+          : <String>[];
+      if (listEquals(_pins.groupKeys, groupKeys) &&
+          listEquals(_pins.sessionIds, sessionIds)) {
+        return;
+      }
+      final pins = SessionPins(
+        groupKeys: groupKeys,
+        sessionIds: sessionIds,
+      );
+      _applyPins(pins, persist: true, syncToDaemon: false);
+      return;
+    }
+
+    if (type == 'session_custom_label_updated') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null) return;
+      final rawLabel = message['custom_label']?.toString();
+      final trimmed = rawLabel?.trim();
+      final key = sessionId;
+      _customLabels.remove('triage / $key');
+      if (trimmed != null && trimmed.isNotEmpty) {
+        _customLabels[key] = trimmed;
+      } else {
+        _customLabels.remove(key);
+      }
+      for (final session in _sessions) {
+        if (session.remoteSessionId == sessionId) {
+          session.customLabel =
+              (trimmed != null && trimmed.isNotEmpty) ? trimmed : null;
+        }
+      }
+      unawaited(_persistCustomLabels());
+      if (mounted) setState(() {});
       return;
     }
 
@@ -3881,8 +4013,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // that id, so its pin is dead weight: it would keep the reset control
     // showing with no indicator anywhere to explain it, and sit in this
     // server's preferences forever.
-    if (sessionId != null && _pins.sessionIds.contains(sessionId)) {
-      _applyPins(unpin(_pins, sessionId: sessionId));
+    if (sessionId != null) {
+      if (_pins.sessionIds.contains(sessionId)) {
+        _applyPins(unpin(_pins, sessionId: sessionId));
+      }
+      if (_customLabels.containsKey(sessionId) ||
+          _customLabels.containsKey('triage / $sessionId')) {
+        _customLabels.remove(sessionId);
+        _customLabels.remove('triage / $sessionId');
+        unawaited(_persistCustomLabels());
+        if (_clientInitialized && _client.isConnected) {
+          unawaited(
+            _client
+                .setSessionCustomLabel(
+                  sessionId: sessionId,
+                  customLabel: null,
+                )
+                .catchError((_) {}),
+          );
+        }
+      }
     }
   }
 

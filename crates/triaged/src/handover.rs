@@ -65,6 +65,12 @@ pub struct HandoverState {
     /// persist across zero-downtime reloads.
     #[serde(default)]
     pub judge_history: Vec<triage_core::judge::JudgeRecord>,
+    /// Preserved session rail pins (custom ordering and pinned items).
+    #[serde(default)]
+    pub pins: triage_core::session::SessionPins,
+    /// Preserved session custom labels.
+    #[serde(default)]
+    pub custom_labels: std::collections::HashMap<String, String>,
 }
 
 /// Result of asking a running daemon to hand over (Phase 1, before the successor
@@ -1577,6 +1583,14 @@ mod unix_impl {
         for (_, mut recovered_state, recovered_fds) in recovered {
             if state.judge_history.is_empty() && !recovered_state.judge_history.is_empty() {
                 state.judge_history = std::mem::take(&mut recovered_state.judge_history);
+            }
+            if state.pins.is_empty() && !recovered_state.pins.is_empty() {
+                state.pins = std::mem::take(&mut recovered_state.pins);
+            }
+            if !recovered_state.custom_labels.is_empty() {
+                for (sid, label) in std::mem::take(&mut recovered_state.custom_labels) {
+                    state.custom_labels.entry(sid).or_insert(label);
+                }
             }
             let mut raw_fds = recovered_fds.into_raw();
             if recovered_state.has_tcp_listener && !raw_fds.is_empty() {

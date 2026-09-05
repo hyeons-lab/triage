@@ -491,6 +491,60 @@ pub fn parse_client_message(
                 .to_string();
             ClientRequest::RemoveJudgeDenySubstring { substring }
         }
+        fb::ClientRequestPayload::GetRailLayoutRequest => ClientRequest::GetRailLayout,
+        fb::ClientRequestPayload::SetRailPinsRequest => {
+            let req = msg.payload_as_set_rail_pins_request().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "SetRailPinsRequest payload is missing",
+                )
+            })?;
+            let group_keys = req
+                .group_keys()
+                .map(|v| {
+                    let mut vec = Vec::with_capacity(v.len());
+                    for s in v.iter() {
+                        vec.push(s.to_string());
+                    }
+                    vec
+                })
+                .unwrap_or_default();
+            let session_ids = req
+                .session_ids()
+                .map(|v| {
+                    let mut vec = Vec::with_capacity(v.len());
+                    for s in v.iter() {
+                        vec.push(s.to_string());
+                    }
+                    vec
+                })
+                .unwrap_or_default();
+            ClientRequest::SetRailPins {
+                group_keys,
+                session_ids,
+            }
+        }
+        fb::ClientRequestPayload::SetSessionCustomLabelRequest => {
+            let req = msg
+                .payload_as_set_session_custom_label_request()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "SetSessionCustomLabelRequest payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let label = if req.has_label() {
+                req.label().map(|s| s.to_string())
+            } else {
+                None
+            };
+            ClientRequest::SetSessionCustomLabel { session_id, label }
+        }
         _ => {
             return Err(crate::ProtocolError::new(
                 "unsupported_payload",
@@ -928,6 +982,55 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::GetRailLayout => {
+            let req = fb::GetRailLayoutRequest::create(builder, &fb::GetRailLayoutRequestArgs {});
+            (
+                fb::ClientRequestPayload::GetRailLayoutRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::SetRailPins {
+            group_keys,
+            session_ids,
+        } => {
+            let gk_offsets: Vec<_> = group_keys
+                .iter()
+                .map(|s| builder.create_string(s))
+                .collect();
+            let gk_vec = builder.create_vector(&gk_offsets);
+            let sid_offsets: Vec<_> = session_ids
+                .iter()
+                .map(|s| builder.create_string(s))
+                .collect();
+            let sid_vec = builder.create_vector(&sid_offsets);
+            let req = fb::SetRailPinsRequest::create(
+                builder,
+                &fb::SetRailPinsRequestArgs {
+                    group_keys: Some(gk_vec),
+                    session_ids: Some(sid_vec),
+                },
+            );
+            (
+                fb::ClientRequestPayload::SetRailPinsRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::SetSessionCustomLabel { session_id, label } => {
+            let sid_str = builder.create_string(session_id.as_str());
+            let label_str = label.as_ref().map(|s| builder.create_string(s));
+            let req = fb::SetSessionCustomLabelRequest::create(
+                builder,
+                &fb::SetSessionCustomLabelRequestArgs {
+                    session_id: Some(sid_str),
+                    label: label_str,
+                    has_label: label.is_some(),
+                },
+            );
+            (
+                fb::ClientRequestPayload::SetSessionCustomLabelRequest,
+                req.as_union_value(),
+            )
+        }
     };
 
     fb::ClientMessage::create(
@@ -1319,6 +1422,49 @@ pub fn build_server_message<'a>(
                         r.as_union_value(),
                     )
                 }
+                ServerResult::RailLayout {
+                    group_keys,
+                    session_ids,
+                    custom_labels,
+                } => {
+                    let gk_offsets: Vec<_> = group_keys
+                        .iter()
+                        .map(|s| builder.create_string(s))
+                        .collect();
+                    let gk_vec = builder.create_vector(&gk_offsets);
+                    let sid_offsets: Vec<_> = session_ids
+                        .iter()
+                        .map(|s| builder.create_string(s))
+                        .collect();
+                    let sid_vec = builder.create_vector(&sid_offsets);
+                    let mut sorted_labels: Vec<_> = custom_labels.iter().collect();
+                    sorted_labels.sort_by(|a, b| a.0.cmp(b.0));
+                    let mut cl_offsets = Vec::with_capacity(sorted_labels.len());
+                    for (sid, label) in sorted_labels {
+                        let sid_str = builder.create_string(sid);
+                        let label_str = builder.create_string(label);
+                        cl_offsets.push(fb::CustomLabelEntry::create(
+                            builder,
+                            &fb::CustomLabelEntryArgs {
+                                session_id: Some(sid_str),
+                                label: Some(label_str),
+                            },
+                        ));
+                    }
+                    let cl_vec = builder.create_vector(&cl_offsets);
+                    let r = fb::RailLayoutResult::create(
+                        builder,
+                        &fb::RailLayoutResultArgs {
+                            group_keys: Some(gk_vec),
+                            session_ids: Some(sid_vec),
+                            custom_labels: Some(cl_vec),
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::RailLayoutResult,
+                        r.as_union_value(),
+                    )
+                }
             };
 
             let res_payload = fb::ResponsePayload::create(
@@ -1563,6 +1709,51 @@ pub fn build_server_message<'a>(
                 payload.as_union_value(),
             )
         }
+        ServerMessage::RailPinsUpdated {
+            group_keys,
+            session_ids,
+        } => {
+            let gk_offsets: Vec<_> = group_keys
+                .iter()
+                .map(|s| builder.create_string(s))
+                .collect();
+            let gk_vec = builder.create_vector(&gk_offsets);
+            let sid_offsets: Vec<_> = session_ids
+                .iter()
+                .map(|s| builder.create_string(s))
+                .collect();
+            let sid_vec = builder.create_vector(&sid_offsets);
+            let payload = fb::RailPinsUpdatedPayload::create(
+                builder,
+                &fb::RailPinsUpdatedPayloadArgs {
+                    group_keys: Some(gk_vec),
+                    session_ids: Some(sid_vec),
+                },
+            );
+            (
+                fb::ServerMessagePayload::RailPinsUpdatedPayload,
+                payload.as_union_value(),
+            )
+        }
+        ServerMessage::SessionCustomLabelUpdated {
+            session_id,
+            custom_label,
+        } => {
+            let sid = builder.create_string(session_id.as_str());
+            let label_str = custom_label.as_ref().map(|s| builder.create_string(s));
+            let payload = fb::SessionCustomLabelUpdatedPayload::create(
+                builder,
+                &fb::SessionCustomLabelUpdatedPayloadArgs {
+                    session_id: Some(sid),
+                    label: label_str,
+                    has_label: custom_label.is_some(),
+                },
+            );
+            (
+                fb::ServerMessagePayload::SessionCustomLabelUpdatedPayload,
+                payload.as_union_value(),
+            )
+        }
     };
 
     fb::ServerMessage::create(
@@ -1624,6 +1815,11 @@ pub enum ServerResultBorrowed<'a> {
     },
     JudgeHistory,
     JudgeRules,
+    RailLayout {
+        group_keys: Vec<&'a str>,
+        session_ids: Vec<&'a str>,
+        custom_labels: Vec<(&'a str, &'a str)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1688,6 +1884,14 @@ pub enum ServerMessageBorrowed<'a> {
         has_pinned: bool,
         pinned: bool,
         effective: bool,
+    },
+    RailPinsUpdated {
+        group_keys: Vec<&'a str>,
+        session_ids: Vec<&'a str>,
+    },
+    SessionCustomLabelUpdated {
+        session_id: &'a str,
+        custom_label: Option<&'a str>,
     },
 }
 
@@ -1795,6 +1999,45 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 }
                 fb::ServerResultPayload::JudgeHistoryResult => ServerResultBorrowed::JudgeHistory,
                 fb::ServerResultPayload::JudgeRulesResult => ServerResultBorrowed::JudgeRules,
+                fb::ServerResultPayload::RailLayoutResult => {
+                    let layout_res = resp.result_as_rail_layout_result().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing rail layout result",
+                        )
+                    })?;
+                    let group_keys = layout_res
+                        .group_keys()
+                        .map(|v| v.iter().collect())
+                        .unwrap_or_default();
+                    let session_ids = layout_res
+                        .session_ids()
+                        .map(|v| v.iter().collect())
+                        .unwrap_or_default();
+                    let custom_labels = layout_res
+                        .custom_labels()
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|entry| {
+                                    let sid = entry.session_id()?.trim();
+                                    if sid.is_empty() {
+                                        return None;
+                                    }
+                                    let label = entry.label()?.trim();
+                                    if label.is_empty() {
+                                        return None;
+                                    }
+                                    Some((sid, label))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    ServerResultBorrowed::RailLayout {
+                        group_keys,
+                        session_ids,
+                        custom_labels,
+                    }
+                }
                 fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {
                     ServerResultBorrowed::Unit
                 }
@@ -1953,6 +2196,45 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 has_pinned: payload.has_pinned(),
                 pinned: payload.pinned(),
                 effective: payload.effective(),
+            })
+        }
+        fb::ServerMessagePayload::RailPinsUpdatedPayload => {
+            let payload = root.payload_as_rail_pins_updated_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing rail pins updated payload")
+            })?;
+            let group_keys = payload
+                .group_keys()
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+            let session_ids = payload
+                .session_ids()
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+            Ok(ServerMessageBorrowed::RailPinsUpdated {
+                group_keys,
+                session_ids,
+            })
+        }
+        fb::ServerMessagePayload::SessionCustomLabelUpdatedPayload => {
+            let payload = root
+                .payload_as_session_custom_label_updated_payload()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "missing session custom label updated payload",
+                    )
+                })?;
+            let custom_label = if payload.has_label() {
+                payload.label()
+            } else {
+                None
+            };
+            let session_id = payload.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            Ok(ServerMessageBorrowed::SessionCustomLabelUpdated {
+                session_id,
+                custom_label,
             })
         }
         _ => Err(crate::ProtocolError::new(
