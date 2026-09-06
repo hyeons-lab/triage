@@ -851,8 +851,6 @@ class SessionVm {
   }
 
   void dispose() {
-    // Idempotent: every call site now disposes the whole view model, and
-    // ChangeNotifier.dispose asserts on a second call.
     if (_disposed) return;
     _disposed = true;
     store.dispose();

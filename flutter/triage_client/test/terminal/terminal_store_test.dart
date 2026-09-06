@@ -49,6 +49,16 @@ class FakeTerminalSink implements TerminalSink {
   void onHistoryReplayed() => historyReplayedCount++;
 }
 
+/// Records the history-replay signal in the same ordered op list as writes, so
+/// a test can assert the signal lands after every decoded byte.
+class ReplayOrderSink extends FakeTerminalSink {
+  @override
+  void onHistoryReplayed() {
+    ops.add('historyReplayed');
+    super.onHistoryReplayed();
+  }
+}
+
 /// A sink that runs a one-shot callback from inside [write], so a test can
 /// tear the store down part-way through a flush the way a listener reacting to
 /// freshly painted output can.
@@ -600,6 +610,31 @@ void main() {
     });
   });
 
+  test('history replay ending mid-frame flushes before it signals', () {
+    // #162 documents onHistoryReplayed as "all decoded snapshot bytes
+    // written", and its web bottom-restore depends on that. A replay whose
+    // tail ends inside a Mode 2026 block would otherwise still be held.
+    final orderSink = ReplayOrderSink();
+    final replayStore = TerminalStore(orderSink);
+    replayStore.dispatch(const Attach());
+    replayStore.dispatch(
+      HistoryBytes(b('\x1b[?2026hheld tail'), cols: 80, rows: 24),
+    );
+
+    final writeIndex = orderSink.ops.indexWhere(
+      (op) => op.startsWith('write:'),
+    );
+    final signalIndex = orderSink.ops.indexOf('historyReplayed');
+    expect(writeIndex, isNonNegative, reason: 'the held tail must be flushed');
+    expect(signalIndex, isNonNegative);
+    expect(
+      writeIndex,
+      lessThan(signalIndex),
+      reason: 'every decoded byte must reach the sink before the signal',
+    );
+    replayStore.dispose();
+  });
+
   test('an abandoned frame stops suppressing newline translation', () {
     fakeAsync((async) {
       store.dispatch(const Attach());
@@ -635,6 +670,45 @@ void main() {
       sink.ops.clear();
       store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 2));
       expect(sink.ops, ['write:ccc\r\nddd']);
+    });
+  });
+
+  test('a session exit while the block is still held closes the frame', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      // No elapse: the block is still buffered, so retiring the frame without
+      // flushing would let the watchdog re-derive it from the buffered start
+      // marker and re-arm the abandon timer.
+      store.dispatch(LiveBytes(b('\x1b[?2026hpartial'), outputSeq: 1));
+      store.dispatch(const Exited());
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 2));
+      expect(sink.ops, [
+        'write:ccc\r\nddd',
+      ], reason: 'the abandoned frame must not survive the flush');
+    });
+  });
+
+  test('output after a closing marker is translated, not carried verbatim', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      // The watchdog stops holding the block while the frame is still open on
+      // the wire, so the closing marker arrives outside a held block.
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('\x1b[?2026lccc\nddd'), outputSeq: 2));
+      expect(
+        sink.ops,
+        ['write:\x1b[?2026l', 'write:ccc\r\nddd'],
+        reason:
+            'only the frame is exempt; the tail after it is ordinary output',
+      );
     });
   });
 

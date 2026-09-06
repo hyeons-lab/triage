@@ -43,7 +43,9 @@ const Duration kSyncOutputLiveFlushInterval = Duration(milliseconds: 100);
 /// A frame legitimately spans a whole `agy` generation, minutes at a time, so
 /// this cannot be an elapsed-time bound. It is an *idle* bound instead: a live
 /// generation is always emitting (tokens, spinner frames, status redraws),
-/// while an application killed mid-frame goes silent forever. Without it a
+/// while an application killed mid-frame goes silent forever. The clock is
+/// reset when frame bytes reach the sink, which for a held block means on each
+/// live flush rather than on each chunk's arrival. Without it a
 /// frame that never receives its closing marker would leave newline
 /// translation disabled for the rest of the session, which turns ordinary
 /// shell output into a staircase.
@@ -107,7 +109,7 @@ class TerminalStore extends ChangeNotifier {
   // dispose.
   Timer? _syncLiveFlushTimer;
   // Guards against a frame that never receives its closing marker (see
-  // [kSyncFrameAbandonTimeout]). Rearmed on every byte while a frame is open.
+  // [kSyncFrameAbandonTimeout]). Rearmed whenever frame bytes reach the sink.
   Timer? _frameAbandonTimer;
   // Set once dispose() runs. A flush writes to the sink synchronously, so a
   // listener reacting to that write can dispose us part-way through a tick or
@@ -198,12 +200,15 @@ class TerminalStore extends ChangeNotifier {
         );
 
       case Detach():
+        _closeFrameOnWire();
         return s.copyWith(phase: AttachPhase.detached);
 
       case Exited():
-        // Whatever the process was drawing, it is not going to close it. Left
-        // set, an abandoned frame would suppress newline translation for every
-        // later write in this session.
+        // Whatever the process was drawing, it is not going to close it. Flush
+        // first: retiring the frame while a block is still held would let the
+        // watchdog re-derive it from the buffered start marker and re-arm the
+        // abandon timer, so newline translation would stay off for 30s.
+        _closeSyncBlockAndFlush();
         _closeFrameOnWire();
         return s.copyWith(exited: true);
 
@@ -390,7 +395,11 @@ class TerminalStore extends ChangeNotifier {
     if (next.sized) {
       _flushPendingLive(throughOutputSeq);
     }
-    _sink.onHistoryReplayed();
+    // #162's contract is that every decoded byte has reached the sink by the
+    // time this fires, and its web bottom-restore depends on it. A replay
+    // ending mid-frame would otherwise still be sitting in _syncBuffer.
+    _closeSyncBlockAndFlush();
+    if (!_disposed) _sink.onHistoryReplayed();
     return next;
   }
 
@@ -679,16 +688,24 @@ class TerminalStore extends ChangeNotifier {
   /// carries.
   void _writeVerbatim(String text) {
     if (text.isEmpty || _disposed) return;
+    final lastStart = text.lastIndexOf(_kSyncStart);
+    final lastEnd = text.lastIndexOf(_kSyncEnd);
+    // A chunk can carry the closing marker and then ordinary output. Only the
+    // frame's own bytes are exempt from newline translation, so hand the tail
+    // back to _writeDirect rather than letting it inherit the exemption.
+    final closes = lastEnd != -1 && lastEnd > lastStart;
+    final split = closes ? lastEnd + _kSyncMarkerLength : text.length;
+    final framePart = split == text.length ? text : text.substring(0, split);
+
     final wasWriting = _isWritingSink;
     _isWritingSink = true;
     try {
-      _pendingCarriageReturn = text.endsWith('\r');
-      _sink.write(text);
+      _pendingCarriageReturn = framePart.endsWith('\r');
+      _sink.write(framePart);
     } finally {
       _isWritingSink = wasWriting;
     }
-    final lastStart = text.lastIndexOf(_kSyncStart);
-    final lastEnd = text.lastIndexOf(_kSyncEnd);
+
     if (lastStart != -1 || lastEnd != -1) {
       _frameOpenOnWire = lastStart > lastEnd;
     }
@@ -697,6 +714,9 @@ class TerminalStore extends ChangeNotifier {
     } else {
       _frameAbandonTimer?.cancel();
       _frameAbandonTimer = null;
+    }
+    if (split < text.length) {
+      _writeDirect(text.substring(split));
     }
   }
 
