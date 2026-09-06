@@ -102,14 +102,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   // Scroll events maintain it, and our own corrections (the anchor re-pin and
   // the bottom snap) record the offset they landed on. Anything that leaves no
   // meaningful previous *user* position nulls it instead: a terminal swap, a
-  // cursor jump, and the end of a drag-select. Output-driven jumps to the bottom deliberately leave it
-  // alone, since they clear the anchor on the way and land at the bottom, so
-  // there is no pin left for a stale reading to release.
+  // cursor jump, and the end of a drag-select. Output-driven jumps to the
+  // bottom deliberately leave it alone, since they clear the anchor on the way
+  // and land at the bottom, so there is no pin left for a stale reading to
+  // release.
   double? _lastScrollPixels;
-  // The scroll position's isScrollingNotifier while a bottom snap waits for the
-  // user's gesture to settle. Held as the notifier we actually subscribed to,
-  // so the listener comes off that same object even if the position has since
-  // been replaced.
   // Pointers currently down on the terminal. A hold activity reports *not*
   // scrolling, so the scroll state alone would treat a finger resting on a
   // stopped fling as settled.

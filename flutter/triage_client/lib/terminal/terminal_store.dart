@@ -544,8 +544,8 @@ class TerminalStore extends ChangeNotifier {
   ///
   /// CLI tools (such as `agy`) wrap animated redraws in Mode 2026 so all intermediate
   /// cursor repositions and status updates are delivered in one atomic frame rather
-  /// than jittering across multiple network chunks. Because a block can also span
-  /// an entire streaming response, an open block additionally flushes
+  /// than jittering across multiple network chunks. Because a block can also
+  /// span an entire streaming response, an open block additionally flushes
   /// periodically ([kSyncOutputLiveFlushInterval]) so the screen stays live
   /// instead of freezing until the closing marker.
   void _processSynchronizedOutput(String input) {

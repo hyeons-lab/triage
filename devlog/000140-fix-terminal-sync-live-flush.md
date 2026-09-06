@@ -40,6 +40,7 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 
 ## Issues
 
+- 2026-09-06T12:20-0700 The max-effort re-review of 15d6141 found no blocking issues. It did catch a doc comment left orphaned above `_activePointers` when the deferred-snap fields were removed, which is the fourth doc comment defect on this branch that the analyzer cannot see. Its one warning, that a stall over `kSyncFrameAbandonTimeout` would resume translating mid-frame, is the accepted cost of bounding the flag and needs no change.
 - 2026-09-04T22:11-0700 `flutter test` cannot run in this sandbox (flutter_tester needs a loopback server socket; SDK self-update and telemetry paths are outside the writable roots). Worked around with a /tmp SDK copy plus a plain-`dart` harness running the byte-identical reducer with FakeAsync: 9/9 pass. `dart analyze` clean, files formatted. Re-run `flutter test` outside the sandbox.
   - Resolved 2026-09-06T07:12-0700: re-ran outside the sandbox. Full suite green, including the pre-existing `session scroll preservation` widget tests that cover the changed pane paths. After the rebase onto c677c4c: 431/431 pass and `flutter analyze` reports no issues.
 - 2026-09-04T22:11-0700 `git fetch origin` fails here (SSH to GitHub denied), so the worktree is based on local `main` at 56bec41, not a freshly fetched `origin/main`.
@@ -54,7 +55,8 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - c7acd48: fix(client): flush open synchronized-output blocks during sustained streams
 - 142d53c: fix(client): close synchronized blocks through one helper and stop a post-dispose re-arm
 - 014d2f5: fix(client): keep synchronized frames verbatim on the wire and defer the bottom snap
-- HEAD: fix(client): flush held blocks before signalling and simplify the bottom snap
+- 15d6141: fix(client): flush held blocks before signalling and simplify the bottom snap
+- HEAD: docs(client): drop the doc comment orphaned by the snap simplification
 
 ## Progress
 
