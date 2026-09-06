@@ -40,6 +40,7 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 
 ## Issues
 
+- 2026-09-06T16:46-0700 On-device confirmation on the Pixel 10 Pro Fold, from a release APK built at 9d414df: the app works and the in-terminal composer renders. The composer was the open unknown, so this closes it as an observed outcome. It does not establish that the scroll-pin release caused it. The bug was never reproducible off-device (1.25MB of real `agy` bytes replayed through the app's own xterm fork rendered the composer at every size from 80x12 to 102x41), so the treadmill remained a theory rather than a diagnosis, and a build this far ahead of the broken one changes more than the pin. Worth remembering if it returns.
 - 2026-09-06T12:20-0700 The max-effort re-review of 15d6141 found no blocking issues. It did catch a doc comment left orphaned above `_activePointers` when the deferred-snap fields were removed, which is the fourth doc comment defect on this branch that the analyzer cannot see. Its one warning, that a stall over `kSyncFrameAbandonTimeout` would resume translating mid-frame, is the accepted cost of bounding the flag and needs no change.
 - 2026-09-04T22:11-0700 `flutter test` cannot run in this sandbox (flutter_tester needs a loopback server socket; SDK self-update and telemetry paths are outside the writable roots). Worked around with a /tmp SDK copy plus a plain-`dart` harness running the byte-identical reducer with FakeAsync: 9/9 pass. `dart analyze` clean, files formatted. Re-run `flutter test` outside the sandbox.
   - Resolved 2026-09-06T07:12-0700: re-ran outside the sandbox. Full suite green, including the pre-existing `session scroll preservation` widget tests that cover the changed pane paths. After the rebase onto c677c4c: 431/431 pass and `flutter analyze` reports no issues.
@@ -68,12 +69,13 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - [x] Rebase onto current `origin/main`, reconcile with #160's scroll cache, renumber devlog (431/431, analyze clean)
 - [x] Address PR #161 review feedback (Copilot + Antigravity)
 - [x] Two rounds of max-effort subagent review, fixes applied and mutation-verified
-- [ ] Rebuild Android APK with the fix and install on device (blocked: Java/adb sockets denied in this sandbox; user runs `flutter build apk --release` + `adb install -r` themselves)
-- [x] Root-cause the Android composer (scroll-pin treadmill + stale revisit restore, native pane only; web unaffected by construction)
+- [x] Rebuild Android APK with the fix and install on device (2026-09-06, Pixel 10 Pro Fold)
+- [~] Theorize the Android composer cause (scroll-pin treadmill, native pane only; never reproduced off-device, so unproven)
 - [x] Implement pin release on downward chase + snap, stale-restore guard, unit tests
-- [ ] On-device confirmation of both fixes (needs fresh APK build)
+- [x] On-device confirmation: composer renders, app works
 
 ## Next Steps
 
-- Build `flutter build apk --release` from this worktree and sideload onto the Pixel 10 Pro Fold.
-- Confirm the freeze is gone on-device; capture the composer case (screenshot or scroll check).
+- Confirm on-device that the freeze itself is gone during a sustained `agy` generation. The composer
+  is confirmed; the freeze, which is the fix this branch is actually named for, has not been
+  reported either way yet.
