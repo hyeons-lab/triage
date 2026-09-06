@@ -30,6 +30,9 @@
 - **2026-09-05T22:47-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: Added non-negative viewport guards (viewportY >= 0) in onScrollCallback and _unbindContainerEvents to prevent corrupted microtask values from saving.
 - **2026-09-05T22:47-0700** flutter/triage_client/lib/main.dart: Returned Uint8List directly from _rawOutputFromSnapshot, enabling zero-allocation byte slicing downstream.
 - **2026-09-05T22:47-0700** flutter/triage_client/test/terminal/terminal_store_test.dart: Added unit test covering concurrent viewport resize and delta-merge updates.
+- **2026-09-05T23:03-0700** flutter/triage_client/analysis_options.yaml: Disabled use_null_aware_elements lint rule to allow standard null-check collection elements across all Dart SDK versions.
+- **2026-09-05T23:03-0700** flutter/triage_client/lib/main.dart, flutter/triage_client/lib/models/daemon_server.dart, flutter/triage_client/lib/services/triage_websocket_client.dart, flutter/triage_client/lib/widgets/terminal_pane_stub.dart: Reverted prefix ? collection elements to standard Dart 3 collection-if and pattern match constructs for universal compiler compatibility.
+- **2026-09-05T23:03-0700** flutter/triage_client/lib/widgets/terminal_pane_stub.dart: Converted _kBottomScrollSentinel comment to formal dartdoc explaining finite bounds assertion and frame-1 layout clamping.
 
 ## Decisions
 
@@ -46,6 +49,7 @@
 - **2026-09-05T22:13-0700 Decision: Universal Regression Guard Before Delta Merge**: Sequence regressions (throughOutputSeq < baselineSeq) and log length contractions (rawOutputStart + bytes.length < currentLogBytes) signify a daemon or session reset. Checking them prior to delta merge guarantees that any restart triggers a complete clear and replay across all paths.
 - **2026-09-05T22:47-0700 Decision: Non-Negative Web Viewport Bounds**: During DOM detachment and rapid window resizing, xterm.js internal measurements can momentarily emit negative viewport indices before layout recalculation; enforcing viewportY >= 0 ensures only valid scroll offsets are persisted.
 - **2026-09-05T22:47-0700 Decision: Concrete Typed Buffer Ingress**: Returning Uint8List from _rawOutputFromSnapshot guarantees that snapshot byte slices avoid dynamic type checking or array coercions on web targets.
+- **2026-09-05T23:03-0700 Decision: Universal Dart Collection-If Compatibility**: Standardizing on standard if-checks (`if (x != null)`) and disabling `use_null_aware_elements` guarantees broad toolchain compatibility across both release compilers and older SDK versions without static analysis warnings.
 
 ## Issues
 
@@ -81,6 +85,7 @@
 - [x] Round 4 review loop: address universal regression guard, session revival Attach dispatch, and viewport cache purge
 - [x] Full test suite and static analysis green across Dart and Rust
 - [x] Address PR review feedback: non-negative viewport guards, typed snapshot buffers, and concurrent resize tests
+- [x] Address follow-up PR review: revert experimental null-aware collection syntax, document scroll sentinel
 - [x] Synthesize review learnings into `~/.gemini/review-refinements.md`
 
 ## Commits
@@ -88,4 +93,5 @@
 - cd0a50f: fix(client): cache session scroll state and delta-merge terminal output
 - 5441c2f: fix(client): harden session tab scroll cache and restore lifecycle
 - d4c42e4: fix(client): synchronize exited session state and harden scroll restoration
-- HEAD: fix(client): address PR review comments and harden web viewport guards
+- a7a201f: fix(client): address PR review comments and harden web viewport guards
+- HEAD: fix(client): restore standard Dart 3 collection syntax and document scroll sentinel

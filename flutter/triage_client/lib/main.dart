@@ -4787,7 +4787,10 @@ class _SessionRailState extends State<SessionRail> {
         layoutBuilder: (currentChild, previousChildren) {
           return Stack(
             alignment: Alignment.topLeft,
-            children: [...previousChildren, ?currentChild],
+            children: [
+              ...previousChildren,
+              if (currentChild != null) currentChild,
+            ],
           );
         },
         child: OverflowBox(

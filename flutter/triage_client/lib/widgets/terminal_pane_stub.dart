@@ -79,10 +79,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
   static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
       {};
-  // Sentinel offset that clamps to maxScrollExtent on initial layout pass
-  // without failing Flutter's assertion that initialScrollOffset is finite.
-  // 1e9 (one billion pixels) is finite, fits within float64 exact precision,
-  // and guarantees clamping to maxScrollExtent on frame 0.
+
+  /// A finite initial scroll offset sentinel (1 billion pixels) that complies
+  /// with Flutter's ScrollController bounds checking (`assert(initialScrollOffset.isFinite)`),
+  /// while safely clamping to `maxScrollExtent` during the very first layout pass to
+  /// prevent frame-0 rendering jumps.
   static const double _kBottomScrollSentinel = 1e9;
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
@@ -1329,7 +1330,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                       ),
                     ),
                   ),
-                  ?copyButton,
+                  if (copyButton != null) copyButton,
                 ],
               ),
             ),
