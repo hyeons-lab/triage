@@ -1,27 +1,51 @@
 import 'package:xterm/xterm.dart' as xt;
 
+/// How close to the bottom a downward scroll must land before the pin is
+/// released. Wider than the single line `TerminalScrollAnchor.capture` uses to
+/// decide it is already at the bottom, so a user chasing live output is handed
+/// over before the pin can re-apply.
+const int kScrollPinReleaseGraceLines = 3;
+
+/// Whether a released pin's deferred trip to the bottom should now complete.
+///
+/// The snap cannot run while the user is still working the viewport: `jumpTo`
+/// calls `goIdle()`, which tears down the drag, hold, or fling in progress. A
+/// held pointer matters on its own because a finger placed down to stop a
+/// fling installs a hold activity, and a hold reports *not* scrolling, so the
+/// scroll state alone would call that settled. [hasAnchor] means the user
+/// re-pinned on the way and no longer wants the bottom.
+bool shouldFinishBottomSnap({
+  required bool isScrolling,
+  required bool pointerDown,
+  required double pixels,
+  required double maxScrollExtent,
+  required bool hasAnchor,
+}) {
+  if (isScrolling || pointerDown || hasAnchor) return false;
+  return pixels < maxScrollExtent;
+}
+
 /// Whether a scroll event should release a held scroll pin and hand the
 /// viewport back to the emulator's stick-to-bottom following.
 ///
 /// A pinned viewport plus a steadily growing buffer is a treadmill: every new
-/// line pushes the bottom further away while the pin holds the same line, so
-/// a user chasing live output (e.g. a composer at the very bottom of a busy
-/// agent session) can never arrive. Releasing when the user is actively
-/// scrolling *down* and already within [graceLines] of the bottom tells the
-/// caller to drop the pin and snap the last few lines to the bottom, while
-/// upward or distant scrolling keeps the pin so background output never
-/// steals a reading position. Takes only scroll metrics and no widget state,
-/// so it is unit-testable without a laid-out render tree.
+/// line pushes the bottom further away while the pin holds the same line, so a
+/// user chasing live output (e.g. a composer at the very bottom of a busy agent
+/// session) can never arrive. Releasing when the user is actively scrolling
+/// *down* and already within [kScrollPinReleaseGraceLines] of the bottom tells
+/// the caller to drop the pin and snap the last few lines to the bottom, while
+/// upward or distant scrolling keeps the pin so background output never steals
+/// a reading position. Takes only scroll metrics and no widget state, so it is
+/// unit-testable without a laid-out render tree.
 bool shouldReleaseScrollPin({
   required double? lastPixels,
   required double pixels,
   required double maxScrollExtent,
   required double lineHeight,
-  int graceLines = 3,
 }) {
-  if (lastPixels == null || lineHeight <= 0 || graceLines < 0) return false;
+  if (lastPixels == null || lineHeight <= 0) return false;
   if (pixels <= lastPixels) return false;
-  return pixels >= maxScrollExtent - graceLines * lineHeight;
+  return pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight;
 }
 
 /// Pins a terminal viewport to a specific scrollback line so that scrollback

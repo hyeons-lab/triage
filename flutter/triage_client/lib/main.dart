@@ -756,6 +756,9 @@ class SessionVm {
   // The sink wraps the controller, so both platform views render through their
   // existing listeners; decoding/buffering/CRLF/dedup all live in the store.
   late final TerminalStore store;
+  // Guards dispose against the second call: every teardown site disposes the
+  // whole view model, and ChangeNotifier.dispose asserts on reuse.
+  bool _disposed = false;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
 
   // Deferred history: replay must wait until the view is laid out and fitted, so
@@ -848,6 +851,10 @@ class SessionVm {
   }
 
   void dispose() {
+    // Idempotent: every call site now disposes the whole view model, and
+    // ChangeNotifier.dispose asserts on a second call.
+    if (_disposed) return;
+    _disposed = true;
     store.dispose();
     terminalController.dispose();
   }
@@ -1294,7 +1301,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // construction (both machines have a `main`), so it would land on a real,
       // unrelated session. None of this is salvageable; the new list rebuilds it.
       for (final session in _sessions) {
-        session.terminalController.dispose();
+        // The whole view model, not just its controller: SessionVm also owns a
+        // TerminalStore whose synchronized-output timers would otherwise stay
+        // armed on an orphaned store and keep flushing into a disposed sink.
+        session.dispose();
         TerminalPane.destroySession(session.title);
       }
       _sessions.clear();
@@ -2293,7 +2303,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           : const <String>{};
       setState(() {
         for (final s in _sessions) {
-          s.terminalController.dispose();
+          // As in _purgeDaemonLocalState: dispose the view model so the store's
+          // timers are retired, not just the controller.
+          s.dispose();
           if (!loadingSessionTitles.contains(s.title)) {
             TerminalPane.destroySession(s.title);
           }

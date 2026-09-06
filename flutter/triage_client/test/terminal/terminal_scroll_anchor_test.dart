@@ -196,6 +196,7 @@ void main() {
   group('shouldReleaseScrollPin', () {
     const lineHeight = 10.0;
     const maxExtent = 1000.0;
+    const graceBand = kScrollPinReleaseGraceLines * lineHeight;
 
     test('no previous position never releases', () {
       expect(
@@ -236,8 +237,8 @@ void main() {
     test('scrolling down within the grace releases the pin', () {
       expect(
         shouldReleaseScrollPin(
-          lastPixels: maxExtent - 50,
-          pixels: maxExtent - 20,
+          lastPixels: maxExtent - graceBand - 20,
+          pixels: maxExtent - graceBand + 1,
           maxScrollExtent: maxExtent,
           lineHeight: lineHeight,
         ),
@@ -245,13 +246,110 @@ void main() {
       );
     });
 
-    test('degenerate inputs never release', () {
+    test('scrolling up inside the grace band keeps the pin', () {
+      // The direction guard is the whole premise of the feature, and proximity
+      // alone cannot carry this: both offsets sit inside the grace band, so
+      // only `pixels <= lastPixels` can reject it.
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: maxExtent,
+          pixels: maxExtent - 5,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a scroll that does not move keeps the pin', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: maxExtent - 5,
+          pixels: maxExtent - 5,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a non-positive line height never releases', () {
+      // Scrolling down onto the bottom, so only the line-height guard can
+      // reject this: with `pixels <= lastPixels` the call would return false
+      // for the wrong reason and the test could not fail.
       expect(
         shouldReleaseScrollPin(
           lastPixels: 0,
-          pixels: 0,
+          pixels: maxExtent,
           maxScrollExtent: maxExtent,
           lineHeight: 0,
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('shouldFinishBottomSnap', () {
+    test('settled below the bottom with no pin finishes the snap', () {
+      expect(
+        shouldFinishBottomSnap(
+          isScrolling: false,
+          pointerDown: false,
+          pixels: 900,
+          maxScrollExtent: 1000,
+          hasAnchor: false,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a scroll still in flight waits', () {
+      expect(
+        shouldFinishBottomSnap(
+          isScrolling: true,
+          pointerDown: false,
+          pixels: 900,
+          maxScrollExtent: 1000,
+          hasAnchor: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a held pointer waits even though a hold reports not scrolling', () {
+      expect(
+        shouldFinishBottomSnap(
+          isScrolling: false,
+          pointerDown: true,
+          pixels: 900,
+          maxScrollExtent: 1000,
+          hasAnchor: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('re-pinning on the way abandons the snap', () {
+      expect(
+        shouldFinishBottomSnap(
+          isScrolling: false,
+          pointerDown: false,
+          pixels: 900,
+          maxScrollExtent: 1000,
+          hasAnchor: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a gesture that reached the bottom leaves nothing to finish', () {
+      expect(
+        shouldFinishBottomSnap(
+          isScrolling: false,
+          pointerDown: false,
+          pixels: 1000,
+          maxScrollExtent: 1000,
+          hasAnchor: false,
         ),
         isFalse,
       );

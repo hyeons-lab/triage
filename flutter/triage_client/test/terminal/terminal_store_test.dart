@@ -537,6 +537,107 @@ void main() {
     },
   );
 
+  test('a watchdog close after a live flush still writes the tail raw', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Sustained chunks keep the 50ms watchdog re-armed so the 100ms live
+      // flush is what fires, consuming the block's opening marker.
+      store.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      async.elapse(const Duration(milliseconds: 30));
+      store.dispatch(LiveBytes(b('two '), outputSeq: 2));
+      async.elapse(const Duration(milliseconds: 30));
+      store.dispatch(LiveBytes(b('three '), outputSeq: 3));
+      async.elapse(const Duration(milliseconds: 30));
+      store.dispatch(LiveBytes(b('four '), outputSeq: 4));
+      async.elapse(const Duration(milliseconds: 10));
+      expect(sink.ops, ['write:\x1b[?2026hone two three four ']);
+
+      // Still inside the block, then idle: the watchdog closes a tail that no
+      // longer carries a marker. Its bare LF must survive untouched, because
+      // the application owns cursor placement inside a synchronized frame.
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 5));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(
+        sink.ops,
+        ['write:bbb\nccc'],
+        reason: 'no \\r may be injected into a synchronized-output frame',
+      );
+    });
+  });
+
+  test('chunks after a premature close stay raw until the real end marker', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Open a frame, then stall longer than the watchdog. The watchdog stops
+      // holding the block, but the application has not closed the frame.
+      store.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(sink.ops, ['write:\x1b[?2026hone ']);
+
+      // A stall mid-generation is routine, and these bytes are still frame
+      // content: the application owns cursor placement until it says otherwise.
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 2));
+      expect(
+        sink.ops,
+        ['write:bbb\nccc'],
+        reason: 'no \\r may be injected while the frame is open on the wire',
+      );
+
+      // Once the frame really closes, ordinary newline translation resumes.
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('\x1b[?2026l'), outputSeq: 3));
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('ddd\neee'), outputSeq: 4));
+      expect(sink.ops, ['write:ddd\r\neee']);
+    });
+  });
+
+  test('an abandoned frame stops suppressing newline translation', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // A frame opens and the application then dies without ever closing it.
+      store.dispatch(LiveBytes(b('\x1b[?2026hpartial'), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      sink.ops.clear();
+
+      // Still inside the abandon window, so this is treated as frame content.
+      store.dispatch(LiveBytes(b('aaa\nbbb'), outputSeq: 2));
+      expect(sink.ops, ['write:aaa\nbbb']);
+
+      // Past it, the frame is presumed gone and ordinary shell output must not
+      // staircase for the rest of the session.
+      sink.ops.clear();
+      async.elapse(kSyncFrameAbandonTimeout * 2);
+      store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 3));
+      expect(sink.ops, ['write:ccc\r\nddd']);
+    });
+  });
+
+  test('a session exit closes an unfinished frame', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[?2026hpartial'), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+      store.dispatch(const Exited());
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 2));
+      expect(sink.ops, ['write:ccc\r\nddd']);
+    });
+  });
+
   test('disposing from inside a live flush leaves no timer armed', () {
     fakeAsync((async) {
       // A store of its own: this one is disposed inside the test, while the
