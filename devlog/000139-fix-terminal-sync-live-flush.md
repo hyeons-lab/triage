@@ -15,9 +15,13 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - 2026-09-04T22:11-0700 `flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart` — unit tests for both helpers.
 - 2026-09-06T07:12-0700 `flutter/triage_client/lib/terminal/terminal_scroll_anchor.dart` — moved the two new helpers above the `TerminalScrollAnchor` doc comment. They had been inserted between that comment and its class, which silently reassigned the class's documentation to `shouldReleaseScrollPin`.
 - 2026-09-06T07:20-0700 Rebased onto `origin/main` (c677c4c). Dropped `shouldRestoreSavedOffset`, `_sessionSavedScrollMaxExtents` and their tests: #160 landed per-session saved `TerminalScrollAnchor`s, which supersede them. Kept the pin release, merged into #160's `_captureScrollAnchor`; the release path now also calls `_saveScrollOffset` so retiring the pin retires the stored offset and anchor with it. Renumbered the devlog and plan from 000136 to 000139 (#157 took 000136 upstream).
+- 2026-09-06T08:40-0700 `flutter/triage_client/lib/terminal/terminal_store.dart` — `dispose` now clears `_inSynchronizedOutput`, and the three block-close sites (end marker, capacity cap, idle watchdog) go through one `_closeSyncBlockAndFlush` helper. A live-flush tick writes to the sink part-way through, so a listener reacting to that write can dispose the store mid-tick; the tick then resumed, still saw the flag set, and armed a fresh timer on a disposed store, which re-armed itself every interval from then on.
+- 2026-09-06T08:40-0700 `flutter/triage_client/test/terminal/terminal_store_test.dart` — regression test for that race, with a sink that disposes the store from inside `write`. It asserts on `nonPeriodicTimerCount` rather than a later write, because `dispose` clears the buffer and the leaked timer's flush is therefore silent.
+- 2026-09-06T08:40-0700 Doc comment corrections: `shouldReleaseScrollPin` no longer claims "all pure doubles" (`graceLines` is an `int`), and `_lastScrollPixels` documents that programmatic jumps store the offset they jumped to rather than nulling it.
 
 ## Decisions
 
+- 2026-09-06T08:40-0700 Declined a sub-pixel epsilon on `shouldReleaseScrollPin`'s bottom comparison (review suggestion). The grace band is `graceLines * lineHeight`, about 51px at the default 3 lines, so float rounding of a few ulps cannot decide the branch; an epsilon would only matter at `graceLines: 0`, which no caller uses. Left it out rather than adding an unexplainable constant.
 - 2026-09-06T07:20-0700 On rebase, #160's saved-anchor restore replaces this branch's `shouldRestoreSavedOffset` guard rather than sitting alongside it. An anchor tracks its buffer line as the buffer grows and trims, so it cannot go stale the way a raw pixel offset does, and the `maxScrollExtent` heuristic it needed becomes dead weight. The pin release is kept and matters more after #160, not less: persisting anchors across session switches means a saved pin re-applies on every revisit, so without a release the treadmill follows the user between sessions.
 
 - 2026-09-04T22:11-0700 Time-based progressive flush (100ms) rather than byte-threshold: a full-screen repaint frame can legitimately be ~200KB, so a byte threshold would tear frames mid-repaint; a 100ms cadence keeps small frames atomic in practice while bounding staleness during streams.
@@ -32,7 +36,8 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 
 ## Commits
 
-- `fix(client): flush open synchronized-output blocks during sustained streams` — rebased onto c677c4c.
+- 9d1b5f2: fix(client): flush open synchronized-output blocks during sustained streams
+- HEAD: fix(client): close synchronized blocks through one helper and stop a post-dispose re-arm
 
 ## Progress
 
@@ -42,6 +47,7 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - [x] Move fix into worktree
 - [x] Verify with the real `flutter test` outside the sandbox
 - [x] Rebase onto current `origin/main`, reconcile with #160's scroll cache, renumber devlog (431/431, analyze clean)
+- [x] Address PR #161 review feedback (Copilot + Antigravity)
 - [ ] Rebuild Android APK with the fix and install on device (blocked: Java/adb sockets denied in this sandbox; user runs `flutter build apk --release` + `adb install -r` themselves)
 - [x] Root-cause the Android composer (scroll-pin treadmill + stale revisit restore, native pane only; web unaffected by construction)
 - [x] Implement pin release on downward chase + snap, stale-restore guard, unit tests

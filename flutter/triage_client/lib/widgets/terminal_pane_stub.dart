@@ -97,9 +97,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _suppressAnchorCapture = false;
   bool _repinScheduled = false;
   // Viewport pixels at the previous scroll event, to tell a downward chase
-  // (release the pin near the bottom) from upward reading (keep it). Nulled
-  // whenever the terminal is swapped or we jump programmatically, so a
-  // direction measured against a stale position can't release the pin.
+  // (release the pin near the bottom) from upward reading (keep it). Every
+  // move we make ourselves resets it rather than leaving it stale: a
+  // programmatic jump stores the offset it jumped to, and a terminal swap
+  // nulls it (the incoming session has no previous position of its own). Both
+  // keep a direction from being measured across a jump we caused, which would
+  // otherwise read as a user chasing the bottom and release the pin.
   double? _lastScrollPixels;
 
   Timer? _resizeOutDebounceTimer;

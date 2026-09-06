@@ -518,11 +518,7 @@ class TerminalStore extends ChangeNotifier {
           final chunkEnd = endIdx + _kSyncMarkerLength;
           _syncBuffer.write(input.substring(cursor, chunkEnd));
           cursor = chunkEnd;
-          _inSynchronizedOutput = false;
-          _syncTimer?.cancel();
-          _syncTimer = null;
-          _cancelSyncLiveFlush();
-          _flushSyncBuffer();
+          _closeSyncBlockAndFlush();
         } else {
           _syncBuffer.write(input.substring(cursor));
           cursor = input.length;
@@ -530,11 +526,7 @@ class TerminalStore extends ChangeNotifier {
             debugPrint(
               'TerminalStore: synchronized output buffer exceeded $_kSyncBufferCap bytes; force-flushing',
             );
-            _inSynchronizedOutput = false;
-            _syncTimer?.cancel();
-            _syncTimer = null;
-            _cancelSyncLiveFlush();
-            _flushSyncBuffer();
+            _closeSyncBlockAndFlush();
           } else {
             _rearmSyncWatchdog();
           }
@@ -559,6 +551,19 @@ class TerminalStore extends ChangeNotifier {
     }
   }
 
+  /// Closes an open synchronized block and paints what it accumulated.
+  ///
+  /// Every exit from a block runs through here (end marker, capacity cap, and
+  /// the idle watchdog) so none of them can drift apart on the timers they
+  /// each have to retire.
+  void _closeSyncBlockAndFlush() {
+    _inSynchronizedOutput = false;
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    _cancelSyncLiveFlush();
+    _flushSyncBuffer();
+  }
+
   void _rearmSyncWatchdog() {
     _syncTimer?.cancel();
     _syncTimer = Timer(kSyncOutputWatchdogTimeout, () {
@@ -568,11 +573,7 @@ class TerminalStore extends ChangeNotifier {
         _processSynchronizedOutput(carried);
       }
       if (_inSynchronizedOutput || _syncBuffer.isNotEmpty) {
-        _inSynchronizedOutput = false;
-        _syncTimer?.cancel();
-        _syncTimer = null;
-        _cancelSyncLiveFlush();
-        _flushSyncBuffer();
+        _closeSyncBlockAndFlush();
       }
     });
   }
@@ -766,6 +767,11 @@ class TerminalStore extends ChangeNotifier {
     _suppressTimer?.cancel();
     _syncTimer?.cancel();
     _cancelSyncLiveFlush();
+    // A live-flush tick writes to the sink, and a listener reacting to that
+    // write can dispose us synchronously, part-way through the tick. Clearing
+    // the flag (as _resetCarries already does) is what stops the tick from
+    // re-arming a timer that would later write to a disposed sink.
+    _inSynchronizedOutput = false;
     _syncBuffer.clear();
     _sink.onOutput = null;
     _sink.onResize = null;

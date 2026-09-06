@@ -49,6 +49,21 @@ class FakeTerminalSink implements TerminalSink {
   void onHistoryReplayed() => historyReplayedCount++;
 }
 
+/// A sink that runs a one-shot callback from inside [write], so a test can
+/// tear the store down part-way through a flush the way a listener reacting to
+/// freshly painted output can.
+class ReentrantSink extends FakeTerminalSink {
+  void Function()? onWrite;
+
+  @override
+  void write(String data) {
+    super.write(data);
+    final callback = onWrite;
+    onWrite = null;
+    callback?.call();
+  }
+}
+
 void main() {
   late FakeTerminalSink sink;
   late TerminalStore store;
@@ -521,6 +536,46 @@ void main() {
       });
     },
   );
+
+  test('disposing from inside a live flush leaves no timer armed', () {
+    fakeAsync((async) {
+      // A store of its own: this one is disposed inside the test, while the
+      // shared `store` stays for tearDown to dispose.
+      final reentrantSink = ReentrantSink();
+      final victim = TerminalStore(reentrantSink);
+      victim.dispatch(const Attach());
+      victim.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      reentrantSink.ops.clear();
+
+      // Chunks must keep arriving inside the 50ms watchdog, or the watchdog
+      // closes the block first and the live flush under test never runs.
+      victim.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      reentrantSink.onWrite = victim.dispose;
+      async.elapse(const Duration(milliseconds: 30));
+      victim.dispatch(LiveBytes(b('two '), outputSeq: 2));
+      async.elapse(const Duration(milliseconds: 30));
+      victim.dispatch(LiveBytes(b('three '), outputSeq: 3));
+      async.elapse(const Duration(milliseconds: 30));
+      victim.dispatch(LiveBytes(b('four '), outputSeq: 4));
+      async.elapse(const Duration(milliseconds: 10)); // t=100: flush fires
+
+      expect(
+        reentrantSink.ops.where((op) => op.startsWith('write:')).length,
+        1,
+        reason: 'the live flush painted once before the store was disposed',
+      );
+      // The tick resumes after the dispose its own write triggered. Re-arming
+      // there would leave a timer firing against a disposed sink every
+      // interval, forever.
+      expect(
+        async.nonPeriodicTimerCount,
+        0,
+        reason:
+            'dispose must leave no live flush armed: '
+            '${async.pendingTimersDebugString}',
+      );
+    });
+  });
 
   test(
     'Synchronized Output buffer capacity cap forces a flush when exceeded',

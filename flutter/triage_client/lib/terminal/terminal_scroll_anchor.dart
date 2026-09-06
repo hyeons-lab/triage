@@ -10,8 +10,8 @@ import 'package:xterm/xterm.dart' as xt;
 /// scrolling *down* and already within [graceLines] of the bottom tells the
 /// caller to drop the pin and snap the last few lines to the bottom, while
 /// upward or distant scrolling keeps the pin so background output never
-/// steals a reading position. All pure doubles so it is unit-testable without
-/// a laid-out render tree.
+/// steals a reading position. Takes only scroll metrics and no widget state,
+/// so it is unit-testable without a laid-out render tree.
 bool shouldReleaseScrollPin({
   required double? lastPixels,
   required double pixels,
