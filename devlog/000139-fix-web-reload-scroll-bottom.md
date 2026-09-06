@@ -11,6 +11,7 @@
 - **2026-09-06T08:28-0700** flutter/triage_client/lib/terminal/terminal_sink.dart, flutter/triage_client/lib/terminal/terminal_controller_sink.dart, flutter/triage_client/lib/widgets/terminal_pane.dart: Added onHistoryReplayed hook across sink and controller.
 - **2026-09-06T08:28-0700** flutter/triage_client/lib/terminal/terminal_store.dart: Invoked onHistoryReplayed when history replay completes.
 - **2026-09-06T08:28-0700** flutter/triage_client/test/terminal/terminal_store_test.dart: Added unit tests verifying onHistoryReplayed notification through store and controller sink.
+- **2026-09-06T09:10-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart, flutter/triage_client/test/terminal/terminal_store_test.dart: Unified scroll suppression timer management via _suppressScrollSaveFor, made controller replacement replay unconditional in didUpdateWidget, added mobile textarea enterkeyhint and inputmode attributes, and added unit tests for unsized history replay and listener deregistration.
 
 ## Decisions
 
@@ -18,7 +19,7 @@
 - **2026-09-06T07:24-0700 Decision: Always Re-trigger Fit and Replay on Controller Replacement**: When `didUpdateWidget` receives a replaced `controller` with matching session title (the placeholder-to-remote-session transition on reload), do not gate `_triggerFullReplayOrReset()` on `!_initialContentWritten`. The incoming session has never received `onViewFit` and requires fit notification to flush its staged history.
 - **2026-09-06T07:24-0700 Decision: Suppress Scroll Capture During Programmatic Replay**: Guard `onScrollCallback` with `_suppressScrollSave` while history is being cleared, decoded, and rendered into xterm.js, preventing transient chunk layout states from latching `_sessionSavedViewportY = 0`.
 - **2026-09-06T08:28-0700 Decision: Directly Intercept Helper Textarea Input Events**: Mobile virtual keyboards (such as Gboard and iOS soft keyboards) run in composition mode where xterm.js's internal input filter drops text events. Intercepting beforeinput on the helper textarea, translating input types, and sending directly through the session input router restores soft keyboard input without interfering with hardware keyboards.
-- **2026-09-06T08:28-0700 Decision: Bidirectional Input Deduplication**: Track timestamps and text of inputs handled by xterm.js onData and mobile beforeinput with a 100ms window, clearing matched entries immediately to guarantee no dropped or duplicated keystrokes.
+- **2026-09-06T08:28-0700 Decision: Multi-Layer Input Deduplication**: Track timestamps and text of inputs handled by xterm.js onData and mobile textarea input with a 20ms window (to avoid swallowing rapid double-key presses such as "ll"), and 40ms between textarea beforeinput and input events on Android. Clearing matched entries immediately guarantees no dropped or duplicated keystrokes.
 
 ## Issues
 
@@ -39,4 +40,5 @@
 
 ## Commits
 
-- HEAD: fix(web): support virtual keyboard text input and bottom scroll positioning on reload
+- 904735b: fix(web): support virtual keyboard text input and bottom scroll positioning on reload
+- HEAD: fix(web): refine scroll suppression lifecycle and mobile input handling

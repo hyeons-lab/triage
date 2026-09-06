@@ -929,6 +929,23 @@ void main() {
     },
   );
 
+  test('HistoryBytes dispatches onHistoryReplayed even when unsized', () {
+    final freshStore = TerminalStore(sink);
+    expect(sink.historyReplayedCount, 0);
+
+    freshStore.dispatch(
+      HistoryBytes(
+        b('unsized prompt> '),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 1,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(sink.historyReplayedCount, 1);
+  });
+
   test(
     'TerminalControllerSink notifies TerminalController history replayed listeners',
     () {
@@ -936,10 +953,16 @@ void main() {
       final controllerSink = TerminalControllerSink(controller);
       var replayedCount = 0;
 
-      controller.addHistoryReplayedListener(() {
+      void listener() {
         replayedCount++;
-      });
+      }
 
+      controller.addHistoryReplayedListener(listener);
+
+      controllerSink.onHistoryReplayed();
+      expect(replayedCount, 1);
+
+      controller.removeHistoryReplayedListener(listener);
       controllerSink.onHistoryReplayed();
       expect(replayedCount, 1);
 

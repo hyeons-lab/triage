@@ -71,6 +71,13 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
+class _InputDedupeRecord {
+  int onDataTime = 0;
+  String? onDataText;
+  int mobileTime = 0;
+  String? mobileText;
+}
+
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
@@ -80,10 +87,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
-  static final Map<String, int> _sessionLastOnDataTime = {};
-  static final Map<String, String> _sessionLastOnDataText = {};
-  static final Map<String, int> _sessionLastSentMobileInputTime = {};
-  static final Map<String, String> _sessionLastSentMobileInputText = {};
+  static final Map<String, _InputDedupeRecord> _sessionInputDedupe = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
   static final Map<String, void Function(String)>
   _sessionPersistentWriteListeners = {};
@@ -110,10 +114,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
-    _TerminalPaneState._sessionLastOnDataTime.remove(sanitizedId);
-    _TerminalPaneState._sessionLastOnDataText.remove(sanitizedId);
-    _TerminalPaneState._sessionLastSentMobileInputTime.remove(sanitizedId);
-    _TerminalPaneState._sessionLastSentMobileInputText.remove(sanitizedId);
+    _TerminalPaneState._sessionInputDedupe.remove(sanitizedId);
     _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
@@ -178,6 +179,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   void Function(html.Event)? _textareaBeforeInputListener;
   void Function(html.Event)? _textareaInputListener;
   void Function(html.Event)? _textareaCompositionEndListener;
+  int _lastHandledBeforeInputTime = 0;
+  String? _lastHandledBeforeInputText;
   ModalRoute<dynamic>? _currentRoute;
   bool _initialized = false;
   bool _initialContentWritten = false;
@@ -202,6 +205,18 @@ class _TerminalPaneState extends State<TerminalPane> {
   // flushes the session's staged history) using the last fitted size.
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
+  Timer? _suppressScrollSaveTimer;
+
+  void _suppressScrollSaveFor(Duration duration) {
+    _suppressScrollSave = true;
+    _suppressScrollSaveTimer?.cancel();
+    _suppressScrollSaveTimer = Timer(duration, () {
+      if (mounted) {
+        _suppressScrollSave = false;
+      }
+    });
+  }
+
   // Bumped on every explicit refit so a superseded refit's delayed retries stop
   // firing. `_lastRefit*` dedupes host resize-outs across a single refit's
   // retries so a settled refit jiggles the host once, not once per tick.
@@ -466,16 +481,21 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!mounted || widget.isExited || text.isEmpty) return;
     if (_currentRoute?.isCurrent == false) return;
 
-    final lastOnDataTime = _sessionLastOnDataTime[_sanitizedId] ?? 0;
-    final lastOnDataText = _sessionLastOnDataText[_sanitizedId];
+    final dedupe = _sessionInputDedupe.putIfAbsent(
+      _sanitizedId,
+      () => _InputDedupeRecord(),
+    );
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - lastOnDataTime < 100 && lastOnDataText == text) {
-      _sessionLastOnDataText.remove(_sanitizedId);
+    if (now - dedupe.onDataTime < 20 && dedupe.onDataText == text) {
+      dedupe.onDataText = null;
       return;
     }
+    if (now - dedupe.onDataTime >= 20) {
+      dedupe.onDataText = null;
+    }
 
-    _sessionLastSentMobileInputTime[_sanitizedId] = now;
-    _sessionLastSentMobileInputText[_sanitizedId] = text;
+    dedupe.mobileTime = now;
+    dedupe.mobileText = text;
 
     if (_ctrlArmed) {
       _setCtrlArmed(false);
@@ -488,12 +508,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     }
 
-    if (text == '\n') {
+    if (text == '\n' || text == '\r\n') {
       _sendInput('\r');
       return;
     }
 
-    if (text.length > 1 && isMultiLine(text) && text != '\r\n') {
+    if (text.length > 1 && isMultiLine(text)) {
       unawaited(_handlePaste(text));
       return;
     }
@@ -738,16 +758,21 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        final lastMobileTime = _sessionLastSentMobileInputTime[sessionId] ?? 0;
-        final lastMobileText = _sessionLastSentMobileInputText[sessionId];
+        final dedupe = _sessionInputDedupe.putIfAbsent(
+          sessionId,
+          () => _InputDedupeRecord(),
+        );
         final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - lastMobileTime < 100 && lastMobileText == data) {
-          _sessionLastSentMobileInputText.remove(sessionId);
+        if (now - dedupe.mobileTime < 20 && dedupe.mobileText == data) {
+          dedupe.mobileText = null;
           return;
         }
+        if (now - dedupe.mobileTime >= 20) {
+          dedupe.mobileText = null;
+        }
 
-        _sessionLastOnDataTime[sessionId] = now;
-        _sessionLastOnDataText[sessionId] = data;
+        dedupe.onDataTime = now;
+        dedupe.onDataText = data;
 
         _sessionSavedViewportY.remove(sessionId);
         try {
@@ -837,8 +862,24 @@ class _TerminalPaneState extends State<TerminalPane> {
           final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
           final viewportY = (js_util.getProperty(active, 'viewportY') as num)
               .toInt();
-          if (viewportY >= baseY) {
+
+          final viewportElem = container.querySelector('.xterm-viewport');
+          var isAtBottom = viewportY >= baseY;
+          if (!isAtBottom && viewportElem != null) {
+            final remainingPixels =
+                viewportElem.scrollHeight -
+                viewportElem.scrollTop -
+                viewportElem.clientHeight;
+            if (remainingPixels <= 3) {
+              isAtBottom = true;
+            }
+          }
+
+          if (isAtBottom) {
             _sessionSavedViewportY.remove(sessionId);
+            if (viewportY < baseY) {
+              js_util.callMethod(term, 'scrollToBottom', []);
+            }
           } else if (viewportY >= 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
@@ -920,7 +961,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedViewportY.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {
-        activePane._suppressScrollSave = true;
+        activePane._suppressScrollSaveFor(const Duration(milliseconds: 1000));
         if (!activePane._initialContentWritten) {
           activePane._pendingLiveWriteBuffer.clear();
         }
@@ -1127,12 +1168,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _bindTextareaEvents() {
+    if (!_isMobile) return;
+
     final textarea = _cachedTextarea ??=
         _container.querySelector('textarea') as html.TextAreaElement?;
     if (textarea == null) return;
 
     try {
       textarea.setAttribute('autocomplete', 'off');
+      textarea.setAttribute('autocorrect', 'off');
+      textarea.setAttribute('autocapitalize', 'none');
+      textarea.setAttribute('spellcheck', 'false');
+      textarea.setAttribute('enterkeyhint', 'enter');
+      textarea.setAttribute('inputmode', 'text');
     } catch (_) {}
 
     _unbindTextareaEvents();
@@ -1144,6 +1192,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       final inputType = js_util.getProperty(event, 'inputType') as String?;
       final data = js_util.getProperty(event, 'data') as String?;
 
+      void handleInput(String text) {
+        _lastHandledBeforeInputTime = DateTime.now().millisecondsSinceEpoch;
+        _lastHandledBeforeInputText = text;
+        _sendMobileInput(text);
+      }
+
       if (inputType == 'insertCompositionText') {
         return;
       }
@@ -1151,28 +1205,28 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (inputType == 'insertLineBreak' || inputType == 'insertParagraph') {
         event.preventDefault();
         event.stopPropagation();
-        _sendMobileInput('\r');
+        handleInput('\r');
         return;
       }
 
       if (inputType == 'deleteContentBackward') {
         event.preventDefault();
         event.stopPropagation();
-        _sendMobileInput('\x7f');
+        handleInput('\x7f');
         return;
       }
 
       if (inputType == 'deleteContentForward') {
         event.preventDefault();
         event.stopPropagation();
-        _sendMobileInput('\x1b[3~');
+        handleInput('\x1b[3~');
         return;
       }
 
       if (inputType == 'deleteWordBackward') {
         event.preventDefault();
         event.stopPropagation();
-        _sendMobileInput('\x17');
+        handleInput('\x17');
         return;
       }
 
@@ -1180,7 +1234,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           inputType == 'deleteSoftLineBackward') {
         event.preventDefault();
         event.stopPropagation();
-        _sendMobileInput('\x15');
+        handleInput('\x15');
         return;
       }
 
@@ -1197,7 +1251,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         if (data != null && data.isNotEmpty) {
           event.preventDefault();
           event.stopPropagation();
-          _sendMobileInput(data);
+          handleInput(data);
           return;
         }
       }
@@ -1207,11 +1261,29 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
         return;
       }
+      final inputType = js_util.getProperty(event, 'inputType') as String?;
+      if (inputType == 'insertCompositionText') {
+        return;
+      }
+      if (inputType == 'deleteContentBackward') {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastHandledBeforeInputTime < 40 &&
+            _lastHandledBeforeInputText == '\x7f') {
+          return;
+        }
+        _sendMobileInput('\x7f');
+        return;
+      }
       final target = event.target;
       if (target is html.TextAreaElement) {
         final val = target.value;
+        target.value = '';
         if (val != null && val.isNotEmpty) {
-          target.value = '';
+          final now = DateTime.now().millisecondsSinceEpoch;
+          if (now - _lastHandledBeforeInputTime < 40 &&
+              _lastHandledBeforeInputText == val) {
+            return;
+          }
           _sendMobileInput(val);
         }
       }
@@ -1223,11 +1295,18 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       final data = js_util.getProperty(event, 'data') as String?;
       final target = event.target;
+      var textToSend = data;
+      if ((textToSend == null || textToSend.isEmpty) &&
+          target is html.TextAreaElement) {
+        textToSend = target.value;
+      }
       if (target is html.TextAreaElement) {
         target.value = '';
       }
-      if (data != null && data.isNotEmpty) {
-        _sendMobileInput(data);
+      if (textToSend != null && textToSend.isNotEmpty) {
+        _lastHandledBeforeInputTime = DateTime.now().millisecondsSinceEpoch;
+        _lastHandledBeforeInputText = textToSend;
+        _sendMobileInput(textToSend);
       }
     }
 
@@ -1241,6 +1320,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _unbindTextareaEvents() {
+    _lastHandledBeforeInputTime = 0;
+    _lastHandledBeforeInputText = null;
     final textarea = _cachedTextarea;
     if (textarea != null) {
       final beforeInput = _textareaBeforeInputListener;
@@ -1315,10 +1396,21 @@ class _TerminalPaneState extends State<TerminalPane> {
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
         final viewportY = (js_util.getProperty(active, 'viewportY') as num)
             .toInt();
-        if (viewportY >= 0 && viewportY < baseY) {
-          _sessionSavedViewportY[_sanitizedId] = viewportY;
-        } else if (viewportY >= baseY) {
+        final viewportElem = container.querySelector('.xterm-viewport');
+        var isAtBottom = viewportY >= baseY;
+        if (!isAtBottom && viewportElem != null) {
+          final remainingPixels =
+              viewportElem.scrollHeight -
+              viewportElem.scrollTop -
+              viewportElem.clientHeight;
+          if (remainingPixels <= 3) {
+            isAtBottom = true;
+          }
+        }
+        if (isAtBottom) {
           _sessionSavedViewportY.remove(_sanitizedId);
+        } else if (viewportY >= 0) {
+          _sessionSavedViewportY[_sanitizedId] = viewportY;
         }
       }
     } catch (_) {}
@@ -1461,7 +1553,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _initialContentWritten = true;
     _writeInitialContent(overrideCols: fittedCols, overrideRows: fittedRows);
     _flushPendingLiveWrites();
-    _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
   }
 
@@ -1585,13 +1676,26 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _restoreScrollPosition({required bool requestFocus}) {
+    var jumped = false;
     void jump() {
-      if (!mounted || !_initialized) return;
+      if (jumped || !mounted || !_initialized) return;
+      jumped = true;
+      _scrollToCursorTimer?.cancel();
+      _scrollToCursorTimer = null;
       _suppressScrollSave = true;
       final savedY = _sessionSavedViewportY[_sanitizedId];
       try {
-        if (savedY != null) {
-          js_util.callMethod(_term, 'scrollToLine', [savedY]);
+        final buffer = js_util.getProperty(_term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+        if (savedY != null && savedY >= baseY) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+        }
+      } catch (_) {}
+      final effectiveSavedY = _sessionSavedViewportY[_sanitizedId];
+      try {
+        if (effectiveSavedY != null) {
+          js_util.callMethod(_term, 'scrollToLine', [effectiveSavedY]);
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);
         }
@@ -1599,11 +1703,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (requestFocus) {
         _activateTerminal();
       }
-      Timer(const Duration(milliseconds: 100), () {
-        if (mounted) {
-          _suppressScrollSave = false;
-        }
-      });
+      _suppressScrollSaveFor(const Duration(milliseconds: 600));
     }
 
     try {
@@ -1617,7 +1717,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       Future.delayed(Duration.zero, jump);
     }
     _scrollToCursorTimer?.cancel();
-    _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
+    _scrollToCursorTimer = Timer(const Duration(milliseconds: 600), jump);
   }
 
   void _updateCursorOptions() {
@@ -1637,9 +1737,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!_initialized) return;
     try {
       if (_initialContentWritten) {
+        _suppressScrollSaveFor(const Duration(milliseconds: 1000));
         _resetTerminalSafe();
         _writeInitialContent();
-        _afterReplayContentWritten(initialReplay: true);
       } else {
         _resetTerminalSafe();
         _pendingLiveWriteBuffer.clear();
@@ -1701,6 +1801,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
+    _suppressScrollSaveTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _unbindContainerEvents();
     _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
