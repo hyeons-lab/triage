@@ -173,6 +173,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // below it.
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
   StreamSubscription<html.KeyboardEvent>? _containerKeyDownSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   void Function(html.Event)? _containerPasteListener;
@@ -486,11 +487,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       () => _InputDedupeRecord(),
     );
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - dedupe.onDataTime < 20 && dedupe.onDataText == text) {
+    if (now - dedupe.onDataTime < 35 && dedupe.onDataText == text) {
       dedupe.onDataText = null;
       return;
     }
-    if (now - dedupe.onDataTime >= 20) {
+    if (now - dedupe.onDataTime >= 35) {
       dedupe.onDataText = null;
     }
 
@@ -573,9 +574,32 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   // Touch clients (mobile-OS browser) get the on-screen accessory bar; desktop
   // browsers keep the full-height terminal and their hardware keyboard.
-  bool get _isMobile =>
-      defaultTargetPlatform == TargetPlatform.iOS ||
-      defaultTargetPlatform == TargetPlatform.android;
+  bool get _isMobile {
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android) {
+      return true;
+    }
+    try {
+      final nav = html.window.navigator;
+      final isMacLikeTouch =
+          defaultTargetPlatform == TargetPlatform.macOS &&
+          (nav.maxTouchPoints ?? 0) > 1;
+      if (isMacLikeTouch) return true;
+      final ua = nav.userAgent.toLowerCase();
+      if (ua.contains('mobile') ||
+          ua.contains('android') ||
+          ua.contains('iphone') ||
+          ua.contains('ipad') ||
+          ua.contains('ipod')) {
+        return true;
+      }
+      if ((nav.maxTouchPoints ?? 0) > 1 &&
+          html.window.matchMedia('(pointer: coarse)').matches) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
 
   void _activateTerminal() {
     if (!_initialized || widget.isExited) return;
@@ -763,11 +787,11 @@ class _TerminalPaneState extends State<TerminalPane> {
           () => _InputDedupeRecord(),
         );
         final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - dedupe.mobileTime < 20 && dedupe.mobileText == data) {
+        if (now - dedupe.mobileTime < 35 && dedupe.mobileText == data) {
           dedupe.mobileText = null;
           return;
         }
-        if (now - dedupe.mobileTime >= 20) {
+        if (now - dedupe.mobileTime >= 35) {
           dedupe.mobileText = null;
         }
 
@@ -1132,6 +1156,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
+    _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
+      if (_initialized) {
+        try {
+          _activateTerminal();
+        } catch (_) {}
+      }
+    });
+
     _containerKeyDownSubscription = _container.onKeyDown.listen((event) {
       if (event.key == 'Tab') {
         event.preventDefault();
@@ -1418,6 +1450,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerMouseDownSubscription = null;
     _containerClickSubscription?.cancel();
     _containerClickSubscription = null;
+    _containerTouchEndSubscription?.cancel();
+    _containerTouchEndSubscription = null;
     _containerKeyDownSubscription?.cancel();
     _containerKeyDownSubscription = null;
     _containerWheelSubscription?.cancel();
@@ -1703,7 +1737,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (requestFocus) {
         _activateTerminal();
       }
-      _suppressScrollSaveFor(const Duration(milliseconds: 600));
+      _suppressScrollSaveFor(const Duration(milliseconds: 1000));
     }
 
     try {

@@ -30,6 +30,6 @@ abstract class TerminalSink {
   void dispose();
 
   /// Called when a full history replay has completed writing all decoded snapshot
-  /// bytes and drained pending live chunks to the sink.
+  /// bytes (and drained pending live chunks if the store is already sized) to the sink.
   void onHistoryReplayed() {}
 }
