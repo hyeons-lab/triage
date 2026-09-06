@@ -475,6 +475,54 @@ void main() {
   );
 
   test(
+    'open synchronized block flushes progressively during sustained streams',
+    () {
+      fakeAsync((async) {
+        store.dispatch(const Attach());
+        store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        sink.ops.clear();
+
+        // Open a block; nothing reaches the sink yet.
+        store.dispatch(LiveBytes(b('\x1b[?2026hchunk-one '), outputSeq: 1));
+        expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+        // Chunks keep arriving faster than the idle watchdog, so the watchdog
+        // alone would never flush and the screen would freeze for the whole
+        // stream. The live-flush interval still paints periodically.
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('chunk-two '), outputSeq: 2));
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('chunk-three '), outputSeq: 3));
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('chunk-four '), outputSeq: 4));
+        async.elapse(const Duration(milliseconds: 10)); // t=100: interval fires
+        var writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+        expect(writes.length, 1);
+        expect(
+          writes.first,
+          'write:\x1b[?2026hchunk-one chunk-two chunk-three chunk-four ',
+          reason: 'live flush paints the open block without closing it',
+        );
+
+        // The block is still open: the remainder closes atomically at its end
+        // marker, with no bytes lost or duplicated across the writes.
+        sink.ops.clear();
+        store.dispatch(LiveBytes(b('tail\x1b[?2026lafter'), outputSeq: 5));
+        writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+        expect(writes, ['write:tail\x1b[?2026l', 'write:after']);
+
+        // The interval stops once the block closes.
+        async.elapse(kSyncOutputLiveFlushInterval * 3);
+        expect(
+          sink.ops.where((op) => op.startsWith('write:')).length,
+          2,
+          reason: 'no further writes after the block closed',
+        );
+      });
+    },
+  );
+
+  test(
     'Synchronized Output buffer capacity cap forces a flush when exceeded',
     () {
       store.dispatch(const Attach());

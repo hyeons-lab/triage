@@ -28,6 +28,15 @@ const int kPendingLiveByteCap = 1024 * 1024;
 const Duration kHistoryInputSuppression = Duration(milliseconds: 50);
 const Duration kSyncOutputWatchdogTimeout = Duration(milliseconds: 50);
 
+/// Upper bound on how long synchronized output stays invisible while its
+/// block is still open. Tools like `agy` wrap an entire streaming response in
+/// a single Mode 2026 block; every chunk re-arms the idle watchdog, so
+/// without this the screen would freeze for the whole generation and only
+/// paint at the closing marker. Flushing periodically keeps the stream live
+/// while small back-to-back frames (which complete well inside this interval)
+/// still land atomically.
+const Duration kSyncOutputLiveFlushInterval = Duration(milliseconds: 100);
+
 const String _kSyncPrefix = '\x1b[?2026';
 const String _kSyncStart = '\x1b[?2026h';
 const String _kSyncEnd = '\x1b[?2026l';
@@ -79,6 +88,10 @@ class TerminalStore extends ChangeNotifier {
   final StringBuffer _syncBuffer = StringBuffer();
   bool _inSynchronizedOutput = false;
   Timer? _syncTimer;
+  // Periodic flush while a synchronized block stays open (see
+  // [kSyncOutputLiveFlushInterval]). Rearmed on every tick until the block
+  // closes; cancelled on close, force-flush, reset, and dispose.
+  Timer? _syncLiveFlushTimer;
 
   // Live chunks received before we are sized / while awaiting history, plus a
   // running byte total so the buffer can be bounded (see [kPendingLiveByteCap]).
@@ -488,7 +501,10 @@ class TerminalStore extends ChangeNotifier {
   ///
   /// CLI tools (such as `agy`) wrap animated redraws in Mode 2026 so all intermediate
   /// cursor repositions and status updates are delivered in one atomic frame rather
-  /// than jittering across multiple network chunks.
+  /// than jittering across multiple network chunks. Because a block can also span
+  /// an entire streaming response, an open block additionally flushes
+  /// periodically ([kSyncOutputLiveFlushInterval]) so the screen stays live
+  /// instead of freezing until the closing marker.
   void _processSynchronizedOutput(String input) {
     if (!_inSynchronizedOutput && !input.contains(_kSyncPrefix)) {
       _writeDirect(input);
@@ -505,6 +521,7 @@ class TerminalStore extends ChangeNotifier {
           _inSynchronizedOutput = false;
           _syncTimer?.cancel();
           _syncTimer = null;
+          _cancelSyncLiveFlush();
           _flushSyncBuffer();
         } else {
           _syncBuffer.write(input.substring(cursor));
@@ -516,6 +533,7 @@ class TerminalStore extends ChangeNotifier {
             _inSynchronizedOutput = false;
             _syncTimer?.cancel();
             _syncTimer = null;
+            _cancelSyncLiveFlush();
             _flushSyncBuffer();
           } else {
             _rearmSyncWatchdog();
@@ -530,6 +548,7 @@ class TerminalStore extends ChangeNotifier {
           _inSynchronizedOutput = true;
           _syncBuffer.write(_kSyncStart);
           cursor = startIdx + _kSyncMarkerLength;
+          _armSyncLiveFlush();
           _rearmSyncWatchdog();
         } else {
           final text = cursor == 0 ? input : input.substring(cursor);
@@ -552,9 +571,35 @@ class TerminalStore extends ChangeNotifier {
         _inSynchronizedOutput = false;
         _syncTimer?.cancel();
         _syncTimer = null;
+        _cancelSyncLiveFlush();
         _flushSyncBuffer();
       }
     });
+  }
+
+  /// Arms the periodic live flush for an open synchronized block, unless one
+  /// is already pending. The tick flushes whatever has accumulated but leaves
+  /// the block open, so a sustained stream paints at least every
+  /// [kSyncOutputLiveFlushInterval] instead of freezing until its end marker.
+  void _armSyncLiveFlush() {
+    _syncLiveFlushTimer ??= Timer(
+      kSyncOutputLiveFlushInterval,
+      _onSyncLiveFlushTick,
+    );
+  }
+
+  void _onSyncLiveFlushTick() {
+    _syncLiveFlushTimer = null;
+    if (!_inSynchronizedOutput) return;
+    _flushSyncBuffer();
+    if (_inSynchronizedOutput) {
+      _armSyncLiveFlush();
+    }
+  }
+
+  void _cancelSyncLiveFlush() {
+    _syncLiveFlushTimer?.cancel();
+    _syncLiveFlushTimer = null;
   }
 
   void _flushSyncBuffer() {
@@ -709,6 +754,7 @@ class TerminalStore extends ChangeNotifier {
     _pendingCarriageReturn = false;
     _syncTimer?.cancel();
     _syncTimer = null;
+    _cancelSyncLiveFlush();
     _inSynchronizedOutput = false;
     _syncBuffer.clear();
     _appliedLiveSeq = null;
@@ -719,6 +765,7 @@ class TerminalStore extends ChangeNotifier {
   void dispose() {
     _suppressTimer?.cancel();
     _syncTimer?.cancel();
+    _cancelSyncLiveFlush();
     _syncBuffer.clear();
     _sink.onOutput = null;
     _sink.onResize = null;

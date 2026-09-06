@@ -192,4 +192,69 @@ void main() {
       );
     });
   });
+
+  group('shouldReleaseScrollPin', () {
+    const lineHeight = 10.0;
+    const maxExtent = 1000.0;
+
+    test('no previous position never releases', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: null,
+          pixels: maxExtent,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
+
+    test('scrolling up keeps the pin', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: 500,
+          pixels: 400,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
+
+    test('scrolling down far from the bottom keeps the pin', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: 100,
+          pixels: 200,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
+
+    test('scrolling down within the grace releases the pin', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: maxExtent - 50,
+          pixels: maxExtent - 20,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        isTrue,
+      );
+    });
+
+    test('degenerate inputs never release', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: 0,
+          pixels: 0,
+          maxScrollExtent: maxExtent,
+          lineHeight: 0,
+        ),
+        isFalse,
+      );
+    });
+  });
 }

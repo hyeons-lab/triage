@@ -1,5 +1,29 @@
 import 'package:xterm/xterm.dart' as xt;
 
+/// Whether a scroll event should release a held scroll pin and hand the
+/// viewport back to the emulator's stick-to-bottom following.
+///
+/// A pinned viewport plus a steadily growing buffer is a treadmill: every new
+/// line pushes the bottom further away while the pin holds the same line, so
+/// a user chasing live output (e.g. a composer at the very bottom of a busy
+/// agent session) can never arrive. Releasing when the user is actively
+/// scrolling *down* and already within [graceLines] of the bottom tells the
+/// caller to drop the pin and snap the last few lines to the bottom, while
+/// upward or distant scrolling keeps the pin so background output never
+/// steals a reading position. All pure doubles so it is unit-testable without
+/// a laid-out render tree.
+bool shouldReleaseScrollPin({
+  required double? lastPixels,
+  required double pixels,
+  required double maxScrollExtent,
+  required double lineHeight,
+  int graceLines = 3,
+}) {
+  if (lastPixels == null || lineHeight <= 0 || graceLines < 0) return false;
+  if (pixels <= lastPixels) return false;
+  return pixels >= maxScrollExtent - graceLines * lineHeight;
+}
+
 /// Pins a terminal viewport to a specific scrollback line so that scrollback
 /// trims don't drift the visible content.
 ///
