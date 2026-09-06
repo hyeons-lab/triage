@@ -89,6 +89,26 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, int> _sessionSavedViewportY = {};
   static final Map<String, _InputDedupeRecord> _sessionInputDedupe = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
+
+  static bool _viewportIsAtBottom(
+    html.Element container,
+    int viewportY,
+    int baseY,
+  ) {
+    if (viewportY >= baseY) return true;
+    final viewportElem = container.querySelector('.xterm-viewport');
+    if (viewportElem != null) {
+      final remainingPixels =
+          viewportElem.scrollHeight -
+          viewportElem.scrollTop -
+          viewportElem.clientHeight;
+      if (remainingPixels <= 3) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static final Map<String, void Function(String)>
   _sessionPersistentWriteListeners = {};
   static final Map<String, VoidCallback> _sessionPersistentClearListeners = {};
@@ -887,17 +907,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           final viewportY = (js_util.getProperty(active, 'viewportY') as num)
               .toInt();
 
-          final viewportElem = container.querySelector('.xterm-viewport');
-          var isAtBottom = viewportY >= baseY;
-          if (!isAtBottom && viewportElem != null) {
-            final remainingPixels =
-                viewportElem.scrollHeight -
-                viewportElem.scrollTop -
-                viewportElem.clientHeight;
-            if (remainingPixels <= 3) {
-              isAtBottom = true;
-            }
-          }
+          final isAtBottom = _viewportIsAtBottom(container, viewportY, baseY);
 
           if (isAtBottom) {
             _sessionSavedViewportY.remove(sessionId);
@@ -1428,17 +1438,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
         final viewportY = (js_util.getProperty(active, 'viewportY') as num)
             .toInt();
-        final viewportElem = container.querySelector('.xterm-viewport');
-        var isAtBottom = viewportY >= baseY;
-        if (!isAtBottom && viewportElem != null) {
-          final remainingPixels =
-              viewportElem.scrollHeight -
-              viewportElem.scrollTop -
-              viewportElem.clientHeight;
-          if (remainingPixels <= 3) {
-            isAtBottom = true;
-          }
-        }
+        final isAtBottom = _viewportIsAtBottom(container, viewportY, baseY);
         if (isAtBottom) {
           _sessionSavedViewportY.remove(_sanitizedId);
         } else if (viewportY >= 0) {

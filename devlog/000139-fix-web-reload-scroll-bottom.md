@@ -18,6 +18,7 @@ Automatically position terminal views at the bottom (live prompt / cursor) upon 
 - **2026-09-06T08:28-0700** flutter/triage_client/test/terminal/terminal_store_test.dart: Added unit tests verifying onHistoryReplayed notification through store and controller sink.
 - **2026-09-06T09:10-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart, flutter/triage_client/test/terminal/terminal_store_test.dart: Unified scroll suppression timer management via _suppressScrollSaveFor, made controller replacement replay unconditional in didUpdateWidget, added mobile textarea enterkeyhint and inputmode attributes, and added unit tests for unsized history replay and listener deregistration.
 - **2026-09-06T09:19-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart, flutter/triage_client/lib/terminal/terminal_sink.dart: Enhanced mobile platform detection for iPadOS Safari desktop mode and mobile user agents, attached onTouchEnd listener to activate terminal on mobile touch gestures, widened deduplication window to 35ms, set scroll suppression window to 1000ms, and clarified onHistoryReplayed doc comment.
+- **2026-09-06T09:22-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: Extracted static helper _viewportIsAtBottom to consolidate viewport bottom detection and subpixel threshold checks across onScrollCallback and _unbindContainerEvents.
 
 ## Decisions
 
@@ -49,4 +50,5 @@ Automatically position terminal views at the bottom (live prompt / cursor) upon 
 
 - 904735b: fix(web): support virtual keyboard text input and bottom scroll positioning on reload
 - 625f1c6: fix(web): refine scroll suppression lifecycle and mobile input handling
-- HEAD: fix(web): address PR review comments for mobile touch and doc clarity
+- f430096: fix(web): address PR review comments for mobile touch and doc clarity
+- HEAD: fix(web): deduplicate viewport bottom detection helper
