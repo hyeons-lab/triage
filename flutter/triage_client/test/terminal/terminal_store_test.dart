@@ -549,4 +549,121 @@ void main() {
       });
     },
   );
+
+  test(
+    'delta merge: subsequent snapshot overlapping applied bytes appends delta without clearing sink',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history replay
+      final initialText = 'hello world\r\n';
+      store.dispatch(
+        HistoryBytes(
+          b(initialText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 0,
+        ),
+      );
+
+      expect(sink.ops, contains('clear'));
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.ops, contains('write:$initialText'));
+
+      // Subsequent snapshot carrying both initial text and new lines
+      final addedText = 'second line\r\n';
+      final fullText = '$initialText$addedText';
+      store.dispatch(
+        HistoryBytes(
+          b(fullText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 15,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Sink must NOT have been cleared a second time
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      // Only the new delta bytes should have been written
+      expect(sink.ops.last, 'write:$addedText');
+      expect(store.appliedLogBytes, fullText.length);
+      expect(store.state.historyHighWaterSeq, 15);
+    },
+  );
+
+  test('delta merge: subsequent snapshot already fully covered is a no-op', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    final text = 'already current content\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b(text),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+
+    final opCount = sink.ops.length;
+
+    // Re-send snapshot with same seq and content
+    store.dispatch(
+      HistoryBytes(
+        b(text),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+
+    // No new clear or write operations performed
+    expect(sink.ops.length, opCount);
+  });
+
+  test(
+    'delta merge fallback: gap in output log triggers full clear and replay',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history with 10 bytes at offset 0
+      store.dispatch(
+        HistoryBytes(
+          b('old prefix'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+
+      // Snapshot arrives starting at byte offset 5000 (a gap exceeding client applied bytes)
+      final newTail = 'rolled over tail\r\n';
+      store.dispatch(
+        HistoryBytes(
+          b(newTail),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 50,
+          rawOutputStart: 5000,
+        ),
+      );
+
+      // Sink must be cleared again and full new tail written
+      expect(sink.ops.where((op) => op == 'clear').length, 2);
+      expect(sink.ops.last, 'write:$newTail');
+      expect(store.appliedLogBytes, 5000 + newTail.length);
+      expect(store.state.historyHighWaterSeq, 50);
+    },
+  );
 }

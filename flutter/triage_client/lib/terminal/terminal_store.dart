@@ -86,9 +86,15 @@ class TerminalStore extends ChangeNotifier {
   int _pendingLiveBytes = 0;
 
   // Highest live `output_seq` already applied. Combined with the history
-  // high-water, this is the single de-duplication baseline — it also drops a
+  // high-water, this is the single de-duplication baseline, it also drops a
   // live chunk re-delivered out of order over a flaky connection.
   int? _appliedLiveSeq;
+
+  // Total cumulative bytes from the host output log applied to the sink.
+  // Initialized from rawOutputStart + history.length on history replay, and
+  // incremented on each applied live chunk. Used for gapless delta-merging of
+  // subsequent history snapshots without clearing the terminal.
+  int? _appliedLogBytes;
 
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
@@ -115,6 +121,12 @@ class TerminalStore extends ChangeNotifier {
   /// query responses produced by the emulator must not reach the host.
   bool get isWritingSink => _isWritingSink;
 
+  /// Highest applied live output sequence number.
+  int? get appliedLiveSeq => _appliedLiveSeq;
+
+  /// Total cumulative bytes from the host output log applied to the sink.
+  int? get appliedLogBytes => _appliedLogBytes;
+
   // ---- Public API -----------------------------------------------------------
 
   void dispatch(TerminalIntent intent) {
@@ -135,6 +147,8 @@ class TerminalStore extends ChangeNotifier {
         // session once HistoryBytes arrives.
         _resetCarries();
         _clearPendingLive();
+        _appliedLiveSeq = null;
+        _appliedLogBytes = null;
         return s.copyWith(
           phase: AttachPhase.awaitingHistory,
           exited: false,
@@ -153,6 +167,8 @@ class TerminalStore extends ChangeNotifier {
         _sink.clear();
         _resetCarries();
         _clearPendingLive();
+        _appliedLiveSeq = null;
+        _appliedLogBytes = null;
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -171,8 +187,16 @@ class TerminalStore extends ChangeNotifier {
         :final cols,
         :final rows,
         :final throughOutputSeq,
+        :final rawOutputStart,
       ):
-        return _reduceHistory(s, bytes, cols, rows, throughOutputSeq);
+        return _reduceHistory(
+          s,
+          bytes,
+          cols,
+          rows,
+          throughOutputSeq,
+          rawOutputStart: rawOutputStart,
+        );
 
       case LiveBytes(:final bytes, :final outputSeq):
         return _reduceLive(s, bytes, outputSeq);
@@ -186,7 +210,7 @@ class TerminalStore extends ChangeNotifier {
 
     var next = s;
     // `sizeChanged` already covers the not-yet-sized case (`|| !s.sized`), so a
-    // change always re-applies the size and marks it sized — no separate branch.
+    // change always re-applies the size and marks it sized, no separate branch.
     final sizeChanged = cols != s.cols || rows != s.rows || !s.sized;
     if (sizeChanged) {
       _applyResizeToSink(cols, rows);
@@ -211,22 +235,68 @@ class TerminalStore extends ChangeNotifier {
     List<int> bytes,
     int cols,
     int rows,
-    int? throughOutputSeq,
-  ) {
+    int? throughOutputSeq, {
+    int? rawOutputStart,
+  }) {
     // Replay at the client's target grid size ([cols] x [rows], the current
-    // emulator/view size chosen by the caller — not the host capture size). A
+    // emulator/view size chosen by the caller, not the host capture size). A
     // later viewport [Resize] reflows and the live repaint self-heals.
     var next = s;
     if (cols >= kMinTerminalCols && rows >= kMinTerminalRows) {
-      _applyResizeToSink(cols, rows);
-      next = next.copyWith(cols: cols, rows: rows, sized: true);
+      final sizeChanged = cols != s.cols || rows != s.rows || !s.sized;
+      if (sizeChanged) {
+        _applyResizeToSink(cols, rows);
+        next = next.copyWith(cols: cols, rows: rows, sized: true);
+      }
+    }
+
+    final currentSeq = _appliedLiveSeq ?? s.historyHighWaterSeq;
+    final currentLogBytes = _appliedLogBytes;
+
+    // Delta merge: if the store is already live and sized with content, check
+    // whether the new snapshot overlaps with what we already applied.
+    if (s.phase == AttachPhase.live &&
+        s.scrollbackReady &&
+        (currentSeq != null || currentLogBytes != null)) {
+      if (throughOutputSeq != null &&
+          currentSeq != null &&
+          currentSeq >= throughOutputSeq) {
+        return next;
+      }
+
+      if (rawOutputStart != null && currentLogBytes != null) {
+        final snapshotEndBytes = rawOutputStart + bytes.length;
+        if (currentLogBytes >= snapshotEndBytes) {
+          if (throughOutputSeq != null) {
+            _appliedLiveSeq = _appliedLiveSeq == null
+                ? throughOutputSeq
+                : max(_appliedLiveSeq!, throughOutputSeq);
+          }
+          return next.copyWith(
+            historyHighWaterSeq: throughOutputSeq ?? next.historyHighWaterSeq,
+            exited: false,
+          );
+        }
+
+        if (currentLogBytes >= rawOutputStart) {
+          final deltaOffset = currentLogBytes - rawOutputStart;
+          if (deltaOffset >= 0 && deltaOffset < bytes.length) {
+            final deltaBytes = bytes.sublist(deltaOffset);
+            _applyLive(deltaBytes, throughOutputSeq);
+            return next.copyWith(
+              historyHighWaterSeq: throughOutputSeq ?? next.historyHighWaterSeq,
+              exited: false,
+            );
+          }
+        }
+      }
     }
 
     _sink.clear();
     // Reset carries so history starts a fresh decode stream; history then
     // decodes through the same streaming path as live, so a UTF-8 rune, CRLF
-    // pair, or `CSI > … m` sequence split across the history→live boundary (the
-    // snapshot tail can end mid-sequence) carries into the first live chunk.
+    // pair, or `CSI > … m` sequence split across the history to live boundary
+    // (the snapshot tail can end mid-sequence) carries into the first live chunk.
     _resetCarries();
     // Replaying the raw tail re-feeds the program's own terminal queries to the
     // emulator, which auto-answers them; suppress those answers so they are not
@@ -234,10 +304,17 @@ class TerminalStore extends ChangeNotifier {
     _beginHostInputSuppression();
     _writeDecoded(bytes);
 
+    if (rawOutputStart != null) {
+      _appliedLogBytes = rawOutputStart + bytes.length;
+    } else {
+      _appliedLogBytes = bytes.length;
+    }
+
     next = next.copyWith(
       phase: AttachPhase.live,
       scrollbackReady: true,
       historyHighWaterSeq: throughOutputSeq,
+      exited: false,
     );
 
     if (next.sized) {
@@ -329,6 +406,9 @@ class TerminalStore extends ChangeNotifier {
   /// high-water so a later re-delivery of the same chunk is dropped.
   void _applyLive(List<int> bytes, int? outputSeq) {
     _writeDecoded(bytes);
+    if (_appliedLogBytes != null) {
+      _appliedLogBytes = _appliedLogBytes! + bytes.length;
+    }
     if (outputSeq != null) {
       _appliedLiveSeq = _appliedLiveSeq == null
           ? outputSeq
@@ -568,7 +648,8 @@ class TerminalStore extends ChangeNotifier {
     final partial = _partialEscapeSequence.firstMatch(s);
     // Only hold a bounded partial; otherwise let it flush to avoid unbounded
     // growth on a stream that never completes the sequence.
-    if (partial != null && (s.length - partial.start) <= _kMaxCarryEscapeLength) {
+    if (partial != null &&
+        (s.length - partial.start) <= _kMaxCarryEscapeLength) {
       var carryStart = partial.start;
       // If the partial escape sequence is immediately preceded by a bare LF,
       // include the LF in the carry so newline translation isn't prematurely

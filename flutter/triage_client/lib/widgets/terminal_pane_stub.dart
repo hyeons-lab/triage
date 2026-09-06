@@ -76,9 +76,12 @@ class TerminalPane extends StatefulWidget {
 
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
+  // Sentinel offset that clamps to maxScrollExtent on initial layout pass
+  // without failing Flutter's assertion that initialScrollOffset is finite.
+  static const double _kBottomScrollSentinel = 1e9;
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
-  final ScrollController _scrollController = ScrollController();
+  late final ScrollController _scrollController;
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
   // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
@@ -223,6 +226,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
+    final initialOffset =
+        _sessionSavedScrollOffsets[widget.terminalId] ?? _kBottomScrollSentinel;
+    _scrollController = ScrollController(initialScrollOffset: initialOffset);
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
@@ -846,10 +852,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
         final saved = _sessionSavedScrollOffsets[widget.terminalId];
-        if (saved != null) {
-          position.jumpTo(saved.clamp(0.0, position.maxScrollExtent));
-        } else {
-          position.jumpTo(position.maxScrollExtent);
+        final target = saved != null
+            ? saved.clamp(0.0, position.maxScrollExtent)
+            : position.maxScrollExtent;
+        if ((position.pixels - target).abs() > 0.5) {
+          position.jumpTo(target);
         }
       }
       if (requestFocus) {
