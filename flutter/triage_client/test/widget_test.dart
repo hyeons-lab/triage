@@ -1353,9 +1353,11 @@ void main() {
     // Only the calls the re-selection itself made. Asserting on `.last` would
     // be satisfied by the first-fit resize emitted at the top of this test,
     // even if re-selecting stopped resizing altogether.
-    expect(client.resizeSessionCalls.skip(beforeReselect.length), [
-      'flutter-spike:95:34',
-    ], reason: 'the replay size must come from this device\'s own fit');
+    expect(
+      client.resizeSessionCalls.skip(beforeReselect.length),
+      ['flutter-spike:95:34'],
+      reason: 'the replay size must come from this device\'s own fit',
+    );
   });
 
   testWidgets('a backgrounded refresh records the host size, not its own', (

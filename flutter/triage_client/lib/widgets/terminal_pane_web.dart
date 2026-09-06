@@ -345,11 +345,12 @@ class _TerminalPaneState extends State<TerminalPane> {
         }
       });
 
+      final marginPx = _isMobile ? 8 : 16;
       _terminalWrapper = html.DivElement()
-        ..style.width = 'calc(100% - 32px)'
+        ..style.width = 'calc(100% - ${marginPx * 2}px)'
         ..style.height = '100%'
-        ..style.marginLeft = '16px'
-        ..style.marginRight = '16px'
+        ..style.marginLeft = '${marginPx}px'
+        ..style.marginRight = '${marginPx}px'
         ..style.overflow = 'hidden';
 
       _container.append(_terminalWrapper);
@@ -1881,6 +1882,14 @@ class _TerminalPaneState extends State<TerminalPane> {
               constraints.maxHeight != _lastHeight) {
             _lastWidth = constraints.maxWidth;
             _lastHeight = constraints.maxHeight;
+            final isNarrow = constraints.maxWidth < 600;
+            final marginPx = (_isMobile || isNarrow) ? 8 : 16;
+            final targetMargin = '${marginPx}px';
+            if (_terminalWrapper.style.marginLeft != targetMargin) {
+              _terminalWrapper.style.width = 'calc(100% - ${marginPx * 2}px)';
+              _terminalWrapper.style.marginLeft = targetMargin;
+              _terminalWrapper.style.marginRight = targetMargin;
+            }
             WidgetsBinding.instance.addPostFrameCallback((_) {
               widget.controller.fit();
             });

@@ -408,48 +408,55 @@ void main() {
   });
 
   group('migrateRailPins', () {
-    test('moves pins and custom labels onto the new id and deletes old keys', () async {
-      SharedPreferences.setMockInitialValues({
-        pinnedGroupsPrefKeyFor('web-127.0.0.1-7777'): ['/repo'],
-        pinnedSessionsPrefKeyFor('web-127.0.0.1-7777'): ['session-2'],
-        sessionCustomLabelsPrefKeyFor('web-127.0.0.1-7777'): '{"s1":"Label 1"}',
-      });
+    test(
+      'moves pins and custom labels onto the new id and deletes old keys',
+      () async {
+        SharedPreferences.setMockInitialValues({
+          pinnedGroupsPrefKeyFor('web-127.0.0.1-7777'): ['/repo'],
+          pinnedSessionsPrefKeyFor('web-127.0.0.1-7777'): ['session-2'],
+          sessionCustomLabelsPrefKeyFor('web-127.0.0.1-7777'):
+              '{"s1":"Label 1"}',
+        });
 
-      await migrateRailPins('web-127.0.0.1-7777', 'web-proxy.example.com-443');
+        await migrateRailPins(
+          'web-127.0.0.1-7777',
+          'web-proxy.example.com-443',
+        );
 
-      final prefs = await SharedPreferences.getInstance();
-      expect(
-        prefs.getStringList(
-          pinnedGroupsPrefKeyFor('web-proxy.example.com-443'),
-        ),
-        ['/repo'],
-      );
-      expect(
-        prefs.getStringList(
-          pinnedSessionsPrefKeyFor('web-proxy.example.com-443'),
-        ),
-        ['session-2'],
-      );
-      expect(
-        prefs.getString(
-          sessionCustomLabelsPrefKeyFor('web-proxy.example.com-443'),
-        ),
-        '{"s1":"Label 1"}',
-      );
-      // The stale keys do not linger once their pins and labels have moved.
-      expect(
-        prefs.getStringList(pinnedGroupsPrefKeyFor('web-127.0.0.1-7777')),
-        isNull,
-      );
-      expect(
-        prefs.getStringList(pinnedSessionsPrefKeyFor('web-127.0.0.1-7777')),
-        isNull,
-      );
-      expect(
-        prefs.getString(sessionCustomLabelsPrefKeyFor('web-127.0.0.1-7777')),
-        isNull,
-      );
-    });
+        final prefs = await SharedPreferences.getInstance();
+        expect(
+          prefs.getStringList(
+            pinnedGroupsPrefKeyFor('web-proxy.example.com-443'),
+          ),
+          ['/repo'],
+        );
+        expect(
+          prefs.getStringList(
+            pinnedSessionsPrefKeyFor('web-proxy.example.com-443'),
+          ),
+          ['session-2'],
+        );
+        expect(
+          prefs.getString(
+            sessionCustomLabelsPrefKeyFor('web-proxy.example.com-443'),
+          ),
+          '{"s1":"Label 1"}',
+        );
+        // The stale keys do not linger once their pins and labels have moved.
+        expect(
+          prefs.getStringList(pinnedGroupsPrefKeyFor('web-127.0.0.1-7777')),
+          isNull,
+        );
+        expect(
+          prefs.getStringList(pinnedSessionsPrefKeyFor('web-127.0.0.1-7777')),
+          isNull,
+        );
+        expect(
+          prefs.getString(sessionCustomLabelsPrefKeyFor('web-127.0.0.1-7777')),
+          isNull,
+        );
+      },
+    );
 
     test('moves custom labels even when no pins exist', () async {
       SharedPreferences.setMockInitialValues({

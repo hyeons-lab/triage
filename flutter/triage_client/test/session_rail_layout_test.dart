@@ -1,4 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/main.dart' show isMobilePlatform;
+import 'package:triage_client/platform_env_io.dart' show isWebMobileBrowser;
 import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
 
@@ -505,12 +507,14 @@ void main() {
       repoName: 'triage',
       worktreeRoot: '/Users/developer/code/triage/worktrees/feat-search',
       worktreeName: 'feat-search',
-      inferredWorktreeRoot: '/Users/developer/code/triage/worktrees/inferred-wt',
+      inferredWorktreeRoot:
+          '/Users/developer/code/triage/worktrees/inferred-wt',
       inferredBranch: 'feat/inferred',
       branch: 'feat/search',
       cwd: '/Users/developer/code/triage/crates/triaged',
       snippet: 'cargo test passing',
-      snippetDetail: 'Running cargo test on triaged crate with all tests passing',
+      snippetDetail:
+          'Running cargo test on triaged crate with all tests passing',
     );
 
     test('empty or whitespace query matches everything', () {
@@ -582,6 +586,16 @@ void main() {
 
     test('returns false for non-matching query', () {
       expect(sample.matchesQuery('nonexistent-term-xyz'), isFalse);
+    });
+  });
+
+  group('platform and mobile viewport detection', () {
+    test('isWebMobileBrowser returns false on native test harnesses', () {
+      expect(isWebMobileBrowser(), isFalse);
+    });
+
+    test('isMobilePlatform returns false under flutter test harnesses', () {
+      expect(isMobilePlatform(), isFalse);
     });
   });
 }

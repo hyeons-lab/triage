@@ -253,15 +253,15 @@ Future<void> migrateRailPins(String fromId, String toId) async {
       await prefs.remove(pinnedGroupsPrefKeyFor(fromId));
     }
 
-    final pinnedSessions =
-        prefs.getStringList(pinnedSessionsPrefKeyFor(fromId));
+    final pinnedSessions = prefs.getStringList(
+      pinnedSessionsPrefKeyFor(fromId),
+    );
     if (pinnedSessions != null) {
       await prefs.setStringList(pinnedSessionsPrefKeyFor(toId), pinnedSessions);
       await prefs.remove(pinnedSessionsPrefKeyFor(fromId));
     }
 
-    final customLabels =
-        prefs.getString(sessionCustomLabelsPrefKeyFor(fromId));
+    final customLabels = prefs.getString(sessionCustomLabelsPrefKeyFor(fromId));
     if (customLabels != null) {
       await prefs.setString(sessionCustomLabelsPrefKeyFor(toId), customLabels);
       await prefs.remove(sessionCustomLabelsPrefKeyFor(fromId));

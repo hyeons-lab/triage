@@ -44,3 +44,6 @@ void allowWebExit() {}
 
 /// No-op on native platforms. Overridden on web to restore window._allowUnload.
 void resetWebExit() {}
+
+/// Always false on native platforms. Overridden on web to detect mobile browsers and touch devices.
+bool isWebMobileBrowser() => false;

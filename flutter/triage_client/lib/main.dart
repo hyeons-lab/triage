@@ -299,7 +299,8 @@ bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
 bool isMobilePlatform() =>
     !runningUnderFlutterTest() &&
     (defaultTargetPlatform == TargetPlatform.iOS ||
-        defaultTargetPlatform == TargetPlatform.android);
+        defaultTargetPlatform == TargetPlatform.android ||
+        isWebMobileBrowser());
 
 /// Whether a client in [state] should be asserting its terminal size on the
 /// shared PTY.
@@ -4401,7 +4402,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         ),
       );
     } else {
-      final isMobile = isMobilePlatform();
+      final isNarrow =
+          !runningUnderFlutterTest() && MediaQuery.of(context).size.width < 768;
+      final isMobile = isMobilePlatform() || isNarrow;
       final hasSelectedSession =
           _selectedIndex >= 0 && _selectedIndex < _sessions.length;
       if (!hasSelectedSession) {
@@ -9018,97 +9021,151 @@ class WorkspaceHeader extends StatelessWidget {
     } else {
       headerMeta = hasBranch ? branch : fallbackCwd;
     }
-    return Container(
-      height: 68,
-      padding: const EdgeInsets.symmetric(horizontal: 22),
-      decoration: const BoxDecoration(
-        color: Color(0xff151a1d),
-        border: Border(bottom: BorderSide(color: Color(0xff263033))),
-      ),
-      child: Row(
-        children: [
-          if (onOpenRail != null) ...[
-            IconButton(
-              icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
-              tooltip: 'Sessions',
-              onPressed: onOpenRail,
-            ),
-            const SizedBox(width: 4),
-          ],
-          Icon(session.icon, color: const Color(0xff7fd1c7)),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  session.displayTitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                  ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isNarrow = constraints.maxWidth < 600;
+        return Container(
+          height: 68,
+          padding: EdgeInsets.symmetric(horizontal: isNarrow ? 12 : 22),
+          decoration: const BoxDecoration(
+            color: Color(0xff151a1d),
+            border: Border(bottom: BorderSide(color: Color(0xff263033))),
+          ),
+          child: Row(
+            children: [
+              if (onOpenRail != null) ...[
+                IconButton(
+                  icon: const Icon(Icons.menu, color: Color(0xffcdd7d6)),
+                  tooltip: 'Sessions',
+                  visualDensity: isNarrow ? VisualDensity.compact : null,
+                  padding: isNarrow ? const EdgeInsets.all(4) : null,
+                  constraints: isNarrow
+                      ? const BoxConstraints(minWidth: 32, minHeight: 32)
+                      : null,
+                  onPressed: onOpenRail,
                 ),
-                const SizedBox(height: 2),
+                SizedBox(width: isNarrow ? 2 : 4),
+              ],
+              Icon(
+                session.icon,
+                size: isNarrow ? 20 : 24,
+                color: const Color(0xff7fd1c7),
+              ),
+              SizedBox(width: isNarrow ? 8 : 12),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      session.displayTitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: isNarrow ? 15 : 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      headerMeta,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: isNarrow ? 11 : 14,
+                        color: const Color(0xff9aa6a8),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (onToggleJudge != null) ...[
+                IconButton(
+                  icon: session.judgePolicyEffective
+                      ? Icon(
+                          Icons.auto_awesome,
+                          size: isNarrow ? 18 : 20,
+                          color: const Color(0xff7fd1c7),
+                        )
+                      : Icon(
+                          Icons.person_outline,
+                          size: isNarrow ? 18 : 20,
+                          color: const Color(0xffffc857),
+                        ),
+                  tooltip: session.judgePolicyEffective
+                      ? (session.judgePolicyExplicit == true
+                            ? 'Auto-Approval: ON (click to disable)'
+                            : 'Auto-Approval: Default ON (click to disable)')
+                      : (session.judgePolicyExplicit == false
+                            ? 'Auto-Approval: OFF (click to enable)'
+                            : 'Auto-Approval: Default OFF (click to enable)'),
+                  visualDensity: isNarrow ? VisualDensity.compact : null,
+                  padding: isNarrow ? const EdgeInsets.all(4) : null,
+                  constraints: isNarrow
+                      ? const BoxConstraints(minWidth: 32, minHeight: 32)
+                      : null,
+                  onPressed: onToggleJudge,
+                ),
+                SizedBox(width: isNarrow ? 2 : 4),
+              ],
+              Tooltip(
+                message: session.status,
+                child: Icon(
+                  Icons.circle,
+                  size: isNarrow ? 10 : 12,
+                  color: session.statusColor,
+                ),
+              ),
+              if (!isNarrow) ...[
+                const SizedBox(width: 8),
                 Text(
-                  headerMeta,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Color(0xff9aa6a8)),
+                  session.status,
+                  style: const TextStyle(color: Color(0xffcdd7d6)),
                 ),
               ],
-            ),
+              SizedBox(width: isNarrow ? 4 : 8),
+              if (onRefit != null) ...[
+                IconButton(
+                  icon: Icon(
+                    Icons.fit_screen,
+                    size: isNarrow ? 18 : 24,
+                    color: const Color(0xffcdd7d6),
+                  ),
+                  tooltip: 'Refit terminal to this device',
+                  visualDensity: isNarrow ? VisualDensity.compact : null,
+                  padding: isNarrow ? const EdgeInsets.all(4) : null,
+                  constraints: isNarrow
+                      ? const BoxConstraints(minWidth: 32, minHeight: 32)
+                      : null,
+                  onPressed: onRefit,
+                ),
+                SizedBox(width: isNarrow ? 4 : 8),
+              ],
+              if (onClose != null)
+                IconButton(
+                  icon: Icon(
+                    Icons.close,
+                    size: isNarrow ? 18 : 24,
+                    color: const Color(0xffcdd7d6),
+                  ),
+                  tooltip: 'Close session',
+                  visualDensity: isNarrow ? VisualDensity.compact : null,
+                  padding: isNarrow ? const EdgeInsets.all(4) : null,
+                  constraints: isNarrow
+                      ? const BoxConstraints(minWidth: 32, minHeight: 32)
+                      : null,
+                  onPressed: onClose,
+                )
+              else
+                Icon(
+                  Icons.more_horiz,
+                  size: isNarrow ? 18 : 24,
+                  color: const Color(0xffcdd7d6),
+                ),
+            ],
           ),
-          if (onToggleJudge != null) ...[
-            IconButton(
-              icon: session.judgePolicyEffective
-                  ? const Icon(
-                      Icons.auto_awesome,
-                      size: 20,
-                      color: Color(0xff7fd1c7),
-                    )
-                  : const Icon(
-                      Icons.person_outline,
-                      size: 20,
-                      color: Color(0xffffc857),
-                    ),
-              tooltip: session.judgePolicyEffective
-                  ? (session.judgePolicyExplicit == true
-                        ? 'Auto-Approval: ON (click to disable)'
-                        : 'Auto-Approval: Default ON (click to disable)')
-                  : (session.judgePolicyExplicit == false
-                        ? 'Auto-Approval: OFF (click to enable)'
-                        : 'Auto-Approval: Default OFF (click to enable)'),
-              onPressed: onToggleJudge,
-            ),
-            const SizedBox(width: 4),
-          ],
-          Icon(Icons.circle, size: 12, color: session.statusColor),
-          const SizedBox(width: 8),
-          Text(
-            session.status,
-            style: const TextStyle(color: Color(0xffcdd7d6)),
-          ),
-          const SizedBox(width: 8),
-          if (onRefit != null)
-            IconButton(
-              icon: const Icon(Icons.fit_screen, color: Color(0xffcdd7d6)),
-              tooltip: 'Refit terminal to this device',
-              onPressed: onRefit,
-            ),
-          const SizedBox(width: 8),
-          if (onClose != null)
-            IconButton(
-              icon: const Icon(Icons.close, color: Color(0xffcdd7d6)),
-              tooltip: 'Close session',
-              onPressed: onClose,
-            )
-          else
-            const Icon(Icons.more_horiz, color: Color(0xffcdd7d6)),
-        ],
-      ),
+        );
+      },
     );
   }
 }
