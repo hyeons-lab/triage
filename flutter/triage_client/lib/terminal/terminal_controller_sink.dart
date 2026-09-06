@@ -37,5 +37,8 @@ class TerminalControllerSink implements TerminalSink {
   set onResize(void Function(int cols, int rows)? handler) {}
 
   @override
+  void onHistoryReplayed() => controller.notifyHistoryReplayed();
+
+  @override
   void dispose() {}
 }

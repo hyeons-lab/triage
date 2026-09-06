@@ -2,10 +2,13 @@ import 'dart:convert';
 
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/terminal/terminal_controller_sink.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
-import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_sink.dart';
+import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
+import 'package:triage_client/widgets/terminal_pane.dart'
+    show TerminalController;
 
 /// Records every sink op in order so tests assert on the *single ordered write
 /// path* the reducer is supposed to produce.
@@ -39,6 +42,11 @@ class FakeTerminalSink implements TerminalSink {
 
   @override
   void dispose() => ops.add('dispose');
+
+  int historyReplayedCount = 0;
+
+  @override
+  void onHistoryReplayed() => historyReplayedCount++;
 }
 
 void main() {
@@ -899,6 +907,66 @@ void main() {
       expect(store.state.cols, 120);
       expect(store.state.rows, 40);
       expect(sink.ops.last, 'write:\r\nfile1.txt\r\n');
+    },
+  );
+
+  test(
+    'HistoryBytes dispatches onHistoryReplayed to sink after write completes',
+    () {
+      expect(sink.historyReplayedCount, 0);
+
+      store.dispatch(
+        HistoryBytes(
+          b('initial prompt> '),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      );
+
+      expect(sink.historyReplayedCount, 1);
+    },
+  );
+
+  test('HistoryBytes dispatches onHistoryReplayed even when unsized', () {
+    final freshStore = TerminalStore(sink);
+    expect(sink.historyReplayedCount, 0);
+
+    freshStore.dispatch(
+      HistoryBytes(
+        b('unsized prompt> '),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 1,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(sink.historyReplayedCount, 1);
+  });
+
+  test(
+    'TerminalControllerSink notifies TerminalController history replayed listeners',
+    () {
+      final controller = TerminalController();
+      final controllerSink = TerminalControllerSink(controller);
+      var replayedCount = 0;
+
+      void listener() {
+        replayedCount++;
+      }
+
+      controller.addHistoryReplayedListener(listener);
+
+      controllerSink.onHistoryReplayed();
+      expect(replayedCount, 1);
+
+      controller.removeHistoryReplayedListener(listener);
+      controllerSink.onHistoryReplayed();
+      expect(replayedCount, 1);
+
+      controller.dispose();
     },
   );
 }

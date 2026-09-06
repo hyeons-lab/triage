@@ -71,6 +71,13 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
+class _InputDedupeRecord {
+  int onDataTime = 0;
+  String? onDataText;
+  int mobileTime = 0;
+  String? mobileText;
+}
+
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
@@ -80,7 +87,28 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
+  static final Map<String, _InputDedupeRecord> _sessionInputDedupe = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
+
+  static bool _viewportIsAtBottom(
+    html.Element container,
+    int viewportY,
+    int baseY,
+  ) {
+    if (viewportY >= baseY) return true;
+    final viewportElem = container.querySelector('.xterm-viewport');
+    if (viewportElem != null) {
+      final remainingPixels =
+          viewportElem.scrollHeight -
+          viewportElem.scrollTop -
+          viewportElem.clientHeight;
+      if (remainingPixels <= 3) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static final Map<String, void Function(String)>
   _sessionPersistentWriteListeners = {};
   static final Map<String, VoidCallback> _sessionPersistentClearListeners = {};
@@ -106,6 +134,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
+    _TerminalPaneState._sessionInputDedupe.remove(sanitizedId);
     _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
@@ -164,15 +193,22 @@ class _TerminalPaneState extends State<TerminalPane> {
   // below it.
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
   StreamSubscription<html.KeyboardEvent>? _containerKeyDownSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   void Function(html.Event)? _containerPasteListener;
+  void Function(html.Event)? _textareaBeforeInputListener;
+  void Function(html.Event)? _textareaInputListener;
+  void Function(html.Event)? _textareaCompositionEndListener;
+  int _lastHandledBeforeInputTime = 0;
+  String? _lastHandledBeforeInputText;
   ModalRoute<dynamic>? _currentRoute;
   bool _initialized = false;
   bool _initialContentWritten = false;
   bool _styleSheetLoaded = false;
   bool _isPasteDialogShowing = false;
   final List<String> _pendingLiveWriteBuffer = [];
+  bool _suppressScrollSave = false;
 
   double? _lastWidth;
   double? _lastHeight;
@@ -190,6 +226,18 @@ class _TerminalPaneState extends State<TerminalPane> {
   // flushes the session's staged history) using the last fitted size.
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
+  Timer? _suppressScrollSaveTimer;
+
+  void _suppressScrollSaveFor(Duration duration) {
+    _suppressScrollSave = true;
+    _suppressScrollSaveTimer?.cancel();
+    _suppressScrollSaveTimer = Timer(duration, () {
+      if (mounted) {
+        _suppressScrollSave = false;
+      }
+    });
+  }
+
   // Bumped on every explicit refit so a superseded refit's delayed retries stop
   // firing. `_lastRefit*` dedupes host resize-outs across a single refit's
   // retries so a settled refit jiggles the host once, not once per tick.
@@ -447,6 +495,53 @@ class _TerminalPaneState extends State<TerminalPane> {
     _focusTerminal();
   }
 
+  // Routes text input from the helper textarea (such as mobile soft keyboards).
+  // Folds sticky Ctrl when armed, routes multi-line input through the paste
+  // handler, and deduplicates against xterm.js onData callbacks.
+  void _sendMobileInput(String text) {
+    if (!mounted || widget.isExited || text.isEmpty) return;
+    if (_currentRoute?.isCurrent == false) return;
+
+    final dedupe = _sessionInputDedupe.putIfAbsent(
+      _sanitizedId,
+      () => _InputDedupeRecord(),
+    );
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - dedupe.onDataTime < 35 && dedupe.onDataText == text) {
+      dedupe.onDataText = null;
+      return;
+    }
+    if (now - dedupe.onDataTime >= 35) {
+      dedupe.onDataText = null;
+    }
+
+    dedupe.mobileTime = now;
+    dedupe.mobileText = text;
+
+    if (_ctrlArmed) {
+      _setCtrlArmed(false);
+      if (text.length == 1) {
+        final ctrl = controlByteForChar(text);
+        if (ctrl != null) {
+          _sendInput(ctrl);
+          return;
+        }
+      }
+    }
+
+    if (text == '\n' || text == '\r\n') {
+      _sendInput('\r');
+      return;
+    }
+
+    if (text.length > 1 && isMultiLine(text)) {
+      unawaited(_handlePaste(text));
+      return;
+    }
+
+    _sendInput(text);
+  }
+
   // Refocus the terminal without sending anything, so a bar tap never steals
   // focus and so never dismisses the soft keyboard.
   void _focusTerminal() {
@@ -499,9 +594,32 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   // Touch clients (mobile-OS browser) get the on-screen accessory bar; desktop
   // browsers keep the full-height terminal and their hardware keyboard.
-  bool get _isMobile =>
-      defaultTargetPlatform == TargetPlatform.iOS ||
-      defaultTargetPlatform == TargetPlatform.android;
+  bool get _isMobile {
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android) {
+      return true;
+    }
+    try {
+      final nav = html.window.navigator;
+      final isMacLikeTouch =
+          defaultTargetPlatform == TargetPlatform.macOS &&
+          (nav.maxTouchPoints ?? 0) > 1;
+      if (isMacLikeTouch) return true;
+      final ua = nav.userAgent.toLowerCase();
+      if (ua.contains('mobile') ||
+          ua.contains('android') ||
+          ua.contains('iphone') ||
+          ua.contains('ipad') ||
+          ua.contains('ipod')) {
+        return true;
+      }
+      if ((nav.maxTouchPoints ?? 0) > 1 &&
+          html.window.matchMedia('(pointer: coarse)').matches) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
 
   void _activateTerminal() {
     if (!_initialized || widget.isExited) return;
@@ -515,6 +633,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       final textarea = _cachedTextarea ??=
           _container.querySelector('textarea') as html.TextAreaElement?;
       if (textarea != null) {
+        if (_textareaBeforeInputListener == null) {
+          _bindTextareaEvents();
+        }
         final opts = js_util.newObject();
         js_util.setProperty(opts, 'preventScroll', true);
         js_util.callMethod(textarea, 'focus', [opts]);
@@ -681,6 +802,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+        final dedupe = _sessionInputDedupe.putIfAbsent(
+          sessionId,
+          () => _InputDedupeRecord(),
+        );
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - dedupe.mobileTime < 35 && dedupe.mobileText == data) {
+          dedupe.mobileText = null;
+          return;
+        }
+        if (now - dedupe.mobileTime >= 35) {
+          dedupe.mobileText = null;
+        }
+
+        dedupe.onDataTime = now;
+        dedupe.onDataText = data;
+
         _sessionSavedViewportY.remove(sessionId);
         try {
           final term = _sessionTerms[sessionId];
@@ -758,6 +895,9 @@ class _TerminalPaneState extends State<TerminalPane> {
           if (activePane == null || !activePane.mounted) {
             return;
           }
+          if (activePane._suppressScrollSave) {
+            return;
+          }
 
           final term = _sessionTerms[sessionId];
           if (term == null) return;
@@ -766,8 +906,14 @@ class _TerminalPaneState extends State<TerminalPane> {
           final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
           final viewportY = (js_util.getProperty(active, 'viewportY') as num)
               .toInt();
-          if (viewportY >= baseY) {
+
+          final isAtBottom = _viewportIsAtBottom(container, viewportY, baseY);
+
+          if (isAtBottom) {
             _sessionSavedViewportY.remove(sessionId);
+            if (viewportY < baseY) {
+              js_util.callMethod(term, 'scrollToBottom', []);
+            }
           } else if (viewportY >= 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
@@ -848,8 +994,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     void onClear() {
       _sessionSavedViewportY.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
-      if (activePane != null && !activePane._initialContentWritten) {
-        activePane._pendingLiveWriteBuffer.clear();
+      if (activePane != null) {
+        activePane._suppressScrollSaveFor(const Duration(milliseconds: 1000));
+        if (!activePane._initialContentWritten) {
+          activePane._pendingLiveWriteBuffer.clear();
+        }
       }
       final term = _sessionTerms[sessionId];
       if (term != null) {
@@ -885,6 +1034,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.addResizeListener(_onResize);
     widget.controller.addFitListener(_onFit);
     widget.controller.addRefitListener(_onRefit);
+    widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
   }
 
   void _unbindController() => _unbindControllerFrom(widget.controller);
@@ -896,6 +1046,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     controller.removeResizeListener(_onResize);
     controller.removeFitListener(_onFit);
     controller.removeRefitListener(_onRefit);
+    controller.removeHistoryReplayedListener(_onHistoryReplayed);
+  }
+
+  void _onHistoryReplayed() {
+    if (!_initialized) return;
+    _afterReplayContentWritten(initialReplay: true);
   }
 
   // The explicit refit — the header button and resume-from-occlusion — as
@@ -1010,6 +1166,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
+    _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
+      if (_initialized) {
+        try {
+          _activateTerminal();
+        } catch (_) {}
+      }
+    });
+
     _containerKeyDownSubscription = _container.onKeyDown.listen((event) {
       if (event.key == 'Tab') {
         event.preventDefault();
@@ -1042,6 +1206,186 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     _containerPasteListener = pasteListener;
     _container.addEventListener('paste', pasteListener, true);
+    _bindTextareaEvents();
+  }
+
+  void _bindTextareaEvents() {
+    if (!_isMobile) return;
+
+    final textarea = _cachedTextarea ??=
+        _container.querySelector('textarea') as html.TextAreaElement?;
+    if (textarea == null) return;
+
+    try {
+      textarea.setAttribute('autocomplete', 'off');
+      textarea.setAttribute('autocorrect', 'off');
+      textarea.setAttribute('autocapitalize', 'none');
+      textarea.setAttribute('spellcheck', 'false');
+      textarea.setAttribute('enterkeyhint', 'enter');
+      textarea.setAttribute('inputmode', 'text');
+    } catch (_) {}
+
+    _unbindTextareaEvents();
+
+    void beforeInputListener(html.Event event) {
+      if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
+        return;
+      }
+      final inputType = js_util.getProperty(event, 'inputType') as String?;
+      final data = js_util.getProperty(event, 'data') as String?;
+
+      void handleInput(String text) {
+        _lastHandledBeforeInputTime = DateTime.now().millisecondsSinceEpoch;
+        _lastHandledBeforeInputText = text;
+        _sendMobileInput(text);
+      }
+
+      if (inputType == 'insertCompositionText') {
+        return;
+      }
+
+      if (inputType == 'insertLineBreak' || inputType == 'insertParagraph') {
+        event.preventDefault();
+        event.stopPropagation();
+        handleInput('\r');
+        return;
+      }
+
+      if (inputType == 'deleteContentBackward') {
+        event.preventDefault();
+        event.stopPropagation();
+        handleInput('\x7f');
+        return;
+      }
+
+      if (inputType == 'deleteContentForward') {
+        event.preventDefault();
+        event.stopPropagation();
+        handleInput('\x1b[3~');
+        return;
+      }
+
+      if (inputType == 'deleteWordBackward') {
+        event.preventDefault();
+        event.stopPropagation();
+        handleInput('\x17');
+        return;
+      }
+
+      if (inputType == 'deleteHardLineBackward' ||
+          inputType == 'deleteSoftLineBackward') {
+        event.preventDefault();
+        event.stopPropagation();
+        handleInput('\x15');
+        return;
+      }
+
+      if (inputType == 'insertFromPaste') {
+        if (data != null && data.isNotEmpty) {
+          event.preventDefault();
+          event.stopPropagation();
+          unawaited(_handlePaste(data));
+        }
+        return;
+      }
+
+      if (inputType == 'insertText' || inputType == 'insertReplacementText') {
+        if (data != null && data.isNotEmpty) {
+          event.preventDefault();
+          event.stopPropagation();
+          handleInput(data);
+          return;
+        }
+      }
+    }
+
+    void inputListener(html.Event event) {
+      if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
+        return;
+      }
+      final inputType = js_util.getProperty(event, 'inputType') as String?;
+      if (inputType == 'insertCompositionText') {
+        return;
+      }
+      if (inputType == 'deleteContentBackward') {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastHandledBeforeInputTime < 40 &&
+            _lastHandledBeforeInputText == '\x7f') {
+          return;
+        }
+        _sendMobileInput('\x7f');
+        return;
+      }
+      final target = event.target;
+      if (target is html.TextAreaElement) {
+        final val = target.value;
+        target.value = '';
+        if (val != null && val.isNotEmpty) {
+          final now = DateTime.now().millisecondsSinceEpoch;
+          if (now - _lastHandledBeforeInputTime < 40 &&
+              _lastHandledBeforeInputText == val) {
+            return;
+          }
+          _sendMobileInput(val);
+        }
+      }
+    }
+
+    void compositionEndListener(html.Event event) {
+      if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
+        return;
+      }
+      final data = js_util.getProperty(event, 'data') as String?;
+      final target = event.target;
+      var textToSend = data;
+      if ((textToSend == null || textToSend.isEmpty) &&
+          target is html.TextAreaElement) {
+        textToSend = target.value;
+      }
+      if (target is html.TextAreaElement) {
+        target.value = '';
+      }
+      if (textToSend != null && textToSend.isNotEmpty) {
+        _lastHandledBeforeInputTime = DateTime.now().millisecondsSinceEpoch;
+        _lastHandledBeforeInputText = textToSend;
+        _sendMobileInput(textToSend);
+      }
+    }
+
+    _textareaBeforeInputListener = beforeInputListener;
+    _textareaInputListener = inputListener;
+    _textareaCompositionEndListener = compositionEndListener;
+
+    textarea.addEventListener('beforeinput', beforeInputListener, false);
+    textarea.addEventListener('input', inputListener, false);
+    textarea.addEventListener('compositionend', compositionEndListener, false);
+  }
+
+  void _unbindTextareaEvents() {
+    _lastHandledBeforeInputTime = 0;
+    _lastHandledBeforeInputText = null;
+    final textarea = _cachedTextarea;
+    if (textarea != null) {
+      final beforeInput = _textareaBeforeInputListener;
+      if (beforeInput != null) {
+        textarea.removeEventListener('beforeinput', beforeInput, false);
+        _textareaBeforeInputListener = null;
+      }
+      final input = _textareaInputListener;
+      if (input != null) {
+        textarea.removeEventListener('input', input, false);
+        _textareaInputListener = null;
+      }
+      final compositionEnd = _textareaCompositionEndListener;
+      if (compositionEnd != null) {
+        textarea.removeEventListener('compositionend', compositionEnd, false);
+        _textareaCompositionEndListener = null;
+      }
+    } else {
+      _textareaBeforeInputListener = null;
+      _textareaInputListener = null;
+      _textareaCompositionEndListener = null;
+    }
   }
 
   Future<void> _handlePaste(String text) async {
@@ -1094,10 +1438,11 @@ class _TerminalPaneState extends State<TerminalPane> {
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
         final viewportY = (js_util.getProperty(active, 'viewportY') as num)
             .toInt();
-        if (viewportY >= 0 && viewportY < baseY) {
-          _sessionSavedViewportY[_sanitizedId] = viewportY;
-        } else if (viewportY >= baseY) {
+        final isAtBottom = _viewportIsAtBottom(container, viewportY, baseY);
+        if (isAtBottom) {
           _sessionSavedViewportY.remove(_sanitizedId);
+        } else if (viewportY >= 0) {
+          _sessionSavedViewportY[_sanitizedId] = viewportY;
         }
       }
     } catch (_) {}
@@ -1105,6 +1450,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerMouseDownSubscription = null;
     _containerClickSubscription?.cancel();
     _containerClickSubscription = null;
+    _containerTouchEndSubscription?.cancel();
+    _containerTouchEndSubscription = null;
     _containerKeyDownSubscription?.cancel();
     _containerKeyDownSubscription = null;
     _containerWheelSubscription?.cancel();
@@ -1114,6 +1461,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _container.removeEventListener('paste', pasteListener, true);
       _containerPasteListener = null;
     }
+    _unbindTextareaEvents();
   }
 
   String? _keyboardEventToInput(html.KeyboardEvent event) {
@@ -1239,7 +1587,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _initialContentWritten = true;
     _writeInitialContent(overrideCols: fittedCols, overrideRows: fittedRows);
     _flushPendingLiveWrites();
-    _afterReplayContentWritten(initialReplay: true);
     _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
   }
 
@@ -1363,12 +1710,26 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _restoreScrollPosition({required bool requestFocus}) {
+    var jumped = false;
     void jump() {
-      if (!mounted || !_initialized) return;
+      if (jumped || !mounted || !_initialized) return;
+      jumped = true;
+      _scrollToCursorTimer?.cancel();
+      _scrollToCursorTimer = null;
+      _suppressScrollSave = true;
       final savedY = _sessionSavedViewportY[_sanitizedId];
       try {
-        if (savedY != null) {
-          js_util.callMethod(_term, 'scrollToLine', [savedY]);
+        final buffer = js_util.getProperty(_term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+        if (savedY != null && savedY >= baseY) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+        }
+      } catch (_) {}
+      final effectiveSavedY = _sessionSavedViewportY[_sanitizedId];
+      try {
+        if (effectiveSavedY != null) {
+          js_util.callMethod(_term, 'scrollToLine', [effectiveSavedY]);
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);
         }
@@ -1376,11 +1737,21 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (requestFocus) {
         _activateTerminal();
       }
+      _suppressScrollSaveFor(const Duration(milliseconds: 1000));
     }
 
-    Future.delayed(Duration.zero, jump);
+    try {
+      js_util.callMethod(_term, 'write', [
+        '',
+        js_util.allowInterop(() {
+          jump();
+        }),
+      ]);
+    } catch (_) {
+      Future.delayed(Duration.zero, jump);
+    }
     _scrollToCursorTimer?.cancel();
-    _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
+    _scrollToCursorTimer = Timer(const Duration(milliseconds: 600), jump);
   }
 
   void _updateCursorOptions() {
@@ -1400,9 +1771,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!_initialized) return;
     try {
       if (_initialContentWritten) {
+        _suppressScrollSaveFor(const Duration(milliseconds: 1000));
         _resetTerminalSafe();
         _writeInitialContent();
-        _afterReplayContentWritten(initialReplay: false);
       } else {
         _resetTerminalSafe();
         _pendingLiveWriteBuffer.clear();
@@ -1453,9 +1824,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         widget.controller,
       );
       _bindController();
-      if (!_initialContentWritten) {
-        _triggerFullReplayOrReset();
-      }
+      _triggerFullReplayOrReset();
     }
   }
 
@@ -1466,6 +1835,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
+    _suppressScrollSaveTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _unbindContainerEvents();
     _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);

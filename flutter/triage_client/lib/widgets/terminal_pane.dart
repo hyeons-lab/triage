@@ -60,6 +60,18 @@ class TerminalController {
   void removeResizeOutListener(void Function(int, int) listener) =>
       _resizeOutListeners.remove(listener);
 
+  final List<void Function()> _historyReplayedListeners = [];
+  void addHistoryReplayedListener(void Function() listener) =>
+      _historyReplayedListeners.add(listener);
+  void removeHistoryReplayedListener(void Function() listener) =>
+      _historyReplayedListeners.remove(listener);
+
+  void notifyHistoryReplayed() {
+    for (final listener in List.from(_historyReplayedListeners)) {
+      listener();
+    }
+  }
+
   void write(String data) {
     if (_writeListeners.isEmpty) {
       _writeBuffer.add(data);
@@ -114,6 +126,7 @@ class TerminalController {
     _refitListeners.clear();
     _inputListeners.clear();
     _resizeOutListeners.clear();
+    _historyReplayedListeners.clear();
     _writeBuffer.clear();
   }
 }
