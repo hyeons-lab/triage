@@ -7690,7 +7690,7 @@ fn resolve_session_context(cwd: Option<&Path>) -> Option<SessionContext> {
     if let Ok(mut guard) = SESSION_CONTEXT_CACHE.lock()
         && let Some(entries) = guard.as_mut()
         && let Some((context, resolved_at)) = entries.get(cwd)
-        && now.duration_since(*resolved_at) < SESSION_CONTEXT_TTL
+        && now.saturating_duration_since(*resolved_at) < SESSION_CONTEXT_TTL
     {
         return context.clone();
     }
@@ -7702,8 +7702,9 @@ fn resolve_session_context(cwd: Option<&Path>) -> Option<SessionContext> {
         // Drop expired entries while the lock is already held. Sessions come and go and
         // their directories change, so without this the map would retain every directory
         // the daemon ever saw.
-        entries
-            .retain(|_, (_, resolved_at)| now.duration_since(*resolved_at) < SESSION_CONTEXT_TTL);
+        entries.retain(|_, (_, resolved_at)| {
+            now.saturating_duration_since(*resolved_at) < SESSION_CONTEXT_TTL
+        });
         entries.insert(cwd.to_path_buf(), (context.clone(), now));
     }
 
@@ -7714,6 +7715,9 @@ fn resolve_session_context(cwd: Option<&Path>) -> Option<SessionContext> {
 ///
 /// Tests that change a repository and then re-resolve the same directory need the cached
 /// window gone; in production that window simply lapses.
+///
+/// Mutates process-wide state, so callers depend on the suite running single-threaded
+/// (`--test-threads=1`); under parallel threads it would clear another test's window.
 #[cfg(test)]
 fn clear_session_context_cache() {
     if let Ok(mut guard) = SESSION_CONTEXT_CACHE.lock() {
