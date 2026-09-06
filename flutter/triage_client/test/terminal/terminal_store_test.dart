@@ -860,4 +860,45 @@ void main() {
       expect(store.appliedLogBytes, truncated.length);
     },
   );
+
+  test(
+    'viewport resize with concurrent delta-merge updates sizing and drains pending live',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Seed initial output
+      store.dispatch(
+        HistoryBytes(
+          b('prompt> '),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops, ['resize:80,24', 'clear', 'write:prompt> ']);
+
+      // Live output arrives before viewport resize
+      store.dispatch(LiveBytes(b('ls -l'), outputSeq: 2));
+
+      // Delta-merge snapshot arrives with resized viewport dimensions (120x40)
+      store.dispatch(
+        HistoryBytes(
+          b('prompt> ls -l\nfile1.txt\n'),
+          cols: 120,
+          rows: 40,
+          throughOutputSeq: 3,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Delta merge updates store dimensions without clearing sink
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.state.cols, 120);
+      expect(store.state.rows, 40);
+      expect(sink.ops.last, 'write:\r\nfile1.txt\r\n');
+    },
+  );
 }

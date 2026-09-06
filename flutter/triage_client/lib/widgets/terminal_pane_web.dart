@@ -745,7 +745,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               .toInt();
           if (viewportY >= baseY) {
             _sessionSavedViewportY.remove(sessionId);
-          } else {
+          } else if (viewportY >= 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
         } catch (_) {}
@@ -1071,9 +1071,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
         final viewportY = (js_util.getProperty(active, 'viewportY') as num)
             .toInt();
-        if (viewportY < baseY) {
+        if (viewportY >= 0 && viewportY < baseY) {
           _sessionSavedViewportY[_sanitizedId] = viewportY;
-        } else {
+        } else if (viewportY >= baseY) {
           _sessionSavedViewportY.remove(_sanitizedId);
         }
       }

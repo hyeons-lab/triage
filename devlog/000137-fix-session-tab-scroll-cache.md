@@ -27,6 +27,9 @@
 - **2026-09-05T22:13-0700** flutter/triage_client/lib/main.dart: Dispatched Attach when session transitions from exited to active, clearing store exited state so user input is accepted immediately.
 - **2026-09-05T22:13-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: Purged _sessionSavedViewportY on onClear() to prevent restoring stale scroll positions on empty buffers.
 - **2026-09-05T22:13-0700** flutter/triage_client/test/terminal/terminal_store_test.dart, flutter/triage_client/test/widget_test.dart: Added tests for sequence regression with rawOutputStart: 0, log length regression, and accepting input upon session revival.
+- **2026-09-05T22:47-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: Added non-negative viewport guards (viewportY >= 0) in onScrollCallback and _unbindContainerEvents to prevent corrupted microtask values from saving.
+- **2026-09-05T22:47-0700** flutter/triage_client/lib/main.dart: Returned Uint8List directly from _rawOutputFromSnapshot, enabling zero-allocation byte slicing downstream.
+- **2026-09-05T22:47-0700** flutter/triage_client/test/terminal/terminal_store_test.dart: Added unit test covering concurrent viewport resize and delta-merge updates.
 
 ## Decisions
 
@@ -41,6 +44,8 @@
 - **2026-09-05T22:06-0700 Decision: Explicit isExited Forwarding in SessionVm**: Passing isExited to SessionVm.applyHistory ensures that snapshot refreshes on dead sessions do not strip exited status, while preserving the ability for revived sessions to reset isExited to false.
 - **2026-09-05T22:06-0700 Decision: Headless Scroll Offset Preservation**: When terminal font metrics are unavailable (e.g. headless tests), preserve scroll offsets if pixels < maxScrollExtent - lineHeight even when a scroll anchor could not be resolved.
 - **2026-09-05T22:13-0700 Decision: Universal Regression Guard Before Delta Merge**: Sequence regressions (throughOutputSeq < baselineSeq) and log length contractions (rawOutputStart + bytes.length < currentLogBytes) signify a daemon or session reset. Checking them prior to delta merge guarantees that any restart triggers a complete clear and replay across all paths.
+- **2026-09-05T22:47-0700 Decision: Non-Negative Web Viewport Bounds**: During DOM detachment and rapid window resizing, xterm.js internal measurements can momentarily emit negative viewport indices before layout recalculation; enforcing viewportY >= 0 ensures only valid scroll offsets are persisted.
+- **2026-09-05T22:47-0700 Decision: Concrete Typed Buffer Ingress**: Returning Uint8List from _rawOutputFromSnapshot guarantees that snapshot byte slices avoid dynamic type checking or array coercions on web targets.
 
 ## Issues
 
@@ -75,9 +80,12 @@
 - [x] Verify Dart and Rust test suites and static analysis
 - [x] Round 4 review loop: address universal regression guard, session revival Attach dispatch, and viewport cache purge
 - [x] Full test suite and static analysis green across Dart and Rust
+- [x] Address PR review feedback: non-negative viewport guards, typed snapshot buffers, and concurrent resize tests
+- [x] Synthesize review learnings into `~/.gemini/review-refinements.md`
 
 ## Commits
 
 - cd0a50f: fix(client): cache session scroll state and delta-merge terminal output
 - 5441c2f: fix(client): harden session tab scroll cache and restore lifecycle
-- HEAD: fix(client): synchronize exited session state and harden scroll restoration
+- d4c42e4: fix(client): synchronize exited session state and harden scroll restoration
+- HEAD: fix(client): address PR review comments and harden web viewport guards
