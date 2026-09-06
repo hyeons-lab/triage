@@ -344,6 +344,7 @@ class TerminalStore extends ChangeNotifier {
     if (next.sized) {
       _flushPendingLive(throughOutputSeq);
     }
+    _sink.onHistoryReplayed();
     return next;
   }
 

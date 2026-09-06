@@ -28,4 +28,8 @@ abstract class TerminalSink {
 
   /// Release any emulator resources/listeners. The store calls this on dispose.
   void dispose();
+
+  /// Called when a full history replay has completed writing all decoded snapshot
+  /// bytes and drained pending live chunks to the sink.
+  void onHistoryReplayed() {}
 }
