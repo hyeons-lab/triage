@@ -666,4 +666,46 @@ void main() {
       expect(store.state.historyHighWaterSeq, 50);
     },
   );
+
+  test('exited session restore clears exited state and does full replay', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    store.dispatch(
+      HistoryBytes(
+        b('shell prompt \$ '),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 20,
+        rawOutputStart: 0,
+      ),
+    );
+    expect(store.state.phase, AttachPhase.live);
+    expect(store.state.exited, isFalse);
+
+    // Session exits
+    store.dispatch(const Exited());
+    expect(store.state.exited, isTrue);
+
+    // When restored, daemon re-spawns at seq 0 or sends fresh history.
+    // If HistoryBytes arrives on an exited store, it must bypass delta-merge,
+    // clear the sink, write the fresh history, and reset exited to false.
+    final freshPrompt = 'restarted shell \$ ';
+    store.dispatch(
+      HistoryBytes(
+        b(freshPrompt),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 0,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(store.state.exited, isFalse);
+    expect(store.state.phase, AttachPhase.live);
+    expect(sink.ops.where((op) => op == 'clear').length, 2);
+    expect(sink.ops.last, 'write:$freshPrompt');
+    expect(store.appliedLogBytes, freshPrompt.length);
+  });
 }

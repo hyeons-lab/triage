@@ -106,21 +106,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
-    final boundController = _TerminalPaneState._sessionBoundControllers.remove(
-      sanitizedId,
-    );
-    final writeListener = _TerminalPaneState._sessionPersistentWriteListeners
-        .remove(sanitizedId);
-    final clearListener = _TerminalPaneState._sessionPersistentClearListeners
-        .remove(sanitizedId);
-    if (boundController != null) {
-      if (writeListener != null) {
-        boundController.removeWriteListener(writeListener);
-      }
-      if (clearListener != null) {
-        boundController.removeClearListener(clearListener);
-      }
-    }
+    _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
     // would only strand a dead `State` in a static map.
@@ -249,6 +235,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
+      _onFit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
       }
@@ -1228,8 +1215,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
     _pendingLiveWriteBuffer.clear();
-    for (final data in pendingWrites) {
-      js_util.callMethod(_term, 'write', [data]);
+    final term = _term ?? _sessionTerms[_sanitizedId];
+    if (term != null) {
+      for (final data in pendingWrites) {
+        try {
+          js_util.callMethod(term, 'write', [data]);
+        } catch (_) {}
+      }
     }
   }
 
@@ -1352,7 +1344,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     }
 
-    jump();
     Future.delayed(Duration.zero, jump);
     _scrollToCursorTimer?.cancel();
     _scrollToCursorTimer = Timer(const Duration(milliseconds: 50), jump);
@@ -1436,6 +1427,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   void dispose() {
+    _flushPendingLiveWrites();
     _resizeDebounceTimer?.cancel();
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();

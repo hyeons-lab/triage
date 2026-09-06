@@ -255,27 +255,22 @@ class TerminalStore extends ChangeNotifier {
 
     // Delta merge: if the store is already live and sized with content, check
     // whether the new snapshot overlaps with what we already applied.
-    if (s.phase == AttachPhase.live &&
+    if (!s.exited &&
+        s.phase == AttachPhase.live &&
         s.scrollbackReady &&
         (currentSeq != null || currentLogBytes != null)) {
-      if (throughOutputSeq != null &&
-          currentSeq != null &&
-          currentSeq >= throughOutputSeq) {
-        return next;
-      }
-
       if (rawOutputStart != null && currentLogBytes != null) {
         final snapshotEndBytes = rawOutputStart + bytes.length;
         if (currentLogBytes >= snapshotEndBytes) {
+          final resolvedSeq = throughOutputSeq != null
+              ? max(next.historyHighWaterSeq ?? 0, throughOutputSeq)
+              : next.historyHighWaterSeq;
           if (throughOutputSeq != null) {
             _appliedLiveSeq = _appliedLiveSeq == null
                 ? throughOutputSeq
                 : max(_appliedLiveSeq!, throughOutputSeq);
           }
-          return next.copyWith(
-            historyHighWaterSeq: throughOutputSeq ?? next.historyHighWaterSeq,
-            exited: false,
-          );
+          return next.copyWith(historyHighWaterSeq: resolvedSeq, exited: false);
         }
 
         if (currentLogBytes >= rawOutputStart) {
@@ -283,12 +278,19 @@ class TerminalStore extends ChangeNotifier {
           if (deltaOffset >= 0 && deltaOffset < bytes.length) {
             final deltaBytes = bytes.sublist(deltaOffset);
             _applyLive(deltaBytes, throughOutputSeq);
+            final resolvedSeq = throughOutputSeq != null
+                ? max(next.historyHighWaterSeq ?? 0, throughOutputSeq)
+                : next.historyHighWaterSeq;
             return next.copyWith(
-              historyHighWaterSeq: throughOutputSeq ?? next.historyHighWaterSeq,
+              historyHighWaterSeq: resolvedSeq,
               exited: false,
             );
           }
         }
+      } else if (throughOutputSeq != null &&
+          currentSeq != null &&
+          currentSeq == throughOutputSeq) {
+        return next;
       }
     }
 
@@ -678,6 +680,7 @@ class TerminalStore extends ChangeNotifier {
     _inSynchronizedOutput = false;
     _syncBuffer.clear();
     _appliedLiveSeq = null;
+    _appliedLogBytes = null;
   }
 
   @override

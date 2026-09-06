@@ -788,7 +788,7 @@ class SessionVm {
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
     );
-    if (store.state.phase != AttachPhase.live) {
+    if (store.state.phase != AttachPhase.live || store.state.exited) {
       store.dispatch(const Attach());
     }
     if (_viewReady) {
@@ -6307,8 +6307,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
             builder: (context) {
               final filteredHistory = history.reversed.where((item) {
                 if (_historyFilter != 'all') {
-                  if (item.decision.toLowerCase() != _historyFilter)
+                  if (item.decision.toLowerCase() != _historyFilter) {
                     return false;
+                  }
                 }
                 if (_historySearchQuery.isNotEmpty) {
                   final q = _historySearchQuery.toLowerCase();

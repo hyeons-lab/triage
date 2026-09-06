@@ -149,5 +149,47 @@ void main() {
       );
       expect(anchor.hasAnchor, isFalse);
     });
+
+    test('clone and copyFrom preserve anchor state and desired offset', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      final maxExtent = _maxExtent(terminal, lineHeight);
+      const anchorRow = 10;
+
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: anchorRow * lineHeight,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+
+      final cloned = anchor.clone();
+      expect(cloned.hasAnchor, isTrue);
+      expect(
+        cloned.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+      );
+
+      final target = TerminalScrollAnchor();
+      target.copyFrom(cloned);
+      expect(target.hasAnchor, isTrue);
+      expect(
+        target.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+      );
+    });
   });
 }
