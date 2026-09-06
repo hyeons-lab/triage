@@ -1309,7 +1309,11 @@ class TriageWebSocketClient {
       'exited': snap.exited,
       // Raw output-history tail for client-side re-emulation (empty from old
       // hosts). raw_output_start is its byte offset in the full output log.
-      'raw_output': snap.rawOutput,
+      'raw_output': snap.rawOutput == null
+          ? null
+          : (snap.rawOutput is Uint8List
+                ? snap.rawOutput as Uint8List
+                : Uint8List.fromList(snap.rawOutput!)),
       'raw_output_start': snap.rawOutputStart,
       // Local-LLM one-line description of the session, if generated.
       'snippet': snap.snippet,

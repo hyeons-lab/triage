@@ -760,12 +760,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     _captureScrollAnchor();
   }
 
-  void _saveScrollOffset([String? terminalId]) {
+  void _saveScrollOffset([String? terminalId, double? lineHeight]) {
     if (!_scrollController.hasClients) return;
     final id = terminalId ?? widget.terminalId;
     final position = _scrollController.position;
-    final lineHeight = _lineHeight() ?? 2.0;
-    if (position.pixels < position.maxScrollExtent - lineHeight) {
+    final lh = lineHeight ?? _lineHeight() ?? 2.0;
+    if (position.pixels < position.maxScrollExtent - lh) {
       _sessionSavedScrollOffsets[id] = position.pixels;
       if (_scrollAnchor.hasAnchor) {
         _sessionSavedScrollAnchors[id] = _scrollAnchor.clone();
@@ -789,7 +789,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         lineHeight: lineHeight,
       );
     }
-    _saveScrollOffset();
+    _saveScrollOffset(widget.terminalId, lineHeight);
   }
 
   void _onTerminalContentChanged() {
