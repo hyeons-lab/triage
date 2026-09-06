@@ -260,6 +260,18 @@ const _: () = assert!(
      swaps that were about to succeed"
 );
 
+/// Soft `RLIMIT_NOFILE` the daemon raises itself to, and the value the macOS
+/// LaunchAgent requests via `SoftResourceLimits`.
+///
+/// The daemon holds one PTY master per live session for its whole lifetime, and
+/// handover briefly doubles that while it dups every master to send. Against
+/// launchd's default soft limit of 256 that ceiling is reached at a few dozen
+/// sessions, and the first symptom is not a clean error: segment listings fail
+/// with `EMFILE` and sessions render with empty scrollback. Well under
+/// `kern.maxfilesperproc`, so the raise is bounded by the hard limit in
+/// practice, never by this constant alone.
+pub const DAEMON_MAX_OPEN_FILES: u64 = 10_240;
+
 #[cfg(unix)]
 pub use unix_impl::*;
 
@@ -755,6 +767,30 @@ mod unix_impl {
         Ok(())
     }
 
+    /// Raises the process file descriptor limit (RLIMIT_NOFILE) up to the hard
+    /// limit (capped at 10240) so the daemon does not exhaust file descriptors
+    /// when supervising many live sessions and segment logs.
+    pub fn raise_fd_limit() {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
+        // SAFETY: `limit` points to writable storage for getrlimit.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return;
+        }
+        // SAFETY: getrlimit succeeded and initialized the structure.
+        let mut limit = unsafe { limit.assume_init() };
+        let desired = limit
+            .rlim_max
+            .min(super::DAEMON_MAX_OPEN_FILES as libc::rlim_t);
+        if desired > limit.rlim_cur {
+            limit.rlim_cur = desired;
+            // SAFETY: `limit` was returned by getrlimit and only its soft value was
+            // raised, never beyond the reported hard limit.
+            unsafe {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    }
+
     fn ensure_fd_capacity(additional: usize) -> io::Result<()> {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
         // SAFETY: `limit` points to writable storage for getrlimit.
@@ -852,6 +888,109 @@ mod unix_impl {
             if id_unavailable(&candidate_id) {
                 continue;
             }
+            let is_segmented = original_log
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::storage::parse_segment_index)
+                .is_some()
+                || original_log
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(session.id.as_str())
+                || original_log
+                    .parent()
+                    .map(|p| p.join("sessions").join(session.id.as_str()).is_dir())
+                    .unwrap_or(false);
+
+            if is_segmented {
+                let session_dir = if original_log.is_dir() {
+                    original_log.clone()
+                } else if original_log
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(session.id.as_str())
+                {
+                    original_log.parent().unwrap_or(&original_log).to_path_buf()
+                } else if let Some(parent) = original_log.parent() {
+                    let cand = parent.join("sessions").join(session.id.as_str());
+                    if cand.is_dir() {
+                        cand
+                    } else {
+                        parent.to_path_buf()
+                    }
+                } else {
+                    original_log.clone()
+                };
+                let sessions_parent = session_dir.parent().unwrap_or(&session_dir);
+                let candidate_dir = sessions_parent.join(candidate_id.as_str());
+                if candidate_dir.exists() {
+                    continue;
+                }
+                let staging_dir = sessions_parent.join(format!(
+                    ".tmp-copy-{}-{}",
+                    std::process::id(),
+                    candidate_id.as_str()
+                ));
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                std::fs::create_dir_all(&staging_dir)?;
+
+                let copy_res = (|| -> io::Result<()> {
+                    if session_dir.is_dir() {
+                        let segments = crate::storage::list_session_segments(&session_dir)
+                            .map_err(io::Error::other)?;
+                        for segment in segments {
+                            let file_name = segment.path.file_name().ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "invalid file name")
+                            })?;
+                            if let Err(err) =
+                                std::fs::copy(&segment.path, staging_dir.join(file_name))
+                            {
+                                if err.kind() != io::ErrorKind::NotFound {
+                                    return Err(err);
+                                }
+                                if !segment.is_compressed {
+                                    let compressed_name =
+                                        crate::storage::compressed_segment_file_name(segment.index);
+                                    let compressed_path = session_dir.join(&compressed_name);
+                                    if let Err(e) = std::fs::copy(
+                                        &compressed_path,
+                                        staging_dir.join(&compressed_name),
+                                    ) && e.kind() != io::ErrorKind::NotFound
+                                    {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if candidate_dir.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "candidate directory already exists",
+                        ));
+                    }
+                    std::fs::rename(&staging_dir, &candidate_dir)?;
+                    Ok(())
+                })();
+
+                if let Err(error) = copy_res {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        continue;
+                    }
+                    return Err(error);
+                }
+
+                let active_segment = crate::storage::resolve_active_segment(&candidate_dir)
+                    .map(|(path, _, _)| path)
+                    .unwrap_or_else(|_| candidate_dir.join(crate::storage::segment_file_name(1)));
+                session.id = candidate_id;
+                session.log_path = active_segment;
+                return Ok(());
+            }
+
             let candidate_log = original_log.with_file_name(format!("{candidate_id}.log"));
             let mut destination = match std::fs::OpenOptions::new()
                 .write(true)
@@ -2434,4 +2573,6 @@ mod fallback_impl {
     ) -> Result<TeardownOutcome> {
         Ok(TeardownOutcome::Adopt)
     }
+
+    pub fn raise_fd_limit() {}
 }

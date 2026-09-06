@@ -232,6 +232,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       _initialized = true;
       _initialContentWritten = true;
       _styleSheetLoaded = true;
+      try {
+        final rowsNum = js_util.getProperty(_term, 'rows') as num?;
+        final colsNum = js_util.getProperty(_term, 'cols') as num?;
+        if (rowsNum != null && colsNum != null) {
+          _lastFittedRows = rowsNum.toInt();
+          _lastFittedCols = colsNum.toInt();
+        }
+      } catch (_) {}
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
@@ -304,7 +312,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
+      if (mounted && _initialized) {
+        if (cachedContainer != null) {
+          _writeInitialContent();
+        }
         _activateTerminal();
       }
     });
@@ -494,6 +505,12 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _activateTerminal() {
     if (!_initialized || widget.isExited) return;
+    final active = html.document.activeElement;
+    if (active is html.InputElement ||
+        (active is html.TextAreaElement && !_container.contains(active)) ||
+        (active != null && active.isContentEditable == true)) {
+      return;
+    }
     try {
       final textarea = _cachedTextarea ??=
           _container.querySelector('textarea') as html.TextAreaElement?;
@@ -630,13 +647,19 @@ class _TerminalPaneState extends State<TerminalPane> {
     // the force-finalize backstop) pass it in so we don't re-read `_term` here:
     // during the size churn the backstop guards against, `_term` can momentarily
     // sit below the minimum grid, and signaling that too-narrow size leaves the
-    // store unsized — which suppresses the live-output flush. The re-replay path
+    // store unsized, which suppresses the live-output flush. The re-replay path
     // (content already written, layout settled) passes nothing and reads the
     // real current size, which is what it wants.
     final fittedRows =
-        overrideRows ?? (js_util.getProperty(_term, 'rows') as num).toInt();
+        overrideRows ??
+        ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
+            _lastFittedRows ??
+            24);
     final fittedCols =
-        overrideCols ?? (js_util.getProperty(_term, 'cols') as num).toInt();
+        overrideCols ??
+        ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
+            _lastFittedCols ??
+            80);
     widget.onViewFit?.call(fittedCols, fittedRows);
   }
 

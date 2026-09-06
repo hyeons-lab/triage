@@ -1461,6 +1461,15 @@ fn handle_handover_server(
 
     tracing::info!("Received handover request. Beginning process serialization...");
 
+    // Serialization dups one PTY master per session plus the TCP listener, so a
+    // daemon supervising many sessions needs far more descriptors than the soft
+    // limit launchd hands it (256). Raising it here rather than only at startup
+    // is what makes an *already running* daemon able to hand over: a process
+    // started before this fix would otherwise fail every dup with EMFILE, abort
+    // the handover, and leave the successor unable to bind; so the fix could
+    // never reach production through a handover.
+    crate::handover::raise_fd_limit();
+
     let (mut state, pty_fds) = manager
         .serialize_active_sessions()
         .context("serializing active sessions for handover")?;
