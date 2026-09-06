@@ -65,8 +65,14 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
         return Ok(Vec::new());
     }
 
-    let entries = fs::read_dir(session_dir)
-        .with_context(|| format!("reading session directory {}", session_dir.display()))?;
+    let entries = match fs::read_dir(session_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("reading session directory {}", session_dir.display()));
+        }
+    };
 
     let mut segments_by_index: std::collections::BTreeMap<u32, SegmentFileInfo> =
         std::collections::BTreeMap::new();
@@ -151,8 +157,6 @@ pub fn resolve_active_segment(session_dir: &Path) -> Result<(PathBuf, u32, u64)>
 /// Writes to a PID-isolated temporary file first, then atomically renames to the final
 /// compressed path, and finally unlinks the raw file.
 pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<u64> {
-    ensure!(raw_path.exists(), "raw segment path does not exist");
-
     let tmp_name = format!(
         "{}.tmp.{}",
         compressed_path
@@ -562,6 +566,17 @@ impl Drop for CompressionWorker {
 
 /// Strips standard ANSI and VT100 escape sequences from byte streams for plain-text search.
 pub fn strip_ansi_escapes(input: &[u8]) -> String {
+    if !input.contains(&0x1B)
+        && input
+            .iter()
+            .all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x20)
+    {
+        return match std::str::from_utf8(input) {
+            Ok(valid) => valid.to_string(),
+            Err(_) => String::from_utf8_lossy(input).into_owned(),
+        };
+    }
+
     let mut output_bytes = Vec::with_capacity(input.len());
     let mut in_escape = false;
     let mut in_csi = false;
@@ -625,6 +640,9 @@ pub fn strip_ansi_escapes(input: &[u8]) -> String {
 }
 
 /// A search hit found in a session segment.
+///
+/// Note: `line_number` is 1-based relative to the start of `segment_index`,
+/// not the cumulative line count across all historical segments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub segment_index: u32,
@@ -664,10 +682,17 @@ pub fn search_session_segments(
 
         for (line_idx, line) in clean_text.lines().enumerate() {
             if line_matches_query(line, query, &query_lower, case_insensitive) {
+                const MAX_HIT_PREVIEW_BYTES: usize = 2048;
+                let preview = if line.len() > MAX_HIT_PREVIEW_BYTES {
+                    let end = line.floor_char_boundary(MAX_HIT_PREVIEW_BYTES);
+                    format!("{}...", &line[..end])
+                } else {
+                    line.to_string()
+                };
                 hits.push(SearchHit {
                     segment_index: segment.index,
                     line_number: line_idx + 1,
-                    line_text: line.to_string(),
+                    line_text: preview,
                 });
                 if hits.len() >= MAX_SEARCH_HITS {
                     return Ok(hits);

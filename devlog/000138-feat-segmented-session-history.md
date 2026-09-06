@@ -1,4 +1,4 @@
-# 000137: feat/segmented-session-history
+# 000138: feat/segmented-session-history
 
 **Agent:** Antigravity (gemini-3.7-flash) @ triage branch feat/segmented-session-history
 **Agent (2026-09-04T21:31-0700):** Antigravity (gemini-3.8-flash) @ triage branch feat/segmented-session-history
@@ -43,6 +43,9 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T10:29-0700 `crates/triaged/src/service.rs`: Set `LimitNOFILE=10240` in Linux systemd service unit template and updated unit tests.
 - 2026-09-05T10:29-0700 `crates/triaged/src/storage_tests.rs`: Added unit test `burst_write_oversized_segment_compression_and_reading` for oversized burst write decompression and tail slicing.
 - 2026-09-05T10:29-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Prevented terminal focus stealing in `_activateTerminal` when active DOM element is an input, non-container textarea, or has `isContentEditable == true`.
+- 2026-09-06T06:36-0700 `crates/triaged/src/storage.rs`: Added fast path in `strip_ansi_escapes` for ASCII-only payloads without escape characters, capped search line previews to 2048 bytes with UTF-8 character boundary snapping, and handled directory `NotFound` in `list_session_segments`.
+- 2026-09-06T06:36-0700 `crates/triaged/src/session.rs`, `crates/triaged/src/storage_tests.rs`: Added unit tests verifying monotonic sequence preservation across adopted runtime tail replay, truncate initialization purging of preexisting segments, legacy long line preview bounding, and disappearing directory handling.
+- 2026-09-06T06:36-0700 `devlog/000138-feat-segmented-session-history.md`, `devlog/plans/000138-01-segmented-session-history.md`: Renumbered devlog from 000137 to 000138 to avoid sequence collision with merged PR #160.
 
 ## Decisions
 - 2026-09-04T20:16-0700 8 MiB Segment Size: Rotate session log files at 8 MiB boundaries to balance mmap/IO performance, low file count, and fast decompression times.
@@ -64,6 +67,8 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - 2026-09-05T10:10-0700 Concurrent Segment Listing Invariant: Catch and skip NotFound errors on entry, file type, and metadata queries during segment listing and handover staging, gracefully accommodating background compression worker unlinking.
 - 2026-09-05T10:29-0700 In-Place Oldest Tail Slicing: In multi-segment tail stitching, drain excess bytes from the oldest chunk before pre-allocating the final buffer, avoiding temporary multi-megabyte oversized buffers and full-vector drain operations.
 - 2026-09-05T10:29-0700 Headroom for PTY Burst Writes: Allow up to 16 MiB (`DEFAULT_SEGMENT_SIZE_BYTES * 2`) in compressed segment frame sizing to handle large atomic writes crossing the 8 MiB boundary prior to rotation.
+- 2026-09-06T06:36-0700 Decision: Search Line Preview Length Ceiling: Large log lines are bounded to 2048 bytes with character boundary alignment before returning in SearchHit to prevent IPC serialization stalls and memory bloat.
+- 2026-09-06T06:36-0700 Decision: Zero-Escape ASCII Fast Path: Slices containing no ESC byte (0x1B) and standard whitespace/ASCII characters bypass the escape state machine and convert directly from UTF-8 without buffer allocation.
 
 ## Progress
 - [x] Create worktree `worktrees/segmented-session-history` and branch `feat/segmented-session-history`
@@ -80,13 +85,15 @@ Implement complete session history retention using rolling 8 MiB segment log fil
 - [x] Diagnose and fix recovery duplicate cascade, raised fd limit, and restored muse-triage session
 - [x] Harden segment listing and handover copy against concurrent unlinking races and bound child processes
 - [x] Execute local review-fix loop across 3 rounds until clean stop condition is satisfied
+- [x] Bound search preview length, optimize ascii escape stripping, and renumber devlog
 
 ## Commits
-- 4a2ebd0: feat(storage): implement rolling 8 MiB segment logs with background zstd compression
-- d9a0bd9: fix(storage): harden segment rotation, atomic migration, and zero-allocation search
-- bf6a177: fix(storage): optimize uncompressed segment tail reads and address review feedback
-- 50957f4: fix(daemon): resolve handover recovery duplication, raise file descriptor limits, and bound git timeouts
-- 75257f9: fix(storage): harden segment rotation, search limits, and adoption sequence monotonicity
-- 7ba9574: fix(storage): eliminate segment listing races and optimize utf8 escape stripping
-- HEAD: fix(storage): optimize tail assembly slicing and harden session boundary checks
+- 81b233f: feat(storage): implement rolling 8 MiB segment logs with background zstd compression
+- 1a74b30: fix(storage): harden segment rotation, atomic migration, and zero-allocation search
+- 6a85a0e: fix(storage): optimize uncompressed segment tail reads and address review feedback
+- 47ae888: fix(daemon): resolve handover recovery duplication, raise file descriptor limits, and bound git timeouts
+- f51dc9f: fix(storage): harden segment rotation, search limits, and adoption sequence monotonicity
+- 7d6401c: fix(storage): eliminate segment listing races and optimize utf8 escape stripping
+- 815a3ca: fix(storage): optimize tail assembly slicing and harden session boundary checks
+- HEAD: fix(storage): bound search preview length, optimize ascii escape stripping, and renumber devlog
 

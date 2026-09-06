@@ -1403,10 +1403,17 @@ impl SessionManager {
                         &query_lower,
                         case_insensitive,
                     ) {
+                        const MAX_HIT_PREVIEW_BYTES: usize = 2048;
+                        let preview = if line.len() > MAX_HIT_PREVIEW_BYTES {
+                            let end = line.floor_char_boundary(MAX_HIT_PREVIEW_BYTES);
+                            format!("{}...", &line[..end])
+                        } else {
+                            line.to_string()
+                        };
                         hits.push(crate::storage::SearchHit {
                             segment_index: 1,
                             line_number: idx + 1,
-                            line_text: line.to_string(),
+                            line_text: preview,
                         });
                         if hits.len() >= crate::storage::MAX_SEARCH_HITS {
                             break;
@@ -1426,17 +1433,28 @@ impl SessionManager {
         case_insensitive: bool,
     ) -> Result<HashMap<SessionId, Vec<crate::storage::SearchHit>>> {
         let sessions = self.sessions()?;
-        let session_ids: Vec<SessionId> = sessions.keys().cloned().collect();
+        let mut session_ids: Vec<SessionId> = sessions.keys().cloned().collect();
         drop(sessions);
+        session_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
+        const MAX_TOTAL_SEARCH_HITS: usize = 20_000;
         let mut all_hits = HashMap::new();
+        let mut total_hits = 0;
         for session_id in session_ids {
-            if let Some(hits) = self
+            if let Some(mut hits) = self
                 .search_session_logs(&session_id, query, case_insensitive)
                 .ok()
                 .filter(|h| !h.is_empty())
             {
+                let remaining = MAX_TOTAL_SEARCH_HITS.saturating_sub(total_hits);
+                if hits.len() > remaining {
+                    hits.truncate(remaining);
+                }
+                total_hits += hits.len();
                 all_hits.insert(session_id, hits);
+                if total_hits >= MAX_TOTAL_SEARCH_HITS {
+                    break;
+                }
             }
         }
         Ok(all_hits)
@@ -2683,7 +2701,9 @@ fn spawn_adopted_pty_runtime(
     let replayed_working_directory = if replay_len == 0 {
         None
     } else {
-        output.replay_tail(replay_len, &replay)?
+        let cwd = output.replay_tail(replay_len, &replay)?;
+        output.output_seq = h_sess.output_seq;
+        cwd
     };
     let current_working_directory = adopted_session_cwd(
         h_sess.pid,
@@ -6352,6 +6372,7 @@ impl OutputState {
     /// size, and [`read_raw_output_tail`] would then seek to the wrong offset and
     /// hand clients a misaligned history.
     fn replay_tail(&mut self, total_len: u64, tail: &[u8]) -> Result<Option<PathBuf>> {
+        let original_output_seq = self.output_seq;
         let current_working_directory = self.replay(tail)?;
         if total_len != tail.len() as u64 {
             // The cache is only valid as a stand-in for the whole log; it holds
@@ -6359,6 +6380,7 @@ impl OutputState {
             self.log_cache = None;
         }
         self.bytes_logged = total_len;
+        self.output_seq = original_output_seq;
         Ok(current_working_directory)
     }
 
@@ -6544,8 +6566,17 @@ fn spawn_pty_runtime(
         LogInitialization::Truncate => {
             let writer = shared_pty_writer(pair.master.take_writer().context("taking PTY writer")?);
             let terminal = terminal_with_writer(&config.size, writer.clone());
-            if let Some(parent) = config.log_path.parent() {
-                let _ = fs::create_dir_all(parent);
+            let session_dir = resolve_segment_session_dir(&config.log_path)
+                .or_else(|| config.log_path.parent().map(|p| p.to_path_buf()));
+            if let Some(dir) = session_dir {
+                if dir.is_dir()
+                    && let Ok(segments) = crate::storage::list_session_segments(&dir)
+                {
+                    for seg in segments {
+                        let _ = fs::remove_file(seg.path);
+                    }
+                }
+                let _ = fs::create_dir_all(&dir);
             }
             let log = OpenOptions::new()
                 .create(true)
@@ -6692,12 +6723,33 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         let _ = fs::create_dir_all(parent);
     }
 
-    let log = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(&target_log_path)
-        .with_context(|| format!("opening session log {}", target_log_path.display()))?;
+    let log = if target_log_path.exists() {
+        OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&target_log_path)
+            .with_context(|| format!("opening session log {}", target_log_path.display()))?
+    } else if let Some(session_dir) = resolve_segment_session_dir(log_path)
+        && let Ok(segments) = crate::storage::list_session_segments(&session_dir)
+        && let Some(last) = segments.last()
+        && last.is_compressed
+    {
+        // When all existing segments are compressed, resolve_active_segment points to
+        // a future uncompressed segment (e.g. segment-000002.tlog). For historical session
+        // restore, creating this file eagerly pollutes disk with 0-byte files.
+        // Instead, open the existing compressed segment as a read-only descriptor.
+        OpenOptions::new()
+            .read(true)
+            .open(&last.path)
+            .with_context(|| format!("opening historical segment {}", last.path.display()))?
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&target_log_path)
+            .with_context(|| format!("opening session log {}", target_log_path.display()))?
+    };
 
     Ok(OutputState {
         log,
@@ -8135,6 +8187,120 @@ mod tests {
         let empty = has_session_segments(&temp);
         std::fs::remove_dir_all(&temp).ok();
         assert!(!empty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_runtime_preserves_handover_output_seq_without_replay_bump() {
+        let temp = std::env::temp_dir().join(format!(
+            "triage-adopted-output-seq-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_dir = temp.join("sessions").join("session-mono");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        let seg1 = session_dir.join("segment-000001.tlog");
+        std::fs::write(&seg1, b"line 1\r\nline 2\r\n").expect("write segment");
+
+        let h_sess = crate::handover::HandoverSession {
+            id: SessionId::new("session-mono").unwrap(),
+            command: "/bin/sh".into(),
+            args: vec![],
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: seg1,
+            output_seq: 42,
+            bytes_logged: 16,
+            last_activity_ms: 0,
+            pid: std::process::id(),
+            process_identity: None,
+            judge_override: None,
+        };
+
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let ret = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, 0, "openpty failed");
+        unsafe {
+            libc::close(slave);
+        }
+
+        let runtime = spawn_adopted_pty_runtime(&h_sess, master).expect("spawn adopted");
+        assert_eq!(
+            runtime.output.output_seq, 42,
+            "adopted runtime must preserve output_seq without incrementing on tail replay"
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncate_session_initialization_purges_preexisting_segments() {
+        let temp = std::env::temp_dir().join(format!(
+            "triage-truncate-purge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let session_dir = temp.join("sessions").join("session-reuse");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        std::fs::write(session_dir.join("segment-000001.tlog"), b"old 1").expect("write seg1");
+        std::fs::write(session_dir.join("segment-000002.tlog.zst"), b"old 2").expect("write seg2");
+
+        let config = SessionConfig {
+            command: "/bin/sh".into(),
+            args: vec![],
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: session_dir.join("segment-000001.tlog"),
+            session_id: Some(SessionId::new("session-reuse").unwrap()),
+        };
+
+        let runtime =
+            spawn_pty_runtime(config, LogInitialization::Truncate).expect("spawn runtime");
+        drop(runtime);
+        let segments = crate::storage::list_session_segments(&session_dir).expect("list segments");
+        assert_eq!(
+            segments.len(),
+            1,
+            "only the newly truncated active segment must exist"
+        );
+        assert_eq!(segments[0].index, 1);
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn search_session_logs_legacy_bounds_long_line_previews() {
+        let temp = std::env::temp_dir().join(format!(
+            "triage-legacy-preview-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let session_id = SessionId::new("legacy-long").unwrap();
+        let log_path = temp.join("legacy-long.log");
+
+        let mut long_line = "a".repeat(2500);
+        long_line.push_str("TARGET");
+        long_line.push_str(&"b".repeat(2500));
+        long_line.push('\n');
+        std::fs::write(&log_path, &long_line).expect("write legacy log");
+
+        let manager = SessionManager::new(SessionManagerConfig::new(temp.clone()));
+        let hits = manager
+            .search_session_logs(&session_id, "TARGET", false)
+            .expect("search logs");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].line_text.len() <= 2048 + 3);
+        assert!(hits[0].line_text.ends_with("..."));
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[cfg(unix)]

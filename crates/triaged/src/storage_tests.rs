@@ -730,3 +730,13 @@ fn burst_write_oversized_segment_compression_and_reading() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn list_session_segments_returns_empty_when_directory_disappears() {
+    let temp_dir = unique_test_dir();
+    let missing_dir = temp_dir.join("missing-dir");
+    let res = list_session_segments(&missing_dir);
+    assert!(res.is_ok());
+    assert!(res.unwrap().is_empty());
+    let _ = fs::remove_dir_all(&temp_dir);
+}
