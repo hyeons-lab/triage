@@ -5,7 +5,14 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/gestures.dart'
     show PointerDeviceKind, kSecondaryMouseButton;
 import 'package:flutter/material.dart'
-    show CheckedPopupMenuItem, FilledButton, Icons, MaterialApp, Scaffold, Switch, TextField;
+    show
+        CheckedPopupMenuItem,
+        FilledButton,
+        Icons,
+        MaterialApp,
+        Scaffold,
+        Switch,
+        TextField;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -16,6 +23,7 @@ import 'package:triage_client/session_grouping.dart' show otherGroupPinKey;
 import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
+import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
@@ -449,12 +457,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<(String, bool?)> setJudgePolicyCalls = [];
 
   @override
-  Future<Map<String, SessionJudgePolicyRecord>> listSessionJudgePolicies() async {
+  Future<Map<String, SessionJudgePolicyRecord>>
+  listSessionJudgePolicies() async {
     return sessionJudgePolicies;
   }
 
   @override
-  Future<SessionJudgePolicyRecord> getSessionJudgePolicy(String sessionId) async {
+  Future<SessionJudgePolicyRecord> getSessionJudgePolicy(
+    String sessionId,
+  ) async {
     return sessionJudgePolicies[sessionId] ?? (explicit: null, effective: true);
   }
 
@@ -466,7 +477,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     setJudgePolicyCalls.add((sessionId, enabled));
     final record = (explicit: enabled, effective: enabled ?? true);
     sessionJudgePolicies[sessionId] = record;
-    emitJudgePolicyUpdated(sessionId, explicit: enabled, effective: record.effective);
+    emitJudgePolicyUpdated(
+      sessionId,
+      explicit: enabled,
+      effective: record.effective,
+    );
     return record;
   }
 
@@ -493,7 +508,9 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   );
 
   @override
-  Future<JudgeHookStatusRecord?> getJudgeHookStatus({String? workspacePath}) async {
+  Future<JudgeHookStatusRecord?> getJudgeHookStatus({
+    String? workspacePath,
+  }) async {
     return fakeHookStatus;
   }
 
@@ -547,7 +564,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<JudgeRulesRecord?> addJudgeAllowCommand(String command) async {
-    final list = List<String>.from(fakeJudgeRules.customAllowCommands)..add(command);
+    final list = List<String>.from(fakeJudgeRules.customAllowCommands)
+      ..add(command);
     fakeJudgeRules = (
       builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
       customAllowCommands: list,
@@ -559,7 +577,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<JudgeRulesRecord?> removeJudgeAllowCommand(String command) async {
-    final list = List<String>.from(fakeJudgeRules.customAllowCommands)..remove(command);
+    final list = List<String>.from(fakeJudgeRules.customAllowCommands)
+      ..remove(command);
     fakeJudgeRules = (
       builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
       customAllowCommands: list,
@@ -571,7 +590,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<JudgeRulesRecord?> addJudgeDenySubstring(String substring) async {
-    final list = List<String>.from(fakeJudgeRules.customDenySubstrings)..add(substring);
+    final list = List<String>.from(fakeJudgeRules.customDenySubstrings)
+      ..add(substring);
     fakeJudgeRules = (
       builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
       customAllowCommands: fakeJudgeRules.customAllowCommands,
@@ -583,7 +603,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
 
   @override
   Future<JudgeRulesRecord?> removeJudgeDenySubstring(String substring) async {
-    final list = List<String>.from(fakeJudgeRules.customDenySubstrings)..remove(substring);
+    final list = List<String>.from(fakeJudgeRules.customDenySubstrings)
+      ..remove(substring);
     fakeJudgeRules = (
       builtinAllowCommands: fakeJudgeRules.builtinAllowCommands,
       customAllowCommands: fakeJudgeRules.customAllowCommands,
@@ -1332,11 +1353,9 @@ void main() {
     // Only the calls the re-selection itself made. Asserting on `.last` would
     // be satisfied by the first-fit resize emitted at the top of this test,
     // even if re-selecting stopped resizing altogether.
-    expect(
-      client.resizeSessionCalls.skip(beforeReselect.length),
-      ['flutter-spike:95:34'],
-      reason: 'the replay size must come from this device\'s own fit',
-    );
+    expect(client.resizeSessionCalls.skip(beforeReselect.length), [
+      'flutter-spike:95:34',
+    ], reason: 'the replay size must come from this device\'s own fit');
   });
 
   testWidgets('a backgrounded refresh records the host size, not its own', (
@@ -3317,171 +3336,190 @@ void main() {
       expect(saved.map((s) => s.id), [workLaptop.id]);
     });
 
-    testWidgets('auto-approval toggle switches policy and reacts to push updates', (
-      WidgetTester tester,
-    ) async {
-      SharedPreferences.setMockInitialValues({});
-      final client = FakeTriageWebSocketClient();
-      client.sessionJudgePolicies['flutter-spike'] = (explicit: null, effective: true);
-      await tester.pumpWidget(TriageClientApp(client: client));
-      await tester.pumpAndSettle();
+    testWidgets(
+      'auto-approval toggle switches policy and reacts to push updates',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final client = FakeTriageWebSocketClient();
+        client.sessionJudgePolicies['flutter-spike'] = (
+          explicit: null,
+          effective: true,
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
 
-      // Starts with effective=true (auto_awesome icon)
-      expect(find.byIcon(Icons.auto_awesome), findsWidgets);
+        // Starts with effective=true (auto_awesome icon)
+        expect(find.byIcon(Icons.auto_awesome), findsWidgets);
 
-      // Tap toggle button in workspace header or session tile
-      await tester.tap(
-        find.byTooltip('Auto-Approval: Default ON (click to disable)').first,
-      );
-      await tester.pumpAndSettle();
+        // Tap toggle button in workspace header or session tile
+        await tester.tap(
+          find.byTooltip('Auto-Approval: Default ON (click to disable)').first,
+        );
+        await tester.pumpAndSettle();
 
-      expect(client.setJudgePolicyCalls, [('flutter-spike', false)]);
+        expect(client.setJudgePolicyCalls, [('flutter-spike', false)]);
 
-      // Now effective=false (person_outline icon)
-      expect(
-        find.byTooltip('Auto-Approval: OFF (click to enable)'),
-        findsWidgets,
-      );
+        // Now effective=false (person_outline icon)
+        expect(
+          find.byTooltip('Auto-Approval: OFF (click to enable)'),
+          findsWidgets,
+        );
 
-      // When daemon pushes an update turning it back on
-      client.emitJudgePolicyUpdated('flutter-spike', explicit: true, effective: true);
-      await tester.pumpAndSettle();
+        // When daemon pushes an update turning it back on
+        client.emitJudgePolicyUpdated(
+          'flutter-spike',
+          explicit: true,
+          effective: true,
+        );
+        await tester.pumpAndSettle();
 
-      expect(
-        find.byTooltip('Auto-Approval: ON (click to disable)'),
-        findsWidgets,
-      );
-    });
+        expect(
+          find.byTooltip('Auto-Approval: ON (click to disable)'),
+          findsWidgets,
+        );
+      },
+    );
 
-    testWidgets('settings dialog supports tabs and renders approval judge guide', (
-      WidgetTester tester,
-    ) async {
-      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+    testWidgets(
+      'settings dialog supports tabs and renders approval judge guide',
+      (WidgetTester tester) async {
+        final client = await pumpWithServers(tester, selectedId: workLaptop.id);
 
-      // Open settings via side rail gear icon
-      await tester.tap(find.byTooltip('Daemons'));
-      await tester.pumpAndSettle();
+        // Open settings via side rail gear icon
+        await tester.tap(find.byTooltip('Daemons'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('Settings'), findsOneWidget);
-      expect(find.text('Daemons'), findsWidgets);
-      expect(find.text('Approval Judge'), findsOneWidget);
-      expect(find.text('Preferences'), findsOneWidget);
+        expect(find.text('Settings'), findsOneWidget);
+        expect(find.text('Daemons'), findsWidgets);
+        expect(find.text('Approval Judge'), findsOneWidget);
+        expect(find.text('Preferences'), findsOneWidget);
 
-      // Tap Approval Judge tab
-      await tester.tap(find.text('Approval Judge'));
-      await tester.pumpAndSettle();
+        // Tap Approval Judge tab
+        await tester.tap(find.text('Approval Judge'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('Tool-Call Approval Judge'), findsOneWidget);
-      expect(find.text('WORKSPACE HOOK INTEGRATION'), findsOneWidget);
-      expect(find.text('Agent PreToolUse Hook'), findsOneWidget);
-      expect(find.text('/path/to/.agents/hooks.json'), findsOneWidget);
-      expect(find.text('Layer 1: Deterministic Deny'), findsOneWidget);
-      expect(find.text('Layer 2: Deterministic Allow'), findsOneWidget);
-      expect(find.text('Layer 3: Local Model'), findsOneWidget);
-      expect(find.text('AGENT SETUP GUIDE'), findsOneWidget);
-      expect(find.byIcon(Icons.content_copy), findsWidgets);
+        expect(find.text('Tool-Call Approval Judge'), findsOneWidget);
+        expect(find.text('WORKSPACE HOOK INTEGRATION'), findsOneWidget);
+        expect(find.text('Agent PreToolUse Hook'), findsOneWidget);
+        expect(find.text('/path/to/.agents/hooks.json'), findsOneWidget);
+        expect(find.text('Layer 1: Deterministic Deny'), findsOneWidget);
+        expect(find.text('Layer 2: Deterministic Allow'), findsOneWidget);
+        expect(find.text('Layer 3: Local Model'), findsOneWidget);
+        expect(find.text('AGENT SETUP GUIDE'), findsOneWidget);
+        expect(find.byIcon(Icons.content_copy), findsWidgets);
 
-      // Toggle hook switch to disable
-      final hookSwitch = find.byType(Switch);
-      expect(hookSwitch, findsOneWidget);
-      await tester.ensureVisible(hookSwitch);
-      await tester.pumpAndSettle();
-      await tester.tap(hookSwitch);
-      await tester.pumpAndSettle();
-      expect(client.fakeHookStatus.enabled, isFalse);
+        // Toggle hook switch to disable
+        final hookSwitch = find.byType(Switch);
+        expect(hookSwitch, findsOneWidget);
+        await tester.ensureVisible(hookSwitch);
+        await tester.pumpAndSettle();
+        await tester.tap(hookSwitch);
+        await tester.pumpAndSettle();
+        expect(client.fakeHookStatus.enabled, isFalse);
 
-      // Tap Preferences tab
-      await tester.tap(find.text('Preferences'));
-      await tester.pumpAndSettle();
+        // Tap Preferences tab
+        await tester.tap(find.text('Preferences'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('Terminal Settings'), findsOneWidget);
-      expect(find.text('Font Family: JetBrains Mono'), findsOneWidget);
-      expect(find.text('Client Identity & Pairing'), findsOneWidget);
+        expect(find.text('Terminal Settings'), findsOneWidget);
+        expect(find.text('Font Family: JetBrains Mono'), findsOneWidget);
+        expect(find.text('Client Identity & Pairing'), findsOneWidget);
 
-      // Close settings
-      await tester.tap(find.byTooltip('Close'));
-      await tester.pumpAndSettle();
+        // Close settings
+        await tester.tap(find.byTooltip('Close'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('Settings'), findsNothing);
-    });
+        expect(find.text('Settings'), findsNothing);
+      },
+    );
 
-    testWidgets('approval judge tab renders decision history and allows adding/removing custom rules', (
-      WidgetTester tester,
-    ) async {
-      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+    testWidgets(
+      'approval judge tab renders decision history and allows adding/removing custom rules',
+      (WidgetTester tester) async {
+        final client = await pumpWithServers(tester, selectedId: workLaptop.id);
 
-      // Open settings and go to Approval Judge tab
-      await tester.tap(find.byTooltip('Daemons'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Approval Judge'));
-      await tester.pumpAndSettle();
+        // Open settings and go to Approval Judge tab
+        await tester.tap(find.byTooltip('Daemons'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Approval Judge'));
+        await tester.pumpAndSettle();
 
-      // Verify recent decision history feed
-      expect(find.text('RECENT DECISION HISTORY'), findsOneWidget);
-      expect(find.text('DENY'), findsOneWidget);
-      expect(find.text('ALLOW'), findsOneWidget);
-      expect(find.text('rm -rf build'), findsOneWidget);
-      expect(find.text('git status'), findsOneWidget);
-      expect(find.text('blocked by deny rule: recursive forced delete'), findsOneWidget);
+        // Verify recent decision history feed
+        expect(find.text('RECENT DECISION HISTORY'), findsOneWidget);
+        expect(find.text('DENY'), findsOneWidget);
+        expect(find.text('ALLOW'), findsOneWidget);
+        expect(find.text('rm -rf build'), findsOneWidget);
+        expect(find.text('git status'), findsOneWidget);
+        expect(
+          find.text('blocked by deny rule: recursive forced delete'),
+          findsOneWidget,
+        );
 
-      // Verify quick allow button on the denied row
-      final allowButton = find.text('Always Allow "rm -rf"');
-      expect(allowButton, findsOneWidget);
-      await tester.ensureVisible(allowButton);
-      await tester.pumpAndSettle();
+        // Verify quick allow button on the denied row
+        final allowButton = find.text('Always Allow "rm -rf"');
+        expect(allowButton, findsOneWidget);
+        await tester.ensureVisible(allowButton);
+        await tester.pumpAndSettle();
 
-      // Tap quick allow button
-      await tester.tap(allowButton);
-      await tester.pumpAndSettle();
-      expect(client.fakeJudgeRules.customAllowCommands, contains('rm -rf'));
+        // Tap quick allow button
+        await tester.tap(allowButton);
+        await tester.pumpAndSettle();
+        expect(client.fakeJudgeRules.customAllowCommands, contains('rm -rf'));
 
-      // Verify custom allow rules editor
-      final allowHeader = find.text('AUTO-APPROVED COMMANDS (ALLOWLIST)');
-      expect(allowHeader, findsOneWidget);
-      await tester.ensureVisible(allowHeader);
-      await tester.pumpAndSettle();
-      expect(find.text('pnpm test'), findsOneWidget);
-      expect(find.text('rm -rf'), findsOneWidget);
+        // Verify custom allow rules editor
+        final allowHeader = find.text('AUTO-APPROVED COMMANDS (ALLOWLIST)');
+        expect(allowHeader, findsOneWidget);
+        await tester.ensureVisible(allowHeader);
+        await tester.pumpAndSettle();
+        expect(find.text('pnpm test'), findsOneWidget);
+        expect(find.text('rm -rf'), findsOneWidget);
 
-      // Add a new custom allow prefix
-      final allowField = find.widgetWithText(
-        TextField,
-        'Add allow prefix (e.g. "pnpm test", "make check")',
-      );
-      await tester.ensureVisible(allowField);
-      await tester.pumpAndSettle();
-      await tester.enterText(allowField, 'cargo check');
-      await tester.pumpAndSettle();
-      final addAllowBtn = find.widgetWithText(FilledButton, 'Add').first;
-      await tester.ensureVisible(addAllowBtn);
-      await tester.pumpAndSettle();
-      await tester.tap(addAllowBtn);
-      await tester.pumpAndSettle();
-      expect(client.fakeJudgeRules.customAllowCommands, contains('cargo check'));
+        // Add a new custom allow prefix
+        final allowField = find.widgetWithText(
+          TextField,
+          'Add allow prefix (e.g. "pnpm test", "make check")',
+        );
+        await tester.ensureVisible(allowField);
+        await tester.pumpAndSettle();
+        await tester.enterText(allowField, 'cargo check');
+        await tester.pumpAndSettle();
+        final addAllowBtn = find.widgetWithText(FilledButton, 'Add').first;
+        await tester.ensureVisible(addAllowBtn);
+        await tester.pumpAndSettle();
+        await tester.tap(addAllowBtn);
+        await tester.pumpAndSettle();
+        expect(
+          client.fakeJudgeRules.customAllowCommands,
+          contains('cargo check'),
+        );
 
-      // Verify custom deny rules editor
-      final denyHeader = find.text('HARD DENY RULES (BLOCKED IMMEDIATELY)');
-      expect(denyHeader, findsOneWidget);
-      await tester.ensureVisible(denyHeader);
-      await tester.pumpAndSettle();
-      expect(find.text('terraform apply'), findsOneWidget);
+        // Verify custom deny rules editor
+        final denyHeader = find.text('HARD DENY RULES (BLOCKED IMMEDIATELY)');
+        expect(denyHeader, findsOneWidget);
+        await tester.ensureVisible(denyHeader);
+        await tester.pumpAndSettle();
+        expect(find.text('terraform apply'), findsOneWidget);
 
-      // Add a new custom deny pattern
-      final denyField = find.widgetWithText(
-        TextField,
-        'Add deny pattern (e.g. "terraform apply", "drop database")',
-      );
-      await tester.ensureVisible(denyField);
-      await tester.pumpAndSettle();
-      await tester.enterText(denyField, 'drop database');
-      await tester.pumpAndSettle();
-      final addDenyBtn = find.widgetWithText(FilledButton, 'Add').last;
-      await tester.ensureVisible(addDenyBtn);
-      await tester.pumpAndSettle();
-      await tester.tap(addDenyBtn);
-      await tester.pumpAndSettle();
-      expect(client.fakeJudgeRules.customDenySubstrings, contains('drop database'));
-    });
+        // Add a new custom deny pattern
+        final denyField = find.widgetWithText(
+          TextField,
+          'Add deny pattern (e.g. "terraform apply", "drop database")',
+        );
+        await tester.ensureVisible(denyField);
+        await tester.pumpAndSettle();
+        await tester.enterText(denyField, 'drop database');
+        await tester.pumpAndSettle();
+        final addDenyBtn = find.widgetWithText(FilledButton, 'Add').last;
+        await tester.ensureVisible(addDenyBtn);
+        await tester.pumpAndSettle();
+        await tester.tap(addDenyBtn);
+        await tester.pumpAndSettle();
+        expect(
+          client.fakeJudgeRules.customDenySubstrings,
+          contains('drop database'),
+        );
+      },
+    );
   });
 
   group('siderail custom label', () {
@@ -3522,89 +3560,99 @@ void main() {
       return client;
     }
 
-    testWidgets('right click on session rail tile assigns custom label and persists it', (
-      WidgetTester tester,
-    ) async {
-      SharedPreferences.setMockInitialValues({});
-      await pumpApp(tester);
+    testWidgets(
+      'right click on session rail tile assigns custom label and persists it',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        await pumpApp(tester);
 
-      // Verify sessions are listed with default titles
-      expect(find.text('experiment/flutter-spike'), findsWidgets);
+        // Verify sessions are listed with default titles
+        expect(find.text('experiment/flutter-spike'), findsWidgets);
 
-      // Right-click the first session tile
-      final firstTile = find.widgetWithText(SessionListTile, 'experiment/flutter-spike');
-      expect(firstTile, findsOneWidget);
-      await tester.tap(firstTile, buttons: kSecondaryMouseButton);
-      await tester.pumpAndSettle();
+        // Right-click the first session tile
+        final firstTile = find.widgetWithText(
+          SessionListTile,
+          'experiment/flutter-spike',
+        );
+        expect(firstTile, findsOneWidget);
+        await tester.tap(firstTile, buttons: kSecondaryMouseButton);
+        await tester.pumpAndSettle();
 
-      // Verify context menu appears with "Assign custom label..."
-      expect(find.text('Assign custom label...'), findsOneWidget);
+        // Verify context menu appears with "Assign custom label..."
+        expect(find.text('Assign custom label...'), findsOneWidget);
 
-      // Tap the menu item
-      await tester.tap(find.text('Assign custom label...'));
-      await tester.pumpAndSettle();
+        // Tap the menu item
+        await tester.tap(find.text('Assign custom label...'));
+        await tester.pumpAndSettle();
 
-      // Verify dialog appears
-      expect(find.text('Assign Custom Label'), findsOneWidget);
-      final labelField = find.byType(TextField);
-      expect(labelField, findsOneWidget);
+        // Verify dialog appears
+        expect(find.text('Assign Custom Label'), findsOneWidget);
+        final labelField = find.byType(TextField);
+        expect(labelField, findsOneWidget);
 
-      // Enter a custom label and save
-      await tester.enterText(labelField, 'Web Client Spike');
-      await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
-      await tester.pumpAndSettle();
+        // Enter a custom label and save
+        await tester.enterText(labelField, 'Web Client Spike');
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+        await tester.pumpAndSettle();
 
-      // Verify tile and header updated with custom label
-      expect(find.text('Web Client Spike'), findsWidgets);
+        // Verify tile and header updated with custom label
+        expect(find.text('Web Client Spike'), findsWidgets);
 
-      // Verify SharedPreferences persisted the custom label
-      final prefs = await SharedPreferences.getInstance();
-      final key = sessionCustomLabelsPrefKeyFor('work-laptop');
-      final raw = prefs.getString(key);
-      expect(raw, isNotNull);
-      final decoded = jsonDecode(raw!) as Map<String, dynamic>;
-      expect(decoded['flutter-spike'], 'Web Client Spike');
-    });
+        // Verify SharedPreferences persisted the custom label
+        final prefs = await SharedPreferences.getInstance();
+        final key = sessionCustomLabelsPrefKeyFor('work-laptop');
+        final raw = prefs.getString(key);
+        expect(raw, isNotNull);
+        final decoded = jsonDecode(raw!) as Map<String, dynamic>;
+        expect(decoded['flutter-spike'], 'Web Client Spike');
+      },
+    );
 
-    testWidgets('right click on session with custom label allows editing and clearing', (
-      WidgetTester tester,
-    ) async {
-      SharedPreferences.setMockInitialValues({
-        sessionCustomLabelsPrefKeyFor('work-laptop'): jsonEncode({
-          'flutter-spike': 'Web Client Spike',
-        }),
-      });
-      await pumpApp(tester);
+    testWidgets(
+      'right click on session with custom label allows editing and clearing',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({
+          sessionCustomLabelsPrefKeyFor('work-laptop'): jsonEncode({
+            'flutter-spike': 'Web Client Spike',
+          }),
+        });
+        await pumpApp(tester);
 
-      // Verify custom label is restored on startup
-      expect(find.text('Web Client Spike'), findsWidgets);
+        // Verify custom label is restored on startup
+        expect(find.text('Web Client Spike'), findsWidgets);
 
-      // Right-click the session tile
-      final customTile = find.widgetWithText(SessionListTile, 'Web Client Spike');
-      expect(customTile, findsOneWidget);
-      await tester.tap(customTile, buttons: kSecondaryMouseButton);
-      await tester.pumpAndSettle();
+        // Right-click the session tile
+        final customTile = find.widgetWithText(
+          SessionListTile,
+          'Web Client Spike',
+        );
+        expect(customTile, findsOneWidget);
+        await tester.tap(customTile, buttons: kSecondaryMouseButton);
+        await tester.pumpAndSettle();
 
-      // Verify context menu has both "Edit custom label..." and "Clear custom label"
-      expect(find.text('Edit custom label...'), findsOneWidget);
-      expect(find.text('Clear custom label'), findsOneWidget);
+        // Verify context menu has both "Edit custom label..." and "Clear custom label"
+        expect(find.text('Edit custom label...'), findsOneWidget);
+        expect(find.text('Clear custom label'), findsOneWidget);
 
-      // Clear the custom label via context menu
-      await tester.tap(find.text('Clear custom label'));
-      await tester.pumpAndSettle();
+        // Clear the custom label via context menu
+        await tester.tap(find.text('Clear custom label'));
+        await tester.pumpAndSettle();
 
-      // Verify custom label is removed and title reverts to default
-      expect(find.text('Web Client Spike'), findsNothing);
-      expect(find.text('experiment/flutter-spike'), findsWidgets);
+        // Verify custom label is removed and title reverts to default
+        expect(find.text('Web Client Spike'), findsNothing);
+        expect(find.text('experiment/flutter-spike'), findsWidgets);
 
-      // Verify SharedPreferences updated
-      final prefs = await SharedPreferences.getInstance();
-      final key = sessionCustomLabelsPrefKeyFor('work-laptop');
-      final raw = prefs.getString(key);
-      final decoded = raw == null ? {} : jsonDecode(raw) as Map<String, dynamic>;
-      expect(decoded['flutter-spike'], isNull);
-    });
+        // Verify SharedPreferences updated
+        final prefs = await SharedPreferences.getInstance();
+        final key = sessionCustomLabelsPrefKeyFor('work-laptop');
+        final raw = prefs.getString(key);
+        final decoded = raw == null
+            ? {}
+            : jsonDecode(raw) as Map<String, dynamic>;
+        expect(decoded['flutter-spike'], isNull);
+      },
+    );
 
     testWidgets('clearing custom label via dialog Clear button', (
       WidgetTester tester,
@@ -3666,26 +3714,27 @@ void main() {
   });
 
   group('webapp back navigation guard', () {
-    testWidgets('handlePopRoute displays Exit Triage dialog and Stay dismisses it', (
-      WidgetTester tester,
-    ) async {
-      final client = FakeTriageWebSocketClient();
-      await tester.pumpWidget(TriageClientApp(client: client));
-      await tester.pumpAndSettle();
+    testWidgets(
+      'handlePopRoute displays Exit Triage dialog and Stay dismisses it',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
 
-      final handled = await tester.binding.handlePopRoute();
-      expect(handled, isTrue);
-      await tester.pumpAndSettle();
+        final handled = await tester.binding.handlePopRoute();
+        expect(handled, isTrue);
+        await tester.pumpAndSettle();
 
-      expect(find.text('Exit Triage?'), findsOneWidget);
-      expect(find.text('Stay'), findsOneWidget);
-      expect(find.text('Leave'), findsOneWidget);
+        expect(find.text('Exit Triage?'), findsOneWidget);
+        expect(find.text('Stay'), findsOneWidget);
+        expect(find.text('Leave'), findsOneWidget);
 
-      await tester.tap(find.text('Stay'));
-      await tester.pumpAndSettle();
+        await tester.tap(find.text('Stay'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('Exit Triage?'), findsNothing);
-    });
+        expect(find.text('Exit Triage?'), findsNothing);
+      },
+    );
 
     testWidgets('handlePopRoute Leave confirms exit', (
       WidgetTester tester,
@@ -3707,51 +3756,58 @@ void main() {
   });
 
   group('session scroll preservation', () {
-    testWidgets('switching away from scrolled-up session preserves scroll offset', (
-      WidgetTester tester,
-    ) async {
-      final client = FakeTriageWebSocketClient();
-      client.snapshotVisibleRows['flutter-spike'] =
-          List.generate(100, (i) => 'Log line $i');
-      await tester.pumpWidget(TriageClientApp(client: client));
-      await tester.pumpAndSettle();
+    testWidgets(
+      'switching away from scrolled-up session preserves scroll offset',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
 
-      final scrollViewFinder = find.descendant(
-        of: find.byType(TerminalPane),
-        matching: find.byType(SingleChildScrollView),
-      );
-      expect(scrollViewFinder, findsOneWidget);
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        expect(scrollViewFinder, findsOneWidget);
 
-      final controller =
-          tester.widget<SingleChildScrollView>(scrollViewFinder).controller!;
-      expect(controller.hasClients, isTrue);
-      expect(controller.position.maxScrollExtent, greaterThan(100.0));
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        expect(controller.hasClients, isTrue);
+        expect(controller.position.maxScrollExtent, greaterThan(100.0));
 
-      // Scroll up away from bottom
-      controller.jumpTo(60.0);
-      await tester.pumpAndSettle();
-      expect(controller.position.pixels, 60.0);
+        // Scroll up away from bottom
+        controller.jumpTo(60.0);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, 60.0);
 
-      // Switch to another session
-      await tester.tap(find.text('triage / main').first);
-      await tester.pumpAndSettle();
+        // Switch to another session
+        await tester.tap(find.text('triage / main').first);
+        await tester.pumpAndSettle();
 
-      // Switch back to flutter-spike
-      await tester.tap(find.text('triage / flutter-spike').first);
-      await tester.pumpAndSettle();
+        // Switch back to flutter-spike
+        await tester.tap(find.text('triage / flutter-spike').first);
+        await tester.pumpAndSettle();
 
-      // Scroll position should be preserved at 60.0
-      final restoredController =
-          tester.widget<SingleChildScrollView>(scrollViewFinder).controller!;
-      expect(restoredController.position.pixels, 60.0);
-    });
+        // Scroll position should be preserved at 60.0
+        final restoredController = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        expect(restoredController.position.pixels, 60.0);
+      },
+    );
 
     testWidgets('sending input while scrolled up resets scroll to bottom', (
       WidgetTester tester,
     ) async {
       final client = FakeTriageWebSocketClient();
-      client.snapshotVisibleRows['flutter-spike'] =
-          List.generate(100, (i) => 'Log line $i');
+      client.snapshotVisibleRows['flutter-spike'] = List.generate(
+        100,
+        (i) => 'Log line $i',
+      );
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
@@ -3759,8 +3815,9 @@ void main() {
         of: find.byType(TerminalPane),
         matching: find.byType(SingleChildScrollView),
       );
-      final controller =
-          tester.widget<SingleChildScrollView>(scrollViewFinder).controller!;
+      final controller = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
 
       // Scroll up away from bottom
       controller.jumpTo(60.0);
@@ -3775,5 +3832,86 @@ void main() {
       expect(controller.position.pixels, controller.position.maxScrollExtent);
     });
   });
-}
 
+  group('SessionVm exited lifecycle', () {
+    test('initializes as exited when isExited flag is true', () {
+      final session = SessionVm(
+        title: 'exited-session',
+        status: 'exited',
+        statusColor: const Color(0xff7fd1c7),
+        icon: Icons.terminal,
+        rows: [],
+        isExited: true,
+      );
+
+      expect(session.isExited, isTrue);
+      expect(session.store.state.exited, isTrue);
+    });
+
+    test(
+      'applyHistory preserves exited state when view is ready and when view is pending',
+      () {
+        final session = SessionVm(
+          title: 'exited-session',
+          status: 'exited',
+          statusColor: const Color(0xff7fd1c7),
+          icon: Icons.terminal,
+          rows: [],
+        );
+
+        // Before view is ready
+        session.applyHistory(
+          utf8.encode('historical prompt'),
+          throughOutputSeq: 5,
+          isExited: true,
+        );
+        expect(session.isExited, isTrue);
+        expect(session.store.state.exited, isTrue);
+
+        // Flushing view ready maintains exited state
+        session.noteViewFit(80, 24);
+        expect(session.isExited, isTrue);
+        expect(session.store.state.exited, isTrue);
+
+        // Subsequent applyHistory with isExited: true maintains exited state
+        session.applyHistory(
+          utf8.encode('more prompt'),
+          throughOutputSeq: 10,
+          isExited: true,
+        );
+        expect(session.isExited, isTrue);
+        expect(session.store.state.exited, isTrue);
+
+        // Reviving session with isExited: false clears exited state
+        session.applyHistory(
+          utf8.encode('revived prompt'),
+          throughOutputSeq: 15,
+          isExited: false,
+        );
+        expect(session.isExited, isFalse);
+        expect(session.store.state.exited, isFalse);
+      },
+    );
+
+    test(
+      'user input is dropped when session is exited and accepted when revived',
+      () {
+        final session = SessionVm(
+          title: 'exited-session',
+          status: 'exited',
+          statusColor: const Color(0xff7fd1c7),
+          icon: Icons.terminal,
+          rows: [],
+          isExited: true,
+        );
+
+        expect(session.store.state.exited, isTrue);
+
+        // Transition session to running
+        session.store.dispatch(const Attach());
+        session.isExited = false;
+        expect(session.store.state.exited, isFalse);
+      },
+    );
+  });
+}

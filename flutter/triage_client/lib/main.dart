@@ -24,6 +24,7 @@ import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
+import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
@@ -377,9 +378,13 @@ class SessionVm {
     // Seed the inferred worktree from the constructor's own context so an attach
     // straight into a worktree is remembered from the first frame.
     _recordInferredWorktree();
+    if (isExited) {
+      markExited();
+    }
   }
 
   final String title;
+
   /// Optional user-assigned label that overrides the automatic workstream title.
   String? customLabel;
   // Git context for this session, from the snapshot context and refreshed live
@@ -437,6 +442,7 @@ class SessionVm {
 
   /// Explicit user override for tool-call auto-approval judging (null = inherit daemon default).
   bool? judgePolicyExplicit;
+
   /// Effective auto-approval judge policy (true = auto-approval enabled, false = manual approval).
   bool judgePolicyEffective = true;
 
@@ -451,10 +457,7 @@ class SessionVm {
     TerminalPane.setBracketedPasteMode(title, enabled);
   }
 
-  void applyJudgePolicy({
-    required bool? explicit,
-    required bool effective,
-  }) {
+  void applyJudgePolicy({required bool? explicit, required bool effective}) {
     judgePolicyExplicit = explicit;
     judgePolicyEffective = effective;
   }
@@ -688,10 +691,9 @@ class SessionVm {
     String query, [
     DateTime? now,
     bool queryIsNormalized = false,
-  ]) => toSearchInput(now).matchesQuery(
-    query,
-    queryIsNormalized: queryIsNormalized,
-  );
+  ]) => toSearchInput(
+    now,
+  ).matchesQuery(query, queryIsNormalized: queryIsNormalized);
 
   final String? sessionId;
   final IconData icon;
@@ -774,16 +776,31 @@ class SessionVm {
   }
 
   /// Begin the attach/resync lifecycle and stage the raw output-history tail.
-  /// [Attach] is dispatched now so live chunks buffer in arrival order; the
-  /// actual [HistoryBytes] replay is deferred until the view reports its fitted
-  /// size (see [noteViewFit]) and replays at that size — the host capture size
-  /// is intentionally not used. Live chunks at or below [throughOutputSeq] are
-  /// dropped by the store as duplicates.
-  void applyHistory(List<int> rawOutput, {int? throughOutputSeq}) {
-    _pendingHistory = _PendingHistory(rawOutput, throughOutputSeq);
-    store.dispatch(const Attach());
+  /// [Attach] is dispatched if not already live so live chunks buffer in arrival
+  /// order; the actual [HistoryBytes] replay is deferred until the view reports
+  /// its fitted size (see [noteViewFit]) and replays at that size (the host
+  /// capture size is intentionally not used). Live chunks at or below
+  /// [throughOutputSeq] are dropped by the store as duplicates.
+  void applyHistory(
+    List<int> rawOutput, {
+    int? throughOutputSeq,
+    int? rawOutputStart,
+    bool isExited = false,
+  }) {
+    _pendingHistory = _PendingHistory(
+      rawOutput,
+      throughOutputSeq,
+      rawOutputStart: rawOutputStart,
+    );
+    final wasExited = this.isExited || store.state.exited;
+    if (store.state.phase != AttachPhase.live || wasExited) {
+      store.dispatch(const Attach());
+    }
+    this.isExited = isExited;
     if (_viewReady) {
       _flushPendingHistory();
+    } else if (isExited) {
+      markExited();
     }
   }
 
@@ -806,8 +823,12 @@ class SessionVm {
         cols: _viewCols,
         rows: _viewRows,
         throughOutputSeq: pending.throughOutputSeq,
+        rawOutputStart: pending.rawOutputStart,
       ),
     );
+    if (isExited) {
+      markExited();
+    }
   }
 
   /// Apply a live raw output chunk (remote PTY bytes) through the write path.
@@ -834,10 +855,15 @@ class SessionVm {
 
 /// Staged attach/resync history awaiting the view's first fit.
 class _PendingHistory {
-  const _PendingHistory(this.rawOutput, this.throughOutputSeq);
+  const _PendingHistory(
+    this.rawOutput,
+    this.throughOutputSeq, {
+    this.rawOutputStart,
+  });
 
   final List<int> rawOutput;
   final int? throughOutputSeq;
+  final int? rawOutputStart;
 }
 
 class TriageHome extends StatefulWidget {
@@ -1406,11 +1432,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Opens the server manager (gear icon / connect-failure action).
-  Future<void> _openConnectionSettings({SettingsTab initialTab = SettingsTab.daemons}) async {
+  Future<void> _openConnectionSettings({
+    SettingsTab initialTab = SettingsTab.daemons,
+  }) async {
     final selected = (_selectedIndex >= 0 && _selectedIndex < _sessions.length)
         ? _sessions[_selectedIndex]
         : null;
-    final workspacePath = selected?.repoRoot ?? selected?.worktreeRoot ?? selected?.cwd;
+    final workspacePath =
+        selected?.repoRoot ?? selected?.worktreeRoot ?? selected?.cwd;
     await showDialog<void>(
       context: context,
       builder: (context) => SettingsDialog(
@@ -2546,7 +2575,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                   entry.value.toString().trim().isNotEmpty)
                 (entry.key.toString().startsWith('triage / ')
                     ? entry.key.toString().substring('triage / '.length)
-                    : entry.key.toString()): entry.value.toString().trim(),
+                    : entry.key.toString()): entry.value
+                    .toString()
+                    .trim(),
           };
         }
       }
@@ -2600,8 +2631,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _client
             .setSessionCustomLabel(
               sessionId: session.remoteSessionId!,
-              customLabel:
-                  trimmed != null && trimmed.isNotEmpty ? trimmed : null,
+              customLabel: trimmed != null && trimmed.isNotEmpty
+                  ? trimmed
+                  : null,
             )
             .catchError((_) {}),
       );
@@ -2758,10 +2790,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (syncToDaemon && _clientInitialized && _client.isConnected) {
       unawaited(
         _client
-            .setRailPins(
-              groupKeys: pins.groupKeys,
-              sessionIds: pins.sessionIds,
-            )
+            .setRailPins(groupKeys: pins.groupKeys, sessionIds: pins.sessionIds)
             .catchError((_) {}),
       );
     }
@@ -3077,9 +3106,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.setBracketedPasteEnabled(bracketedPaste);
       // Replay the raw output-history tail through the single write path. Live
       // chunks already covered by this snapshot are dropped by output_seq.
+      final rawOutputStart = snapshot?['raw_output_start'] as int?;
       session.applyHistory(
         _rawOutputFromSnapshot(snapshot ?? const {}),
         throughOutputSeq: outputSeq,
+        rawOutputStart: rawOutputStart,
+        isExited: exited,
       );
       _setupSessionInputListener(session);
       return session;
@@ -3275,12 +3307,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final bool? explicitVal;
       final bool effective;
       if (policy != null) {
-        hasExplicit = policy.containsKey('explicit') && policy['explicit'] != null;
+        hasExplicit =
+            policy.containsKey('explicit') && policy['explicit'] != null;
         explicitVal = policy['explicit'] as bool?;
         effective = policy['effective'] as bool? ?? false;
       } else {
-        hasExplicit = message['has_pinned'] as bool? ?? (message.containsKey('explicit') && message['explicit'] != null);
-        explicitVal = message['pinned'] as bool? ?? (message['explicit'] as bool?);
+        hasExplicit =
+            message['has_pinned'] as bool? ??
+            (message.containsKey('explicit') && message['explicit'] != null);
+        explicitVal =
+            message['pinned'] as bool? ?? (message['explicit'] as bool?);
         effective = message['effective'] as bool? ?? false;
       }
       void apply() {
@@ -3311,10 +3347,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           listEquals(_pins.sessionIds, sessionIds)) {
         return;
       }
-      final pins = SessionPins(
-        groupKeys: groupKeys,
-        sessionIds: sessionIds,
-      );
+      final pins = SessionPins(groupKeys: groupKeys, sessionIds: sessionIds);
       _applyPins(pins, persist: true, syncToDaemon: false);
       return;
     }
@@ -3333,8 +3366,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       for (final session in _sessions) {
         if (session.remoteSessionId == sessionId) {
-          session.customLabel =
-              (trimmed != null && trimmed.isNotEmpty) ? trimmed : null;
+          session.customLabel = (trimmed != null && trimmed.isNotEmpty)
+              ? trimmed
+              : null;
         }
       }
       unawaited(_persistCustomLabels());
@@ -3455,6 +3489,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final fittedRows = renderSize?.$1 ?? rowsVal;
     final rawOutput = _rawOutputFromSnapshot(snapshot);
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
+    final snapshotRawOutputStart = snapshot['raw_output_start'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
 
     // Replay history through the single write path: raw PTY bytes, not the
@@ -3462,7 +3497,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // session, avoid clearing and re-emulating the buffer so scroll position and
     // existing scrollback are preserved.
     if (replayHistory || !session.loaded) {
-      session.applyHistory(rawOutput, throughOutputSeq: snapshotOutputSeq);
+      session.applyHistory(
+        rawOutput,
+        throughOutputSeq: snapshotOutputSeq,
+        rawOutputStart: snapshotRawOutputStart,
+        isExited: exited,
+      );
+    } else if (exited != session.isExited) {
+      session.isExited = exited;
+      if (exited) {
+        session.markExited();
+      } else {
+        session.store.dispatch(const Attach());
+      }
     }
     final bracketedPaste =
         snapshot['bracketed_paste_enabled'] as bool? ?? false;
@@ -3512,9 +3559,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   /// Extracts the raw output-history tail from a parsed snapshot map. Empty when
   /// the host did not carry history (old host, or a resize broadcast).
-  List<int> _rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
+  Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
     final raw = snapshot['raw_output'];
-    return raw is List ? raw.cast<int>() : const <int>[];
+    if (raw is Uint8List) return raw;
+    if (raw is List) {
+      return Uint8List.fromList(raw.cast<int>());
+    }
+    return Uint8List(0);
   }
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
@@ -3890,9 +3941,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               snapshot?['bracketed_paste_enabled'] as bool? ?? false;
           session.setBracketedPasteEnabled(bracketedPaste);
           _setupSessionInputListener(session);
+          final rawOutputStart = snapshot?['raw_output_start'] as int?;
           session.applyHistory(
             _rawOutputFromSnapshot(snapshot ?? const {}),
             throughOutputSeq: outputSeq,
+            rawOutputStart: rawOutputStart,
+            isExited: exited,
           );
 
           // Rank it above everything already on the rail. The daemon has no
@@ -4022,10 +4076,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (_clientInitialized && _client.isConnected) {
           unawaited(
             _client
-                .setSessionCustomLabel(
-                  sessionId: sessionId,
-                  customLabel: null,
-                )
+                .setSessionCustomLabel(sessionId: sessionId, customLabel: null)
                 .catchError((_) {}),
           );
         }
@@ -4175,10 +4226,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                     'Clear custom label',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: Color(0xffcdd7d6),
-                      fontSize: 13,
-                    ),
+                    style: TextStyle(color: Color(0xffcdd7d6), fontSize: 13),
                   ),
                 ),
               ],
@@ -4200,9 +4248,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final result = await showDialog<String>(
       context: context,
       barrierColor: Colors.black.withValues(alpha: 0.55),
-      builder: (dialogContext) => _CustomLabelDialog(
-        initialLabel: session.customLabel,
-      ),
+      builder: (dialogContext) =>
+          _CustomLabelDialog(initialLabel: session.customLabel),
     );
 
     if (!mounted || result == null) return;
@@ -4406,8 +4453,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           if (isMobile) collapseRail();
         },
         selectedShell: _newSessionShell,
-        shellOptions: newSessionShellMenuOrderForPlatform(defaultTargetPlatform),
-        showShellMenu: showNewSessionShellMenuForPlatform(defaultTargetPlatform),
+        shellOptions: newSessionShellMenuOrderForPlatform(
+          defaultTargetPlatform,
+        ),
+        showShellMenu: showNewSessionShellMenuForPlatform(
+          defaultTargetPlatform,
+        ),
         connectionStatus: _connectionStatus,
         connectionStatusColor: _connectionStatusColor,
         serverLabel: _activeServer?.label,
@@ -4749,7 +4800,9 @@ class _SessionRailState extends State<SessionRail> {
           maxWidth: railWidth,
           child: SizedBox(
             width: railWidth,
-            child: widget.isCollapsed ? _buildCollapsedRail() : _buildExpandedRail(),
+            child: widget.isCollapsed
+                ? _buildCollapsedRail()
+                : _buildExpandedRail(),
           ),
         ),
       ),
@@ -4794,11 +4847,7 @@ class _SessionRailState extends State<SessionRail> {
         IconButton(
           onPressed: widget.onOpenSettings,
           tooltip: 'Daemons',
-          icon: const Icon(
-            Icons.settings,
-            color: Color(0xff7f8b8d),
-            size: 20,
-          ),
+          icon: const Icon(Icons.settings, color: Color(0xff7f8b8d), size: 20),
         ),
         const SizedBox(height: 12),
         const Divider(height: 1, color: Color(0xff263033)),
@@ -4817,19 +4866,19 @@ class _SessionRailState extends State<SessionRail> {
                         onTap: () => widget.onSelectSession(indexed.$1),
                         onTapDown: widget.onSessionContextMenu != null
                             ? (details) =>
-                                _lastTapDownPosition = details.globalPosition
+                                  _lastTapDownPosition = details.globalPosition
                             : null,
                         onSecondaryTapDown: widget.onSessionContextMenu != null
                             ? (details) => widget.onSessionContextMenu!(
-                                  indexed.$2,
-                                  details.globalPosition,
-                                )
+                                indexed.$2,
+                                details.globalPosition,
+                              )
                             : null,
                         onLongPress: widget.onSessionContextMenu != null
                             ? () => widget.onSessionContextMenu!(
-                                  indexed.$2,
-                                  _lastTapDownPosition,
-                                )
+                                indexed.$2,
+                                _lastTapDownPosition,
+                              )
                             : null,
                         borderRadius: BorderRadius.circular(8),
                         child: Container(
@@ -5027,11 +5076,7 @@ class _SessionRailState extends State<SessionRail> {
               padding: const EdgeInsets.symmetric(horizontal: 8),
               child: Row(
                 children: [
-                  const Icon(
-                    Icons.search,
-                    size: 16,
-                    color: Color(0xff7f8b8d),
-                  ),
+                  const Icon(Icons.search, size: 16, color: Color(0xff7f8b8d)),
                   const SizedBox(width: 6),
                   Expanded(
                     child: TextField(
@@ -5160,14 +5205,17 @@ class _SessionRailState extends State<SessionRail> {
                         snippet: session.snippet,
                         snippetDetail: session.snippetDetail,
                         activityAt: session.snippetUpdatedAt,
-                        pinned: widget.pins.sessionIds
-                            .contains(session.remoteSessionId),
+                        pinned: widget.pins.sessionIds.contains(
+                          session.remoteSessionId,
+                        ),
                         onUnpin: session.remoteSessionId == null
                             ? null
-                            : () =>
-                                widget.onUnpinSession(session.remoteSessionId!),
-                        indistinguishable:
-                            indistinguishable.contains(originalIndex),
+                            : () => widget.onUnpinSession(
+                                session.remoteSessionId!,
+                              ),
+                        indistinguishable: indistinguishable.contains(
+                          originalIndex,
+                        ),
                         judgeEffective: session.judgePolicyEffective,
                         judgeExplicit: session.judgePolicyExplicit,
                         customLabel: session.trimmedCustomLabel,
@@ -5177,12 +5225,13 @@ class _SessionRailState extends State<SessionRail> {
                         onTap: () => widget.onSelectSession(originalIndex),
                         onContextMenu: widget.onSessionContextMenu != null
                             ? (position) => widget.onSessionContextMenu!(
-                                  session,
-                                  position,
-                                )
+                                session,
+                                position,
+                              )
                             : null,
                       );
-                      final lifted = item.groupKey.isNotEmpty &&
+                      final lifted =
+                          item.groupKey.isNotEmpty &&
                           item.groupKey == widget.draggingGroupKey;
                       final tileForDrag = Opacity(
                         opacity: lifted ? 0.4 : 1.0,
@@ -5342,15 +5391,13 @@ class _JudgeToggleButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final tooltip = effective
         ? (explicit == true
-            ? 'Auto-Approval: ON (click to disable)'
-            : 'Auto-Approval: Default ON (click to disable)')
+              ? 'Auto-Approval: ON (click to disable)'
+              : 'Auto-Approval: Default ON (click to disable)')
         : (explicit == false
-            ? 'Auto-Approval: OFF (click to enable)'
-            : 'Auto-Approval: Default OFF (click to enable)');
+              ? 'Auto-Approval: OFF (click to enable)'
+              : 'Auto-Approval: Default OFF (click to enable)');
 
-    final color = effective
-        ? const Color(0xff7fd1c7)
-        : const Color(0xffffc857);
+    final color = effective ? const Color(0xff7fd1c7) : const Color(0xffffc857);
 
     return Padding(
       padding: const EdgeInsets.only(left: 6),
@@ -5444,16 +5491,10 @@ class _ConnectionStatus extends StatelessWidget {
   }
 }
 
-enum SettingsTab {
-  daemons,
-  judge,
-  preferences,
-}
+enum SettingsTab { daemons, judge, preferences }
 
 class _CodeSnippetBox extends StatefulWidget {
-  const _CodeSnippetBox({
-    required this.code,
-  });
+  const _CodeSnippetBox({required this.code});
 
   final String code;
 
@@ -5579,7 +5620,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
 
   final TextEditingController _allowRuleController = TextEditingController();
   final TextEditingController _denyRuleController = TextEditingController();
-  final TextEditingController _historySearchController = TextEditingController();
+  final TextEditingController _historySearchController =
+      TextEditingController();
   String _historyFilter = 'all';
   String _historySearchQuery = '';
   int _historyDisplayLimit = 50;
@@ -5662,7 +5704,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
     final client = widget.client;
     if (client == null) return;
     setState(() => _loadingHookStatus = true);
-    final status = await client.getJudgeHookStatus(workspacePath: widget.workspacePath);
+    final status = await client.getJudgeHookStatus(
+      workspacePath: widget.workspacePath,
+    );
     if (mounted) {
       setState(() {
         _hookStatus = status;
@@ -5781,18 +5825,29 @@ class _SettingsDialogState extends State<SettingsDialog> {
             children: [
               Row(
                 children: [
-                  const Icon(Icons.settings, color: Color(0xff7fd1c7), size: 22),
+                  const Icon(
+                    Icons.settings,
+                    color: Color(0xff7fd1c7),
+                    size: 22,
+                  ),
                   const SizedBox(width: 10),
                   const Expanded(
                     child: Text(
                       'Settings',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                   IconButton(
                     onPressed: () => Navigator.of(context).pop(),
                     tooltip: 'Close',
-                    icon: const Icon(Icons.close, color: Color(0xff7f8b8d), size: 20),
+                    icon: const Icon(
+                      Icons.close,
+                      color: Color(0xff7f8b8d),
+                      size: 20,
+                    ),
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(),
                   ),
@@ -5985,7 +6040,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 14,
-                        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                        fontWeight: isSelected
+                            ? FontWeight.w700
+                            : FontWeight.w500,
                       ),
                     ),
                     subtitle: Text(
@@ -6053,22 +6110,34 @@ class _SettingsDialogState extends State<SettingsDialog> {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.auto_awesome, color: Color(0xff7fd1c7), size: 18),
+                    const Icon(
+                      Icons.auto_awesome,
+                      color: Color(0xff7fd1c7),
+                      size: 18,
+                    ),
                     const SizedBox(width: 8),
                     const Expanded(
                       child: Text(
                         'Tool-Call Approval Judge',
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ),
                     const SizedBox(width: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
                       decoration: BoxDecoration(
                         color: const Color(0xff7fd1c7).withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: const Color(0xff7fd1c7).withValues(alpha: 0.3)),
+                        border: Border.all(
+                          color: const Color(0xff7fd1c7).withValues(alpha: 0.3),
+                        ),
                       ),
                       child: const Text(
                         'Local AI · LFM2-2.6B',
@@ -6084,7 +6153,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 const SizedBox(height: 8),
                 const Text(
                   'Auto-approves routine agent commands (reads, checks, tests) while stopping dangerous ones for manual confirmation. All decisions are evaluated locally in daemon memory with zero cloud telemetry.',
-                  style: TextStyle(fontSize: 13, color: Color(0xff9aa6a8), height: 1.4),
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Color(0xff9aa6a8),
+                    height: 1.4,
+                  ),
                 ),
               ],
             ),
@@ -6143,7 +6216,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
                             ),
                             const SizedBox(height: 2),
                             Text(
-                              _hookStatus != null && _hookStatus!.path.isNotEmpty
+                              _hookStatus != null &&
+                                      _hookStatus!.path.isNotEmpty
                                   ? _hookStatus!.path
                                   : '.agents/hooks.json',
                               style: const TextStyle(
@@ -6163,7 +6237,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
                           height: 24,
                           child: CircularProgressIndicator(
                             strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation(Color(0xff7fd1c7)),
+                            valueColor: AlwaysStoppedAnimation(
+                              Color(0xff7fd1c7),
+                            ),
                           ),
                         )
                       else
@@ -6174,14 +6250,19 @@ class _SettingsDialogState extends State<SettingsDialog> {
                           activeTrackColor: const Color(0xff233c3e),
                           inactiveThumbColor: const Color(0xff7f8b8d),
                           inactiveTrackColor: const Color(0xff1b2426),
-                          onChanged: widget.client != null ? _toggleHookConfig : null,
+                          onChanged: widget.client != null
+                              ? _toggleHookConfig
+                              : null,
                         ),
                     ],
                   ),
                   if (_hookStatus?.enabled == true) ...[
                     const SizedBox(height: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
                       decoration: BoxDecoration(
                         color: const Color(0xff7fd1c7).withValues(alpha: 0.1),
                         borderRadius: BorderRadius.circular(4),
@@ -6207,14 +6288,21 @@ class _SettingsDialogState extends State<SettingsDialog> {
                   if (_hookStatus != null && !_hookStatus!.shimInstalled) ...[
                     const SizedBox(height: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
                       decoration: BoxDecoration(
                         color: const Color(0xffffc857).withValues(alpha: 0.1),
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: const Row(
                         children: [
-                          Icon(Icons.warning_amber_rounded, size: 14, color: Color(0xffffc857)),
+                          Icon(
+                            Icons.warning_amber_rounded,
+                            size: 14,
+                            color: Color(0xffffc857),
+                          ),
                           SizedBox(width: 6),
                           Expanded(
                             child: Text(
@@ -6244,7 +6332,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
             builder: (context) {
               final filteredHistory = history.reversed.where((item) {
                 if (_historyFilter != 'all') {
-                  if (item.decision.toLowerCase() != _historyFilter) return false;
+                  if (item.decision.toLowerCase() != _historyFilter) {
+                    return false;
+                  }
                 }
                 if (_historySearchQuery.isNotEmpty) {
                   final q = _historySearchQuery.toLowerCase();
@@ -6262,15 +6352,19 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 return true;
               }).toList();
 
-              final allowTotal =
-                  history.where((i) => i.decision.toLowerCase() == 'allow').length;
-              final askTotal =
-                  history.where((i) => i.decision.toLowerCase() == 'ask').length;
-              final denyTotal =
-                  history.where((i) => i.decision.toLowerCase() == 'deny').length;
+              final allowTotal = history
+                  .where((i) => i.decision.toLowerCase() == 'allow')
+                  .length;
+              final askTotal = history
+                  .where((i) => i.decision.toLowerCase() == 'ask')
+                  .length;
+              final denyTotal = history
+                  .where((i) => i.decision.toLowerCase() == 'deny')
+                  .length;
 
-              final displayedItems =
-                  filteredHistory.take(_historyDisplayLimit).toList();
+              final displayedItems = filteredHistory
+                  .take(_historyDisplayLimit)
+                  .toList();
 
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -6294,13 +6388,19 @@ class _SettingsDialogState extends State<SettingsDialog> {
                           height: 14,
                           child: CircularProgressIndicator(
                             strokeWidth: 1.5,
-                            valueColor: AlwaysStoppedAnimation(Color(0xff7fd1c7)),
+                            valueColor: AlwaysStoppedAnimation(
+                              Color(0xff7fd1c7),
+                            ),
                           ),
                         )
                       else
                         IconButton(
                           onPressed: _loadJudgeData,
-                          icon: const Icon(Icons.refresh, size: 16, color: Color(0xff7fd1c7)),
+                          icon: const Icon(
+                            Icons.refresh,
+                            size: 16,
+                            color: Color(0xff7fd1c7),
+                          ),
                           tooltip: 'Refresh History & Rules',
                           padding: EdgeInsets.zero,
                           constraints: const BoxConstraints(),
@@ -6317,49 +6417,71 @@ class _SettingsDialogState extends State<SettingsDialog> {
                           height: 32,
                           child: TextField(
                             controller: _historySearchController,
-                            onChanged: (val) =>
-                                setState(() => _historySearchQuery = val.trim()),
+                            onChanged: (val) => setState(
+                              () => _historySearchQuery = val.trim(),
+                            ),
                             style: const TextStyle(
                               fontSize: 12,
                               fontFamily: 'JetBrains Mono',
                               color: Color(0xffcdd7d6),
                             ),
                             decoration: InputDecoration(
-                              hintText: 'Filter decisions by command, tool, or reason...',
-                              hintStyle:
-                                  const TextStyle(fontSize: 11, color: Color(0xff5a686b)),
-                              prefixIcon:
-                                  const Icon(Icons.search, size: 14, color: Color(0xff7f8b8d)),
-                              prefixIconConstraints:
-                                  const BoxConstraints(minWidth: 28, minHeight: 28),
+                              hintText:
+                                  'Filter decisions by command, tool, or reason...',
+                              hintStyle: const TextStyle(
+                                fontSize: 11,
+                                color: Color(0xff5a686b),
+                              ),
+                              prefixIcon: const Icon(
+                                Icons.search,
+                                size: 14,
+                                color: Color(0xff7f8b8d),
+                              ),
+                              prefixIconConstraints: const BoxConstraints(
+                                minWidth: 28,
+                                minHeight: 28,
+                              ),
                               suffixIcon: _historySearchQuery.isNotEmpty
                                   ? IconButton(
-                                      icon: const Icon(Icons.clear,
-                                          size: 14, color: Color(0xff7f8b8d)),
+                                      icon: const Icon(
+                                        Icons.clear,
+                                        size: 14,
+                                        color: Color(0xff7f8b8d),
+                                      ),
                                       onPressed: () {
                                         _historySearchController.clear();
-                                        setState(() => _historySearchQuery = '');
+                                        setState(
+                                          () => _historySearchQuery = '',
+                                        );
                                       },
                                       padding: EdgeInsets.zero,
                                       constraints: const BoxConstraints(),
                                     )
                                   : null,
                               isDense: true,
-                              contentPadding:
-                                  const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 0,
+                              ),
                               filled: true,
                               fillColor: const Color(0xff0d1113),
                               border: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(6),
-                                borderSide: const BorderSide(color: Color(0xff222a2d)),
+                                borderSide: const BorderSide(
+                                  color: Color(0xff222a2d),
+                                ),
                               ),
                               enabledBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(6),
-                                borderSide: const BorderSide(color: Color(0xff222a2d)),
+                                borderSide: const BorderSide(
+                                  color: Color(0xff222a2d),
+                                ),
                               ),
                               focusedBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(6),
-                                borderSide: const BorderSide(color: Color(0xff7fd1c7)),
+                                borderSide: const BorderSide(
+                                  color: Color(0xff7fd1c7),
+                                ),
                               ),
                             ),
                           ),
@@ -6391,63 +6513,81 @@ class _SettingsDialogState extends State<SettingsDialog> {
                             padding: EdgeInsets.symmetric(vertical: 8),
                             child: Text(
                               'No tool calls judged yet. Live decisions evaluated while coding agents run will appear here.',
-                              style: TextStyle(fontSize: 12, color: Color(0xff7f8b8d)),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Color(0xff7f8b8d),
+                              ),
                             ),
                           )
                         : filteredHistory.isEmpty
-                            ? const Padding(
-                                padding: EdgeInsets.symmetric(vertical: 8),
-                                child: Text(
-                                  'No decisions match the current filter or search query.',
-                                  style: TextStyle(fontSize: 12, color: Color(0xff7f8b8d)),
+                        ? const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 8),
+                            child: Text(
+                              'No decisions match the current filter or search query.',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Color(0xff7f8b8d),
+                              ),
+                            ),
+                          )
+                        : Column(
+                            children: [
+                              for (
+                                int i = 0;
+                                i < displayedItems.length;
+                                i++
+                              ) ...[
+                                _buildHistoryRow(displayedItems[i]),
+                                if (i < displayedItems.length - 1)
+                                  const Divider(
+                                    color: Color(0xff1e2628),
+                                    height: 16,
+                                  ),
+                              ],
+                              if (filteredHistory.length >
+                                  displayedItems.length) ...[
+                                const Divider(
+                                  color: Color(0xff1e2628),
+                                  height: 16,
                                 ),
-                              )
-                            : Column(
-                                children: [
-                                  for (int i = 0; i < displayedItems.length; i++) ...[
-                                    _buildHistoryRow(displayedItems[i]),
-                                    if (i < displayedItems.length - 1)
-                                      const Divider(color: Color(0xff1e2628), height: 16),
-                                  ],
-                                  if (filteredHistory.length > displayedItems.length) ...[
-                                    const Divider(color: Color(0xff1e2628), height: 16),
-                                    Row(
-                                      mainAxisAlignment: MainAxisAlignment.center,
-                                      children: [
-                                        TextButton(
-                                          onPressed: () {
-                                            setState(() {
-                                              _historyDisplayLimit += 50;
-                                            });
-                                          },
-                                          child: Text(
-                                            'Show 50 more (${filteredHistory.length - displayedItems.length} remaining)',
-                                            style: const TextStyle(
-                                              fontSize: 12,
-                                              color: Color(0xff7fd1c7),
-                                            ),
-                                          ),
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    TextButton(
+                                      onPressed: () {
+                                        setState(() {
+                                          _historyDisplayLimit += 50;
+                                        });
+                                      },
+                                      child: Text(
+                                        'Show 50 more (${filteredHistory.length - displayedItems.length} remaining)',
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Color(0xff7fd1c7),
                                         ),
-                                        const SizedBox(width: 12),
-                                        TextButton(
-                                          onPressed: () {
-                                            setState(() {
-                                              _historyDisplayLimit = filteredHistory.length;
-                                            });
-                                          },
-                                          child: Text(
-                                            'Show all (${filteredHistory.length})',
-                                            style: const TextStyle(
-                                              fontSize: 12,
-                                              color: Color(0xff9aa6a8),
-                                            ),
-                                          ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    TextButton(
+                                      onPressed: () {
+                                        setState(() {
+                                          _historyDisplayLimit =
+                                              filteredHistory.length;
+                                        });
+                                      },
+                                      child: Text(
+                                        'Show all (${filteredHistory.length})',
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Color(0xff9aa6a8),
                                         ),
-                                      ],
+                                      ),
                                     ),
                                   ],
-                                ],
-                              ),
+                                ),
+                              ],
+                            ],
+                          ),
                   ),
                 ],
               );
@@ -6500,7 +6640,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
                               color: Color(0xff7fd1c7),
                             ),
                           ),
-                          deleteIcon: const Icon(Icons.close, size: 14, color: Color(0xff7fd1c7)),
+                          deleteIcon: const Icon(
+                            Icons.close,
+                            size: 14,
+                            color: Color(0xff7fd1c7),
+                          ),
                           onDeleted: () => _removeAllowRule(cmd),
                         ),
                     ],
@@ -6520,23 +6664,36 @@ class _SettingsDialogState extends State<SettingsDialog> {
                           color: Color(0xffcdd7d6),
                         ),
                         decoration: InputDecoration(
-                          hintText: 'Add allow prefix (e.g. "pnpm test", "make check")',
-                          hintStyle: const TextStyle(fontSize: 11, color: Color(0xff5a686b)),
+                          hintText:
+                              'Add allow prefix (e.g. "pnpm test", "make check")',
+                          hintStyle: const TextStyle(
+                            fontSize: 11,
+                            color: Color(0xff5a686b),
+                          ),
                           isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
                           filled: true,
                           fillColor: const Color(0xff0d1113),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(6),
-                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                            borderSide: const BorderSide(
+                              color: Color(0xff222a2d),
+                            ),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(6),
-                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                            borderSide: const BorderSide(
+                              color: Color(0xff222a2d),
+                            ),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(6),
-                            borderSide: const BorderSide(color: Color(0xff7fd1c7)),
+                            borderSide: const BorderSide(
+                              color: Color(0xff7fd1c7),
+                            ),
                           ),
                         ),
                         onSubmitted: _addAllowRule,
@@ -6550,7 +6707,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       style: FilledButton.styleFrom(
                         backgroundColor: const Color(0xff233c3e),
                         foregroundColor: const Color(0xff7fd1c7),
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
                       ),
                     ),
                   ],
@@ -6559,14 +6719,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
 
                 // Collapsible built-in allow rules
                 InkWell(
-                  onTap: () => setState(() => _showBuiltinAllows = !_showBuiltinAllows),
+                  onTap: () =>
+                      setState(() => _showBuiltinAllows = !_showBuiltinAllows),
                   borderRadius: BorderRadius.circular(4),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 4),
                     child: Row(
                       children: [
                         Icon(
-                          _showBuiltinAllows ? Icons.expand_less : Icons.expand_more,
+                          _showBuiltinAllows
+                              ? Icons.expand_less
+                              : Icons.expand_more,
                           size: 16,
                           color: const Color(0xff7fd1c7),
                         ),
@@ -6598,7 +6761,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       children: [
                         for (final cmd in rules.builtinAllowCommands)
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
                             decoration: BoxDecoration(
                               color: const Color(0xff161e20),
                               borderRadius: BorderRadius.circular(4),
@@ -6666,7 +6832,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
                               color: Color(0xffff6b6b),
                             ),
                           ),
-                          deleteIcon: const Icon(Icons.close, size: 14, color: Color(0xffff6b6b)),
+                          deleteIcon: const Icon(
+                            Icons.close,
+                            size: 14,
+                            color: Color(0xffff6b6b),
+                          ),
                           onDeleted: () => _removeDenyRule(sub),
                         ),
                     ],
@@ -6686,23 +6856,36 @@ class _SettingsDialogState extends State<SettingsDialog> {
                           color: Color(0xffcdd7d6),
                         ),
                         decoration: InputDecoration(
-                          hintText: 'Add deny pattern (e.g. "terraform apply", "drop database")',
-                          hintStyle: const TextStyle(fontSize: 11, color: Color(0xff5a686b)),
+                          hintText:
+                              'Add deny pattern (e.g. "terraform apply", "drop database")',
+                          hintStyle: const TextStyle(
+                            fontSize: 11,
+                            color: Color(0xff5a686b),
+                          ),
                           isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
                           filled: true,
                           fillColor: const Color(0xff0d1113),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(6),
-                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                            borderSide: const BorderSide(
+                              color: Color(0xff222a2d),
+                            ),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(6),
-                            borderSide: const BorderSide(color: Color(0xff222a2d)),
+                            borderSide: const BorderSide(
+                              color: Color(0xff222a2d),
+                            ),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(6),
-                            borderSide: const BorderSide(color: Color(0xffff6b6b)),
+                            borderSide: const BorderSide(
+                              color: Color(0xffff6b6b),
+                            ),
                           ),
                         ),
                         onSubmitted: _addDenyRule,
@@ -6716,7 +6899,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       style: FilledButton.styleFrom(
                         backgroundColor: const Color(0xff3e1b1b),
                         foregroundColor: const Color(0xffff6b6b),
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
                       ),
                     ),
                   ],
@@ -6725,14 +6911,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
 
                 // Collapsible built-in deny rules
                 InkWell(
-                  onTap: () => setState(() => _showBuiltinDenies = !_showBuiltinDenies),
+                  onTap: () =>
+                      setState(() => _showBuiltinDenies = !_showBuiltinDenies),
                   borderRadius: BorderRadius.circular(4),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 4),
                     child: Row(
                       children: [
                         Icon(
-                          _showBuiltinDenies ? Icons.expand_less : Icons.expand_more,
+                          _showBuiltinDenies
+                              ? Icons.expand_less
+                              : Icons.expand_more,
                           size: 16,
                           color: const Color(0xffff6b6b),
                         ),
@@ -6764,7 +6953,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       children: [
                         for (final sub in rules.builtinDenySubstrings)
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
                             decoration: BoxDecoration(
                               color: const Color(0xff1e1616),
                               borderRadius: BorderRadius.circular(4),
@@ -6802,21 +6994,24 @@ class _SettingsDialogState extends State<SettingsDialog> {
             icon: Icons.shield_outlined,
             iconColor: const Color(0xffff6b6b),
             title: 'Layer 1: Deterministic Deny',
-            description: 'Destructive commands (rm -rf, git push --force) and credential files (.ssh, .env) are blocked instantly.',
+            description:
+                'Destructive commands (rm -rf, git push --force) and credential files (.ssh, .env) are blocked instantly.',
           ),
           const SizedBox(height: 6),
           _buildLayerRow(
             icon: Icons.bolt,
             iconColor: const Color(0xff7fd1c7),
             title: 'Layer 2: Deterministic Allow',
-            description: 'Safe read-only commands (git status/diff/log, cargo test, flutter test) auto-approve in <10ms.',
+            description:
+                'Safe read-only commands (git status/diff/log, cargo test, flutter test) auto-approve in <10ms.',
           ),
           const SizedBox(height: 6),
           _buildLayerRow(
             icon: Icons.auto_awesome,
             iconColor: const Color(0xffffc857),
             title: 'Layer 3: Local Model',
-            description: 'Ambiguous commands are evaluated by resident model using GBNF grammar constraints (allow/ask).',
+            description:
+                'Ambiguous commands are evaluated by resident model using GBNF grammar constraints (allow/ask).',
           ),
           const SizedBox(height: 16),
 
@@ -6833,20 +7028,30 @@ class _SettingsDialogState extends State<SettingsDialog> {
           const SizedBox(height: 8),
           const Text(
             '1. Install the hook shim on PATH:',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: Color(0xffcdd7d6),
+            ),
           ),
           const SizedBox(height: 6),
           const _CodeSnippetBox(
-            code: 'TRIAGE_SKIP_FLUTTER_BUILD=1 cargo install --path crates/triage-hook',
+            code:
+                'TRIAGE_SKIP_FLUTTER_BUILD=1 cargo install --path crates/triage-hook',
           ),
           const SizedBox(height: 12),
           const Text(
             '2. Generated workspace .agents/hooks.json (managed by switch above):',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: Color(0xffcdd7d6),
+            ),
           ),
           const SizedBox(height: 6),
           const _CodeSnippetBox(
-            code: '{\n'
+            code:
+                '{\n'
                 '  "triage-approval-judge": {\n'
                 '    "enabled": true,\n'
                 '    "PreToolUse": [\n'
@@ -6867,12 +7072,20 @@ class _SettingsDialogState extends State<SettingsDialog> {
           const SizedBox(height: 12),
           const Text(
             '3. Run agent inside Triage:',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: Color(0xffcdd7d6),
+            ),
           ),
           const SizedBox(height: 4),
           const Text(
             'Start your agent (agy, claude, etc.) inside any Triage terminal session. Triage automatically injects TRIAGE_SESSION_ID so tool calls associate with your active session.',
-            style: TextStyle(fontSize: 12, color: Color(0xff9aa6a8), height: 1.4),
+            style: TextStyle(
+              fontSize: 12,
+              color: Color(0xff9aa6a8),
+              height: 1.4,
+            ),
           ),
         ],
       ),
@@ -6890,7 +7103,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
           color: isSelected ? const Color(0xff1b2b2b) : const Color(0xff0d1113),
           borderRadius: BorderRadius.circular(5),
           border: Border.all(
-            color: isSelected ? const Color(0xff7fd1c7) : const Color(0xff222a2d),
+            color: isSelected
+                ? const Color(0xff7fd1c7)
+                : const Color(0xff222a2d),
           ),
         ),
         child: Text(
@@ -6898,7 +7113,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
           style: TextStyle(
             fontSize: 11,
             fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-            color: isSelected ? const Color(0xff7fd1c7) : const Color(0xff9aa6a8),
+            color: isSelected
+                ? const Color(0xff7fd1c7)
+                : const Color(0xff9aa6a8),
           ),
         ),
       ),
@@ -6906,25 +7123,26 @@ class _SettingsDialogState extends State<SettingsDialog> {
   }
 
   Widget _buildHistoryRow(JudgeRecordItem item) {
-    final (badgeBg, badgeBorder, badgeText, badgeLabel) = switch (item.decision.toLowerCase()) {
+    final (badgeBg, badgeBorder, badgeText, badgeLabel) = switch (item.decision
+        .toLowerCase()) {
       'deny' => (
-          const Color(0xffff6b6b).withValues(alpha: 0.15),
-          const Color(0xffff6b6b).withValues(alpha: 0.4),
-          const Color(0xffff6b6b),
-          'DENY',
-        ),
+        const Color(0xffff6b6b).withValues(alpha: 0.15),
+        const Color(0xffff6b6b).withValues(alpha: 0.4),
+        const Color(0xffff6b6b),
+        'DENY',
+      ),
       'allow' => (
-          const Color(0xff7fd1c7).withValues(alpha: 0.15),
-          const Color(0xff7fd1c7).withValues(alpha: 0.4),
-          const Color(0xff7fd1c7),
-          'ALLOW',
-        ),
+        const Color(0xff7fd1c7).withValues(alpha: 0.15),
+        const Color(0xff7fd1c7).withValues(alpha: 0.4),
+        const Color(0xff7fd1c7),
+        'ALLOW',
+      ),
       _ => (
-          const Color(0xffffc857).withValues(alpha: 0.15),
-          const Color(0xffffc857).withValues(alpha: 0.4),
-          const Color(0xffffc857),
-          'ASK',
-        ),
+        const Color(0xffffc857).withValues(alpha: 0.15),
+        const Color(0xffffc857).withValues(alpha: 0.4),
+        const Color(0xffffc857),
+        'ASK',
+      ),
     };
 
     final command = item.commandLine?.trim();
@@ -6938,7 +7156,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
       }
     }
 
-    final isAlreadyAllowed = suggestedPrefix != null &&
+    final isAlreadyAllowed =
+        suggestedPrefix != null &&
         (_judgeRules?.customAllowCommands.contains(suggestedPrefix) ?? false);
 
     return Column(
@@ -7020,7 +7239,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
             children: [
               if (isAlreadyAllowed) ...[
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
                   decoration: BoxDecoration(
                     color: const Color(0xff7fd1c7).withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(4),
@@ -7031,7 +7253,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      const Icon(Icons.check, size: 12, color: Color(0xff7fd1c7)),
+                      const Icon(
+                        Icons.check,
+                        size: 12,
+                        color: Color(0xff7fd1c7),
+                      ),
                       const SizedBox(width: 4),
                       Text(
                         'Allowed via "$suggestedPrefix"',
@@ -7047,7 +7273,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
               ] else ...[
                 OutlinedButton.icon(
                   onPressed: () => _addAllowRule(suggestedPrefix!),
-                  icon: const Icon(Icons.add, size: 13, color: Color(0xff7fd1c7)),
+                  icon: const Icon(
+                    Icons.add,
+                    size: 13,
+                    color: Color(0xff7fd1c7),
+                  ),
                   label: Text(
                     'Always Allow "$suggestedPrefix"',
                     style: const TextStyle(
@@ -7057,12 +7287,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
                     ),
                   ),
                   style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
                     minimumSize: Size.zero,
                     side: BorderSide(
                       color: const Color(0xff7fd1c7).withValues(alpha: 0.45),
                     ),
-                    backgroundColor: const Color(0xff7fd1c7).withValues(alpha: 0.08),
+                    backgroundColor: const Color(
+                      0xff7fd1c7,
+                    ).withValues(alpha: 0.08),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(5),
                     ),
@@ -7078,12 +7313,15 @@ class _SettingsDialogState extends State<SettingsDialog> {
 
   Widget _buildJudgeDashboard(List<JudgeRecordItem> history) {
     final total = history.length;
-    final allowCount =
-        history.where((i) => i.decision.toLowerCase() == 'allow').length;
-    final askCount =
-        history.where((i) => i.decision.toLowerCase() == 'ask').length;
-    final denyCount =
-        history.where((i) => i.decision.toLowerCase() == 'deny').length;
+    final allowCount = history
+        .where((i) => i.decision.toLowerCase() == 'allow')
+        .length;
+    final askCount = history
+        .where((i) => i.decision.toLowerCase() == 'ask')
+        .length;
+    final denyCount = history
+        .where((i) => i.decision.toLowerCase() == 'deny')
+        .length;
 
     final allowPct = total == 0 ? 0.0 : (allowCount / total) * 100;
     final askPct = total == 0 ? 0.0 : (askCount / total) * 100;
@@ -7398,7 +7636,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 ),
                 Text(
                   description,
-                  style: const TextStyle(fontSize: 10, color: Color(0xff7f8b8d)),
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: Color(0xff7f8b8d),
+                  ),
                 ),
               ],
             ),
@@ -7458,7 +7699,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 const SizedBox(height: 2),
                 Text(
                   description,
-                  style: const TextStyle(fontSize: 11, color: Color(0xff9aa6a8), height: 1.35),
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xff9aa6a8),
+                    height: 1.35,
+                  ),
                 ),
               ],
             ),
@@ -7524,16 +7769,27 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 const SizedBox(height: 8),
                 const Text(
                   'This client authenticates against daemons using a persistent cryptographic token stored in secure storage.',
-                  style: TextStyle(fontSize: 12, color: Color(0xff9aa6a8), height: 1.4),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Color(0xff9aa6a8),
+                    height: 1.4,
+                  ),
                 ),
                 const SizedBox(height: 10),
                 const Text(
                   'Client ID:',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Color(0xffcdd7d6)),
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xffcdd7d6),
+                  ),
                 ),
                 const SizedBox(height: 4),
                 _CodeSnippetBox(
-                  code: widget.clientId ?? retrieveClientId() ?? 'Initializing...',
+                  code:
+                      widget.clientId ??
+                      retrieveClientId() ??
+                      'Initializing...',
                 ),
               ],
             ),
@@ -7789,19 +8045,13 @@ class _CustomLabelDialogState extends State<_CustomLabelDialog> {
           children: [
             const Text(
               'Set a custom label to easily differentiate this session in the side rail.',
-              style: TextStyle(
-                color: Color(0xff8b9799),
-                fontSize: 13,
-              ),
+              style: TextStyle(color: Color(0xff8b9799), fontSize: 13),
             ),
             const SizedBox(height: 16),
             TextField(
               controller: _controller,
               autofocus: true,
-              style: const TextStyle(
-                color: Color(0xffcdd7d6),
-                fontSize: 14,
-              ),
+              style: const TextStyle(color: Color(0xffcdd7d6), fontSize: 14),
               decoration: InputDecoration(
                 hintText: 'e.g. Frontend Server, Build Agent, DB Migration',
                 hintStyle: const TextStyle(color: Color(0xff607073)),
@@ -7841,9 +8091,7 @@ class _CustomLabelDialogState extends State<_CustomLabelDialog> {
           ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(null),
-          style: TextButton.styleFrom(
-            foregroundColor: const Color(0xff7f8b8d),
-          ),
+          style: TextButton.styleFrom(foregroundColor: const Color(0xff7f8b8d)),
           child: const Text('Cancel'),
         ),
         FilledButton(
@@ -8236,7 +8484,8 @@ class _SessionGlanceCard extends StatelessWidget {
     final hasWorktree = worktreeName != null && worktreeName != branch;
     final hasCwd = cwd != null && cwd!.isNotEmpty;
     final showCustomLabelRow = hasCustomLabel && title != custom;
-    final hasDetails = showCustomLabelRow ||
+    final hasDetails =
+        showCustomLabelRow ||
         repoName != null ||
         hasBranch ||
         hasWorktree ||
@@ -8827,11 +9076,11 @@ class WorkspaceHeader extends StatelessWidget {
                     ),
               tooltip: session.judgePolicyEffective
                   ? (session.judgePolicyExplicit == true
-                      ? 'Auto-Approval: ON (click to disable)'
-                      : 'Auto-Approval: Default ON (click to disable)')
+                        ? 'Auto-Approval: ON (click to disable)'
+                        : 'Auto-Approval: Default ON (click to disable)')
                   : (session.judgePolicyExplicit == false
-                      ? 'Auto-Approval: OFF (click to enable)'
-                      : 'Auto-Approval: Default OFF (click to enable)'),
+                        ? 'Auto-Approval: OFF (click to enable)'
+                        : 'Auto-Approval: Default OFF (click to enable)'),
               onPressed: onToggleJudge,
             ),
             const SizedBox(width: 4),

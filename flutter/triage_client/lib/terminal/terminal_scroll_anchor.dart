@@ -31,6 +31,20 @@ class TerminalScrollAnchor {
   /// Drop the anchor (e.g. on a session/terminal swap).
   void clear() => _line = null;
 
+  /// Clone this anchor.
+  TerminalScrollAnchor clone() {
+    final copy = TerminalScrollAnchor();
+    copy._line = _line;
+    copy._withinLine = _withinLine;
+    return copy;
+  }
+
+  /// Copy anchor state from another anchor.
+  void copyFrom(TerminalScrollAnchor other) {
+    _line = other._line;
+    _withinLine = other._withinLine;
+  }
+
   /// Capture an anchor from the current scroll metrics. Clears the anchor when
   /// the viewport is at (or within a line of) the bottom, so the caller follows
   /// new output instead of pinning just shy of the bottom.

@@ -549,4 +549,356 @@ void main() {
       });
     },
   );
+
+  test(
+    'delta merge: subsequent snapshot overlapping applied bytes appends delta without clearing sink',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history replay
+      final initialText = 'hello world\r\n';
+      store.dispatch(
+        HistoryBytes(
+          b(initialText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 0,
+        ),
+      );
+
+      expect(sink.ops, contains('clear'));
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.ops, contains('write:$initialText'));
+
+      // Subsequent snapshot carrying both initial text and new lines
+      final addedText = 'second line\r\n';
+      final fullText = '$initialText$addedText';
+      store.dispatch(
+        HistoryBytes(
+          b(fullText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 15,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Sink must NOT have been cleared a second time
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      // Only the new delta bytes should have been written
+      expect(sink.ops.last, 'write:$addedText');
+      expect(store.appliedLogBytes, fullText.length);
+      expect(store.state.historyHighWaterSeq, 15);
+    },
+  );
+
+  test('delta merge: subsequent snapshot already fully covered is a no-op', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    final text = 'already current content\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b(text),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+
+    final opCount = sink.ops.length;
+
+    // Re-send snapshot with same seq and content
+    store.dispatch(
+      HistoryBytes(
+        b(text),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+
+    // No new clear or write operations performed
+    expect(sink.ops.length, opCount);
+  });
+
+  test(
+    'delta merge fallback: gap in output log triggers full clear and replay',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history with 10 bytes at offset 0
+      store.dispatch(
+        HistoryBytes(
+          b('old prefix'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+
+      // Snapshot arrives starting at byte offset 5000 (a gap exceeding client applied bytes)
+      final newTail = 'rolled over tail\r\n';
+      store.dispatch(
+        HistoryBytes(
+          b(newTail),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 50,
+          rawOutputStart: 5000,
+        ),
+      );
+
+      // Sink must be cleared again and full new tail written
+      expect(sink.ops.where((op) => op == 'clear').length, 2);
+      expect(sink.ops.last, 'write:$newTail');
+      expect(store.appliedLogBytes, 5000 + newTail.length);
+      expect(store.state.historyHighWaterSeq, 50);
+    },
+  );
+
+  test('exited session restore clears exited state and does full replay', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    store.dispatch(
+      HistoryBytes(
+        b('shell prompt \$ '),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 20,
+        rawOutputStart: 0,
+      ),
+    );
+    expect(store.state.phase, AttachPhase.live);
+    expect(store.state.exited, isFalse);
+
+    // Session exits
+    store.dispatch(const Exited());
+    expect(store.state.exited, isTrue);
+
+    // When restored, daemon re-spawns at seq 0 or sends fresh history.
+    // If HistoryBytes arrives on an exited store, it must bypass delta-merge,
+    // clear the sink, write the fresh history, and reset exited to false.
+    final freshPrompt = 'restarted shell \$ ';
+    store.dispatch(
+      HistoryBytes(
+        b(freshPrompt),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 0,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(store.state.exited, isFalse);
+    expect(store.state.phase, AttachPhase.live);
+    expect(sink.ops.where((op) => op == 'clear').length, 2);
+    expect(sink.ops.last, 'write:$freshPrompt');
+    expect(store.appliedLogBytes, freshPrompt.length);
+  });
+
+  test('delta merge: flushes queued pending live chunks when sized', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Attach());
+
+    // Live arrives before sizing
+    store.dispatch(LiveBytes(b('live queued'), outputSeq: 6));
+
+    // History arrives, providing sizing (80, 24) and delta-mergeable output
+    store.dispatch(
+      HistoryBytes(
+        b('hello '),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(sink.ops, contains('write:live queued'));
+  });
+
+  test(
+    'sequence regression when rawOutputStart is null triggers full clear and replay',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      store.dispatch(
+        HistoryBytes(
+          b('old shell prompt'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 50,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+
+      // New snapshot arrives with regressed sequence (e.g. 0 < 50) and no rawOutputStart
+      final fresh = 'restarted shell';
+      store.dispatch(
+        HistoryBytes(b(fresh), cols: 80, rows: 24, throughOutputSeq: 0),
+      );
+
+      // Must trigger a full clear and replay
+      expect(sink.ops.where((op) => op == 'clear').length, 2);
+      expect(sink.ops.last, 'write:$fresh');
+    },
+  );
+
+  test(
+    'sequence reset when rawOutputStart is null and appliedLiveSeq is ahead triggers full clear and replay',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history arrives at seq 0
+      store.dispatch(
+        HistoryBytes(
+          b('initial prompt'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+
+      // Live output advances appliedLiveSeq to 10
+      store.dispatch(LiveBytes(b(' live text'), outputSeq: 10));
+      expect(store.appliedLiveSeq, 10);
+
+      // Daemon restarts and emits fresh history at seq 0 with null rawOutputStart
+      final fresh = 'restarted shell prompt';
+      store.dispatch(
+        HistoryBytes(b(fresh), cols: 80, rows: 24, throughOutputSeq: 0),
+      );
+
+      // Must trigger full clear and replay rather than dropping the restart
+      expect(sink.ops.where((op) => op == 'clear').length, 2);
+      expect(sink.ops.last, 'write:$fresh');
+    },
+  );
+
+  test(
+    'sequence regression when rawOutputStart is 0 triggers full clear and replay',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history arrives at seq 50 with rawOutputStart 0 and 500 bytes
+      final initialOutput = 'x' * 500;
+      store.dispatch(
+        HistoryBytes(
+          b(initialOutput),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 50,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.appliedLogBytes, 500);
+
+      // Daemon or shell resets and emits fresh snapshot at seq 0, rawOutputStart 0, and 100 bytes
+      final fresh = 'restarted shell after daemon reload';
+      store.dispatch(
+        HistoryBytes(
+          b(fresh),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 0,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Must trigger full clear and replay instead of misinterpreting currentLogBytes as having covered the snapshot
+      expect(sink.ops.where((op) => op == 'clear').length, 2);
+      expect(sink.ops.last, 'write:$fresh');
+      expect(store.appliedLogBytes, fresh.length);
+    },
+  );
+
+  test(
+    'log length regression when bytes shrink triggers full clear and replay',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history arrives with 500 bytes
+      final initialOutput = 'y' * 500;
+      store.dispatch(
+        HistoryBytes(b(initialOutput), cols: 80, rows: 24, rawOutputStart: 0),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.appliedLogBytes, 500);
+
+      // Shrunk log arrives with rawOutputStart 0 and 100 bytes
+      final truncated = 'short log after reset';
+      store.dispatch(
+        HistoryBytes(b(truncated), cols: 80, rows: 24, rawOutputStart: 0),
+      );
+
+      expect(sink.ops.where((op) => op == 'clear').length, 2);
+      expect(sink.ops.last, 'write:$truncated');
+      expect(store.appliedLogBytes, truncated.length);
+    },
+  );
+
+  test(
+    'viewport resize with concurrent delta-merge updates sizing and drains pending live',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Seed initial output
+      store.dispatch(
+        HistoryBytes(
+          b('prompt> '),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops, ['resize:80,24', 'clear', 'write:prompt> ']);
+
+      // Live output arrives before viewport resize
+      store.dispatch(LiveBytes(b('ls -l'), outputSeq: 2));
+
+      // Delta-merge snapshot arrives with resized viewport dimensions (120x40)
+      store.dispatch(
+        HistoryBytes(
+          b('prompt> ls -l\nfile1.txt\n'),
+          cols: 120,
+          rows: 40,
+          throughOutputSeq: 3,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Delta merge updates store dimensions without clearing sink
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.state.cols, 120);
+      expect(store.state.rows, 40);
+      expect(sink.ops.last, 'write:\r\nfile1.txt\r\n');
+    },
+  );
 }

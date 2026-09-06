@@ -68,10 +68,7 @@ typedef SessionContextRecord = ({
 });
 
 /// One session's tool-call auto-approval judge policy.
-typedef SessionJudgePolicyRecord = ({
-  bool? explicit,
-  bool effective,
-});
+typedef SessionJudgePolicyRecord = ({bool? explicit, bool effective});
 
 /// Status of the agent tool-call approval hook on disk.
 typedef JudgeHookStatusRecord = ({
@@ -601,19 +598,23 @@ class TriageWebSocketClient {
       final response = await _send('get_judge_rules');
       final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
       return (
-        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+        builtinAllowCommands:
+            (rules['builtin_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+        customAllowCommands:
+            (rules['custom_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+        builtinDenySubstrings:
+            (rules['builtin_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+        customDenySubstrings:
+            (rules['custom_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
@@ -630,19 +631,23 @@ class TriageWebSocketClient {
       });
       final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
       return (
-        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+        builtinAllowCommands:
+            (rules['builtin_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+        customAllowCommands:
+            (rules['custom_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+        builtinDenySubstrings:
+            (rules['builtin_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+        customDenySubstrings:
+            (rules['custom_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
@@ -659,19 +664,23 @@ class TriageWebSocketClient {
       });
       final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
       return (
-        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+        builtinAllowCommands:
+            (rules['builtin_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+        customAllowCommands:
+            (rules['custom_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+        builtinDenySubstrings:
+            (rules['builtin_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+        customDenySubstrings:
+            (rules['custom_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
@@ -688,19 +697,23 @@ class TriageWebSocketClient {
       });
       final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
       return (
-        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+        builtinAllowCommands:
+            (rules['builtin_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+        customAllowCommands:
+            (rules['custom_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+        builtinDenySubstrings:
+            (rules['builtin_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+        customDenySubstrings:
+            (rules['custom_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
@@ -717,19 +730,23 @@ class TriageWebSocketClient {
       });
       final rules = (response['rules'] as Map<String, dynamic>?) ?? response;
       return (
-        builtinAllowCommands: (rules['builtin_allow_commands'] as List<dynamic>?)
+        builtinAllowCommands:
+            (rules['builtin_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customAllowCommands: (rules['custom_allow_commands'] as List<dynamic>?)
+        customAllowCommands:
+            (rules['custom_allow_commands'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        builtinDenySubstrings: (rules['builtin_deny_substrings'] as List<dynamic>?)
+        builtinDenySubstrings:
+            (rules['builtin_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
-        customDenySubstrings: (rules['custom_deny_substrings'] as List<dynamic>?)
+        customDenySubstrings:
+            (rules['custom_deny_substrings'] as List<dynamic>?)
                 ?.map((e) => e.toString())
                 .toList() ??
             [],
@@ -743,11 +760,13 @@ class TriageWebSocketClient {
   Future<RailLayoutRecord?> getRailLayout() async {
     try {
       final response = await _send('get_rail_layout');
-      final groupKeys = (response['group_keys'] as List<dynamic>?)
+      final groupKeys =
+          (response['group_keys'] as List<dynamic>?)
               ?.map((e) => e.toString())
               .toList() ??
           <String>[];
-      final sessionIds = (response['session_ids'] as List<dynamic>?)
+      final sessionIds =
+          (response['session_ids'] as List<dynamic>?)
               ?.map((e) => e.toString())
               .toList() ??
           <String>[];
@@ -1290,7 +1309,11 @@ class TriageWebSocketClient {
       'exited': snap.exited,
       // Raw output-history tail for client-side re-emulation (empty from old
       // hosts). raw_output_start is its byte offset in the full output log.
-      'raw_output': snap.rawOutput,
+      'raw_output': snap.rawOutput == null
+          ? null
+          : (snap.rawOutput is Uint8List
+                ? snap.rawOutput as Uint8List
+                : Uint8List.fromList(snap.rawOutput!)),
       'raw_output_start': snap.rawOutputStart,
       // Local-LLM one-line description of the session, if generated.
       'snippet': snap.snippet,

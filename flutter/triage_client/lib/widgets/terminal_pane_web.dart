@@ -80,6 +80,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
+  static final Map<String, TerminalController> _sessionBoundControllers = {};
+  static final Map<String, void Function(String)>
+  _sessionPersistentWriteListeners = {};
+  static final Map<String, VoidCallback> _sessionPersistentClearListeners = {};
   static final TerminalSessionInputRouter _sessionInputRouter =
       TerminalSessionInputRouter();
   static final Set<String> _registeredViewTypes = {};
@@ -102,6 +106,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
+    _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
     // would only strand a dead `State` in a static map.
@@ -230,6 +235,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
+      _onFit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
       }
@@ -718,6 +724,18 @@ class _TerminalPaneState extends State<TerminalPane> {
         dynamic _,
       ]) {
         try {
+          final container = _sessionContainers[sessionId];
+          if (container == null) return;
+          final isConnected =
+              js_util.getProperty(container, 'isConnected') as bool? ?? true;
+          if (!isConnected || container.clientWidth <= 0) {
+            return;
+          }
+          final activePane = _containerEventOwners[sessionId];
+          if (activePane == null || !activePane.mounted) {
+            return;
+          }
+
           final term = _sessionTerms[sessionId];
           if (term == null) return;
           final buffer = js_util.getProperty(term, 'buffer');
@@ -727,7 +745,7 @@ class _TerminalPaneState extends State<TerminalPane> {
               .toInt();
           if (viewportY >= baseY) {
             _sessionSavedViewportY.remove(sessionId);
-          } else {
+          } else if (viewportY >= 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
         } catch (_) {}
@@ -748,9 +766,9 @@ class _TerminalPaneState extends State<TerminalPane> {
             final shiftKey =
                 js_util.getProperty(event, 'shiftKey') as bool? ?? false;
             if (shiftKey) {
-              _sessionInputRouter.sendInput(_sanitizedId, '\x1B[Z');
+              _sendInput('\x1B[Z');
             } else {
-              _sessionInputRouter.sendInput(_sanitizedId, '\t');
+              _sendInput('\t');
             }
             return false;
           }
@@ -781,9 +799,66 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {}
   }
 
+  void _bindPersistentSessionController(TerminalController controller) {
+    final existingController = _sessionBoundControllers[_sanitizedId];
+    if (identical(existingController, controller)) {
+      return;
+    }
+    _unbindPersistentSessionController(_sanitizedId);
+    _sessionBoundControllers[_sanitizedId] = controller;
+    final sessionId = _sanitizedId;
+
+    void onWrite(String data) {
+      final activePane = _containerEventOwners[sessionId];
+      if (activePane != null && !activePane._initialContentWritten) {
+        activePane._pendingLiveWriteBuffer.add(data);
+      } else {
+        final term = _sessionTerms[sessionId];
+        if (term != null) {
+          try {
+            js_util.callMethod(term, 'write', [data]);
+          } catch (_) {}
+        }
+      }
+    }
+
+    void onClear() {
+      _sessionSavedViewportY.remove(sessionId);
+      final activePane = _containerEventOwners[sessionId];
+      if (activePane != null && !activePane._initialContentWritten) {
+        activePane._pendingLiveWriteBuffer.clear();
+      }
+      final term = _sessionTerms[sessionId];
+      if (term != null) {
+        try {
+          js_util.callMethod(term, 'clear', []);
+          js_util.callMethod(term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
+        } catch (_) {}
+      }
+    }
+
+    _sessionPersistentWriteListeners[sessionId] = onWrite;
+    _sessionPersistentClearListeners[sessionId] = onClear;
+    controller.addWriteListener(onWrite);
+    controller.addClearListener(onClear);
+  }
+
+  static void _unbindPersistentSessionController(String sanitizedId) {
+    final controller = _sessionBoundControllers.remove(sanitizedId);
+    final writeListener = _sessionPersistentWriteListeners.remove(sanitizedId);
+    final clearListener = _sessionPersistentClearListeners.remove(sanitizedId);
+    if (controller != null) {
+      if (writeListener != null) {
+        controller.removeWriteListener(writeListener);
+      }
+      if (clearListener != null) {
+        controller.removeClearListener(clearListener);
+      }
+    }
+  }
+
   void _bindController() {
-    widget.controller.addWriteListener(_onWrite);
-    widget.controller.addClearListener(_onClear);
+    _bindPersistentSessionController(widget.controller);
     widget.controller.addResizeListener(_onResize);
     widget.controller.addFitListener(_onFit);
     widget.controller.addRefitListener(_onRefit);
@@ -791,14 +866,10 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _unbindController() => _unbindControllerFrom(widget.controller);
 
-  // Removes every listener `_bindController` adds, from an explicit controller —
-  // the controller swap in `didUpdateWidget` must detach from the *old* one, and
-  // routing both through here keeps the add/remove sets from drifting (a missed
-  // `removeRefitListener` on swap would leave an orphaned controller able to
-  // force-send a resize-out for this pane).
+  // Removes pane-specific listeners from an explicit controller. Persistent write
+  // and clear listeners remain attached to the session controller so background
+  // sessions receive live output.
   void _unbindControllerFrom(TerminalController controller) {
-    controller.removeWriteListener(_onWrite);
-    controller.removeClearListener(_onClear);
     controller.removeResizeListener(_onResize);
     controller.removeFitListener(_onFit);
     controller.removeRefitListener(_onRefit);
@@ -987,6 +1058,26 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// when there are none: an adopted container may already have been handed on
   /// to a newer pane, which unbinds this one as it takes over.
   void _unbindContainerEvents() {
+    try {
+      final container = _sessionContainers[_sanitizedId];
+      final isConnected =
+          container != null &&
+          (js_util.getProperty(container, 'isConnected') as bool? ?? true) &&
+          container.clientWidth > 0;
+      final term = _sessionTerms[_sanitizedId];
+      if (term != null && isConnected) {
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+        final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+            .toInt();
+        if (viewportY >= 0 && viewportY < baseY) {
+          _sessionSavedViewportY[_sanitizedId] = viewportY;
+        } else if (viewportY >= baseY) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+        }
+      }
+    } catch (_) {}
     _containerMouseDownSubscription?.cancel();
     _containerMouseDownSubscription = null;
     _containerClickSubscription?.cancel();
@@ -1113,20 +1204,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     return _container.contains(active);
   }
 
-  void _onWrite(String data) {
-    if (!_initialContentWritten) {
-      _pendingLiveWriteBuffer.add(data);
-    } else {
-      if (!_initialized) return;
-      js_util.callMethod(_term, 'write', [data]);
-    }
-  }
-
-  void _onClear() {
-    if (!_initialized) return;
-    js_util.callMethod(_term, 'clear', []);
-  }
-
   void _onResize(int cols, int rows) {
     if (!_initialized) return;
     js_util.callMethod(_term, 'resize', [cols, rows]);
@@ -1149,8 +1226,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
     _pendingLiveWriteBuffer.clear();
-    for (final data in pendingWrites) {
-      js_util.callMethod(_term, 'write', [data]);
+    final term = _term ?? _sessionTerms[_sanitizedId];
+    if (term != null) {
+      for (final data in pendingWrites) {
+        try {
+          js_util.callMethod(term, 'write', [data]);
+        } catch (_) {}
+      }
     }
   }
 
@@ -1333,7 +1415,9 @@ class _TerminalPaneState extends State<TerminalPane> {
           _updateCursorOptions();
         } catch (_) {}
       }
-      _triggerFullReplayOrReset();
+      if (!_initialContentWritten) {
+        _triggerFullReplayOrReset();
+      }
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
@@ -1346,12 +1430,15 @@ class _TerminalPaneState extends State<TerminalPane> {
         widget.controller,
       );
       _bindController();
-      _triggerFullReplayOrReset();
+      if (!_initialContentWritten) {
+        _triggerFullReplayOrReset();
+      }
     }
   }
 
   @override
   void dispose() {
+    _flushPendingLiveWrites();
     _resizeDebounceTimer?.cancel();
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();

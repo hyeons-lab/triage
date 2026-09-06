@@ -63,6 +63,7 @@ class TerminalPane extends StatefulWidget {
 
   static void destroySession(String terminalId) {
     _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
+    _TerminalPaneState._sessionSavedScrollAnchors.remove(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
   }
 
@@ -76,9 +77,17 @@ class TerminalPane extends StatefulWidget {
 
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
+  static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
+      {};
+
+  /// A finite initial scroll offset sentinel (1 billion pixels) that complies
+  /// with Flutter's ScrollController bounds checking (`assert(initialScrollOffset.isFinite)`),
+  /// while safely clamping to `maxScrollExtent` during the very first layout pass to
+  /// prevent frame-0 rendering jumps.
+  static const double _kBottomScrollSentinel = 1e9;
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
-  final ScrollController _scrollController = ScrollController();
+  late final ScrollController _scrollController;
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
   // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
@@ -223,6 +232,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
+    final initialOffset =
+        _sessionSavedScrollOffsets[widget.terminalId] ?? _kBottomScrollSentinel;
+    final savedAnchor = _sessionSavedScrollAnchors[widget.terminalId];
+    if (savedAnchor != null) {
+      _scrollAnchor.copyFrom(savedAnchor);
+    }
+    _scrollController = ScrollController(initialScrollOffset: initialOffset);
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
@@ -280,9 +296,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       _copyTarget = null;
       _copyTargetBuffer = null;
       _xtermController.clearSelection();
-      // The scroll anchor pointed at the old terminal's buffer line; drop it so
-      // the new session starts following the bottom.
-      _scrollAnchor.clear();
+      // Restore the incoming session's scroll anchor if one was saved.
+      final savedAnchor = _sessionSavedScrollAnchors[widget.terminalId];
+      if (savedAnchor != null) {
+        _scrollAnchor.copyFrom(savedAnchor);
+      } else {
+        _scrollAnchor.clear();
+      }
       // Drop any latched sticky Ctrl so it can't fold into the new session's
       // first keystroke (a Ctrl armed for session A must not reach session B).
       _ctrlArmed = false;
@@ -578,6 +598,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _onTerminalOutput(String data) {
     _sessionSavedScrollOffsets.remove(widget.terminalId);
+    _sessionSavedScrollAnchors.remove(widget.terminalId);
     _scrollAnchor.clear();
     if (_scrollController.hasClients) {
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
@@ -739,28 +760,36 @@ class _TerminalPaneState extends State<TerminalPane> {
     _captureScrollAnchor();
   }
 
-  void _saveScrollOffset([String? terminalId]) {
+  void _saveScrollOffset([String? terminalId, double? lineHeight]) {
     if (!_scrollController.hasClients) return;
     final id = terminalId ?? widget.terminalId;
     final position = _scrollController.position;
-    if (position.pixels < position.maxScrollExtent - 2.0) {
+    final lh = lineHeight ?? _lineHeight() ?? 2.0;
+    if (position.pixels < position.maxScrollExtent - lh) {
       _sessionSavedScrollOffsets[id] = position.pixels;
+      if (_scrollAnchor.hasAnchor) {
+        _sessionSavedScrollAnchors[id] = _scrollAnchor.clone();
+      } else {
+        _sessionSavedScrollAnchors.remove(id);
+      }
     } else {
       _sessionSavedScrollOffsets.remove(id);
+      _sessionSavedScrollAnchors.remove(id);
     }
   }
 
   void _captureScrollAnchor() {
     if (!_scrollController.hasClients) return;
-    _saveScrollOffset();
     final lineHeight = _lineHeight();
-    if (lineHeight == null) return;
-    _scrollAnchor.capture(
-      buffer: _terminal.buffer,
-      pixels: _scrollController.position.pixels,
-      maxScrollExtent: _scrollController.position.maxScrollExtent,
-      lineHeight: lineHeight,
-    );
+    if (lineHeight != null) {
+      _scrollAnchor.capture(
+        buffer: _terminal.buffer,
+        pixels: _scrollController.position.pixels,
+        maxScrollExtent: _scrollController.position.maxScrollExtent,
+        lineHeight: lineHeight,
+      );
+    }
+    _saveScrollOffset(widget.terminalId, lineHeight);
   }
 
   void _onTerminalContentChanged() {
@@ -846,10 +875,24 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
         final saved = _sessionSavedScrollOffsets[widget.terminalId];
-        if (saved != null) {
-          position.jumpTo(saved.clamp(0.0, position.maxScrollExtent));
+        final lineHeight = _lineHeight();
+        double target;
+        if (_scrollAnchor.hasAnchor && lineHeight != null) {
+          final anchored = _scrollAnchor.desiredOffset(
+            maxScrollExtent: position.maxScrollExtent,
+            lineHeight: lineHeight,
+          );
+          target =
+              anchored ??
+              (saved?.clamp(0.0, position.maxScrollExtent) ??
+                  position.maxScrollExtent);
+        } else if (saved != null) {
+          target = saved.clamp(0.0, position.maxScrollExtent);
         } else {
-          position.jumpTo(position.maxScrollExtent);
+          target = position.maxScrollExtent;
+        }
+        if ((position.pixels - target).abs() > 0.5) {
+          position.jumpTo(target);
         }
       }
       if (requestFocus) {
