@@ -252,10 +252,21 @@ class TerminalStore extends ChangeNotifier {
 
     final currentSeq = _appliedLiveSeq ?? s.historyHighWaterSeq;
     final currentLogBytes = _appliedLogBytes;
+    final baselineSeq = max(s.historyHighWaterSeq ?? 0, _appliedLiveSeq ?? 0);
+    final isSequenceRegressed =
+        throughOutputSeq != null &&
+        baselineSeq > 0 &&
+        throughOutputSeq < baselineSeq;
+    final isLogBytesRegressed =
+        rawOutputStart != null &&
+        currentLogBytes != null &&
+        rawOutputStart + bytes.length < currentLogBytes;
 
     // Delta merge: if the store is already live and sized with content, check
     // whether the new snapshot overlaps with what we already applied.
     if (!s.exited &&
+        !isSequenceRegressed &&
+        !isLogBytesRegressed &&
         s.phase == AttachPhase.live &&
         s.scrollbackReady &&
         (currentSeq != null || currentLogBytes != null)) {
@@ -270,17 +281,25 @@ class TerminalStore extends ChangeNotifier {
                 ? throughOutputSeq
                 : max(_appliedLiveSeq!, throughOutputSeq);
           }
+          if (next.sized) {
+            _flushPendingLive(resolvedSeq);
+          }
           return next.copyWith(historyHighWaterSeq: resolvedSeq, exited: false);
         }
 
         if (currentLogBytes >= rawOutputStart) {
           final deltaOffset = currentLogBytes - rawOutputStart;
           if (deltaOffset >= 0 && deltaOffset < bytes.length) {
-            final deltaBytes = bytes.sublist(deltaOffset);
+            final deltaBytes = bytes is Uint8List
+                ? Uint8List.sublistView(bytes, deltaOffset)
+                : bytes.sublist(deltaOffset);
             _applyLive(deltaBytes, throughOutputSeq);
             final resolvedSeq = throughOutputSeq != null
                 ? max(next.historyHighWaterSeq ?? 0, throughOutputSeq)
                 : next.historyHighWaterSeq;
+            if (next.sized) {
+              _flushPendingLive(resolvedSeq);
+            }
             return next.copyWith(
               historyHighWaterSeq: resolvedSeq,
               exited: false,
@@ -289,7 +308,10 @@ class TerminalStore extends ChangeNotifier {
         }
       } else if (throughOutputSeq != null &&
           currentSeq != null &&
-          currentSeq == throughOutputSeq) {
+          currentSeq >= throughOutputSeq) {
+        if (next.sized) {
+          _flushPendingLive(throughOutputSeq);
+        }
         return next;
       }
     }

@@ -378,6 +378,9 @@ class SessionVm {
     // Seed the inferred worktree from the constructor's own context so an attach
     // straight into a worktree is remembered from the first frame.
     _recordInferredWorktree();
+    if (isExited) {
+      markExited();
+    }
   }
 
   final String title;
@@ -782,17 +785,22 @@ class SessionVm {
     List<int> rawOutput, {
     int? throughOutputSeq,
     int? rawOutputStart,
+    bool isExited = false,
   }) {
     _pendingHistory = _PendingHistory(
       rawOutput,
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
     );
-    if (store.state.phase != AttachPhase.live || store.state.exited) {
+    final wasExited = this.isExited || store.state.exited;
+    if (store.state.phase != AttachPhase.live || wasExited) {
       store.dispatch(const Attach());
     }
+    this.isExited = isExited;
     if (_viewReady) {
       _flushPendingHistory();
+    } else if (isExited) {
+      markExited();
     }
   }
 
@@ -818,6 +826,9 @@ class SessionVm {
         rawOutputStart: pending.rawOutputStart,
       ),
     );
+    if (isExited) {
+      markExited();
+    }
   }
 
   /// Apply a live raw output chunk (remote PTY bytes) through the write path.
@@ -3100,6 +3111,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _rawOutputFromSnapshot(snapshot ?? const {}),
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
+        isExited: exited,
       );
       _setupSessionInputListener(session);
       return session;
@@ -3489,7 +3501,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
+        isExited: exited,
       );
+    } else if (exited != session.isExited) {
+      session.isExited = exited;
+      if (exited) {
+        session.markExited();
+      } else {
+        session.store.dispatch(const Attach());
+      }
     }
     final bracketedPaste =
         snapshot['bracketed_paste_enabled'] as bool? ?? false;
@@ -3922,6 +3942,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             _rawOutputFromSnapshot(snapshot ?? const {}),
             throughOutputSeq: outputSeq,
             rawOutputStart: rawOutputStart,
+            isExited: exited,
           );
 
           // Rank it above everything already on the rail. The daemon has no
@@ -4762,10 +4783,7 @@ class _SessionRailState extends State<SessionRail> {
         layoutBuilder: (currentChild, previousChildren) {
           return Stack(
             alignment: Alignment.topLeft,
-            children: [
-              ...previousChildren,
-              if (currentChild != null) currentChild,
-            ],
+            children: [...previousChildren, ?currentChild],
           );
         },
         child: OverflowBox(

@@ -766,9 +766,9 @@ class _TerminalPaneState extends State<TerminalPane> {
             final shiftKey =
                 js_util.getProperty(event, 'shiftKey') as bool? ?? false;
             if (shiftKey) {
-              _sessionInputRouter.sendInput(_sanitizedId, '\x1B[Z');
+              _sendInput('\x1B[Z');
             } else {
-              _sessionInputRouter.sendInput(_sanitizedId, '\t');
+              _sendInput('\t');
             }
             return false;
           }
@@ -823,10 +823,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     void onClear() {
+      _sessionSavedViewportY.remove(sessionId);
+      final activePane = _containerEventOwners[sessionId];
+      if (activePane != null && !activePane._initialContentWritten) {
+        activePane._pendingLiveWriteBuffer.clear();
+      }
       final term = _sessionTerms[sessionId];
       if (term != null) {
         try {
           js_util.callMethod(term, 'clear', []);
+          js_util.callMethod(term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
         } catch (_) {}
       }
     }
@@ -1053,8 +1059,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// to a newer pane, which unbinds this one as it takes over.
   void _unbindContainerEvents() {
     try {
+      final container = _sessionContainers[_sanitizedId];
+      final isConnected =
+          container != null &&
+          (js_util.getProperty(container, 'isConnected') as bool? ?? true) &&
+          container.clientWidth > 0;
       final term = _sessionTerms[_sanitizedId];
-      if (term != null) {
+      if (term != null && isConnected) {
         final buffer = js_util.getProperty(term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();

@@ -89,7 +89,7 @@ class DaemonServer {
       return [
         for (final entry in decoded)
           if (entry is Map<String, dynamic>)
-            if (fromJson(entry) case final server?) server,
+            ?fromJson(entry),
       ];
     } catch (_) {
       return const [];
