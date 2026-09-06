@@ -2153,6 +2153,8 @@ impl SessionManager {
         };
         let mut failures = Vec::new();
         let mut failure_messages = Vec::new();
+        let mut pending_contexts: Vec<PendingSessionContext> = Vec::new();
+        let install_started = Instant::now();
 
         for mut h_sess in state.sessions {
             let Some(fd) = pending.take_next() else {
@@ -2174,7 +2176,8 @@ impl SessionManager {
             };
 
             match self.adopt_one_session(&mut sessions, &mut h_sess, attempt_fd) {
-                Ok(()) => {
+                Ok(pending_context) => {
+                    pending_contexts.push(pending_context);
                     // SAFETY: `pending.take_next` transferred sole ownership of
                     // the reserve descriptor to this iteration. The live actor
                     // owns `attempt_fd`, so the reserve is no longer needed.
@@ -2189,6 +2192,21 @@ impl SessionManager {
 
         self.retain_pending_adoptions(failures);
         let persist_result = self.persist_manifest(&sessions);
+        let install_elapsed = install_started.elapsed();
+        // Every remaining step is off-lock, so release the guard before resolving git
+        // context — that resolution is the reason the resolution was deferred at all.
+        drop(sessions);
+        let installed = pending_contexts.len();
+        resolve_adopted_contexts(pending_contexts);
+        tracing::debug!(
+            sessions = installed,
+            install_ms = install_elapsed.as_millis(),
+            per_session_ms = install_elapsed
+                .as_millis()
+                .checked_div(installed.max(1) as u128)
+                .unwrap_or(0),
+            "installed inherited sessions under the session-manager lock"
+        );
         if !failure_messages.is_empty() {
             if let Err(error) = &persist_result {
                 failure_messages.push(format!("persisting adopted sessions: {error:#}"));
@@ -2253,7 +2271,7 @@ impl SessionManager {
         sessions: &mut HashMap<SessionId, ManagedSession>,
         h_sess: &mut crate::handover::HandoverSession,
         fd: std::os::unix::io::RawFd,
-    ) -> Result<()> {
+    ) -> Result<PendingSessionContext> {
         let canonical_id = Self::original_session_id(&h_sess.id);
         if canonical_id != h_sess.id {
             match sessions.get(&canonical_id) {
@@ -2327,7 +2345,7 @@ impl SessionManager {
         let initial_working_directory = current_working_directory
             .or_else(|| h_sess.cwd.clone())
             .or_else(|| std::env::current_dir().ok());
-        let initial_context = resolve_session_context(initial_working_directory.as_deref());
+        let context_cwd = initial_working_directory.clone();
         let last_known_cwd = initial_working_directory.clone();
 
         let (command_tx, command_rx) = mpsc::channel();
@@ -2367,7 +2385,9 @@ impl SessionManager {
                     output_closed: false,
                     exit_broadcasted: false,
                     current_working_directory: initial_working_directory,
-                    context: initial_context,
+                    // Resolved off-lock by `adopt_sessions` once every session is
+                    // installed; see `PendingSessionContext`.
+                    context: None,
                     event_session_id,
                     dirty_tx,
                     last_activity_ms: actor_last_activity_ms,
@@ -2386,6 +2406,11 @@ impl SessionManager {
         reader_start_tx
             .send(())
             .context("starting adopted session reader thread")?;
+
+        let pending_context = PendingSessionContext {
+            tx: command_tx.clone(),
+            cwd: context_cwd,
+        };
 
         let actor = SessionActor {
             tx: command_tx,
@@ -2427,7 +2452,7 @@ impl SessionManager {
             command = %h_sess.command,
             "adopted inherited live session"
         );
-        Ok(())
+        Ok(pending_context)
     }
 
     #[cfg(unix)]
@@ -5240,6 +5265,16 @@ enum ActorCommand {
     Context {
         response: Sender<ActorResult<Option<SessionContext>>>,
     },
+    /// Installs a git context resolved on the caller's behalf, for a session adopted
+    /// through a handover. Adoption deliberately leaves the context unresolved so the
+    /// `git` subprocesses it costs stay off the session-manager lock; the resolved answer
+    /// arrives here a moment later and reaches clients through the same broadcast a branch
+    /// switch uses. Fire-and-forget: a dropped or closed channel just means the session
+    /// went away, and the next cwd poll would resolve the context anyway.
+    #[cfg(unix)]
+    SetContext {
+        context: Option<SessionContext>,
+    },
     StyledRows {
         start: usize,
         end: usize,
@@ -5644,6 +5679,14 @@ impl ActorState {
             }
             ActorCommand::Context { response } => {
                 let _ = response.send(Ok(self.context.clone()));
+                false
+            }
+            #[cfg(unix)]
+            ActorCommand::SetContext { context } => {
+                if self.context != context {
+                    self.context = context;
+                    self.broadcast_context_update();
+                }
                 false
             }
             ActorCommand::StyledRows {
@@ -7288,7 +7331,10 @@ fn request_actor_shutdown(tx: &Sender<ActorCommand>) -> Result<CompletedSession>
 fn reject_command_during_shutdown(command: ActorCommand) {
     let error = anyhow!("session is shutting down");
     match command {
+        // No response channel to fail: dropping these is the whole rejection.
         ActorCommand::WriteInput { .. } => {}
+        #[cfg(unix)]
+        ActorCommand::SetContext { .. } => {}
         ActorCommand::Resize { response, .. } => {
             let _ = response.send(Err(error));
         }
@@ -7569,8 +7615,113 @@ fn canonicalize_path(path: &Path) -> PathBuf {
     canonical
 }
 
+/// A session installed by handover adoption whose git context is not resolved yet.
+#[cfg(unix)]
+struct PendingSessionContext {
+    tx: Sender<ActorCommand>,
+    cwd: Option<PathBuf>,
+}
+
+/// Resolves the git context of freshly adopted sessions away from the session-manager lock.
+///
+/// Adoption holds that lock across every inherited session, so resolving there charged each
+/// one three to four `git` subprocesses of lock-held time and froze the whole daemon for the
+/// duration. Doing it here instead costs the same `git` work but blocks nothing: the actors
+/// are already installed and serving, and each context reaches clients through the ordinary
+/// change broadcast when it lands.
+///
+/// On its own thread so neither adoption nor the daemon start that follows it waits on
+/// `git`. A failed send means the session is already gone. If the thread cannot be spawned,
+/// contexts stay unresolved until each session's next cwd poll fills them in.
+#[cfg(unix)]
+fn resolve_adopted_contexts(pending: Vec<PendingSessionContext>) {
+    if pending.is_empty() {
+        return;
+    }
+    let spawned = thread::Builder::new()
+        .name("triage-adopt-context".into())
+        .spawn(move || {
+            for PendingSessionContext { tx, cwd } in pending {
+                let context = resolve_session_context(cwd.as_deref());
+                let _ = tx.send(ActorCommand::SetContext { context });
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not spawn adopted session context resolution");
+    }
+}
+
+/// How long a resolved [`SessionContext`] stays reusable for a given directory.
+///
+/// Resolution costs three to four `git` subprocesses, and the answer depends only on which
+/// worktree contains the directory — never on which session is asking. Two sessions sitting
+/// in one directory are always on one branch, so serving both from a single resolution is
+/// exact rather than approximate. What the window does trade away is latency on a *branch
+/// switch*: a checkout is noticed up to `SESSION_CONTEXT_TTL` late. Keeping it under
+/// [`CWD_POLL_INTERVAL`] bounds that below the polling granularity that already governs
+/// how fast a switch can surface, so detection is unchanged in practice.
+///
+/// A window rather than a permanent entry so the cache self-heals when a directory becomes
+/// or stops being a repository (`git init`, a worktree removed) without needing to observe
+/// the event.
+const SESSION_CONTEXT_TTL: Duration = Duration::from_millis(500);
+
+/// Memoizes [`resolve_session_context`] by directory.
+///
+/// Sessions cluster into far fewer directories than there are sessions, so the uncached
+/// resolution repeats the same `git` work many times over. That is worst during handover
+/// adoption, where every inherited session resolves at once and the daemon forks a large,
+/// many-threaded process once per call; it also runs continuously while sessions are busy,
+/// because `apply_cwd` re-resolves on every cwd poll.
+static SESSION_CONTEXT_CACHE: Mutex<Option<SessionContextCache>> = Mutex::new(None);
+
+/// Directory -> (resolution, when it was resolved).
+type SessionContextCache = HashMap<PathBuf, (Option<SessionContext>, Instant)>;
+
+/// Resolves a directory's git context, reusing a recent answer for the same directory.
+///
+/// A poisoned cache is treated as a miss rather than propagated: the cache is an
+/// optimization, and failing a session's context resolution because some unrelated thread
+/// panicked would turn a performance aid into a correctness hazard.
 fn resolve_session_context(cwd: Option<&Path>) -> Option<SessionContext> {
     let cwd = cwd?;
+    let now = Instant::now();
+
+    if let Ok(mut guard) = SESSION_CONTEXT_CACHE.lock()
+        && let Some(entries) = guard.as_mut()
+        && let Some((context, resolved_at)) = entries.get(cwd)
+        && now.duration_since(*resolved_at) < SESSION_CONTEXT_TTL
+    {
+        return context.clone();
+    }
+
+    let context = resolve_session_context_uncached(cwd);
+
+    if let Ok(mut guard) = SESSION_CONTEXT_CACHE.lock() {
+        let entries = guard.get_or_insert_with(SessionContextCache::new);
+        // Drop expired entries while the lock is already held. Sessions come and go and
+        // their directories change, so without this the map would retain every directory
+        // the daemon ever saw.
+        entries
+            .retain(|_, (_, resolved_at)| now.duration_since(*resolved_at) < SESSION_CONTEXT_TTL);
+        entries.insert(cwd.to_path_buf(), (context.clone(), now));
+    }
+
+    context
+}
+
+/// Drops every memoized resolution.
+///
+/// Tests that change a repository and then re-resolve the same directory need the cached
+/// window gone; in production that window simply lapses.
+#[cfg(test)]
+fn clear_session_context_cache() {
+    if let Ok(mut guard) = SESSION_CONTEXT_CACHE.lock() {
+        guard.take();
+    }
+}
+
+fn resolve_session_context_uncached(cwd: &Path) -> Option<SessionContext> {
     let worktree_root =
         git_path_output(cwd, &["rev-parse", "--show-toplevel"]).map(|p| canonicalize_path(&p));
     let repository_root = git_repository_root(cwd).or_else(|| worktree_root.clone());
@@ -9232,6 +9383,10 @@ mod tests {
 
         // Delete .git directory while in detached HEAD state
         let _ = std::fs::remove_dir_all(repo.join(".git"));
+        // The resolution above is memoized for `SESSION_CONTEXT_TTL`, so without this the
+        // assertion would read that entry back rather than observe the deleted repo. The
+        // window itself is covered by `session_context_reuses_recent_resolution`.
+        clear_session_context_cache();
         assert!(resolve_session_context(Some(&repo)).is_none());
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -9311,6 +9466,112 @@ mod tests {
         assert_eq!(context.branch.as_deref(), Some("feat/submodule-wt"));
 
         let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn session_context_reuses_recent_resolution() {
+        let repo = unique_log_dir();
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_test_command(&repo, &["init", "--initial-branch=main"]);
+        git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+        git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+        git_test_command(&repo, &["add", "README.md"]);
+        git_test_command(&repo, &["commit", "-m", "initial"]);
+
+        clear_session_context_cache();
+        let first = resolve_session_context(Some(&repo)).expect("git session context");
+        assert_eq!(first.branch.as_deref(), Some("main"));
+
+        // Switch branches behind the cache. A repeat inside the window answers from the
+        // memoized entry, which is the whole point: many sessions in one directory cost
+        // one resolution.
+        git_test_command(&repo, &["checkout", "-b", "feat/cached"]);
+        let cached = resolve_session_context(Some(&repo)).expect("git session context");
+        assert_eq!(cached.branch.as_deref(), Some("main"));
+
+        // Once the window lapses the switch is picked up, so the memoization delays a
+        // branch change rather than pinning it.
+        std::thread::sleep(SESSION_CONTEXT_TTL + Duration::from_millis(50));
+        let refreshed = resolve_session_context(Some(&repo)).expect("git session context");
+        assert_eq!(refreshed.branch.as_deref(), Some("feat/cached"));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// Adoption installs sessions with no context so the `git` subprocesses it costs stay
+    /// off the session-manager lock; this covers the follow-up that fills them in.
+    #[test]
+    #[cfg(unix)]
+    fn adopted_session_resolves_git_context_off_lock() {
+        use std::os::fd::IntoRawFd;
+
+        let repo = unique_log_dir();
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_test_command(&repo, &["init", "--initial-branch=feat/adopted"]);
+        git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+        git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+        std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+        git_test_command(&repo, &["add", "README.md"]);
+        git_test_command(&repo, &["commit", "-m", "initial"]);
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-1").expect("session id");
+        let log_path = log_dir.join("session-1.log");
+        std::fs::write(&log_path, b"hello").expect("write log");
+        let fd = std::fs::File::open("/dev/null")
+            .expect("open probe")
+            .into_raw_fd();
+
+        manager
+            .adopt_sessions(
+                crate::handover::HandoverState {
+                    sessions: vec![crate::handover::HandoverSession {
+                        id: session_id.clone(),
+                        command: "/bin/sh".to_string(),
+                        args: Vec::new(),
+                        cwd: Some(repo.clone()),
+                        size: SessionSize::default(),
+                        log_path: log_path.clone(),
+                        output_seq: 0,
+                        bytes_logged: 0,
+                        pid: 1,
+                        process_identity: None,
+                        last_activity_ms: 0,
+                        judge_override: None,
+                    }],
+                    has_tcp_listener: false,
+                    sends_teardown_commit: true,
+                    ..Default::default()
+                },
+                vec![fd],
+            )
+            .expect("adopt session");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let branch = loop {
+            let rows = manager.list_session_contexts().expect("list contexts");
+            let context = rows
+                .iter()
+                .find(|row| row.session_id == session_id)
+                .and_then(|row| row.context.clone());
+            if let Some(context) = context {
+                break context.branch;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "adopted session context was never resolved"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(branch.as_deref(), Some("feat/adopted"));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
