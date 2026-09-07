@@ -366,6 +366,16 @@ class _TerminalPaneState extends State<TerminalPane> {
           _writeInitialContent();
         }
         _activateTerminal();
+        Future.delayed(const Duration(milliseconds: 50), () {
+          if (mounted && _initialized) {
+            _activateTerminal();
+          }
+        });
+        Future.delayed(const Duration(milliseconds: 150), () {
+          if (mounted && _initialized) {
+            _activateTerminal();
+          }
+        });
       }
     });
 
@@ -629,6 +639,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         (active is html.TextAreaElement && !_container.contains(active)) ||
         (active != null && active.isContentEditable == true)) {
       return;
+    }
+    if (mounted && !_focusNode.hasFocus) {
+      _focusNode.requestFocus();
     }
     try {
       final textarea = _cachedTextarea ??=
@@ -1541,6 +1554,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       return false;
     }
 
+    if (!identical(_containerEventOwners[_sanitizedId], this)) {
+      return false;
+    }
+
     // If this pane's FocusNode has Flutter focus, it owns the input.
     if (_focusNode.hasFocus) {
       return true;
@@ -1563,11 +1580,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     // (such as a modal search box or pairing input), do not intercept.
     final active = html.document.activeElement;
     if (active is html.InputElement ||
-        (active is html.TextAreaElement && !_container.contains(active))) {
+        (active is html.TextAreaElement && !_container.contains(active)) ||
+        (active != null && active.isContentEditable == true)) {
       return false;
     }
 
-    return false;
+    return true;
   }
 
   bool _isActiveElementInTerminal() {
