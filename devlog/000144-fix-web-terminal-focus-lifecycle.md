@@ -26,6 +26,14 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-07T01:15-0700 `flutter/triage_client/lib/main.dart`:
   - Added `FocusManager.instance.primaryFocus?.unfocus();` to `_selectSession` upon selecting any session so stale widget focus is cleared.
   - Set `canRequestFocus: false` on `SessionListTile`'s `InkWell` to prevent rail clicks from capturing focus.
+- 2026-09-07T01:46-0700 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 3 detailing Shadow DOM activeElement retargeting, idle host input bypass, and retry expansion for new sessions.
+- 2026-09-07T01:46-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added `_deepActiveElement()` helper to traverse Shadow DOM roots recursively and resolve the leaf active element.
+  - Updated `_isActiveElementInTerminal()`, `_activateTerminal()`, `_eventTargetsTerminal()`, and `dispose()` to inspect `_deepActiveElement()` instead of `html.document.activeElement`.
+  - Exempted Flutter Web engine internal text editing host elements (`flt-text-editing`) in `_isExternalInput()` unless an `EditableText` holds primary focus.
+  - Introduced `_activeTextarea` getter ensuring cached textarea is verified for DOM connection and re-queried if detached.
+  - Invoked `_term.focus()` alongside `textarea.focus()` in `_focusTerminal()` and `_activateTerminal()`.
+  - Moved post-frame focus retry timers `[50, 150, 300]` outside the `cachedContainer` check so newly created sessions also benefit from focus retries.
 
 ## Decisions
 
@@ -37,6 +45,9 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-07T01:15-0700 Distinguish external form inputs from terminal helper textareas: An inactive session's `xterm-helper-textarea` can remain as `html.document.activeElement` when switching sessions. Exempting `xterm-helper-textarea` and any element within `_sessionContainers` prevents `_activateTerminal()` and `_eventTargetsTerminal()` from treating dormant sessions as external form fields.
 - 2026-09-07T01:15-0700 Restrict `primaryFocus` ambient bypass to `EditableText`: In Flutter, clicking buttons or list tiles assigns focus to their `FocusNode`. Only yield ambient keystrokes if the focused widget actually accepts text editing (`EditableText`).
 - 2026-09-07T01:15-0700 Re-attempt focus on `requestAnimationFrame` when disconnected: Calling `.focus()` on a DOM element not yet connected to the document is a silent no-op. If `!_container.isConnected`, schedule focus once the browser attaches the platform view.
+- 2026-09-07T01:46-0700 Deep Shadow DOM traversal for activeElement: Under standard DOM semantics, `document.activeElement` on platform view elements retargets to the shadow host (`<flt-platform-view>` or `<flt-glass-pane>`). Traversing `shadowRoot.activeElement` recursively resolves the true focused element, preventing window capture listeners from mistaking focused xterm textareas for inactive elements and suppressing keystrokes.
+- 2026-09-07T01:46-0700 Differentiate Flutter engine idle input hosts: Flutter Web maintains hidden text editing host elements in the DOM even when no text field is active. Exempting `flt-text-editing` elements unless an `EditableText` is focused prevents false external input locks from aborting `_activateTerminal()`.
+- 2026-09-07T01:46-0700 Apply focus retries to new sessions: Newly created sessions register platform views that take multiple frames to attach and layout in the browser DOM. Scheduling focus retries across both new and cached containers guarantees reliable terminal input activation.
 
 ## Issues
 
@@ -56,9 +67,13 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Restrict primaryFocus ambient rejection to EditableText
 - [x] Blur unmounted session textarea on dispose
 - [x] Unfocus stale widget focus on session selection
+- [x] Implement Shadow DOM deep activeElement traversal
+- [x] Exempt idle Flutter text editing hosts from external input guard
+- [x] Apply focus retries to newly created sessions
 
 ## Commits
 
 - 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
-- HEAD: fix(triage_client): restore input on session switch and refine focus delegation
+- 0baa475: fix(triage_client): restore input on session switch and refine focus delegation
+- HEAD: fix(triage_client): penetrate shadow dom focus and eliminate external input false locks
 

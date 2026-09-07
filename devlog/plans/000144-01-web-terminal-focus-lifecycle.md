@@ -76,3 +76,22 @@ After testing the initial focus lifecycle adjustments, a critical regression sce
    - Call `FocusManager.instance.primaryFocus?.unfocus()` in `_selectSession`.
    - Set `canRequestFocus: false` on `SessionListTile` `InkWell`.
 3. Validate with `flutter analyze`, `flutter test`, `cargo fmt`, `cargo clippy`, and `cargo test`.
+
+## Section 3: Shadow DOM Focus Traversal and Idle Host Guard Refinement
+
+### Thinking
+
+In Flutter Web, platform views (`HtmlElementView`) are mounted inside shadow roots within `<flt-platform-view>`. Under the DOM specification, querying `document.activeElement` retargets active elements inside shadow roots to their containing host element (`<flt-platform-view>` or `<flt-glass-pane>`).
+
+Consequently:
+1. `_isActiveElementInTerminal()` checked `_container.contains(html.document.activeElement)`. Because `_container` is a descendant of the shadow host rather than an ancestor, this check constantly evaluated to false even when xterm's textarea possessed DOM focus.
+2. Because `_isActiveElementInTerminal()` evaluated to false, `_windowKeyDownListener` intercepted every key event during the capture phase, called `event.preventDefault()` and `event.stopPropagation()`, and prevented native browser dispatch to xterm's textarea.
+3. In addition, Flutter Web retains idle hidden input elements (`flt-text-editing-host`). In `_isExternalInput()`, encountering these idle elements without an active `EditableText` falsely flagged external input locks and aborted `_activateTerminal()`.
+
+### Plan
+
+1. Implement `_deepActiveElement()` helper that traverses shadow roots (`active.shadowRoot?.activeElement`) until reaching the focused leaf element.
+2. Update `_isActiveElementInTerminal()`, `_activateTerminal()`, `_eventTargetsTerminal()`, and `dispose()` to inspect `_deepActiveElement()`.
+3. In `_isExternalInput()`, exempt Flutter Web engine internal text editing elements (`flt-text-editing`) unless Flutter's `primaryFocus` is an active `EditableText`.
+4. Introduce `_activeTextarea` getter to ensure `_cachedTextarea` is re-queried if detached during platform view reparenting.
+5. Verify analysis, test suites, and formatting.

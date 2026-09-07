@@ -256,6 +256,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _lastRefitCols;
   int? _lastRefitRows;
   html.TextAreaElement? _cachedTextarea;
+  html.TextAreaElement? get _activeTextarea {
+    if (_cachedTextarea?.isConnected != true) {
+      _cachedTextarea =
+          _container.querySelector('textarea') as html.TextAreaElement?;
+    }
+    return _cachedTextarea;
+  }
 
   @override
   void initState() {
@@ -376,23 +383,23 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
           _writeInitialContent();
-          for (final delayMs in const [50, 150, 300]) {
-            late final Timer timer;
-            timer = Timer(Duration(milliseconds: delayMs), () {
-              _focusRetryTimers.remove(timer);
-              if (!mounted ||
-                  !_initialized ||
-                  !(_currentRoute?.isCurrent ?? true)) {
-                return;
-              }
-              if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
-                _clearFocusRetryTimers();
-                return;
-              }
-              _activateTerminal();
-            });
-            _focusRetryTimers.add(timer);
-          }
+        }
+        for (final delayMs in const [50, 150, 300]) {
+          late final Timer timer;
+          timer = Timer(Duration(milliseconds: delayMs), () {
+            _focusRetryTimers.remove(timer);
+            if (!mounted ||
+                !_initialized ||
+                !(_currentRoute?.isCurrent ?? true)) {
+              return;
+            }
+            if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
+              _clearFocusRetryTimers();
+              return;
+            }
+            _activateTerminal();
+          });
+          _focusRetryTimers.add(timer);
         }
         _activateTerminal();
       }
@@ -577,15 +584,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _focusTerminal() {
     if (_initialized && !widget.isExited) {
       try {
-        final textarea = _cachedTextarea ??=
-            _container.querySelector('textarea') as html.TextAreaElement?;
+        final textarea = _activeTextarea;
         if (textarea != null) {
           final opts = js_util.newObject();
           js_util.setProperty(opts, 'preventScroll', true);
           js_util.callMethod(textarea, 'focus', [opts]);
-        } else {
-          js_util.callMethod(_term, 'focus', []);
         }
+        js_util.callMethod(_term, 'focus', []);
       } catch (_) {}
     }
   }
@@ -651,6 +656,31 @@ class _TerminalPaneState extends State<TerminalPane> {
     return false;
   }
 
+  static html.Element? _deepActiveElement() {
+    try {
+      var active = html.document.activeElement;
+      while (active != null) {
+        final shadow =
+            active.shadowRoot ??
+            (js_util.hasProperty(active, 'shadowRoot')
+                ? js_util.getProperty(active, 'shadowRoot') as html.Node?
+                : null);
+        if (shadow != null) {
+          final shadowActive =
+              js_util.getProperty(shadow, 'activeElement') as html.Element?;
+          if (shadowActive != null && shadowActive != active) {
+            active = shadowActive;
+            continue;
+          }
+        }
+        break;
+      }
+      return active;
+    } catch (_) {
+      return html.document.activeElement;
+    }
+  }
+
   bool _isExternalInput(html.Element? element) {
     if (element == null) return false;
     if (_container.contains(element)) return false;
@@ -661,6 +691,27 @@ class _TerminalPaneState extends State<TerminalPane> {
             _sessionContainers.values.any((c) => c.contains(element)))) {
       return false;
     }
+    // Flutter Web engine internal text editing host elements must not block the terminal
+    // unless a Flutter EditableText currently holds primary focus.
+    try {
+      final tagName = element.tagName.toLowerCase();
+      final className = element.className.toLowerCase();
+      final isFlutterInternal =
+          className.contains('flt-text-editing') ||
+          tagName == 'flt-text-editing-host' ||
+          element.parent?.tagName.toLowerCase() == 'flt-text-editing-host';
+      if (isFlutterInternal) {
+        final primaryFocus = FocusManager.instance.primaryFocus;
+        if (primaryFocus != null &&
+            primaryFocus != _focusNode &&
+            primaryFocus.context != null) {
+          final ctx = primaryFocus.context!;
+          return ctx.widget is EditableText ||
+              ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+        }
+        return false;
+      }
+    } catch (_) {}
     return element is html.InputElement ||
         element is html.SelectElement ||
         element is html.TextAreaElement ||
@@ -672,7 +723,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     final isCurrent = _currentRoute?.isCurrent ?? true;
     if (!isCurrent) return;
 
-    final active = html.document.activeElement;
+    final active = _deepActiveElement();
     if (_isExternalInput(active)) {
       return;
     }
@@ -694,8 +745,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     try {
-      final textarea = _cachedTextarea ??=
-          _container.querySelector('textarea') as html.TextAreaElement?;
+      final textarea = _activeTextarea;
       if (textarea != null) {
         if (_textareaBeforeInputListener == null) {
           _bindTextareaEvents();
@@ -1275,8 +1325,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _bindTextareaEvents() {
     if (!_isMobile) return;
 
-    final textarea = _cachedTextarea ??=
-        _container.querySelector('textarea') as html.TextAreaElement?;
+    final textarea = _activeTextarea;
     if (textarea == null) return;
 
     try {
@@ -1653,7 +1702,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // If focus is currently on an HTML input or textarea outside this terminal
     // (such as a modal search box or pairing input), do not intercept.
     // An inactive xterm helper textarea from another session must not block.
-    final active = html.document.activeElement;
+    final active = _deepActiveElement();
     if (_isExternalInput(active)) {
       return false;
     }
@@ -1673,7 +1722,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   bool _isActiveElementInTerminal() {
-    final active = html.document.activeElement;
+    final active = _deepActiveElement();
     if (active == null) return false;
     return _container.contains(active);
   }
@@ -1955,9 +2004,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _currentMountedPane = null;
     }
     try {
-      final textarea = _cachedTextarea ??=
-          _container.querySelector('textarea') as html.TextAreaElement?;
-      if (textarea != null && html.document.activeElement == textarea) {
+      final textarea = _activeTextarea;
+      if (textarea != null && _deepActiveElement() == textarea) {
         textarea.blur();
       }
       if (_term != null) {
