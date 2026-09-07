@@ -1789,27 +1789,80 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         return;
       }
       if (_isRemoteSession(session)) {
-        if (session.status != 'attached') {
-          return;
-        }
-
         if (!_client.isConnected) {
           _markRemoteSessionDisconnected(session);
           return;
         }
 
         final sessionId = session.remoteSessionId;
-        if (sessionId != null) {
-          _client
-              .writeInput(
-                sessionId: sessionId,
-                clientId: _clientId,
-                bytes: utf8.encode(keys),
-              )
-              .catchError((_) {
-                _markRemoteSessionDisconnected(session);
-              });
+        if (sessionId == null) return;
+
+        if (session.status != 'attached') {
+          if (session.status != 'exited') {
+            _client
+                .attachSession(
+                  sessionId: sessionId,
+                  clientId: _clientId,
+                  mode: 'InteractiveController',
+                )
+                .then((_) {
+                  if (!_disposed && mounted) {
+                    setState(() {
+                      session.status = 'attached';
+                      session.statusColor = const Color(0xff7fd1c7);
+                    });
+                    _client
+                        .writeInput(
+                          sessionId: sessionId,
+                          clientId: _clientId,
+                          bytes: utf8.encode(keys),
+                        )
+                        .catchError((_) {});
+                  }
+                })
+                .catchError((_) {});
+          }
+          return;
         }
+
+        _client
+            .writeInput(
+              sessionId: sessionId,
+              clientId: _clientId,
+              bytes: utf8.encode(keys),
+            )
+            .catchError((_) {
+              if (!_client.isConnected) {
+                _markRemoteSessionDisconnected(session);
+              } else {
+                _client
+                    .attachSession(
+                      sessionId: sessionId,
+                      clientId: _clientId,
+                      mode: 'InteractiveController',
+                    )
+                    .then((_) {
+                      if (!_disposed && mounted) {
+                        setState(() {
+                          session.status = 'attached';
+                          session.statusColor = const Color(0xff7fd1c7);
+                        });
+                        _client
+                            .writeInput(
+                              sessionId: sessionId,
+                              clientId: _clientId,
+                              bytes: utf8.encode(keys),
+                            )
+                            .catchError((_) {});
+                      }
+                    })
+                    .catchError((_) {
+                      if (!_client.isConnected) {
+                        _markRemoteSessionDisconnected(session);
+                      }
+                    });
+              }
+            });
       } else {
         // Local/demo session: echo keystrokes through the same single write
         // path the remote stream uses, so there is one rendering pipeline.
@@ -3690,6 +3743,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.isRemote &&
         _sessionIdFor(session) != null;
     setState(() {
+      if (_client.isConnected &&
+          session.isRemote &&
+          session.status == 'disconnected') {
+        session.status = 'attached';
+        session.statusColor = const Color(0xff7fd1c7);
+      }
       session.focusCursorOnNextDisplay();
       _selectedIndex = index;
     });
@@ -4042,7 +4101,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   Future<void> _closeSession(SessionVm session) async {
     final confirmed = await _confirmCloseSession(session);
-    if (confirmed != true) return;
+    if (confirmed != true) {
+      if (mounted) {
+        session.focusCursorOnNextDisplay();
+      }
+      return;
+    }
 
     final sessionId = session.remoteSessionId;
 
@@ -4264,8 +4328,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _CustomLabelDialog(initialLabel: session.customLabel),
     );
 
-    if (!mounted || result == null) return;
-    _setSessionCustomLabel(session, result);
+    if (!mounted) return;
+    if (result != null) {
+      _setSessionCustomLabel(session, result);
+    }
+    session.focusCursorOnNextDisplay();
   }
 
   bool _allowExit = false;

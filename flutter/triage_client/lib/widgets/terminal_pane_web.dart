@@ -384,24 +384,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         if (cachedContainer != null) {
           _writeInitialContent();
         }
-        for (final delayMs in const [50, 150, 300]) {
-          late final Timer timer;
-          timer = Timer(Duration(milliseconds: delayMs), () {
-            _focusRetryTimers.remove(timer);
-            if (!mounted ||
-                !_initialized ||
-                !(_currentRoute?.isCurrent ?? true)) {
-              return;
-            }
-            if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
-              _clearFocusRetryTimers();
-              return;
-            }
-            _activateTerminal();
-          });
-          _focusRetryTimers.add(timer);
-        }
         _activateTerminal();
+        _scheduleFocusRetries();
       }
     });
 
@@ -681,6 +665,41 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  static bool _isFlutterInternalElement(html.Element? element) {
+    if (element == null) return false;
+    try {
+      html.Element? curr = element;
+      while (curr != null) {
+        final tag = curr.tagName.toLowerCase();
+        final cls = curr.className.toLowerCase();
+        if (tag.startsWith('flt-') ||
+            tag.startsWith('flutter-') ||
+            cls.contains('flt-') ||
+            cls.contains('flutter-')) {
+          return true;
+        }
+        curr = curr.parent;
+      }
+      final rootNode = js_util.callMethod(element, 'getRootNode', []);
+      if (rootNode != null && rootNode != html.document) {
+        final host = js_util.getProperty(rootNode, 'host') as html.Element?;
+        html.Element? hostCurr = host;
+        while (hostCurr != null) {
+          final hostTag = hostCurr.tagName.toLowerCase();
+          final hostCls = hostCurr.className.toLowerCase();
+          if (hostTag.startsWith('flt-') ||
+              hostTag.startsWith('flutter-') ||
+              hostCls.contains('flt-') ||
+              hostCls.contains('flutter-')) {
+            return true;
+          }
+          hostCurr = hostCurr.parent;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
   bool _isExternalInput(html.Element? element) {
     if (element == null) return false;
     if (_container.contains(element)) return false;
@@ -693,42 +712,56 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     // Flutter Web engine internal text editing host elements must not block the terminal
     // unless a Flutter EditableText currently holds primary focus.
-    try {
-      final tagName = element.tagName.toLowerCase();
-      final className = element.className.toLowerCase();
-      final isFlutterInternal =
-          className.contains('flt-text-editing') ||
-          tagName == 'flt-text-editing-host' ||
-          element.parent?.tagName.toLowerCase() == 'flt-text-editing-host';
-      if (isFlutterInternal) {
-        final primaryFocus = FocusManager.instance.primaryFocus;
-        if (primaryFocus != null &&
-            primaryFocus != _focusNode &&
-            primaryFocus.context != null) {
-          final ctx = primaryFocus.context!;
-          return ctx.widget is EditableText ||
-              ctx.findAncestorWidgetOfExactType<EditableText>() != null;
-        }
-        return false;
+    if (_isFlutterInternalElement(element)) {
+      final primaryFocus = FocusManager.instance.primaryFocus;
+      if (primaryFocus != null &&
+          primaryFocus != _focusNode &&
+          primaryFocus.context != null) {
+        final ctx = primaryFocus.context!;
+        return ctx.widget is EditableText ||
+            ctx.findAncestorWidgetOfExactType<EditableText>() != null;
       }
-    } catch (_) {}
+      return false;
+    }
     return element is html.InputElement ||
         element is html.SelectElement ||
         element is html.TextAreaElement ||
         element.isContentEditable == true;
   }
 
-  void _activateTerminal() {
+  void _scheduleFocusRetries({bool force = false}) {
+    _clearFocusRetryTimers();
+    for (final delayMs in const [50, 150, 300]) {
+      late final Timer timer;
+      timer = Timer(Duration(milliseconds: delayMs), () {
+        _focusRetryTimers.remove(timer);
+        if (!mounted || !_initialized || !(_currentRoute?.isCurrent ?? true)) {
+          return;
+        }
+        if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
+          _clearFocusRetryTimers();
+          return;
+        }
+        _activateTerminal(force: force);
+      });
+      _focusRetryTimers.add(timer);
+    }
+  }
+
+  void _activateTerminal({bool force = false}) {
     if (!mounted || !_initialized || widget.isExited) return;
     final isCurrent = _currentRoute?.isCurrent ?? true;
     if (!isCurrent) return;
 
-    final active = _deepActiveElement();
-    if (_isExternalInput(active)) {
-      return;
+    if (!force) {
+      final active = _deepActiveElement();
+      if (_isExternalInput(active)) {
+        return;
+      }
     }
 
     _currentMountedPane = this;
+    _containerEventOwners[_sanitizedId] = this;
 
     if (mounted && _focusNode.canRequestFocus && !_focusNode.hasFocus) {
       _focusNode.requestFocus();
@@ -738,7 +771,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!isConnected) {
       html.window.requestAnimationFrame((_) {
         if (mounted && _initialized) {
-          _activateTerminal();
+          _activateTerminal(force: force);
         }
       });
       return;
@@ -1266,7 +1299,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
       if (_initialized) {
         try {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         } catch (_) {}
       }
     });
@@ -1274,7 +1308,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = _container.onClick.listen((event) {
       if (_initialized) {
         try {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         } catch (_) {}
       }
     });
@@ -1282,7 +1317,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
       if (_initialized) {
         try {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         } catch (_) {}
       }
     });
@@ -1968,6 +2004,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
+      _scheduleFocusRetries(force: true);
     }
     if (oldWidget.controller != widget.controller) {
       _unbindControllerFrom(oldWidget.controller);
@@ -1978,7 +2015,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       );
       _bindController();
       _triggerFullReplayOrReset();
+      _activateTerminal(force: true);
+      _scheduleFocusRetries(force: true);
     }
+    _activateTerminal();
   }
 
   @override
@@ -2032,7 +2072,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       autofocus: true,
       onFocusChange: (hasFocus) {
         if (hasFocus && _initialized) {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         }
       },
       onKeyEvent: (node, event) {
@@ -2061,7 +2102,10 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
           final terminal = GestureDetector(
             behavior: HitTestBehavior.opaque,
-            onTapDown: (_) => _activateTerminal(),
+            onTapDown: (_) {
+              _activateTerminal(force: true);
+              _scheduleFocusRetries(force: true);
+            },
             child: Container(
               color: const Color(0xff0d1113),
               child: HtmlElementView(viewType: _viewType),

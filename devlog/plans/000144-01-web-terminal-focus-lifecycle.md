@@ -95,3 +95,37 @@ Consequently:
 3. In `_isExternalInput()`, exempt Flutter Web engine internal text editing elements (`flt-text-editing`) unless Flutter's `primaryFocus` is an active `EditableText`.
 4. Introduce `_activeTextarea` getter to ensure `_cachedTextarea` is re-queried if detached during platform view reparenting.
 5. Verify analysis, test suites, and formatting.
+
+## Section 4: Self-Healing Input Lease Recovery and Gesture-Driven Focus Retries
+
+### Thinking
+
+Investigating the user report where Codex input remained stuck after switching or editing custom labels revealed two interacting failure modes:
+
+1. Session input lease loss followed by permanent client lockout:
+   - When a remote session's input lease is released, expired, or contested, the daemon rejects `write_input` with an RPC error.
+   - In `flutter/triage_client/lib/main.dart` (`_setupSessionInputListener`), any error from `writeInput` was caught by `.catchError((_) { _markRemoteSessionDisconnected(session); })`.
+   - `_markRemoteSessionDisconnected` marked `session.status = 'disconnected'` and set the connection status to 'Connection Closed'.
+   - Once marked `disconnected`, subsequent keystrokes were dropped immediately by `if (session.status != 'attached') return;`.
+   - Even though the WebSocket connection was completely intact and the process was healthy, the client permanently locked the user out of typing into that session.
+   - Solution: In `_setupSessionInputListener`, when `_client.isConnected`, handle lease errors by requesting an `InteractiveController` lease via `_client.attachSession` and retrying the write. If `session.status != 'attached'` but `_client.isConnected` and `session.status != 'exited'`, automatically re-attach and forward input instead of discarding keystrokes. When selecting a session in `_selectSession`, heal any stale `disconnected` status back to `attached`.
+
+2. Direct user gestures and dialog dismissal focus restoration:
+   - Clicking, tapping, or touching directly on the terminal container represents unambiguous user intent. In `_bindContainerEvents`, container `onMouseDown`, `onClick`, and `onTouchEnd` listeners must pass `force: true` to `_activateTerminal` and `_scheduleFocusRetries` to break out of any stale focus states.
+   - In `TerminalPane.didUpdateWidget`, invoke `_activateTerminal()` and trigger `_scheduleFocusRetries(force: true)` when `focusCursorRevision` or `controller` changes.
+   - In `_openCustomLabelDialog` and `_closeSession`, ensure `session.focusCursorOnNextDisplay()` is invoked upon dismissal so terminal focus is restored.
+
+### Plan
+
+1. In `flutter/triage_client/lib/main.dart`:
+   - Update `_setupSessionInputListener` to re-acquire the `InteractiveController` lease on demand when connected rather than marking the session disconnected.
+   - In `_selectSession`, restore `session.status = 'attached'` and reset `statusColor` if the client is connected.
+   - In `_openCustomLabelDialog` and `_closeSession`, call `session.focusCursorOnNextDisplay()` on dismissal.
+2. In `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+   - Pass `force: true` to `_activateTerminal` and `_scheduleFocusRetries` on container mouse, click, and touch events.
+   - In `didUpdateWidget`, trigger focus activation and retries on controller and revision changes.
+   - In `build`, trigger forced activation and retries on `onFocusChange` and `onTapDown`.
+3. Verify formatting and test suites:
+   - Run `dart format`, `flutter analyze`, and `flutter test`.
+   - Run `cargo fmt`, `cargo clippy`, and `cargo test`.
+
