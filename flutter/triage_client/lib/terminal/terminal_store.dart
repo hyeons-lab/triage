@@ -693,6 +693,13 @@ class TerminalStore extends ChangeNotifier {
     // A chunk can carry the closing marker and then ordinary output. Only the
     // frame's own bytes are exempt from newline translation, so hand the tail
     // back to _writeDirect rather than letting it inherit the exemption.
+    //
+    // Comparing only the last marker of each kind is enough because callers
+    // never hand this text spanning a close and a reopen: _processSynchronizedOutput
+    // splits its input at the first start marker, and _syncBuffer is flushed at
+    // the close, so text arriving here holds at most one frame boundary. See
+    // the 'a close and a reopen in one chunk' test, which pins that.
+
     final closes = lastEnd != -1 && lastEnd > lastStart;
     final split = closes ? lastEnd + _kSyncMarkerLength : text.length;
     final framePart = split == text.length ? text : text.substring(0, split);

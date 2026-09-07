@@ -57,7 +57,9 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - 142d53c: fix(client): close synchronized blocks through one helper and stop a post-dispose re-arm
 - 014d2f5: fix(client): keep synchronized frames verbatim on the wire and defer the bottom snap
 - 15d6141: fix(client): flush held blocks before signalling and simplify the bottom snap
-- HEAD: docs(client): drop the doc comment orphaned by the snap simplification
+- 9d414df: docs(client): drop the doc comment orphaned by the snap simplification
+- 9934427: docs(devlog): record on-device confirmation of the composer
+- HEAD: test(client): pin the frame-boundary invariant _writeVerbatim relies on
 
 ## Progress
 

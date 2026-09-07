@@ -635,6 +635,29 @@ void main() {
     replayStore.dispose();
   });
 
+  test('a close and a reopen in one chunk keeps the middle translated', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[?2026hopen'), outputSeq: 1));
+      // Let the watchdog stop holding the block while the frame is still open
+      // on the wire, so the next chunk is dispatched with the exemption active.
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      sink.ops.clear();
+
+      // Close, ordinary output, reopen, all in one chunk. _writeVerbatim only
+      // compares the last marker of each kind, which is sound only because the
+      // text reaching it never spans a close and a reopen.
+      store.dispatch(
+        LiveBytes(b('\x1b[?2026laaa\nbbb\x1b[?2026hccc'), outputSeq: 2),
+      );
+      expect(sink.ops, [
+        'write:\x1b[?2026l',
+        'write:aaa\r\nbbb',
+      ], reason: 'output between the two frames is not frame content');
+    });
+  });
+
   test('an abandoned frame stops suppressing newline translation', () {
     fakeAsync((async) {
       store.dispatch(const Attach());
