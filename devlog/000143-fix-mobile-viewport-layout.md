@@ -1,4 +1,4 @@
-# 000140: Mobile Viewport Meta Tag and Responsive Mobile Layout
+# 000143: Mobile Viewport Meta Tag and Responsive Mobile Layout
 
 ## Agent
 
@@ -10,12 +10,13 @@ Configure the mobile viewport meta tag in the web client and make the applicatio
 
 ## What Changed
 
-- **2026-09-06T09:44-0700** devlog/plans/000140-01-mobile-viewport-layout.md: Authored implementation plan covering viewport meta tag configuration, responsive rail drawer activation, workspace header compaction, and terminal margins.
+- **2026-09-06T09:44-0700** devlog/plans/000143-01-mobile-viewport-layout.md: Authored implementation plan covering viewport meta tag configuration, responsive rail drawer activation, workspace header compaction, and terminal margins.
 - **2026-09-06T09:54-0700** flutter/triage_client/web/index.html: Added mobile viewport meta tag with device-width, initial and maximum scale 1.0, user-scalable no, and viewport-fit cover.
 - **2026-09-06T09:54-0700** flutter/triage_client/lib/platform_env_io.dart, flutter/triage_client/lib/platform_env_web.dart: Added isWebMobileBrowser helper detecting mobile browsers and touch devices on web, stubbed to false on native.
 - **2026-09-06T09:54-0700** flutter/triage_client/lib/main.dart: Wired isWebMobileBrowser into isMobilePlatform. Made SessionWorkspace rail layout responsive when screen width is under 768px outside test harnesses. Wrapped WorkspaceHeader in LayoutBuilder to adapt padding, icon sizes, action button density, and status display when width is under 600px.
 - **2026-09-06T09:54-0700** flutter/triage_client/lib/widgets/terminal_pane_web.dart: Reduced terminal wrapper margins from 16px to 8px on mobile devices and narrow viewports.
 - **2026-09-06T09:54-0700** flutter/triage_client/test/session_rail_identity_test.dart, flutter/triage_client/test/session_rail_layout_test.dart: Added tests verifying responsive WorkspaceHeader layout on narrow mobile vs desktop viewports, and platform mobile detection.
+- **2026-09-06T17:05-0700** flutter/triage_client/web/index.html: Dropped `maximum-scale=1.0` and `user-scalable=no` from the viewport meta. Rendering at device-width instead of the legacy 980px viewport is what this change was for, and `width=device-width, initial-scale=1.0` delivers that on its own; the two zoom-blocking attributes came along with the boilerplate and cost pinch-to-zoom, which readers who enlarge content depend on.
 
 ## Decisions
 
@@ -26,6 +27,8 @@ Configure the mobile viewport meta tag in the web client and make the applicatio
 
 ## Issues
 
+- **2026-09-06T17:05-0700** This devlog was renumbered from 000140 to 000143. Two unmerged branches had both claimed 000140, since neither can see the other's devlog until one lands. #161 keeps 000140, and 000141 and 000142 belong to #164 and #165.
+- **2026-09-06T17:05-0700** Restoring zoom leaves one known behaviour: iOS zooms in when a text input smaller than 16px takes focus, which `user-scalable=no` had been masking. The accessible fix is a 16px minimum on the focused input rather than blocking zoom, and it is not addressed here.
 - None.
 
 ## Progress
@@ -42,4 +45,5 @@ Configure the mobile viewport meta tag in the web client and make the applicatio
 
 ## Commits
 
-- HEAD: fix(web): configure mobile viewport meta and responsive layout
+- 790e1d9: fix(web): configure mobile viewport meta and responsive layout
+- HEAD: fix(web): keep pinch-to-zoom available on mobile
