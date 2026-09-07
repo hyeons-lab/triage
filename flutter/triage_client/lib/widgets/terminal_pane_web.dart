@@ -232,6 +232,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   Timer? _suppressScrollSaveTimer;
   final List<Timer> _focusRetryTimers = [];
 
+  void _clearFocusRetryTimers() {
+    for (final timer in _focusRetryTimers) {
+      timer.cancel();
+    }
+    _focusRetryTimers.clear();
+  }
+
   void _suppressScrollSaveFor(Duration duration) {
     _suppressScrollSave = true;
     _suppressScrollSaveTimer?.cancel();
@@ -369,23 +376,22 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
           _writeInitialContent();
-          for (final delayMs in const [50, 150]) {
-            _focusRetryTimers.add(
-              Timer(Duration(milliseconds: delayMs), () {
-                if (mounted &&
-                    _initialized &&
-                    (_currentRoute?.isCurrent ?? true)) {
-                  if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
-                    for (final timer in _focusRetryTimers) {
-                      timer.cancel();
-                    }
-                    _focusRetryTimers.clear();
-                    return;
-                  }
-                  _activateTerminal();
-                }
-              }),
-            );
+          for (final delayMs in const [50, 150, 300]) {
+            late final Timer timer;
+            timer = Timer(Duration(milliseconds: delayMs), () {
+              _focusRetryTimers.remove(timer);
+              if (!mounted ||
+                  !_initialized ||
+                  !(_currentRoute?.isCurrent ?? true)) {
+                return;
+              }
+              if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
+                _clearFocusRetryTimers();
+                return;
+              }
+              _activateTerminal();
+            });
+            _focusRetryTimers.add(timer);
           }
         }
         _activateTerminal();
@@ -645,23 +651,48 @@ class _TerminalPaneState extends State<TerminalPane> {
     return false;
   }
 
+  bool _isExternalInput(html.Element? element) {
+    if (element == null) return false;
+    if (_container.contains(element)) return false;
+    // An xterm helper textarea belonging to this or any other session is a terminal
+    // input, not an external form control (such as a modal search box or pairing input).
+    if (element is html.TextAreaElement &&
+        (element.classes.contains('xterm-helper-textarea') ||
+            _sessionContainers.values.any((c) => c.contains(element)))) {
+      return false;
+    }
+    return element is html.InputElement ||
+        element is html.SelectElement ||
+        element is html.TextAreaElement ||
+        element.isContentEditable == true;
+  }
+
   void _activateTerminal() {
     if (!mounted || !_initialized || widget.isExited) return;
     final isCurrent = _currentRoute?.isCurrent ?? true;
     if (!isCurrent) return;
 
-    _currentMountedPane = this;
-
     final active = html.document.activeElement;
-    if (active is html.InputElement ||
-        active is html.SelectElement ||
-        (active is html.TextAreaElement && !_container.contains(active)) ||
-        (active != null && active.isContentEditable == true)) {
+    if (_isExternalInput(active)) {
       return;
     }
+
+    _currentMountedPane = this;
+
     if (mounted && _focusNode.canRequestFocus && !_focusNode.hasFocus) {
       _focusNode.requestFocus();
     }
+
+    final isConnected = _container.isConnected ?? true;
+    if (!isConnected) {
+      html.window.requestAnimationFrame((_) {
+        if (mounted && _initialized) {
+          _activateTerminal();
+        }
+      });
+      return;
+    }
+
     try {
       final textarea = _cachedTextarea ??=
           _container.querySelector('textarea') as html.TextAreaElement?;
@@ -1604,23 +1635,26 @@ class _TerminalPaneState extends State<TerminalPane> {
       return false;
     }
 
-    // If another Flutter widget explicitly holds primary focus (such as a search
-    // bar, sidebar rail buttons, or form dialogs), do not intercept ambient keystrokes.
+    // If another Flutter widget explicitly holds primary focus and is an editable
+    // text field (such as the rail search box or a modal dialog), do not intercept.
     final primaryFocus = FocusManager.instance.primaryFocus;
     if (primaryFocus != null &&
         primaryFocus != _focusNode &&
-        primaryFocus is! FocusScopeNode &&
         primaryFocus.context != null) {
-      return false;
+      final ctx = primaryFocus.context!;
+      final isEditable =
+          ctx.widget is EditableText ||
+          ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+      if (isEditable) {
+        return false;
+      }
     }
 
     // If focus is currently on an HTML input or textarea outside this terminal
     // (such as a modal search box or pairing input), do not intercept.
+    // An inactive xterm helper textarea from another session must not block.
     final active = html.document.activeElement;
-    if (active is html.InputElement ||
-        active is html.SelectElement ||
-        (active is html.TextAreaElement && !_container.contains(active)) ||
-        (active != null && active.isContentEditable == true)) {
+    if (_isExternalInput(active)) {
       return false;
     }
 
@@ -1916,13 +1950,20 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     _focusNode.dispose();
     _unbindController();
-    for (final timer in _focusRetryTimers) {
-      timer.cancel();
-    }
-    _focusRetryTimers.clear();
+    _clearFocusRetryTimers();
     if (identical(_currentMountedPane, this)) {
       _currentMountedPane = null;
     }
+    try {
+      final textarea = _cachedTextarea ??=
+          _container.querySelector('textarea') as html.TextAreaElement?;
+      if (textarea != null && html.document.activeElement == textarea) {
+        textarea.blur();
+      }
+      if (_term != null) {
+        js_util.callMethod(_term, 'blur', []);
+      }
+    } catch (_) {}
     // Everything above releases only what this pane holds. The cached session is
     // shared across panes and survives switching sessions so its DOM container,
     // xterm instance, and scroll position remain preserved. Ending the session

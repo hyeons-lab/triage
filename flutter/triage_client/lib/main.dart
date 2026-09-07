@@ -3680,6 +3680,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _selectSession(int index) {
     if (index < 0 || index >= _sessions.length) return;
+    FocusManager.instance.primaryFocus?.unfocus();
     final session = _sessions[index];
     // On a session's first load the view-fit handler issues the initial refresh
     // at the real fitted size; refreshing here too would race it (and use an
@@ -8306,6 +8307,7 @@ class _SessionListTileState extends State<SessionListTile> {
             // a screen reader has no meta line beside it to supply the repo.
             label: widget.glanceTitle ?? widget.title,
             child: InkWell(
+              canRequestFocus: false,
               onTap: widget.onTap,
               onTapDown: widget.onContextMenu != null
                   ? (details) => _lastTapDownPosition = details.globalPosition

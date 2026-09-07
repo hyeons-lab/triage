@@ -35,3 +35,44 @@ Following PR #166 merging into main at commit e311e2a, a rigorous local review l
    - Run workspace `cargo check` and tests.
    - Audit for em dashes.
 3. Run Round 3 review subagent at max effort to verify all findings are resolved and diff is clean.
+
+## Section 2: Restoring Input After Session Switching
+
+### Thinking
+
+After testing the initial focus lifecycle adjustments, a critical regression scenario remained when switching away from an active session (such as Codex) and then switching back:
+
+1. Inactive session textarea activeElement lockout:
+   - When switching from Session 2 back to Session 1, Session 2's `xterm-helper-textarea` remained as `html.document.activeElement` in the browser DOM.
+   - In `_activateTerminal()` and `_eventTargetsTerminal()`, the check `(active is html.TextAreaElement && !_container.contains(active))` evaluated to true because Session 2's textarea was not inside Session 1's container.
+   - Consequently, `_activateTerminal()` exited prematurely without requesting Flutter focus or focusing Session 1's textarea, and `_eventTargetsTerminal()` returned false on ambient keystrokes.
+   - Fix: define `_isExternalInput(html.Element? element)` that exempts any `xterm-helper-textarea` or elements within any session container (`_sessionContainers.values`), ensuring dormant terminal textareas do not block the active pane from claiming focus.
+
+2. `primaryFocus` rejection on rail interaction:
+   - Clicking a rail tile (`SessionListTile` / `InkWell`) sets Flutter's `primaryFocus` to the tile's `FocusNode`.
+   - Because `InkWell` is not a `FocusScopeNode` and has a valid `BuildContext`, the previous check `primaryFocus != null && primaryFocus != _focusNode && primaryFocus is! FocusScopeNode` rejected ambient keystrokes.
+   - Ambient keystrokes should only be yielded if the focused widget is an editable text field (`EditableText`).
+   - Fix: check `isEditable` via `ctx.widget is EditableText || ctx.findAncestorWidgetOfExactType<EditableText>() != null`.
+
+3. Rail tile focus isolation:
+   - Set `canRequestFocus: false` on `SessionListTile`'s `InkWell`.
+   - Call `FocusManager.instance.primaryFocus?.unfocus();` in `_selectSession` so switching sessions immediately clears stale focus.
+
+4. Unmounted pane blur cleanup:
+   - In `_TerminalPaneState.dispose()`, if the pane's helper textarea or terminal had DOM focus, explicitly invoke `blur()` to prevent zombie active elements.
+
+5. DOM attachment synchronization:
+   - Check `_container.isConnected` before focusing the textarea in `_activateTerminal()`. If not yet attached, schedule a retry on `requestAnimationFrame`.
+
+### Plan
+
+1. In `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+   - Implement `_clearFocusRetryTimers()` helper and clean up timers when fired or disposed.
+   - Implement `_isExternalInput(html.Element? element)` helper.
+   - Update `_activateTerminal()` to check `_isExternalInput`, update `_currentMountedPane` after the guard, request Flutter focus, check `_container.isConnected`, and focus xterm.
+   - Update `_eventTargetsTerminal()` to check `isEditable` and `_isExternalInput`.
+   - In `dispose()`, blur active textarea and `_term`, and clear timers.
+2. In `flutter/triage_client/lib/main.dart`:
+   - Call `FocusManager.instance.primaryFocus?.unfocus()` in `_selectSession`.
+   - Set `canRequestFocus: false` on `SessionListTile` `InkWell`.
+3. Validate with `flutter analyze`, `flutter test`, `cargo fmt`, `cargo clippy`, and `cargo test`.
