@@ -129,6 +129,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // window rather than the container, and guarded by `_eventTargetsTerminal`
   // instead. Overlapping panes both still see keydowns.
   static final Map<String, _TerminalPaneState> _containerEventOwners = {};
+  static _TerminalPaneState? _currentMountedPane;
 
   static void _discardCachedSession(String sanitizedId) {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
@@ -227,6 +228,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
   Timer? _suppressScrollSaveTimer;
+  final List<Timer> _focusRetryTimers = [];
 
   void _suppressScrollSaveFor(Duration duration) {
     _suppressScrollSave = true;
@@ -249,6 +251,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void initState() {
     super.initState();
+    _currentMountedPane = this;
     _focusNode = FocusNode();
     final sanitizedId = widget.terminalId.replaceAll(
       RegExp(r'[^a-zA-Z0-9-]'),
@@ -364,18 +367,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
           _writeInitialContent();
+          for (final delayMs in const [50, 150]) {
+            _focusRetryTimers.add(
+              Timer(Duration(milliseconds: delayMs), () {
+                if (mounted &&
+                    _initialized &&
+                    (_currentRoute?.isCurrent ?? true)) {
+                  _activateTerminal();
+                }
+              }),
+            );
+          }
         }
         _activateTerminal();
-        Future.delayed(const Duration(milliseconds: 50), () {
-          if (mounted && _initialized) {
-            _activateTerminal();
-          }
-        });
-        Future.delayed(const Duration(milliseconds: 150), () {
-          if (mounted && _initialized) {
-            _activateTerminal();
-          }
-        });
       }
     });
 
@@ -634,13 +638,16 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _activateTerminal() {
     if (!_initialized || widget.isExited) return;
+    final isCurrent = _currentRoute?.isCurrent ?? true;
+    if (!isCurrent) return;
+
     final active = html.document.activeElement;
     if (active is html.InputElement ||
         (active is html.TextAreaElement && !_container.contains(active)) ||
         (active != null && active.isContentEditable == true)) {
       return;
     }
-    if (mounted && !_focusNode.hasFocus) {
+    if (mounted && _focusNode.canRequestFocus && !_focusNode.hasFocus) {
       _focusNode.requestFocus();
     }
     try {
@@ -653,9 +660,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         final opts = js_util.newObject();
         js_util.setProperty(opts, 'preventScroll', true);
         js_util.callMethod(textarea, 'focus', [opts]);
-      } else {
-        js_util.callMethod(_term, 'focus', []);
       }
+      js_util.callMethod(_term, 'focus', []);
     } catch (_) {}
   }
 
@@ -1576,6 +1582,25 @@ class _TerminalPaneState extends State<TerminalPane> {
       return true;
     }
 
+    if (_isActiveElementInTerminal()) {
+      return true;
+    }
+
+    // Ambient window keydown fallback:
+    // Only the currently mounted/visible pane should handle ambient keystrokes.
+    if (!identical(_currentMountedPane, this)) {
+      return false;
+    }
+
+    // If another Flutter widget explicitly holds primary focus (such as a search
+    // bar, sidebar rail buttons, or form dialogs), do not intercept ambient keystrokes.
+    final primaryFocus = FocusManager.instance.primaryFocus;
+    if (primaryFocus != null &&
+        primaryFocus != _focusNode &&
+        primaryFocus.context != null) {
+      return false;
+    }
+
     // If focus is currently on an HTML input or textarea outside this terminal
     // (such as a modal search box or pairing input), do not intercept.
     final active = html.document.activeElement;
@@ -1583,6 +1608,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         (active is html.TextAreaElement && !_container.contains(active)) ||
         (active != null && active.isContentEditable == true)) {
       return false;
+    }
+
+    // Do not intercept Tab navigation or Escape from outside the terminal.
+    if (event is html.KeyboardEvent) {
+      if (event.key == 'Tab' || event.key == 'Escape') {
+        return false;
+      }
     }
 
     return true;
@@ -1807,6 +1839,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _currentMountedPane = this;
     if (oldWidget.bracketedPasteEnabled != widget.bracketedPasteEnabled) {
       _sessionBracketedPasteModes[_sanitizedId] = widget.bracketedPasteEnabled;
       if (_term != null) {
@@ -1865,6 +1898,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     _focusNode.dispose();
     _unbindController();
+    for (final timer in _focusRetryTimers) {
+      timer.cancel();
+    }
+    _focusRetryTimers.clear();
+    if (identical(_currentMountedPane, this)) {
+      _currentMountedPane = null;
+    }
     // Everything above releases only what this pane holds. The cached session is
     // shared across panes and survives switching sessions so its DOM container,
     // xterm instance, and scroll position remain preserved. Ending the session
