@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
+
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
+
 import 'terminal_pane.dart';
 
 class TerminalPane extends StatefulWidget {
@@ -373,6 +375,13 @@ class _TerminalPaneState extends State<TerminalPane> {
                 if (mounted &&
                     _initialized &&
                     (_currentRoute?.isCurrent ?? true)) {
+                  if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
+                    for (final timer in _focusRetryTimers) {
+                      timer.cancel();
+                    }
+                    _focusRetryTimers.clear();
+                    return;
+                  }
                   _activateTerminal();
                 }
               }),
@@ -637,12 +646,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _activateTerminal() {
-    if (!_initialized || widget.isExited) return;
+    if (!mounted || !_initialized || widget.isExited) return;
     final isCurrent = _currentRoute?.isCurrent ?? true;
     if (!isCurrent) return;
 
+    _currentMountedPane = this;
+
     final active = html.document.activeElement;
     if (active is html.InputElement ||
+        active is html.SelectElement ||
         (active is html.TextAreaElement && !_container.contains(active)) ||
         (active != null && active.isContentEditable == true)) {
       return;
@@ -1597,6 +1609,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     final primaryFocus = FocusManager.instance.primaryFocus;
     if (primaryFocus != null &&
         primaryFocus != _focusNode &&
+        primaryFocus is! FocusScopeNode &&
         primaryFocus.context != null) {
       return false;
     }
@@ -1605,6 +1618,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // (such as a modal search box or pairing input), do not intercept.
     final active = html.document.activeElement;
     if (active is html.InputElement ||
+        active is html.SelectElement ||
         (active is html.TextAreaElement && !_container.contains(active)) ||
         (active != null && active.isContentEditable == true)) {
       return false;
@@ -1612,7 +1626,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     // Do not intercept Tab navigation or Escape from outside the terminal.
     if (event is html.KeyboardEvent) {
-      if (event.key == 'Tab' || event.key == 'Escape') {
+      if (event.key == 'Tab' ||
+          event.code == 'Tab' ||
+          event.key == 'Escape' ||
+          event.key == 'Esc' ||
+          event.code == 'Escape') {
         return false;
       }
     }
