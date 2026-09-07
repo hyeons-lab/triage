@@ -3459,7 +3459,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (sessionId == null) return;
 
       final sessionIndex = _sessions.indexWhere(
-        (s) => s.title == 'triage / $sessionId',
+        (s) =>
+            s.remoteSessionId == sessionId ||
+            s.sessionId == sessionId ||
+            s.title == 'triage / $sessionId',
       );
 
       if (sessionIndex == -1) {
@@ -3472,6 +3475,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (session.status == 'loading') {
         _pendingEvents.putIfAbsent(sessionId, () => []).add(message);
         return;
+      }
+
+      // Drain any events buffered while this session was loading or resolving.
+      final pending = _pendingEvents.remove(sessionId);
+      if (pending != null && pending.isNotEmpty) {
+        for (final msg in pending) {
+          _processWebSocketEvent(msg);
+        }
       }
 
       if (event.containsKey('Output')) {
@@ -3991,6 +4002,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
           final session = SessionVm(
             title: 'triage / $sessionId',
+            sessionId: sessionId,
             branch: branch,
             repoRoot: repoRoot,
             worktreeRoot: worktreeRoot,

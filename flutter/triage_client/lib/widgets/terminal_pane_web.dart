@@ -512,6 +512,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     try {
       js_util.callMethod(_term, 'scrollToBottom', []);
     } catch (_) {}
+    if (!_initialContentWritten &&
+        (_lastFittedCols ?? 0) >= 10 &&
+        (_lastFittedRows ?? 0) >= 5) {
+      _finishInitialContent(_lastFittedCols!, _lastFittedRows!);
+    } else {
+      _flushPendingLiveWrites();
+    }
     _sessionInputRouter.sendInput(_sanitizedId, data);
     _focusTerminal();
   }
@@ -789,6 +796,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       js_util.callMethod(_term, 'focus', []);
     } catch (_) {}
+
+    if (_pendingLiveWriteBuffer.isNotEmpty) {
+      _flushPendingLiveWrites();
+    }
   }
 
   void _initTerminal(String sanitizedId) {
@@ -971,6 +982,19 @@ class _TerminalPaneState extends State<TerminalPane> {
             js_util.callMethod(term, 'scrollToBottom', []);
           }
         } catch (_) {}
+        final activePane = _containerEventOwners[sessionId];
+        if (activePane != null) {
+          if (!activePane._initialContentWritten &&
+              (activePane._lastFittedCols ?? 0) >= 10 &&
+              (activePane._lastFittedRows ?? 0) >= 5) {
+            activePane._finishInitialContent(
+              activePane._lastFittedCols!,
+              activePane._lastFittedRows!,
+            );
+          } else {
+            activePane._flushPendingLiveWrites();
+          }
+        }
         // Sticky Ctrl (accessory bar): fold an armed Ctrl into the next single
         // character before it reaches the session: arming Ctrl then typing "c"
         // on the soft keyboard sends 0x03 (SIGINT), not a literal "c". A
@@ -1126,6 +1150,20 @@ class _TerminalPaneState extends State<TerminalPane> {
     void onWrite(String data) {
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null && !activePane._initialContentWritten) {
+        if ((activePane._lastFittedCols ?? 0) >= 10 &&
+            (activePane._lastFittedRows ?? 0) >= 5) {
+          activePane._finishInitialContent(
+            activePane._lastFittedCols!,
+            activePane._lastFittedRows!,
+          );
+          final term = _sessionTerms[sessionId];
+          if (term != null) {
+            try {
+              js_util.callMethod(term, 'write', [data]);
+            } catch (_) {}
+          }
+          return;
+        }
         activePane._pendingLiveWriteBuffer.add(data);
       } else {
         final term = _sessionTerms[sessionId];
@@ -1955,24 +1993,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     js_util.setProperty(options, 'cursorBlink', !widget.isExited);
   }
 
-  void _triggerFullReplayOrReset() {
-    if (!_initialized) return;
-    try {
-      if (_initialContentWritten) {
-        _suppressScrollSaveFor(const Duration(milliseconds: 1000));
-        _resetTerminalSafe();
-        _writeInitialContent();
-      } else {
-        _resetTerminalSafe();
-        _pendingLiveWriteBuffer.clear();
-        _initialContentWritten = false;
-        _stableWidth = null;
-        _stableHeight = null;
-        _triggerFitWithDelayedRetries();
-      }
-    } catch (_) {}
-  }
-
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1998,9 +2018,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           _updateCursorOptions();
         } catch (_) {}
       }
-      if (!_initialContentWritten) {
-        _triggerFullReplayOrReset();
-      }
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
@@ -2014,7 +2031,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         widget.controller,
       );
       _bindController();
-      _triggerFullReplayOrReset();
       _activateTerminal(force: true);
       _scheduleFocusRetries(force: true);
     }

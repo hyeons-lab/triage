@@ -45,6 +45,16 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Updated `_setupSessionInputListener()` to self-heal and re-acquire `InteractiveController` lease on demand via `_client.attachSession()` rather than discarding input or falsely marking the session disconnected.
   - Updated `_selectSession()` to restore `session.status = 'attached'` and reset `statusColor` if the client is connected and the session was marked disconnected.
   - Updated `_openCustomLabelDialog()` and `_closeSession()` to call `session.focusCursorOnNextDisplay()` upon dialog dismissal.
+- 2026-09-07T16:36-0700 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 5 detailing session event lookup refinement, pending event buffer draining, live write gating elimination on user typing, and non-destructive controller updates.
+- 2026-09-07T16:36-0700 `flutter/triage_client/lib/main.dart`:
+  - Updated `_processWebSocketEvent` to match sessions by `remoteSessionId`, `sessionId`, or `title`, and immediately drain pending buffered events once the session is not loading.
+  - Passed explicit `sessionId` to `SessionVm` constructor in `_createSession`.
+- 2026-09-07T16:36-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `onWrite`, immediately finalized initial content and wrote directly to `term` if valid fitted dimensions exist, eliminating live write output stalling in `_pendingLiveWriteBuffer`.
+  - In `_sendInput` and `onDataCallback`, finalized initial content when fitted and flushed pending live writes.
+  - In `_activateTerminal`, flushed pending live writes upon terminal activation.
+  - Removed destructive `_triggerFullReplayOrReset()` call on controller update in `didUpdateWidget`.
+  - Removed `_resetTerminalSafe()` screen clearing and `_pendingLiveWriteBuffer.clear()` from `_triggerFullReplayOrReset()`, and removed unused helper.
 
 ## Decisions
 
@@ -62,6 +72,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-07T09:22-0700 Self-healing input lease re-attachment: If `writeInput()` fails or input is received for a session whose status is not attached, check `_client.isConnected`. If the WebSocket is alive and the session is not exited, request an `InteractiveController` lease via `attachSession()` and retry the write instead of disconnecting the session.
 - 2026-09-07T09:22-0700 Gesture-driven focus enforcement: Direct mouse, click, and touch gestures on the terminal container or GestureDetector indicate unambiguous user focus intent. Bypassing external input guards via `force: true` and triggering the retry ladder ensures focus immediately transfers to xterm.
 - 2026-09-07T09:22-0700 Dialog dismissal cursor focus restoration: Closing modal dialogs like custom label renaming leaves DOM focus on hidden Flutter engine elements. Invoking `session.focusCursorOnNextDisplay()` on dismissal increments `focusCursorRevision` and triggers terminal focus reactivation.
+- 2026-09-07T16:36-0700 Resilient remote session lookup in WebSocket event processing: Match remoteSessionId, sessionId, and title fallback in _processWebSocketEvent so sessions with custom labels or renamed titles route events reliably.
+- 2026-09-07T16:36-0700 Proactive pending event draining on WebSocket messages: Once a session is not in loading state, immediately drain any buffered events from _pendingEvents before handling new messages to preserve message sequence and output order.
+- 2026-09-07T16:36-0700 Immediate live write finalization on user input: If the user sends input or incoming output arrives while valid fitted dimensions are present, finalize initial content immediately rather than waiting for stability timers, avoiding output stalls.
+- 2026-09-07T16:36-0700 Eliminate destructive screen clearing on controller swap: Terminal state is owned by xterm.js in the browser; controller swaps during rebinds must not clear the screen or wipe pending live buffers.
 
 ## Issues
 
@@ -88,11 +102,15 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Direct user gesture forced focus retries on mousedown, click, touch, and tap
 - [x] Dialog dismissal cursor focus restoration
 - [x] Flutter internal element ancestor traversal in _isExternalInput()
+- [x] Resilient session lookup and pending event draining in main.dart
+- [x] Immediate live write finalization and flush in terminal_pane_web.dart
+- [x] Eliminate destructive terminal resets and buffer clearing on controller update
 
 ## Commits
 
 - 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
 - 0baa475: fix(triage_client): restore input on session switch and refine focus delegation
 - c747c84: fix(triage_client): penetrate shadow dom focus and eliminate external input false locks
-- HEAD: fix(triage_client): re-acquire input lease on demand and harden focus retry lifecycle
+- e192036: fix(triage_client): re-acquire input lease on demand and harden focus retry lifecycle
+- HEAD: fix(triage_client): unblock session output stream and eliminate destructive resets
 

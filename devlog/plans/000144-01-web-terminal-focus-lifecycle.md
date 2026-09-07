@@ -129,3 +129,48 @@ Investigating the user report where Codex input remained stuck after switching o
    - Run `dart format`, `flutter analyze`, and `flutter test`.
    - Run `cargo fmt`, `cargo clippy`, and `cargo test`.
 
+## Section 5: Unblocking Codex Session Echoes and Eliminating Web Output Stalling
+
+### Thinking
+
+Detailed debugging of session-218 (`stuck-codex`) revealed three cooperating root causes preventing user keystrokes from displaying:
+
+1. Remote session event lookup and event stranding in `main.dart`:
+   - `_processWebSocketEvent` looked up sessions using `s.title == 'triage / $sessionId'`.
+   - If `s.title` diverged (such as when custom labels or renamed titles were used), `sessionIndex` evaluated to `-1`.
+   - When `sessionIndex == -1` or `session.status == 'loading'`, incoming WebSocket events (such as `Output`) were buffered into `_pendingEvents[sessionId]`.
+   - Even when `sessionIndex != -1` and `session.status != 'loading'`, `_processWebSocketEvent` never drained `_pendingEvents[sessionId]`. Events buffered during loading or transitions remained trapped indefinitely.
+   - In addition, `_createSession` created `SessionVm` without passing `sessionId: sessionId`, leaving `remoteSessionId` dependent on parsing `title`.
+   - Solution: In `_processWebSocketEvent`, match sessions via `s.remoteSessionId == sessionId || s.sessionId == sessionId || s.title == 'triage / $sessionId'`. Before processing a live event, drain any queued events from `_pendingEvents.remove(sessionId)`. In `_createSession`, pass `sessionId: sessionId`.
+
+2. Live output buffering stall in `terminal_pane_web.dart`:
+   - In `onWrite(String data)`: if `activePane._initialContentWritten` is false, incoming data is pushed into `activePane._pendingLiveWriteBuffer` instead of being written directly to `_term`.
+   - `_initialContentWritten` is only set to true by `_finishInitialContent()`, which waits for a 250ms stability timer or 800ms force-finalize timer in `_onFit()`.
+   - When the user types, `_sendInput` sends bytes to the backend, which echoes them back over WebSocket. Because the user is typing while `_initialContentWritten` is false, the echoed bytes are held in `_pendingLiveWriteBuffer` indefinitely without being rendered.
+   - Neither `_sendInput` nor `_sendMobileInput` flushed `_pendingLiveWriteBuffer` or finalized initial content.
+   - Solution: In `onWrite`, if `activePane._lastFittedCols >= 10 && activePane._lastFittedRows >= 5`, immediately call `_finishInitialContent` and write to `term`. In `_sendInput` and `_sendMobileInput`, if valid fitted dimensions exist, immediately call `_finishInitialContent`, and always call `_flushPendingLiveWrites()`. In `_activateTerminal`, also flush `_flushPendingLiveWrites()`.
+
+3. Destructive terminal clearing on controller update:
+   - In `didUpdateWidget`, when `oldWidget.controller != widget.controller`, `_triggerFullReplayOrReset()` called `_resetTerminalSafe()`, sending `\x1b[2J\x1b[3J\x1b[H` to clear xterm.js.
+   - Because `session.hasFitted` was already true, `noteViewFit` returned early without replaying history. The existing terminal buffer was wiped clean, leaving the display blank.
+   - Furthermore, if `!_initialContentWritten`, `_triggerFullReplayOrReset()` called `_pendingLiveWriteBuffer.clear()`, destroying pending output chunks.
+   - Solution: Remove `_triggerFullReplayOrReset()` from the controller update path in `didUpdateWidget`. The controller itself issues `clear()` via its sink listener when a genuine reset is required. In `_triggerFullReplayOrReset()`, remove `_resetTerminalSafe()` and `_pendingLiveWriteBuffer.clear()` to prevent destructive buffer wipes.
+
+### Plan
+
+1. In `flutter/triage_client/lib/main.dart`:
+   - Update `_processWebSocketEvent` session lookup to check `s.remoteSessionId == sessionId || s.sessionId == sessionId || s.title == 'triage / $sessionId'`.
+   - In `_processWebSocketEvent`, drain `_pendingEvents.remove(sessionId)` before handling incoming events once the session is not loading.
+   - Pass `sessionId: sessionId` when constructing `SessionVm` in `_createSession`.
+2. In `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+   - In `onWrite`, if `activePane` has fitted dimensions, finalize initial content and write directly to `term`.
+   - In `_sendInput` and `_sendMobileInput`, finalize initial content if fitted, and always call `_flushPendingLiveWrites()`.
+   - In `_activateTerminal`, flush `_flushPendingLiveWrites()`.
+   - In `didUpdateWidget`, remove `_triggerFullReplayOrReset()` from the `oldWidget.controller != widget.controller` block.
+   - In `_triggerFullReplayOrReset()`, remove `_resetTerminalSafe()` and `_pendingLiveWriteBuffer.clear()`.
+3. Validate and build:
+   - Format with `dart format`.
+   - Verify with `flutter analyze` and `flutter test`.
+   - Check `cargo check --workspace` and `cargo test --workspace`.
+   - Rebuild web bundle and reload daemon.
+
