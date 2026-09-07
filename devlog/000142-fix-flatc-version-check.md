@@ -32,20 +32,22 @@ mismatch surface as a wall of rustc type errors inside generated code.
 
 ## Issues
 
+- 2026-09-06T16:55-0700 Review on #165 pointed out that a prefix match on `flatbuffers` would also match a neighbouring key such as `flatbuffers-build`, and was not restricted to `[workspace.dependencies]`. Now scoped to that table with an exact key match, and it reads a `version` field when the value is an inline table rather than a bare string.
 - 2026-09-06T12:12-0700 The check keys on the major version alone. FlatBuffers versions by year, so
   that catches the distribution-package case that motivated this (Ubuntu ships 2.0.x) but would not
   catch an incompatibility introduced between two releases of the same year.
 
 ## Commits
 
-- HEAD: fix(build): reject a flatc that cannot generate code for the pinned runtime
+- a3c68c6: fix(build): reject a flatc that cannot generate code for the pinned runtime
+- HEAD: fix(build): match the flatbuffers pin exactly when reading the manifest
 
 ## Progress
 
 - [x] Add the generation check with an actionable error
 - [x] Verify all four paths: matching, older, newer, unreadable
-- [ ] Open PR
+- [x] Open PR (#165)
 
 ## Next Steps
 
-- Open a PR against main.
+- Await review on #165.

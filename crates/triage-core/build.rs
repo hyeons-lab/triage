@@ -133,16 +133,45 @@ fn flatc_major(flatc: &std::path::Path) -> Option<u64> {
 
 /// Reads the `flatbuffers` major version pinned in the workspace manifest, so
 /// this check tracks the pin instead of drifting from it.
+///
+/// Matches the `flatbuffers` key inside `[workspace.dependencies]` exactly, so
+/// a neighbour like `flatbuffers-build`, or a same-named key in another table,
+/// cannot be read as the runtime pin.
 fn pinned_flatbuffers_major() -> Option<u64> {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?)
         .parent()?
         .parent()?
         .join("Cargo.toml");
     let text = std::fs::read_to_string(manifest).ok()?;
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("flatbuffers"))?;
-    let version = line.split('"').nth(1)?;
-    version.split('.').next()?.parse::<u64>().ok()
+
+    let mut in_workspace_deps = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_workspace_deps = line == "[workspace.dependencies]";
+            continue;
+        }
+        if !in_workspace_deps {
+            continue;
+        }
+        // Only whitespace may sit between the key and its `=`, so `flatbuffers-build`
+        // and friends do not match.
+        let Some(rest) = line.strip_prefix("flatbuffers") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        // Either a bare version string or an inline table carrying `version`.
+        let version = if value.starts_with('{') {
+            value
+                .split_once("version")
+                .and_then(|(_, after)| after.trim_start().strip_prefix('='))
+                .and_then(|after| after.split('"').nth(1))?
+        } else {
+            value.split('"').nth(1)?
+        };
+        return version.split('.').next()?.parse::<u64>().ok();
+    }
+    None
 }
