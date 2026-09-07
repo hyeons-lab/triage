@@ -71,6 +71,7 @@ Measured against the live session distribution (32 sessions across 14 distinct c
 
 ## Issues
 
+- 2026-09-06T17:00-0700 Review on #164 found that `session_context_reuses_recent_resolution` put a `git checkout` subprocess between the cache write and the staleness assertion, so a slow or contended runner could expire the 500ms window and flip the result. The staleness assertion is now made only when the window is measurably still open; the expiry half stays unconditional, so the miss path is still covered on every run.
 - 2026-09-06T12:20-0700 Review on #164 flagged `Instant::duration_since`, which panics when the earlier instant is later than `self`. `Instant` is monotonic under normal OS conditions but not across VM migration, hypervisor suspend, or container wake, so both cache-window comparisons now use `saturating_duration_since`. Also documented that `clear_session_context_cache` mutates process-wide state and depends on the suite running single-threaded.
 - 2026-09-06T10:11-0700 Rebased onto `origin/main` at 892c91e and renumbered from 000137 to 000141, since main had since taken 000137 (session tab scroll cache) and 000140 is claimed by the open PR #161. One conflict, in `adopt_one_session`: main had added session-id canonicalization that resolves the active segment for a recovered id, which #158's segmented storage needs, while this branch changed the signature to return `PendingSessionContext`. Both were kept, the canonicalization ahead of the conflict check.
 - 2026-09-06T10:11-0700 Verified the change is still needed rather than superseded. Main's `adopt_sessions` still takes the session-manager lock once and calls `resolve_session_context` per session inside `adopt_one_session`, and no `SetContext` command, directory cache, or install-phase timing exists there. `REPLAY_TAIL_CAP` is still `MAX_SESSION_LOG_BYTES` at 16 MiB on main, so #158's 8 MiB figure is the segment size and does not shrink the replay tail this measured.
@@ -78,7 +79,8 @@ Measured against the live session distribution (32 sessions across 14 distinct c
 ## Commits
 
 - f2dbacb: perf(daemon): take git context resolution off the adoption lock
-- HEAD: fix(daemon): use saturating_duration_since for the context cache window
+- eec1ad3: fix(daemon): use saturating_duration_since for the context cache window
+- HEAD: test(daemon): stop the cache test depending on how fast git checkout runs
 
 ## Lessons Learned
 

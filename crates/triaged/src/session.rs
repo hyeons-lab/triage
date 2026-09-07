@@ -9485,6 +9485,7 @@ mod tests {
         git_test_command(&repo, &["commit", "-m", "initial"]);
 
         clear_session_context_cache();
+        let cached_at = Instant::now();
         let first = resolve_session_context(Some(&repo)).expect("git session context");
         assert_eq!(first.branch.as_deref(), Some("main"));
 
@@ -9492,8 +9493,15 @@ mod tests {
         // memoized entry, which is the whole point: many sessions in one directory cost
         // one resolution.
         git_test_command(&repo, &["checkout", "-b", "feat/cached"]);
+        // That checkout is a subprocess, and on a slow or contended runner it can outrun
+        // the window on its own. Assert staleness only when the entry is actually still
+        // live, or the test fails for the machine's speed rather than the cache's
+        // behaviour. Expiry below is unconditional, so the miss path stays covered.
+        let still_within_window = cached_at.elapsed() < SESSION_CONTEXT_TTL;
         let cached = resolve_session_context(Some(&repo)).expect("git session context");
-        assert_eq!(cached.branch.as_deref(), Some("main"));
+        if still_within_window {
+            assert_eq!(cached.branch.as_deref(), Some("main"));
+        }
 
         // Once the window lapses the switch is picked up, so the memoization delays a
         // branch change rather than pinning it.
