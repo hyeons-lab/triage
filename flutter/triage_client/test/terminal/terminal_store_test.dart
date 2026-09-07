@@ -49,6 +49,31 @@ class FakeTerminalSink implements TerminalSink {
   void onHistoryReplayed() => historyReplayedCount++;
 }
 
+/// Records the history-replay signal in the same ordered op list as writes, so
+/// a test can assert the signal lands after every decoded byte.
+class ReplayOrderSink extends FakeTerminalSink {
+  @override
+  void onHistoryReplayed() {
+    ops.add('historyReplayed');
+    super.onHistoryReplayed();
+  }
+}
+
+/// A sink that runs a one-shot callback from inside [write], so a test can
+/// tear the store down part-way through a flush the way a listener reacting to
+/// freshly painted output can.
+class ReentrantSink extends FakeTerminalSink {
+  void Function()? onWrite;
+
+  @override
+  void write(String data) {
+    super.write(data);
+    final callback = onWrite;
+    onWrite = null;
+    callback?.call();
+  }
+}
+
 void main() {
   late FakeTerminalSink sink;
   late TerminalStore store;
@@ -473,6 +498,282 @@ void main() {
       });
     },
   );
+
+  test(
+    'open synchronized block flushes progressively during sustained streams',
+    () {
+      fakeAsync((async) {
+        store.dispatch(const Attach());
+        store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        sink.ops.clear();
+
+        // Open a block; nothing reaches the sink yet.
+        store.dispatch(LiveBytes(b('\x1b[?2026hchunk-one '), outputSeq: 1));
+        expect(sink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+        // Chunks keep arriving faster than the idle watchdog, so the watchdog
+        // alone would never flush and the screen would freeze for the whole
+        // stream. The live-flush interval still paints periodically.
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('chunk-two '), outputSeq: 2));
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('chunk-three '), outputSeq: 3));
+        async.elapse(const Duration(milliseconds: 30));
+        store.dispatch(LiveBytes(b('chunk-four '), outputSeq: 4));
+        async.elapse(const Duration(milliseconds: 10)); // t=100: interval fires
+        var writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+        expect(writes.length, 1);
+        expect(
+          writes.first,
+          'write:\x1b[?2026hchunk-one chunk-two chunk-three chunk-four ',
+          reason: 'live flush paints the open block without closing it',
+        );
+
+        // The block is still open: the remainder closes atomically at its end
+        // marker, with no bytes lost or duplicated across the writes.
+        sink.ops.clear();
+        store.dispatch(LiveBytes(b('tail\x1b[?2026lafter'), outputSeq: 5));
+        writes = sink.ops.where((op) => op.startsWith('write:')).toList();
+        expect(writes, ['write:tail\x1b[?2026l', 'write:after']);
+
+        // The interval stops once the block closes.
+        async.elapse(kSyncOutputLiveFlushInterval * 3);
+        expect(
+          sink.ops.where((op) => op.startsWith('write:')).length,
+          2,
+          reason: 'no further writes after the block closed',
+        );
+      });
+    },
+  );
+
+  test('a watchdog close after a live flush still writes the tail raw', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Sustained chunks keep the 50ms watchdog re-armed so the 100ms live
+      // flush is what fires, consuming the block's opening marker.
+      store.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      async.elapse(const Duration(milliseconds: 30));
+      store.dispatch(LiveBytes(b('two '), outputSeq: 2));
+      async.elapse(const Duration(milliseconds: 30));
+      store.dispatch(LiveBytes(b('three '), outputSeq: 3));
+      async.elapse(const Duration(milliseconds: 30));
+      store.dispatch(LiveBytes(b('four '), outputSeq: 4));
+      async.elapse(const Duration(milliseconds: 10));
+      expect(sink.ops, ['write:\x1b[?2026hone two three four ']);
+
+      // Still inside the block, then idle: the watchdog closes a tail that no
+      // longer carries a marker. Its bare LF must survive untouched, because
+      // the application owns cursor placement inside a synchronized frame.
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 5));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(
+        sink.ops,
+        ['write:bbb\nccc'],
+        reason: 'no \\r may be injected into a synchronized-output frame',
+      );
+    });
+  });
+
+  test('chunks after a premature close stay raw until the real end marker', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Open a frame, then stall longer than the watchdog. The watchdog stops
+      // holding the block, but the application has not closed the frame.
+      store.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(sink.ops, ['write:\x1b[?2026hone ']);
+
+      // A stall mid-generation is routine, and these bytes are still frame
+      // content: the application owns cursor placement until it says otherwise.
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 2));
+      expect(
+        sink.ops,
+        ['write:bbb\nccc'],
+        reason: 'no \\r may be injected while the frame is open on the wire',
+      );
+
+      // Once the frame really closes, ordinary newline translation resumes.
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('\x1b[?2026l'), outputSeq: 3));
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('ddd\neee'), outputSeq: 4));
+      expect(sink.ops, ['write:ddd\r\neee']);
+    });
+  });
+
+  test('history replay ending mid-frame flushes before it signals', () {
+    // #162 documents onHistoryReplayed as "all decoded snapshot bytes
+    // written", and its web bottom-restore depends on that. A replay whose
+    // tail ends inside a Mode 2026 block would otherwise still be held.
+    final orderSink = ReplayOrderSink();
+    final replayStore = TerminalStore(orderSink);
+    replayStore.dispatch(const Attach());
+    replayStore.dispatch(
+      HistoryBytes(b('\x1b[?2026hheld tail'), cols: 80, rows: 24),
+    );
+
+    final writeIndex = orderSink.ops.indexWhere(
+      (op) => op.startsWith('write:'),
+    );
+    final signalIndex = orderSink.ops.indexOf('historyReplayed');
+    expect(writeIndex, isNonNegative, reason: 'the held tail must be flushed');
+    expect(signalIndex, isNonNegative);
+    expect(
+      writeIndex,
+      lessThan(signalIndex),
+      reason: 'every decoded byte must reach the sink before the signal',
+    );
+    replayStore.dispose();
+  });
+
+  test('a close and a reopen in one chunk keeps the middle translated', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[?2026hopen'), outputSeq: 1));
+      // Let the watchdog stop holding the block while the frame is still open
+      // on the wire, so the next chunk is dispatched with the exemption active.
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      sink.ops.clear();
+
+      // Close, ordinary output, reopen, all in one chunk. _writeVerbatim only
+      // compares the last marker of each kind, which is sound only because the
+      // text reaching it never spans a close and a reopen.
+      store.dispatch(
+        LiveBytes(b('\x1b[?2026laaa\nbbb\x1b[?2026hccc'), outputSeq: 2),
+      );
+      expect(sink.ops, [
+        'write:\x1b[?2026l',
+        'write:aaa\r\nbbb',
+      ], reason: 'output between the two frames is not frame content');
+    });
+  });
+
+  test('an abandoned frame stops suppressing newline translation', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // A frame opens and the application then dies without ever closing it.
+      store.dispatch(LiveBytes(b('\x1b[?2026hpartial'), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      sink.ops.clear();
+
+      // Still inside the abandon window, so this is treated as frame content.
+      store.dispatch(LiveBytes(b('aaa\nbbb'), outputSeq: 2));
+      expect(sink.ops, ['write:aaa\nbbb']);
+
+      // Past it, the frame is presumed gone and ordinary shell output must not
+      // staircase for the rest of the session.
+      sink.ops.clear();
+      async.elapse(kSyncFrameAbandonTimeout * 2);
+      store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 3));
+      expect(sink.ops, ['write:ccc\r\nddd']);
+    });
+  });
+
+  test('a session exit closes an unfinished frame', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[?2026hpartial'), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+      store.dispatch(const Exited());
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 2));
+      expect(sink.ops, ['write:ccc\r\nddd']);
+    });
+  });
+
+  test('a session exit while the block is still held closes the frame', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      // No elapse: the block is still buffered, so retiring the frame without
+      // flushing would let the watchdog re-derive it from the buffered start
+      // marker and re-arm the abandon timer.
+      store.dispatch(LiveBytes(b('\x1b[?2026hpartial'), outputSeq: 1));
+      store.dispatch(const Exited());
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('ccc\nddd'), outputSeq: 2));
+      expect(sink.ops, [
+        'write:ccc\r\nddd',
+      ], reason: 'the abandoned frame must not survive the flush');
+    });
+  });
+
+  test('output after a closing marker is translated, not carried verbatim', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      store.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      // The watchdog stops holding the block while the frame is still open on
+      // the wire, so the closing marker arrives outside a held block.
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+      sink.ops.clear();
+      store.dispatch(LiveBytes(b('\x1b[?2026lccc\nddd'), outputSeq: 2));
+      expect(
+        sink.ops,
+        ['write:\x1b[?2026l', 'write:ccc\r\nddd'],
+        reason:
+            'only the frame is exempt; the tail after it is ordinary output',
+      );
+    });
+  });
+
+  test('disposing from inside a live flush leaves no timer armed', () {
+    fakeAsync((async) {
+      // A store of its own: this one is disposed inside the test, while the
+      // shared `store` stays for tearDown to dispose.
+      final reentrantSink = ReentrantSink();
+      final victim = TerminalStore(reentrantSink);
+      victim.dispatch(const Attach());
+      victim.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      reentrantSink.ops.clear();
+
+      // Chunks must keep arriving inside the 50ms watchdog, or the watchdog
+      // closes the block first and the live flush under test never runs.
+      victim.dispatch(LiveBytes(b('\x1b[?2026hone '), outputSeq: 1));
+      reentrantSink.onWrite = victim.dispose;
+      async.elapse(const Duration(milliseconds: 30));
+      victim.dispatch(LiveBytes(b('two '), outputSeq: 2));
+      async.elapse(const Duration(milliseconds: 30));
+      victim.dispatch(LiveBytes(b('three '), outputSeq: 3));
+      async.elapse(const Duration(milliseconds: 30));
+      victim.dispatch(LiveBytes(b('four '), outputSeq: 4));
+      async.elapse(const Duration(milliseconds: 10)); // t=100: flush fires
+
+      expect(
+        reentrantSink.ops.where((op) => op.startsWith('write:')).length,
+        1,
+        reason: 'the live flush painted once before the store was disposed',
+      );
+      // The tick resumes after the dispose its own write triggered. Re-arming
+      // there would leave a timer firing against a disposed sink every
+      // interval, forever.
+      expect(
+        async.nonPeriodicTimerCount,
+        0,
+        reason:
+            'dispose must leave no live flush armed: '
+            '${async.pendingTimersDebugString}',
+      );
+    });
+  });
 
   test(
     'Synchronized Output buffer capacity cap forces a flush when exceeded',

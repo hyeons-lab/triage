@@ -28,6 +28,29 @@ const int kPendingLiveByteCap = 1024 * 1024;
 const Duration kHistoryInputSuppression = Duration(milliseconds: 50);
 const Duration kSyncOutputWatchdogTimeout = Duration(milliseconds: 50);
 
+/// Upper bound on how long synchronized output stays invisible while its
+/// block is still open. Tools like `agy` wrap an entire streaming response in
+/// a single Mode 2026 block; every chunk re-arms the idle watchdog, so
+/// without this the screen would freeze for the whole generation and only
+/// paint at the closing marker. Flushing periodically keeps the stream live
+/// while small back-to-back frames (which complete well inside this interval)
+/// still land atomically.
+const Duration kSyncOutputLiveFlushInterval = Duration(milliseconds: 100);
+
+/// How long a Mode 2026 frame may stay open on the wire with no bytes at all
+/// before it is treated as abandoned.
+///
+/// A frame legitimately spans a whole `agy` generation, minutes at a time, so
+/// this cannot be an elapsed-time bound. It is an *idle* bound instead: a live
+/// generation is always emitting (tokens, spinner frames, status redraws),
+/// while an application killed mid-frame goes silent forever. The clock is
+/// reset when frame bytes reach the sink, which for a held block means on each
+/// live flush rather than on each chunk's arrival. Without it a
+/// frame that never receives its closing marker would leave newline
+/// translation disabled for the rest of the session, which turns ordinary
+/// shell output into a staircase.
+const Duration kSyncFrameAbandonTimeout = Duration(seconds: 30);
+
 const String _kSyncPrefix = '\x1b[?2026';
 const String _kSyncStart = '\x1b[?2026h';
 const String _kSyncEnd = '\x1b[?2026l';
@@ -79,6 +102,26 @@ class TerminalStore extends ChangeNotifier {
   final StringBuffer _syncBuffer = StringBuffer();
   bool _inSynchronizedOutput = false;
   Timer? _syncTimer;
+  // Periodic flush while a synchronized block stays open (see
+  // [kSyncOutputLiveFlushInterval]). Rearmed on every tick until the block
+  // closes; cancelled by _closeSyncBlockAndFlush (the end marker, the capacity
+  // cap and the idle watchdog all route through it), by _resetCarries, and by
+  // dispose.
+  Timer? _syncLiveFlushTimer;
+  // Guards against a frame that never receives its closing marker (see
+  // [kSyncFrameAbandonTimeout]). Rearmed whenever frame bytes reach the sink.
+  Timer? _frameAbandonTimer;
+  // Set once dispose() runs. A flush writes to the sink synchronously, so a
+  // listener reacting to that write can dispose us part-way through a tick or
+  // through _processSynchronizedOutput's loop; both would otherwise carry on
+  // and arm timers that fire against a disposed sink.
+  bool _disposed = false;
+  // Whether the application has opened a Mode 2026 frame and not yet closed it.
+  // Distinct from _inSynchronizedOutput, which only tracks whether we are still
+  // *holding* one: the watchdog and the capacity cap both stop holding a block
+  // that is still open on the wire, and everything up to the real closing
+  // marker is still frame content that must not be newline-translated.
+  bool _frameOpenOnWire = false;
 
   // Live chunks received before we are sized / while awaiting history, plus a
   // running byte total so the buffer can be bounded (see [kPendingLiveByteCap]).
@@ -130,6 +173,7 @@ class TerminalStore extends ChangeNotifier {
   // ---- Public API -----------------------------------------------------------
 
   void dispatch(TerminalIntent intent) {
+    if (_disposed) return;
     final next = _reduce(_state, intent);
     if (next != _state) {
       _state = next;
@@ -156,9 +200,16 @@ class TerminalStore extends ChangeNotifier {
         );
 
       case Detach():
+        _closeFrameOnWire();
         return s.copyWith(phase: AttachPhase.detached);
 
       case Exited():
+        // Whatever the process was drawing, it is not going to close it. Flush
+        // first: retiring the frame while a block is still held would let the
+        // watchdog re-derive it from the buffered start marker and re-arm the
+        // abandon timer, so newline translation would stay off for 30s.
+        _closeSyncBlockAndFlush();
+        _closeFrameOnWire();
         return s.copyWith(exited: true);
 
       case Clear():
@@ -344,7 +395,11 @@ class TerminalStore extends ChangeNotifier {
     if (next.sized) {
       _flushPendingLive(throughOutputSeq);
     }
-    _sink.onHistoryReplayed();
+    // #162's contract is that every decoded byte has reached the sink by the
+    // time this fires, and its web bottom-restore depends on it. A replay
+    // ending mid-frame would otherwise still be sitting in _syncBuffer.
+    _closeSyncBlockAndFlush();
+    if (!_disposed) _sink.onHistoryReplayed();
     return next;
   }
 
@@ -452,6 +507,7 @@ class TerminalStore extends ChangeNotifier {
   }
 
   void _beginHostInputSuppression() {
+    if (_disposed) return;
     _suppressHostInput = true;
     _suppressTimer?.cancel();
     _suppressTimer = Timer(kHistoryInputSuppression, () {
@@ -488,7 +544,10 @@ class TerminalStore extends ChangeNotifier {
   ///
   /// CLI tools (such as `agy`) wrap animated redraws in Mode 2026 so all intermediate
   /// cursor repositions and status updates are delivered in one atomic frame rather
-  /// than jittering across multiple network chunks.
+  /// than jittering across multiple network chunks. Because a block can also
+  /// span an entire streaming response, an open block additionally flushes
+  /// periodically ([kSyncOutputLiveFlushInterval]) so the screen stays live
+  /// instead of freezing until the closing marker.
   void _processSynchronizedOutput(String input) {
     if (!_inSynchronizedOutput && !input.contains(_kSyncPrefix)) {
       _writeDirect(input);
@@ -502,10 +561,9 @@ class TerminalStore extends ChangeNotifier {
           final chunkEnd = endIdx + _kSyncMarkerLength;
           _syncBuffer.write(input.substring(cursor, chunkEnd));
           cursor = chunkEnd;
-          _inSynchronizedOutput = false;
-          _syncTimer?.cancel();
-          _syncTimer = null;
-          _flushSyncBuffer();
+          // The flushed buffer ends with the closing marker, so _writeVerbatim
+          // derives the frame state from it; this path needs no second writer.
+          _closeSyncBlockAndFlush();
         } else {
           _syncBuffer.write(input.substring(cursor));
           cursor = input.length;
@@ -513,10 +571,7 @@ class TerminalStore extends ChangeNotifier {
             debugPrint(
               'TerminalStore: synchronized output buffer exceeded $_kSyncBufferCap bytes; force-flushing',
             );
-            _inSynchronizedOutput = false;
-            _syncTimer?.cancel();
-            _syncTimer = null;
-            _flushSyncBuffer();
+            _closeSyncBlockAndFlush();
           } else {
             _rearmSyncWatchdog();
           }
@@ -528,8 +583,10 @@ class TerminalStore extends ChangeNotifier {
             _writeDirect(input.substring(cursor, startIdx));
           }
           _inSynchronizedOutput = true;
+          _frameOpenOnWire = true;
           _syncBuffer.write(_kSyncStart);
           cursor = startIdx + _kSyncMarkerLength;
+          _armSyncLiveFlush();
           _rearmSyncWatchdog();
         } else {
           final text = cursor == 0 ? input : input.substring(cursor);
@@ -540,7 +597,21 @@ class TerminalStore extends ChangeNotifier {
     }
   }
 
+  /// Closes an open synchronized block and paints what it accumulated.
+  ///
+  /// Every exit from a block runs through here (end marker, capacity cap, and
+  /// the idle watchdog) so none of them can drift apart on the timers they
+  /// each have to retire.
+  void _closeSyncBlockAndFlush() {
+    _inSynchronizedOutput = false;
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    _cancelSyncLiveFlush();
+    _flushSyncBuffer();
+  }
+
   void _rearmSyncWatchdog() {
+    if (_disposed) return;
     _syncTimer?.cancel();
     _syncTimer = Timer(kSyncOutputWatchdogTimeout, () {
       if (_escapeCarry.isNotEmpty) {
@@ -549,35 +620,123 @@ class TerminalStore extends ChangeNotifier {
         _processSynchronizedOutput(carried);
       }
       if (_inSynchronizedOutput || _syncBuffer.isNotEmpty) {
-        _inSynchronizedOutput = false;
-        _syncTimer?.cancel();
-        _syncTimer = null;
-        _flushSyncBuffer();
+        _closeSyncBlockAndFlush();
       }
     });
+  }
+
+  /// Arms the periodic live flush for an open synchronized block, unless one
+  /// is already pending. The tick flushes whatever has accumulated but leaves
+  /// the block open, so a sustained stream paints at least every
+  /// [kSyncOutputLiveFlushInterval] instead of freezing until its end marker.
+  void _armSyncLiveFlush() {
+    if (_disposed) return;
+    _syncLiveFlushTimer ??= Timer(
+      kSyncOutputLiveFlushInterval,
+      _onSyncLiveFlushTick,
+    );
+  }
+
+  void _onSyncLiveFlushTick() {
+    _syncLiveFlushTimer = null;
+    if (_disposed || !_inSynchronizedOutput) return;
+    _flushSyncBuffer();
+    if (_inSynchronizedOutput) {
+      _armSyncLiveFlush();
+    }
+  }
+
+  void _cancelSyncLiveFlush() {
+    _syncLiveFlushTimer?.cancel();
+    _syncLiveFlushTimer = null;
   }
 
   void _flushSyncBuffer() {
     if (_syncBuffer.isEmpty) return;
     final toFlush = _syncBuffer.toString();
     _syncBuffer.clear();
-    _writeDirect(toFlush);
+    // Always verbatim: inside a block the application owns cursor and column
+    // placement, so newline translation must not run. _writeDirect used to
+    // infer this from the buffer still carrying the opening \x1b[?2026h, but a
+    // live flush now consumes that marker, and the block's own flag is already
+    // cleared by the time _closeSyncBlockAndFlush flushes the tail. Without
+    // this the same bytes would render differently depending on whether a
+    // 100ms boundary happened to fall mid-block.
+    _writeVerbatim(toFlush);
   }
 
   void _writeDirect(String text) {
-    if (text.isEmpty) return;
+    if (text.isEmpty || _disposed) return;
+    // Frame content goes to the sink untouched: inside a Mode 2026 frame the
+    // application owns cursor and column placement, so a bare LF must not
+    // acquire a carriage return.
+    if (_frameOpenOnWire || text.contains(_kSyncPrefix)) {
+      _writeVerbatim(text);
+      return;
+    }
     final wasWriting = _isWritingSink;
     _isWritingSink = true;
     try {
-      if (_inSynchronizedOutput || text.contains(_kSyncPrefix)) {
-        _pendingCarriageReturn = text.endsWith('\r');
-        _sink.write(text);
-      } else {
-        _sink.write(_translateNewlines(text));
-      }
+      _sink.write(_translateNewlines(text));
     } finally {
       _isWritingSink = wasWriting;
     }
+  }
+
+  /// Writes [text] to the sink exactly as received, with no newline
+  /// translation, and updates the on-the-wire frame state from any markers it
+  /// carries.
+  void _writeVerbatim(String text) {
+    if (text.isEmpty || _disposed) return;
+    final lastStart = text.lastIndexOf(_kSyncStart);
+    final lastEnd = text.lastIndexOf(_kSyncEnd);
+    // A chunk can carry the closing marker and then ordinary output. Only the
+    // frame's own bytes are exempt from newline translation, so hand the tail
+    // back to _writeDirect rather than letting it inherit the exemption.
+    //
+    // Comparing only the last marker of each kind is enough because callers
+    // never hand this text spanning a close and a reopen: _processSynchronizedOutput
+    // splits its input at the first start marker, and _syncBuffer is flushed at
+    // the close, so text arriving here holds at most one frame boundary. See
+    // the 'a close and a reopen in one chunk' test, which pins that.
+
+    final closes = lastEnd != -1 && lastEnd > lastStart;
+    final split = closes ? lastEnd + _kSyncMarkerLength : text.length;
+    final framePart = split == text.length ? text : text.substring(0, split);
+
+    final wasWriting = _isWritingSink;
+    _isWritingSink = true;
+    try {
+      _pendingCarriageReturn = framePart.endsWith('\r');
+      _sink.write(framePart);
+    } finally {
+      _isWritingSink = wasWriting;
+    }
+
+    if (lastStart != -1 || lastEnd != -1) {
+      _frameOpenOnWire = lastStart > lastEnd;
+    }
+    if (_frameOpenOnWire) {
+      _rearmFrameAbandonTimer();
+    } else {
+      _frameAbandonTimer?.cancel();
+      _frameAbandonTimer = null;
+    }
+    if (split < text.length) {
+      _writeDirect(text.substring(split));
+    }
+  }
+
+  void _rearmFrameAbandonTimer() {
+    if (_disposed) return;
+    _frameAbandonTimer?.cancel();
+    _frameAbandonTimer = Timer(kSyncFrameAbandonTimeout, _closeFrameOnWire);
+  }
+
+  void _closeFrameOnWire() {
+    _frameAbandonTimer?.cancel();
+    _frameAbandonTimer = null;
+    _frameOpenOnWire = false;
   }
 
   static bool _isFollowedByRelativeCursorMovement(
@@ -709,7 +868,9 @@ class TerminalStore extends ChangeNotifier {
     _pendingCarriageReturn = false;
     _syncTimer?.cancel();
     _syncTimer = null;
+    _cancelSyncLiveFlush();
     _inSynchronizedOutput = false;
+    _closeFrameOnWire();
     _syncBuffer.clear();
     _appliedLiveSeq = null;
     _appliedLogBytes = null;
@@ -717,8 +878,14 @@ class TerminalStore extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _suppressTimer?.cancel();
+    _suppressTimer = null;
     _syncTimer?.cancel();
+    _syncTimer = null;
+    _frameAbandonTimer?.cancel();
+    _frameAbandonTimer = null;
+    _cancelSyncLiveFlush();
     _syncBuffer.clear();
     _sink.onOutput = null;
     _sink.onResize = null;

@@ -96,6 +96,21 @@ class _TerminalPaneState extends State<TerminalPane> {
   // notification doesn't re-capture the anchor from our own correction.
   bool _suppressAnchorCapture = false;
   bool _repinScheduled = false;
+  // Viewport pixels at the previous scroll event, to tell a downward chase
+  // (release the pin near the bottom) from upward reading (keep it).
+  //
+  // Scroll events maintain it, and our own corrections (the anchor re-pin and
+  // the bottom snap) record the offset they landed on. Anything that leaves no
+  // meaningful previous *user* position nulls it instead: a terminal swap, a
+  // cursor jump, and the end of a drag-select. Output-driven jumps to the
+  // bottom deliberately leave it alone, since they clear the anchor on the way
+  // and land at the bottom, so there is no pin left for a stale reading to
+  // release.
+  double? _lastScrollPixels;
+  // Pointers currently down on the terminal. A hold activity reports *not*
+  // scrolling, so the scroll state alone would treat a finger resting on a
+  // stopped fling as settled.
+  final Set<int> _activePointers = <int>{};
 
   Timer? _resizeOutDebounceTimer;
   Timer? _scrollToCursorTimer;
@@ -303,6 +318,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       } else {
         _scrollAnchor.clear();
       }
+      // A snap queued for the outgoing session must not land on this one.
+      _activePointers.clear();
+      // The last scroll position belongs to the outgoing terminal; a direction
+      // measured against it could release the incoming session's pin on its
+      // first scroll event.
+      _lastScrollPixels = null;
       // Drop any latched sticky Ctrl so it can't fold into the new session's
       // first keystroke (a Ctrl armed for session A must not reach session B).
       _ctrlArmed = false;
@@ -419,6 +440,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
+    _activePointers.add(event.pointer);
     // Desktop only: focus on pointer-down so a mouse click focuses the terminal
     // before a drag-select. On mobile this same pointer-down begins a scroll
     // swipe, and requesting focus here raises the soft keyboard mid-scroll — the
@@ -471,6 +493,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // 4.0.0; raw pointer handling also sidesteps the gesture arena, so normal
   // drag-select keeps working.
   void _handlePointerUp(PointerUpEvent event) {
+    _activePointers.remove(event.pointer);
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -487,6 +510,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _handlePointerCancel(PointerCancelEvent event) {
+    _activePointers.remove(event.pointer);
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -499,6 +523,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _endDrag() {
     _stopAutoScroll();
+    // Auto-scroll moved the viewport while _onScrollChanged was short-circuited
+    // on _dragSelecting, so the offset from before the drag is no longer a
+    // previous *user* position. Left in place it reads as one large downward
+    // delta and releases a pin the user never gave up.
+    _lastScrollPixels = null;
     _dragPointer = null;
     _dragDownPosition = null;
     _dragLastPosition = null;
@@ -780,16 +809,68 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _captureScrollAnchor() {
     if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
     final lineHeight = _lineHeight();
     if (lineHeight != null) {
-      _scrollAnchor.capture(
-        buffer: _terminal.buffer,
-        pixels: _scrollController.position.pixels,
-        maxScrollExtent: _scrollController.position.maxScrollExtent,
-        lineHeight: lineHeight,
-      );
+      if (_scrollAnchor.hasAnchor &&
+          shouldReleaseScrollPin(
+            lastPixels: _lastScrollPixels,
+            pixels: position.pixels,
+            maxScrollExtent: position.maxScrollExtent,
+            lineHeight: lineHeight,
+          )) {
+        // The user is chasing live output and nearly there. Dropping the pin
+        // is what stops the treadmill, and is the whole fix; the snap only
+        // saves them the last line or two.
+        _scrollAnchor.clear();
+        if (shouldFinishBottomSnap(
+          isScrolling: position.isScrollingNotifier.value,
+          pointerDown: _activePointers.isNotEmpty,
+          pixels: position.pixels,
+          maxScrollExtent: position.maxScrollExtent,
+          hasAnchor: false,
+        )) {
+          // Nothing is in flight, so jumpTo cannot tear down a gesture. When
+          // something is, the pin is already off and the user's own movement
+          // finishes the trip, which is why this needs no deferral.
+          _snapToBottom(position);
+          return;
+        }
+      } else {
+        _scrollAnchor.capture(
+          buffer: _terminal.buffer,
+          pixels: position.pixels,
+          maxScrollExtent: position.maxScrollExtent,
+          lineHeight: lineHeight,
+        );
+      }
     }
+    // Tracked on every scroll event, laid out or not: skipping it while the
+    // line height is unmeasurable would leave the next event measuring
+    // direction across the gap and reading one large jump as a bottom chase.
+    _lastScrollPixels = position.pixels;
     _saveScrollOffset(widget.terminalId, lineHeight);
+  }
+
+  void _snapToBottom(ScrollPosition position) {
+    // Suppressed like our own re-pin correction so the snap's notification
+    // cannot re-capture an anchor from it. Saved and restored rather than
+    // forced false, so a nested call cannot clear an outer suppressed region.
+    final wasSuppressed = _suppressAnchorCapture;
+    _suppressAnchorCapture = true;
+    try {
+      position.jumpTo(position.maxScrollExtent);
+    } finally {
+      _suppressAnchorCapture = wasSuppressed;
+      // Read the offset back rather than assuming the target: jumpTo can throw
+      // on a transient scroll-range issue, and recording a bottom we never
+      // reached would make the next event measure a fake delta.
+      _lastScrollPixels = position.pixels;
+    }
+    // Saving at the bottom retires this session's stored offset and anchor, so
+    // a later revisit follows live output instead of being pulled back to the
+    // position the user just scrolled away from.
+    _saveScrollOffset(widget.terminalId, _lineHeight());
   }
 
   void _onTerminalContentChanged() {
@@ -859,13 +940,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     );
     if (desired == null) return;
     if ((desired - position.pixels).abs() < 0.5) return;
+    final wasSuppressed = _suppressAnchorCapture;
     _suppressAnchorCapture = true;
     try {
       position.jumpTo(desired);
     } finally {
-      // Guarantee the guard resets even if jumpTo throws on a transient
-      // scroll-range issue — otherwise user scrolls would stop capturing.
-      _suppressAnchorCapture = false;
+      // Restored rather than forced false, so a nested correction cannot clear
+      // an outer suppressed region. Runs even if jumpTo throws on a transient
+      // scroll-range issue, so user scrolls keep capturing either way.
+      _suppressAnchorCapture = wasSuppressed;
+      _lastScrollPixels = position.pixels;
     }
   }
 
@@ -874,6 +958,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted) return;
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
+        // A jump of our own must not read as a user scroll direction, so the
+        // capture it triggers can pin (or clear at the bottom) normally.
+        _lastScrollPixels = null;
         final saved = _sessionSavedScrollOffsets[widget.terminalId];
         final lineHeight = _lineHeight();
         double target;
