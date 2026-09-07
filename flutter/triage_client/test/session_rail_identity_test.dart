@@ -600,6 +600,73 @@ void main() {
       expect(find.text(session.displayTitle), findsOneWidget);
     });
 
+    testWidgets(
+      'workspace header adapts responsively on narrow mobile viewport',
+      (tester) async {
+        final session = _session(
+          branch: 'feat/mobile-viewport',
+          repoRoot: '/src/triage',
+          worktreeRoot: '/src/triage',
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 360,
+                child: WorkspaceHeader(
+                  session: session,
+                  onOpenRail: () {},
+                  onToggleJudge: () {},
+                  onRefit: () {},
+                  onClose: () {},
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        expect(find.text(session.displayTitle), findsOneWidget);
+        // Status text is hidden on narrow viewports to preserve space for title.
+        expect(find.text(session.status), findsNothing);
+        // Status dot icon remains present with tooltip.
+        expect(find.byType(Tooltip), findsWidgets);
+      },
+    );
+
+    testWidgets(
+      'workspace header renders status text on wide desktop viewport',
+      (tester) async {
+        final session = _session(
+          branch: 'feat/desktop-viewport',
+          repoRoot: '/src/triage',
+          worktreeRoot: '/src/triage',
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 800,
+                child: WorkspaceHeader(
+                  session: session,
+                  onOpenRail: () {},
+                  onToggleJudge: () {},
+                  onRefit: () {},
+                  onClose: () {},
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        expect(find.text(session.displayTitle), findsOneWidget);
+        expect(find.text(session.status), findsOneWidget);
+      },
+    );
+
     testWidgets('the tile announces the repo-first name to a screen reader', (
       tester,
     ) async {
@@ -687,10 +754,8 @@ void main() {
         worktreeRoot: '/src/frontend/worktrees/wt-search',
       )..snippet = 'flutter test passing';
 
-      final s2 = _session(
-        title: 'triage / s2',
-        cwd: '/var/log/syslog',
-      )..snippet = 'analyzing server logs';
+      final s2 = _session(title: 'triage / s2', cwd: '/var/log/syslog')
+        ..snippet = 'analyzing server logs';
 
       final sessions = [s0, s1, s2];
       final groups = [
@@ -745,7 +810,10 @@ void main() {
 
       // All 3 sessions initially visible; search field is hidden until search button is pressed
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
-      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'feat/widget'),
+        findsOneWidget,
+      );
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
       expect(find.byType(TextField), findsNothing);
 
@@ -761,7 +829,10 @@ void main() {
       // 1. Search by repo name ("frontend")
       await tester.enterText(searchField, 'frontend');
       await tester.pump();
-      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'feat/widget'),
+        findsOneWidget,
+      );
       expect(find.widgetWithText(SessionListTile, 'main'), findsNothing);
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsNothing);
 
@@ -772,7 +843,10 @@ void main() {
       // 2. Search by worktree name ("wt-search")
       await tester.enterText(searchField, 'wt-search');
       await tester.pump();
-      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'feat/widget'),
+        findsOneWidget,
+      );
       expect(find.widgetWithText(SessionListTile, 'main'), findsNothing);
 
       // 3. Search by cwd ("syslog")
@@ -801,7 +875,10 @@ void main() {
 
       expect(find.byType(TextField), findsNothing);
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
-      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'feat/widget'),
+        findsOneWidget,
+      );
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
 
       // 7. Open search, type query, and press Escape to close
@@ -816,7 +893,10 @@ void main() {
       await tester.pump();
       expect(find.byType(TextField), findsNothing);
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
-      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'feat/widget'),
+        findsOneWidget,
+      );
 
       // 8. Open search, type query, and verify collapsing the sidebar resets search
       await tester.tap(searchButton);
@@ -889,24 +969,30 @@ void main() {
       await tester.pump();
       expect(find.byType(TextField), findsNothing);
       expect(find.widgetWithText(SessionListTile, 'main'), findsOneWidget);
-      expect(find.widgetWithText(SessionListTile, 'feat/widget'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'feat/widget'),
+        findsOneWidget,
+      );
       expect(find.widgetWithText(SessionListTile, 'syslog'), findsOneWidget);
     });
   });
 
   group('customLabel', () {
-    test('outranks branch, worktree, repo and cwd in railTitle and displayTitle', () {
-      final session = _session(
-        customLabel: 'Primary Web Worker',
-        branch: 'feat/rail-identity',
-        repoRoot: '/Users/me/dev/triage',
-        worktreeRoot: '/Users/me/dev/triage/worktrees/rail-identity',
-        cwd: '/Users/me/dev/triage',
-      );
-      expect(session.railTitle, 'Primary Web Worker');
-      expect(session.displayTitle, 'Primary Web Worker');
-      expect(session.glanceTitleAt(DateTime.now()), 'Primary Web Worker');
-    });
+    test(
+      'outranks branch, worktree, repo and cwd in railTitle and displayTitle',
+      () {
+        final session = _session(
+          customLabel: 'Primary Web Worker',
+          branch: 'feat/rail-identity',
+          repoRoot: '/Users/me/dev/triage',
+          worktreeRoot: '/Users/me/dev/triage/worktrees/rail-identity',
+          cwd: '/Users/me/dev/triage',
+        );
+        expect(session.railTitle, 'Primary Web Worker');
+        expect(session.displayTitle, 'Primary Web Worker');
+        expect(session.glanceTitleAt(DateTime.now()), 'Primary Web Worker');
+      },
+    );
 
     test('whitespace-only customLabel is treated as absent', () {
       final session = _session(
@@ -930,7 +1016,9 @@ void main() {
       expect(session.matchesSearch('beta'), isFalse);
     });
 
-    testWidgets('session rail search finds sessions by their customLabel', (tester) async {
+    testWidgets('session rail search finds sessions by their customLabel', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1200, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetPhysicalSize);
@@ -994,8 +1082,14 @@ void main() {
       );
       await tester.pump();
 
-      expect(find.widgetWithText(SessionListTile, 'Frontend Dev Server'), findsOneWidget);
-      expect(find.widgetWithText(SessionListTile, 'Database Migration'), findsOneWidget);
+      expect(
+        find.widgetWithText(SessionListTile, 'Frontend Dev Server'),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(SessionListTile, 'Database Migration'),
+        findsOneWidget,
+      );
 
       final searchButton = find.byTooltip('Search sessions');
       await tester.tap(searchButton);
@@ -1004,8 +1098,14 @@ void main() {
       await tester.enterText(find.byType(TextField), 'Migration');
       await tester.pump();
 
-      expect(find.widgetWithText(SessionListTile, 'Database Migration'), findsOneWidget);
-      expect(find.widgetWithText(SessionListTile, 'Frontend Dev Server'), findsNothing);
+      expect(
+        find.widgetWithText(SessionListTile, 'Database Migration'),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(SessionListTile, 'Frontend Dev Server'),
+        findsNothing,
+      );
     });
   });
 }

@@ -42,7 +42,8 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
   }
 
   final remainingLines = lines - previewLines.length;
-  final previewSnippet = previewLines.join('\n') +
+  final previewSnippet =
+      previewLines.join('\n') +
       (remainingLines > 0
           ? '\n... (${remainingLines == 1 ? '1 more line' : '$remainingLines more lines'})'
           : '');
@@ -51,8 +52,8 @@ Future<String?> showMultiLinePasteDialog(BuildContext context, String text) {
   final sizeLabel = byteCount < 1024
       ? '$byteCount B'
       : byteCount < 1024 * 1024
-          ? '${(byteCount / 1024).toStringAsFixed(1)} KB'
-          : '${(byteCount / (1024 * 1024)).toStringAsFixed(1)} MB';
+      ? '${(byteCount / 1024).toStringAsFixed(1)} KB'
+      : '${(byteCount / (1024 * 1024)).toStringAsFixed(1)} MB';
 
   return showDialog<String>(
     context: context,

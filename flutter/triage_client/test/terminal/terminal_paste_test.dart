@@ -206,10 +206,13 @@ void main() {
       expect(estimateUtf8Bytes(cjk), utf8.encode(cjk).length);
     });
 
-    test('matches utf8.encode length for 4-byte emojis and surrogate pairs', () {
-      const emojis = '🚀 👨‍👩‍👧‍👦 🛰️ ✨ 🎉';
-      expect(estimateUtf8Bytes(emojis), utf8.encode(emojis).length);
-    });
+    test(
+      'matches utf8.encode length for 4-byte emojis and surrogate pairs',
+      () {
+        const emojis = '🚀 👨‍👩‍👧‍👦 🛰️ ✨ 🎉';
+        expect(estimateUtf8Bytes(emojis), utf8.encode(emojis).length);
+      },
+    );
 
     test('matches utf8.encode length for mixed multi-byte payloads', () {
       const mixed = 'git commit -m "feat(web): ¡añadir soporte UTF-8! 🚀 世界"';
@@ -329,34 +332,33 @@ void main() {
       expect(result, isNull);
     });
 
-    testWidgets(
-      'renders truncated snippet when lines exceed display limit',
-      (tester) async {
-        final multiline = List.generate(10, (i) => 'Line ${i + 1}').join('\n');
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: Builder(
-                builder: (context) => ElevatedButton(
-                  onPressed: () => showMultiLinePasteDialog(context, multiline),
-                  child: const Text('Open Dialog'),
-                ),
+    testWidgets('renders truncated snippet when lines exceed display limit', (
+      tester,
+    ) async {
+      final multiline = List.generate(10, (i) => 'Line ${i + 1}').join('\n');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => ElevatedButton(
+                onPressed: () => showMultiLinePasteDialog(context, multiline),
+                child: const Text('Open Dialog'),
               ),
             ),
           ),
-        );
+        ),
+      );
 
-        await tester.tap(find.text('Open Dialog'));
-        await tester.pumpAndSettle();
+      await tester.tap(find.text('Open Dialog'));
+      await tester.pumpAndSettle();
 
-        expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
-        expect(find.textContaining('10 lines'), findsOneWidget);
-        expect(find.textContaining('... (4 more lines)'), findsOneWidget);
-        expect(find.textContaining('Line 1'), findsOneWidget);
-        expect(find.textContaining('Line 6'), findsOneWidget);
-        expect(find.textContaining('Line 7'), findsNothing);
-      },
-    );
+      expect(find.text('Multi-Line Paste Warning'), findsOneWidget);
+      expect(find.textContaining('10 lines'), findsOneWidget);
+      expect(find.textContaining('... (4 more lines)'), findsOneWidget);
+      expect(find.textContaining('Line 1'), findsOneWidget);
+      expect(find.textContaining('Line 6'), findsOneWidget);
+      expect(find.textContaining('Line 7'), findsNothing);
+    });
 
     testWidgets('formats size in KB for payloads >= 1024 bytes', (
       tester,
@@ -367,7 +369,8 @@ void main() {
           home: Scaffold(
             body: Builder(
               builder: (context) => ElevatedButton(
-                onPressed: () => showMultiLinePasteDialog(context, largePayload),
+                onPressed: () =>
+                    showMultiLinePasteDialog(context, largePayload),
                 child: const Text('Open Dialog'),
               ),
             ),
@@ -381,33 +384,30 @@ void main() {
       expect(find.textContaining('2.0 KB'), findsOneWidget);
     });
 
-    testWidgets(
-      'formats size accurately for multi-byte UTF-8 payloads in KB',
-      (tester) async {
-        // 512 2-byte characters = 1024 bytes -> 1.0 KB
-        final multiBytePayload = '${'£' * 512}\nline 2';
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: Builder(
-                builder: (context) => ElevatedButton(
-                  onPressed: () => showMultiLinePasteDialog(
-                    context,
-                    multiBytePayload,
-                  ),
-                  child: const Text('Open Dialog'),
-                ),
+    testWidgets('formats size accurately for multi-byte UTF-8 payloads in KB', (
+      tester,
+    ) async {
+      // 512 2-byte characters = 1024 bytes -> 1.0 KB
+      final multiBytePayload = '${'£' * 512}\nline 2';
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => ElevatedButton(
+                onPressed: () =>
+                    showMultiLinePasteDialog(context, multiBytePayload),
+                child: const Text('Open Dialog'),
               ),
             ),
           ),
-        );
+        ),
+      );
 
-        await tester.tap(find.text('Open Dialog'));
-        await tester.pumpAndSettle();
+      await tester.tap(find.text('Open Dialog'));
+      await tester.pumpAndSettle();
 
-        expect(find.textContaining('1.0 KB'), findsOneWidget);
-      },
-    );
+      expect(find.textContaining('1.0 KB'), findsOneWidget);
+    });
 
     testWidgets(
       'truncates preview line safely when surrogate pair borders truncation boundary',
@@ -457,10 +457,8 @@ void main() {
             home: Scaffold(
               body: Builder(
                 builder: (context) => ElevatedButton(
-                  onPressed: () => showMultiLinePasteDialog(
-                    context,
-                    testPayload,
-                  ),
+                  onPressed: () =>
+                      showMultiLinePasteDialog(context, testPayload),
                   child: const Text('Open Dialog'),
                 ),
               ),
@@ -479,56 +477,55 @@ void main() {
       },
     );
 
-    testWidgets(
-      'uses singular grammar for 1 line and 1 more line',
-      (tester) async {
-        // 7 lines: 6 preview lines + 1 remaining line -> "... (1 more line)"
-        final sevenLines = List.generate(7, (i) => 'Line ${i + 1}').join('\n');
+    testWidgets('uses singular grammar for 1 line and 1 more line', (
+      tester,
+    ) async {
+      // 7 lines: 6 preview lines + 1 remaining line -> "... (1 more line)"
+      final sevenLines = List.generate(7, (i) => 'Line ${i + 1}').join('\n');
 
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: Builder(
-                builder: (context) => ElevatedButton(
-                  onPressed: () => showMultiLinePasteDialog(context, sevenLines),
-                  child: const Text('Open 7 Lines'),
-                ),
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => ElevatedButton(
+                onPressed: () => showMultiLinePasteDialog(context, sevenLines),
+                child: const Text('Open 7 Lines'),
               ),
             ),
           ),
-        );
+        ),
+      );
 
-        await tester.tap(find.text('Open 7 Lines'));
-        await tester.pumpAndSettle();
+      await tester.tap(find.text('Open 7 Lines'));
+      await tester.pumpAndSettle();
 
-        expect(find.textContaining('... (1 more line)'), findsOneWidget);
+      expect(find.textContaining('... (1 more line)'), findsOneWidget);
 
-        // Dismiss dialog
-        await tester.tap(find.text('Cancel'));
-        await tester.pumpAndSettle();
+      // Dismiss dialog
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
 
-        // 1 line with trailing newline
-        const singleCommand = 'cargo test\n';
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: Builder(
-                builder: (context) => ElevatedButton(
-                  onPressed: () =>
-                      showMultiLinePasteDialog(context, singleCommand),
-                  child: const Text('Open 1 Line'),
-                ),
+      // 1 line with trailing newline
+      const singleCommand = 'cargo test\n';
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => ElevatedButton(
+                onPressed: () =>
+                    showMultiLinePasteDialog(context, singleCommand),
+                child: const Text('Open 1 Line'),
               ),
             ),
           ),
-        );
+        ),
+      );
 
-        await tester.tap(find.text('Open 1 Line'));
-        await tester.pumpAndSettle();
+      await tester.tap(find.text('Open 1 Line'));
+      await tester.pumpAndSettle();
 
-        expect(find.textContaining('Pasting 1 line'), findsOneWidget);
-      },
-    );
+      expect(find.textContaining('Pasting 1 line'), findsOneWidget);
+    });
 
     testWidgets(
       'renders without layout overflow on constrained landscape mobile screen',
@@ -548,10 +545,8 @@ void main() {
             home: Scaffold(
               body: Builder(
                 builder: (context) => ElevatedButton(
-                  onPressed: () => showMultiLinePasteDialog(
-                    context,
-                    testPayload,
-                  ),
+                  onPressed: () =>
+                      showMultiLinePasteDialog(context, testPayload),
                   child: const Text('Open Landscape'),
                 ),
               ),
