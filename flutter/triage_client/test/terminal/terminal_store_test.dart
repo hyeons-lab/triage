@@ -571,11 +571,9 @@ void main() {
       sink.ops.clear();
       store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 5));
       async.elapse(kSyncOutputWatchdogTimeout * 2);
-      expect(
-        sink.ops,
-        ['write:bbb\nccc'],
-        reason: 'no \\r may be injected into a synchronized-output frame',
-      );
+      expect(sink.ops, [
+        'write:bbb\nccc',
+      ], reason: 'no \\r may be injected into a synchronized-output frame');
     });
   });
 
@@ -595,11 +593,9 @@ void main() {
       // content: the application owns cursor placement until it says otherwise.
       sink.ops.clear();
       store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 2));
-      expect(
-        sink.ops,
-        ['write:bbb\nccc'],
-        reason: 'no \\r may be injected while the frame is open on the wire',
-      );
+      expect(sink.ops, [
+        'write:bbb\nccc',
+      ], reason: 'no \\r may be injected while the frame is open on the wire');
 
       // Once the frame really closes, ordinary newline translation resumes.
       sink.ops.clear();
@@ -774,6 +770,84 @@ void main() {
       );
     });
   });
+
+  test(
+    'disposing during chunk processing does not resurrect synchronized state',
+    () {
+      fakeAsync((async) {
+        final reentrantSink = ReentrantSink();
+        final victim = TerminalStore(reentrantSink);
+        victim.dispatch(const Attach());
+        victim.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        reentrantSink.ops.clear();
+
+        // Open a block first
+        victim.dispatch(LiveBytes(b('\x1b[?2026hstart'), outputSeq: 1));
+        // Dispose when the close flush fires
+        reentrantSink.onWrite = victim.dispose;
+        // Next chunk closes the block and immediately starts a new one
+        victim.dispatch(
+          LiveBytes(b('tail\x1b[?2026l\x1b[?2026hnewstart'), outputSeq: 2),
+        );
+
+        expect(
+          async.nonPeriodicTimerCount,
+          0,
+          reason:
+              'disposed store must not arm timers for subsequent start markers: '
+              '${async.pendingTimersDebugString}',
+        );
+      });
+    },
+  );
+
+  test('user input containing Ctrl-C resets open wire frame', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      // Open a frame and let the holding block time out
+      store.dispatch(LiveBytes(b('\x1b[?2026hprompt '), outputSeq: 1));
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      sink.ops.clear();
+
+      // User presses Ctrl-C to cancel the foreground process
+      store.dispatch(const UserInput('\x03'));
+
+      // Subsequent shell output must receive newline translation
+      store.dispatch(LiveBytes(b('prompt\nnext'), outputSeq: 2));
+      expect(sink.ops, ['write:prompt\r\nnext']);
+    });
+  });
+
+  test(
+    'user input containing Ctrl-C while block is actively held flushes and resets wire frame',
+    () {
+      fakeAsync((async) {
+        store.dispatch(const Attach());
+        store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        sink.ops.clear();
+
+        // Open a frame and send live bytes while still inside the block
+        store.dispatch(LiveBytes(b('\x1b[?2026hactive-gen '), outputSeq: 1));
+
+        // User presses Ctrl-C while block is still buffered in _syncBuffer
+        store.dispatch(const UserInput('\x03'));
+
+        // Held content must be flushed immediately
+        expect(sink.ops, ['write:\x1b[?2026hactive-gen ']);
+
+        // Advancing time past watchdog must not resurrect _frameOpenOnWire
+        sink.ops.clear();
+        async.elapse(kSyncOutputWatchdogTimeout * 2);
+
+        // Subsequent shell output must receive newline translation
+        store.dispatch(LiveBytes(b('prompt\nnext'), outputSeq: 2));
+        expect(sink.ops, ['write:prompt\r\nnext']);
+      });
+    },
+  );
 
   test(
     'Synchronized Output buffer capacity cap forces a flush when exceeded',

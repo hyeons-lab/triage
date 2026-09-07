@@ -287,6 +287,30 @@ void main() {
         isFalse,
       );
     });
+
+    test('a non-positive max scroll extent never releases', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: -20,
+          pixels: -10,
+          maxScrollExtent: 0,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a negative pixel offset during top overscroll never releases', () {
+      expect(
+        shouldReleaseScrollPin(
+          lastPixels: -25,
+          pixels: -10,
+          maxScrollExtent: 15,
+          lineHeight: lineHeight,
+        ),
+        isFalse,
+      );
+    });
   });
 
   group('shouldFinishBottomSnap', () {
@@ -302,6 +326,22 @@ void main() {
         isTrue,
       );
     });
+
+    test(
+      'a negative pixel offset during top overscroll never finishes snap',
+      () {
+        expect(
+          shouldFinishBottomSnap(
+            isScrolling: false,
+            pointerDown: false,
+            pixels: -10,
+            maxScrollExtent: 1000,
+            hasAnchor: false,
+          ),
+          isFalse,
+        );
+      },
+    );
 
     test('a scroll still in flight waits', () {
       expect(

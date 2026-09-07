@@ -791,8 +791,9 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _saveScrollOffset([String? terminalId, double? lineHeight]) {
     if (!_scrollController.hasClients) return;
-    final id = terminalId ?? widget.terminalId;
     final position = _scrollController.position;
+    if (!position.hasContentDimensions) return;
+    final id = terminalId ?? widget.terminalId;
     final lh = lineHeight ?? _lineHeight() ?? 2.0;
     if (position.pixels < position.maxScrollExtent - lh) {
       _sessionSavedScrollOffsets[id] = position.pixels;
@@ -810,15 +811,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _captureScrollAnchor() {
     if (!_scrollController.hasClients) return;
     final position = _scrollController.position;
+    if (!position.hasContentDimensions) return;
     final lineHeight = _lineHeight();
     if (lineHeight != null) {
-      if (_scrollAnchor.hasAnchor &&
-          shouldReleaseScrollPin(
-            lastPixels: _lastScrollPixels,
-            pixels: position.pixels,
-            maxScrollExtent: position.maxScrollExtent,
-            lineHeight: lineHeight,
-          )) {
+      if (shouldReleaseScrollPin(
+        lastPixels: _lastScrollPixels,
+        pixels: position.pixels,
+        maxScrollExtent: position.maxScrollExtent,
+        lineHeight: lineHeight,
+      )) {
         // The user is chasing live output and nearly there. Dropping the pin
         // is what stops the treadmill, and is the whole fix; the snap only
         // saves them the last line or two.
@@ -860,12 +861,15 @@ class _TerminalPaneState extends State<TerminalPane> {
     _suppressAnchorCapture = true;
     try {
       position.jumpTo(position.maxScrollExtent);
+    } catch (_) {
     } finally {
       _suppressAnchorCapture = wasSuppressed;
       // Read the offset back rather than assuming the target: jumpTo can throw
       // on a transient scroll-range issue, and recording a bottom we never
       // reached would make the next event measure a fake delta.
-      _lastScrollPixels = position.pixels;
+      _lastScrollPixels = position.hasContentDimensions
+          ? position.pixels
+          : null;
     }
     // Saving at the bottom retires this session's stored offset and anchor, so
     // a later revisit follows live output instead of being pulled back to the
@@ -931,9 +935,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   // drift that would otherwise scroll the user's content out from under them.
   void _repinScrollAnchor() {
     if (!mounted || !_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (!position.hasContentDimensions) return;
     final lineHeight = _lineHeight();
     if (lineHeight == null) return;
-    final position = _scrollController.position;
     final desired = _scrollAnchor.desiredOffset(
       maxScrollExtent: position.maxScrollExtent,
       lineHeight: lineHeight,
@@ -944,12 +949,15 @@ class _TerminalPaneState extends State<TerminalPane> {
     _suppressAnchorCapture = true;
     try {
       position.jumpTo(desired);
+    } catch (_) {
     } finally {
       // Restored rather than forced false, so a nested correction cannot clear
       // an outer suppressed region. Runs even if jumpTo throws on a transient
       // scroll-range issue, so user scrolls keep capturing either way.
       _suppressAnchorCapture = wasSuppressed;
-      _lastScrollPixels = position.pixels;
+      _lastScrollPixels = position.hasContentDimensions
+          ? position.pixels
+          : null;
     }
   }
 
@@ -958,6 +966,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted) return;
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
+        if (!position.hasContentDimensions) return;
         // A jump of our own must not read as a user scroll direction, so the
         // capture it triggers can pin (or clear at the bottom) normally.
         _lastScrollPixels = null;

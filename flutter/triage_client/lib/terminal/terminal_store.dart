@@ -200,6 +200,7 @@ class TerminalStore extends ChangeNotifier {
         );
 
       case Detach():
+        _closeSyncBlockAndFlush();
         _closeFrameOnWire();
         return s.copyWith(phase: AttachPhase.detached);
 
@@ -226,6 +227,10 @@ class TerminalStore extends ChangeNotifier {
         return _reduceResize(s, cols, rows);
 
       case UserInput(:final data):
+        if (data.contains('\x03')) {
+          _closeSyncBlockAndFlush();
+          _closeFrameOnWire();
+        }
         if (!s.exited &&
             !_suppressHostInput &&
             !isEmulatorQueryResponse(data)) {
@@ -555,6 +560,7 @@ class TerminalStore extends ChangeNotifier {
     }
     var cursor = 0;
     while (cursor < input.length) {
+      if (_disposed) return;
       if (_inSynchronizedOutput) {
         final endIdx = input.indexOf(_kSyncEnd, cursor);
         if (endIdx != -1) {
@@ -564,6 +570,7 @@ class TerminalStore extends ChangeNotifier {
           // The flushed buffer ends with the closing marker, so _writeVerbatim
           // derives the frame state from it; this path needs no second writer.
           _closeSyncBlockAndFlush();
+          if (_disposed) return;
         } else {
           _syncBuffer.write(input.substring(cursor));
           cursor = input.length;
@@ -572,6 +579,7 @@ class TerminalStore extends ChangeNotifier {
               'TerminalStore: synchronized output buffer exceeded $_kSyncBufferCap bytes; force-flushing',
             );
             _closeSyncBlockAndFlush();
+            if (_disposed) return;
           } else {
             _rearmSyncWatchdog();
           }
@@ -581,6 +589,7 @@ class TerminalStore extends ChangeNotifier {
         if (startIdx != -1) {
           if (startIdx > cursor) {
             _writeDirect(input.substring(cursor, startIdx));
+            if (_disposed) return;
           }
           _inSynchronizedOutput = true;
           _frameOpenOnWire = true;
@@ -614,6 +623,7 @@ class TerminalStore extends ChangeNotifier {
     if (_disposed) return;
     _syncTimer?.cancel();
     _syncTimer = Timer(kSyncOutputWatchdogTimeout, () {
+      if (_disposed) return;
       if (_escapeCarry.isNotEmpty) {
         final carried = _escapeCarry;
         _escapeCarry = '';
@@ -887,6 +897,10 @@ class TerminalStore extends ChangeNotifier {
     _frameAbandonTimer = null;
     _cancelSyncLiveFlush();
     _syncBuffer.clear();
+    _utf8Carry.clear();
+    _escapeCarry = '';
+    _inSynchronizedOutput = false;
+    _frameOpenOnWire = false;
     _sink.onOutput = null;
     _sink.onResize = null;
     _sink.dispose();

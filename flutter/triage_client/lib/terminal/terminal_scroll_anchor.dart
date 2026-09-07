@@ -6,7 +6,7 @@ import 'package:xterm/xterm.dart' as xt;
 /// over before the pin can re-apply.
 const int kScrollPinReleaseGraceLines = 3;
 
-/// Whether a released pin's deferred trip to the bottom should now complete.
+/// Whether a released pin should immediately snap the viewport to the bottom.
 ///
 /// The snap cannot run while the user is still working the viewport: `jumpTo`
 /// calls `goIdle()`, which tears down the drag, hold, or fling in progress. A
@@ -21,7 +21,7 @@ bool shouldFinishBottomSnap({
   required double maxScrollExtent,
   required bool hasAnchor,
 }) {
-  if (isScrolling || pointerDown || hasAnchor) return false;
+  if (isScrolling || pointerDown || hasAnchor || pixels < 0) return false;
   return pixels < maxScrollExtent;
 }
 
@@ -43,8 +43,15 @@ bool shouldReleaseScrollPin({
   required double maxScrollExtent,
   required double lineHeight,
 }) {
-  if (lastPixels == null || lineHeight <= 0) return false;
-  if (pixels <= lastPixels) return false;
+  if (lastPixels == null ||
+      lineHeight <= 0 ||
+      maxScrollExtent <= 0 ||
+      pixels < 0) {
+    return false;
+  }
+  if (pixels <= lastPixels) {
+    return false;
+  }
   return pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight;
 }
 

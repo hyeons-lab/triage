@@ -2,6 +2,7 @@
 
 **Agent:** Muse Code @ triage branch fix/terminal-sync-live-flush
 **Agent (2026-09-06T07:12-0700):** Claude Code (claude-opus-5) @ triage branch fix/terminal-sync-live-flush
+**Agent (2026-09-06T20:19-0700):** Antigravity @ triage branch fix/terminal-sync-live-flush
 
 ## Intent
 
@@ -26,6 +27,9 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 
 - 2026-09-06T09:47-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`: `Exited` and the history replay signal now flush a held block before acting. Retiring the frame while a block was still buffered let the watchdog re-derive it from the buffered start marker, and #162 documents `onHistoryReplayed` as every decoded byte having reached the sink, which its web bottom-restore depends on. A chunk carrying the closing marker plus ordinary output now splits at the marker, so only the frame is exempt from newline translation.
 - 2026-09-06T09:47-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: the bottom snap no longer defers. It runs when nothing is in flight and is skipped otherwise, since the pin is already off and the user's own gesture finishes the trip. Removes `_snapPending`, `_snapWatchedNotifier`, `_watchScrollSettle`, `_onScrollSettled`, `_maybeFinishBottomSnap` and `_cancelPendingBottomSnap`, and with them a stranded-snap bug and a flag that blocked anchor capture for the pane's lifetime.
+- 2026-09-06T20:19-0700 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: resolved scroll anchor re-capture oscillation during downward swipe within the grace band by checking `shouldReleaseScrollPin` unconditionally; guarded scroll offset saving, anchor capture, repin, cursor scrolling, and settle handlers with `position.hasContentDimensions` to prevent assertions before layout; ignored negative scroll offsets (`pixels < 0`) to prevent false bottom snaps during top rubber-band bounces.
+- 2026-09-06T20:19-0700 `flutter/triage_client/lib/terminal/terminal_store.dart`: flushed and closed held synchronized output blocks upon UserInput Ctrl-C (`\x03`) and `Detach()` before retiring wire frames, preventing orphaned start markers from resurrecting wire frame tracking; guarded chunk loop processing and live-flush timer callbacks against re-entrant store disposal; defensively cleared carryover buffer on disposal.
+- 2026-09-06T20:19-0700 `flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart` and `flutter/triage_client/test/terminal/terminal_store_test.dart`: added unit test coverage for zero and negative scroll extents in anchor release checks, Ctrl-C / Detach sync flush ordering, and disposal re-entrancy.
 
 ## Decisions
 
@@ -37,6 +41,8 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - 2026-09-06T09:25-0700 `_frameOpenOnWire` needs an idle bound, not an elapsed one. A frame legitimately spans a whole `agy` generation, minutes at a time, so any wall-clock cap would reintroduce the corruption mid-generation. A live generation is never silent (tokens, spinner frames, status redraws) while a killed application is silent forever, so 30s with no bytes at all is the abandon signal, alongside clearing on `Exited`. Without a bound, an application killed mid-frame would leave newline translation off for the rest of the session and turn ordinary shell output into a staircase.
 
 - 2026-09-06T09:47-0700 Dropped the deferred bottom snap after it produced a new bug in three consecutive review rounds (a synchronous jump tearing down the gesture, then a hold activity reporting not-scrolling plus a stale notifier plus re-capture defeating the release, then a stranded snap and a pending flag that blocked capture). Each fix was right on its own and added more lifecycle. The reported bug is the treadmill, which clearing the pin alone fixes; the snap only saves the last line or two, so it now runs only when nothing is in flight and is skipped otherwise.
+- 2026-09-06T20:19-0700 Removed `_scrollAnchor.hasAnchor` precondition from downward pin-release checks. Gating release on an existing anchor caused rapid anchor drop and re-capture oscillation when scrolling downward within the 3-line grace band. Unconditionally checking release ensures chasing live output keeps the pin cleared.
+- 2026-09-06T20:19-0700 Flushed held Mode 2026 sync blocks immediately on Ctrl-C and Detach prior to closing wire frames. Calling `_closeFrameOnWire()` alone left buffered start markers in `_syncBuffer`, which allowed subsequent watchdog ticks to re-derive `_frameOpenOnWire = true`.
 
 ## Issues
 
@@ -59,7 +65,8 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - 15d6141: fix(client): flush held blocks before signalling and simplify the bottom snap
 - 9d414df: docs(client): drop the doc comment orphaned by the snap simplification
 - 9934427: docs(devlog): record on-device confirmation of the composer
-- HEAD: test(client): pin the frame-boundary invariant _writeVerbatim relies on
+- 53009e7: test(client): pin the frame-boundary invariant _writeVerbatim relies on
+- HEAD: fix(client): harden synchronized output lifecycles and scroll pin handoff
 
 ## Progress
 
@@ -70,7 +77,7 @@ Fix the client appearing frozen (no output updates until the user types) in sess
 - [x] Verify with the real `flutter test` outside the sandbox
 - [x] Rebase onto current `origin/main`, reconcile with #160's scroll cache, renumber devlog (431/431, analyze clean)
 - [x] Address PR #161 review feedback (Copilot + Antigravity)
-- [x] Two rounds of max-effort subagent review, fixes applied and mutation-verified
+- [x] Four rounds of max-effort subagent review, fixes applied and mutation-verified
 - [x] Rebuild Android APK with the fix and install on device (2026-09-06, Pixel 10 Pro Fold)
 - [~] Theorize the Android composer cause (scroll-pin treadmill, native pane only; never reproduced off-device, so unproven)
 - [x] Implement pin release on downward chase + snap, stale-restore guard, unit tests
