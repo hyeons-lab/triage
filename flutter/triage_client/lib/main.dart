@@ -386,6 +386,10 @@ class SessionVm {
 
   final String title;
 
+  /// True when the input listener has been bound to this session's controller,
+  /// preventing duplicate registrations from sending duplicated keystrokes.
+  bool inputListenerBound = false;
+
   /// Optional user-assigned label that overrides the automatic workstream title.
   String? customLabel;
   // Git context for this session, from the snapshot context and refreshed live
@@ -1782,12 +1786,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   void _setupSessionInputListener(SessionVm session) {
+    if (session.inputListenerBound) return;
+    session.inputListenerBound = true;
+
     session.terminalController.addInputListener((keys) {
       // While the store replays history or when the emulator auto-answers terminal
       // queries (DSR, DA, Kitty queries), those answers surface here as emulator
       // output; they must not be forwarded to the host as fake user input.
       if (session.store.isSuppressingHostInput ||
-          session.store.isWritingSink ||
           isEmulatorQueryResponse(keys)) {
         return;
       }
@@ -1801,7 +1807,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           return;
         }
 
-        final sessionId = session.remoteSessionId;
+        final sessionId = _sessionIdFor(session);
         if (sessionId == null) return;
 
         _client
@@ -1810,8 +1816,33 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               clientId: _clientId,
               bytes: utf8.encode(keys),
             )
-            .catchError((_) {
-              if (!_client.isConnected) {
+            .catchError((error) {
+              final errStr = error.toString();
+              if (errStr.contains('does not hold input lease') ||
+                  errStr.contains('no input lease holder')) {
+                _client
+                    .attachSession(
+                      sessionId: sessionId,
+                      clientId: _clientId,
+                      mode: 'InteractiveController',
+                    )
+                    .then((_) {
+                      if (!_disposed && mounted) {
+                        setState(() {
+                          session.status = 'attached';
+                          session.statusColor = const Color(0xff7fd1c7);
+                        });
+                      }
+                      _client
+                          .writeInput(
+                            sessionId: sessionId,
+                            clientId: _clientId,
+                            bytes: utf8.encode(keys),
+                          )
+                          .catchError((_) {});
+                    })
+                    .catchError((_) {});
+              } else if (!_client.isConnected) {
                 _markRemoteSessionDisconnected(session);
               }
             });
@@ -3258,6 +3289,30 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
 
+    if (type == 'error') {
+      final error = message['error'] as Map<String, dynamic>?;
+      final msg = error?['message']?.toString() ?? '';
+      if (msg.contains('does not hold input lease') ||
+          msg.contains('no input lease holder')) {
+        final current = _selectedSession;
+        if (current != null) {
+          final sid = _sessionIdFor(current);
+          if (sid != null && !current.isExited) {
+            unawaited(
+              _client
+                  .attachSession(
+                    sessionId: sid,
+                    clientId: _clientId,
+                    mode: 'InteractiveController',
+                  )
+                  .catchError((_) => <String, dynamic>{}),
+            );
+          }
+        }
+      }
+      return;
+    }
+
     if (type == 'session_snippet_updated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null) return;
@@ -3749,6 +3804,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         );
       }
       return;
+    }
+    final sid = _sessionIdFor(session);
+    if (sid != null && !session.isExited) {
+      unawaited(
+        _client
+            .attachSession(
+              sessionId: sid,
+              clientId: _clientId,
+              mode: 'InteractiveController',
+            )
+            .catchError((_) => <String, dynamic>{}),
+      );
     }
     if (session.hasFitted) {
       // Already fitted: refresh metadata without clearing and replaying history.

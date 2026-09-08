@@ -78,8 +78,6 @@ class _InputDedupeRecord {
   String? onDataText;
   int mobileTime = 0;
   String? mobileText;
-  int windowTime = 0;
-  String? windowText;
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
@@ -433,23 +431,18 @@ class _TerminalPaneState extends State<TerminalPane> {
             return;
           }
 
+          // If the terminal's helper textarea already has DOM focus, let xterm.js
+          // handle all keystrokes natively through its focused helper element.
+          if (_isActiveElementInTerminal()) {
+            return;
+          }
+
+          // Otherwise, focus is outside the terminal (such as ambient keydown after
+          // clicking outside or on initial interaction). Forward this initial keystroke
+          // to the session and activate the terminal so subsequent keystrokes flow
+          // natively through xterm.onData.
           final input = _keyboardEventToInput(event);
           if (input != null && input.isNotEmpty) {
-            final dedupe = _sessionInputDedupe.putIfAbsent(
-              _sanitizedId,
-              () => _InputDedupeRecord(),
-            );
-            final now = DateTime.now().millisecondsSinceEpoch;
-            if (now - dedupe.onDataTime < 50 && dedupe.onDataText == input) {
-              dedupe.onDataText = null;
-              event.preventDefault();
-              event.stopPropagation();
-              return;
-            }
-            if (now - dedupe.onDataTime >= 50) {
-              dedupe.onDataText = null;
-            }
-
             event.preventDefault();
             event.stopPropagation();
             _sendInput(input);
@@ -487,14 +480,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _sendInput(String data) {
-    final dedupe = _sessionInputDedupe.putIfAbsent(
-      _sanitizedId,
-      () => _InputDedupeRecord(),
-    );
-    final now = DateTime.now().millisecondsSinceEpoch;
-    dedupe.windowTime = now;
-    dedupe.windowText = data;
-
     _sessionSavedViewportY.remove(_sanitizedId);
     try {
       js_util.callMethod(_term, 'scrollToBottom', []);
@@ -949,13 +934,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         }
         if (now - dedupe.mobileTime >= 35) {
           dedupe.mobileText = null;
-        }
-        if (now - dedupe.windowTime < 50 && dedupe.windowText == data) {
-          dedupe.windowText = null;
-          return;
-        }
-        if (now - dedupe.windowTime >= 50) {
-          dedupe.windowText = null;
         }
 
         dedupe.onDataTime = now;

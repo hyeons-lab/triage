@@ -85,6 +85,20 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Expanded `_keyboardEventToInput()` to comprehensively support navigation, function keys, Ctrl modifiers, Alt/Option word navigation, Shift+arrows, and international character input.
   - Added window input tracking to `_InputDedupeRecord` and bidirectional deduplication between window keydowns and onData callbacks.
   - Removed unused `_resetTerminalSafe` helper.
+- 2026-09-08T19:14-0400 `devlog/plans/000144-03-refactor-terminal-input-lease-pipeline.md`:
+  - Created plan to refactor terminal input pipeline, restore native xterm.js handling, eliminate window listener deduplication race conditions, and guarantee daemon input lease acquisition.
+- 2026-09-08T19:14-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Restored `_isActiveElementInTerminal()` check in `_windowKeyDownListener` so focused textareas allow native browser event dispatch directly to xterm.js without interception.
+  - Removed `windowTime` and `windowText` fields from `_InputDedupeRecord`.
+  - Removed timestamp deduplication logic from `_sendInput` and `onDataCallback`, eliminating dropped rapid keystrokes and Backspace drops.
+- 2026-09-08T19:14-0400 `flutter/triage_client/lib/main.dart`:
+  - Added `inputListenerBound` guard to `SessionVm` to prevent duplicate input listener registrations from sending duplicate keystrokes.
+  - Updated `_setupSessionInputListener` to resolve session ID via `_sessionIdFor(session)` and removed `session.store.isWritingSink` guard.
+  - In `_selectSession`, proactively requested `InteractiveController` lease via `attachSession` on every selected session.
+  - In `_processWebSocketEvent`, added error event handling to automatically re-acquire `InteractiveController` lease if the daemon rejects writes due to a missing or lost lease.
+- 2026-09-08T19:14-0400 `flutter/triage_client/lib/services/triage_websocket_client.dart`:
+  - Forwarded uncorrelated error messages from the daemon to `_eventController` in `_handleIncomingMessage`.
+  - Added FlatBuffers serialization for `write_input` requests.
 
 ## Decisions
 
@@ -115,6 +129,9 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T01:20-0400 Defer history replay until widget controller is bound: Staged history must only be flushed through `SessionVm.noteViewFit()` after `TerminalPane` has bound its write listener to `session.terminalController`.
 - 2026-09-08T08:08-0400 Direct window capture key routing for active terminal: Relying on xterm.js internal helper textarea event dispatch inside Flutter Web's platform view caused dropped keystrokes once the textarea was focused. Handling key translation directly at the window capture listener guarantees continuous, immediate input response for all typing, backspaces, enters, and control sequences.
 - 2026-09-08T08:08-0400 Bidirectional deduplication between window keydown and onData: Tracking window input timestamps and text in `_InputDedupeRecord` prevents duplicate emission if an xterm.onData or mobile virtual keyboard event fires for the same keystroke within 50ms.
+- 2026-09-08T19:14-0400 Restore native xterm.js input flow when textarea is focused: Direct window keydown interception with preventDefault broke xterm.js internal keyboard handling, alternate screen cursor modes, and Backspace in full-screen TUI apps like Codex and agy. Returning early when `_isActiveElementInTerminal()` is true allows xterm.js to receive native events and emit clean onData streams.
+- 2026-09-08T19:14-0400 Eliminate 50ms timestamp deduplication: Window keydown deduplication against onData timestamps caused rapid keystrokes and repeated keys (such as holding Backspace) to be dropped.
+- 2026-09-08T19:14-0400 Proactive lease acquisition on session selection: When switching sessions or loading daemon sessions, the client must explicitly acquire an InteractiveController lease. Proactively requesting the lease on session selection and auto-recovering on lease error responses ensures write_input is never rejected by the daemon.
 
 ## Issues
 
@@ -157,6 +174,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Expand _keyboardEventToInput for full modifier, navigation, and international keyboard support
 - [x] Implement bidirectional window/onData deduplication
 - [x] Deploy release binary with zero-downtime handover preserving all 29 live sessions
+- [x] Restore native xterm.js keyboard handling when terminal helper textarea is active
+- [x] Eliminate window timestamp deduplication and Backspace drops
+- [x] Prevent duplicate input listener registrations via inputListenerBound guard
+- [x] Proactively acquire InteractiveController input lease on session selection and recover on lease errors
 
 ## Commits
 
@@ -168,7 +189,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - f1b364a: chore: uninstall code-review-graph and remove automated tool hooks
 - adf465c: fix(triage_client): resolve terminal store history deadlock on controller rebind
 - 386a1d9: fix(triage_client): refactor and simplify terminal input and screen lifecycle
-- HEAD: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
+- ab3e213: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
+- HEAD: fix(triage_client): restore native terminal input pipeline and lease acquisition
 
 
 

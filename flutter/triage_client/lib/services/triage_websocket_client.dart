@@ -263,6 +263,8 @@ class TriageWebSocketClient {
               ? TriageAuthException(errorMessage)
               : Exception(errorMessage);
           _pendingRequests.remove(id)!.completeError(failure);
+        } else {
+          _eventController.add(message);
         }
       } else if (type == 'event') {
         _eventController.add(message);
@@ -1597,6 +1599,16 @@ class TriageWebSocketClient {
                   pixelHeight: sizeMap['pixel_height'] as int? ?? 480,
                   dpi: sizeMap['dpi'] as int? ?? 96,
                 ),
+        );
+        break;
+
+      case 'write_input':
+        payloadType = fbs.ClientRequestPayloadTypeId.WriteInputRequestTable;
+        final writeReq = extra?['request'] as Map<String, dynamic>?;
+        payload = fbs.WriteInputRequestTableObjectBuilder(
+          sessionId: writeReq?['session_id'] as String?,
+          clientId: writeReq?['client_id'] as String?,
+          bytes: (writeReq?['bytes'] as List?)?.cast<int>(),
         );
         break;
 
