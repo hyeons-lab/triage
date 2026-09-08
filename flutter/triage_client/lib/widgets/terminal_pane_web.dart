@@ -73,13 +73,6 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
-class _InputDedupeRecord {
-  int onDataTime = 0;
-  String? onDataText;
-  int mobileTime = 0;
-  String? mobileText;
-}
-
 class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
@@ -89,7 +82,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
-  static final Map<String, _InputDedupeRecord> _sessionInputDedupe = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
 
   static bool _viewportIsAtBottom(
@@ -137,7 +129,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
-    _TerminalPaneState._sessionInputDedupe.remove(sanitizedId);
     _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
@@ -197,7 +188,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
-  StreamSubscription<html.KeyboardEvent>? _containerKeyDownSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   void Function(html.Event)? _containerPasteListener;
   void Function(html.Event)? _textareaBeforeInputListener;
@@ -389,7 +379,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (event is html.KeyboardEvent) {
         final isCurrent = _currentRoute?.isCurrent ?? true;
         if (!widget.isExited && isCurrent && _eventTargetsTerminal(event)) {
-          if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
+          // Allow IME composition to proceed natively.
+          if (event.isComposing == true || event.key == 'Process') {
+            return;
+          }
+
+          if ((event.ctrlKey || event.metaKey) &&
+              (event.key == 'c' || event.key == 'C')) {
             // Prefer xterm.js's own selection: it rebuilds the row text from the
             // buffer with the inter-column spaces intact. The browser-native
             // window.getSelection() serializes the DOM-renderer's per-cell spans
@@ -425,28 +421,24 @@ class _TerminalPaneState extends State<TerminalPane> {
               });
               return;
             }
+            // If no text is selected on macOS with Cmd+C, do not send SIGINT.
+            if (event.metaKey && !event.ctrlKey) {
+              return;
+            }
           } else if ((event.ctrlKey || event.metaKey) &&
               (event.key == 'v' || event.key == 'V')) {
             // Deliberately not handled here: paste is left to the browser.
             return;
           }
 
-          // If the terminal's helper textarea already has DOM focus, let xterm.js
-          // handle all keystrokes natively through its focused helper element.
-          if (_isActiveElementInTerminal()) {
-            return;
-          }
-
-          // Otherwise, focus is outside the terminal (such as ambient keydown after
-          // clicking outside or on initial interaction). Forward this initial keystroke
-          // to the session and activate the terminal so subsequent keystrokes flow
-          // natively through xterm.onData.
           final input = _keyboardEventToInput(event);
           if (input != null && input.isNotEmpty) {
             event.preventDefault();
             event.stopPropagation();
             _sendInput(input);
-            _activateTerminal();
+            if (!_focusNode.hasFocus && mounted && _focusNode.canRequestFocus) {
+              _focusNode.requestFocus();
+            }
           }
         }
       }
@@ -492,31 +484,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       _flushPendingLiveWrites();
     }
     _sessionInputRouter.sendInput(_sanitizedId, data);
-    _focusTerminal();
   }
 
   // Routes text input from the helper textarea (such as mobile soft keyboards).
-  // Folds sticky Ctrl when armed, routes multi-line input through the paste
-  // handler, and deduplicates against xterm.js onData callbacks.
+  // Folds sticky Ctrl when armed, and routes multi-line input through the paste
+  // handler.
   void _sendMobileInput(String text) {
     if (!mounted || widget.isExited || text.isEmpty) return;
     if (_currentRoute?.isCurrent == false) return;
-
-    final dedupe = _sessionInputDedupe.putIfAbsent(
-      _sanitizedId,
-      () => _InputDedupeRecord(),
-    );
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - dedupe.onDataTime < 35 && dedupe.onDataText == text) {
-      dedupe.onDataText = null;
-      return;
-    }
-    if (now - dedupe.onDataTime >= 35) {
-      dedupe.onDataText = null;
-    }
-
-    dedupe.mobileTime = now;
-    dedupe.mobileText = text;
 
     if (_ctrlArmed) {
       _setCtrlArmed(false);
@@ -542,21 +517,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _sendInput(text);
   }
 
-  // Refocus the terminal without sending anything, so a bar tap never steals
-  // focus and so never dismisses the soft keyboard.
-  void _focusTerminal() {
-    if (_initialized && !widget.isExited) {
-      try {
-        final textarea = _activeTextarea;
-        if (textarea != null) {
-          final opts = js_util.newObject();
-          js_util.setProperty(opts, 'preventScroll', true);
-          js_util.callMethod(textarea, 'focus', [opts]);
-        }
-        js_util.callMethod(_term, 'focus', []);
-      } catch (_) {}
-    }
-  }
 
   // Sticky Ctrl for the on-screen accessory bar (mobile web): when armed, the
   // next single character typed on the soft keyboard is folded into its control
@@ -923,21 +883,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        final dedupe = _sessionInputDedupe.putIfAbsent(
-          sessionId,
-          () => _InputDedupeRecord(),
-        );
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - dedupe.mobileTime < 35 && dedupe.mobileText == data) {
-          dedupe.mobileText = null;
+        if (!_isMobile) {
+          // On desktop web, _windowKeyDownListener is the authoritative input handler.
+          // xterm.js onData is only used on desktop for terminal mouse tracking sequences.
+          if (data.startsWith('\x1b[<') || data.startsWith('\x1b[M')) {
+            _sessionInputRouter.sendInput(sessionId, data);
+          }
           return;
         }
-        if (now - dedupe.mobileTime >= 35) {
-          dedupe.mobileText = null;
-        }
-
-        dedupe.onDataTime = now;
-        dedupe.onDataText = data;
 
         _sessionSavedViewportY.remove(sessionId);
         try {
@@ -1059,26 +1012,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionOnScrollSubscriptions[_sanitizedId] = onScrollSubscription;
     }
 
-    try {
-      js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
-        js_util.allowInterop((dynamic event) {
-          final key = js_util.getProperty(event, 'key') as String?;
-          if (key == 'Tab') {
-            js_util.callMethod(event, 'preventDefault', []);
-            js_util.callMethod(event, 'stopPropagation', []);
-            final shiftKey =
-                js_util.getProperty(event, 'shiftKey') as bool? ?? false;
-            if (shiftKey) {
-              _sendInput('\x1B[Z');
-            } else {
-              _sendInput('\t');
-            }
-            return false;
-          }
-          return true;
-        }),
-      ]);
-    } catch (_) {}
 
     try {
       final resizeObserverConstructor = js_util.getProperty(
@@ -1307,12 +1240,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           _activateTerminal(force: true);
           _scheduleFocusRetries(force: true);
         } catch (_) {}
-      }
-    });
-
-    _containerKeyDownSubscription = _container.onKeyDown.listen((event) {
-      if (event.key == 'Tab') {
-        event.preventDefault();
       }
     });
 
@@ -1587,8 +1514,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = null;
     _containerTouchEndSubscription?.cancel();
     _containerTouchEndSubscription = null;
-    _containerKeyDownSubscription?.cancel();
-    _containerKeyDownSubscription = null;
     _containerWheelSubscription?.cancel();
     _containerWheelSubscription = null;
     final pasteListener = _containerPasteListener;
@@ -1613,12 +1538,22 @@ class _TerminalPaneState extends State<TerminalPane> {
             return '\x1b[6~';
           case 'Backspace':
             return '\x15';
+          case 'k':
+          case 'K':
+            return '\x0c';
         }
       }
       return null;
     }
 
     if (event.ctrlKey && !event.altKey) {
+      if (event.shiftKey &&
+          (event.key == 'R' ||
+              event.key == 'r' ||
+              event.key == 'I' ||
+              event.key == 'i')) {
+        return null;
+      }
       switch (event.key) {
         case 'ArrowLeft':
           return '\x1b[1;5D';
@@ -1632,6 +1567,10 @@ class _TerminalPaneState extends State<TerminalPane> {
           return '\x17';
         case 'Delete':
           return '\x1b[3;5~';
+        case 'Home':
+          return '\x1b[1;5H';
+        case 'End':
+          return '\x1b[1;5F';
       }
       final key = event.key?.toLowerCase();
       if (key != null && key.length == 1) {
@@ -1674,6 +1613,10 @@ class _TerminalPaneState extends State<TerminalPane> {
           return '\x1bd';
         case 'Backspace':
           return '\x1b\x7f';
+        case 'Enter':
+          return '\x1b\r';
+        case 'Delete':
+          return '\x1b[3;3~';
       }
       final key = event.key;
       if (key != null && key.length == 1) {
@@ -1697,6 +1640,14 @@ class _TerminalPaneState extends State<TerminalPane> {
           return '\x1b[1;2C';
         case 'ArrowLeft':
           return '\x1b[1;2D';
+        case 'Home':
+          return '\x1b[1;2H';
+        case 'End':
+          return '\x1b[1;2F';
+        case 'PageUp':
+          return '\x1b[5;2~';
+        case 'PageDown':
+          return '\x1b[6;2~';
       }
     }
 
@@ -1725,8 +1676,34 @@ class _TerminalPaneState extends State<TerminalPane> {
         return '\x1b[5~';
       case 'PageDown':
         return '\x1b[6~';
+      case 'Insert':
+        return '\x1b[2~';
       case 'Delete':
         return '\x1b[3~';
+      case 'F1':
+        return '\x1bOP';
+      case 'F2':
+        return '\x1bOQ';
+      case 'F3':
+        return '\x1bOR';
+      case 'F4':
+        return '\x1bOS';
+      case 'F5':
+        return '\x1b[15~';
+      case 'F6':
+        return '\x1b[17~';
+      case 'F7':
+        return '\x1b[18~';
+      case 'F8':
+        return '\x1b[19~';
+      case 'F9':
+        return '\x1b[20~';
+      case 'F10':
+        return '\x1b[21~';
+      case 'F11':
+        return '\x1b[23~';
+      case 'F12':
+        return '\x1b[24~';
       default:
         if (key.length == 1) {
           return key;

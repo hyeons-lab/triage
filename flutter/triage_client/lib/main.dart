@@ -3295,19 +3295,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (msg.contains('does not hold input lease') ||
           msg.contains('no input lease holder')) {
         final current = _selectedSession;
-        if (current != null) {
-          final sid = _sessionIdFor(current);
-          if (sid != null && !current.isExited) {
-            unawaited(
-              _client
-                  .attachSession(
-                    sessionId: sid,
-                    clientId: _clientId,
-                    mode: 'InteractiveController',
-                  )
-                  .catchError((_) => <String, dynamic>{}),
-            );
-          }
+        final sid = _sessionIdFor(current);
+        if (sid != null && !current.isExited) {
+          unawaited(
+            _client
+                .attachSession(
+                  sessionId: sid,
+                  clientId: _clientId,
+                  mode: 'InteractiveController',
+                )
+                .catchError((_) => <String, dynamic>{}),
+          );
         }
       }
       return;

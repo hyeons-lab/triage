@@ -99,6 +99,19 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T19:14-0400 `flutter/triage_client/lib/services/triage_websocket_client.dart`:
   - Forwarded uncorrelated error messages from the daemon to `_eventController` in `_handleIncomingMessage`.
   - Added FlatBuffers serialization for `write_input` requests.
+- 2026-09-08T19:46-0400 `devlog/plans/000144-04-unify-desktop-terminal-keyboard-input.md`:
+  - Created plan to unify desktop terminal keyboard input into an authoritative window capture listener and eliminate split-brain gating.
+- 2026-09-08T19:46-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Removed `_isActiveElementInTerminal()` early return in `_windowKeyDownListener`, making the capture listener the sole authoritative dispatcher for desktop web keyboard events.
+  - Added native IME composition bypass (`event.isComposing == true || event.key == 'Process'`).
+  - Added Cmd+C non-selection macOS guard and Cmd+V browser paste pass-through.
+  - Expanded `_keyboardEventToInput()` with Cmd+K clear, Ctrl+Home/End, Alt+Enter/Delete, Shift+Home/End/PgUp/PgDn, Insert, and F1 through F12.
+  - Restricted xterm.js `onDataCallback` on desktop web to terminal mouse tracking sequences (`\x1b[<` and `\x1b[M`), while preserving virtual keyboard and sticky Ctrl on mobile.
+  - Completely deleted `_InputDedupeRecord` and `_sessionInputDedupe`, eliminating artificial timer delays, dropped fast typing, and dropped Backspaces.
+  - Removed redundant `attachCustomKeyEventHandler` on `_term` and `_containerKeyDownSubscription`.
+  - Removed unnecessary `_focusTerminal()` DOM focus calls on every keystroke in `_sendInput()`.
+- 2026-09-08T19:46-0400 `flutter/triage_client/lib/main.dart`:
+  - Removed redundant null check on non-nullable `_selectedSession`.
 
 ## Decisions
 
@@ -132,6 +145,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T19:14-0400 Restore native xterm.js input flow when textarea is focused: Direct window keydown interception with preventDefault broke xterm.js internal keyboard handling, alternate screen cursor modes, and Backspace in full-screen TUI apps like Codex and agy. Returning early when `_isActiveElementInTerminal()` is true allows xterm.js to receive native events and emit clean onData streams.
 - 2026-09-08T19:14-0400 Eliminate 50ms timestamp deduplication: Window keydown deduplication against onData timestamps caused rapid keystrokes and repeated keys (such as holding Backspace) to be dropped.
 - 2026-09-08T19:14-0400 Proactive lease acquisition on session selection: When switching sessions or loading daemon sessions, the client must explicitly acquire an InteractiveController lease. Proactively requesting the lease on session selection and auto-recovering on lease error responses ensures write_input is never rejected by the daemon.
+- 2026-09-08T19:46-0400 Authoritative window capture listener for desktop terminal input: In Flutter Web, physical keystrokes do not reliably flow into xterm.js helper textareas embedded within platform view Shadow DOM trees. Making `_windowKeyDownListener` the sole authoritative dispatcher on desktop web ensures continuous, reliable input for all typing, backspacing, entering, and control sequences.
+- 2026-09-08T19:46-0400 Eliminate split-brain `_isActiveElementInTerminal()` gating: Bypassing the window listener when the textarea was focused caused keypress drops because subsequent keystrokes were discarded. Removing this check ensures every keystroke for the active terminal is processed.
+- 2026-09-08T19:46-0400 Restrict desktop xterm.js onData to mouse tracking: Because `_windowKeyDownListener` calls `preventDefault()` and `stopPropagation()`, normal keystrokes are dispatched without duplication. Restricting `onData` on desktop to mouse sequences (`\x1b[<` and `\x1b[M`) guarantees zero double-sending while preserving mouse reporting for interactive terminal programs.
+- 2026-09-08T19:46-0400 Completely remove `_InputDedupeRecord` and `_sessionInputDedupe`: Timestamp deduplication timers caused rapid keystrokes (such as double letters) and held Backspace keys to be dropped. With a single input source of truth on desktop, deduplication is unnecessary.
 
 ## Issues
 
@@ -178,6 +195,14 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Eliminate window timestamp deduplication and Backspace drops
 - [x] Prevent duplicate input listener registrations via inputListenerBound guard
 - [x] Proactively acquire InteractiveController input lease on session selection and recover on lease errors
+- [x] Make `_windowKeyDownListener` the single authoritative input source for desktop web
+- [x] Eliminate `_isActiveElementInTerminal()` gating and dropped keystrokes
+- [x] Restrict xterm.js onData to mouse tracking on desktop
+- [x] Delete `_InputDedupeRecord` and all timestamp deduplication
+- [x] Eliminate redundant `attachCustomKeyEventHandler` and `_containerKeyDownSubscription`
+- [x] Remove per-keystroke `_focusTerminal()` calls from `_sendInput`
+- [x] Validate all 454 Flutter tests and clippy checks
+- [x] Rebuild release web bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -190,7 +215,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - adf465c: fix(triage_client): resolve terminal store history deadlock on controller rebind
 - 386a1d9: fix(triage_client): refactor and simplify terminal input and screen lifecycle
 - ab3e213: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
-- HEAD: fix(triage_client): restore native terminal input pipeline and lease acquisition
+- 3902388: fix(triage_client): restore native terminal input pipeline and lease acquisition
+- HEAD: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
 
 
 
