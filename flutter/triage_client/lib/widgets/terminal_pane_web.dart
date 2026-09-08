@@ -1148,30 +1148,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     final sessionId = _sanitizedId;
 
     void onWrite(String data) {
+      final term = _sessionTerms[sessionId];
+      if (term != null) {
+        try {
+          js_util.callMethod(term, 'write', [data]);
+        } catch (_) {}
+        return;
+      }
       final activePane = _containerEventOwners[sessionId];
-      if (activePane != null && !activePane._initialContentWritten) {
-        if ((activePane._lastFittedCols ?? 0) >= 10 &&
-            (activePane._lastFittedRows ?? 0) >= 5) {
-          activePane._finishInitialContent(
-            activePane._lastFittedCols!,
-            activePane._lastFittedRows!,
-          );
-          final term = _sessionTerms[sessionId];
-          if (term != null) {
-            try {
-              js_util.callMethod(term, 'write', [data]);
-            } catch (_) {}
-          }
-          return;
-        }
+      if (activePane != null) {
         activePane._pendingLiveWriteBuffer.add(data);
-      } else {
-        final term = _sessionTerms[sessionId];
-        if (term != null) {
-          try {
-            js_util.callMethod(term, 'write', [data]);
-          } catch (_) {}
-        }
       }
     }
 
@@ -1997,6 +1983,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
     _currentMountedPane = this;
+    _containerEventOwners[_sanitizedId] = this;
     if (oldWidget.bracketedPasteEnabled != widget.bracketedPasteEnabled) {
       _sessionBracketedPasteModes[_sanitizedId] = widget.bracketedPasteEnabled;
       if (_term != null) {
@@ -2031,6 +2018,10 @@ class _TerminalPaneState extends State<TerminalPane> {
         widget.controller,
       );
       _bindController();
+      _containerEventOwners[_sanitizedId] = this;
+      if (_initialized) {
+        _writeInitialContent();
+      }
       _activateTerminal(force: true);
       _scheduleFocusRetries(force: true);
     }

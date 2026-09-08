@@ -837,6 +837,9 @@ class SessionVm {
 
   /// Apply a live raw output chunk (remote PTY bytes) through the write path.
   void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
+    if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
+      noteViewFit(lastFittedCols!, lastFittedRows!);
+    }
     store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
   }
 
@@ -3013,6 +3016,24 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.worktreeRoot ??= oldSession.worktreeRoot;
         }
         regrouped = session.repoRoot != oldSession.repoRoot;
+        if (oldSession.hasFitted) {
+          session.hasFitted = true;
+          session.lastFittedCols = oldSession.lastFittedCols;
+          session.lastFittedRows = oldSession.lastFittedRows;
+          session.ownFittedCols = oldSession.ownFittedCols;
+          session.ownFittedRows = oldSession.ownFittedRows;
+          session.hostSizeCols = oldSession.hostSizeCols;
+          session.hostSizeRows = oldSession.hostSizeRows;
+        }
+        if (oldSession._viewReady) {
+          session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
+        } else if (oldSession.lastFittedCols != null &&
+            oldSession.lastFittedRows != null) {
+          session.noteViewFit(
+            oldSession.lastFittedCols!,
+            oldSession.lastFittedRows!,
+          );
+        }
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);

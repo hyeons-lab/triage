@@ -186,3 +186,29 @@ The code-review-graph MCP server and automated tool hooks (such as `.gemini/hook
 2. Remove code-review-graph instruction sections from `AGENTS.md` and `CLAUDE.md`, and remove `.code-review-graph/` from `.gitignore`.
 3. Kill all running `code-review-graph` background processes and remove local database caches.
 4. Clean rebuild Flutter web client release bundle, compile release `triaged`, and reload daemon via zero-downtime handover.
+
+## 7. Propagate Fitted Dimensions to Swapped Controllers and Eliminate Terminal Store History Deadlock
+
+### Thinking
+
+When a session is lazy-loaded via `_loadDaemonSessionInto`, a new `SessionVm` replaces the placeholder session. The new `SessionVm` is constructed with `_viewReady = false`, staging its history in `_pendingHistory` while awaiting `noteViewFit`. In `TerminalPane`, `didUpdateWidget` binds the new controller when `oldWidget.controller != widget.controller`, but previously never invoked `onViewFit` or `_writeInitialContent()`. Because the DOM container was already rendered and its pixel dimensions remained unchanged, `ResizeObserver` never fired. Consequently, `noteViewFit` was never called for the new `SessionVm`, `_pendingHistory` remained unplayed, and `TerminalStore` remained stuck in `AttachPhase.awaitingHistory`.
+
+In this state, `TerminalStore._reduceLive` routes all incoming live output (including user typing echoes from Codex) into `_pendingLive` rather than writing to the sink. Because `HistoryBytes` was never dispatched, `_flushPendingLive` never ran, freezing the terminal display while keystrokes continued to reach the backend PTY.
+
+Furthermore, `onWrite` in `terminal_pane_web.dart` should write directly to `term` whenever the xterm.js instance exists in memory rather than pushing data into `_pendingLiveWriteBuffer`.
+
+### Plan
+
+1. In `flutter/triage_client/lib/main.dart`:
+   - In `_loadDaemonSessionInto`, carry forward fitted dimensions (`hasFitted`, `lastFittedCols`, `lastFittedRows`, `ownFittedCols`, `ownFittedRows`, `hostSizeCols`, `hostSizeRows`) and call `session.noteViewFit` if `oldSession._viewReady` or fitted dimensions exist.
+   - In `SessionVm.applyLiveBytes`, if `!_viewReady` but `lastFittedCols != null && lastFittedRows != null`, invoke `noteViewFit` immediately so history and live bytes drain.
+2. In `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+   - In `didUpdateWidget`, when `oldWidget.controller != widget.controller`, ensure `_containerEventOwners[_sanitizedId] = this;` and call `_writeInitialContent()` if `_initialized`.
+   - In `didUpdateWidget`, always re-assert `_containerEventOwners[_sanitizedId] = this;`.
+   - In `onWrite`, write directly to `term` if `term != null`.
+3. Preserve stub invariants:
+   - Keep `terminal_pane_stub.dart` sizing strictly driven by layout, avoiding false terminal size drift on app resume.
+4. Validate and test:
+   - Run `cargo check --workspace` and `cargo test --workspace`.
+   - Run `flutter test`.
+   - Build web bundle and execute zero-downtime reload.

@@ -59,6 +59,13 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Completely uninstalled code-review-graph: deleted repository configurations, tool hooks, and agent instructions.
   - Terminated background code-review-graph processes and removed local `.code-review-graph` database caches.
   - Clean rebuilt Flutter web client release bundle, recompiled `triaged` in release mode, and executed zero-downtime daemon handover preserving all 28 live sessions.
+- 2026-09-08T00:36-0400 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 7 detailing controller swap dimension propagation, initial content writing on rebind, and eliminating TerminalStore history deadlock.
+- 2026-09-08T00:36-0400 `flutter/triage_client/lib/main.dart`:
+  - In `_loadDaemonSessionInto`, carried forward fitted dimensions (`hasFitted`, `lastFittedCols`, `lastFittedRows`, `ownFittedCols`, `ownFittedRows`, `hostSizeCols`, `hostSizeRows`) and invoked `session.noteViewFit` if `oldSession._viewReady` or fitted dimensions exist.
+  - In `SessionVm.applyLiveBytes`, ensured `noteViewFit(lastFittedCols!, lastFittedRows!)` is invoked if `!_viewReady` and fitted dimensions are present so staged history and live output drain immediately.
+- 2026-09-08T00:36-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `onWrite`, wrote directly to `term` if present in memory, eliminating output buffering when the xterm instance is already active.
+  - In `didUpdateWidget`, re-asserted `_containerEventOwners[_sanitizedId] = this;` and invoked `_writeInitialContent()` when the controller is swapped on an initialized pane.
 
 ## Decisions
 
@@ -81,6 +88,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-07T16:36-0700 Immediate live write finalization on user input: If the user sends input or incoming output arrives while valid fitted dimensions are present, finalize initial content immediately rather than waiting for stability timers, avoiding output stalls.
 - 2026-09-07T16:36-0700 Eliminate destructive screen clearing on controller swap: Terminal state is owned by xterm.js in the browser; controller swaps during rebinds must not clear the screen or wipe pending live buffers.
 - 2026-09-07T18:44-0700 Complete removal of code-review-graph: The code-review-graph MCP server, automated hooks, and database indexing spawned background processes on every session start and tool execution with long timeouts, causing process blocking and resource contention across active terminals.
+- 2026-09-08T00:36-0400 Carry forward fitted dimensions on session load: When `_loadDaemonSessionInto` replaces a placeholder `SessionVm` with a new instance, the container DOM element is already fitted and rendered, meaning `ResizeObserver` will not fire. Carrying forward `lastFittedCols`/`lastFittedRows` and calling `session.noteViewFit` transitions `TerminalStore` out of `AttachPhase.awaitingHistory` and immediately drains live output.
+- 2026-09-08T00:36-0400 Direct terminal write when xterm instance exists: If `_sessionTerms[sessionId]` is already allocated and alive in the DOM, writing incoming data directly to the terminal avoids unwarranted buffering in `_pendingLiveWriteBuffer`.
 
 ## Issues
 
@@ -112,6 +121,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Eliminate destructive terminal resets and buffer clearing on controller update
 - [x] Uninstall code-review-graph and remove automated tool hooks
 - [x] Clean build Flutter web release bundle and reload daemon via zero-downtime handover
+- [x] Resolve TerminalStore awaitingHistory deadlock on session load
+- [x] Direct live terminal writes for active xterm instances
 
 ## Commits
 
@@ -120,5 +131,6 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - c747c84: fix(triage_client): penetrate shadow dom focus and eliminate external input false locks
 - e192036: fix(triage_client): re-acquire input lease on demand and harden focus retry lifecycle
 - e76d810: fix(triage_client): unblock session output stream and eliminate destructive resets
-- HEAD: chore: uninstall code-review-graph and remove automated tool hooks
+- f1b364a: chore: uninstall code-review-graph and remove automated tool hooks
+- HEAD: fix(triage_client): resolve terminal store history deadlock on controller rebind
 
