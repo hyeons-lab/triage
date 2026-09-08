@@ -332,8 +332,6 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (mounted) {
               _styleSheetLoaded = true;
               try {
-                _resetTerminalSafe();
-                _initialContentWritten = false;
                 _stableWidth = null;
                 _stableHeight = null;
                 _forceFinalizeTimer?.cancel();
@@ -352,8 +350,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           _styleSheetLoaded = true;
           if (_initialized) {
             try {
-              _resetTerminalSafe();
-              _initialContentWritten = false;
               _stableWidth = null;
               _stableHeight = null;
               _forceFinalizeTimer?.cancel();
@@ -945,7 +941,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!_initialized) return;
     try {
       js_util.callMethod(_term, 'clear', []);
-      js_util.callMethod(_term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
     } catch (_) {}
   }
 
@@ -1174,7 +1169,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (term != null) {
         try {
           js_util.callMethod(term, 'clear', []);
-          js_util.callMethod(term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
         } catch (_) {}
       }
     }
@@ -1712,7 +1706,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       return false;
     }
 
-    if (!identical(_containerEventOwners[_sanitizedId], this)) {
+    if (!identical(_currentMountedPane, this)) {
       return false;
     }
 
@@ -1736,12 +1730,6 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     if (_isActiveElementInTerminal()) {
       return true;
-    }
-
-    // Ambient window keydown fallback:
-    // Only the currently mounted/visible pane should handle ambient keystrokes.
-    if (!identical(_currentMountedPane, this)) {
-      return false;
     }
 
     // If another Flutter widget explicitly holds primary focus and is an editable
@@ -2020,7 +2008,15 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _containerEventOwners[_sanitizedId] = this;
       if (_initialized) {
-        _writeInitialContent();
+        final fittedRows =
+            ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
+            _lastFittedRows ??
+            24);
+        final fittedCols =
+            ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
+            _lastFittedCols ??
+            80);
+        widget.onViewFit?.call(fittedCols, fittedRows);
       }
       _activateTerminal(force: true);
       _scheduleFocusRetries(force: true);
@@ -2050,15 +2046,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (identical(_currentMountedPane, this)) {
       _currentMountedPane = null;
     }
-    try {
-      final textarea = _activeTextarea;
-      if (textarea != null && _deepActiveElement() == textarea) {
-        textarea.blur();
-      }
-      if (_term != null) {
-        js_util.callMethod(_term, 'blur', []);
-      }
-    } catch (_) {}
     // Everything above releases only what this pane holds. The cached session is
     // shared across panes and survives switching sessions so its DOM container,
     // xterm instance, and scroll position remain preserved. Ending the session

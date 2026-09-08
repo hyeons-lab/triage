@@ -1797,36 +1797,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           return;
         }
 
-        final sessionId = session.remoteSessionId;
-        if (sessionId == null) return;
-
-        if (session.status != 'attached') {
-          if (session.status != 'exited') {
-            _client
-                .attachSession(
-                  sessionId: sessionId,
-                  clientId: _clientId,
-                  mode: 'InteractiveController',
-                )
-                .then((_) {
-                  if (!_disposed && mounted) {
-                    setState(() {
-                      session.status = 'attached';
-                      session.statusColor = const Color(0xff7fd1c7);
-                    });
-                    _client
-                        .writeInput(
-                          sessionId: sessionId,
-                          clientId: _clientId,
-                          bytes: utf8.encode(keys),
-                        )
-                        .catchError((_) {});
-                  }
-                })
-                .catchError((_) {});
-          }
+        if (session.isExited || session.status == 'exited') {
           return;
         }
+
+        final sessionId = session.remoteSessionId;
+        if (sessionId == null) return;
 
         _client
             .writeInput(
@@ -1837,33 +1813,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             .catchError((_) {
               if (!_client.isConnected) {
                 _markRemoteSessionDisconnected(session);
-              } else {
-                _client
-                    .attachSession(
-                      sessionId: sessionId,
-                      clientId: _clientId,
-                      mode: 'InteractiveController',
-                    )
-                    .then((_) {
-                      if (!_disposed && mounted) {
-                        setState(() {
-                          session.status = 'attached';
-                          session.statusColor = const Color(0xff7fd1c7);
-                        });
-                        _client
-                            .writeInput(
-                              sessionId: sessionId,
-                              clientId: _clientId,
-                              bytes: utf8.encode(keys),
-                            )
-                            .catchError((_) {});
-                      }
-                    })
-                    .catchError((_) {
-                      if (!_client.isConnected) {
-                        _markRemoteSessionDisconnected(session);
-                      }
-                    });
               }
             });
       } else {
@@ -3025,15 +2974,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hostSizeCols = oldSession.hostSizeCols;
           session.hostSizeRows = oldSession.hostSizeRows;
         }
-        if (oldSession._viewReady) {
-          session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
-        } else if (oldSession.lastFittedCols != null &&
-            oldSession.lastFittedRows != null) {
-          session.noteViewFit(
-            oldSession.lastFittedCols!,
-            oldSession.lastFittedRows!,
-          );
-        }
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);
@@ -3758,7 +3698,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!session.hasFitted) {
       session.hasFitted = true;
       if (session.isRemote && _client.isConnected) {
-        unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+        unawaited(_refreshSessionSnapshot(session, includeHistory: false));
       }
     }
   }
@@ -3777,7 +3717,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       if (_client.isConnected &&
           session.isRemote &&
-          session.status == 'disconnected') {
+          session.status != 'exited') {
         session.status = 'attached';
         session.statusColor = const Color(0xff7fd1c7);
       }

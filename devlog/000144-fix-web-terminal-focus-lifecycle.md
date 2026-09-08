@@ -67,6 +67,20 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - In `onWrite`, wrote directly to `term` if present in memory, eliminating output buffering when the xterm instance is already active.
   - In `didUpdateWidget`, re-asserted `_containerEventOwners[_sanitizedId] = this;` and invoked `_writeInitialContent()` when the controller is swapped on an initialized pane.
 
+- 2026-09-08T01:20-0400 `devlog/plans/000144-02-terminal-input-refactor.md`: Created plan to refactor terminal input and session switching lifecycle, eliminating fragile async attach loops and destructive clear/reset sequences.
+- 2026-09-08T01:20-0400 `flutter/triage_client/lib/main.dart`:
+  - Simplified `_setupSessionInputListener()` to perform direct, synchronous `_client.writeInput()` calls without async `attachSession()` chaining.
+  - Added early exit in `_setupSessionInputListener()` when `session.isExited || session.status == 'exited'` to drop user input on exited sessions.
+  - Removed premature `noteViewFit()` from `_loadDaemonSessionInto()` so staged history is not flushed to unbound controllers before `TerminalPane` mounts.
+  - Changed `_onSessionViewFit()` initial refresh to pass `includeHistory: false` so that view fits do not trigger destructive history replays.
+  - In `_selectSession()`, set `session.status = 'attached'` for non-exited remote sessions.
+- 2026-09-08T01:20-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Removed raw VT100 escape sequence `write('\x1b[2J\x1b[3J\x1b[H')` from `_resetTerminalSafe()` and `onClear()` to prevent screen wiping in alternate screen applications like Codex.
+  - Removed `_resetTerminalSafe()` and `_initialContentWritten = false` from stylesheet load listeners in `initState()`.
+  - Simplified `_eventTargetsTerminal()` to check `identical(_currentMountedPane, this)` directly.
+  - Removed destructive `textarea.blur()` and `_term.blur()` calls from `dispose()`.
+  - In `didUpdateWidget()`, bound controller first, then notified `widget.onViewFit()` with fitted dimensions, and activated focus.
+
 ## Decisions
 
 - 2026-09-06T23:05-0700 Exclude `FocusScopeNode` from `primaryFocus` check: In Flutter, when no child widget holds focus, `primaryFocus` defaults to the route `FocusScopeNode` (which retains a non-null context). Exclude `FocusScopeNode` so ambient window keydown events are routed to the active terminal pane when no input field holds focus.
@@ -90,6 +104,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-07T18:44-0700 Complete removal of code-review-graph: The code-review-graph MCP server, automated hooks, and database indexing spawned background processes on every session start and tool execution with long timeouts, causing process blocking and resource contention across active terminals.
 - 2026-09-08T00:36-0400 Carry forward fitted dimensions on session load: When `_loadDaemonSessionInto` replaces a placeholder `SessionVm` with a new instance, the container DOM element is already fitted and rendered, meaning `ResizeObserver` will not fire. Carrying forward `lastFittedCols`/`lastFittedRows` and calling `session.noteViewFit` transitions `TerminalStore` out of `AttachPhase.awaitingHistory` and immediately drains live output.
 - 2026-09-08T00:36-0400 Direct terminal write when xterm instance exists: If `_sessionTerms[sessionId]` is already allocated and alive in the DOM, writing incoming data directly to the terminal avoids unwarranted buffering in `_pendingLiveWriteBuffer`.
+- 2026-09-08T01:20-0400 Direct synchronous input writing: Keystroke listeners should not initiate asynchronous lease acquisition loops. Direct writes via `_client.writeInput()` ensure immediate input response without keystroke drops or race conditions.
+- 2026-09-08T01:20-0400 Eliminate raw VT100 clear sequences in client reset helpers: Writing `\x1b[2J\x1b[3J\x1b[H` directly to xterm erases active alternate screen buffers in TUI apps (like Codex and Ratatui) without the backend program's knowledge. Standard `term.clear()` suffices for scrollback clearing without corrupting terminal viewports.
+- 2026-09-08T01:20-0400 Preserve rendered buffer on stylesheet load: Loading font stylesheets changes metrics and requires re-fitting the grid, but must never wipe or reset already rendered terminal content.
+- 2026-09-08T01:20-0400 Defer history replay until widget controller is bound: Staged history must only be flushed through `SessionVm.noteViewFit()` after `TerminalPane` has bound its write listener to `session.terminalController`.
 
 ## Issues
 
@@ -123,6 +141,11 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Clean build Flutter web release bundle and reload daemon via zero-downtime handover
 - [x] Resolve TerminalStore awaitingHistory deadlock on session load
 - [x] Direct live terminal writes for active xterm instances
+- [x] Refactor terminal input pipeline to direct synchronous writes
+- [x] Remove raw VT100 clear escape sequences from client reset helpers
+- [x] Eliminate destructive stylesheet load resets and buffer clearing
+- [x] Defer history replay until controller is bound to prevent blank screens
+- [x] Verify all 454 Flutter tests and 328 Rust tests pass
 
 ## Commits
 
@@ -132,5 +155,7 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - e192036: fix(triage_client): re-acquire input lease on demand and harden focus retry lifecycle
 - e76d810: fix(triage_client): unblock session output stream and eliminate destructive resets
 - f1b364a: chore: uninstall code-review-graph and remove automated tool hooks
-- HEAD: fix(triage_client): resolve terminal store history deadlock on controller rebind
+- adf465c: fix(triage_client): resolve terminal store history deadlock on controller rebind
+- HEAD: fix(triage_client): refactor and simplify terminal input and screen lifecycle
+
 
