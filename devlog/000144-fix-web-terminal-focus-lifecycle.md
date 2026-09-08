@@ -80,6 +80,11 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Simplified `_eventTargetsTerminal()` to check `identical(_currentMountedPane, this)` directly.
   - Removed destructive `textarea.blur()` and `_term.blur()` calls from `dispose()`.
   - In `didUpdateWidget()`, bound controller first, then notified `widget.onViewFit()` with fitted dimensions, and activated focus.
+- 2026-09-08T08:08-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Removed `!_isActiveElementInTerminal()` gating in `_windowKeyDownListener`, routing all terminal keystrokes directly via `_keyboardEventToInput()` and `_sendInput()`.
+  - Expanded `_keyboardEventToInput()` to comprehensively support navigation, function keys, Ctrl modifiers, Alt/Option word navigation, Shift+arrows, and international character input.
+  - Added window input tracking to `_InputDedupeRecord` and bidirectional deduplication between window keydowns and onData callbacks.
+  - Removed unused `_resetTerminalSafe` helper.
 
 ## Decisions
 
@@ -108,6 +113,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T01:20-0400 Eliminate raw VT100 clear sequences in client reset helpers: Writing `\x1b[2J\x1b[3J\x1b[H` directly to xterm erases active alternate screen buffers in TUI apps (like Codex and Ratatui) without the backend program's knowledge. Standard `term.clear()` suffices for scrollback clearing without corrupting terminal viewports.
 - 2026-09-08T01:20-0400 Preserve rendered buffer on stylesheet load: Loading font stylesheets changes metrics and requires re-fitting the grid, but must never wipe or reset already rendered terminal content.
 - 2026-09-08T01:20-0400 Defer history replay until widget controller is bound: Staged history must only be flushed through `SessionVm.noteViewFit()` after `TerminalPane` has bound its write listener to `session.terminalController`.
+- 2026-09-08T08:08-0400 Direct window capture key routing for active terminal: Relying on xterm.js internal helper textarea event dispatch inside Flutter Web's platform view caused dropped keystrokes once the textarea was focused. Handling key translation directly at the window capture listener guarantees continuous, immediate input response for all typing, backspaces, enters, and control sequences.
+- 2026-09-08T08:08-0400 Bidirectional deduplication between window keydown and onData: Tracking window input timestamps and text in `_InputDedupeRecord` prevents duplicate emission if an xterm.onData or mobile virtual keyboard event fires for the same keystroke within 50ms.
 
 ## Issues
 
@@ -146,6 +153,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Eliminate destructive stylesheet load resets and buffer clearing
 - [x] Defer history replay until controller is bound to prevent blank screens
 - [x] Verify all 454 Flutter tests and 328 Rust tests pass
+- [x] Eliminate inactive terminal focus gating in _windowKeyDownListener
+- [x] Expand _keyboardEventToInput for full modifier, navigation, and international keyboard support
+- [x] Implement bidirectional window/onData deduplication
+- [x] Deploy release binary with zero-downtime handover preserving all 29 live sessions
 
 ## Commits
 
@@ -156,6 +167,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - e76d810: fix(triage_client): unblock session output stream and eliminate destructive resets
 - f1b364a: chore: uninstall code-review-graph and remove automated tool hooks
 - adf465c: fix(triage_client): resolve terminal store history deadlock on controller rebind
-- HEAD: fix(triage_client): refactor and simplify terminal input and screen lifecycle
+- 386a1d9: fix(triage_client): refactor and simplify terminal input and screen lifecycle
+- HEAD: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
+
 
 

@@ -78,6 +78,8 @@ class _InputDedupeRecord {
   String? onDataText;
   int mobileTime = 0;
   String? mobileText;
+  int windowTime = 0;
+  String? windowText;
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
@@ -389,19 +391,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (event is html.KeyboardEvent) {
         final isCurrent = _currentRoute?.isCurrent ?? true;
         if (!widget.isExited && isCurrent && _eventTargetsTerminal(event)) {
-          if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
-            event.preventDefault();
-            event.stopPropagation();
-            if (event.shiftKey) {
-              _sendInput('\x1B[Z');
-            } else {
-              _sendInput('\t');
-            }
-          } else if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
+          if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
             // Prefer xterm.js's own selection: it rebuilds the row text from the
             // buffer with the inter-column spaces intact. The browser-native
             // window.getSelection() serializes the DOM-renderer's per-cell spans
-            // instead, which concatenates the columns and drops those spaces —
+            // instead, which concatenates the columns and drops those spaces,
             // so only fall back to it when xterm has no selection of its own.
             var selection = '';
             try {
@@ -426,51 +420,40 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              // Logged rather than swallowed: a rejected write and an empty
-              // selection both present as "the copy did nothing", and with the
-              // error dropped there was no way to tell them apart from the
-              // console. Failure is still non-fatal, so the terminal keeps its
-              // keystroke handling either way.
               html.window.navigator.clipboard?.writeText(selection).catchError((
                 Object error,
               ) {
                 debugPrint('Terminal copy failed: $error');
               });
+              return;
             }
           } else if ((event.ctrlKey || event.metaKey) &&
               (event.key == 'v' || event.key == 'V')) {
             // Deliberately not handled here: paste is left to the browser.
-            //
-            // Calling `preventDefault` on this keydown is what suppresses the
-            // native paste action, and with it the `paste` event that
-            // `_containerPasteListener` is waiting for. What was left was
-            // `navigator.clipboard.readText()`, which needs the `clipboard-read`
-            // permission; that sits at `prompt` until the user accepts, and a
-            // single dismissal denies it for the origin from then on. The
-            // rejection was swallowed, so paste simply stopped working with
-            // nothing logged.
-            //
-            // Letting the event through costs nothing and needs no permission: a
-            // user-initiated paste hands the page its own text on the `paste`
-            // event. The branch is inert, and deleting it would behave exactly
-            // the same, since `_keyboardEventToInput` already returns null for a
-            // ctrl/meta-modified "v". It is kept only as the marker saying the
-            // interception was removed on purpose, sitting next to the reason.
-          } else {
-            // When the xterm.js helper textarea is NOT yet the active element in the DOM
-            // (e.g. after clicking outside or on initial interaction), the browser fires
-            // keydown on body and does NOT deliver text input to a textarea focused in-flight.
-            // We immediately forward this first keystroke to the session and focus the textarea
-            // with preventDefault so subsequent keystrokes flow natively through xterm.onData.
-            if (!_isActiveElementInTerminal()) {
-              final input = _keyboardEventToInput(event);
-              if (input != null && input.isNotEmpty) {
-                event.preventDefault();
-                event.stopPropagation();
-                _sendInput(input);
-              }
-              _activateTerminal();
+            return;
+          }
+
+          final input = _keyboardEventToInput(event);
+          if (input != null && input.isNotEmpty) {
+            final dedupe = _sessionInputDedupe.putIfAbsent(
+              _sanitizedId,
+              () => _InputDedupeRecord(),
+            );
+            final now = DateTime.now().millisecondsSinceEpoch;
+            if (now - dedupe.onDataTime < 50 && dedupe.onDataText == input) {
+              dedupe.onDataText = null;
+              event.preventDefault();
+              event.stopPropagation();
+              return;
             }
+            if (now - dedupe.onDataTime >= 50) {
+              dedupe.onDataText = null;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+            _sendInput(input);
+            _activateTerminal();
           }
         }
       }
@@ -504,6 +487,14 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _sendInput(String data) {
+    final dedupe = _sessionInputDedupe.putIfAbsent(
+      _sanitizedId,
+      () => _InputDedupeRecord(),
+    );
+    final now = DateTime.now().millisecondsSinceEpoch;
+    dedupe.windowTime = now;
+    dedupe.windowText = data;
+
     _sessionSavedViewportY.remove(_sanitizedId);
     try {
       js_util.callMethod(_term, 'scrollToBottom', []);
@@ -937,13 +928,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
-  void _resetTerminalSafe() {
-    if (!_initialized) return;
-    try {
-      js_util.callMethod(_term, 'clear', []);
-    } catch (_) {}
-  }
-
   void _bindTerminalSubscriptions() {
     _inputRouteToken = _sessionInputRouter.bind(
       _sanitizedId,
@@ -965,6 +949,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         }
         if (now - dedupe.mobileTime >= 35) {
           dedupe.mobileText = null;
+        }
+        if (now - dedupe.windowTime < 50 && dedupe.windowText == data) {
+          dedupe.windowText = null;
+          return;
+        }
+        if (now - dedupe.windowTime >= 50) {
+          dedupe.windowText = null;
         }
 
         dedupe.onDataTime = now;
@@ -1631,11 +1622,39 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   String? _keyboardEventToInput(html.KeyboardEvent event) {
-    if (event.metaKey || event.altKey) {
+    if (event.metaKey) {
+      if (!event.ctrlKey && !event.altKey) {
+        switch (event.key) {
+          case 'ArrowLeft':
+            return '\x1b[H';
+          case 'ArrowRight':
+            return '\x1b[F';
+          case 'ArrowUp':
+            return '\x1b[5~';
+          case 'ArrowDown':
+            return '\x1b[6~';
+          case 'Backspace':
+            return '\x15';
+        }
+      }
       return null;
     }
 
-    if (event.ctrlKey) {
+    if (event.ctrlKey && !event.altKey) {
+      switch (event.key) {
+        case 'ArrowLeft':
+          return '\x1b[1;5D';
+        case 'ArrowRight':
+          return '\x1b[1;5C';
+        case 'ArrowUp':
+          return '\x1b[1;5A';
+        case 'ArrowDown':
+          return '\x1b[1;5B';
+        case 'Backspace':
+          return '\x17';
+        case 'Delete':
+          return '\x1b[3;5~';
+      }
       final key = event.key?.toLowerCase();
       if (key != null && key.length == 1) {
         final code = key.codeUnitAt(0);
@@ -1662,8 +1681,46 @@ class _TerminalPaneState extends State<TerminalPane> {
       return null;
     }
 
+    if (event.altKey && !event.metaKey && !event.ctrlKey) {
+      switch (event.key) {
+        case 'ArrowLeft':
+        case 'b':
+        case 'B':
+          return '\x1bb';
+        case 'ArrowRight':
+        case 'f':
+        case 'F':
+          return '\x1bf';
+        case 'd':
+        case 'D':
+          return '\x1bd';
+        case 'Backspace':
+          return '\x1b\x7f';
+      }
+      final key = event.key;
+      if (key != null && key.length == 1) {
+        return key;
+      }
+      return null;
+    }
+
     final key = event.key;
     if (key == null) return null;
+
+    if (event.shiftKey) {
+      switch (key) {
+        case 'Tab':
+          return '\x1b[Z';
+        case 'ArrowUp':
+          return '\x1b[1;2A';
+        case 'ArrowDown':
+          return '\x1b[1;2B';
+        case 'ArrowRight':
+          return '\x1b[1;2C';
+        case 'ArrowLeft':
+          return '\x1b[1;2D';
+      }
+    }
 
     switch (key) {
       case 'Enter':
@@ -1671,7 +1728,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       case 'Backspace':
         return '\x7f';
       case 'Tab':
-        return event.shiftKey ? '\x1b[Z' : '\t';
+        return '\t';
       case 'Escape':
         return '\x1b';
       case 'ArrowUp':
