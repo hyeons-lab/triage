@@ -174,3 +174,15 @@ Detailed debugging of session-218 (`stuck-codex`) revealed three cooperating roo
    - Check `cargo check --workspace` and `cargo test --workspace`.
    - Rebuild web bundle and reload daemon.
 
+## 6. Code-Review-Graph Uninstallation and Tool Hook Removal
+
+### Thinking
+
+The code-review-graph MCP server and automated tool hooks (such as `.gemini/hooks/crg-update.sh` and `.claude/settings.json`) run on session starts and tool use with long timeouts (up to 30s). When background terminals and agents run concurrently, multiple instances of `uvx code-review-graph serve` are spawned, holding file handles, executing incremental graph updates, and consuming process resources. Completely removing these configuration files, agent instructions, and background processes unblocks active development and terminal interactions.
+
+### Plan
+
+1. Delete `.mcp.json`, `.gemini/`, `.claude/`, `.qoder/`, `.kiro/`, `.opencode.json`, `.cursorrules`, `.windsurfrules`, `GEMINI.md`, `QODER.md`, and `.github/code-review-graph.instruction.md`.
+2. Remove code-review-graph instruction sections from `AGENTS.md` and `CLAUDE.md`, and remove `.code-review-graph/` from `.gitignore`.
+3. Kill all running `code-review-graph` background processes and remove local database caches.
+4. Clean rebuild Flutter web client release bundle, compile release `triaged`, and reload daemon via zero-downtime handover.

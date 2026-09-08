@@ -55,6 +55,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - In `_activateTerminal`, flushed pending live writes upon terminal activation.
   - Removed destructive `_triggerFullReplayOrReset()` call on controller update in `didUpdateWidget`.
   - Removed `_resetTerminalSafe()` screen clearing and `_pendingLiveWriteBuffer.clear()` from `_triggerFullReplayOrReset()`, and removed unused helper.
+- 2026-09-07T18:44-0700 `.mcp.json`, `.gemini/`, `.claude/`, `.qoder/`, `.kiro/`, `.opencode.json`, `.cursorrules`, `.windsurfrules`, `GEMINI.md`, `QODER.md`, `.github/code-review-graph.instruction.md`, `AGENTS.md`, `CLAUDE.md`, `.gitignore`:
+  - Completely uninstalled code-review-graph: deleted repository configurations, tool hooks, and agent instructions.
+  - Terminated background code-review-graph processes and removed local `.code-review-graph` database caches.
+  - Clean rebuilt Flutter web client release bundle, recompiled `triaged` in release mode, and executed zero-downtime daemon handover preserving all 28 live sessions.
 
 ## Decisions
 
@@ -76,6 +80,7 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-07T16:36-0700 Proactive pending event draining on WebSocket messages: Once a session is not in loading state, immediately drain any buffered events from _pendingEvents before handling new messages to preserve message sequence and output order.
 - 2026-09-07T16:36-0700 Immediate live write finalization on user input: If the user sends input or incoming output arrives while valid fitted dimensions are present, finalize initial content immediately rather than waiting for stability timers, avoiding output stalls.
 - 2026-09-07T16:36-0700 Eliminate destructive screen clearing on controller swap: Terminal state is owned by xterm.js in the browser; controller swaps during rebinds must not clear the screen or wipe pending live buffers.
+- 2026-09-07T18:44-0700 Complete removal of code-review-graph: The code-review-graph MCP server, automated hooks, and database indexing spawned background processes on every session start and tool execution with long timeouts, causing process blocking and resource contention across active terminals.
 
 ## Issues
 
@@ -105,6 +110,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Resilient session lookup and pending event draining in main.dart
 - [x] Immediate live write finalization and flush in terminal_pane_web.dart
 - [x] Eliminate destructive terminal resets and buffer clearing on controller update
+- [x] Uninstall code-review-graph and remove automated tool hooks
+- [x] Clean build Flutter web release bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -112,5 +119,6 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 0baa475: fix(triage_client): restore input on session switch and refine focus delegation
 - c747c84: fix(triage_client): penetrate shadow dom focus and eliminate external input false locks
 - e192036: fix(triage_client): re-acquire input lease on demand and harden focus retry lifecycle
-- HEAD: fix(triage_client): unblock session output stream and eliminate destructive resets
+- e76d810: fix(triage_client): unblock session output stream and eliminate destructive resets
+- HEAD: chore: uninstall code-review-graph and remove automated tool hooks
 
