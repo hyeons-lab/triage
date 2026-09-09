@@ -437,14 +437,22 @@ class _TerminalPaneState extends State<TerminalPane> {
             return;
           }
 
+          // If the terminal's helper textarea already has DOM focus, let xterm.js
+          // handle all keystrokes natively through its focused helper element.
+          if (_isActiveElementInTerminal()) {
+            return;
+          }
+
+          // Otherwise, focus is outside the terminal (such as ambient keydown after
+          // clicking outside or on initial interaction). Forward this initial keystroke
+          // to the session and activate the terminal so subsequent keystrokes flow
+          // natively through xterm.onData.
           final input = _keyboardEventToInput(event);
           if (input != null && input.isNotEmpty) {
             event.preventDefault();
             event.stopPropagation();
             _sendInput(input);
-            if (!_focusNode.hasFocus && mounted && _focusNode.canRequestFocus) {
-              _focusNode.requestFocus();
-            }
+            _activateTerminal();
           }
         }
       }
@@ -683,7 +691,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         if (!mounted || !_initialized || !(_currentRoute?.isCurrent ?? true)) {
           return;
         }
-        if (_isActiveElementInTerminal() && _focusNode.hasFocus) {
+        if (_isActiveElementInTerminal()) {
           _clearFocusRetryTimers();
           return;
         }
@@ -708,10 +716,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _currentMountedPane = this;
     _containerEventOwners[_sanitizedId] = this;
 
-    if (mounted && _focusNode.canRequestFocus && !_focusNode.hasFocus) {
-      _focusNode.requestFocus();
-    }
-
     final isConnected = _container.isConnected ?? true;
     if (!isConnected) {
       html.window.requestAnimationFrame((_) {
@@ -725,7 +729,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     try {
       final textarea = _activeTextarea;
       if (textarea != null) {
-        if (_textareaBeforeInputListener == null) {
+        if (_isMobile && _textareaBeforeInputListener == null) {
           _bindTextareaEvents();
         }
         final opts = js_util.newObject();
@@ -889,15 +893,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        if (!_isMobile) {
-          // On desktop web, _windowKeyDownListener is the authoritative input handler.
-          // xterm.js onData is only used on desktop for terminal mouse tracking sequences.
-          if (data.startsWith('\x1b[<') || data.startsWith('\x1b[M')) {
-            _sessionInputRouter.sendInput(sessionId, data);
-          }
-          return;
-        }
-
         _sessionSavedViewportY.remove(sessionId);
         try {
           final term = _sessionTerms[sessionId];
@@ -1018,6 +1013,52 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionOnScrollSubscriptions[_sanitizedId] = onScrollSubscription;
     }
 
+    try {
+      final sessionId = _sanitizedId;
+      js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
+        js_util.allowInterop((dynamic event) {
+          final key = js_util.getProperty(event, 'key') as String?;
+          if (key == 'Tab') {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final shiftKey =
+                js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+            if (shiftKey) {
+              _sessionInputRouter.sendInput(sessionId, '\x1b[Z');
+            } else {
+              _sessionInputRouter.sendInput(sessionId, '\t');
+            }
+            return false;
+          }
+          final ctrlKey =
+              js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
+          final metaKey =
+              js_util.getProperty(event, 'metaKey') as bool? ?? false;
+          if ((ctrlKey || metaKey) && (key == 'c' || key == 'C')) {
+            var selection = '';
+            try {
+              selection =
+                  js_util.callMethod(_term, 'getSelection', []) as String? ??
+                  '';
+            } catch (_) {}
+            if (selection.isNotEmpty) {
+              js_util.callMethod(event, 'preventDefault', []);
+              js_util.callMethod(event, 'stopPropagation', []);
+              html.window.navigator.clipboard
+                  ?.writeText(selection)
+                  .catchError((Object error) {
+                    debugPrint('Terminal copy failed: $error');
+                  });
+              return false;
+            }
+            if (metaKey && !ctrlKey) {
+              return false;
+            }
+          }
+          return true;
+        }),
+      ]);
+    } catch (_) {}
 
     try {
       final resizeObserverConstructor = js_util.getProperty(

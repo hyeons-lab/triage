@@ -120,6 +120,15 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - In `SessionWorkspace`, ensured `session.noteViewFit(cols, rows)` is invoked directly on the workspace's session instance.
 - 2026-09-08T20:14-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
   - In `initState()`, inside the `cachedContainer != null` branch, invoked `_writeInitialContent(overrideCols: _lastFittedCols, overrideRows: _lastFittedRows)` right after `_bindController()` to immediately propagate fitted dimensions to the controller and session.
+- 2026-09-08T20:34-0400 `devlog/plans/000144-06-restore-native-xterm-input-and-stop-focus-storm.md`:
+  - Created plan to restore native xterm.js keyboard input pipeline, eliminate per-keystroke focus requests, and cancel retry timers once the terminal is active.
+- 2026-09-08T20:34-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Restored native xterm.js keyboard input pipeline by removing the desktop mouse-only filter from `onDataCallback`, routing all keyboard data, control characters, and escape sequences directly to the session input router.
+  - Attached `attachCustomKeyEventHandler` on `_term` to intercept Tab key navigation (routing `\t` or `\x1b[Z`) and Copy shortcuts, returning true for all other keys so xterm.js handles them natively.
+  - Gated `_windowKeyDownListener` on `_isActiveElementInTerminal()`, returning early when the terminal helper textarea has DOM focus to allow uninterrupted browser event delivery to xterm.js.
+  - Eliminated the perpetual focus storm by removing `_focusNode.requestFocus()` from `_windowKeyDownListener` and `_activateTerminal()`, preventing continuous focus fighting between Flutter's engine and the browser DOM textarea.
+  - Simplified `_scheduleFocusRetries()` short-circuit check to cancel remaining retry timers immediately once `_isActiveElementInTerminal()` is true.
+  - Scoped `_bindTextareaEvents()` to `_isMobile == true`.
 
 ## Decisions
 
@@ -160,6 +169,9 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T20:14-0400 Re-add `noteViewFit` in `_loadDaemonSessionInto`: Replacing a placeholder session with a live daemon session left `_viewReady` false when `hasFitted` was true, locking `TerminalStore` in `AttachPhase.awaitingHistory` and routing all incoming live bytes from Codex into `_pendingLive`. Invoking `session.noteViewFit` with the carried dimensions immediately unblocks history playback and live terminal streaming.
 - 2026-09-08T20:14-0400 Immediate cached container dimension notification: Re-mounting a cached DOM container reuses existing xterm dimensions. Calling `_writeInitialContent` right after `_bindController()` immediately notifies the controller and session of the fitted geometry without waiting for async callbacks.
 - 2026-09-08T20:14-0400 Broaden lease rejection matching: Daemon error responses for lease rejections can vary across server states. Matching `input lease` generically ensures any lease rejection triggers an automatic `InteractiveController` re-acquisition.
+- 2026-09-08T20:34-0400 Native xterm.js keyboard event ownership: When the terminal helper textarea has DOM focus, xterm.js must directly own the keyboard event pipeline. It natively handles application cursor keys mode (`DECCKM`), alternate screen buffers, keypad modes, dead keys, and IME.
+- 2026-09-08T20:34-0400 Eliminate per-keystroke Flutter FocusNode requests: Calling `_focusNode.requestFocus()` on every keystroke when DOM focus is held by the platform view textarea triggered `Focus.onFocusChange(true)` and scheduled continuous retry timers at 50ms, 150ms, and 300ms. In Chromium and Brave, calling `.focus()` on DOM elements during active typing disrupts the browser event pipeline and cancels in-flight keystrokes. Removing `requestFocus()` stops the focus oscillation and allows zero dropped keystrokes.
+- 2026-09-08T20:34-0400 Tab interception via attachCustomKeyEventHandler: Intercepting Tab key via xterm.js custom key event handler prevents the browser from shifting focus away to other page elements while preserving bash tab-completion and TUI navigation.
 
 ## Issues
 
@@ -218,6 +230,13 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Notify cached container dimensions synchronously in initState()
 - [x] Broaden input lease error recovery matching in main.dart
 - [x] Rebuild Flutter web release bundle and reload daemon via zero-downtime handover
+- [x] Restore native xterm.js keyboard pipeline and eliminate desktop mouse-only filter
+- [x] Attach attachCustomKeyEventHandler for Tab and Copy in xterm.js
+- [x] Gate _windowKeyDownListener on _isActiveElementInTerminal()
+- [x] Eliminate per-keystroke requestFocus and retry timer loop
+- [x] Cancel focus retries immediately once _isActiveElementInTerminal() is true
+- [x] Verify all 454 Flutter tests and clippy pass
+- [x] Rebuild release web bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -232,7 +251,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - ab3e213: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
 - 3902388: fix(triage_client): restore native terminal input pipeline and lease acquisition
 - 0d74e54: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
-- HEAD: fix(triage_client): resolve codex session display deadlock and input lease recovery
+- 66aa20e: fix(triage_client): resolve codex session display deadlock and input lease recovery
+- HEAD: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
 
 
 
