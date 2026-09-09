@@ -173,6 +173,15 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T22:15-0400 `flutter/triage_client/test/terminal/terminal_store_test.dart`:
   - Added a regression test replaying a handover: history at seq 90000 and live at 90001, then live renumbered to 1 and 2 must still render. Fails on the prior code with `Actual: []`.
 
+- 2026-09-08T23:12-0400 `devlog/plans/000144-11-fix-xterm-detached-line-on-scroll-alias.md`: Created plan to fix the xterm.dart crash that made `session-218` report `load failed` once it stopped being deaf.
+- 2026-09-08T23:12-0400 `hyeons-lab/xterm.dart` @ `551423e` (fork, branch `fix/trim-start-reindex-v4`):
+  - In `IndexAwareCircularBuffer._moveChild`, place the element with `_attach(this, toIndex)` instead of `_move(toIndex)`, so an element left detached by an aliasing assignment is repaired rather than dereferenced null.
+  - Return early when a shift resolves to its own slot; the sequence below it clears the slot it just wrote and drops the element.
+  - Removed the now-unused `IndexedItem._move`, whose `assert(attached)` was compiled out of release builds.
+  - Added regression coverage in `test/src/utils/circular_buffer_test.dart` for an element left detached by an aliasing assignment, plus an invariant guard for the self-slot shift.
+- 2026-09-08T23:12-0400 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: Bumped the `xterm` override ref from `1ca073d` to `551423e`.
+- 2026-09-08T23:12-0400 `flutter/triage_client/lib/main.dart`: Log the stack alongside the message in the `_loadDaemonSessionInto` catch. The catch spans the whole load, so the message alone does not say which step threw.
+
 ## Decisions
 
 - 2026-09-06T23:05-0700 Exclude `FocusScopeNode` from `primaryFocus` check: In Flutter, when no child widget holds focus, `primaryFocus` defaults to the route `FocusScopeNode` (which retains a non-null context). Exclude `FocusScopeNode` so ambient window keydown events are routed to the active terminal pane when no input field holds focus.
@@ -227,6 +236,12 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T22:15-0400 Keep `_appliedLogBytes` across an epoch reset: log byte offsets survive a handover — the same session reports one `bytes_logged` either side of an adoption — so the value stays valid and still anchors the next history delta-merge. Only the seq-derived state is rebased.
 - 2026-09-08T22:15-0400 Give `copyWith` an explicit reset flag rather than overloading null: `?? this` cannot express "clear", and a null argument already reads as "unchanged" for every other field. A dedicated flag keeps the clear intentional at each call site.
 - 2026-09-08T22:15-0400 Deploy web assets via `triage client upgrade`, not a handover: only Dart changed, so rebuilding the bundle and copying it into the override dir (`~/.local/share/triage/web`) hot-reloads the daemon's web cache with no restart and no risk to live sessions. Override files are read from disk ahead of the cache on every request, so the swap takes effect immediately.
+
+- 2026-09-08T23:12-0400 Fix the crash in the fork rather than work around it in the client: there is no patch mechanism for pub dependencies here — the only patch machinery, `scripts/generate-dart-flatbuffers.sh`, rewrites generated flatbuffers output — and `xterm` is already a `dependency_overrides` git pin to our own fork, so the fix goes upstream of the pin and the ref moves.
+- 2026-09-08T23:12-0400 Place a shifted element with `_attach` rather than `_move`: for an element still attached to this buffer the two are the same assignment, and for one that is not, `_attach` re-establishes the owner where `_move` dereferences null. `_moveChild` is where the invariant is violated but not where it is broken — it is handed an element `scrollUp`/`scrollDown` already poisoned by aliasing one line object into two slots.
+- 2026-09-08T23:12-0400 Keep the self-slot guard even without a failing case: `insert` and `remove` step by one and their early returns rule out the colliding wrap, so it is unreachable today. It is stated as an invariant guard rather than a regression, because the sequence it guards drops the element silently rather than throwing.
+- 2026-09-08T23:12-0400 Keep the stack in the load catch: the first console line pointed at `debugPrint`'s own `console.log`, and the bare message named none of attach, the swap `setState`, `_regroupRail`, `_drainPendingEvents` or resize. Two round trips went to recovering what the catch had discarded.
+- 2026-09-08T23:12-0400 Clear the web override directory before deploying rather than copying over it: `triage client upgrade` does not prune, so the diagnostic `main.dart.js.map` would have stayed behind and mis-symbolicated a later trace against a bundle it no longer describes.
 
 ## Issues
 
@@ -319,6 +334,15 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Verify all 455 Flutter tests pass, `flutter analyze` clean, `dart format` unchanged
 - [x] Build release web bundle and deploy via `triage client upgrade` (no daemon restart; 29 sessions intact, served bytes match build)
 
+- [x] Map the minified release frames back to Dart via a `--source-maps` build
+- [x] Establish the crash is in vendored xterm.dart, not client code (bare `Terminal` reproduces it)
+- [x] Rule out the epoch fix as the cause (no `historyHighWaterSeq!` exists; repro uses no client code)
+- [x] Identify the detach site by recording it on the item (`scrollDown` via `reverseIndex`)
+- [x] Fix `_moveChild` in the fork, with a test that fails without it
+- [x] Verify the full xterm suite (125) and the real 366KB capture at every client size
+- [x] Push the fork commit and bump the pin to `551423e`
+- [x] Verify 455 client tests, `flutter analyze` clean, and deploy (no daemon restart; 29 sessions intact)
+
 ## Commits
 
 - 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
@@ -337,7 +361,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - bf1d17d: fix(triage_client): resolve half-height layout clamping and input lease buffering
 - 0474f65: fix(triage_client): guarantee web terminal Enter and control key dispatch
 - 7cdaa89: fix(triage_client): resolve live session pty clamping and ensure full-height resize
-- HEAD: fix(triage_client): render live output after an output_seq epoch reset
+- 2bac2e8: fix(triage_client): render live output after an output_seq epoch reset
+- HEAD: fix(triage_client): pin the xterm fork fix for detached lines on scroll
 
 ## Research & Discoveries
 
@@ -346,9 +371,17 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T22:15-0400 `output_seq` is per-daemon-instance and is not preserved across an adoption; `bytes_logged` is. The daemon listed one adopted session under two ids reporting identical `bytes_logged` (31169681) with `output_seq` 2474 and 98838. Byte offsets are the stable identity across a handover; sequence numbers are not.
 - 2026-09-08T22:15-0400 Live `Output` events carry only `output_seq` and `bytes` — no log byte offset — so the live path cannot dedup on the stable identity and must reason about seq epochs instead.
 
+- 2026-09-08T23:12-0400 A console line number for a `debugPrint` string points at the logger, not the throw site. `main.dart.js:28559` was `console.log(a)` inside `debugPrint`; static hunting from it found nothing because there was nothing there. Release frames need a `--source-maps` build and an explicit mapping pass.
+- 2026-09-08T23:12-0400 `Buffer.scrollUp`/`scrollDown` shift lines with `lines[i] = lines[i +/- n]`, which routes through `_adoptChild` and leaves one line object referenced by two slots. The `_detach` in a later `_adoptChild` then detaches an element still reachable from the other slot. The aliasing is the defect; `_moveChild` is only where it surfaces.
+- 2026-09-08T23:12-0400 The crash is independent of buffer capacity — it throws at `maxLines` 100 and 200000 alike — so it is not a trimming or wrap-around problem, which is what the fork's previous fixes in this file addressed.
+- 2026-09-08T23:12-0400 Codex reaches the faulty path because its redraws set and clear scrolling regions constantly (`ESC[1;27r`, `ESC[r`, `ESC[1;39r`, `ESC[1;9r`) and issue reverse index (`ESC M`). With `marginTop == 0` on the normal buffer, `Buffer.index()` takes the `lines.insert(absoluteMarginBottom + 1, ...)` branch instead of `scrollUp(1)`.
+
 ## Lessons Learned
 
 - 2026-09-08T22:15-0400 "Session won't take input" is not evidence that input is failing. Here every keystroke reached the PTY and Codex answered all three prompts; only the rendering was broken. Reading the server's own terminal buffer before touching client code would have separated the two on the first step, and nine prior plans searched the input and focus paths for a fault that was in the output path.
 - 2026-09-08T22:15-0400 A blinking cursor is a signal that xterm is alive and focused — that is, that focus and input are *working*. It argues against the focus-and-lease hypotheses rather than for them.
 - 2026-09-08T22:15-0400 Silent-drop paths need a regression escape hatch. De-duplication that trusts a monotonic counter fails permanently, not transiently, once its baseline outlives the numbering it came from, and it fails invisibly because dropping is indistinguishable from receiving nothing.
 - 2026-09-08T22:15-0400 A `copyWith` written as `field ?? this.field` cannot express "clear", so any field that legitimately needs clearing is quietly unclearable. The stale baseline could not have been reset by any caller even where the code plainly intended to.
+- 2026-09-08T23:12-0400 Fixing one bug can reveal the next one rather than finish the job. The epoch fix was correct and the session still failed, because a second, independent defect sat behind it. "Still broken after the fix" is not evidence the fix was wrong — here it was evidence the first bug had been hiding the second.
+- 2026-09-08T23:12-0400 Record where state was mutated, do not infer it. Two passes of reading `_moveChild`, `insert` and `trimStart` produced three wrong hypotheses (same-slot collision, buffer fullness, `trimStart` leftovers). Stashing a `StackTrace` on the item in `_detach` answered it on the first run.
+- 2026-09-08T23:12-0400 A catch that spans a whole operation must keep its stack. `catch (e)` over attach, replay, regroup, drain and resize turned a one-line defect into three round trips, and the fix is five characters plus the log.

@@ -3101,7 +3101,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // caller finish and report a healthy "Connected to Daemon" over the top of
       // the pairing prompt.
       rethrow;
-    } catch (e) {
+    } catch (e, stack) {
       // A load that failed because we tore its daemon down is not a failure of
       // the session now sitting under that id on the new daemon — painting that
       // one "load failed" would be a lie about a healthy session.
@@ -3118,7 +3118,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ..clear()
           ..add(_plainRow('Failed to load session $sid'));
       });
-      debugPrint('Failed to load session $sid: ${e.toString()}');
+      // With the stack: this catch spans the whole load — attach, the swap
+      // setState, regroup, drain, resize — so the message alone does not say
+      // which step threw, and a load failure is not reproducible on demand.
+      debugPrint('Failed to load session $sid: $e\n$stack');
     } finally {
       _loadingSessionIds.remove(sid);
     }
