@@ -689,6 +689,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _focusTerminal() {
+    widget.controller.notifyInteraction();
     _focusNode.requestFocus();
   }
 

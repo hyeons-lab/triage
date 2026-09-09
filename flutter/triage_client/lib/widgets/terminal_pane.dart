@@ -10,6 +10,7 @@ class TerminalController {
   final List<void Function()> _refitListeners = [];
   final List<void Function(String)> _inputListeners = [];
   final List<void Function(int, int)> _resizeOutListeners = [];
+  final List<void Function()> _interactionListeners = [];
 
   final List<String> _writeBuffer = [];
 
@@ -59,6 +60,17 @@ class TerminalController {
       _resizeOutListeners.add(listener);
   void removeResizeOutListener(void Function(int, int) listener) =>
       _resizeOutListeners.remove(listener);
+
+  void addInteractionListener(void Function() listener) =>
+      _interactionListeners.add(listener);
+  void removeInteractionListener(void Function() listener) =>
+      _interactionListeners.remove(listener);
+
+  void notifyInteraction() {
+    for (final listener in List.from(_interactionListeners)) {
+      listener();
+    }
+  }
 
   final List<void Function()> _historyReplayedListeners = [];
   void addHistoryReplayedListener(void Function() listener) =>
@@ -126,6 +138,7 @@ class TerminalController {
     _refitListeners.clear();
     _inputListeners.clear();
     _resizeOutListeners.clear();
+    _interactionListeners.clear();
     _historyReplayedListeners.clear();
     _writeBuffer.clear();
   }
@@ -159,6 +172,10 @@ class TerminalSessionInputRouter {
 
   void sendResizeOut(String sessionId, int cols, int rows) {
     _routes[sessionId]?.controller.sendResizeOut(cols, rows);
+  }
+
+  void notifyInteraction(String sessionId) {
+    _routes[sessionId]?.controller.notifyInteraction();
   }
 }
 

@@ -129,6 +129,23 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Eliminated the perpetual focus storm by removing `_focusNode.requestFocus()` from `_windowKeyDownListener` and `_activateTerminal()`, preventing continuous focus fighting between Flutter's engine and the browser DOM textarea.
   - Simplified `_scheduleFocusRetries()` short-circuit check to cancel remaining retry timers immediately once `_isActiveElementInTerminal()` is true.
   - Scoped `_bindTextareaEvents()` to `_isMobile == true`.
+- 2026-09-08T21:00-0400 `devlog/plans/000144-07-fix-full-height-layout-and-input-responsiveness.md`:
+  - Created plan to resolve half-height terminal layout clamping and input responsiveness drops.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`:
+  - Added `interactionListeners` (`addInteractionListener`, `removeInteractionListener`, `notifyInteraction()`) on `TerminalController` and `TerminalSessionInputRouter` to immediately detect user interaction from taps, clicks, and keystrokes.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`:
+  - Implemented `notifyInteraction` on `TerminalController` stub.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Set `minHeight = '100%'` on `_container` and `_terminalWrapper` styles.
+  - Wrapped terminal in `SizedBox.expand` with `width: double.infinity, height: double.infinity` to prevent half-height viewport clamping.
+  - Called `widget.controller.notifyInteraction()` on terminal activation, taps, and focus changes.
+  - Filtered `attachCustomKeyEventHandler` to `type == 'keydown'` to prevent duplicate handling on `keyup`.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/main.dart`:
+  - Added `hasInputLease` property to `SessionVm`.
+  - Implemented `_pendingInputBytes` buffer and `_acquireInputLeaseAndFlush` helper to buffer keystrokes during lease acquisition and prevent dropped input.
+  - Removed restrictive `session.status == 'attached'` check from `addResizeOutListener`, allowing resizes while session status is `loading`.
+  - In `_loadDaemonSessionInto`, synchronized host size with `resizeSession` if fitted dimensions differ after attach.
+  - In `_loadDaemonSession`, used `replayTargetSize` to resize before initial replay.
 
 ## Decisions
 
@@ -172,6 +189,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T20:34-0400 Native xterm.js keyboard event ownership: When the terminal helper textarea has DOM focus, xterm.js must directly own the keyboard event pipeline. It natively handles application cursor keys mode (`DECCKM`), alternate screen buffers, keypad modes, dead keys, and IME.
 - 2026-09-08T20:34-0400 Eliminate per-keystroke Flutter FocusNode requests: Calling `_focusNode.requestFocus()` on every keystroke when DOM focus is held by the platform view textarea triggered `Focus.onFocusChange(true)` and scheduled continuous retry timers at 50ms, 150ms, and 300ms. In Chromium and Brave, calling `.focus()` on DOM elements during active typing disrupts the browser event pipeline and cancels in-flight keystrokes. Removing `requestFocus()` stops the focus oscillation and allows zero dropped keystrokes.
 - 2026-09-08T20:34-0400 Tab interception via attachCustomKeyEventHandler: Intercepting Tab key via xterm.js custom key event handler prevents the browser from shifting focus away to other page elements while preserving bash tab-completion and TUI navigation.
+- 2026-09-08T21:00-0400 Unrestricted resize-out during session loading: Terminal DOM mounting and layout fitting occur while session status is loading. Removing the attached status restriction prevents fitted dimension changes from being dropped and avoids half-height panel clamping.
+- 2026-09-08T21:00-0400 Proactive input lease acquisition and buffering: User interactions notify the session router to verify lease ownership. Pending input is buffered while InteractiveController lease requests are in flight, ensuring zero dropped keystrokes on session switches.
 
 ## Issues
 
@@ -237,6 +256,13 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Cancel focus retries immediately once _isActiveElementInTerminal() is true
 - [x] Verify all 454 Flutter tests and clippy pass
 - [x] Rebuild release web bundle and reload daemon via zero-downtime handover
+- [x] Fix half-height panel layout clamping with minHeight and SizedBox.expand
+- [x] Allow resize-out events while session is loading to prevent size desynchronization
+- [x] Implement interaction listener and input lease verification on TerminalController
+- [x] Buffer pending keystrokes during lease acquisition to eliminate dropped input
+- [x] Filter custom key event handler to keydown events only
+- [x] Verify all 454 Flutter tests and 340 Rust tests pass
+- [x] Rebuild release web bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -252,7 +278,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 3902388: fix(triage_client): restore native terminal input pipeline and lease acquisition
 - 0d74e54: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
 - 66aa20e: fix(triage_client): resolve codex session display deadlock and input lease recovery
-- HEAD: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
+- 84e85f7: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
+- HEAD: fix(triage_client): resolve half-height layout clamping and input lease buffering
 
 
 

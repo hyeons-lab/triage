@@ -314,6 +314,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _container = html.DivElement()
         ..style.width = '100%'
         ..style.height = '100%'
+        ..style.minHeight = '100%'
         ..style.backgroundColor = '#0d1113'
         ..style.overflow = 'hidden';
 
@@ -360,6 +361,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _terminalWrapper = html.DivElement()
         ..style.width = 'calc(100% - ${marginPx * 2}px)'
         ..style.height = '100%'
+        ..style.minHeight = '100%'
         ..style.marginLeft = '${marginPx}px'
         ..style.marginRight = '${marginPx}px'
         ..style.overflow = 'hidden';
@@ -451,6 +453,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           if (input != null && input.isNotEmpty) {
             event.preventDefault();
             event.stopPropagation();
+            widget.controller.notifyInteraction();
             _sendInput(input);
             _activateTerminal();
           }
@@ -715,6 +718,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     _currentMountedPane = this;
     _containerEventOwners[_sanitizedId] = this;
+    widget.controller.notifyInteraction();
 
     final isConnected = _container.isConnected ?? true;
     if (!isConnected) {
@@ -1017,6 +1021,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       final sessionId = _sanitizedId;
       js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
         js_util.allowInterop((dynamic event) {
+          final type = js_util.getProperty(event, 'type') as String?;
+          if (type != null && type != 'keydown') {
+            return true;
+          }
           final key = js_util.getProperty(event, 'key') as String?;
           if (key == 'Tab') {
             js_util.callMethod(event, 'preventDefault', []);
@@ -2125,6 +2133,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       autofocus: true,
       onFocusChange: (hasFocus) {
         if (hasFocus && _initialized) {
+          widget.controller.notifyInteraction();
           _activateTerminal(force: true);
           _scheduleFocusRetries(force: true);
         }
@@ -2153,15 +2162,20 @@ class _TerminalPaneState extends State<TerminalPane> {
               widget.controller.fit();
             });
           }
-          final terminal = GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTapDown: (_) {
-              _activateTerminal(force: true);
-              _scheduleFocusRetries(force: true);
-            },
-            child: Container(
-              color: const Color(0xff0d1113),
-              child: HtmlElementView(viewType: _viewType),
+          final terminal = SizedBox.expand(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapDown: (_) {
+                widget.controller.notifyInteraction();
+                _activateTerminal(force: true);
+                _scheduleFocusRetries(force: true);
+              },
+              child: Container(
+                width: double.infinity,
+                height: double.infinity,
+                color: const Color(0xff0d1113),
+                child: HtmlElementView(viewType: _viewType),
+              ),
             ),
           );
           // Desktop browsers keep the full-height terminal; only a mobile-OS
