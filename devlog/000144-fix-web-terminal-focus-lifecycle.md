@@ -146,6 +146,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Removed restrictive `session.status == 'attached'` check from `addResizeOutListener`, allowing resizes while session status is `loading`.
   - In `_loadDaemonSessionInto`, synchronized host size with `resizeSession` if fitted dimensions differ after attach.
   - In `_loadDaemonSession`, used `replayTargetSize` to resize before initial replay.
+- 2026-09-08T21:17-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added explicit Enter key handling in `_windowKeyDownListener` before `_isActiveElementInTerminal()`, ensuring Enter (`\r`) is dispatched immediately, preventDefault and stopPropagation are invoked, and Flutter Web cannot swallow newlines.
+  - Added explicit Enter and Escape handling in `attachCustomKeyEventHandler` on `_term`, preventing browser bubbling and delivering `\r` (or `\x1b\r` if Alt held) and `\x1b` (or `\x1b\x1b` if Alt held) directly to `_sessionInputRouter`.
+  - Added `event.code == 'NumpadEnter'` and raw `event.keyCode == 13` / `keyCode == 27` fallback mappings in `_keyboardEventToInput()`.
 
 ## Decisions
 
@@ -191,6 +195,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T20:34-0400 Tab interception via attachCustomKeyEventHandler: Intercepting Tab key via xterm.js custom key event handler prevents the browser from shifting focus away to other page elements while preserving bash tab-completion and TUI navigation.
 - 2026-09-08T21:00-0400 Unrestricted resize-out during session loading: Terminal DOM mounting and layout fitting occur while session status is loading. Removing the attached status restriction prevents fitted dimension changes from being dropped and avoids half-height panel clamping.
 - 2026-09-08T21:00-0400 Proactive input lease acquisition and buffering: User interactions notify the session router to verify lease ownership. Pending input is buffered while InteractiveController lease requests are in flight, ensuring zero dropped keystrokes on session switches.
+- 2026-09-08T21:17-0400 Unconditional Enter interception in window capture and custom key event handlers: Flutter Web registers global key listeners that intercept Enter as an ActivateIntent, calling preventDefault and preventing xterm.js or the browser from forwarding carriage returns to the PTY. Capturing Enter explicitly in both the window capture listener and xterm.js custom key event handler guarantees reliable newline delivery for CLI tools like Codex while preventing focus loss.
+- 2026-09-08T21:17-0400 Escape key interception in xterm custom key handler: Capturing Escape in attachCustomKeyEventHandler dispatches \x1b directly to the session and prevents the browser from dismissing overlays or popping Flutter routes during TUI navigation.
 
 ## Issues
 
@@ -263,6 +269,11 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Filter custom key event handler to keydown events only
 - [x] Verify all 454 Flutter tests and 340 Rust tests pass
 - [x] Rebuild release web bundle and reload daemon via zero-downtime handover
+- [x] Intercept Enter key in _windowKeyDownListener before _isActiveElementInTerminal()
+- [x] Handle Enter and Escape in attachCustomKeyEventHandler on _term
+- [x] Add NumpadEnter and keyCode fallbacks in _keyboardEventToInput()
+- [x] Verify all 454 Flutter tests and 342 Rust tests pass
+- [x] Build release web bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -279,7 +290,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 0d74e54: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
 - 66aa20e: fix(triage_client): resolve codex session display deadlock and input lease recovery
 - 84e85f7: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
-- HEAD: fix(triage_client): resolve half-height layout clamping and input lease buffering
+- bf1d17d: fix(triage_client): resolve half-height layout clamping and input lease buffering
+- HEAD: fix(triage_client): guarantee web terminal Enter and control key dispatch
 
 
 

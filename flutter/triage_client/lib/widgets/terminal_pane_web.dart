@@ -439,6 +439,24 @@ class _TerminalPaneState extends State<TerminalPane> {
             return;
           }
 
+          // Intercept Enter unconditionally when targeting the terminal:
+          // In Flutter Web, Enter events risk being swallowed by ActivateIntent
+          // or browser form activation before reaching the PTY. Intercepting here
+          // in the window capture listener guarantees the newline is delivered
+          // immediately and prevented from bubbling to Flutter.
+          if (event.key == 'Enter' ||
+              event.code == 'Enter' ||
+              event.code == 'NumpadEnter' ||
+              event.keyCode == 13) {
+            event.preventDefault();
+            event.stopPropagation();
+            widget.controller.notifyInteraction();
+            final altKey = event.altKey;
+            _sendInput(altKey ? '\x1b\r' : '\r');
+            _activateTerminal();
+            return;
+          }
+
           // If the terminal's helper textarea already has DOM focus, let xterm.js
           // handle all keystrokes natively through its focused helper element.
           if (_isActiveElementInTerminal()) {
@@ -533,7 +551,6 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     _sendInput(text);
   }
-
 
   // Sticky Ctrl for the on-screen accessory bar (mobile web): when armed, the
   // next single character typed on the soft keyboard is folded into its control
@@ -1026,6 +1043,35 @@ class _TerminalPaneState extends State<TerminalPane> {
             return true;
           }
           final key = js_util.getProperty(event, 'key') as String?;
+          final code = js_util.getProperty(event, 'code') as String?;
+          final keyCode = js_util.getProperty(event, 'keyCode') as num?;
+          if (key == 'Enter' ||
+              key == '\r' ||
+              key == '\n' ||
+              code == 'Enter' ||
+              code == 'NumpadEnter' ||
+              keyCode == 13) {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final altKey =
+                js_util.getProperty(event, 'altKey') as bool? ?? false;
+            _sessionInputRouter.sendInput(sessionId, altKey ? '\x1b\r' : '\r');
+            return false;
+          }
+          if (key == 'Escape' ||
+              key == 'Esc' ||
+              code == 'Escape' ||
+              keyCode == 27) {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final altKey =
+                js_util.getProperty(event, 'altKey') as bool? ?? false;
+            _sessionInputRouter.sendInput(
+              sessionId,
+              altKey ? '\x1b\x1b' : '\x1b',
+            );
+            return false;
+          }
           if (key == 'Tab') {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
@@ -1052,11 +1098,11 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               js_util.callMethod(event, 'preventDefault', []);
               js_util.callMethod(event, 'stopPropagation', []);
-              html.window.navigator.clipboard
-                  ?.writeText(selection)
-                  .catchError((Object error) {
-                    debugPrint('Terminal copy failed: $error');
-                  });
+              html.window.navigator.clipboard?.writeText(selection).catchError((
+                Object error,
+              ) {
+                debugPrint('Terminal copy failed: $error');
+              });
               return false;
             }
             if (metaKey && !ctrlKey) {
@@ -1673,11 +1719,21 @@ class _TerminalPaneState extends State<TerminalPane> {
         case 'Delete':
           return '\x1b[3;3~';
       }
+      if (event.code == 'NumpadEnter') {
+        return '\x1b\r';
+      }
       final key = event.key;
       if (key != null && key.length == 1) {
         return key;
       }
       return null;
+    }
+
+    if (event.code == 'NumpadEnter' || event.keyCode == 13) {
+      return '\r';
+    }
+    if (event.code == 'Escape' || event.keyCode == 27) {
+      return '\x1b';
     }
 
     final key = event.key;
