@@ -162,6 +162,17 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - In `_currentReplayTerminalSize`, checked `TerminalPane.getCachedTerminalSize` first so cached DOM sizes take precedence over estimates.
   - In `_refitActiveSession`, relaxed session status check to allow refitting any active remote session.
 
+- 2026-09-08T22:15-0400 `devlog/plans/000144-10-fix-live-output-seq-epoch-deafness.md`: Created plan to fix live output silently dropped after a daemon handover renumbers a session's `output_seq`.
+- 2026-09-08T22:15-0400 `flutter/triage_client/lib/terminal/terminal_state.dart`:
+  - Added a `resetHistoryHighWaterSeq` flag to `copyWith`. The field was written as `historyHighWaterSeq ?? this.historyHighWaterSeq`, so no caller could clear it; the full-replay path silently retained a stale baseline whenever `throughOutputSeq` was null.
+- 2026-09-08T22:15-0400 `flutter/triage_client/lib/terminal/terminal_store.dart`:
+  - Added `kSeqEpochResetWindow` (1024), documented against the daemon's `EVENT_REPLAY_BUFFER`.
+  - Added `_isSeqEpochReset()`, comparing an incoming `output_seq` against `max(historyHighWaterSeq, _appliedLiveSeq)`.
+  - In `_reduceLive`, rebase on an epoch reset — clear `_appliedLiveSeq` and the baseline, keep `_appliedLogBytes` — before the duplicate check, so renumbered chunks render instead of being dropped forever.
+  - In the `Attach` reducer, clear `historyHighWaterSeq` alongside `_appliedLiveSeq` and `_appliedLogBytes`, which it already reset.
+- 2026-09-08T22:15-0400 `flutter/triage_client/test/terminal/terminal_store_test.dart`:
+  - Added a regression test replaying a handover: history at seq 90000 and live at 90001, then live renumbered to 1 and 2 must still render. Fails on the prior code with `Actual: []`.
+
 ## Decisions
 
 - 2026-09-06T23:05-0700 Exclude `FocusScopeNode` from `primaryFocus` check: In Flutter, when no child widget holds focus, `primaryFocus` defaults to the route `FocusScopeNode` (which retains a non-null context). Exclude `FocusScopeNode` so ambient window keydown events are routed to the active terminal pane when no input field holds focus.
@@ -210,6 +221,12 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T21:17-0400 Escape key interception in xterm custom key handler: Capturing Escape in attachCustomKeyEventHandler dispatches \x1b directly to the session and prevents the browser from dismissing overlays or popping Flutter routes during TUI navigation.
 - 2026-09-08T21:38-0400 Authoritative cached DOM terminal dimensions for session replay: Before falling back to viewport estimates during session loading, query `TerminalPane.getCachedTerminalSize` to retrieve real pixel-fitted rows and columns from active xterm.js DOM instances. This prevents live daemon sessions from being artificially shrunk to 19 rows.
 - 2026-09-08T21:38-0400 Controller swap resize dispatch in web terminal: Swapping `TerminalController` on an initialized `TerminalPane` must re-emit `sendResizeOut` to the new controller and notify `onViewFit`, synchronizing host PTY dimensions when switching or reloading sessions.
+
+- 2026-09-08T22:15-0400 Treat a far-regressed live `output_seq` as a new epoch, not a duplicate: `output_seq` counts events within one daemon instance, so a handover renumbers an adopted session low while its byte log continues unbroken. A client holding the pre-handover high-water scores every renumbered chunk as a duplicate and goes permanently deaf — history frozen, cursor still blinking, keystrokes still reaching the PTY. The history path already made this call via `isSequenceRegressed`; the live path had no equivalent.
+- 2026-09-08T22:15-0400 Bound the epoch test by the daemon's replay contract rather than a tuned constant: ordinary re-delivery de-duplication depends on rejecting lower seqs, so "lower means new epoch" cannot be reused on the live path. The daemon replays at most `EVENT_REPLAY_BUFFER` (1024) events to a lagging subscriber and sends `ResyncRequired` past that, so no genuine re-delivery can regress further than 1024; anything below is a new epoch. All pre-existing re-delivery dedup tests still pass under this window.
+- 2026-09-08T22:15-0400 Keep `_appliedLogBytes` across an epoch reset: log byte offsets survive a handover — the same session reports one `bytes_logged` either side of an adoption — so the value stays valid and still anchors the next history delta-merge. Only the seq-derived state is rebased.
+- 2026-09-08T22:15-0400 Give `copyWith` an explicit reset flag rather than overloading null: `?? this` cannot express "clear", and a null argument already reads as "unchanged" for every other field. A dedicated flag keeps the clear intentional at each call site.
+- 2026-09-08T22:15-0400 Deploy web assets via `triage client upgrade`, not a handover: only Dart changed, so rebuilding the bundle and copying it into the override dir (`~/.local/share/triage/web`) hot-reloads the daemon's web cache with no restart and no risk to live sessions. Override files are read from disk ahead of the cache on every request, so the swap takes effect immediately.
 
 ## Issues
 
@@ -294,6 +311,14 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Verify all 454 Flutter tests and 342 Rust tests pass
 - [x] Build release web bundle and reload daemon via zero-downtime handover
 
+- [x] Confirm server-side that `session-218` was live and receiving input (SnapshotSession over the IPC socket)
+- [x] Rule out a stale deployment by comparing served `main.dart.js` against the latest build
+- [x] Add a failing regression test for a renumbered `output_seq` after a handover
+- [x] Add `_isSeqEpochReset` and rebase the dedup baseline in `_reduceLive`
+- [x] Let `copyWith` clear `historyHighWaterSeq`, and clear it on `Attach`
+- [x] Verify all 455 Flutter tests pass, `flutter analyze` clean, `dart format` unchanged
+- [x] Build release web bundle and deploy via `triage client upgrade` (no daemon restart; 29 sessions intact, served bytes match build)
+
 ## Commits
 
 - 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
@@ -311,7 +336,19 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 84e85f7: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
 - bf1d17d: fix(triage_client): resolve half-height layout clamping and input lease buffering
 - 0474f65: fix(triage_client): guarantee web terminal Enter and control key dispatch
-- HEAD: fix(triage_client): resolve live session pty clamping and ensure full-height resize
+- 7cdaa89: fix(triage_client): resolve live session pty clamping and ensure full-height resize
+- HEAD: fix(triage_client): render live output after an output_seq epoch reset
 
+## Research & Discoveries
 
+- 2026-09-08T22:15-0400 The daemon's HTTP port serves only `/ws`, `/pair`, and the Flutter bundle. `/api/sessions` falls through to `index.html`, so curl against it appears to succeed while returning the SPA. Live session state is only reachable over the control socket at `$TMPDIR/triage-501/triage.sock`, which speaks one JSON `WireRequest` per line (externally-tagged serde, so `"ListSessions"` is a bare string and `{"SnapshotSession": {"session_id": "session-218"}}` a map).
+- 2026-09-08T22:15-0400 `SnapshotSession` returns `visible_rows`, `cursor`, `output_seq`, `bytes_logged`, `exited`, and `context` — enough to distinguish a wedged PTY from a client that is not rendering. That distinction settled this bug in one call.
+- 2026-09-08T22:15-0400 `output_seq` is per-daemon-instance and is not preserved across an adoption; `bytes_logged` is. The daemon listed one adopted session under two ids reporting identical `bytes_logged` (31169681) with `output_seq` 2474 and 98838. Byte offsets are the stable identity across a handover; sequence numbers are not.
+- 2026-09-08T22:15-0400 Live `Output` events carry only `output_seq` and `bytes` — no log byte offset — so the live path cannot dedup on the stable identity and must reason about seq epochs instead.
 
+## Lessons Learned
+
+- 2026-09-08T22:15-0400 "Session won't take input" is not evidence that input is failing. Here every keystroke reached the PTY and Codex answered all three prompts; only the rendering was broken. Reading the server's own terminal buffer before touching client code would have separated the two on the first step, and nine prior plans searched the input and focus paths for a fault that was in the output path.
+- 2026-09-08T22:15-0400 A blinking cursor is a signal that xterm is alive and focused — that is, that focus and input are *working*. It argues against the focus-and-lease hypotheses rather than for them.
+- 2026-09-08T22:15-0400 Silent-drop paths need a regression escape hatch. De-duplication that trusts a monotonic counter fails permanently, not transiently, once its baseline outlives the numbering it came from, and it fails invisibly because dropping is indistinguishable from receiving nothing.
+- 2026-09-08T22:15-0400 A `copyWith` written as `field ?? this.field` cannot express "clear", so any field that legitimately needs clearing is quietly unclearable. The stale baseline could not have been reset by any caller even where the code plainly intended to.

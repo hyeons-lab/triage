@@ -1270,4 +1270,26 @@ void main() {
       controller.dispose();
     },
   );
+
+  // A daemon handover restarts a session's `output_seq` counter: the successor
+  // renumbers from a low value while the byte log carries on unchanged (two
+  // entries for one adopted session report identical `bytes_logged` under very
+  // different `output_seq`). A client still holding the pre-handover high-water
+  // would score every renumbered chunk as a duplicate and go permanently deaf —
+  // history stays on screen, the cursor still blinks, and typing reaches the PTY
+  // while nothing it produces is ever drawn.
+  test('live seq restarting below the high-water still renders (handover)', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 90000),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 90001));
+    expect(sink.ops, ['resize:80,24', 'clear', 'write:OLD', 'write:pre']);
+
+    // Successor daemon adopts the session and renumbers from scratch.
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('after'), outputSeq: 1));
+    store.dispatch(LiveBytes(b('more'), outputSeq: 2));
+    expect(sink.ops, ['write:after', 'write:more']);
+  });
 }

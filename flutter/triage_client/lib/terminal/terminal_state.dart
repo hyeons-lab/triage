@@ -64,6 +64,7 @@ class TerminalState {
     int? lastSentCols,
     int? lastSentRows,
     int? historyHighWaterSeq,
+    bool resetHistoryHighWaterSeq = false,
   }) {
     return TerminalState(
       cols: cols ?? this.cols,
@@ -74,7 +75,12 @@ class TerminalState {
       scrollbackReady: scrollbackReady ?? this.scrollbackReady,
       lastSentCols: lastSentCols ?? this.lastSentCols,
       lastSentRows: lastSentRows ?? this.lastSentRows,
-      historyHighWaterSeq: historyHighWaterSeq ?? this.historyHighWaterSeq,
+      // `?? this` cannot express "clear", and the baseline genuinely needs
+      // clearing when the numbering epoch it came from is gone, so that case
+      // gets its own flag rather than a null that would read as "unchanged".
+      historyHighWaterSeq: resetHistoryHighWaterSeq
+          ? null
+          : (historyHighWaterSeq ?? this.historyHighWaterSeq),
     );
   }
 
