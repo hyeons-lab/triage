@@ -71,6 +71,8 @@ class TerminalPane extends StatefulWidget {
     _TerminalPaneState._sessionBracketedPasteModes[terminalId] = enabled;
   }
 
+  static (int, int)? getCachedTerminalSize(String terminalId) => null;
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }

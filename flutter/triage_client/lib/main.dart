@@ -1570,7 +1570,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
-    if (!session.isRemote || session.status != 'attached') return;
+    if (!session.isRemote || session.isExited || session.status == 'exited') {
+      return;
+    }
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
 
@@ -1931,11 +1933,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   ) {
     if (session.hasInputLease) {
       _client
-          .writeInput(
-            sessionId: sessionId,
-            clientId: _clientId,
-            bytes: bytes,
-          )
+          .writeInput(sessionId: sessionId, clientId: _clientId, bytes: bytes)
           .catchError((error) {
             if (!_client.isConnected) {
               _markRemoteSessionDisconnected(session);
@@ -3042,7 +3040,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.worktreeRoot ??= oldSession.worktreeRoot;
         }
         regrouped = session.repoRoot != oldSession.repoRoot;
-        if (oldSession.hasFitted) {
+        final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+        if (cachedSize != null) {
+          session.hasFitted = true;
+          session.lastFittedRows = cachedSize.$1;
+          session.lastFittedCols = cachedSize.$2;
+          session.ownFittedRows = cachedSize.$1;
+          session.ownFittedCols = cachedSize.$2;
+          session.hostSizeCols ??= oldSession.hostSizeCols;
+          session.hostSizeRows ??= oldSession.hostSizeRows;
+          session.noteViewFit(cachedSize.$2, cachedSize.$1);
+        } else if (oldSession.hasFitted) {
           session.hasFitted = true;
           session.lastFittedCols = oldSession.lastFittedCols;
           session.lastFittedRows = oldSession.lastFittedRows;
@@ -3051,14 +3059,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hostSizeCols = oldSession.hostSizeCols;
           session.hostSizeRows = oldSession.hostSizeRows;
         }
-        if (oldSession._viewReady) {
-          session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
-        } else if (oldSession.lastFittedCols != null &&
-            oldSession.lastFittedRows != null) {
-          session.noteViewFit(
-            oldSession.lastFittedCols!,
-            oldSession.lastFittedRows!,
-          );
+        if (cachedSize == null) {
+          if (oldSession._viewReady) {
+            session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
+          } else if (oldSession.lastFittedCols != null &&
+              oldSession.lastFittedRows != null) {
+            session.noteViewFit(
+              oldSession.lastFittedCols!,
+              oldSession.lastFittedRows!,
+            );
+          }
         }
         oldSession.dispose();
         if (oldSession.title != session.title) {
@@ -3131,16 +3141,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         (s) => s?.remoteSessionId == sid,
         orElse: () => null,
       );
+      final cachedSize = TerminalPane.getCachedTerminalSize('triage / $sid');
       final knownFittedRows =
-          existing?.ownFittedRows ?? existing?.lastFittedRows;
+          cachedSize?.$1 ?? existing?.ownFittedRows ?? existing?.lastFittedRows;
       final knownFittedCols =
-          existing?.ownFittedCols ?? existing?.lastFittedCols;
+          cachedSize?.$2 ?? existing?.ownFittedCols ?? existing?.lastFittedCols;
       final (int, int)? knownTargetSize =
           (knownFittedRows != null && knownFittedCols != null)
-              ? (knownFittedRows, knownFittedCols)
-              : null;
+          ? (knownFittedRows, knownFittedCols)
+          : null;
 
-      final replayTargetSize = knownTargetSize ??
+      final replayTargetSize =
+          knownTargetSize ??
           (includeHistory
               ? _estimatedTerminalRestoreSize(
                   preAttachSnapshot['size'] as Map<String, dynamic>?,
@@ -3308,14 +3320,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     SessionVm session,
     Map<String, dynamic>? fallbackSize,
   ) {
-    // This device's own fit first. `lastFittedCols` is also written by the
-    // host's resize broadcast, so on a shared PTY it can be another device's
-    // width; replaying at that would leave this client rendering at a size it
-    // never fitted to, and because the snapshot would then match, nothing
-    // would correct it. Falls back to `lastFitted*` for the case where no local
-    // fit has happened yet, where the host's size is the better guess.
-    final cols = session.ownFittedCols ?? session.lastFittedCols;
-    final rows = session.ownFittedRows ?? session.lastFittedRows;
+    final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+    final cols =
+        cachedSize?.$2 ?? session.ownFittedCols ?? session.lastFittedCols;
+    final rows =
+        cachedSize?.$1 ?? session.ownFittedRows ?? session.lastFittedRows;
     if (cols != null && rows != null) {
       return (rows, cols);
     }
@@ -3626,11 +3635,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               buffered.isNotEmpty &&
               _client.isConnected &&
               !session.isExited) {
-            unawaited(_client.writeInput(
-              sessionId: sessionId,
-              clientId: _clientId,
-              bytes: buffered,
-            ));
+            unawaited(
+              _client.writeInput(
+                sessionId: sessionId,
+                clientId: _clientId,
+                bytes: buffered,
+              ),
+            );
           }
         }
       }

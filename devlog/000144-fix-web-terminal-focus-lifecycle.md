@@ -150,6 +150,17 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Added explicit Enter key handling in `_windowKeyDownListener` before `_isActiveElementInTerminal()`, ensuring Enter (`\r`) is dispatched immediately, preventDefault and stopPropagation are invoked, and Flutter Web cannot swallow newlines.
   - Added explicit Enter and Escape handling in `attachCustomKeyEventHandler` on `_term`, preventing browser bubbling and delivering `\r` (or `\x1b\r` if Alt held) and `\x1b` (or `\x1b\x1b` if Alt held) directly to `_sessionInputRouter`.
   - Added `event.code == 'NumpadEnter'` and raw `event.keyCode == 13` / `keyCode == 27` fallback mappings in `_keyboardEventToInput()`.
+- 2026-09-08T21:38-0400 `devlog/plans/000144-09-fix-live-session-pty-shrink-and-full-height-resize.md`: Created plan to resolve live session PTY shrinking to 19 rows and ensure reliable full-height resize delivery across session loading and controller rebinds.
+- 2026-09-08T21:38-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`, `terminal_pane_stub.dart`, `terminal_pane_web.dart`:
+  - Added `TerminalPane.getCachedTerminalSize(String terminalId)` static method querying actual cols and rows from DOM xterm instances.
+  - In `didUpdateWidget`, dispatched `sendResizeOut` and `_onFit()` immediately when controller is swapped so the newly bound controller receives real terminal dimensions.
+  - In `_refitAndSend`, invoked `_finishInitialContent(cols, rows)` if initial content was not yet written, ensuring refit works during initial mount.
+  - In `initState`, dispatched `sendResizeOut` on cached container reuse.
+- 2026-09-08T21:38-0400 `flutter/triage_client/lib/main.dart`:
+  - In `_loadDaemonSession`, checked `TerminalPane.getCachedTerminalSize` before falling back to session state, ensuring real DOM dimensions take precedence over estimates.
+  - In `_loadDaemonSessionInto`, populated fitted dimensions from `TerminalPane.getCachedTerminalSize` and immediately synchronized host PTY size if `hostSizeRows` or `hostSizeCols` differs.
+  - In `_currentReplayTerminalSize`, checked `TerminalPane.getCachedTerminalSize` first so cached DOM sizes take precedence over estimates.
+  - In `_refitActiveSession`, relaxed session status check to allow refitting any active remote session.
 
 ## Decisions
 
@@ -197,6 +208,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T21:00-0400 Proactive input lease acquisition and buffering: User interactions notify the session router to verify lease ownership. Pending input is buffered while InteractiveController lease requests are in flight, ensuring zero dropped keystrokes on session switches.
 - 2026-09-08T21:17-0400 Unconditional Enter interception in window capture and custom key event handlers: Flutter Web registers global key listeners that intercept Enter as an ActivateIntent, calling preventDefault and preventing xterm.js or the browser from forwarding carriage returns to the PTY. Capturing Enter explicitly in both the window capture listener and xterm.js custom key event handler guarantees reliable newline delivery for CLI tools like Codex while preventing focus loss.
 - 2026-09-08T21:17-0400 Escape key interception in xterm custom key handler: Capturing Escape in attachCustomKeyEventHandler dispatches \x1b directly to the session and prevents the browser from dismissing overlays or popping Flutter routes during TUI navigation.
+- 2026-09-08T21:38-0400 Authoritative cached DOM terminal dimensions for session replay: Before falling back to viewport estimates during session loading, query `TerminalPane.getCachedTerminalSize` to retrieve real pixel-fitted rows and columns from active xterm.js DOM instances. This prevents live daemon sessions from being artificially shrunk to 19 rows.
+- 2026-09-08T21:38-0400 Controller swap resize dispatch in web terminal: Swapping `TerminalController` on an initialized `TerminalPane` must re-emit `sendResizeOut` to the new controller and notify `onViewFit`, synchronizing host PTY dimensions when switching or reloading sessions.
 
 ## Issues
 
@@ -274,6 +287,12 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Add NumpadEnter and keyCode fallbacks in _keyboardEventToInput()
 - [x] Verify all 454 Flutter tests and 342 Rust tests pass
 - [x] Build release web bundle and reload daemon via zero-downtime handover
+- [x] Expose TerminalPane.getCachedTerminalSize for authoritative DOM dimensions
+- [x] Dispatch sendResizeOut on controller swap in didUpdateWidget
+- [x] Synchronize host PTY size on load in _loadDaemonSessionInto
+- [x] Allow refitting active remote sessions regardless of transitional status
+- [x] Verify all 454 Flutter tests and 342 Rust tests pass
+- [x] Build release web bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -291,7 +310,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 66aa20e: fix(triage_client): resolve codex session display deadlock and input lease recovery
 - 84e85f7: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
 - bf1d17d: fix(triage_client): resolve half-height layout clamping and input lease buffering
-- HEAD: fix(triage_client): guarantee web terminal Enter and control key dispatch
+- 0474f65: fix(triage_client): guarantee web terminal Enter and control key dispatch
+- HEAD: fix(triage_client): resolve live session pty clamping and ensure full-height resize
 
 
 

@@ -69,6 +69,21 @@ class TerminalPane extends StatefulWidget {
     }
   }
 
+  static (int, int)? getCachedTerminalSize(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final term = _TerminalPaneState._sessionTerms[sanitizedId];
+    if (term != null) {
+      try {
+        final cols = (js_util.getProperty(term, 'cols') as num?)?.toInt();
+        final rows = (js_util.getProperty(term, 'rows') as num?)?.toInt();
+        if (cols != null && rows != null && cols >= 10 && rows >= 5) {
+          return (rows, cols);
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }
@@ -305,6 +320,13 @@ class _TerminalPaneState extends State<TerminalPane> {
           overrideCols: _lastFittedCols,
           overrideRows: _lastFittedRows,
         );
+        if (_lastFittedRows! >= 5 && _lastFittedCols! >= 10) {
+          _sessionInputRouter.sendResizeOut(
+            sanitizedId,
+            _lastFittedCols!,
+            _lastFittedRows!,
+          );
+        }
       }
       _onFit();
       if (widget.focusCursorRevision > 0) {
@@ -1256,16 +1278,20 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   // One fit-and-force-send pass. `force` sends even when the fitted size is
-  // unchanged — needed on the first pass so a device-reclaim (right grid, wrong
+  // unchanged: needed on the first pass so a device-reclaim (right grid, wrong
   // host) still corrects; the delayed retries pass `false`, so a settled refit
   // does not jiggle the host on every tick, only when a tick actually changes
   // the fitted size.
   void _refitAndSend({required bool force}) {
-    // Not during the first-fit handshake: that path owns the initial size and
-    // its own host sync, and a force-send here would bypass its history-flush
-    // gate. Refit/resume happen well after load, so this only guards the edge.
-    if (!_initialContentWritten) return;
     _onFit();
+    if (!_initialContentWritten) {
+      final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt();
+      final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt();
+      if (cols != null && rows != null && cols >= 10 && rows >= 5) {
+        _finishInitialContent(cols, rows);
+      }
+      return;
+    }
     final cols = (js_util.getProperty(_term, 'cols') as num).toInt();
     final rows = (js_util.getProperty(_term, 'rows') as num).toInt();
     if (cols < 2 || rows < 2) return;
@@ -2140,6 +2166,14 @@ class _TerminalPaneState extends State<TerminalPane> {
             _lastFittedCols ??
             80);
         widget.onViewFit?.call(fittedCols, fittedRows);
+        if (fittedRows >= 5 && fittedCols >= 10) {
+          _sessionInputRouter.sendResizeOut(
+            _sanitizedId,
+            fittedCols,
+            fittedRows,
+          );
+        }
+        _onFit();
       }
       _activateTerminal(force: true);
       _scheduleFocusRetries(force: true);
