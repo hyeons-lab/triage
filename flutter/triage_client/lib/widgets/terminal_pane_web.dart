@@ -87,6 +87,7 @@ class TerminalPane extends StatefulWidget {
       sanitizedId,
       controller,
     );
+    _TerminalPaneState._sessionInputRouter.rebind(sanitizedId, controller);
     // The pane's own view listeners (resize/fit/refit/history-replayed) are
     // bound per instance, so a mounted pane has to move them too or it stops
     // hearing about sizing on the new controller.
@@ -500,6 +501,22 @@ class _TerminalPaneState extends State<TerminalPane> {
             widget.controller.notifyInteraction();
             final altKey = event.altKey;
             _sendInput(altKey ? '\x1b\r' : '\r');
+            _activateTerminal();
+            return;
+          }
+
+          // Intercept Tab unconditionally when targeting the terminal:
+          // In Flutter Web, Tab events risk triggering browser focus navigation
+          // or being swallowed by Flutter focus traversal before reaching the PTY.
+          // Intercepting here in the window capture listener guarantees the tab
+          // character is delivered immediately to shell autocomplete and prevented
+          // from escaping focus or bubbling to Flutter.
+          if (event.key == 'Tab' || event.code == 'Tab' || event.keyCode == 9) {
+            event.preventDefault();
+            event.stopPropagation();
+            widget.controller.notifyInteraction();
+            final shiftKey = event.shiftKey;
+            _sendInput(shiftKey ? '\x1b[Z' : '\t');
             _activateTerminal();
             return;
           }
@@ -1120,7 +1137,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             );
             return false;
           }
-          if (key == 'Tab') {
+          if (key == 'Tab' || code == 'Tab' || keyCode == 9) {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
             final shiftKey =
@@ -1859,6 +1876,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (event.code == 'Escape' || event.keyCode == 27) {
       return '\x1b';
     }
+    if (event.code == 'Tab' || event.keyCode == 9) {
+      return event.shiftKey ? '\x1b[Z' : '\t';
+    }
 
     final key = event.key;
     if (key == null) return null;
@@ -2340,6 +2360,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       },
       onKeyEvent: (node, event) {
         if (event.logicalKey == LogicalKeyboardKey.tab) {
+          if (event is KeyDownEvent) {
+            widget.controller.notifyInteraction();
+            final shiftKey = HardwareKeyboard.instance.isShiftPressed;
+            _sendInput(shiftKey ? '\x1b[Z' : '\t');
+            _activateTerminal();
+          }
           return KeyEventResult.handled;
         }
         return KeyEventResult.ignored;
@@ -2367,6 +2393,11 @@ class _TerminalPaneState extends State<TerminalPane> {
               behavior: HitTestBehavior.opaque,
               onTapDown: (_) {
                 widget.controller.notifyInteraction();
+                if (mounted &&
+                    _focusNode.canRequestFocus &&
+                    !_focusNode.hasFocus) {
+                  _focusNode.requestFocus();
+                }
                 _activateTerminal(force: true);
                 _scheduleFocusRetries(force: true);
               },

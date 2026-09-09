@@ -53,4 +53,25 @@ void main() {
 
     expect(inputs, ['old:before', 'new:after', 'new:still-new']);
   });
+
+  test('rebind updates controller without changing existing token', () {
+    final router = TerminalSessionInputRouter();
+    final oldController = TerminalController();
+    final newController = TerminalController();
+    final inputs = <String>[];
+
+    oldController.addInputListener((data) => inputs.add('old:$data'));
+    newController.addInputListener((data) => inputs.add('new:$data'));
+
+    final token = router.bind('session-42', oldController);
+    router.sendInput('session-42', 'first');
+
+    router.rebind('session-42', newController);
+    router.sendInput('session-42', 'second');
+
+    router.unbind('session-42', token);
+    router.sendInput('session-42', 'third');
+
+    expect(inputs, ['old:first', 'new:second']);
+  });
 }

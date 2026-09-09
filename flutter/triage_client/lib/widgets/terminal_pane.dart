@@ -180,6 +180,15 @@ class TerminalSessionInputRouter {
     return token;
   }
 
+  void rebind(String sessionId, TerminalController controller) {
+    final route = _routes[sessionId];
+    if (route != null) {
+      _routes[sessionId] = _TerminalSessionRoute(controller, route.token);
+    } else {
+      bind(sessionId, controller);
+    }
+  }
+
   void unbind(String sessionId, Object token) {
     final route = _routes[sessionId];
     if (route != null && identical(route.token, token)) {

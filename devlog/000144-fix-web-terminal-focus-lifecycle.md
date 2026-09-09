@@ -192,6 +192,15 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`: `TerminalController.write` isolates each write listener, so one throwing consumer no longer stops the rest.
 - 2026-09-09T06:33-0400 `flutter/triage_client/lib/main.dart`: Call `TerminalPane.rebindSessionController` at the swap site in `_loadDaemonSessionInto`.
 - 2026-09-09T06:33-0400 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: Bumped the `xterm` override ref to `43069c4` (the `eraseRange` guard).
+- 2026-09-09T11:41-0400 `devlog/plans/000144-13-fix-web-terminal-tab-autocomplete.md`: Created plan to restore web terminal Tab shell autocompletion across browser focus states.
+- 2026-09-09T11:41-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`: Added `rebind(sessionId, controller)` to `TerminalSessionInputRouter` to update existing session route target controllers without disturbing routing tokens.
+- 2026-09-09T11:41-0400 `flutter/triage_client/test/terminal_session_input_router_test.dart`: Added unit test verifying `TerminalSessionInputRouter.rebind` forwards subsequent inputs to the new controller.
+- 2026-09-09T11:41-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `TerminalPane.rebindSessionController`, rebound `_sessionInputRouter` to the new controller.
+  - In `_windowKeyDownListener`, intercepted Tab unconditionally when targeting the active terminal (matching Enter behavior), preventing browser focus navigation, stopping event propagation to Flutter traversal, and dispatching `\t` or Shift+Tab `\x1b[Z` directly to the session.
+  - In `Focus.onKeyEvent`, dispatched `\t` or `\x1b[Z` on `KeyDownEvent` before returning `KeyEventResult.handled` so Flutter focus nodes do not silently discard Tab.
+  - In `attachCustomKeyEventHandler` and `_keyboardEventToInput`, expanded Tab detection to match `event.code == 'Tab'` and `keyCode == 9`.
+  - In `GestureDetector.onTapDown`, requested `_focusNode` focus when `canRequestFocus` is true.
 
 ## Decisions
 
@@ -258,6 +267,9 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-09T06:33-0400 Isolate write listeners in `TerminalController.write`: xterm.dart is listener #0 and xterm.js is #1, so any emulator throw silently stopped the pane from being written. Both xterm bugs fixed on this branch reached the user through that path, which is why three unrelated causes all presented as "blank".
 - 2026-09-09T06:33-0400 Keep the `TDBG` trace in the tree, gated off: the seams that hid this — two `catch (_) {}` sites and two silent buffers — are still seams, and the trace is what turned a fifth round of guessing into a single answer.
 - 2026-09-09T06:33-0400 Restore the epoch fix after the bisect cleared it: a build with the store reverted and both xterm fixes kept was still blank, and the pre-branch embedded bundle was blank too, so the store change was never implicated.
+- 2026-09-09T11:41-0400 Unconditional Tab capture in window keydown listener: Like Enter, Tab is an essential terminal control key that browser default focus navigation and Flutter Web focus traversal aggressively swallow. Capturing Tab unconditionally in the capture phase of _windowKeyDownListener when targeting the terminal guarantees immediate dispatch to the PTY and prevents browser focus escapes.
+- 2026-09-09T11:41-0400 Forward Tab in Focus.onKeyEvent: Returning KeyEventResult.handled in Flutter Focus widget stops widget traversal, but previously discarded the keystroke without forwarding \t to the session. Forwarding \t (or \x1b[Z for Shift+Tab) ensures that if Flutter focus tree holds focus, Tab autocompletion continues to work seamlessly.
+- 2026-09-09T11:41-0400 Rebind _sessionInputRouter in rebindSessionController: Session swaps in main.dart replace placeholder controllers with loaded controllers. Updating the input router route ensures all input forwarded through the router reaches the live controller without relying on a widget tree rebuild.
 
 ## Issues
 
@@ -367,6 +379,14 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Verify 455 tests, `flutter analyze` clean, and confirm rendering + input in the browser
 - [x] Redeploy with logging switched off (no daemon restart; 29 sessions intact)
 
+- [x] Add rebind method to TerminalSessionInputRouter and unit tests
+- [x] Intercept Tab unconditionally in _windowKeyDownListener before _isActiveElementInTerminal()
+- [x] Dispatch Tab in Focus.onKeyEvent before returning handled
+- [x] Expand Tab matching for code and keyCode in attachCustomKeyEventHandler and _keyboardEventToInput
+- [x] Rebind _sessionInputRouter in TerminalPane.rebindSessionController
+- [x] Verify all 456 Flutter tests pass, flutter analyze clean, dart format clean
+- [x] Build release web bundle and upgrade client assets via triage client upgrade
+
 ## Commits
 
 - 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
@@ -387,7 +407,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 7cdaa89: fix(triage_client): resolve live session pty clamping and ensure full-height resize
 - 2bac2e8: fix(triage_client): render live output after an output_seq epoch reset
 - 5713d0d: fix(triage_client): pin the xterm fork fix for detached lines on scroll
-- HEAD: fix(triage_client): rebind the terminal controller when a session is swapped
+- 2d1b8f0: fix(triage_client): rebind the terminal controller when a session is swapped
+- HEAD: fix(triage_client): restore web terminal tab shell autocompletion
 
 ## Research & Discoveries
 
