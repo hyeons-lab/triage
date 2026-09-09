@@ -1,3 +1,4 @@
+import '../terminal/debug_log.dart';
 import 'terminal_pane_stub.dart'
     if (dart.library.js_util) 'terminal_pane_web.dart'
     as impl;
@@ -16,6 +17,12 @@ class TerminalController {
 
   void addWriteListener(void Function(String) listener) {
     _writeListeners.add(listener);
+    tdbg(
+      'ctrl.addWrite',
+      'ctrl#${identityHashCode(this)} now '
+          '${_writeListeners.length} listeners, '
+          'buffered=${_writeBuffer.length}',
+    );
     if (_writeBuffer.isNotEmpty) {
       for (final data in _writeBuffer) {
         listener(data);
@@ -86,10 +93,28 @@ class TerminalController {
 
   void write(String data) {
     if (_writeListeners.isEmpty) {
+      tdbg(
+        'ctrl.write',
+        'ctrl#${identityHashCode(this)} NO LISTENERS '
+            '-> buffered; ${tdbgPreview(data)}',
+      );
       _writeBuffer.add(data);
     } else {
-      for (final listener in List.from(_writeListeners)) {
-        listener(data);
+      tdbg(
+        'ctrl.write',
+        'ctrl#${identityHashCode(this)} '
+            '${_writeListeners.length} listeners; ${tdbgPreview(data)}',
+      );
+      // Isolated per listener: these are independent consumers (xterm.dart on
+      // one side, xterm.js on the other), and letting one throw used to stop
+      // the rest, which blanked the pane rather than degrading it.
+      final listeners = List.of(_writeListeners);
+      for (var i = 0; i < listeners.length; i++) {
+        try {
+          listeners[i](data);
+        } catch (error, stack) {
+          tdbg('ctrl.write', 'listener #$i THREW: $error\n$stack');
+        }
       }
     }
   }

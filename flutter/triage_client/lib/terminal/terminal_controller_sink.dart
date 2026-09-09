@@ -1,4 +1,5 @@
 import '../widgets/terminal_pane.dart' show TerminalController;
+import 'debug_log.dart';
 import 'terminal_sink.dart';
 
 /// [TerminalSink] over the platform-agnostic [TerminalController].
@@ -20,10 +21,20 @@ class TerminalControllerSink implements TerminalSink {
   final TerminalController controller;
 
   @override
-  void write(String data) => controller.write(data);
+  void write(String data) {
+    tdbg(
+      'sink.write',
+      'ctrl#${identityHashCode(controller)} '
+          '${tdbgPreview(data)}',
+    );
+    controller.write(data);
+  }
 
   @override
-  void clear() => controller.clear();
+  void clear() {
+    tdbg('sink.clear', 'clearing');
+    controller.clear();
+  }
 
   @override
   void resize(int cols, int rows) {

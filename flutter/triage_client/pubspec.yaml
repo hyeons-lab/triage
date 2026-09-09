@@ -107,7 +107,7 @@ dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: 551423e02ff335eed10c62a57915c188a56f716d
+      ref: 43069c44931e842b5fbad5c0fa88cf21664ee8e0
 
 dev_dependencies:
   flutter_test:

@@ -1,4 +1,5 @@
 // ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
+import '../terminal/debug_log.dart';
 
 import 'dart:async';
 import 'dart:html' as html;
@@ -67,6 +68,30 @@ class TerminalPane extends StatefulWidget {
         }
       } catch (_) {}
     }
+  }
+
+  /// Re-points a live session's terminal wiring at [controller].
+  ///
+  /// Loading a daemon session replaces the placeholder `SessionVm` with the
+  /// real one, and the replacement constructs its own [TerminalController].
+  /// The mounted pane keeps listening to the old one, so the store's writes
+  /// reach a controller the pane never hears: the emulator is created and the
+  /// bytes are decoded, but nothing paints. Call this after the swap so the
+  /// session's listeners follow the controller that is actually being written.
+  static void rebindSessionController(
+    String terminalId,
+    TerminalController controller,
+  ) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _TerminalPaneState._bindPersistentSessionControllerFor(
+      sanitizedId,
+      controller,
+    );
+    // The pane's own view listeners (resize/fit/refit/history-replayed) are
+    // bound per instance, so a mounted pane has to move them too or it stops
+    // hearing about sizing on the new controller.
+    final pane = _TerminalPaneState._containerEventOwners[sanitizedId];
+    pane?._rebindViewListenersTo(controller);
   }
 
   static (int, int)? getCachedTerminalSize(String terminalId) {
@@ -832,6 +857,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
       _sessionTerms[sanitizedId] = _term;
+      tdbg('pane.initTerm', '$sanitizedId xterm.js instance created');
       js_util.setProperty(html.window, 'activeTerm', _term);
 
       js_util.callMethod(_term, 'open', [_terminalWrapper]);
@@ -1158,26 +1184,74 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {}
   }
 
-  void _bindPersistentSessionController(TerminalController controller) {
-    final existingController = _sessionBoundControllers[_sanitizedId];
+  void _bindPersistentSessionController(TerminalController controller) =>
+      _bindPersistentSessionControllerFor(_sanitizedId, controller);
+
+  /// Attaches the session's persistent write/clear listeners to [controller].
+  ///
+  /// Addressed by session id rather than by pane instance because the
+  /// controller can be replaced while the pane stays mounted: loading a daemon
+  /// session swaps the placeholder `SessionVm` for the real one, and the
+  /// replacement builds its own `TerminalController`. A pane that is not
+  /// rebuilt never sees that swap, so the rebind has to be reachable without
+  /// one.
+  static void _bindPersistentSessionControllerFor(
+    String sanitizedId,
+    TerminalController controller,
+  ) {
+    final existingController = _sessionBoundControllers[sanitizedId];
     if (identical(existingController, controller)) {
+      tdbg(
+        'pane.bind',
+        '$sanitizedId SKIP (already bound to '
+            'ctrl#${identityHashCode(controller)})',
+      );
       return;
     }
-    _unbindPersistentSessionController(_sanitizedId);
-    _sessionBoundControllers[_sanitizedId] = controller;
-    final sessionId = _sanitizedId;
+    tdbg(
+      'pane.bind',
+      '$sanitizedId BIND ctrl#${identityHashCode(controller)} '
+          '(was ctrl#${existingController == null ? "none" : identityHashCode(existingController)})',
+    );
+    _unbindPersistentSessionController(sanitizedId);
+    _sessionBoundControllers[sanitizedId] = controller;
+    final sessionId = sanitizedId;
 
     void onWrite(String data) {
       final term = _sessionTerms[sessionId];
       if (term != null) {
         try {
           js_util.callMethod(term, 'write', [data]);
-        } catch (_) {}
+          tdbg(
+            'pane.onWrite',
+            '$sessionId -> xterm.js ok; '
+                '${tdbgPreview(data)}',
+          );
+        } catch (error, stack) {
+          // Was `catch (_) {}`: an xterm.js write that threw left the pane
+          // blank and the console clean, which is indistinguishable from bytes
+          // that never arrived.
+          tdbg('pane.onWrite', '$sessionId -> xterm.js THREW: $error\n$stack');
+        }
         return;
       }
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {
+        tdbg(
+          'pane.onWrite',
+          '$sessionId no term -> buffered '
+              '(${activePane._pendingLiveWriteBuffer.length + 1} chunks, '
+              'initialWritten=${activePane._initialContentWritten}, '
+              'fitted=${activePane._lastFittedCols}x${activePane._lastFittedRows}); '
+              '${tdbgPreview(data)}',
+        );
         activePane._pendingLiveWriteBuffer.add(data);
+      } else {
+        tdbg(
+          'pane.onWrite',
+          '$sessionId DROPPED (no term, no active pane); '
+              '${tdbgPreview(data)}',
+        );
       }
     }
 
@@ -1218,8 +1292,32 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  /// Moves this pane's view listeners onto [controller], leaving the session's
+  /// persistent write/clear listeners to [_bindPersistentSessionControllerFor].
+  void _rebindViewListenersTo(TerminalController controller) {
+    if (identical(_boundViewController, controller)) return;
+    final previous = _boundViewController;
+    if (previous != null) _unbindControllerFrom(previous);
+    _boundViewController = controller;
+    controller.addResizeListener(_onResize);
+    controller.addFitListener(_onFit);
+    controller.addRefitListener(_onRefit);
+    controller.addHistoryReplayedListener(_onHistoryReplayed);
+    tdbg(
+      'pane.rebind',
+      '$_sanitizedId view listeners -> '
+          'ctrl#${identityHashCode(controller)}',
+    );
+  }
+
+  // The controller this pane's view listeners are currently attached to, which
+  // is not always `widget.controller`: the session's controller can be replaced
+  // without the pane being rebuilt.
+  TerminalController? _boundViewController;
+
   void _bindController() {
     _bindPersistentSessionController(widget.controller);
+    _boundViewController = widget.controller;
     widget.controller.addResizeListener(_onResize);
     widget.controller.addFitListener(_onFit);
     widget.controller.addRefitListener(_onRefit);
@@ -1943,6 +2041,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_pendingLiveWriteBuffer.isEmpty) {
       return;
     }
+    tdbg(
+      'pane.flush',
+      '$_sanitizedId flushing '
+          '${_pendingLiveWriteBuffer.length} buffered chunks '
+          '(term=${_sessionTerms[_sanitizedId] != null})',
+    );
     final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
     _pendingLiveWriteBuffer.clear();
     final term = _term ?? _sessionTerms[_sanitizedId];
@@ -2148,6 +2252,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       _scheduleFocusRetries(force: true);
     }
     if (oldWidget.controller != widget.controller) {
+      tdbg(
+        'pane.didUpdate',
+        '$_sanitizedId controller changed '
+            'ctrl#${identityHashCode(oldWidget.controller)} -> '
+            'ctrl#${identityHashCode(widget.controller)}',
+      );
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
       _inputRouteToken = _sessionInputRouter.bind(

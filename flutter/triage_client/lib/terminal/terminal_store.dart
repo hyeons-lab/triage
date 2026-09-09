@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
+import 'debug_log.dart';
 import 'emulator_query_response.dart';
 import 'terminal_intent.dart';
 import 'terminal_sink.dart';
@@ -387,6 +388,11 @@ class TerminalStore extends ChangeNotifier {
       }
     }
 
+    tdbg(
+      'store.history',
+      'FULL REPLAY ${bytes.length}B at ${cols}x$rows '
+          'throughSeq=$throughOutputSeq rawStart=$rawOutputStart',
+    );
     _sink.clear();
     // Reset carries so history starts a fresh decode stream; history then
     // decodes through the same streaming path as live, so a UTF-8 rune, CRLF
@@ -440,9 +446,15 @@ class TerminalStore extends ChangeNotifier {
       return next;
     }
     if (!next.sized || next.phase == AttachPhase.awaitingHistory) {
+      tdbg(
+        'store.live',
+        'QUEUED seq=$outputSeq ${bytes.length}B '
+            '(sized=${next.sized} phase=${next.phase})',
+      );
       _enqueuePendingLive(_QueuedLive(bytes, outputSeq));
       return next;
     }
+    tdbg('store.live', 'APPLY seq=$outputSeq ${bytes.length}B');
     _applyLive(bytes, outputSeq);
     return next;
   }

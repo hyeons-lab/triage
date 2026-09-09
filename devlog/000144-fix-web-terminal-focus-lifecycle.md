@@ -182,6 +182,17 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T23:12-0400 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: Bumped the `xterm` override ref from `1ca073d` to `551423e`.
 - 2026-09-08T23:12-0400 `flutter/triage_client/lib/main.dart`: Log the stack alongside the message in the `_loadDaemonSessionInto` catch. The catch spans the whole load, so the message alone does not say which step threw.
 
+- 2026-09-09T06:33-0400 `devlog/plans/000144-12-fix-controller-rebind-on-session-swap.md`: Created plan for the pane binding to a stale `TerminalController` after a session swap.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/terminal/debug_log.dart` (new): `kTerminalDebug`-gated `TDBG` trace across the five seams bytes cross (store, sink, controller, pane, xterm.js). Left in the tree, switched off.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Made the persistent binder addressable by session id (`_bindPersistentSessionControllerFor`), with the instance method as a wrapper.
+  - Added `TerminalPane.rebindSessionController`, re-pointing the session's write/clear listeners and, for a mounted pane, its view listeners via `_rebindViewListenersTo` (tracked by `_boundViewController`).
+  - `onWrite` logs a throwing xterm.js write instead of `catch (_) {}` discarding it.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: No-op `rebindSessionController` so callers need no platform branch.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`: `TerminalController.write` isolates each write listener, so one throwing consumer no longer stops the rest.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/main.dart`: Call `TerminalPane.rebindSessionController` at the swap site in `_loadDaemonSessionInto`.
+- 2026-09-09T06:33-0400 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: Bumped the `xterm` override ref to `43069c4` (the `eraseRange` guard).
+
 ## Decisions
 
 - 2026-09-06T23:05-0700 Exclude `FocusScopeNode` from `primaryFocus` check: In Flutter, when no child widget holds focus, `primaryFocus` defaults to the route `FocusScopeNode` (which retains a non-null context). Exclude `FocusScopeNode` so ambient window keydown events are routed to the active terminal pane when no input field holds focus.
@@ -242,6 +253,11 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T23:12-0400 Keep the self-slot guard even without a failing case: `insert` and `remove` step by one and their early returns rule out the colliding wrap, so it is unreachable today. It is stated as an invariant guard rather than a regression, because the sequence it guards drops the element silently rather than throwing.
 - 2026-09-08T23:12-0400 Keep the stack in the load catch: the first console line pointed at `debugPrint`'s own `console.log`, and the bare message named none of attach, the swap `setState`, `_regroupRail`, `_drainPendingEvents` or resize. Two round trips went to recovering what the catch had discarded.
 - 2026-09-08T23:12-0400 Clear the web override directory before deploying rather than copying over it: `triage client upgrade` does not prune, so the diagnostic `main.dart.js.map` would have stayed behind and mis-symbolicated a later trace against a bundle it no longer describes.
+
+- 2026-09-09T06:33-0400 Rebind by session id, not through the widget lifecycle: the case that breaks is precisely the one where the pane is not rebuilt, so `didUpdateWidget` cannot be the hook. `rebindSessionController` is reachable from the swap site without a rebuild.
+- 2026-09-09T06:33-0400 Isolate write listeners in `TerminalController.write`: xterm.dart is listener #0 and xterm.js is #1, so any emulator throw silently stopped the pane from being written. Both xterm bugs fixed on this branch reached the user through that path, which is why three unrelated causes all presented as "blank".
+- 2026-09-09T06:33-0400 Keep the `TDBG` trace in the tree, gated off: the seams that hid this — two `catch (_) {}` sites and two silent buffers — are still seams, and the trace is what turned a fifth round of guessing into a single answer.
+- 2026-09-09T06:33-0400 Restore the epoch fix after the bisect cleared it: a build with the store reverted and both xterm fixes kept was still blank, and the pre-branch embedded bundle was blank too, so the store change was never implicated.
 
 ## Issues
 
@@ -343,6 +359,14 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Push the fork commit and bump the pin to `551423e`
 - [x] Verify 455 client tests, `flutter analyze` clean, and deploy (no daemon restart; 29 sessions intact)
 
+- [x] Instrument the five seams with a gated `TDBG` trace
+- [x] Identify the fault from controller identity: pane bound `ctrl#92859691`, store wrote `ctrl#250931763`
+- [x] Add `rebindSessionController` and call it at the swap site
+- [x] Isolate `TerminalController.write` listeners; stop `onWrite` swallowing xterm.js errors
+- [x] Restore the epoch fix reverted during the bisect
+- [x] Verify 455 tests, `flutter analyze` clean, and confirm rendering + input in the browser
+- [x] Redeploy with logging switched off (no daemon restart; 29 sessions intact)
+
 ## Commits
 
 - 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
@@ -362,7 +386,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 0474f65: fix(triage_client): guarantee web terminal Enter and control key dispatch
 - 7cdaa89: fix(triage_client): resolve live session pty clamping and ensure full-height resize
 - 2bac2e8: fix(triage_client): render live output after an output_seq epoch reset
-- HEAD: fix(triage_client): pin the xterm fork fix for detached lines on scroll
+- 5713d0d: fix(triage_client): pin the xterm fork fix for detached lines on scroll
+- HEAD: fix(triage_client): rebind the terminal controller when a session is swapped
 
 ## Research & Discoveries
 
@@ -376,6 +401,9 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T23:12-0400 The crash is independent of buffer capacity — it throws at `maxLines` 100 and 200000 alike — so it is not a trimming or wrap-around problem, which is what the fork's previous fixes in this file addressed.
 - 2026-09-08T23:12-0400 Codex reaches the faulty path because its redraws set and clear scrolling regions constantly (`ESC[1;27r`, `ESC[r`, `ESC[1;39r`, `ESC[1;9r`) and issue reverse index (`ESC M`). With `marginTop == 0` on the normal buffer, `Buffer.index()` takes the `lines.insert(absoluteMarginBottom + 1, ...)` branch instead of `scrollUp(1)`.
 
+- 2026-09-09T06:33-0400 The daemon caps a session's replayed history tail at 4 MiB. Every blank Antigravity session reported `raw_output` of exactly 4194304 bytes while every rendering one reported `raw_output == bytes_logged`; a capped tail starts mid-stream with the cursor at column 0, which is what reached the `eraseRange` bug. Comparing `rawlen` against `bytes_logged` across all sessions is a fast way to spot replay-tail problems.
+- 2026-09-09T06:33-0400 `DAEMON_MAX_OPEN_FILES` is 10240 and `raise_fd_limit()` runs at startup (`main.rs`), so `launchctl limit maxfiles` (256) is only what the process starts with, not its ceiling. Reading the launchd default and calling it the limit produced a false EMFILE alarm; the live limit needs `launchctl procinfo <pid>`. The installed LaunchAgent plist predates the `SoftResourceLimits` key the installer now writes, so this daemon relies solely on its own `setrlimit`.
+
 ## Lessons Learned
 
 - 2026-09-08T22:15-0400 "Session won't take input" is not evidence that input is failing. Here every keystroke reached the PTY and Codex answered all three prompts; only the rendering was broken. Reading the server's own terminal buffer before touching client code would have separated the two on the first step, and nine prior plans searched the input and focus paths for a fault that was in the output path.
@@ -385,3 +413,7 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T23:12-0400 Fixing one bug can reveal the next one rather than finish the job. The epoch fix was correct and the session still failed, because a second, independent defect sat behind it. "Still broken after the fix" is not evidence the fix was wrong — here it was evidence the first bug had been hiding the second.
 - 2026-09-08T23:12-0400 Record where state was mutated, do not infer it. Two passes of reading `_moveChild`, `insert` and `trimStart` produced three wrong hypotheses (same-slot collision, buffer fullness, `trimStart` leftovers). Stashing a `StackTrace` on the item in `_detach` answered it on the first run.
 - 2026-09-08T23:12-0400 A catch that spans a whole operation must keep its stack. `catch (e)` over attach, replay, regroup, drain and resize turned a one-line defect into three round trips, and the fix is five characters plus the log.
+- 2026-09-09T06:33-0400 Instrument the seams before theorising past the second hypothesis. Four wrong causes (`?? 0` on `output_seq`, the store, main-thread starvation, the epoch fix) each survived a round of code reading and died to a measurement. The `TDBG` trace took ten minutes and answered it on the first run; it should have come hours earlier.
+- 2026-09-09T06:33-0400 Identity, not behaviour, is what proves a wiring bug. Every stage logged plausible-looking work; only tagging the controller with `identityHashCode` showed the pane and the store holding different instances. When output "vanishes" between two correct-looking stages, log *which object* each stage is talking to.
+- 2026-09-09T06:33-0400 A symptom that tracks content is worth distrusting. "Codex breaks, then Antigravity breaks" pointed at terminal streams for hours; the real split was lifecycle — swapped daemon sessions versus a local session that is never swapped. `flutter-spike` worked the whole time and was the control that would have shown this.
+- 2026-09-09T06:33-0400 Fixing a real bug is not evidence it was *the* bug. Both xterm fixes are correct and provable, and neither addressed the blank panes. Deploying them while assuming otherwise cost two rounds and made the state harder to reason about, because it changed several things between observations.

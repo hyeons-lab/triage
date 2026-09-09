@@ -22,6 +22,7 @@ import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
+import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_state.dart';
@@ -804,6 +805,11 @@ class SessionVm {
       rawOutputStart: rawOutputStart,
     );
     final wasExited = this.isExited || store.state.exited;
+    tdbg(
+      'vm.applyHistory',
+      '$title ${rawOutput.length}B seq=$throughOutputSeq '
+          'phase=${store.state.phase} viewReady=$_viewReady',
+    );
     if (store.state.phase != AttachPhase.live || wasExited) {
       store.dispatch(const Attach());
     }
@@ -818,6 +824,11 @@ class SessionVm {
   /// The view fitted to a real grid size. Records it and replays any staged
   /// history at that size. Idempotent on subsequent fits (no staged history).
   void noteViewFit(int cols, int rows) {
+    tdbg(
+      'vm.noteViewFit',
+      '$title ${cols}x$rows '
+          'pendingHistory=${_pendingHistory != null}',
+    );
     _viewCols = cols;
     _viewRows = rows;
     _viewReady = true;
@@ -3075,6 +3086,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           TerminalPane.destroySession(oldSession.title);
         }
         _sessions[existingIndex] = session;
+        // The replacement carries its own TerminalController. A pane that is
+        // already mounted for this session is not necessarily rebuilt by this
+        // setState, and without a rebuild it never sees the swap — it keeps
+        // listening to the placeholder's controller while the store writes to
+        // the new one, so the emulator exists and decodes nothing to screen.
+        TerminalPane.rebindSessionController(
+          session.title,
+          session.terminalController,
+        );
       });
       if (regrouped) _regroupRail();
       _drainPendingEvents(sid);
