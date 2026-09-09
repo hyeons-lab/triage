@@ -300,6 +300,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
+      if (_lastFittedCols != null && _lastFittedRows != null) {
+        _writeInitialContent(
+          overrideCols: _lastFittedCols,
+          overrideRows: _lastFittedRows,
+        );
+      }
       _onFit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);

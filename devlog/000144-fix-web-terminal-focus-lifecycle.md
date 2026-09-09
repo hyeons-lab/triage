@@ -112,6 +112,14 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
   - Removed unnecessary `_focusTerminal()` DOM focus calls on every keystroke in `_sendInput()`.
 - 2026-09-08T19:46-0400 `flutter/triage_client/lib/main.dart`:
   - Removed redundant null check on non-nullable `_selectedSession`.
+- 2026-09-08T20:14-0400 `devlog/plans/000144-05-fix-codex-session-deadlock-and-lease.md`:
+  - Created plan to resolve Codex session display deadlock and input lease recovery.
+- 2026-09-08T20:14-0400 `flutter/triage_client/lib/main.dart`:
+  - In `_loadDaemonSessionInto`, invoked `session.noteViewFit` when `oldSession._viewReady` is true or fitted dimensions exist, transitioning `TerminalStore` out of `AttachPhase.awaitingHistory` and releasing staged history and live output.
+  - In `_setupSessionInputListener` and `_processWebSocketEvent`, broadened input lease rejection matching to check `errStr.contains('input lease')` and `msg.contains('input lease')` to automatically trigger `attachSession(mode: 'InteractiveController')`.
+  - In `SessionWorkspace`, ensured `session.noteViewFit(cols, rows)` is invoked directly on the workspace's session instance.
+- 2026-09-08T20:14-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `initState()`, inside the `cachedContainer != null` branch, invoked `_writeInitialContent(overrideCols: _lastFittedCols, overrideRows: _lastFittedRows)` right after `_bindController()` to immediately propagate fitted dimensions to the controller and session.
 
 ## Decisions
 
@@ -149,6 +157,9 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 2026-09-08T19:46-0400 Eliminate split-brain `_isActiveElementInTerminal()` gating: Bypassing the window listener when the textarea was focused caused keypress drops because subsequent keystrokes were discarded. Removing this check ensures every keystroke for the active terminal is processed.
 - 2026-09-08T19:46-0400 Restrict desktop xterm.js onData to mouse tracking: Because `_windowKeyDownListener` calls `preventDefault()` and `stopPropagation()`, normal keystrokes are dispatched without duplication. Restricting `onData` on desktop to mouse sequences (`\x1b[<` and `\x1b[M`) guarantees zero double-sending while preserving mouse reporting for interactive terminal programs.
 - 2026-09-08T19:46-0400 Completely remove `_InputDedupeRecord` and `_sessionInputDedupe`: Timestamp deduplication timers caused rapid keystrokes (such as double letters) and held Backspace keys to be dropped. With a single input source of truth on desktop, deduplication is unnecessary.
+- 2026-09-08T20:14-0400 Re-add `noteViewFit` in `_loadDaemonSessionInto`: Replacing a placeholder session with a live daemon session left `_viewReady` false when `hasFitted` was true, locking `TerminalStore` in `AttachPhase.awaitingHistory` and routing all incoming live bytes from Codex into `_pendingLive`. Invoking `session.noteViewFit` with the carried dimensions immediately unblocks history playback and live terminal streaming.
+- 2026-09-08T20:14-0400 Immediate cached container dimension notification: Re-mounting a cached DOM container reuses existing xterm dimensions. Calling `_writeInitialContent` right after `_bindController()` immediately notifies the controller and session of the fitted geometry without waiting for async callbacks.
+- 2026-09-08T20:14-0400 Broaden lease rejection matching: Daemon error responses for lease rejections can vary across server states. Matching `input lease` generically ensures any lease rejection triggers an automatic `InteractiveController` re-acquisition.
 
 ## Issues
 
@@ -203,6 +214,10 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - [x] Remove per-keystroke `_focusTerminal()` calls from `_sendInput`
 - [x] Validate all 454 Flutter tests and clippy checks
 - [x] Rebuild release web bundle and reload daemon via zero-downtime handover
+- [x] Resolve TerminalStore awaitingHistory deadlock in _loadDaemonSessionInto
+- [x] Notify cached container dimensions synchronously in initState()
+- [x] Broaden input lease error recovery matching in main.dart
+- [x] Rebuild Flutter web release bundle and reload daemon via zero-downtime handover
 
 ## Commits
 
@@ -216,7 +231,8 @@ Refine web terminal focus lifecycle, primary focus scope checks, and ambient inp
 - 386a1d9: fix(triage_client): refactor and simplify terminal input and screen lifecycle
 - ab3e213: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
 - 3902388: fix(triage_client): restore native terminal input pipeline and lease acquisition
-- HEAD: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
+- 0d74e54: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
+- HEAD: fix(triage_client): resolve codex session display deadlock and input lease recovery
 
 
 

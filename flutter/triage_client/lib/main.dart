@@ -1818,8 +1818,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             )
             .catchError((error) {
               final errStr = error.toString();
-              if (errStr.contains('does not hold input lease') ||
-                  errStr.contains('no input lease holder')) {
+              if (errStr.contains('input lease')) {
                 _client
                     .attachSession(
                       sessionId: sessionId,
@@ -3005,6 +3004,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hostSizeCols = oldSession.hostSizeCols;
           session.hostSizeRows = oldSession.hostSizeRows;
         }
+        if (oldSession._viewReady) {
+          session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
+        } else if (oldSession.lastFittedCols != null &&
+            oldSession.lastFittedRows != null) {
+          session.noteViewFit(
+            oldSession.lastFittedCols!,
+            oldSession.lastFittedRows!,
+          );
+        }
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);
@@ -3292,8 +3300,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'error') {
       final error = message['error'] as Map<String, dynamic>?;
       final msg = error?['message']?.toString() ?? '';
-      if (msg.contains('does not hold input lease') ||
-          msg.contains('no input lease holder')) {
+      if (msg.contains('input lease')) {
         final current = _selectedSession;
         final sid = _sessionIdFor(current);
         if (sid != null && !current.isExited) {
@@ -9081,8 +9088,10 @@ class SessionWorkspace extends StatelessWidget {
             onTerminalResizeBind: (callback) {
               session.onTerminalResize = callback;
             },
-            onViewFit: (cols, rows) =>
-                (onViewFit ?? session.noteViewFit)(cols, rows),
+            onViewFit: (cols, rows) {
+              session.noteViewFit(cols, rows);
+              onViewFit?.call(cols, rows);
+            },
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
