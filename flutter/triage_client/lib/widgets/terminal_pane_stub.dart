@@ -71,6 +71,16 @@ class TerminalPane extends StatefulWidget {
     _TerminalPaneState._sessionBracketedPasteModes[terminalId] = enabled;
   }
 
+  /// No-op on non-web: the native pane binds its `Terminal` through the widget
+  /// tree, so a controller swap arrives with the rebuild. Declared so callers
+  /// do not have to branch on platform.
+  static void rebindSessionController(
+    String terminalId,
+    TerminalController controller,
+  ) {}
+
+  static (int, int)? getCachedTerminalSize(String terminalId) => null;
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }
@@ -689,6 +699,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _focusTerminal() {
+    widget.controller.notifyInteraction();
     _focusNode.requestFocus();
   }
 

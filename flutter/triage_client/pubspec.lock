@@ -109,10 +109,10 @@ packages:
     dependency: transitive
     description:
       name: equatable
-      sha256: "3e0141505477fd8ad55d6eb4e7776d3fe8430be8e497ccb1521370c3f21a3e2b"
+      sha256: "3bce007a596ff8b3119c45d68aaef631272537c03d30e5d4534dd24bf4c5eaa2"
       url: "https://pub.dev"
     source: hosted
-    version: "2.0.8"
+    version: "2.1.0"
   fake_async:
     dependency: "direct dev"
     description:
@@ -713,8 +713,8 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: "1ca073d34fec7f731e1523b604a82e2d45edb9a4"
-      resolved-ref: "1ca073d34fec7f731e1523b604a82e2d45edb9a4"
+      ref: "43069c44931e842b5fbad5c0fa88cf21664ee8e0"
+      resolved-ref: "43069c44931e842b5fbad5c0fa88cf21664ee8e0"
       url: "https://github.com/hyeons-lab/xterm.dart.git"
     source: git
     version: "4.0.0"

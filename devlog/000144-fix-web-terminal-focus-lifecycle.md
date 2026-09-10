@@ -1,0 +1,440 @@
+# 000144: fix/web-terminal-focus-lifecycle
+
+**Agent:** Antigravity (gemini-3.8-flash) @ triage branch fix/web-terminal-focus-lifecycle
+
+## Intent
+
+Refine web terminal focus lifecycle, primary focus scope checks, and ambient input routing in `terminal_pane_web.dart` to prevent ambient keystroke drops when no leaf widget holds focus, guard against unmounted DOM invocations, and ensure active pane tracking is preserved across user interactions.
+
+## What Changed
+
+- 2026-09-06T23:05-0700 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Created plan covering `FocusScopeNode` exclusion, `!mounted` guards in `_activateTerminal()`, dynamic `_currentMountedPane` updates, and Escape key matching.
+- 2026-09-06T23:06-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added `primaryFocus is! FocusScopeNode` to ambient keydown filter in `_eventTargetsTerminal()` to avoid false rejections when no leaf widget holds focus.
+  - Added matching for `event.key == 'Esc'` and `event.code == 'Escape'` alongside `Tab` and `Escape`.
+  - Added early `!mounted` guard at the top of `_activateTerminal()`.
+  - Set `_currentMountedPane = this;` inside `_activateTerminal()` to dynamically update pane authority on user interaction.
+  - Short-circuited and cancelled remaining `_focusRetryTimers` when focus is already acquired on frame retries.
+  - Added `html.SelectElement` to external input exclusion filters in `_activateTerminal()` and `_eventTargetsTerminal()`.
+  - Added symmetrical `event.code == 'Tab'` to navigation key filter in `_eventTargetsTerminal()`.
+- 2026-09-07T01:15-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added `_isExternalInput(html.Element? element)` helper that exempts any `xterm-helper-textarea` or elements within any session container (`_sessionContainers.values`), ensuring dormant terminal textareas from unmounted sessions do not block the active terminal from claiming focus.
+  - Updated `_activateTerminal()` to check `_isExternalInput`, assign `_currentMountedPane = this;` only after the input guard, request Flutter focus, and verify `_container.isConnected` before focusing the textarea (rescheduling via `requestAnimationFrame` if pending DOM attachment).
+  - Replaced generic `primaryFocus` exclusion in `_eventTargetsTerminal()` with an explicit `EditableText` check so non-text controls (such as sidebar rail tiles or buttons) do not block ambient terminal keystrokes.
+  - Added `_clearFocusRetryTimers()` helper, automatically removing each timer when it fires and clearing all pending timers on dispose.
+  - Explicitly blurred active `textarea` and `_term` in `dispose()` to prevent zombie active elements in the browser DOM.
+- 2026-09-07T01:15-0700 `flutter/triage_client/lib/main.dart`:
+  - Added `FocusManager.instance.primaryFocus?.unfocus();` to `_selectSession` upon selecting any session so stale widget focus is cleared.
+  - Set `canRequestFocus: false` on `SessionListTile`'s `InkWell` to prevent rail clicks from capturing focus.
+- 2026-09-07T01:46-0700 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 3 detailing Shadow DOM activeElement retargeting, idle host input bypass, and retry expansion for new sessions.
+- 2026-09-07T01:46-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added `_deepActiveElement()` helper to traverse Shadow DOM roots recursively and resolve the leaf active element.
+  - Updated `_isActiveElementInTerminal()`, `_activateTerminal()`, `_eventTargetsTerminal()`, and `dispose()` to inspect `_deepActiveElement()` instead of `html.document.activeElement`.
+  - Exempted Flutter Web engine internal text editing host elements (`flt-text-editing`) in `_isExternalInput()` unless an `EditableText` holds primary focus.
+  - Introduced `_activeTextarea` getter ensuring cached textarea is verified for DOM connection and re-queried if detached.
+  - Invoked `_term.focus()` alongside `textarea.focus()` in `_focusTerminal()` and `_activateTerminal()`.
+  - Moved post-frame focus retry timers `[50, 150, 300]` outside the `cachedContainer` check so newly created sessions also benefit from focus retries.
+- 2026-09-07T09:22-0700 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 4 covering input lease self-healing, gesture-driven focus retries, and dialog dismissal cursor reactivation.
+- 2026-09-07T09:22-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added recursive `_isFlutterInternalElement()` checking light DOM and shadow root ancestor chains for `flt-` and `flutter-` tags and class names.
+  - Updated `_isExternalInput()` to evaluate Flutter internal elements against active `EditableText` focus so hidden engine text inputs do not lock the terminal.
+  - Added `force` parameter to `_activateTerminal()` and `_scheduleFocusRetries()` to bypass external input checks on explicit user gestures.
+  - Passed `force: true` to `_activateTerminal()` and `_scheduleFocusRetries()` on container `onMouseDown`, `onClick`, and `onTouchEnd` events, as well as `onFocusChange` and `onTapDown`.
+  - Updated `didUpdateWidget()` to re-assert active pane authority, invoke `_activateTerminal()`, and schedule focus retries on `focusCursorRevision` or `controller` changes.
+- 2026-09-07T09:22-0700 `flutter/triage_client/lib/main.dart`:
+  - Updated `_setupSessionInputListener()` to self-heal and re-acquire `InteractiveController` lease on demand via `_client.attachSession()` rather than discarding input or falsely marking the session disconnected.
+  - Updated `_selectSession()` to restore `session.status = 'attached'` and reset `statusColor` if the client is connected and the session was marked disconnected.
+  - Updated `_openCustomLabelDialog()` and `_closeSession()` to call `session.focusCursorOnNextDisplay()` upon dialog dismissal.
+- 2026-09-07T16:36-0700 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 5 detailing session event lookup refinement, pending event buffer draining, live write gating elimination on user typing, and non-destructive controller updates.
+- 2026-09-07T16:36-0700 `flutter/triage_client/lib/main.dart`:
+  - Updated `_processWebSocketEvent` to match sessions by `remoteSessionId`, `sessionId`, or `title`, and immediately drain pending buffered events once the session is not loading.
+  - Passed explicit `sessionId` to `SessionVm` constructor in `_createSession`.
+- 2026-09-07T16:36-0700 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `onWrite`, immediately finalized initial content and wrote directly to `term` if valid fitted dimensions exist, eliminating live write output stalling in `_pendingLiveWriteBuffer`.
+  - In `_sendInput` and `onDataCallback`, finalized initial content when fitted and flushed pending live writes.
+  - In `_activateTerminal`, flushed pending live writes upon terminal activation.
+  - Removed destructive `_triggerFullReplayOrReset()` call on controller update in `didUpdateWidget`.
+  - Removed `_resetTerminalSafe()` screen clearing and `_pendingLiveWriteBuffer.clear()` from `_triggerFullReplayOrReset()`, and removed unused helper.
+- 2026-09-07T18:44-0700 `.mcp.json`, `.gemini/`, `.claude/`, `.qoder/`, `.kiro/`, `.opencode.json`, `.cursorrules`, `.windsurfrules`, `GEMINI.md`, `QODER.md`, `.github/code-review-graph.instruction.md`, `AGENTS.md`, `CLAUDE.md`, `.gitignore`:
+  - Completely uninstalled code-review-graph: deleted repository configurations, tool hooks, and agent instructions.
+  - Terminated background code-review-graph processes and removed local `.code-review-graph` database caches.
+  - Clean rebuilt Flutter web client release bundle, recompiled `triaged` in release mode, and executed zero-downtime daemon handover preserving all 28 live sessions.
+- 2026-09-08T00:36-0400 `devlog/plans/000144-01-web-terminal-focus-lifecycle.md`: Added Section 7 detailing controller swap dimension propagation, initial content writing on rebind, and eliminating TerminalStore history deadlock.
+- 2026-09-08T00:36-0400 `flutter/triage_client/lib/main.dart`:
+  - In `_loadDaemonSessionInto`, carried forward fitted dimensions (`hasFitted`, `lastFittedCols`, `lastFittedRows`, `ownFittedCols`, `ownFittedRows`, `hostSizeCols`, `hostSizeRows`) and invoked `session.noteViewFit` if `oldSession._viewReady` or fitted dimensions exist.
+  - In `SessionVm.applyLiveBytes`, ensured `noteViewFit(lastFittedCols!, lastFittedRows!)` is invoked if `!_viewReady` and fitted dimensions are present so staged history and live output drain immediately.
+- 2026-09-08T00:36-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `onWrite`, wrote directly to `term` if present in memory, eliminating output buffering when the xterm instance is already active.
+  - In `didUpdateWidget`, re-asserted `_containerEventOwners[_sanitizedId] = this;` and invoked `_writeInitialContent()` when the controller is swapped on an initialized pane.
+
+- 2026-09-08T01:20-0400 `devlog/plans/000144-02-terminal-input-refactor.md`: Created plan to refactor terminal input and session switching lifecycle, eliminating fragile async attach loops and destructive clear/reset sequences.
+- 2026-09-08T01:20-0400 `flutter/triage_client/lib/main.dart`:
+  - Simplified `_setupSessionInputListener()` to perform direct, synchronous `_client.writeInput()` calls without async `attachSession()` chaining.
+  - Added early exit in `_setupSessionInputListener()` when `session.isExited || session.status == 'exited'` to drop user input on exited sessions.
+  - Removed premature `noteViewFit()` from `_loadDaemonSessionInto()` so staged history is not flushed to unbound controllers before `TerminalPane` mounts.
+  - Changed `_onSessionViewFit()` initial refresh to pass `includeHistory: false` so that view fits do not trigger destructive history replays.
+  - In `_selectSession()`, set `session.status = 'attached'` for non-exited remote sessions.
+- 2026-09-08T01:20-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Removed raw VT100 escape sequence `write('\x1b[2J\x1b[3J\x1b[H')` from `_resetTerminalSafe()` and `onClear()` to prevent screen wiping in alternate screen applications like Codex.
+  - Removed `_resetTerminalSafe()` and `_initialContentWritten = false` from stylesheet load listeners in `initState()`.
+  - Simplified `_eventTargetsTerminal()` to check `identical(_currentMountedPane, this)` directly.
+  - Removed destructive `textarea.blur()` and `_term.blur()` calls from `dispose()`.
+  - In `didUpdateWidget()`, bound controller first, then notified `widget.onViewFit()` with fitted dimensions, and activated focus.
+- 2026-09-08T08:08-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Removed `!_isActiveElementInTerminal()` gating in `_windowKeyDownListener`, routing all terminal keystrokes directly via `_keyboardEventToInput()` and `_sendInput()`.
+  - Expanded `_keyboardEventToInput()` to comprehensively support navigation, function keys, Ctrl modifiers, Alt/Option word navigation, Shift+arrows, and international character input.
+  - Added window input tracking to `_InputDedupeRecord` and bidirectional deduplication between window keydowns and onData callbacks.
+  - Removed unused `_resetTerminalSafe` helper.
+- 2026-09-08T19:14-0400 `devlog/plans/000144-03-refactor-terminal-input-lease-pipeline.md`:
+  - Created plan to refactor terminal input pipeline, restore native xterm.js handling, eliminate window listener deduplication race conditions, and guarantee daemon input lease acquisition.
+- 2026-09-08T19:14-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Restored `_isActiveElementInTerminal()` check in `_windowKeyDownListener` so focused textareas allow native browser event dispatch directly to xterm.js without interception.
+  - Removed `windowTime` and `windowText` fields from `_InputDedupeRecord`.
+  - Removed timestamp deduplication logic from `_sendInput` and `onDataCallback`, eliminating dropped rapid keystrokes and Backspace drops.
+- 2026-09-08T19:14-0400 `flutter/triage_client/lib/main.dart`:
+  - Added `inputListenerBound` guard to `SessionVm` to prevent duplicate input listener registrations from sending duplicate keystrokes.
+  - Updated `_setupSessionInputListener` to resolve session ID via `_sessionIdFor(session)` and removed `session.store.isWritingSink` guard.
+  - In `_selectSession`, proactively requested `InteractiveController` lease via `attachSession` on every selected session.
+  - In `_processWebSocketEvent`, added error event handling to automatically re-acquire `InteractiveController` lease if the daemon rejects writes due to a missing or lost lease.
+- 2026-09-08T19:14-0400 `flutter/triage_client/lib/services/triage_websocket_client.dart`:
+  - Forwarded uncorrelated error messages from the daemon to `_eventController` in `_handleIncomingMessage`.
+  - Added FlatBuffers serialization for `write_input` requests.
+- 2026-09-08T19:46-0400 `devlog/plans/000144-04-unify-desktop-terminal-keyboard-input.md`:
+  - Created plan to unify desktop terminal keyboard input into an authoritative window capture listener and eliminate split-brain gating.
+- 2026-09-08T19:46-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Removed `_isActiveElementInTerminal()` early return in `_windowKeyDownListener`, making the capture listener the sole authoritative dispatcher for desktop web keyboard events.
+  - Added native IME composition bypass (`event.isComposing == true || event.key == 'Process'`).
+  - Added Cmd+C non-selection macOS guard and Cmd+V browser paste pass-through.
+  - Expanded `_keyboardEventToInput()` with Cmd+K clear, Ctrl+Home/End, Alt+Enter/Delete, Shift+Home/End/PgUp/PgDn, Insert, and F1 through F12.
+  - Restricted xterm.js `onDataCallback` on desktop web to terminal mouse tracking sequences (`\x1b[<` and `\x1b[M`), while preserving virtual keyboard and sticky Ctrl on mobile.
+  - Completely deleted `_InputDedupeRecord` and `_sessionInputDedupe`, eliminating artificial timer delays, dropped fast typing, and dropped Backspaces.
+  - Removed redundant `attachCustomKeyEventHandler` on `_term` and `_containerKeyDownSubscription`.
+  - Removed unnecessary `_focusTerminal()` DOM focus calls on every keystroke in `_sendInput()`.
+- 2026-09-08T19:46-0400 `flutter/triage_client/lib/main.dart`:
+  - Removed redundant null check on non-nullable `_selectedSession`.
+- 2026-09-08T20:14-0400 `devlog/plans/000144-05-fix-codex-session-deadlock-and-lease.md`:
+  - Created plan to resolve Codex session display deadlock and input lease recovery.
+- 2026-09-08T20:14-0400 `flutter/triage_client/lib/main.dart`:
+  - In `_loadDaemonSessionInto`, invoked `session.noteViewFit` when `oldSession._viewReady` is true or fitted dimensions exist, transitioning `TerminalStore` out of `AttachPhase.awaitingHistory` and releasing staged history and live output.
+  - In `_setupSessionInputListener` and `_processWebSocketEvent`, broadened input lease rejection matching to check `errStr.contains('input lease')` and `msg.contains('input lease')` to automatically trigger `attachSession(mode: 'InteractiveController')`.
+  - In `SessionWorkspace`, ensured `session.noteViewFit(cols, rows)` is invoked directly on the workspace's session instance.
+- 2026-09-08T20:14-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `initState()`, inside the `cachedContainer != null` branch, invoked `_writeInitialContent(overrideCols: _lastFittedCols, overrideRows: _lastFittedRows)` right after `_bindController()` to immediately propagate fitted dimensions to the controller and session.
+- 2026-09-08T20:34-0400 `devlog/plans/000144-06-restore-native-xterm-input-and-stop-focus-storm.md`:
+  - Created plan to restore native xterm.js keyboard input pipeline, eliminate per-keystroke focus requests, and cancel retry timers once the terminal is active.
+- 2026-09-08T20:34-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Restored native xterm.js keyboard input pipeline by removing the desktop mouse-only filter from `onDataCallback`, routing all keyboard data, control characters, and escape sequences directly to the session input router.
+  - Attached `attachCustomKeyEventHandler` on `_term` to intercept Tab key navigation (routing `\t` or `\x1b[Z`) and Copy shortcuts, returning true for all other keys so xterm.js handles them natively.
+  - Gated `_windowKeyDownListener` on `_isActiveElementInTerminal()`, returning early when the terminal helper textarea has DOM focus to allow uninterrupted browser event delivery to xterm.js.
+  - Eliminated the perpetual focus storm by removing `_focusNode.requestFocus()` from `_windowKeyDownListener` and `_activateTerminal()`, preventing continuous focus fighting between Flutter's engine and the browser DOM textarea.
+  - Simplified `_scheduleFocusRetries()` short-circuit check to cancel remaining retry timers immediately once `_isActiveElementInTerminal()` is true.
+  - Scoped `_bindTextareaEvents()` to `_isMobile == true`.
+- 2026-09-08T21:00-0400 `devlog/plans/000144-07-fix-full-height-layout-and-input-responsiveness.md`:
+  - Created plan to resolve half-height terminal layout clamping and input responsiveness drops.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`:
+  - Added `interactionListeners` (`addInteractionListener`, `removeInteractionListener`, `notifyInteraction()`) on `TerminalController` and `TerminalSessionInputRouter` to immediately detect user interaction from taps, clicks, and keystrokes.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`:
+  - Implemented `notifyInteraction` on `TerminalController` stub.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Set `minHeight = '100%'` on `_container` and `_terminalWrapper` styles.
+  - Wrapped terminal in `SizedBox.expand` with `width: double.infinity, height: double.infinity` to prevent half-height viewport clamping.
+  - Called `widget.controller.notifyInteraction()` on terminal activation, taps, and focus changes.
+  - Filtered `attachCustomKeyEventHandler` to `type == 'keydown'` to prevent duplicate handling on `keyup`.
+- 2026-09-08T21:00-0400 `flutter/triage_client/lib/main.dart`:
+  - Added `hasInputLease` property to `SessionVm`.
+  - Implemented `_pendingInputBytes` buffer and `_acquireInputLeaseAndFlush` helper to buffer keystrokes during lease acquisition and prevent dropped input.
+  - Removed restrictive `session.status == 'attached'` check from `addResizeOutListener`, allowing resizes while session status is `loading`.
+  - In `_loadDaemonSessionInto`, synchronized host size with `resizeSession` if fitted dimensions differ after attach.
+  - In `_loadDaemonSession`, used `replayTargetSize` to resize before initial replay.
+- 2026-09-08T21:17-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Added explicit Enter key handling in `_windowKeyDownListener` before `_isActiveElementInTerminal()`, ensuring Enter (`\r`) is dispatched immediately, preventDefault and stopPropagation are invoked, and Flutter Web cannot swallow newlines.
+  - Added explicit Enter and Escape handling in `attachCustomKeyEventHandler` on `_term`, preventing browser bubbling and delivering `\r` (or `\x1b\r` if Alt held) and `\x1b` (or `\x1b\x1b` if Alt held) directly to `_sessionInputRouter`.
+  - Added `event.code == 'NumpadEnter'` and raw `event.keyCode == 13` / `keyCode == 27` fallback mappings in `_keyboardEventToInput()`.
+- 2026-09-08T21:38-0400 `devlog/plans/000144-09-fix-live-session-pty-shrink-and-full-height-resize.md`: Created plan to resolve live session PTY shrinking to 19 rows and ensure reliable full-height resize delivery across session loading and controller rebinds.
+- 2026-09-08T21:38-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`, `terminal_pane_stub.dart`, `terminal_pane_web.dart`:
+  - Added `TerminalPane.getCachedTerminalSize(String terminalId)` static method querying actual cols and rows from DOM xterm instances.
+  - In `didUpdateWidget`, dispatched `sendResizeOut` and `_onFit()` immediately when controller is swapped so the newly bound controller receives real terminal dimensions.
+  - In `_refitAndSend`, invoked `_finishInitialContent(cols, rows)` if initial content was not yet written, ensuring refit works during initial mount.
+  - In `initState`, dispatched `sendResizeOut` on cached container reuse.
+- 2026-09-08T21:38-0400 `flutter/triage_client/lib/main.dart`:
+  - In `_loadDaemonSession`, checked `TerminalPane.getCachedTerminalSize` before falling back to session state, ensuring real DOM dimensions take precedence over estimates.
+  - In `_loadDaemonSessionInto`, populated fitted dimensions from `TerminalPane.getCachedTerminalSize` and immediately synchronized host PTY size if `hostSizeRows` or `hostSizeCols` differs.
+  - In `_currentReplayTerminalSize`, checked `TerminalPane.getCachedTerminalSize` first so cached DOM sizes take precedence over estimates.
+  - In `_refitActiveSession`, relaxed session status check to allow refitting any active remote session.
+
+- 2026-09-08T22:15-0400 `devlog/plans/000144-10-fix-live-output-seq-epoch-deafness.md`: Created plan to fix live output silently dropped after a daemon handover renumbers a session's `output_seq`.
+- 2026-09-08T22:15-0400 `flutter/triage_client/lib/terminal/terminal_state.dart`:
+  - Added a `resetHistoryHighWaterSeq` flag to `copyWith`. The field was written as `historyHighWaterSeq ?? this.historyHighWaterSeq`, so no caller could clear it; the full-replay path silently retained a stale baseline whenever `throughOutputSeq` was null.
+- 2026-09-08T22:15-0400 `flutter/triage_client/lib/terminal/terminal_store.dart`:
+  - Added `kSeqEpochResetWindow` (1024), documented against the daemon's `EVENT_REPLAY_BUFFER`.
+  - Added `_isSeqEpochReset()`, comparing an incoming `output_seq` against `max(historyHighWaterSeq, _appliedLiveSeq)`.
+  - In `_reduceLive`, rebase on an epoch reset — clear `_appliedLiveSeq` and the baseline, keep `_appliedLogBytes` — before the duplicate check, so renumbered chunks render instead of being dropped forever.
+  - In the `Attach` reducer, clear `historyHighWaterSeq` alongside `_appliedLiveSeq` and `_appliedLogBytes`, which it already reset.
+- 2026-09-08T22:15-0400 `flutter/triage_client/test/terminal/terminal_store_test.dart`:
+  - Added a regression test replaying a handover: history at seq 90000 and live at 90001, then live renumbered to 1 and 2 must still render. Fails on the prior code with `Actual: []`.
+
+- 2026-09-08T23:12-0400 `devlog/plans/000144-11-fix-xterm-detached-line-on-scroll-alias.md`: Created plan to fix the xterm.dart crash that made `session-218` report `load failed` once it stopped being deaf.
+- 2026-09-08T23:12-0400 `hyeons-lab/xterm.dart` @ `551423e` (fork, branch `fix/trim-start-reindex-v4`):
+  - In `IndexAwareCircularBuffer._moveChild`, place the element with `_attach(this, toIndex)` instead of `_move(toIndex)`, so an element left detached by an aliasing assignment is repaired rather than dereferenced null.
+  - Return early when a shift resolves to its own slot; the sequence below it clears the slot it just wrote and drops the element.
+  - Removed the now-unused `IndexedItem._move`, whose `assert(attached)` was compiled out of release builds.
+  - Added regression coverage in `test/src/utils/circular_buffer_test.dart` for an element left detached by an aliasing assignment, plus an invariant guard for the self-slot shift.
+- 2026-09-08T23:12-0400 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: Bumped the `xterm` override ref from `1ca073d` to `551423e`.
+- 2026-09-08T23:12-0400 `flutter/triage_client/lib/main.dart`: Log the stack alongside the message in the `_loadDaemonSessionInto` catch. The catch spans the whole load, so the message alone does not say which step threw.
+
+- 2026-09-09T06:33-0400 `devlog/plans/000144-12-fix-controller-rebind-on-session-swap.md`: Created plan for the pane binding to a stale `TerminalController` after a session swap.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/terminal/debug_log.dart` (new): `kTerminalDebug`-gated `TDBG` trace across the five seams bytes cross (store, sink, controller, pane, xterm.js). Left in the tree, switched off.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - Made the persistent binder addressable by session id (`_bindPersistentSessionControllerFor`), with the instance method as a wrapper.
+  - Added `TerminalPane.rebindSessionController`, re-pointing the session's write/clear listeners and, for a mounted pane, its view listeners via `_rebindViewListenersTo` (tracked by `_boundViewController`).
+  - `onWrite` logs a throwing xterm.js write instead of `catch (_) {}` discarding it.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: No-op `rebindSessionController` so callers need no platform branch.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`: `TerminalController.write` isolates each write listener, so one throwing consumer no longer stops the rest.
+- 2026-09-09T06:33-0400 `flutter/triage_client/lib/main.dart`: Call `TerminalPane.rebindSessionController` at the swap site in `_loadDaemonSessionInto`.
+- 2026-09-09T06:33-0400 `flutter/triage_client/pubspec.yaml`, `pubspec.lock`: Bumped the `xterm` override ref to `43069c4` (the `eraseRange` guard).
+- 2026-09-09T11:41-0400 `devlog/plans/000144-13-fix-web-terminal-tab-autocomplete.md`: Created plan to restore web terminal Tab shell autocompletion across browser focus states.
+- 2026-09-09T11:41-0400 `flutter/triage_client/lib/widgets/terminal_pane.dart`: Added `rebind(sessionId, controller)` to `TerminalSessionInputRouter` to update existing session route target controllers without disturbing routing tokens.
+- 2026-09-09T11:41-0400 `flutter/triage_client/test/terminal_session_input_router_test.dart`: Added unit test verifying `TerminalSessionInputRouter.rebind` forwards subsequent inputs to the new controller.
+- 2026-09-09T11:41-0400 `flutter/triage_client/lib/widgets/terminal_pane_web.dart`:
+  - In `TerminalPane.rebindSessionController`, rebound `_sessionInputRouter` to the new controller.
+  - In `_windowKeyDownListener`, intercepted Tab unconditionally when targeting the active terminal (matching Enter behavior), preventing browser focus navigation, stopping event propagation to Flutter traversal, and dispatching `\t` or Shift+Tab `\x1b[Z` directly to the session.
+  - In `Focus.onKeyEvent`, dispatched `\t` or `\x1b[Z` on `KeyDownEvent` before returning `KeyEventResult.handled` so Flutter focus nodes do not silently discard Tab.
+  - In `attachCustomKeyEventHandler` and `_keyboardEventToInput`, expanded Tab detection to match `event.code == 'Tab'` and `keyCode == 9`.
+  - In `GestureDetector.onTapDown`, requested `_focusNode` focus when `canRequestFocus` is true.
+
+## Decisions
+
+- 2026-09-06T23:05-0700 Exclude `FocusScopeNode` from `primaryFocus` check: In Flutter, when no child widget holds focus, `primaryFocus` defaults to the route `FocusScopeNode` (which retains a non-null context). Exclude `FocusScopeNode` so ambient window keydown events are routed to the active terminal pane when no input field holds focus.
+- 2026-09-06T23:05-0700 Guard `_activateTerminal()` on `!mounted`: Abort before inspecting widget properties or DOM elements if the state is unmounted.
+- 2026-09-06T23:05-0700 Re-assert `_currentMountedPane` on `_activateTerminal()`: Ensure user interactions (such as clicks, taps, or refits) dynamically establish pane authority for ambient keystroke handling.
+- 2026-09-06T23:06-0700 Short-circuit focus retries once verified: Cancel remaining retry timers immediately if `_isActiveElementInTerminal() && _focusNode.hasFocus` is true to avoid unnecessary DOM queries and refocus attempts.
+- 2026-09-06T23:13-0700 Guard SelectElement and match event.code Tab: Ensure native dropdowns are not intercepted and Tab navigation is symmetrically bypassed.
+- 2026-09-07T01:15-0700 Distinguish external form inputs from terminal helper textareas: An inactive session's `xterm-helper-textarea` can remain as `html.document.activeElement` when switching sessions. Exempting `xterm-helper-textarea` and any element within `_sessionContainers` prevents `_activateTerminal()` and `_eventTargetsTerminal()` from treating dormant sessions as external form fields.
+- 2026-09-07T01:15-0700 Restrict `primaryFocus` ambient bypass to `EditableText`: In Flutter, clicking buttons or list tiles assigns focus to their `FocusNode`. Only yield ambient keystrokes if the focused widget actually accepts text editing (`EditableText`).
+- 2026-09-07T01:15-0700 Re-attempt focus on `requestAnimationFrame` when disconnected: Calling `.focus()` on a DOM element not yet connected to the document is a silent no-op. If `!_container.isConnected`, schedule focus once the browser attaches the platform view.
+- 2026-09-07T01:46-0700 Deep Shadow DOM traversal for activeElement: Under standard DOM semantics, `document.activeElement` on platform view elements retargets to the shadow host (`<flt-platform-view>` or `<flt-glass-pane>`). Traversing `shadowRoot.activeElement` recursively resolves the true focused element, preventing window capture listeners from mistaking focused xterm textareas for inactive elements and suppressing keystrokes.
+- 2026-09-07T01:46-0700 Differentiate Flutter engine idle input hosts: Flutter Web maintains hidden text editing host elements in the DOM even when no text field is active. Exempting `flt-text-editing` elements unless an `EditableText` is focused prevents false external input locks from aborting `_activateTerminal()`.
+- 2026-09-07T01:46-0700 Apply focus retries to new sessions: Newly created sessions register platform views that take multiple frames to attach and layout in the browser DOM. Scheduling focus retries across both new and cached containers guarantees reliable terminal input activation.
+- 2026-09-07T09:22-0700 Self-healing input lease re-attachment: If `writeInput()` fails or input is received for a session whose status is not attached, check `_client.isConnected`. If the WebSocket is alive and the session is not exited, request an `InteractiveController` lease via `attachSession()` and retry the write instead of disconnecting the session.
+- 2026-09-07T09:22-0700 Gesture-driven focus enforcement: Direct mouse, click, and touch gestures on the terminal container or GestureDetector indicate unambiguous user focus intent. Bypassing external input guards via `force: true` and triggering the retry ladder ensures focus immediately transfers to xterm.
+- 2026-09-07T09:22-0700 Dialog dismissal cursor focus restoration: Closing modal dialogs like custom label renaming leaves DOM focus on hidden Flutter engine elements. Invoking `session.focusCursorOnNextDisplay()` on dismissal increments `focusCursorRevision` and triggers terminal focus reactivation.
+- 2026-09-07T16:36-0700 Resilient remote session lookup in WebSocket event processing: Match remoteSessionId, sessionId, and title fallback in _processWebSocketEvent so sessions with custom labels or renamed titles route events reliably.
+- 2026-09-07T16:36-0700 Proactive pending event draining on WebSocket messages: Once a session is not in loading state, immediately drain any buffered events from _pendingEvents before handling new messages to preserve message sequence and output order.
+- 2026-09-07T16:36-0700 Immediate live write finalization on user input: If the user sends input or incoming output arrives while valid fitted dimensions are present, finalize initial content immediately rather than waiting for stability timers, avoiding output stalls.
+- 2026-09-07T16:36-0700 Eliminate destructive screen clearing on controller swap: Terminal state is owned by xterm.js in the browser; controller swaps during rebinds must not clear the screen or wipe pending live buffers.
+- 2026-09-07T18:44-0700 Complete removal of code-review-graph: The code-review-graph MCP server, automated hooks, and database indexing spawned background processes on every session start and tool execution with long timeouts, causing process blocking and resource contention across active terminals.
+- 2026-09-08T00:36-0400 Carry forward fitted dimensions on session load: When `_loadDaemonSessionInto` replaces a placeholder `SessionVm` with a new instance, the container DOM element is already fitted and rendered, meaning `ResizeObserver` will not fire. Carrying forward `lastFittedCols`/`lastFittedRows` and calling `session.noteViewFit` transitions `TerminalStore` out of `AttachPhase.awaitingHistory` and immediately drains live output.
+- 2026-09-08T00:36-0400 Direct terminal write when xterm instance exists: If `_sessionTerms[sessionId]` is already allocated and alive in the DOM, writing incoming data directly to the terminal avoids unwarranted buffering in `_pendingLiveWriteBuffer`.
+- 2026-09-08T01:20-0400 Direct synchronous input writing: Keystroke listeners should not initiate asynchronous lease acquisition loops. Direct writes via `_client.writeInput()` ensure immediate input response without keystroke drops or race conditions.
+- 2026-09-08T01:20-0400 Eliminate raw VT100 clear sequences in client reset helpers: Writing `\x1b[2J\x1b[3J\x1b[H` directly to xterm erases active alternate screen buffers in TUI apps (like Codex and Ratatui) without the backend program's knowledge. Standard `term.clear()` suffices for scrollback clearing without corrupting terminal viewports.
+- 2026-09-08T01:20-0400 Preserve rendered buffer on stylesheet load: Loading font stylesheets changes metrics and requires re-fitting the grid, but must never wipe or reset already rendered terminal content.
+- 2026-09-08T01:20-0400 Defer history replay until widget controller is bound: Staged history must only be flushed through `SessionVm.noteViewFit()` after `TerminalPane` has bound its write listener to `session.terminalController`.
+- 2026-09-08T08:08-0400 Direct window capture key routing for active terminal: Relying on xterm.js internal helper textarea event dispatch inside Flutter Web's platform view caused dropped keystrokes once the textarea was focused. Handling key translation directly at the window capture listener guarantees continuous, immediate input response for all typing, backspaces, enters, and control sequences.
+- 2026-09-08T08:08-0400 Bidirectional deduplication between window keydown and onData: Tracking window input timestamps and text in `_InputDedupeRecord` prevents duplicate emission if an xterm.onData or mobile virtual keyboard event fires for the same keystroke within 50ms.
+- 2026-09-08T19:14-0400 Restore native xterm.js input flow when textarea is focused: Direct window keydown interception with preventDefault broke xterm.js internal keyboard handling, alternate screen cursor modes, and Backspace in full-screen TUI apps like Codex and agy. Returning early when `_isActiveElementInTerminal()` is true allows xterm.js to receive native events and emit clean onData streams.
+- 2026-09-08T19:14-0400 Eliminate 50ms timestamp deduplication: Window keydown deduplication against onData timestamps caused rapid keystrokes and repeated keys (such as holding Backspace) to be dropped.
+- 2026-09-08T19:14-0400 Proactive lease acquisition on session selection: When switching sessions or loading daemon sessions, the client must explicitly acquire an InteractiveController lease. Proactively requesting the lease on session selection and auto-recovering on lease error responses ensures write_input is never rejected by the daemon.
+- 2026-09-08T19:46-0400 Authoritative window capture listener for desktop terminal input: In Flutter Web, physical keystrokes do not reliably flow into xterm.js helper textareas embedded within platform view Shadow DOM trees. Making `_windowKeyDownListener` the sole authoritative dispatcher on desktop web ensures continuous, reliable input for all typing, backspacing, entering, and control sequences.
+- 2026-09-08T19:46-0400 Eliminate split-brain `_isActiveElementInTerminal()` gating: Bypassing the window listener when the textarea was focused caused keypress drops because subsequent keystrokes were discarded. Removing this check ensures every keystroke for the active terminal is processed.
+- 2026-09-08T19:46-0400 Restrict desktop xterm.js onData to mouse tracking: Because `_windowKeyDownListener` calls `preventDefault()` and `stopPropagation()`, normal keystrokes are dispatched without duplication. Restricting `onData` on desktop to mouse sequences (`\x1b[<` and `\x1b[M`) guarantees zero double-sending while preserving mouse reporting for interactive terminal programs.
+- 2026-09-08T19:46-0400 Completely remove `_InputDedupeRecord` and `_sessionInputDedupe`: Timestamp deduplication timers caused rapid keystrokes (such as double letters) and held Backspace keys to be dropped. With a single input source of truth on desktop, deduplication is unnecessary.
+- 2026-09-08T20:14-0400 Re-add `noteViewFit` in `_loadDaemonSessionInto`: Replacing a placeholder session with a live daemon session left `_viewReady` false when `hasFitted` was true, locking `TerminalStore` in `AttachPhase.awaitingHistory` and routing all incoming live bytes from Codex into `_pendingLive`. Invoking `session.noteViewFit` with the carried dimensions immediately unblocks history playback and live terminal streaming.
+- 2026-09-08T20:14-0400 Immediate cached container dimension notification: Re-mounting a cached DOM container reuses existing xterm dimensions. Calling `_writeInitialContent` right after `_bindController()` immediately notifies the controller and session of the fitted geometry without waiting for async callbacks.
+- 2026-09-08T20:14-0400 Broaden lease rejection matching: Daemon error responses for lease rejections can vary across server states. Matching `input lease` generically ensures any lease rejection triggers an automatic `InteractiveController` re-acquisition.
+- 2026-09-08T20:34-0400 Native xterm.js keyboard event ownership: When the terminal helper textarea has DOM focus, xterm.js must directly own the keyboard event pipeline. It natively handles application cursor keys mode (`DECCKM`), alternate screen buffers, keypad modes, dead keys, and IME.
+- 2026-09-08T20:34-0400 Eliminate per-keystroke Flutter FocusNode requests: Calling `_focusNode.requestFocus()` on every keystroke when DOM focus is held by the platform view textarea triggered `Focus.onFocusChange(true)` and scheduled continuous retry timers at 50ms, 150ms, and 300ms. In Chromium and Brave, calling `.focus()` on DOM elements during active typing disrupts the browser event pipeline and cancels in-flight keystrokes. Removing `requestFocus()` stops the focus oscillation and allows zero dropped keystrokes.
+- 2026-09-08T20:34-0400 Tab interception via attachCustomKeyEventHandler: Intercepting Tab key via xterm.js custom key event handler prevents the browser from shifting focus away to other page elements while preserving bash tab-completion and TUI navigation.
+- 2026-09-08T21:00-0400 Unrestricted resize-out during session loading: Terminal DOM mounting and layout fitting occur while session status is loading. Removing the attached status restriction prevents fitted dimension changes from being dropped and avoids half-height panel clamping.
+- 2026-09-08T21:00-0400 Proactive input lease acquisition and buffering: User interactions notify the session router to verify lease ownership. Pending input is buffered while InteractiveController lease requests are in flight, ensuring zero dropped keystrokes on session switches.
+- 2026-09-08T21:17-0400 Unconditional Enter interception in window capture and custom key event handlers: Flutter Web registers global key listeners that intercept Enter as an ActivateIntent, calling preventDefault and preventing xterm.js or the browser from forwarding carriage returns to the PTY. Capturing Enter explicitly in both the window capture listener and xterm.js custom key event handler guarantees reliable newline delivery for CLI tools like Codex while preventing focus loss.
+- 2026-09-08T21:17-0400 Escape key interception in xterm custom key handler: Capturing Escape in attachCustomKeyEventHandler dispatches \x1b directly to the session and prevents the browser from dismissing overlays or popping Flutter routes during TUI navigation.
+- 2026-09-08T21:38-0400 Authoritative cached DOM terminal dimensions for session replay: Before falling back to viewport estimates during session loading, query `TerminalPane.getCachedTerminalSize` to retrieve real pixel-fitted rows and columns from active xterm.js DOM instances. This prevents live daemon sessions from being artificially shrunk to 19 rows.
+- 2026-09-08T21:38-0400 Controller swap resize dispatch in web terminal: Swapping `TerminalController` on an initialized `TerminalPane` must re-emit `sendResizeOut` to the new controller and notify `onViewFit`, synchronizing host PTY dimensions when switching or reloading sessions.
+
+- 2026-09-08T22:15-0400 Treat a far-regressed live `output_seq` as a new epoch, not a duplicate: `output_seq` counts events within one daemon instance, so a handover renumbers an adopted session low while its byte log continues unbroken. A client holding the pre-handover high-water scores every renumbered chunk as a duplicate and goes permanently deaf — history frozen, cursor still blinking, keystrokes still reaching the PTY. The history path already made this call via `isSequenceRegressed`; the live path had no equivalent.
+- 2026-09-08T22:15-0400 Bound the epoch test by the daemon's replay contract rather than a tuned constant: ordinary re-delivery de-duplication depends on rejecting lower seqs, so "lower means new epoch" cannot be reused on the live path. The daemon replays at most `EVENT_REPLAY_BUFFER` (1024) events to a lagging subscriber and sends `ResyncRequired` past that, so no genuine re-delivery can regress further than 1024; anything below is a new epoch. All pre-existing re-delivery dedup tests still pass under this window.
+- 2026-09-08T22:15-0400 Keep `_appliedLogBytes` across an epoch reset: log byte offsets survive a handover — the same session reports one `bytes_logged` either side of an adoption — so the value stays valid and still anchors the next history delta-merge. Only the seq-derived state is rebased.
+- 2026-09-08T22:15-0400 Give `copyWith` an explicit reset flag rather than overloading null: `?? this` cannot express "clear", and a null argument already reads as "unchanged" for every other field. A dedicated flag keeps the clear intentional at each call site.
+- 2026-09-08T22:15-0400 Deploy web assets via `triage client upgrade`, not a handover: only Dart changed, so rebuilding the bundle and copying it into the override dir (`~/.local/share/triage/web`) hot-reloads the daemon's web cache with no restart and no risk to live sessions. Override files are read from disk ahead of the cache on every request, so the swap takes effect immediately.
+
+- 2026-09-08T23:12-0400 Fix the crash in the fork rather than work around it in the client: there is no patch mechanism for pub dependencies here — the only patch machinery, `scripts/generate-dart-flatbuffers.sh`, rewrites generated flatbuffers output — and `xterm` is already a `dependency_overrides` git pin to our own fork, so the fix goes upstream of the pin and the ref moves.
+- 2026-09-08T23:12-0400 Place a shifted element with `_attach` rather than `_move`: for an element still attached to this buffer the two are the same assignment, and for one that is not, `_attach` re-establishes the owner where `_move` dereferences null. `_moveChild` is where the invariant is violated but not where it is broken — it is handed an element `scrollUp`/`scrollDown` already poisoned by aliasing one line object into two slots.
+- 2026-09-08T23:12-0400 Keep the self-slot guard even without a failing case: `insert` and `remove` step by one and their early returns rule out the colliding wrap, so it is unreachable today. It is stated as an invariant guard rather than a regression, because the sequence it guards drops the element silently rather than throwing.
+- 2026-09-08T23:12-0400 Keep the stack in the load catch: the first console line pointed at `debugPrint`'s own `console.log`, and the bare message named none of attach, the swap `setState`, `_regroupRail`, `_drainPendingEvents` or resize. Two round trips went to recovering what the catch had discarded.
+- 2026-09-08T23:12-0400 Clear the web override directory before deploying rather than copying over it: `triage client upgrade` does not prune, so the diagnostic `main.dart.js.map` would have stayed behind and mis-symbolicated a later trace against a bundle it no longer describes.
+
+- 2026-09-09T06:33-0400 Rebind by session id, not through the widget lifecycle: the case that breaks is precisely the one where the pane is not rebuilt, so `didUpdateWidget` cannot be the hook. `rebindSessionController` is reachable from the swap site without a rebuild.
+- 2026-09-09T06:33-0400 Isolate write listeners in `TerminalController.write`: xterm.dart is listener #0 and xterm.js is #1, so any emulator throw silently stopped the pane from being written. Both xterm bugs fixed on this branch reached the user through that path, which is why three unrelated causes all presented as "blank".
+- 2026-09-09T06:33-0400 Keep the `TDBG` trace in the tree, gated off: the seams that hid this — two `catch (_) {}` sites and two silent buffers — are still seams, and the trace is what turned a fifth round of guessing into a single answer.
+- 2026-09-09T06:33-0400 Restore the epoch fix after the bisect cleared it: a build with the store reverted and both xterm fixes kept was still blank, and the pre-branch embedded bundle was blank too, so the store change was never implicated.
+- 2026-09-09T11:41-0400 Unconditional Tab capture in window keydown listener: Like Enter, Tab is an essential terminal control key that browser default focus navigation and Flutter Web focus traversal aggressively swallow. Capturing Tab unconditionally in the capture phase of _windowKeyDownListener when targeting the terminal guarantees immediate dispatch to the PTY and prevents browser focus escapes.
+- 2026-09-09T11:41-0400 Forward Tab in Focus.onKeyEvent: Returning KeyEventResult.handled in Flutter Focus widget stops widget traversal, but previously discarded the keystroke without forwarding \t to the session. Forwarding \t (or \x1b[Z for Shift+Tab) ensures that if Flutter focus tree holds focus, Tab autocompletion continues to work seamlessly.
+- 2026-09-09T11:41-0400 Rebind _sessionInputRouter in rebindSessionController: Session swaps in main.dart replace placeholder controllers with loaded controllers. Updating the input router route ensures all input forwarded through the router reaches the live controller without relying on a widget tree rebuild.
+
+## Issues
+
+- None.
+
+## Progress
+
+- [x] Create worktree and branch devlog / plan
+- [x] Refine `_eventTargetsTerminal()` in `terminal_pane_web.dart`
+- [x] Refine `_activateTerminal()` in `terminal_pane_web.dart`
+- [x] Short-circuit retry timers once focus is verified
+- [x] Verify formatting, analysis, and test suites
+- [x] Run Round 3 review subagent at max effort
+- [x] Address Round 3 review suggestions (SelectElement, event.code Tab)
+- [x] Address session switch input restoration lockout
+- [x] Exempt terminal helper textareas from external input guard
+- [x] Restrict primaryFocus ambient rejection to EditableText
+- [x] Blur unmounted session textarea on dispose
+- [x] Unfocus stale widget focus on session selection
+- [x] Implement Shadow DOM deep activeElement traversal
+- [x] Exempt idle Flutter text editing hosts from external input guard
+- [x] Apply focus retries to newly created sessions
+- [x] Self-healing input lease re-attachment on input error
+- [x] Direct user gesture forced focus retries on mousedown, click, touch, and tap
+- [x] Dialog dismissal cursor focus restoration
+- [x] Flutter internal element ancestor traversal in _isExternalInput()
+- [x] Resilient session lookup and pending event draining in main.dart
+- [x] Immediate live write finalization and flush in terminal_pane_web.dart
+- [x] Eliminate destructive terminal resets and buffer clearing on controller update
+- [x] Uninstall code-review-graph and remove automated tool hooks
+- [x] Clean build Flutter web release bundle and reload daemon via zero-downtime handover
+- [x] Resolve TerminalStore awaitingHistory deadlock on session load
+- [x] Direct live terminal writes for active xterm instances
+- [x] Refactor terminal input pipeline to direct synchronous writes
+- [x] Remove raw VT100 clear escape sequences from client reset helpers
+- [x] Eliminate destructive stylesheet load resets and buffer clearing
+- [x] Defer history replay until controller is bound to prevent blank screens
+- [x] Verify all 454 Flutter tests and 328 Rust tests pass
+- [x] Eliminate inactive terminal focus gating in _windowKeyDownListener
+- [x] Expand _keyboardEventToInput for full modifier, navigation, and international keyboard support
+- [x] Implement bidirectional window/onData deduplication
+- [x] Deploy release binary with zero-downtime handover preserving all 29 live sessions
+- [x] Restore native xterm.js keyboard handling when terminal helper textarea is active
+- [x] Eliminate window timestamp deduplication and Backspace drops
+- [x] Prevent duplicate input listener registrations via inputListenerBound guard
+- [x] Proactively acquire InteractiveController input lease on session selection and recover on lease errors
+- [x] Make `_windowKeyDownListener` the single authoritative input source for desktop web
+- [x] Eliminate `_isActiveElementInTerminal()` gating and dropped keystrokes
+- [x] Restrict xterm.js onData to mouse tracking on desktop
+- [x] Delete `_InputDedupeRecord` and all timestamp deduplication
+- [x] Eliminate redundant `attachCustomKeyEventHandler` and `_containerKeyDownSubscription`
+- [x] Remove per-keystroke `_focusTerminal()` calls from `_sendInput`
+- [x] Validate all 454 Flutter tests and clippy checks
+- [x] Rebuild release web bundle and reload daemon via zero-downtime handover
+- [x] Resolve TerminalStore awaitingHistory deadlock in _loadDaemonSessionInto
+- [x] Notify cached container dimensions synchronously in initState()
+- [x] Broaden input lease error recovery matching in main.dart
+- [x] Rebuild Flutter web release bundle and reload daemon via zero-downtime handover
+- [x] Restore native xterm.js keyboard pipeline and eliminate desktop mouse-only filter
+- [x] Attach attachCustomKeyEventHandler for Tab and Copy in xterm.js
+- [x] Gate _windowKeyDownListener on _isActiveElementInTerminal()
+- [x] Eliminate per-keystroke requestFocus and retry timer loop
+- [x] Cancel focus retries immediately once _isActiveElementInTerminal() is true
+- [x] Verify all 454 Flutter tests and clippy pass
+- [x] Rebuild release web bundle and reload daemon via zero-downtime handover
+- [x] Fix half-height panel layout clamping with minHeight and SizedBox.expand
+- [x] Allow resize-out events while session is loading to prevent size desynchronization
+- [x] Implement interaction listener and input lease verification on TerminalController
+- [x] Buffer pending keystrokes during lease acquisition to eliminate dropped input
+- [x] Filter custom key event handler to keydown events only
+- [x] Verify all 454 Flutter tests and 340 Rust tests pass
+- [x] Rebuild release web bundle and reload daemon via zero-downtime handover
+- [x] Intercept Enter key in _windowKeyDownListener before _isActiveElementInTerminal()
+- [x] Handle Enter and Escape in attachCustomKeyEventHandler on _term
+- [x] Add NumpadEnter and keyCode fallbacks in _keyboardEventToInput()
+- [x] Verify all 454 Flutter tests and 342 Rust tests pass
+- [x] Build release web bundle and reload daemon via zero-downtime handover
+- [x] Expose TerminalPane.getCachedTerminalSize for authoritative DOM dimensions
+- [x] Dispatch sendResizeOut on controller swap in didUpdateWidget
+- [x] Synchronize host PTY size on load in _loadDaemonSessionInto
+- [x] Allow refitting active remote sessions regardless of transitional status
+- [x] Verify all 454 Flutter tests and 342 Rust tests pass
+- [x] Build release web bundle and reload daemon via zero-downtime handover
+
+- [x] Confirm server-side that `session-218` was live and receiving input (SnapshotSession over the IPC socket)
+- [x] Rule out a stale deployment by comparing served `main.dart.js` against the latest build
+- [x] Add a failing regression test for a renumbered `output_seq` after a handover
+- [x] Add `_isSeqEpochReset` and rebase the dedup baseline in `_reduceLive`
+- [x] Let `copyWith` clear `historyHighWaterSeq`, and clear it on `Attach`
+- [x] Verify all 455 Flutter tests pass, `flutter analyze` clean, `dart format` unchanged
+- [x] Build release web bundle and deploy via `triage client upgrade` (no daemon restart; 29 sessions intact, served bytes match build)
+
+- [x] Map the minified release frames back to Dart via a `--source-maps` build
+- [x] Establish the crash is in vendored xterm.dart, not client code (bare `Terminal` reproduces it)
+- [x] Rule out the epoch fix as the cause (no `historyHighWaterSeq!` exists; repro uses no client code)
+- [x] Identify the detach site by recording it on the item (`scrollDown` via `reverseIndex`)
+- [x] Fix `_moveChild` in the fork, with a test that fails without it
+- [x] Verify the full xterm suite (125) and the real 366KB capture at every client size
+- [x] Push the fork commit and bump the pin to `551423e`
+- [x] Verify 455 client tests, `flutter analyze` clean, and deploy (no daemon restart; 29 sessions intact)
+
+- [x] Instrument the five seams with a gated `TDBG` trace
+- [x] Identify the fault from controller identity: pane bound `ctrl#92859691`, store wrote `ctrl#250931763`
+- [x] Add `rebindSessionController` and call it at the swap site
+- [x] Isolate `TerminalController.write` listeners; stop `onWrite` swallowing xterm.js errors
+- [x] Restore the epoch fix reverted during the bisect
+- [x] Verify 455 tests, `flutter analyze` clean, and confirm rendering + input in the browser
+- [x] Redeploy with logging switched off (no daemon restart; 29 sessions intact)
+
+- [x] Add rebind method to TerminalSessionInputRouter and unit tests
+- [x] Intercept Tab unconditionally in _windowKeyDownListener before _isActiveElementInTerminal()
+- [x] Dispatch Tab in Focus.onKeyEvent before returning handled
+- [x] Expand Tab matching for code and keyCode in attachCustomKeyEventHandler and _keyboardEventToInput
+- [x] Rebind _sessionInputRouter in TerminalPane.rebindSessionController
+- [x] Verify all 456 Flutter tests pass, flutter analyze clean, dart format clean
+- [x] Build release web bundle and upgrade client assets via triage client upgrade
+
+## Commits
+
+- 833c770: fix(triage_client): harden web terminal focus lifecycle and ambient routing
+- 0baa475: fix(triage_client): restore input on session switch and refine focus delegation
+- c747c84: fix(triage_client): penetrate shadow dom focus and eliminate external input false locks
+- e192036: fix(triage_client): re-acquire input lease on demand and harden focus retry lifecycle
+- e76d810: fix(triage_client): unblock session output stream and eliminate destructive resets
+- f1b364a: chore: uninstall code-review-graph and remove automated tool hooks
+- adf465c: fix(triage_client): resolve terminal store history deadlock on controller rebind
+- 386a1d9: fix(triage_client): refactor and simplify terminal input and screen lifecycle
+- ab3e213: fix(triage_client): directly route web terminal keyboard events and eliminate focus gating
+- 3902388: fix(triage_client): restore native terminal input pipeline and lease acquisition
+- 0d74e54: fix(triage_client): unify desktop web terminal input and eliminate split-brain gating
+- 66aa20e: fix(triage_client): resolve codex session display deadlock and input lease recovery
+- 84e85f7: fix(triage_client): restore native xterm input pipeline and eliminate focus storm
+- bf1d17d: fix(triage_client): resolve half-height layout clamping and input lease buffering
+- 0474f65: fix(triage_client): guarantee web terminal Enter and control key dispatch
+- 7cdaa89: fix(triage_client): resolve live session pty clamping and ensure full-height resize
+- 2bac2e8: fix(triage_client): render live output after an output_seq epoch reset
+- 5713d0d: fix(triage_client): pin the xterm fork fix for detached lines on scroll
+- 2d1b8f0: fix(triage_client): rebind the terminal controller when a session is swapped
+- HEAD: fix(triage_client): restore web terminal tab shell autocompletion
+
+## Research & Discoveries
+
+- 2026-09-08T22:15-0400 The daemon's HTTP port serves only `/ws`, `/pair`, and the Flutter bundle. `/api/sessions` falls through to `index.html`, so curl against it appears to succeed while returning the SPA. Live session state is only reachable over the control socket at `$TMPDIR/triage-501/triage.sock`, which speaks one JSON `WireRequest` per line (externally-tagged serde, so `"ListSessions"` is a bare string and `{"SnapshotSession": {"session_id": "session-218"}}` a map).
+- 2026-09-08T22:15-0400 `SnapshotSession` returns `visible_rows`, `cursor`, `output_seq`, `bytes_logged`, `exited`, and `context` — enough to distinguish a wedged PTY from a client that is not rendering. That distinction settled this bug in one call.
+- 2026-09-08T22:15-0400 `output_seq` is per-daemon-instance and is not preserved across an adoption; `bytes_logged` is. The daemon listed one adopted session under two ids reporting identical `bytes_logged` (31169681) with `output_seq` 2474 and 98838. Byte offsets are the stable identity across a handover; sequence numbers are not.
+- 2026-09-08T22:15-0400 Live `Output` events carry only `output_seq` and `bytes` — no log byte offset — so the live path cannot dedup on the stable identity and must reason about seq epochs instead.
+
+- 2026-09-08T23:12-0400 A console line number for a `debugPrint` string points at the logger, not the throw site. `main.dart.js:28559` was `console.log(a)` inside `debugPrint`; static hunting from it found nothing because there was nothing there. Release frames need a `--source-maps` build and an explicit mapping pass.
+- 2026-09-08T23:12-0400 `Buffer.scrollUp`/`scrollDown` shift lines with `lines[i] = lines[i +/- n]`, which routes through `_adoptChild` and leaves one line object referenced by two slots. The `_detach` in a later `_adoptChild` then detaches an element still reachable from the other slot. The aliasing is the defect; `_moveChild` is only where it surfaces.
+- 2026-09-08T23:12-0400 The crash is independent of buffer capacity — it throws at `maxLines` 100 and 200000 alike — so it is not a trimming or wrap-around problem, which is what the fork's previous fixes in this file addressed.
+- 2026-09-08T23:12-0400 Codex reaches the faulty path because its redraws set and clear scrolling regions constantly (`ESC[1;27r`, `ESC[r`, `ESC[1;39r`, `ESC[1;9r`) and issue reverse index (`ESC M`). With `marginTop == 0` on the normal buffer, `Buffer.index()` takes the `lines.insert(absoluteMarginBottom + 1, ...)` branch instead of `scrollUp(1)`.
+
+- 2026-09-09T06:33-0400 The daemon caps a session's replayed history tail at 4 MiB. Every blank Antigravity session reported `raw_output` of exactly 4194304 bytes while every rendering one reported `raw_output == bytes_logged`; a capped tail starts mid-stream with the cursor at column 0, which is what reached the `eraseRange` bug. Comparing `rawlen` against `bytes_logged` across all sessions is a fast way to spot replay-tail problems.
+- 2026-09-09T06:33-0400 `DAEMON_MAX_OPEN_FILES` is 10240 and `raise_fd_limit()` runs at startup (`main.rs`), so `launchctl limit maxfiles` (256) is only what the process starts with, not its ceiling. Reading the launchd default and calling it the limit produced a false EMFILE alarm; the live limit needs `launchctl procinfo <pid>`. The installed LaunchAgent plist predates the `SoftResourceLimits` key the installer now writes, so this daemon relies solely on its own `setrlimit`.
+
+## Lessons Learned
+
+- 2026-09-08T22:15-0400 "Session won't take input" is not evidence that input is failing. Here every keystroke reached the PTY and Codex answered all three prompts; only the rendering was broken. Reading the server's own terminal buffer before touching client code would have separated the two on the first step, and nine prior plans searched the input and focus paths for a fault that was in the output path.
+- 2026-09-08T22:15-0400 A blinking cursor is a signal that xterm is alive and focused — that is, that focus and input are *working*. It argues against the focus-and-lease hypotheses rather than for them.
+- 2026-09-08T22:15-0400 Silent-drop paths need a regression escape hatch. De-duplication that trusts a monotonic counter fails permanently, not transiently, once its baseline outlives the numbering it came from, and it fails invisibly because dropping is indistinguishable from receiving nothing.
+- 2026-09-08T22:15-0400 A `copyWith` written as `field ?? this.field` cannot express "clear", so any field that legitimately needs clearing is quietly unclearable. The stale baseline could not have been reset by any caller even where the code plainly intended to.
+- 2026-09-08T23:12-0400 Fixing one bug can reveal the next one rather than finish the job. The epoch fix was correct and the session still failed, because a second, independent defect sat behind it. "Still broken after the fix" is not evidence the fix was wrong — here it was evidence the first bug had been hiding the second.
+- 2026-09-08T23:12-0400 Record where state was mutated, do not infer it. Two passes of reading `_moveChild`, `insert` and `trimStart` produced three wrong hypotheses (same-slot collision, buffer fullness, `trimStart` leftovers). Stashing a `StackTrace` on the item in `_detach` answered it on the first run.
+- 2026-09-08T23:12-0400 A catch that spans a whole operation must keep its stack. `catch (e)` over attach, replay, regroup, drain and resize turned a one-line defect into three round trips, and the fix is five characters plus the log.
+- 2026-09-09T06:33-0400 Instrument the seams before theorising past the second hypothesis. Four wrong causes (`?? 0` on `output_seq`, the store, main-thread starvation, the epoch fix) each survived a round of code reading and died to a measurement. The `TDBG` trace took ten minutes and answered it on the first run; it should have come hours earlier.
+- 2026-09-09T06:33-0400 Identity, not behaviour, is what proves a wiring bug. Every stage logged plausible-looking work; only tagging the controller with `identityHashCode` showed the pane and the store holding different instances. When output "vanishes" between two correct-looking stages, log *which object* each stage is talking to.
+- 2026-09-09T06:33-0400 A symptom that tracks content is worth distrusting. "Codex breaks, then Antigravity breaks" pointed at terminal streams for hours; the real split was lifecycle — swapped daemon sessions versus a local session that is never swapped. `flutter-spike` worked the whole time and was the control that would have shown this.
+- 2026-09-09T06:33-0400 Fixing a real bug is not evidence it was *the* bug. Both xterm fixes are correct and provable, and neither addressed the blank panes. Deploying them while assuming otherwise cost two rounds and made the state harder to reason about, because it changed several things between observations.

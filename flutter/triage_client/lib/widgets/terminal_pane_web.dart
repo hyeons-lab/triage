@@ -1,9 +1,11 @@
 // ignore_for_file: avoid_web_libraries_in_flutter, uri_does_not_exist, deprecated_member_use
+import '../terminal/debug_log.dart';
 
 import 'dart:async';
 import 'dart:html' as html;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
+
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +14,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
+
 import 'terminal_pane.dart';
 
 class TerminalPane extends StatefulWidget {
@@ -67,15 +70,48 @@ class TerminalPane extends StatefulWidget {
     }
   }
 
+  /// Re-points a live session's terminal wiring at [controller].
+  ///
+  /// Loading a daemon session replaces the placeholder `SessionVm` with the
+  /// real one, and the replacement constructs its own [TerminalController].
+  /// The mounted pane keeps listening to the old one, so the store's writes
+  /// reach a controller the pane never hears: the emulator is created and the
+  /// bytes are decoded, but nothing paints. Call this after the swap so the
+  /// session's listeners follow the controller that is actually being written.
+  static void rebindSessionController(
+    String terminalId,
+    TerminalController controller,
+  ) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _TerminalPaneState._bindPersistentSessionControllerFor(
+      sanitizedId,
+      controller,
+    );
+    _TerminalPaneState._sessionInputRouter.rebind(sanitizedId, controller);
+    // The pane's own view listeners (resize/fit/refit/history-replayed) are
+    // bound per instance, so a mounted pane has to move them too or it stops
+    // hearing about sizing on the new controller.
+    final pane = _TerminalPaneState._containerEventOwners[sanitizedId];
+    pane?._rebindViewListenersTo(controller);
+  }
+
+  static (int, int)? getCachedTerminalSize(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final term = _TerminalPaneState._sessionTerms[sanitizedId];
+    if (term != null) {
+      try {
+        final cols = (js_util.getProperty(term, 'cols') as num?)?.toInt();
+        final rows = (js_util.getProperty(term, 'rows') as num?)?.toInt();
+        if (cols != null && rows != null && cols >= 10 && rows >= 5) {
+          return (rows, cols);
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
-}
-
-class _InputDedupeRecord {
-  int onDataTime = 0;
-  String? onDataText;
-  int mobileTime = 0;
-  String? mobileText;
 }
 
 class _TerminalPaneState extends State<TerminalPane> {
@@ -87,7 +123,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, dynamic> _sessionOnResizeSubscriptions = {};
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
-  static final Map<String, _InputDedupeRecord> _sessionInputDedupe = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
 
   static bool _viewportIsAtBottom(
@@ -135,7 +170,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
-    _TerminalPaneState._sessionInputDedupe.remove(sanitizedId);
     _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
@@ -195,7 +229,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
-  StreamSubscription<html.KeyboardEvent>? _containerKeyDownSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   void Function(html.Event)? _containerPasteListener;
   void Function(html.Event)? _textareaBeforeInputListener;
@@ -230,6 +263,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   Timer? _suppressScrollSaveTimer;
   final List<Timer> _focusRetryTimers = [];
 
+  void _clearFocusRetryTimers() {
+    for (final timer in _focusRetryTimers) {
+      timer.cancel();
+    }
+    _focusRetryTimers.clear();
+  }
+
   void _suppressScrollSaveFor(Duration duration) {
     _suppressScrollSave = true;
     _suppressScrollSaveTimer?.cancel();
@@ -247,6 +287,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _lastRefitCols;
   int? _lastRefitRows;
   html.TextAreaElement? _cachedTextarea;
+  html.TextAreaElement? get _activeTextarea {
+    if (_cachedTextarea?.isConnected != true) {
+      _cachedTextarea =
+          _container.querySelector('textarea') as html.TextAreaElement?;
+    }
+    return _cachedTextarea;
+  }
 
   @override
   void initState() {
@@ -294,6 +341,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
+      if (_lastFittedCols != null && _lastFittedRows != null) {
+        _writeInitialContent(
+          overrideCols: _lastFittedCols,
+          overrideRows: _lastFittedRows,
+        );
+        if (_lastFittedRows! >= 5 && _lastFittedCols! >= 10) {
+          _sessionInputRouter.sendResizeOut(
+            sanitizedId,
+            _lastFittedCols!,
+            _lastFittedRows!,
+          );
+        }
+      }
       _onFit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
@@ -302,6 +362,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _container = html.DivElement()
         ..style.width = '100%'
         ..style.height = '100%'
+        ..style.minHeight = '100%'
         ..style.backgroundColor = '#0d1113'
         ..style.overflow = 'hidden';
 
@@ -316,8 +377,6 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (mounted) {
               _styleSheetLoaded = true;
               try {
-                _resetTerminalSafe();
-                _initialContentWritten = false;
                 _stableWidth = null;
                 _stableHeight = null;
                 _forceFinalizeTimer?.cancel();
@@ -336,8 +395,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           _styleSheetLoaded = true;
           if (_initialized) {
             try {
-              _resetTerminalSafe();
-              _initialContentWritten = false;
               _stableWidth = null;
               _stableHeight = null;
               _forceFinalizeTimer?.cancel();
@@ -352,6 +409,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _terminalWrapper = html.DivElement()
         ..style.width = 'calc(100% - ${marginPx * 2}px)'
         ..style.height = '100%'
+        ..style.minHeight = '100%'
         ..style.marginLeft = '${marginPx}px'
         ..style.marginRight = '${marginPx}px'
         ..style.overflow = 'hidden';
@@ -367,19 +425,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
           _writeInitialContent();
-          for (final delayMs in const [50, 150]) {
-            _focusRetryTimers.add(
-              Timer(Duration(milliseconds: delayMs), () {
-                if (mounted &&
-                    _initialized &&
-                    (_currentRoute?.isCurrent ?? true)) {
-                  _activateTerminal();
-                }
-              }),
-            );
-          }
         }
         _activateTerminal();
+        _scheduleFocusRetries();
       }
     });
 
@@ -387,19 +435,17 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (event is html.KeyboardEvent) {
         final isCurrent = _currentRoute?.isCurrent ?? true;
         if (!widget.isExited && isCurrent && _eventTargetsTerminal(event)) {
-          if (event.key == 'Tab' || event.keyCode == 9 || event.code == 'Tab') {
-            event.preventDefault();
-            event.stopPropagation();
-            if (event.shiftKey) {
-              _sendInput('\x1B[Z');
-            } else {
-              _sendInput('\t');
-            }
-          } else if ((event.ctrlKey || event.metaKey) && event.key == 'c') {
+          // Allow IME composition to proceed natively.
+          if (event.isComposing == true || event.key == 'Process') {
+            return;
+          }
+
+          if ((event.ctrlKey || event.metaKey) &&
+              (event.key == 'c' || event.key == 'C')) {
             // Prefer xterm.js's own selection: it rebuilds the row text from the
             // buffer with the inter-column spaces intact. The browser-native
             // window.getSelection() serializes the DOM-renderer's per-cell spans
-            // instead, which concatenates the columns and drops those spaces —
+            // instead, which concatenates the columns and drops those spaces,
             // so only fall back to it when xterm has no selection of its own.
             var selection = '';
             try {
@@ -424,51 +470,74 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              // Logged rather than swallowed: a rejected write and an empty
-              // selection both present as "the copy did nothing", and with the
-              // error dropped there was no way to tell them apart from the
-              // console. Failure is still non-fatal, so the terminal keeps its
-              // keystroke handling either way.
               html.window.navigator.clipboard?.writeText(selection).catchError((
                 Object error,
               ) {
                 debugPrint('Terminal copy failed: $error');
               });
+              return;
+            }
+            // If no text is selected on macOS with Cmd+C, do not send SIGINT.
+            if (event.metaKey && !event.ctrlKey) {
+              return;
             }
           } else if ((event.ctrlKey || event.metaKey) &&
               (event.key == 'v' || event.key == 'V')) {
             // Deliberately not handled here: paste is left to the browser.
-            //
-            // Calling `preventDefault` on this keydown is what suppresses the
-            // native paste action, and with it the `paste` event that
-            // `_containerPasteListener` is waiting for. What was left was
-            // `navigator.clipboard.readText()`, which needs the `clipboard-read`
-            // permission; that sits at `prompt` until the user accepts, and a
-            // single dismissal denies it for the origin from then on. The
-            // rejection was swallowed, so paste simply stopped working with
-            // nothing logged.
-            //
-            // Letting the event through costs nothing and needs no permission: a
-            // user-initiated paste hands the page its own text on the `paste`
-            // event. The branch is inert, and deleting it would behave exactly
-            // the same, since `_keyboardEventToInput` already returns null for a
-            // ctrl/meta-modified "v". It is kept only as the marker saying the
-            // interception was removed on purpose, sitting next to the reason.
-          } else {
-            // When the xterm.js helper textarea is NOT yet the active element in the DOM
-            // (e.g. after clicking outside or on initial interaction), the browser fires
-            // keydown on body and does NOT deliver text input to a textarea focused in-flight.
-            // We immediately forward this first keystroke to the session and focus the textarea
-            // with preventDefault so subsequent keystrokes flow natively through xterm.onData.
-            if (!_isActiveElementInTerminal()) {
-              final input = _keyboardEventToInput(event);
-              if (input != null && input.isNotEmpty) {
-                event.preventDefault();
-                event.stopPropagation();
-                _sendInput(input);
-              }
-              _activateTerminal();
-            }
+            return;
+          }
+
+          // Intercept Enter unconditionally when targeting the terminal:
+          // In Flutter Web, Enter events risk being swallowed by ActivateIntent
+          // or browser form activation before reaching the PTY. Intercepting here
+          // in the window capture listener guarantees the newline is delivered
+          // immediately and prevented from bubbling to Flutter.
+          if (event.key == 'Enter' ||
+              event.code == 'Enter' ||
+              event.code == 'NumpadEnter' ||
+              event.keyCode == 13) {
+            event.preventDefault();
+            event.stopPropagation();
+            widget.controller.notifyInteraction();
+            final altKey = event.altKey;
+            _sendInput(altKey ? '\x1b\r' : '\r');
+            _activateTerminal();
+            return;
+          }
+
+          // Intercept Tab unconditionally when targeting the terminal:
+          // In Flutter Web, Tab events risk triggering browser focus navigation
+          // or being swallowed by Flutter focus traversal before reaching the PTY.
+          // Intercepting here in the window capture listener guarantees the tab
+          // character is delivered immediately to shell autocomplete and prevented
+          // from escaping focus or bubbling to Flutter.
+          if (event.key == 'Tab' || event.code == 'Tab' || event.keyCode == 9) {
+            event.preventDefault();
+            event.stopPropagation();
+            widget.controller.notifyInteraction();
+            final shiftKey = event.shiftKey;
+            _sendInput(shiftKey ? '\x1b[Z' : '\t');
+            _activateTerminal();
+            return;
+          }
+
+          // If the terminal's helper textarea already has DOM focus, let xterm.js
+          // handle all keystrokes natively through its focused helper element.
+          if (_isActiveElementInTerminal()) {
+            return;
+          }
+
+          // Otherwise, focus is outside the terminal (such as ambient keydown after
+          // clicking outside or on initial interaction). Forward this initial keystroke
+          // to the session and activate the terminal so subsequent keystrokes flow
+          // natively through xterm.onData.
+          final input = _keyboardEventToInput(event);
+          if (input != null && input.isNotEmpty) {
+            event.preventDefault();
+            event.stopPropagation();
+            widget.controller.notifyInteraction();
+            _sendInput(input);
+            _activateTerminal();
           }
         }
       }
@@ -506,32 +575,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     try {
       js_util.callMethod(_term, 'scrollToBottom', []);
     } catch (_) {}
+    if (!_initialContentWritten &&
+        (_lastFittedCols ?? 0) >= 10 &&
+        (_lastFittedRows ?? 0) >= 5) {
+      _finishInitialContent(_lastFittedCols!, _lastFittedRows!);
+    } else {
+      _flushPendingLiveWrites();
+    }
     _sessionInputRouter.sendInput(_sanitizedId, data);
-    _focusTerminal();
   }
 
   // Routes text input from the helper textarea (such as mobile soft keyboards).
-  // Folds sticky Ctrl when armed, routes multi-line input through the paste
-  // handler, and deduplicates against xterm.js onData callbacks.
+  // Folds sticky Ctrl when armed, and routes multi-line input through the paste
+  // handler.
   void _sendMobileInput(String text) {
     if (!mounted || widget.isExited || text.isEmpty) return;
     if (_currentRoute?.isCurrent == false) return;
-
-    final dedupe = _sessionInputDedupe.putIfAbsent(
-      _sanitizedId,
-      () => _InputDedupeRecord(),
-    );
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - dedupe.onDataTime < 35 && dedupe.onDataText == text) {
-      dedupe.onDataText = null;
-      return;
-    }
-    if (now - dedupe.onDataTime >= 35) {
-      dedupe.onDataText = null;
-    }
-
-    dedupe.mobileTime = now;
-    dedupe.mobileText = text;
 
     if (_ctrlArmed) {
       _setCtrlArmed(false);
@@ -555,24 +614,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     _sendInput(text);
-  }
-
-  // Refocus the terminal without sending anything, so a bar tap never steals
-  // focus and so never dismisses the soft keyboard.
-  void _focusTerminal() {
-    if (_initialized && !widget.isExited) {
-      try {
-        final textarea = _cachedTextarea ??=
-            _container.querySelector('textarea') as html.TextAreaElement?;
-        if (textarea != null) {
-          final opts = js_util.newObject();
-          js_util.setProperty(opts, 'preventScroll', true);
-          js_util.callMethod(textarea, 'focus', [opts]);
-        } else {
-          js_util.callMethod(_term, 'focus', []);
-        }
-      } catch (_) {}
-    }
   }
 
   // Sticky Ctrl for the on-screen accessory bar (mobile web): when armed, the
@@ -636,25 +677,144 @@ class _TerminalPaneState extends State<TerminalPane> {
     return false;
   }
 
-  void _activateTerminal() {
-    if (!_initialized || widget.isExited) return;
+  static html.Element? _deepActiveElement() {
+    try {
+      var active = html.document.activeElement;
+      while (active != null) {
+        final shadow =
+            active.shadowRoot ??
+            (js_util.hasProperty(active, 'shadowRoot')
+                ? js_util.getProperty(active, 'shadowRoot') as html.Node?
+                : null);
+        if (shadow != null) {
+          final shadowActive =
+              js_util.getProperty(shadow, 'activeElement') as html.Element?;
+          if (shadowActive != null && shadowActive != active) {
+            active = shadowActive;
+            continue;
+          }
+        }
+        break;
+      }
+      return active;
+    } catch (_) {
+      return html.document.activeElement;
+    }
+  }
+
+  static bool _isFlutterInternalElement(html.Element? element) {
+    if (element == null) return false;
+    try {
+      html.Element? curr = element;
+      while (curr != null) {
+        final tag = curr.tagName.toLowerCase();
+        final cls = curr.className.toLowerCase();
+        if (tag.startsWith('flt-') ||
+            tag.startsWith('flutter-') ||
+            cls.contains('flt-') ||
+            cls.contains('flutter-')) {
+          return true;
+        }
+        curr = curr.parent;
+      }
+      final rootNode = js_util.callMethod(element, 'getRootNode', []);
+      if (rootNode != null && rootNode != html.document) {
+        final host = js_util.getProperty(rootNode, 'host') as html.Element?;
+        html.Element? hostCurr = host;
+        while (hostCurr != null) {
+          final hostTag = hostCurr.tagName.toLowerCase();
+          final hostCls = hostCurr.className.toLowerCase();
+          if (hostTag.startsWith('flt-') ||
+              hostTag.startsWith('flutter-') ||
+              hostCls.contains('flt-') ||
+              hostCls.contains('flutter-')) {
+            return true;
+          }
+          hostCurr = hostCurr.parent;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  bool _isExternalInput(html.Element? element) {
+    if (element == null) return false;
+    if (_container.contains(element)) return false;
+    // An xterm helper textarea belonging to this or any other session is a terminal
+    // input, not an external form control (such as a modal search box or pairing input).
+    if (element is html.TextAreaElement &&
+        (element.classes.contains('xterm-helper-textarea') ||
+            _sessionContainers.values.any((c) => c.contains(element)))) {
+      return false;
+    }
+    // Flutter Web engine internal text editing host elements must not block the terminal
+    // unless a Flutter EditableText currently holds primary focus.
+    if (_isFlutterInternalElement(element)) {
+      final primaryFocus = FocusManager.instance.primaryFocus;
+      if (primaryFocus != null &&
+          primaryFocus != _focusNode &&
+          primaryFocus.context != null) {
+        final ctx = primaryFocus.context!;
+        return ctx.widget is EditableText ||
+            ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+      }
+      return false;
+    }
+    return element is html.InputElement ||
+        element is html.SelectElement ||
+        element is html.TextAreaElement ||
+        element.isContentEditable == true;
+  }
+
+  void _scheduleFocusRetries({bool force = false}) {
+    _clearFocusRetryTimers();
+    for (final delayMs in const [50, 150, 300]) {
+      late final Timer timer;
+      timer = Timer(Duration(milliseconds: delayMs), () {
+        _focusRetryTimers.remove(timer);
+        if (!mounted || !_initialized || !(_currentRoute?.isCurrent ?? true)) {
+          return;
+        }
+        if (_isActiveElementInTerminal()) {
+          _clearFocusRetryTimers();
+          return;
+        }
+        _activateTerminal(force: force);
+      });
+      _focusRetryTimers.add(timer);
+    }
+  }
+
+  void _activateTerminal({bool force = false}) {
+    if (!mounted || !_initialized || widget.isExited) return;
     final isCurrent = _currentRoute?.isCurrent ?? true;
     if (!isCurrent) return;
 
-    final active = html.document.activeElement;
-    if (active is html.InputElement ||
-        (active is html.TextAreaElement && !_container.contains(active)) ||
-        (active != null && active.isContentEditable == true)) {
+    if (!force) {
+      final active = _deepActiveElement();
+      if (_isExternalInput(active)) {
+        return;
+      }
+    }
+
+    _currentMountedPane = this;
+    _containerEventOwners[_sanitizedId] = this;
+    widget.controller.notifyInteraction();
+
+    final isConnected = _container.isConnected ?? true;
+    if (!isConnected) {
+      html.window.requestAnimationFrame((_) {
+        if (mounted && _initialized) {
+          _activateTerminal(force: force);
+        }
+      });
       return;
     }
-    if (mounted && _focusNode.canRequestFocus && !_focusNode.hasFocus) {
-      _focusNode.requestFocus();
-    }
+
     try {
-      final textarea = _cachedTextarea ??=
-          _container.querySelector('textarea') as html.TextAreaElement?;
+      final textarea = _activeTextarea;
       if (textarea != null) {
-        if (_textareaBeforeInputListener == null) {
+        if (_isMobile && _textareaBeforeInputListener == null) {
           _bindTextareaEvents();
         }
         final opts = js_util.newObject();
@@ -663,6 +823,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       js_util.callMethod(_term, 'focus', []);
     } catch (_) {}
+
+    if (_pendingLiveWriteBuffer.isNotEmpty) {
+      _flushPendingLiveWrites();
+    }
   }
 
   void _initTerminal(String sanitizedId) {
@@ -710,6 +874,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
       _sessionTerms[sanitizedId] = _term;
+      tdbg('pane.initTerm', '$sanitizedId xterm.js instance created');
       js_util.setProperty(html.window, 'activeTerm', _term);
 
       js_util.callMethod(_term, 'open', [_terminalWrapper]);
@@ -804,14 +969,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.onViewFit?.call(fittedCols, fittedRows);
   }
 
-  void _resetTerminalSafe() {
-    if (!_initialized) return;
-    try {
-      js_util.callMethod(_term, 'clear', []);
-      js_util.callMethod(_term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
-    } catch (_) {}
-  }
-
   void _bindTerminalSubscriptions() {
     _inputRouteToken = _sessionInputRouter.bind(
       _sanitizedId,
@@ -822,22 +979,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        final dedupe = _sessionInputDedupe.putIfAbsent(
-          sessionId,
-          () => _InputDedupeRecord(),
-        );
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - dedupe.mobileTime < 35 && dedupe.mobileText == data) {
-          dedupe.mobileText = null;
-          return;
-        }
-        if (now - dedupe.mobileTime >= 35) {
-          dedupe.mobileText = null;
-        }
-
-        dedupe.onDataTime = now;
-        dedupe.onDataText = data;
-
         _sessionSavedViewportY.remove(sessionId);
         try {
           final term = _sessionTerms[sessionId];
@@ -845,6 +986,19 @@ class _TerminalPaneState extends State<TerminalPane> {
             js_util.callMethod(term, 'scrollToBottom', []);
           }
         } catch (_) {}
+        final activePane = _containerEventOwners[sessionId];
+        if (activePane != null) {
+          if (!activePane._initialContentWritten &&
+              (activePane._lastFittedCols ?? 0) >= 10 &&
+              (activePane._lastFittedRows ?? 0) >= 5) {
+            activePane._finishInitialContent(
+              activePane._lastFittedCols!,
+              activePane._lastFittedRows!,
+            );
+          } else {
+            activePane._flushPendingLiveWrites();
+          }
+        }
         // Sticky Ctrl (accessory bar): fold an armed Ctrl into the next single
         // character before it reaches the session: arming Ctrl then typing "c"
         // on the soft keyboard sends 0x03 (SIGINT), not a literal "c". A
@@ -946,20 +1100,79 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     try {
+      final sessionId = _sanitizedId;
       js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
         js_util.allowInterop((dynamic event) {
+          final type = js_util.getProperty(event, 'type') as String?;
+          if (type != null && type != 'keydown') {
+            return true;
+          }
           final key = js_util.getProperty(event, 'key') as String?;
-          if (key == 'Tab') {
+          final code = js_util.getProperty(event, 'code') as String?;
+          final keyCode = js_util.getProperty(event, 'keyCode') as num?;
+          if (key == 'Enter' ||
+              key == '\r' ||
+              key == '\n' ||
+              code == 'Enter' ||
+              code == 'NumpadEnter' ||
+              keyCode == 13) {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final altKey =
+                js_util.getProperty(event, 'altKey') as bool? ?? false;
+            _sessionInputRouter.sendInput(sessionId, altKey ? '\x1b\r' : '\r');
+            return false;
+          }
+          if (key == 'Escape' ||
+              key == 'Esc' ||
+              code == 'Escape' ||
+              keyCode == 27) {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            final altKey =
+                js_util.getProperty(event, 'altKey') as bool? ?? false;
+            _sessionInputRouter.sendInput(
+              sessionId,
+              altKey ? '\x1b\x1b' : '\x1b',
+            );
+            return false;
+          }
+          if (key == 'Tab' || code == 'Tab' || keyCode == 9) {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
             final shiftKey =
                 js_util.getProperty(event, 'shiftKey') as bool? ?? false;
             if (shiftKey) {
-              _sendInput('\x1B[Z');
+              _sessionInputRouter.sendInput(sessionId, '\x1b[Z');
             } else {
-              _sendInput('\t');
+              _sessionInputRouter.sendInput(sessionId, '\t');
             }
             return false;
+          }
+          final ctrlKey =
+              js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
+          final metaKey =
+              js_util.getProperty(event, 'metaKey') as bool? ?? false;
+          if ((ctrlKey || metaKey) && (key == 'c' || key == 'C')) {
+            var selection = '';
+            try {
+              selection =
+                  js_util.callMethod(_term, 'getSelection', []) as String? ??
+                  '';
+            } catch (_) {}
+            if (selection.isNotEmpty) {
+              js_util.callMethod(event, 'preventDefault', []);
+              js_util.callMethod(event, 'stopPropagation', []);
+              html.window.navigator.clipboard?.writeText(selection).catchError((
+                Object error,
+              ) {
+                debugPrint('Terminal copy failed: $error');
+              });
+              return false;
+            }
+            if (metaKey && !ctrlKey) {
+              return false;
+            }
           }
           return true;
         }),
@@ -988,26 +1201,74 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {}
   }
 
-  void _bindPersistentSessionController(TerminalController controller) {
-    final existingController = _sessionBoundControllers[_sanitizedId];
+  void _bindPersistentSessionController(TerminalController controller) =>
+      _bindPersistentSessionControllerFor(_sanitizedId, controller);
+
+  /// Attaches the session's persistent write/clear listeners to [controller].
+  ///
+  /// Addressed by session id rather than by pane instance because the
+  /// controller can be replaced while the pane stays mounted: loading a daemon
+  /// session swaps the placeholder `SessionVm` for the real one, and the
+  /// replacement builds its own `TerminalController`. A pane that is not
+  /// rebuilt never sees that swap, so the rebind has to be reachable without
+  /// one.
+  static void _bindPersistentSessionControllerFor(
+    String sanitizedId,
+    TerminalController controller,
+  ) {
+    final existingController = _sessionBoundControllers[sanitizedId];
     if (identical(existingController, controller)) {
+      tdbg(
+        'pane.bind',
+        '$sanitizedId SKIP (already bound to '
+            'ctrl#${identityHashCode(controller)})',
+      );
       return;
     }
-    _unbindPersistentSessionController(_sanitizedId);
-    _sessionBoundControllers[_sanitizedId] = controller;
-    final sessionId = _sanitizedId;
+    tdbg(
+      'pane.bind',
+      '$sanitizedId BIND ctrl#${identityHashCode(controller)} '
+          '(was ctrl#${existingController == null ? "none" : identityHashCode(existingController)})',
+    );
+    _unbindPersistentSessionController(sanitizedId);
+    _sessionBoundControllers[sanitizedId] = controller;
+    final sessionId = sanitizedId;
 
     void onWrite(String data) {
+      final term = _sessionTerms[sessionId];
+      if (term != null) {
+        try {
+          js_util.callMethod(term, 'write', [data]);
+          tdbg(
+            'pane.onWrite',
+            '$sessionId -> xterm.js ok; '
+                '${tdbgPreview(data)}',
+          );
+        } catch (error, stack) {
+          // Was `catch (_) {}`: an xterm.js write that threw left the pane
+          // blank and the console clean, which is indistinguishable from bytes
+          // that never arrived.
+          tdbg('pane.onWrite', '$sessionId -> xterm.js THREW: $error\n$stack');
+        }
+        return;
+      }
       final activePane = _containerEventOwners[sessionId];
-      if (activePane != null && !activePane._initialContentWritten) {
+      if (activePane != null) {
+        tdbg(
+          'pane.onWrite',
+          '$sessionId no term -> buffered '
+              '(${activePane._pendingLiveWriteBuffer.length + 1} chunks, '
+              'initialWritten=${activePane._initialContentWritten}, '
+              'fitted=${activePane._lastFittedCols}x${activePane._lastFittedRows}); '
+              '${tdbgPreview(data)}',
+        );
         activePane._pendingLiveWriteBuffer.add(data);
       } else {
-        final term = _sessionTerms[sessionId];
-        if (term != null) {
-          try {
-            js_util.callMethod(term, 'write', [data]);
-          } catch (_) {}
-        }
+        tdbg(
+          'pane.onWrite',
+          '$sessionId DROPPED (no term, no active pane); '
+              '${tdbgPreview(data)}',
+        );
       }
     }
 
@@ -1024,7 +1285,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (term != null) {
         try {
           js_util.callMethod(term, 'clear', []);
-          js_util.callMethod(term, 'write', ['\x1b[2J\x1b[3J\x1b[H']);
         } catch (_) {}
       }
     }
@@ -1049,8 +1309,32 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  /// Moves this pane's view listeners onto [controller], leaving the session's
+  /// persistent write/clear listeners to [_bindPersistentSessionControllerFor].
+  void _rebindViewListenersTo(TerminalController controller) {
+    if (identical(_boundViewController, controller)) return;
+    final previous = _boundViewController;
+    if (previous != null) _unbindControllerFrom(previous);
+    _boundViewController = controller;
+    controller.addResizeListener(_onResize);
+    controller.addFitListener(_onFit);
+    controller.addRefitListener(_onRefit);
+    controller.addHistoryReplayedListener(_onHistoryReplayed);
+    tdbg(
+      'pane.rebind',
+      '$_sanitizedId view listeners -> '
+          'ctrl#${identityHashCode(controller)}',
+    );
+  }
+
+  // The controller this pane's view listeners are currently attached to, which
+  // is not always `widget.controller`: the session's controller can be replaced
+  // without the pane being rebuilt.
+  TerminalController? _boundViewController;
+
   void _bindController() {
     _bindPersistentSessionController(widget.controller);
+    _boundViewController = widget.controller;
     widget.controller.addResizeListener(_onResize);
     widget.controller.addFitListener(_onFit);
     widget.controller.addRefitListener(_onRefit);
@@ -1109,16 +1393,20 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   // One fit-and-force-send pass. `force` sends even when the fitted size is
-  // unchanged — needed on the first pass so a device-reclaim (right grid, wrong
+  // unchanged: needed on the first pass so a device-reclaim (right grid, wrong
   // host) still corrects; the delayed retries pass `false`, so a settled refit
   // does not jiggle the host on every tick, only when a tick actually changes
   // the fitted size.
   void _refitAndSend({required bool force}) {
-    // Not during the first-fit handshake: that path owns the initial size and
-    // its own host sync, and a force-send here would bypass its history-flush
-    // gate. Refit/resume happen well after load, so this only guards the edge.
-    if (!_initialContentWritten) return;
     _onFit();
+    if (!_initialContentWritten) {
+      final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt();
+      final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt();
+      if (cols != null && rows != null && cols >= 10 && rows >= 5) {
+        _finishInitialContent(cols, rows);
+      }
+      return;
+    }
     final cols = (js_util.getProperty(_term, 'cols') as num).toInt();
     final rows = (js_util.getProperty(_term, 'rows') as num).toInt();
     if (cols < 2 || rows < 2) return;
@@ -1173,7 +1461,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
       if (_initialized) {
         try {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         } catch (_) {}
       }
     });
@@ -1181,7 +1470,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = _container.onClick.listen((event) {
       if (_initialized) {
         try {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         } catch (_) {}
       }
     });
@@ -1189,14 +1479,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
       if (_initialized) {
         try {
-          _activateTerminal();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         } catch (_) {}
-      }
-    });
-
-    _containerKeyDownSubscription = _container.onKeyDown.listen((event) {
-      if (event.key == 'Tab') {
-        event.preventDefault();
       }
     });
 
@@ -1232,8 +1517,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _bindTextareaEvents() {
     if (!_isMobile) return;
 
-    final textarea = _cachedTextarea ??=
-        _container.querySelector('textarea') as html.TextAreaElement?;
+    final textarea = _activeTextarea;
     if (textarea == null) return;
 
     try {
@@ -1472,8 +1756,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = null;
     _containerTouchEndSubscription?.cancel();
     _containerTouchEndSubscription = null;
-    _containerKeyDownSubscription?.cancel();
-    _containerKeyDownSubscription = null;
     _containerWheelSubscription?.cancel();
     _containerWheelSubscription = null;
     final pasteListener = _containerPasteListener;
@@ -1485,11 +1767,53 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   String? _keyboardEventToInput(html.KeyboardEvent event) {
-    if (event.metaKey || event.altKey) {
+    if (event.metaKey) {
+      if (!event.ctrlKey && !event.altKey) {
+        switch (event.key) {
+          case 'ArrowLeft':
+            return '\x1b[H';
+          case 'ArrowRight':
+            return '\x1b[F';
+          case 'ArrowUp':
+            return '\x1b[5~';
+          case 'ArrowDown':
+            return '\x1b[6~';
+          case 'Backspace':
+            return '\x15';
+          case 'k':
+          case 'K':
+            return '\x0c';
+        }
+      }
       return null;
     }
 
-    if (event.ctrlKey) {
+    if (event.ctrlKey && !event.altKey) {
+      if (event.shiftKey &&
+          (event.key == 'R' ||
+              event.key == 'r' ||
+              event.key == 'I' ||
+              event.key == 'i')) {
+        return null;
+      }
+      switch (event.key) {
+        case 'ArrowLeft':
+          return '\x1b[1;5D';
+        case 'ArrowRight':
+          return '\x1b[1;5C';
+        case 'ArrowUp':
+          return '\x1b[1;5A';
+        case 'ArrowDown':
+          return '\x1b[1;5B';
+        case 'Backspace':
+          return '\x17';
+        case 'Delete':
+          return '\x1b[3;5~';
+        case 'Home':
+          return '\x1b[1;5H';
+        case 'End':
+          return '\x1b[1;5F';
+      }
       final key = event.key?.toLowerCase();
       if (key != null && key.length == 1) {
         final code = key.codeUnitAt(0);
@@ -1516,8 +1840,71 @@ class _TerminalPaneState extends State<TerminalPane> {
       return null;
     }
 
+    if (event.altKey && !event.metaKey && !event.ctrlKey) {
+      switch (event.key) {
+        case 'ArrowLeft':
+        case 'b':
+        case 'B':
+          return '\x1bb';
+        case 'ArrowRight':
+        case 'f':
+        case 'F':
+          return '\x1bf';
+        case 'd':
+        case 'D':
+          return '\x1bd';
+        case 'Backspace':
+          return '\x1b\x7f';
+        case 'Enter':
+          return '\x1b\r';
+        case 'Delete':
+          return '\x1b[3;3~';
+      }
+      if (event.code == 'NumpadEnter') {
+        return '\x1b\r';
+      }
+      final key = event.key;
+      if (key != null && key.length == 1) {
+        return key;
+      }
+      return null;
+    }
+
+    if (event.code == 'NumpadEnter' || event.keyCode == 13) {
+      return '\r';
+    }
+    if (event.code == 'Escape' || event.keyCode == 27) {
+      return '\x1b';
+    }
+    if (event.code == 'Tab' || event.keyCode == 9) {
+      return event.shiftKey ? '\x1b[Z' : '\t';
+    }
+
     final key = event.key;
     if (key == null) return null;
+
+    if (event.shiftKey) {
+      switch (key) {
+        case 'Tab':
+          return '\x1b[Z';
+        case 'ArrowUp':
+          return '\x1b[1;2A';
+        case 'ArrowDown':
+          return '\x1b[1;2B';
+        case 'ArrowRight':
+          return '\x1b[1;2C';
+        case 'ArrowLeft':
+          return '\x1b[1;2D';
+        case 'Home':
+          return '\x1b[1;2H';
+        case 'End':
+          return '\x1b[1;2F';
+        case 'PageUp':
+          return '\x1b[5;2~';
+        case 'PageDown':
+          return '\x1b[6;2~';
+      }
+    }
 
     switch (key) {
       case 'Enter':
@@ -1525,7 +1912,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       case 'Backspace':
         return '\x7f';
       case 'Tab':
-        return event.shiftKey ? '\x1b[Z' : '\t';
+        return '\t';
       case 'Escape':
         return '\x1b';
       case 'ArrowUp':
@@ -1544,8 +1931,34 @@ class _TerminalPaneState extends State<TerminalPane> {
         return '\x1b[5~';
       case 'PageDown':
         return '\x1b[6~';
+      case 'Insert':
+        return '\x1b[2~';
       case 'Delete':
         return '\x1b[3~';
+      case 'F1':
+        return '\x1bOP';
+      case 'F2':
+        return '\x1bOQ';
+      case 'F3':
+        return '\x1bOR';
+      case 'F4':
+        return '\x1bOS';
+      case 'F5':
+        return '\x1b[15~';
+      case 'F6':
+        return '\x1b[17~';
+      case 'F7':
+        return '\x1b[18~';
+      case 'F8':
+        return '\x1b[19~';
+      case 'F9':
+        return '\x1b[20~';
+      case 'F10':
+        return '\x1b[21~';
+      case 'F11':
+        return '\x1b[23~';
+      case 'F12':
+        return '\x1b[24~';
       default:
         if (key.length == 1) {
           return key;
@@ -1560,7 +1973,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       return false;
     }
 
-    if (!identical(_containerEventOwners[_sanitizedId], this)) {
+    if (!identical(_currentMountedPane, this)) {
       return false;
     }
 
@@ -1586,33 +1999,36 @@ class _TerminalPaneState extends State<TerminalPane> {
       return true;
     }
 
-    // Ambient window keydown fallback:
-    // Only the currently mounted/visible pane should handle ambient keystrokes.
-    if (!identical(_currentMountedPane, this)) {
-      return false;
-    }
-
-    // If another Flutter widget explicitly holds primary focus (such as a search
-    // bar, sidebar rail buttons, or form dialogs), do not intercept ambient keystrokes.
+    // If another Flutter widget explicitly holds primary focus and is an editable
+    // text field (such as the rail search box or a modal dialog), do not intercept.
     final primaryFocus = FocusManager.instance.primaryFocus;
     if (primaryFocus != null &&
         primaryFocus != _focusNode &&
         primaryFocus.context != null) {
-      return false;
+      final ctx = primaryFocus.context!;
+      final isEditable =
+          ctx.widget is EditableText ||
+          ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+      if (isEditable) {
+        return false;
+      }
     }
 
     // If focus is currently on an HTML input or textarea outside this terminal
     // (such as a modal search box or pairing input), do not intercept.
-    final active = html.document.activeElement;
-    if (active is html.InputElement ||
-        (active is html.TextAreaElement && !_container.contains(active)) ||
-        (active != null && active.isContentEditable == true)) {
+    // An inactive xterm helper textarea from another session must not block.
+    final active = _deepActiveElement();
+    if (_isExternalInput(active)) {
       return false;
     }
 
     // Do not intercept Tab navigation or Escape from outside the terminal.
     if (event is html.KeyboardEvent) {
-      if (event.key == 'Tab' || event.key == 'Escape') {
+      if (event.key == 'Tab' ||
+          event.code == 'Tab' ||
+          event.key == 'Escape' ||
+          event.key == 'Esc' ||
+          event.code == 'Escape') {
         return false;
       }
     }
@@ -1621,7 +2037,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   bool _isActiveElementInTerminal() {
-    final active = html.document.activeElement;
+    final active = _deepActiveElement();
     if (active == null) return false;
     return _container.contains(active);
   }
@@ -1645,6 +2061,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_pendingLiveWriteBuffer.isEmpty) {
       return;
     }
+    tdbg(
+      'pane.flush',
+      '$_sanitizedId flushing '
+          '${_pendingLiveWriteBuffer.length} buffered chunks '
+          '(term=${_sessionTerms[_sanitizedId] != null})',
+    );
     final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
     _pendingLiveWriteBuffer.clear();
     final term = _term ?? _sessionTerms[_sanitizedId];
@@ -1818,28 +2240,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     js_util.setProperty(options, 'cursorBlink', !widget.isExited);
   }
 
-  void _triggerFullReplayOrReset() {
-    if (!_initialized) return;
-    try {
-      if (_initialContentWritten) {
-        _suppressScrollSaveFor(const Duration(milliseconds: 1000));
-        _resetTerminalSafe();
-        _writeInitialContent();
-      } else {
-        _resetTerminalSafe();
-        _pendingLiveWriteBuffer.clear();
-        _initialContentWritten = false;
-        _stableWidth = null;
-        _stableHeight = null;
-        _triggerFitWithDelayedRetries();
-      }
-    } catch (_) {}
-  }
-
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
     _currentMountedPane = this;
+    _containerEventOwners[_sanitizedId] = this;
     if (oldWidget.bracketedPasteEnabled != widget.bracketedPasteEnabled) {
       _sessionBracketedPasteModes[_sanitizedId] = widget.bracketedPasteEnabled;
       if (_term != null) {
@@ -1861,14 +2266,18 @@ class _TerminalPaneState extends State<TerminalPane> {
           _updateCursorOptions();
         } catch (_) {}
       }
-      if (!_initialContentWritten) {
-        _triggerFullReplayOrReset();
-      }
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _focusCursorNowAndAfterReplay();
+      _scheduleFocusRetries(force: true);
     }
     if (oldWidget.controller != widget.controller) {
+      tdbg(
+        'pane.didUpdate',
+        '$_sanitizedId controller changed '
+            'ctrl#${identityHashCode(oldWidget.controller)} -> '
+            'ctrl#${identityHashCode(widget.controller)}',
+      );
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
       _inputRouteToken = _sessionInputRouter.bind(
@@ -1876,8 +2285,30 @@ class _TerminalPaneState extends State<TerminalPane> {
         widget.controller,
       );
       _bindController();
-      _triggerFullReplayOrReset();
+      _containerEventOwners[_sanitizedId] = this;
+      if (_initialized) {
+        final fittedRows =
+            ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
+            _lastFittedRows ??
+            24);
+        final fittedCols =
+            ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
+            _lastFittedCols ??
+            80);
+        widget.onViewFit?.call(fittedCols, fittedRows);
+        if (fittedRows >= 5 && fittedCols >= 10) {
+          _sessionInputRouter.sendResizeOut(
+            _sanitizedId,
+            fittedCols,
+            fittedRows,
+          );
+        }
+        _onFit();
+      }
+      _activateTerminal(force: true);
+      _scheduleFocusRetries(force: true);
     }
+    _activateTerminal();
   }
 
   @override
@@ -1898,10 +2329,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     _focusNode.dispose();
     _unbindController();
-    for (final timer in _focusRetryTimers) {
-      timer.cancel();
-    }
-    _focusRetryTimers.clear();
+    _clearFocusRetryTimers();
     if (identical(_currentMountedPane, this)) {
       _currentMountedPane = null;
     }
@@ -1925,11 +2353,19 @@ class _TerminalPaneState extends State<TerminalPane> {
       autofocus: true,
       onFocusChange: (hasFocus) {
         if (hasFocus && _initialized) {
-          _activateTerminal();
+          widget.controller.notifyInteraction();
+          _activateTerminal(force: true);
+          _scheduleFocusRetries(force: true);
         }
       },
       onKeyEvent: (node, event) {
         if (event.logicalKey == LogicalKeyboardKey.tab) {
+          if (event is KeyDownEvent) {
+            widget.controller.notifyInteraction();
+            final shiftKey = HardwareKeyboard.instance.isShiftPressed;
+            _sendInput(shiftKey ? '\x1b[Z' : '\t');
+            _activateTerminal();
+          }
           return KeyEventResult.handled;
         }
         return KeyEventResult.ignored;
@@ -1952,12 +2388,25 @@ class _TerminalPaneState extends State<TerminalPane> {
               widget.controller.fit();
             });
           }
-          final terminal = GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTapDown: (_) => _activateTerminal(),
-            child: Container(
-              color: const Color(0xff0d1113),
-              child: HtmlElementView(viewType: _viewType),
+          final terminal = SizedBox.expand(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapDown: (_) {
+                widget.controller.notifyInteraction();
+                if (mounted &&
+                    _focusNode.canRequestFocus &&
+                    !_focusNode.hasFocus) {
+                  _focusNode.requestFocus();
+                }
+                _activateTerminal(force: true);
+                _scheduleFocusRetries(force: true);
+              },
+              child: Container(
+                width: double.infinity,
+                height: double.infinity,
+                color: const Color(0xff0d1113),
+                child: HtmlElementView(viewType: _viewType),
+              ),
             ),
           );
           // Desktop browsers keep the full-height terminal; only a mobile-OS

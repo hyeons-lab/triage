@@ -22,6 +22,7 @@ import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
+import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_state.dart';
@@ -385,6 +386,13 @@ class SessionVm {
   }
 
   final String title;
+
+  /// True when the input listener has been bound to this session's controller,
+  /// preventing duplicate registrations from sending duplicated keystrokes.
+  bool inputListenerBound = false;
+
+  /// True when this client currently holds the daemon's input lease for this session.
+  bool hasInputLease = false;
 
   /// Optional user-assigned label that overrides the automatic workstream title.
   String? customLabel;
@@ -797,6 +805,11 @@ class SessionVm {
       rawOutputStart: rawOutputStart,
     );
     final wasExited = this.isExited || store.state.exited;
+    tdbg(
+      'vm.applyHistory',
+      '$title ${rawOutput.length}B seq=$throughOutputSeq '
+          'phase=${store.state.phase} viewReady=$_viewReady',
+    );
     if (store.state.phase != AttachPhase.live || wasExited) {
       store.dispatch(const Attach());
     }
@@ -811,6 +824,11 @@ class SessionVm {
   /// The view fitted to a real grid size. Records it and replays any staged
   /// history at that size. Idempotent on subsequent fits (no staged history).
   void noteViewFit(int cols, int rows) {
+    tdbg(
+      'vm.noteViewFit',
+      '$title ${cols}x$rows '
+          'pendingHistory=${_pendingHistory != null}',
+    );
     _viewCols = cols;
     _viewRows = rows;
     _viewReady = true;
@@ -837,6 +855,9 @@ class SessionVm {
 
   /// Apply a live raw output chunk (remote PTY bytes) through the write path.
   void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
+    if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
+      noteViewFit(lastFittedCols!, lastFittedRows!);
+    }
     store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
   }
 
@@ -891,6 +912,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Remote session ids currently being attached (lazy-load), so a repeated
   // select can't open a second subscription for the same session.
   final Set<String> _loadingSessionIds = {};
+  final Map<String, List<int>> _pendingInputBytes = {};
+  final Set<String> _leaseAcquisitionInFlight = {};
   // Marks the selected session's rail tile so reopening the rail can scroll it
   // to the top — the session you're in should be the first thing you see.
   final GlobalKey _selectedTileKey = GlobalKey();
@@ -1314,6 +1337,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _subscriptionIds.clear();
     _refreshInFlight.clear();
     _loadingSessionIds.clear();
+    _pendingInputBytes.clear();
+    _leaseAcquisitionInFlight.clear();
     _sessionsServerId = null;
     _sessionGroups = const [];
     // Pins are per server and reload with the next session list; keeping the
@@ -1556,7 +1581,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
-    if (!session.isRemote || session.status != 'attached') return;
+    if (!session.isRemote || session.isExited || session.status == 'exited') {
+      return;
+    }
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
 
@@ -1779,37 +1806,31 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   void _setupSessionInputListener(SessionVm session) {
+    if (session.inputListenerBound) return;
+    session.inputListenerBound = true;
+
     session.terminalController.addInputListener((keys) {
       // While the store replays history or when the emulator auto-answers terminal
       // queries (DSR, DA, Kitty queries), those answers surface here as emulator
       // output; they must not be forwarded to the host as fake user input.
       if (session.store.isSuppressingHostInput ||
-          session.store.isWritingSink ||
           isEmulatorQueryResponse(keys)) {
         return;
       }
       if (_isRemoteSession(session)) {
-        if (session.status != 'attached') {
-          return;
-        }
-
         if (!_client.isConnected) {
           _markRemoteSessionDisconnected(session);
           return;
         }
 
-        final sessionId = session.remoteSessionId;
-        if (sessionId != null) {
-          _client
-              .writeInput(
-                sessionId: sessionId,
-                clientId: _clientId,
-                bytes: utf8.encode(keys),
-              )
-              .catchError((_) {
-                _markRemoteSessionDisconnected(session);
-              });
+        if (session.isExited || session.status == 'exited') {
+          return;
         }
+
+        final sessionId = _sessionIdFor(session) ?? session.remoteSessionId;
+        if (sessionId == null) return;
+
+        _sendRemoteSessionInput(session, sessionId, utf8.encode(keys));
       } else {
         // Local/demo session: echo keystrokes through the same single write
         // path the remote stream uses, so there is one rendering pipeline.
@@ -1821,6 +1842,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.echoLocalBytes(utf8.encode(keys));
         }
       }
+    });
+
+    session.terminalController.addInteractionListener(() {
+      unawaited(_ensureSessionInputLease(session));
     });
 
     session.terminalController.addResizeOutListener((cols, rows) {
@@ -1843,28 +1868,94 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (!_clientForeground) {
         return;
       }
-      // `_client` is `late`: on the first-run and mock paths nothing has
-      // connected yet, and xterm fires this on its very first layout.
+      final sessionId = _sessionIdFor(session) ?? session.remoteSessionId;
       if (_clientInitialized &&
           _client.isConnected &&
-          session.status == 'attached') {
-        final sessionId = session.remoteSessionId;
-        if (sessionId != null) {
-          ++session.resizeRequestSeq;
-          // Tell the host its new PTY size; the program repaints and the live
-          // byte stream self-heals the view. No history replay on resize.
-          unawaited(() async {
-            try {
-              await _client.resizeSession(
-                sessionId: sessionId,
-                cols: cols,
-                rows: rows,
-              );
-            } catch (_) {}
-          }());
-        }
+          sessionId != null &&
+          !session.isExited &&
+          session.status != 'exited') {
+        ++session.resizeRequestSeq;
+        // Tell the host its new PTY size; the program repaints and the live
+        // byte stream self-heals the view. No history replay on resize.
+        unawaited(() async {
+          try {
+            await _client.resizeSession(
+              sessionId: sessionId,
+              cols: cols,
+              rows: rows,
+            );
+          } catch (_) {}
+        }());
       }
     });
+  }
+
+  Future<void> _ensureSessionInputLease(SessionVm session) async {
+    if (!_clientInitialized || !_client.isConnected || session.isExited) return;
+    final sessionId = _sessionIdFor(session) ?? session.remoteSessionId;
+    if (sessionId == null) return;
+    if (session.hasInputLease) return;
+    await _acquireInputLeaseAndFlush(session, sessionId);
+  }
+
+  Future<void> _acquireInputLeaseAndFlush(
+    SessionVm session,
+    String sessionId,
+  ) async {
+    if (!_clientInitialized || !_client.isConnected || session.isExited) return;
+    if (!_leaseAcquisitionInFlight.add(sessionId)) return;
+    try {
+      await _client.attachSession(
+        sessionId: sessionId,
+        clientId: _clientId,
+        mode: 'InteractiveController',
+      );
+      session.hasInputLease = true;
+      if (!_disposed &&
+          mounted &&
+          session.status != 'attached' &&
+          session.status != 'loading') {
+        setState(() {
+          session.status = 'attached';
+          session.statusColor = const Color(0xff7fd1c7);
+        });
+      }
+      final buffered = _pendingInputBytes.remove(sessionId);
+      if (buffered != null &&
+          buffered.isNotEmpty &&
+          _client.isConnected &&
+          !session.isExited) {
+        await _client.writeInput(
+          sessionId: sessionId,
+          clientId: _clientId,
+          bytes: buffered,
+        );
+      }
+    } catch (_) {
+    } finally {
+      _leaseAcquisitionInFlight.remove(sessionId);
+    }
+  }
+
+  void _sendRemoteSessionInput(
+    SessionVm session,
+    String sessionId,
+    List<int> bytes,
+  ) {
+    if (session.hasInputLease) {
+      _client
+          .writeInput(sessionId: sessionId, clientId: _clientId, bytes: bytes)
+          .catchError((error) {
+            if (!_client.isConnected) {
+              _markRemoteSessionDisconnected(session);
+            }
+          });
+    } else {
+      // Buffer input so keystrokes are never dropped while acquiring the lease.
+      final buffer = _pendingInputBytes.putIfAbsent(sessionId, () => <int>[]);
+      buffer.addAll(bytes);
+      unawaited(_acquireInputLeaseAndFlush(session, sessionId));
+    }
   }
 
   Duration _nextReconnectDelay() {
@@ -2960,14 +3051,68 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.worktreeRoot ??= oldSession.worktreeRoot;
         }
         regrouped = session.repoRoot != oldSession.repoRoot;
+        final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+        if (cachedSize != null) {
+          session.hasFitted = true;
+          session.lastFittedRows = cachedSize.$1;
+          session.lastFittedCols = cachedSize.$2;
+          session.ownFittedRows = cachedSize.$1;
+          session.ownFittedCols = cachedSize.$2;
+          session.hostSizeCols ??= oldSession.hostSizeCols;
+          session.hostSizeRows ??= oldSession.hostSizeRows;
+          session.noteViewFit(cachedSize.$2, cachedSize.$1);
+        } else if (oldSession.hasFitted) {
+          session.hasFitted = true;
+          session.lastFittedCols = oldSession.lastFittedCols;
+          session.lastFittedRows = oldSession.lastFittedRows;
+          session.ownFittedCols = oldSession.ownFittedCols;
+          session.ownFittedRows = oldSession.ownFittedRows;
+          session.hostSizeCols = oldSession.hostSizeCols;
+          session.hostSizeRows = oldSession.hostSizeRows;
+        }
+        if (cachedSize == null) {
+          if (oldSession._viewReady) {
+            session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
+          } else if (oldSession.lastFittedCols != null &&
+              oldSession.lastFittedRows != null) {
+            session.noteViewFit(
+              oldSession.lastFittedCols!,
+              oldSession.lastFittedRows!,
+            );
+          }
+        }
         oldSession.dispose();
         if (oldSession.title != session.title) {
           TerminalPane.destroySession(oldSession.title);
         }
         _sessions[existingIndex] = session;
+        // The replacement carries its own TerminalController. A pane that is
+        // already mounted for this session is not necessarily rebuilt by this
+        // setState, and without a rebuild it never sees the swap — it keeps
+        // listening to the placeholder's controller while the store writes to
+        // the new one, so the emulator exists and decodes nothing to screen.
+        TerminalPane.rebindSessionController(
+          session.title,
+          session.terminalController,
+        );
       });
       if (regrouped) _regroupRail();
       _drainPendingEvents(sid);
+      if (session.lastFittedCols != null &&
+          session.lastFittedRows != null &&
+          (session.hostSizeCols != session.lastFittedCols ||
+              session.hostSizeRows != session.lastFittedRows)) {
+        unawaited(() async {
+          try {
+            await _client.resizeSession(
+              sessionId: sid,
+              cols: session.lastFittedCols!,
+              rows: session.lastFittedRows!,
+            );
+          } catch (_) {}
+        }());
+        session.terminalController.refit();
+      }
     } on TriageAuthException {
       // The daemon refused the attach: this client is no longer paired. Painting
       // the row "load failed" would be a dead end — the same token fails for
@@ -2976,7 +3121,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // caller finish and report a healthy "Connected to Daemon" over the top of
       // the pairing prompt.
       rethrow;
-    } catch (e) {
+    } catch (e, stack) {
       // A load that failed because we tore its daemon down is not a failure of
       // the session now sitting under that id on the new daemon — painting that
       // one "load failed" would be a lie about a healthy session.
@@ -2993,7 +3138,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ..clear()
           ..add(_plainRow('Failed to load session $sid'));
       });
-      debugPrint('Failed to load session $sid: ${e.toString()}');
+      // With the stack: this catch spans the whole load — attach, the swap
+      // setState, regroup, drain, resize — so the message alone does not say
+      // which step threw, and a load failure is not reproducible on demand.
+      debugPrint('Failed to load session $sid: $e\n$stack');
     } finally {
       _loadingSessionIds.remove(sid);
     }
@@ -3012,11 +3160,27 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             snapshotRes['snapshot'] as Map<String, dynamic>? ?? {};
       } catch (_) {}
 
-      final replayTargetSize = includeHistory
-          ? _estimatedTerminalRestoreSize(
-              preAttachSnapshot['size'] as Map<String, dynamic>?,
-            )
+      final existing = _sessions.cast<SessionVm?>().firstWhere(
+        (s) => s?.remoteSessionId == sid,
+        orElse: () => null,
+      );
+      final cachedSize = TerminalPane.getCachedTerminalSize('triage / $sid');
+      final knownFittedRows =
+          cachedSize?.$1 ?? existing?.ownFittedRows ?? existing?.lastFittedRows;
+      final knownFittedCols =
+          cachedSize?.$2 ?? existing?.ownFittedCols ?? existing?.lastFittedCols;
+      final (int, int)? knownTargetSize =
+          (knownFittedRows != null && knownFittedCols != null)
+          ? (knownFittedRows, knownFittedCols)
           : null;
+
+      final replayTargetSize =
+          knownTargetSize ??
+          (includeHistory
+              ? _estimatedTerminalRestoreSize(
+                  preAttachSnapshot['size'] as Map<String, dynamic>?,
+                )
+              : null);
       Map<String, dynamic>? preparedSnapshot;
       if (preAttachSnapshot['exited'] == true) {
         final sizeObj = preAttachSnapshot['size'] as Map<String, dynamic>?;
@@ -3037,12 +3201,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } else if (replayTargetSize != null &&
           _clientForeground &&
           !_snapshotSizeMatches(preAttachSnapshot, replayTargetSize)) {
-        // Gated like the other resize-out paths. This one is the weakest claim
-        // of the three: the size is `_estimatedTerminalRestoreSize`, a
-        // MediaQuery guess this client has not fitted to, so a backgrounded
-        // reconnect taking the shared PTY here would move it to a size nobody
-        // is rendering at. What corrects it later is whichever comes first, the
-        // first fit made while foreground or the reclaim on regaining focus.
+        // Gated like the other resize-out paths. When a known fitted size is
+        // available, use it; otherwise fall back to estimated restore size.
         try {
           preparedSnapshot = _snapshotFromResponse(
             await _client.resizeSession(
@@ -3108,6 +3268,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         isRemote: true,
         isExited: exited,
       );
+      session.hasInputLease = true;
       // Snapshot carries the current snippet for the attached session (the list
       // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
@@ -3182,14 +3343,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     SessionVm session,
     Map<String, dynamic>? fallbackSize,
   ) {
-    // This device's own fit first. `lastFittedCols` is also written by the
-    // host's resize broadcast, so on a shared PTY it can be another device's
-    // width; replaying at that would leave this client rendering at a size it
-    // never fitted to, and because the snapshot would then match, nothing
-    // would correct it. Falls back to `lastFitted*` for the case where no local
-    // fit has happened yet, where the host's size is the better guess.
-    final cols = session.ownFittedCols ?? session.lastFittedCols;
-    final rows = session.ownFittedRows ?? session.lastFittedRows;
+    final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+    final cols =
+        cachedSize?.$2 ?? session.ownFittedCols ?? session.lastFittedCols;
+    final rows =
+        cachedSize?.$1 ?? session.ownFittedRows ?? session.lastFittedRows;
     if (cols != null && rows != null) {
       return (rows, cols);
     }
@@ -3241,6 +3399,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
       _onWebSocketClosed(_connectGeneration);
+      return;
+    }
+
+    if (type == 'error') {
+      final error = message['error'] as Map<String, dynamic>?;
+      final msg = error?['message']?.toString() ?? '';
+      if (msg.contains('input lease')) {
+        final current = _selectedSession;
+        final sid = _sessionIdFor(current) ?? current.remoteSessionId;
+        if (sid != null && !current.isExited) {
+          current.hasInputLease = false;
+          unawaited(_acquireInputLeaseAndFlush(current, sid));
+        }
+      }
       return;
     }
 
@@ -3401,12 +3573,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionId = event['Snapshot']['session_id'] as String?;
       } else if (event.containsKey('ResyncRequired')) {
         sessionId = event['ResyncRequired']['session_id'] as String?;
+      } else if (event.containsKey('LeaseChanged')) {
+        sessionId = event['LeaseChanged']['session_id'] as String?;
       }
 
       if (sessionId == null) return;
 
       final sessionIndex = _sessions.indexWhere(
-        (s) => s.title == 'triage / $sessionId',
+        (s) =>
+            s.remoteSessionId == sessionId ||
+            s.sessionId == sessionId ||
+            s.title == 'triage / $sessionId',
       );
 
       if (sessionIndex == -1) {
@@ -3419,6 +3596,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (session.status == 'loading') {
         _pendingEvents.putIfAbsent(sessionId, () => []).add(message);
         return;
+      }
+
+      // Drain any events buffered while this session was loading or resolving.
+      final pending = _pendingEvents.remove(sessionId);
+      if (pending != null && pending.isNotEmpty) {
+        for (final msg in pending) {
+          _processWebSocketEvent(msg);
+        }
       }
 
       if (event.containsKey('Output')) {
@@ -3461,6 +3646,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
           await _applySnapshotToSession(session, sessionId, snapshot);
+        }
+      } else if (event.containsKey('LeaseChanged')) {
+        final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
+        final currentHolder = change?['current'] as Map<String, dynamic>?;
+        final holderClientId = currentHolder?['client_id'] as String?;
+        session.hasInputLease = holderClientId == _clientId;
+        if (session.hasInputLease) {
+          final buffered = _pendingInputBytes.remove(sessionId);
+          if (buffered != null &&
+              buffered.isNotEmpty &&
+              _client.isConnected &&
+              !session.isExited) {
+            unawaited(
+              _client.writeInput(
+                sessionId: sessionId,
+                clientId: _clientId,
+                bytes: buffered,
+              ),
+            );
+          }
         }
       }
     }
@@ -3673,13 +3878,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!session.hasFitted) {
       session.hasFitted = true;
       if (session.isRemote && _client.isConnected) {
-        unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+        unawaited(_refreshSessionSnapshot(session, includeHistory: false));
       }
     }
   }
 
   void _selectSession(int index) {
     if (index < 0 || index >= _sessions.length) return;
+    FocusManager.instance.primaryFocus?.unfocus();
     final session = _sessions[index];
     // On a session's first load the view-fit handler issues the initial refresh
     // at the real fitted size; refreshing here too would race it (and use an
@@ -3689,6 +3895,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.isRemote &&
         _sessionIdFor(session) != null;
     setState(() {
+      if (_client.isConnected &&
+          session.isRemote &&
+          session.status != 'exited') {
+        session.status = 'attached';
+        session.statusColor = const Color(0xff7fd1c7);
+      }
       session.focusCursorOnNextDisplay();
       _selectedIndex = index;
     });
@@ -3717,6 +3929,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         );
       }
       return;
+    }
+    final sid = _sessionIdFor(session);
+    if (sid != null && !session.isExited) {
+      unawaited(
+        _client
+            .attachSession(
+              sessionId: sid,
+              clientId: _clientId,
+              mode: 'InteractiveController',
+            )
+            .then((_) {
+              session.hasInputLease = true;
+            })
+            .catchError((_) {}),
+      );
     }
     if (session.hasFitted) {
       // Already fitted: refresh metadata without clearing and replaying history.
@@ -3754,6 +3981,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         clientId: _clientId,
         mode: 'InteractiveController',
       );
+      session.hasInputLease = true;
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot != null && !_disposed) {
@@ -3931,6 +4159,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
           final session = SessionVm(
             title: 'triage / $sessionId',
+            sessionId: sessionId,
             branch: branch,
             repoRoot: repoRoot,
             worktreeRoot: worktreeRoot,
@@ -3946,6 +4175,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             isRemote: true,
             isExited: exited,
           );
+          session.hasInputLease = true;
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
           final bracketedPaste =
@@ -4041,7 +4271,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   Future<void> _closeSession(SessionVm session) async {
     final confirmed = await _confirmCloseSession(session);
-    if (confirmed != true) return;
+    if (confirmed != true) {
+      if (mounted) {
+        session.focusCursorOnNextDisplay();
+      }
+      return;
+    }
 
     final sessionId = session.remoteSessionId;
 
@@ -4263,8 +4498,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _CustomLabelDialog(initialLabel: session.customLabel),
     );
 
-    if (!mounted || result == null) return;
-    _setSessionCustomLabel(session, result);
+    if (!mounted) return;
+    if (result != null) {
+      _setSessionCustomLabel(session, result);
+    }
+    session.focusCursorOnNextDisplay();
   }
 
   bool _allowExit = false;
@@ -8306,6 +8544,7 @@ class _SessionListTileState extends State<SessionListTile> {
             // a screen reader has no meta line beside it to supply the repo.
             label: widget.glanceTitle ?? widget.title,
             child: InkWell(
+              canRequestFocus: false,
               onTap: widget.onTap,
               onTapDown: widget.onContextMenu != null
                   ? (details) => _lastTapDownPosition = details.globalPosition
@@ -8974,8 +9213,10 @@ class SessionWorkspace extends StatelessWidget {
             onTerminalResizeBind: (callback) {
               session.onTerminalResize = callback;
             },
-            onViewFit: (cols, rows) =>
-                (onViewFit ?? session.noteViewFit)(cols, rows),
+            onViewFit: (cols, rows) {
+              session.noteViewFit(cols, rows);
+              onViewFit?.call(cols, rows);
+            },
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',

@@ -1,3 +1,4 @@
+import '../terminal/debug_log.dart';
 import 'terminal_pane_stub.dart'
     if (dart.library.js_util) 'terminal_pane_web.dart'
     as impl;
@@ -10,11 +11,18 @@ class TerminalController {
   final List<void Function()> _refitListeners = [];
   final List<void Function(String)> _inputListeners = [];
   final List<void Function(int, int)> _resizeOutListeners = [];
+  final List<void Function()> _interactionListeners = [];
 
   final List<String> _writeBuffer = [];
 
   void addWriteListener(void Function(String) listener) {
     _writeListeners.add(listener);
+    tdbg(
+      'ctrl.addWrite',
+      'ctrl#${identityHashCode(this)} now '
+          '${_writeListeners.length} listeners, '
+          'buffered=${_writeBuffer.length}',
+    );
     if (_writeBuffer.isNotEmpty) {
       for (final data in _writeBuffer) {
         listener(data);
@@ -60,6 +68,17 @@ class TerminalController {
   void removeResizeOutListener(void Function(int, int) listener) =>
       _resizeOutListeners.remove(listener);
 
+  void addInteractionListener(void Function() listener) =>
+      _interactionListeners.add(listener);
+  void removeInteractionListener(void Function() listener) =>
+      _interactionListeners.remove(listener);
+
+  void notifyInteraction() {
+    for (final listener in List.from(_interactionListeners)) {
+      listener();
+    }
+  }
+
   final List<void Function()> _historyReplayedListeners = [];
   void addHistoryReplayedListener(void Function() listener) =>
       _historyReplayedListeners.add(listener);
@@ -74,10 +93,28 @@ class TerminalController {
 
   void write(String data) {
     if (_writeListeners.isEmpty) {
+      tdbg(
+        'ctrl.write',
+        'ctrl#${identityHashCode(this)} NO LISTENERS '
+            '-> buffered; ${tdbgPreview(data)}',
+      );
       _writeBuffer.add(data);
     } else {
-      for (final listener in List.from(_writeListeners)) {
-        listener(data);
+      tdbg(
+        'ctrl.write',
+        'ctrl#${identityHashCode(this)} '
+            '${_writeListeners.length} listeners; ${tdbgPreview(data)}',
+      );
+      // Isolated per listener: these are independent consumers (xterm.dart on
+      // one side, xterm.js on the other), and letting one throw used to stop
+      // the rest, which blanked the pane rather than degrading it.
+      final listeners = List.of(_writeListeners);
+      for (var i = 0; i < listeners.length; i++) {
+        try {
+          listeners[i](data);
+        } catch (error, stack) {
+          tdbg('ctrl.write', 'listener #$i THREW: $error\n$stack');
+        }
       }
     }
   }
@@ -126,6 +163,7 @@ class TerminalController {
     _refitListeners.clear();
     _inputListeners.clear();
     _resizeOutListeners.clear();
+    _interactionListeners.clear();
     _historyReplayedListeners.clear();
     _writeBuffer.clear();
   }
@@ -140,6 +178,15 @@ class TerminalSessionInputRouter {
     final token = Object();
     _routes[sessionId] = _TerminalSessionRoute(controller, token);
     return token;
+  }
+
+  void rebind(String sessionId, TerminalController controller) {
+    final route = _routes[sessionId];
+    if (route != null) {
+      _routes[sessionId] = _TerminalSessionRoute(controller, route.token);
+    } else {
+      bind(sessionId, controller);
+    }
   }
 
   void unbind(String sessionId, Object token) {
@@ -159,6 +206,10 @@ class TerminalSessionInputRouter {
 
   void sendResizeOut(String sessionId, int cols, int rows) {
     _routes[sessionId]?.controller.sendResizeOut(cols, rows);
+  }
+
+  void notifyInteraction(String sessionId) {
+    _routes[sessionId]?.controller.notifyInteraction();
   }
 }
 

@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
+import 'debug_log.dart';
 import 'emulator_query_response.dart';
 import 'terminal_intent.dart';
 import 'terminal_sink.dart';
@@ -19,6 +20,22 @@ const int kMinTerminalRows = 1;
 /// dropping the oldest queued chunks past this cap only ever discards output the
 /// new snapshot supersedes.
 const int kPendingLiveByteCap = 1024 * 1024;
+
+/// How far below the dedup baseline an `output_seq` may fall and still be a
+/// re-delivery rather than a fresh numbering epoch.
+///
+/// `output_seq` counts events within one daemon *instance*: a handover restarts
+/// it low for an adopted session while the byte log continues unbroken (the same
+/// session observed either side of an adoption reports one `bytes_logged` under
+/// two very different `output_seq`). A client that kept the pre-handover
+/// high-water would score every renumbered chunk as a duplicate and go
+/// permanently deaf — history frozen on screen, cursor still blinking, typing
+/// still reaching the PTY with nothing it produces ever drawn.
+///
+/// The daemon replays at most `EVENT_REPLAY_BUFFER` (1024) events to a lagging
+/// subscriber and sends `ResyncRequired` beyond that, so no genuine re-delivery
+/// can regress further than this. Anything below it is a new epoch.
+const int kSeqEpochResetWindow = 1024;
 
 /// How long emulator-emitted bytes stay suppressed after a history replay. The
 /// program's own terminal queries (DSR/cursor reports) are replayed into the
@@ -197,6 +214,10 @@ class TerminalStore extends ChangeNotifier {
           phase: AttachPhase.awaitingHistory,
           exited: false,
           scrollbackReady: false,
+          // The other two dedup inputs are reset just above; leaving the
+          // baseline behind let a stale one outlive the attach it came from.
+          // The [HistoryBytes] that ends this attach re-establishes it.
+          resetHistoryHighWaterSeq: true,
         );
 
       case Detach():
@@ -367,6 +388,11 @@ class TerminalStore extends ChangeNotifier {
       }
     }
 
+    tdbg(
+      'store.history',
+      'FULL REPLAY ${bytes.length}B at ${cols}x$rows '
+          'throughSeq=$throughOutputSeq rawStart=$rawOutputStart',
+    );
     _sink.clear();
     // Reset carries so history starts a fresh decode stream; history then
     // decodes through the same streaming path as live, so a UTF-8 rune, CRLF
@@ -407,15 +433,30 @@ class TerminalStore extends ChangeNotifier {
     if (s.phase == AttachPhase.detached) {
       return s;
     }
-    if (_isDuplicate(outputSeq, s.historyHighWaterSeq)) {
-      return s;
+    var next = s;
+    if (_isSeqEpochReset(outputSeq, s.historyHighWaterSeq)) {
+      // The counter this baseline described no longer exists. Drop it and
+      // rebase on the new epoch; `_appliedLogBytes` is deliberately kept,
+      // because log byte offsets — unlike `output_seq` — survive a handover
+      // and still anchor the next history delta-merge.
+      _appliedLiveSeq = null;
+      next = s.copyWith(resetHistoryHighWaterSeq: true);
     }
-    if (!s.sized || s.phase == AttachPhase.awaitingHistory) {
+    if (_isDuplicate(outputSeq, next.historyHighWaterSeq)) {
+      return next;
+    }
+    if (!next.sized || next.phase == AttachPhase.awaitingHistory) {
+      tdbg(
+        'store.live',
+        'QUEUED seq=$outputSeq ${bytes.length}B '
+            '(sized=${next.sized} phase=${next.phase})',
+      );
       _enqueuePendingLive(_QueuedLive(bytes, outputSeq));
-      return s;
+      return next;
     }
+    tdbg('store.live', 'APPLY seq=$outputSeq ${bytes.length}B');
     _applyLive(bytes, outputSeq);
-    return s;
+    return next;
   }
 
   // ---- Sink-driven events ---------------------------------------------------
@@ -504,6 +545,18 @@ class TerminalStore extends ChangeNotifier {
     if (highWaterSeq != null && outputSeq <= highWaterSeq) return true;
     if (_appliedLiveSeq != null && outputSeq <= _appliedLiveSeq!) return true;
     return false;
+  }
+
+  /// A live chunk starts a new numbering epoch when its `output_seq` falls
+  /// further below the dedup baseline than the daemon could ever replay — the
+  /// signature of a handover renumbering an adopted session. See
+  /// [kSeqEpochResetWindow]; the history path makes the same call via
+  /// `isSequenceRegressed`.
+  bool _isSeqEpochReset(int? outputSeq, int? highWaterSeq) {
+    if (outputSeq == null) return false;
+    final baseline = max(highWaterSeq ?? 0, _appliedLiveSeq ?? 0);
+    if (baseline == 0) return false;
+    return outputSeq < baseline - kSeqEpochResetWindow;
   }
 
   void _beginHostInputSuppression() {
