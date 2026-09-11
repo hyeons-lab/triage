@@ -141,7 +141,7 @@ void main() {
     test(
       'surrogate pairs such as emojis do not register as word characters',
       () {
-        final emoji = '🚀';
+        const emoji = '🚀';
         final firstCodeUnit = emoji.codeUnitAt(0);
         expect(MobileAutoSpaceTracker.isWordChar(firstCodeUnit), isFalse);
 
@@ -150,5 +150,50 @@ void main() {
         expect(tracker.processInput('launch'), 'launch');
       },
     );
+
+    test('astral plane (SMP) alphanumeric symbols register as word characters', () {
+      // Mathematical bold: 𝐚𝐛𝐜 (U+1D41A, U+1D41B, U+1D41C)
+      const boldWord1 = '𝐚𝐛𝐜';
+      const boldWord2 = '𝐝𝐞𝐟';
+      expect(tracker.processInput(boldWord1), boldWord1);
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput(boldWord2), ' $boldWord2');
+
+      // Sequential single-character SMP taps do not insert spaces within the word
+      tracker.reset();
+      expect(tracker.processInput('𝐚'), '𝐚');
+      expect(tracker.processInput('𝐛'), '𝐛');
+      expect(tracker.processInput('𝐜'), '𝐜');
+      // Subsequent swiped word chunk receives a leading space
+      expect(tracker.processInput('𝐝𝐞𝐟'), ' 𝐝𝐞𝐟');
+    });
+
+    test('unspaced scripts (Chinese, Japanese, Thai) suppress inter-word spaces', () {
+      // Chinese phrase commits
+      tracker.reset();
+      expect(tracker.processInput('你好'), '你好');
+      expect(tracker.processInput('世界'), '世界');
+
+      // Japanese phrase commits
+      tracker.reset();
+      expect(tracker.processInput('東京'), '東京');
+      expect(tracker.processInput('大学'), '大学');
+
+      // Thai phrase commits
+      tracker.reset();
+      expect(tracker.processInput('ภาษา'), 'ภาษา');
+      expect(tracker.processInput('ไทย'), 'ไทย');
+
+      // Latin word followed by Chinese phrase does not insert leading space before Chinese
+      tracker.reset();
+      expect(tracker.processInput('grep'), 'grep');
+      expect(tracker.processInput('中文'), '中文');
+    });
+
+    test('single-letter words retain word character state for subsequent swipes', () {
+      expect(tracker.processInput('I'), 'I');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput('am'), ' am');
+    });
   });
 }

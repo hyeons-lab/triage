@@ -36,6 +36,14 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - `2026-09-11T07:40-0400 flutter/triage_client/lib/services/storage_native.dart`: Added catchError guards on SharedPreferences write and remove operations.
 - `2026-09-11T07:40-0400 flutter/triage_client/test/terminal/mobile_auto_space_test.dart`: Added tests for global Unicode scripts, PTY echo immunity, tokens ending with digits, and surrogate pair emojis.
 - `2026-09-11T07:40-0400 flutter/triage_client/test/terminal/terminal_scrollbar_test.dart`: Added test for constrained track heights.
+- `2026-09-11T13:56-0400 devlog/plans/000145-03-emulator-queries-astral-unicode-and-scrollbar-layout.md`: Authored plan addressing web query filtering, astral plane unicode, unspaced scripts, and scrollbar layout optimizations.
+- `2026-09-11T13:56-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Filtered automated emulator query replies with isEmulatorQueryResponse in onDataCallback, routing responses to the PTY without clearing viewport offset or jumping to bottom.
+- `2026-09-11T13:56-0400 flutter/triage_client/lib/terminal/mobile_auto_space.dart`: Reconstructed 32-bit scalar code points from surrogate pairs at string boundaries, added isMultiChar guard for single astral plane characters, suppressed spaces for unspaced scripts (CJK, Thai, Lao, Khmer, Myanmar), and added zero-allocation fast paths for Cyrillic, Greek, Hangul, and CJK ideographs.
+- `2026-09-11T13:56-0400 flutter/triage_client/lib/services/storage_native.dart`: Cached resolved SharedPreferences instance during fallback writes and removals.
+- `2026-09-11T13:56-0400 flutter/triage_client/lib/widgets/terminal_scrollbar.dart`: Inverted LayoutBuilder and AnimatedBuilder so layout constraints are only calculated on resize, added single-position check, and guarded content dimensions and finiteness.
+- `2026-09-11T13:56-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Guarded _snapToBottom with hasContentDimensions and added saved scroll offset fallback in _onTerminalResize.
+- `2026-09-11T13:56-0400 flutter/triage_client/lib/services/triage_websocket_client.dart`: Resolved unawaited_return_in_try_block analysis warning by moving future return outside try-catch.
+- `2026-09-11T13:56-0400 flutter/triage_client/test/terminal/mobile_auto_space_test.dart`: Added unit tests for astral plane symbols, sequential single SMP character taps, unspaced script suppression, and single-letter words.
 
 ## Decisions
 
@@ -56,6 +64,10 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - 2026-09-11T07:40-0400 Decouple mobile auto-space tracking from PTY echo: Shells echo typed characters back to the terminal; resetting tracker state on host writes cleared tracking before subsequent words were emitted. Resets now trigger strictly on user input actions (Enter, Backspace, Delimiters, PointerDown, Session Switch, Clear).
 - 2026-09-11T07:40-0400 Support Unicode letters and digits in isWordChar: Replaced Latin-1 ceiling with Unicode property regex with zero-allocation ASCII and Latin-1 fast paths, safely excluding surrogate code units.
 - 2026-09-11T07:40-0400 Coalesce scroll metrics notifications in TerminalScrollbar: Multiple metrics notifications in a single layout frame now schedule at most one post-frame setState to prevent redundant rebuilds during terminal streaming.
+- 2026-09-11T13:56-0400 Filter emulator query responses in web onDataCallback: Interactive applications querying cursor position or device attributes emitted synthetic xterm.js responses that caused web viewports to snap to the bottom; filtering with isEmulatorQueryResponse ensures parity with the native pane.
+- 2026-09-11T13:56-0400 Suppress auto-spacing for unspaced scripts: Chinese, Japanese, Thai, Lao, Khmer, and Myanmar orthographies do not use inter-word spaces; filtering these scripts prevents injecting corrupting spaces into continuous words and commands.
+- 2026-09-11T13:56-0400 Guard single SMP surrogate pairs from multi-character word classification: Astral plane characters have UTF-16 length == 2; checking isMultiChar ensures single-key taps do not auto-prepend spaces.
+- 2026-09-11T13:56-0400 Invert LayoutBuilder and AnimatedBuilder in TerminalScrollbar: Prevents executing layout constraint callbacks on every scroll frame tick, limiting layout passes to container resize events.
 
 ## Issues
 
@@ -68,4 +80,5 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - c3a19a5: fix(client): support Mode 2026 synchronized output and persist session scroll position
 - d1d2a7d: fix(terminal): support CSI s/u cursor save/restore, 1-index CPR, and prevent scroll loss on fit and switch
 - a159ee6: fix(client): persist credentials across restarts, stick terminal to bottom, and add draggable scrollbar
-- HEAD: fix(client): refine mobile auto-space tracking, unicode support, and scrollbar resilience
+- f73826a: fix(client): refine mobile auto-space tracking, unicode support, and scrollbar resilience
+- HEAD: fix(client): filter web emulator queries, support astral unicode, and optimize scrollbar layout

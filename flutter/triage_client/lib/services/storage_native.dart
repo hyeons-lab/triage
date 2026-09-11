@@ -136,9 +136,10 @@ void _writeThrough(String key, String value) {
   if (_prefs != null) {
     _prefs!.setString(key, value).catchError((_) => false);
   } else {
-    SharedPreferences.getInstance()
-        .then((p) => p.setString(key, value))
-        .catchError((_) => false);
+    SharedPreferences.getInstance().then((p) {
+      _prefs ??= p;
+      return p.setString(key, value);
+    }).catchError((_) => false);
   }
 }
 
@@ -147,8 +148,9 @@ void _deleteThrough(String key) {
   if (_prefs != null) {
     _prefs!.remove(key).catchError((_) => false);
   } else {
-    SharedPreferences.getInstance()
-        .then((p) => p.remove(key))
-        .catchError((_) => false);
+    SharedPreferences.getInstance().then((p) {
+      _prefs ??= p;
+      return p.remove(key);
+    }).catchError((_) => false);
   }
 }

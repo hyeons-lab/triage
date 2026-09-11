@@ -792,11 +792,12 @@ class _TerminalPaneState extends State<TerminalPane> {
             }
             final dist = _sessionSavedDistanceFromBottom[widget.terminalId];
             final frac = _sessionSavedScrollFractions[widget.terminalId];
+            final saved = _sessionSavedScrollOffsets[widget.terminalId];
             target ??= dist != null
                 ? (pos.maxScrollExtent - dist).clamp(0.0, pos.maxScrollExtent)
                 : frac != null
                 ? (pos.maxScrollExtent * frac).clamp(0.0, pos.maxScrollExtent)
-                : null;
+                : saved?.clamp(0.0, pos.maxScrollExtent);
             if (target != null && (pos.pixels - target).abs() > 0.5) {
               final wasSuppressed = _suppressAnchorCapture;
               _suppressAnchorCapture = true;
@@ -963,6 +964,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _snapToBottom(ScrollPosition position) {
+    if (!position.hasContentDimensions) return;
     // Suppressed like our own re-pin correction so the snap's notification
     // cannot re-capture an anchor from it. Saved and restored rather than
     // forced false, so a nested call cannot clear an outer suppressed region.

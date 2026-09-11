@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
+import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
@@ -991,6 +992,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
+        // Filter terminal query responses (such as CPR \x1b[...R or DA \x1b[?...c)
+        // emitted by the terminal emulator itself in reply to application queries.
+        // Send directly to the PTY without resetting scroll positions, disarming
+        // sticky Ctrl, or formatting as paste.
+        if (isEmulatorQueryResponse(data)) {
+          _sessionInputRouter.sendInput(sessionId, data);
+          return;
+        }
         _sessionSavedViewportY.remove(sessionId);
         try {
           final term = _sessionTerms[sessionId];

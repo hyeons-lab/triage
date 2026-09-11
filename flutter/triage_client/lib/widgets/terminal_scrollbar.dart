@@ -35,6 +35,16 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
   double? _dragStartPixels;
 
   @override
+  void didUpdateWidget(TerminalScrollbar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _isDragging = false;
+      _dragStartLocalY = null;
+      _dragStartPixels = null;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     if (!widget.enabled) {
       return widget.child;
@@ -42,7 +52,8 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
 
     return NotificationListener<Notification>(
       onNotification: (notification) {
-        if (notification is ScrollMetricsNotification) {
+        if (notification is ScrollMetricsNotification &&
+            notification.depth == 0) {
           if (!_metricsUpdateScheduled) {
             _metricsUpdateScheduled = true;
             WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -68,25 +79,29 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
       bottom: 0,
       right: 0,
       width: widget.width,
-      child: AnimatedBuilder(
-        animation: widget.controller,
-        builder: (context, _) {
-          if (!widget.controller.hasClients) {
-            return const SizedBox.shrink();
-          }
-          final position = widget.controller.position;
-          if (!position.hasContentDimensions || position.maxScrollExtent <= 0) {
-            return const SizedBox.shrink();
-          }
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final trackHeight = constraints.maxHeight;
+          if (trackHeight <= 0) return const SizedBox.shrink();
 
-          return LayoutBuilder(
-            builder: (context, constraints) {
-              final trackHeight = constraints.maxHeight;
-              if (trackHeight <= 0) return const SizedBox.shrink();
+          return AnimatedBuilder(
+            animation: widget.controller,
+            builder: (context, _) {
+              if (!widget.controller.hasClients ||
+                  widget.controller.positions.length != 1) {
+                return const SizedBox.shrink();
+              }
+              final position = widget.controller.position;
+              if (!position.hasContentDimensions ||
+                  position.maxScrollExtent <= 0) {
+                return const SizedBox.shrink();
+              }
 
               final maxScroll = position.maxScrollExtent;
               final viewport = position.viewportDimension;
-              final pixels = position.pixels.clamp(0.0, maxScroll);
+              final pixels = position.pixels.isFinite
+                  ? position.pixels.clamp(0.0, maxScroll)
+                  : 0.0;
 
               final effectiveMinThumbHeight = widget.minThumbHeight.clamp(
                 0.0,
@@ -115,7 +130,9 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
                   behavior: HitTestBehavior.opaque,
                   onTapDown: (details) {
                     final clickY = details.localPosition.dy;
-                    if (availableTrack <= 0 || !widget.controller.hasClients) {
+                    if (availableTrack <= 0 ||
+                        !widget.controller.hasClients ||
+                        !widget.controller.position.hasContentDimensions) {
                       return;
                     }
                     if (clickY < thumbTop || clickY > thumbTop + thumbHeight) {
@@ -138,7 +155,8 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
                     if (startY == null ||
                         startPixels == null ||
                         availableTrack <= 0 ||
-                        !widget.controller.hasClients) {
+                        !widget.controller.hasClients ||
+                        !widget.controller.position.hasContentDimensions) {
                       return;
                     }
 
