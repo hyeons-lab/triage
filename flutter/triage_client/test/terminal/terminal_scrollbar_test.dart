@@ -76,4 +76,34 @@ void main() {
       expect(controller.offset, greaterThan(500.0));
     },
   );
+
+  testWidgets(
+    'TerminalScrollbar handles constrained track heights without throwing',
+    (tester) async {
+      final controller = ScrollController();
+      // Viewport height 20 is smaller than minThumbHeight (28.0)
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              height: 20,
+              width: 400,
+              child: TerminalScrollbar(
+                controller: controller,
+                child: SingleChildScrollView(
+                  controller: controller,
+                  child: const SizedBox(height: 500),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Ensure widget renders without throwing ArgumentError: lowerLimit <= upperLimit
+      expect(controller.position.maxScrollExtent, 480.0);
+      expect(find.byType(DecoratedBox), findsWidgets);
+    },
+  );
 }

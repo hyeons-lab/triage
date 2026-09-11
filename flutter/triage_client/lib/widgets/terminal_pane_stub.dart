@@ -351,6 +351,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       // Drop any latched sticky Ctrl so it can't fold into the new session's
       // first keystroke (a Ctrl armed for session A must not reach session B).
       _ctrlArmed = false;
+      _mobileAutoSpace.reset();
       _endDrag();
       _scrollToCursor(requestFocus: true);
     }
@@ -811,7 +812,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       // This fires from inside RenderTerminal.performLayout (the view auto-fits
       // by calling terminal.resize). Replaying history writes to the terminal,
-      // which would mark the render object dirty during its own layout — illegal.
+      // which would mark the render object dirty during its own layout: illegal.
       // Defer out of the layout pass via a microtask so the write lands after
       // layout completes (the terminal is already at the fitted size by then).
       scheduleMicrotask(() {
@@ -985,7 +986,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalContentChanged() {
-    _mobileAutoSpace.reset();
     // Reposition the copy button as content arrives. The scroll listener alone
     // is not enough: xterm's stick-to-bottom runs through `correctBy` during
     // layout, which moves the viewport without notifying the ScrollController,

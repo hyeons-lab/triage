@@ -8,12 +8,16 @@
 /// when swiping or committing words. This tracker restores natural word spacing
 /// on mobile while preserving single-keystroke typing, flags, paths, and punctuation.
 class MobileAutoSpaceTracker {
+  static final RegExp _unicodeWordCharRegex = RegExp(
+    r'^[\p{L}\p{N}]$',
+    unicode: true,
+  );
+
   bool _lastEndedWithWordChar = false;
 
   bool get lastEndedWithWordChar => _lastEndedWithWordChar;
 
-  /// Resets the tracker. Must be called when the terminal receives host output
-  /// (such as shell prompts or command output), when the user taps or clicks
+  /// Resets the tracker. Must be called when the user taps or clicks
   /// the terminal viewport, on session switch, or when control codes are emitted.
   void reset() {
     _lastEndedWithWordChar = false;
@@ -43,14 +47,22 @@ class MobileAutoSpaceTracker {
   }
 
   /// Whether a character code unit represents an alphanumeric word character.
-  /// Includes ASCII letters and digits, as well as Latin-1 accented letters.
+  /// Supports ASCII, Latin-1, and global Unicode scripts (letters and numbers).
   static bool isWordChar(int codeUnit) {
-    return (codeUnit >= 0x30 && codeUnit <= 0x39) || // 0-9
-        (codeUnit >= 0x41 && codeUnit <= 0x5a) || // A-Z
-        (codeUnit >= 0x61 && codeUnit <= 0x7a) || // a-z
-        (codeUnit >= 0xc0 &&
-            codeUnit <= 0xff &&
-            codeUnit != 0xd7 &&
-            codeUnit != 0xf7); // Latin-1 letters
+    if (codeUnit < 0x80) {
+      return (codeUnit >= 0x30 && codeUnit <= 0x39) || // 0-9
+          (codeUnit >= 0x41 && codeUnit <= 0x5a) || // A-Z
+          (codeUnit >= 0x61 && codeUnit <= 0x7a); // a-z
+    }
+    if (codeUnit >= 0xc0 &&
+        codeUnit <= 0xff &&
+        codeUnit != 0xd7 &&
+        codeUnit != 0xf7) {
+      return true;
+    }
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdfff) {
+      return false;
+    }
+    return _unicodeWordCharRegex.hasMatch(String.fromCharCode(codeUnit));
   }
 }

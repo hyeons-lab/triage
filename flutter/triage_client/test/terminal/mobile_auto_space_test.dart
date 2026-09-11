@@ -94,5 +94,61 @@ void main() {
       expect(tracker.lastEndedWithWordChar, isTrue);
       expect(tracker.processInput('noir'), ' noir');
     });
+
+    test('global Unicode scripts are treated as word characters', () {
+      // Cyrillic
+      expect(tracker.processInput('привет'), 'привет');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput('мир'), ' мир');
+
+      // Polish (Extended Latin)
+      tracker.reset();
+      expect(tracker.processInput('cześć'), 'cześć');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput('świecie'), ' świecie');
+
+      // Korean Hangul
+      tracker.reset();
+      expect(tracker.processInput('안녕'), '안녕');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput('세상'), ' 세상');
+    });
+
+    test('PTY echo simulation does not clear tracking state between words', () {
+      // 1. User swipes first word
+      expect(tracker.processInput('git'), 'git');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+
+      // 2. Remote PTY echoes "git" to terminal output (not a tracker reset event)
+      expect(tracker.lastEndedWithWordChar, isTrue);
+
+      // 3. User swipes second word: leading space is correctly inserted
+      expect(tracker.processInput('status'), ' status');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+    });
+
+    test('words ending with digits retain word character state', () {
+      expect(tracker.processInput('python3'), 'python3');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput('script'), ' script');
+
+      tracker.reset();
+      expect(tracker.processInput('utf8'), 'utf8');
+      expect(tracker.lastEndedWithWordChar, isTrue);
+      expect(tracker.processInput('encoding'), ' encoding');
+    });
+
+    test(
+      'surrogate pairs such as emojis do not register as word characters',
+      () {
+        final emoji = '🚀';
+        final firstCodeUnit = emoji.codeUnitAt(0);
+        expect(MobileAutoSpaceTracker.isWordChar(firstCodeUnit), isFalse);
+
+        expect(tracker.processInput(emoji), emoji);
+        expect(tracker.lastEndedWithWordChar, isFalse);
+        expect(tracker.processInput('launch'), 'launch');
+      },
+    );
   });
 }

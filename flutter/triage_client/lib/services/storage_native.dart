@@ -134,7 +134,7 @@ void clearClientId() {
 void _writeThrough(String key, String value) {
   _secureStorage.write(key: key, value: value).catchError((_) {});
   if (_prefs != null) {
-    _prefs!.setString(key, value);
+    _prefs!.setString(key, value).catchError((_) => false);
   } else {
     SharedPreferences.getInstance()
         .then((p) => p.setString(key, value))
@@ -145,7 +145,7 @@ void _writeThrough(String key, String value) {
 void _deleteThrough(String key) {
   _secureStorage.delete(key: key).catchError((_) {});
   if (_prefs != null) {
-    _prefs!.remove(key);
+    _prefs!.remove(key).catchError((_) => false);
   } else {
     SharedPreferences.getInstance()
         .then((p) => p.remove(key))

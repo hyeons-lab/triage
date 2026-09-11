@@ -998,18 +998,16 @@ class _TerminalPaneState extends State<TerminalPane> {
             js_util.callMethod(term, 'scrollToBottom', []);
           }
         } catch (_) {}
-        final activePane = _containerEventOwners[sessionId];
-        if (activePane != null) {
-          if (!activePane._initialContentWritten &&
-              (activePane._lastFittedCols ?? 0) >= 10 &&
-              (activePane._lastFittedRows ?? 0) >= 5) {
-            activePane._finishInitialContent(
-              activePane._lastFittedCols!,
-              activePane._lastFittedRows!,
-            );
-          } else {
-            activePane._flushPendingLiveWrites();
-          }
+        final activePane = _containerEventOwners[sessionId] ?? this;
+        if (!activePane._initialContentWritten &&
+            (activePane._lastFittedCols ?? 0) >= 10 &&
+            (activePane._lastFittedRows ?? 0) >= 5) {
+          activePane._finishInitialContent(
+            activePane._lastFittedCols!,
+            activePane._lastFittedRows!,
+          );
+        } else {
+          activePane._flushPendingLiveWrites();
         }
         // Sticky Ctrl (accessory bar): fold an armed Ctrl into the next single
         // character before it reaches the session: arming Ctrl then typing "c"
@@ -1031,12 +1029,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
           _sessionAutoSpace[sessionId]?.reset();
           if (_currentRoute?.isCurrent == false) return;
-          final activePane = _containerEventOwners[sessionId] ?? this;
           unawaited(activePane._handlePaste(data));
           return;
         }
-        final effectiveData = activePane?._isMobile == true
-            ? (_sessionAutoSpace[sessionId]?.processInput(data) ?? data)
+        final effectiveData = activePane._isMobile
+            ? _sessionAutoSpace
+                  .putIfAbsent(sessionId, MobileAutoSpaceTracker.new)
+                  .processInput(data)
             : data;
         _sessionInputRouter.sendInput(sessionId, effectiveData);
       });
@@ -1252,7 +1251,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     final sessionId = sanitizedId;
 
     void onWrite(String data) {
-      _sessionAutoSpace[sessionId]?.reset();
       final term = _sessionTerms[sessionId];
       if (term != null) {
         try {

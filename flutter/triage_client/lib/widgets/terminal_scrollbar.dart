@@ -30,6 +30,7 @@ class TerminalScrollbar extends StatefulWidget {
 class _TerminalScrollbarState extends State<TerminalScrollbar> {
   bool _isHovered = false;
   bool _isDragging = false;
+  bool _metricsUpdateScheduled = false;
   double? _dragStartLocalY;
   double? _dragStartPixels;
 
@@ -41,10 +42,15 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
 
     return NotificationListener<Notification>(
       onNotification: (notification) {
-        if (notification is ScrollNotification ||
-            notification is ScrollMetricsNotification) {
-          if (mounted) {
-            setState(() {});
+        if (notification is ScrollMetricsNotification) {
+          if (!_metricsUpdateScheduled) {
+            _metricsUpdateScheduled = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _metricsUpdateScheduled = false;
+              if (mounted) {
+                setState(() {});
+              }
+            });
           }
         }
         return false;
@@ -82,9 +88,13 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
               final viewport = position.viewportDimension;
               final pixels = position.pixels.clamp(0.0, maxScroll);
 
+              final effectiveMinThumbHeight = widget.minThumbHeight.clamp(
+                0.0,
+                trackHeight,
+              );
               final thumbHeight =
                   (viewport / (viewport + maxScroll) * trackHeight).clamp(
-                    widget.minThumbHeight,
+                    effectiveMinThumbHeight,
                     trackHeight,
                   );
               final availableTrack = trackHeight - thumbHeight;
@@ -105,7 +115,9 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
                   behavior: HitTestBehavior.opaque,
                   onTapDown: (details) {
                     final clickY = details.localPosition.dy;
-                    if (availableTrack <= 0) return;
+                    if (availableTrack <= 0 || !widget.controller.hasClients) {
+                      return;
+                    }
                     if (clickY < thumbTop || clickY > thumbTop + thumbHeight) {
                       final targetPixels =
                           ((clickY - thumbHeight / 2) /
@@ -125,7 +137,8 @@ class _TerminalScrollbarState extends State<TerminalScrollbar> {
                     final startPixels = _dragStartPixels;
                     if (startY == null ||
                         startPixels == null ||
-                        availableTrack <= 0) {
+                        availableTrack <= 0 ||
+                        !widget.controller.hasClients) {
                       return;
                     }
 

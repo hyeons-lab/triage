@@ -29,6 +29,13 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - `2026-09-11T00:47-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Removed false-positive wasScrolledUp fallback in _scrollToCursor so un-scrolled sessions reliably start and stay at bottom.
 - `2026-09-11T00:48-0400 flutter/triage_client/lib/widgets/terminal_scrollbar.dart`: Implemented custom interactive TerminalScrollbar with opaque hit-testing, direct drag tracking, and track tap navigation.
 - `2026-09-11T00:49-0400 flutter/triage_client/test/terminal/terminal_scrollbar_test.dart`: Added unit and widget tests for TerminalScrollbar visibility, dragging, and track navigation.
+- `2026-09-11T07:40-0400 flutter/triage_client/lib/terminal/mobile_auto_space.dart`: Added global Unicode script support with zero-allocation ASCII/Latin-1 fast paths and surrogate pair guards.
+- `2026-09-11T07:40-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Removed premature tracker reset on PTY echo / terminal content change and reset tracker on session swap in didUpdateWidget.
+- `2026-09-11T07:40-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Removed tracker reset on host write, unified activePane resolution, and ensured lazy initialization with putIfAbsent in onDataCallback.
+- `2026-09-11T07:40-0400 flutter/triage_client/lib/widgets/terminal_scrollbar.dart`: Clamped minThumbHeight against trackHeight, coalesced multiple ScrollMetricsNotification callbacks per frame, and guarded controller.hasClients.
+- `2026-09-11T07:40-0400 flutter/triage_client/lib/services/storage_native.dart`: Added catchError guards on SharedPreferences write and remove operations.
+- `2026-09-11T07:40-0400 flutter/triage_client/test/terminal/mobile_auto_space_test.dart`: Added tests for global Unicode scripts, PTY echo immunity, tokens ending with digits, and surrogate pair emojis.
+- `2026-09-11T07:40-0400 flutter/triage_client/test/terminal/terminal_scrollbar_test.dart`: Added test for constrained track heights.
 
 ## Decisions
 
@@ -46,6 +53,9 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - 2026-09-11T00:47-0400 Revert _hasCheckedInitialOffset in RenderTerminal (xterm.dart): On initial layout before lines settle, maxScrollExtent is 0, which caused _hasCheckedInitialOffset to prematurely disable stick-to-bottom on the first non-zero frame. Preserving default stick-to-bottom ensures output stays anchored at the bottom.
 - 2026-09-11T00:47-0400 Require explicit saved scroll state in _scrollToCursor: Removed the pixels < maxScrollExtent - 2 * lineHeight heuristic so an un-scrolled 0.0 offset on initial load is never mistaken for intentional user scrollback.
 - 2026-09-11T00:48-0400 Use opaque hit-testing for TerminalScrollbar overlay: Prevents pointer down and drag events on the right scrollbar track from falling through to terminal selection listeners and gesture detectors below.
+- 2026-09-11T07:40-0400 Decouple mobile auto-space tracking from PTY echo: Shells echo typed characters back to the terminal; resetting tracker state on host writes cleared tracking before subsequent words were emitted. Resets now trigger strictly on user input actions (Enter, Backspace, Delimiters, PointerDown, Session Switch, Clear).
+- 2026-09-11T07:40-0400 Support Unicode letters and digits in isWordChar: Replaced Latin-1 ceiling with Unicode property regex with zero-allocation ASCII and Latin-1 fast paths, safely excluding surrogate code units.
+- 2026-09-11T07:40-0400 Coalesce scroll metrics notifications in TerminalScrollbar: Multiple metrics notifications in a single layout frame now schedule at most one post-frame setState to prevent redundant rebuilds during terminal streaming.
 
 ## Issues
 
@@ -57,4 +67,5 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - a0c3217: fix(client): auto-space words on mobile, fix terminal resize clipping and cursor drift, update cera to 0.5.6
 - c3a19a5: fix(client): support Mode 2026 synchronized output and persist session scroll position
 - d1d2a7d: fix(terminal): support CSI s/u cursor save/restore, 1-index CPR, and prevent scroll loss on fit and switch
-- HEAD: fix(client): persist credentials across restarts, stick terminal to bottom, and add draggable scrollbar
+- a159ee6: fix(client): persist credentials across restarts, stick terminal to bottom, and add draggable scrollbar
+- HEAD: fix(client): refine mobile auto-space tracking, unicode support, and scrollbar resilience
