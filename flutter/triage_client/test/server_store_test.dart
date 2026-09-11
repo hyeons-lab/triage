@@ -528,4 +528,44 @@ void main() {
       expect(prefs.getStringList(pinnedGroupsPrefKeyFor('web-a-1')), ['/repo']);
     });
   });
+
+  group('credential persistence fallback', () {
+    test(
+      'restores clientId and token from SharedPreferences when Keychain is empty',
+      () async {
+        FlutterSecureStorage.setMockInitialValues({});
+        SharedPreferences.setMockInitialValues({
+          'triage_client_id': 'saved-client-id-123',
+          'triage_bearer_token_server-xyz': 'saved-token-xyz',
+        });
+        resetCredentialCacheForTesting();
+        await loadCredentials();
+
+        expect(retrieveClientId(), 'saved-client-id-123');
+        expect(retrieveTokenFor('server-xyz'), 'saved-token-xyz');
+      },
+    );
+
+    test(
+      'writes through to SharedPreferences so ad-hoc sandboxed apps persist credentials',
+      () async {
+        FlutterSecureStorage.setMockInitialValues({});
+        SharedPreferences.setMockInitialValues({});
+        resetCredentialCacheForTesting();
+        await loadCredentials();
+
+        persistClientId('client-new-456');
+        persistTokenFor('srv-1', 'token-abc');
+
+        final prefs = await SharedPreferences.getInstance();
+        expect(prefs.getString('triage_client_id'), 'client-new-456');
+        expect(prefs.getString('triage_bearer_token_srv-1'), 'token-abc');
+
+        clearClientId();
+        clearTokenFor('srv-1');
+        expect(prefs.getString('triage_client_id'), isNull);
+        expect(prefs.getString('triage_bearer_token_srv-1'), isNull);
+      },
+    );
+  });
 }

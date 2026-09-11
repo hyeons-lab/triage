@@ -22,6 +22,13 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - `2026-09-11T00:37-0400 flutter/triage_client/pubspec.yaml, pubspec.lock`: Updated xterm dependency override to commit 6964d2250a8052207f5a7ffa3df92a9863992ad5 supporting CSI s (SCP) and CSI u (RCP) cursor save/restore, 1-based ANSI Cursor Position Report (CPR), and initial scroll offset preservation in RenderTerminal without forced jump to bottom.
 - `2026-09-11T00:37-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Guarded _scrollToCursor against maxScrollExtent <= 0, tracked _sessionSavedScrollFractions, preserved scrollback offset and distance from bottom when pressing fit or switching sessions, and filtered automated terminal query responses with isEmulatorQueryResponse.
 - `2026-09-11T00:37-0400 flutter/triage_client/test/widget_test.dart`: Added widget tests verifying scroll offset preservation when pressing the fit button while scrolled up, and bottom stickiness when switching sessions.
+- `2026-09-11T00:45-0400 devlog/plans/000145-02-scroll-credentials-and-scrollbar-handle.md`: Authored implementation plan covering credential persistence fallback, terminal initial scroll stick-to-bottom, and draggable scrollbar handle.
+- `2026-09-11T00:46-0400 flutter/triage_client/lib/services/storage_native.dart`: Added SharedPreferences shadow store alongside FlutterSecureStorage so sandboxed ad-hoc macOS apps persist clientId and daemon tokens across launches without prompting for PIN pairing.
+- `2026-09-11T00:46-0400 flutter/triage_client/test/server_store_test.dart`: Added unit tests verifying SharedPreferences credential persistence fallback when Keychain is unavailable.
+- `2026-09-11T00:47-0400 flutter/triage_client/pubspec.yaml, pubspec.lock`: Updated xterm dependency override to commit 7e867fe15be8e76cca5651f3def8876d801df9a7 reverting initial offset check in RenderTerminal so stick-to-bottom works reliably.
+- `2026-09-11T00:47-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Removed false-positive wasScrolledUp fallback in _scrollToCursor so un-scrolled sessions reliably start and stay at bottom.
+- `2026-09-11T00:48-0400 flutter/triage_client/lib/widgets/terminal_scrollbar.dart`: Implemented custom interactive TerminalScrollbar with opaque hit-testing, direct drag tracking, and track tap navigation.
+- `2026-09-11T00:49-0400 flutter/triage_client/test/terminal/terminal_scrollbar_test.dart`: Added unit and widget tests for TerminalScrollbar visibility, dragging, and track navigation.
 
 ## Decisions
 
@@ -35,6 +42,10 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - 2026-09-11T00:37-0400 Support CSI s/u and 1-based CPR in xterm.dart: Fixes cursor dancing and character insertion displacement during terminal waiting/spinner animations (such as Antigravity/Bubbletea) where cursor save/restore sequences were previously ignored by the parser.
 - 2026-09-11T00:37-0400 Guard maxScrollExtent <= 0 in _scrollToCursor: Prevents premature post-frame jumps to offset 0 during initial layout passes or before content dimensions are reported, keeping bottom sessions sticky and scrolled-up sessions anchored.
 - 2026-09-11T00:37-0400 Preserve relative fraction and distance from bottom on resize and fit: Avoids falling back to maxScrollExtent when buffer lines are reflowed or detached, ensuring the user stays at their exact scrollback position when clicking Fit or resizing.
+- 2026-09-11T00:46-0400 Back FlutterSecureStorage with SharedPreferences on native platforms: Sandboxed macOS apps with ad-hoc signing cannot access the Keychain without entitlements or prompts. Shadowing writes to SharedPreferences (inside the app's sandboxed container plist) guarantees client ID and bearer token persistence across restarts.
+- 2026-09-11T00:47-0400 Revert _hasCheckedInitialOffset in RenderTerminal (xterm.dart): On initial layout before lines settle, maxScrollExtent is 0, which caused _hasCheckedInitialOffset to prematurely disable stick-to-bottom on the first non-zero frame. Preserving default stick-to-bottom ensures output stays anchored at the bottom.
+- 2026-09-11T00:47-0400 Require explicit saved scroll state in _scrollToCursor: Removed the pixels < maxScrollExtent - 2 * lineHeight heuristic so an un-scrolled 0.0 offset on initial load is never mistaken for intentional user scrollback.
+- 2026-09-11T00:48-0400 Use opaque hit-testing for TerminalScrollbar overlay: Prevents pointer down and drag events on the right scrollbar track from falling through to terminal selection listeners and gesture detectors below.
 
 ## Issues
 
@@ -45,4 +56,5 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 
 - a0c3217: fix(client): auto-space words on mobile, fix terminal resize clipping and cursor drift, update cera to 0.5.6
 - c3a19a5: fix(client): support Mode 2026 synchronized output and persist session scroll position
-- HEAD: fix(terminal): support CSI s/u cursor save/restore, 1-index CPR, and prevent scroll loss on fit and switch
+- d1d2a7d: fix(terminal): support CSI s/u cursor save/restore, 1-index CPR, and prevent scroll loss on fit and switch
+- HEAD: fix(client): persist credentials across restarts, stick terminal to bottom, and add draggable scrollbar

@@ -25,12 +25,15 @@ void main() {
       expect(tracker.lastEndedWithWordChar, isTrue);
     });
 
-    test('manual space prevents duplicate spaces on subsequent swiped word', () {
-      expect(tracker.processInput('git'), 'git');
-      expect(tracker.processInput(' '), ' ');
-      expect(tracker.lastEndedWithWordChar, isFalse);
-      expect(tracker.processInput('status'), 'status');
-    });
+    test(
+      'manual space prevents duplicate spaces on subsequent swiped word',
+      () {
+        expect(tracker.processInput('git'), 'git');
+        expect(tracker.processInput(' '), ' ');
+        expect(tracker.lastEndedWithWordChar, isFalse);
+        expect(tracker.processInput('status'), 'status');
+      },
+    );
 
     test('key-by-key tap typing within a word does not insert spaces', () {
       expect(tracker.processInput('c'), 'c');
