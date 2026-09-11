@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
+import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
@@ -170,6 +171,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
+    _TerminalPaneState._sessionAutoSpace.remove(sanitizedId);
     _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
@@ -594,6 +596,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     if (_ctrlArmed) {
       _setCtrlArmed(false);
+      _autoSpace.reset();
       if (text.length == 1) {
         final ctrl = controlByteForChar(text);
         if (ctrl != null) {
@@ -604,16 +607,19 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     if (text == '\n' || text == '\r\n') {
+      _autoSpace.reset();
       _sendInput('\r');
       return;
     }
 
     if (text.length > 1 && isMultiLine(text)) {
+      _autoSpace.reset();
       unawaited(_handlePaste(text));
       return;
     }
 
-    _sendInput(text);
+    final effectiveText = _isMobile ? _autoSpace.processInput(text) : text;
+    _sendInput(effectiveText);
   }
 
   // Sticky Ctrl for the on-screen accessory bar (mobile web): when armed, the
@@ -627,6 +633,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   // lives here and a rebuild hook lets the fold un-highlight the mounted bar.
   static final Map<String, bool> _sessionCtrlArmed = {};
   static final Map<String, VoidCallback> _sessionCtrlRebuild = {};
+  static final Map<String, MobileAutoSpaceTracker> _sessionAutoSpace = {};
+
+  MobileAutoSpaceTracker get _autoSpace =>
+      _sessionAutoSpace.putIfAbsent(_sanitizedId, MobileAutoSpaceTracker.new);
 
   bool get _ctrlArmed => _sessionCtrlArmed[_sanitizedId] ?? false;
 
@@ -646,6 +656,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _sendAccessory(String bytes) {
     _sessionInputRouter.sendInput(_sanitizedId, bytes);
     _setCtrlArmed(false);
+    _autoSpace.reset();
   }
 
   // Touch clients (mobile-OS browser) get the on-screen accessory bar; desktop
@@ -800,6 +811,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _currentMountedPane = this;
     _containerEventOwners[_sanitizedId] = this;
     widget.controller.notifyInteraction();
+    _autoSpace.reset();
 
     final isConnected = _container.isConnected ?? true;
     if (!isConnected) {
@@ -1007,6 +1019,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         // by session (not `this`) because this callback is cached and reused
         // across State instances.
         if (_sessionCtrlArmed[sessionId] ?? false) {
+          _sessionAutoSpace[sessionId]?.reset();
           final ctrl = data.length == 1 ? controlByteForChar(data) : null;
           _sessionCtrlArmed[sessionId] = false;
           _sessionCtrlRebuild[sessionId]?.call();
@@ -1016,12 +1029,16 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
         }
         if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
+          _sessionAutoSpace[sessionId]?.reset();
           if (_currentRoute?.isCurrent == false) return;
           final activePane = _containerEventOwners[sessionId] ?? this;
           unawaited(activePane._handlePaste(data));
           return;
         }
-        _sessionInputRouter.sendInput(sessionId, data);
+        final effectiveData = activePane?._isMobile == true
+            ? (_sessionAutoSpace[sessionId]?.processInput(data) ?? data)
+            : data;
+        _sessionInputRouter.sendInput(sessionId, effectiveData);
       });
       onDataSubscription = js_util.callMethod(_term, 'onData', [
         onDataCallback,
@@ -1235,6 +1252,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     final sessionId = sanitizedId;
 
     void onWrite(String data) {
+      _sessionAutoSpace[sessionId]?.reset();
       final term = _sessionTerms[sessionId];
       if (term != null) {
         try {
@@ -1273,6 +1291,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     void onClear() {
+      _sessionAutoSpace[sessionId]?.reset();
       _sessionSavedViewportY.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {

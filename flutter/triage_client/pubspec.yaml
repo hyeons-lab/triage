@@ -91,6 +91,15 @@ dependencies:
 # PR 225; it is ours, and it is also what makes the rule the guards here rely on
 # ("a negative row means cleared away") hold on the resize path.
 #
+# 3. `Buffer.resize` previously dropped bottom lines on height shrink even if they
+# contained active content, and advanced cursorY on expand into blank space. It also
+# did not reposition the cursor across width reflow. The fork preserves cursor
+# coordinates relative to content, tracks cursor during width reflow with an anchor,
+# and only trims trailing empty lines below the cursor.
+#
+# 4. `RenderTerminal` layout race condition where `_stickToBottom` was cleared during
+# `applyContentDimensions` before `correctBy` executed during viewport resizing.
+#
 # Branched from the `v4.0.0` tag rather than upstream master. Master carries
 # unreleased commits beyond the tag, two of them behavioural (colour rendering
 # in `palette_builder.dart`, Android enter-key handling in `terminal_view.dart`),
@@ -100,14 +109,14 @@ dependencies:
 # Pinned by commit, not by branch name: a branch ref would let a force-push or
 # a new commit change the terminal emulator this app ships with no diff here.
 #
-# Fix 1 can be dropped once a release contains PR 225. Fix 2 has not been filed
-# upstream yet, so nothing will carry it until that happens; drop the override
-# only once a release contains both.
+# Fix 1 can be dropped once a release contains PR 225. Fixes 2, 3, and 4 have not
+# been filed upstream yet, so nothing will carry them until that happens; drop the
+# override only once a release contains all of them.
 dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: 43069c44931e842b5fbad5c0fa88cf21664ee8e0
+      ref: f43cd66be3d6070be08a95c693502e53d4a4eee7
 
 dev_dependencies:
   flutter_test:

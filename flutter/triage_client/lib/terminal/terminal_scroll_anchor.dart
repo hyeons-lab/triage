@@ -105,7 +105,7 @@ class TerminalScrollAnchor {
     final lineCount = buffer.lines.length;
     if (lineHeight <= 0 ||
         lineCount <= 0 ||
-        pixels >= maxScrollExtent - lineHeight) {
+        pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight) {
       _line = null;
       return;
     }

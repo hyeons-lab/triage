@@ -17,6 +17,7 @@ import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
+import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/platform_env_io.dart';
@@ -148,6 +149,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _ctrlArmed = false;
   bool _isPasting = false;
   bool _isPasteDialogShowing = false;
+  final MobileAutoSpaceTracker _mobileAutoSpace = MobileAutoSpaceTracker();
 
   // The selection the floating Copy button is offering (mobile only), or null
   // when there is none. Not a visibility flag: it stays set while the button is
@@ -450,6 +452,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
+    _mobileAutoSpace.reset();
     _activePointers.add(event.pointer);
     // Desktop only: focus on pointer-down so a mouse click focuses the terminal
     // before a drag-select. On mobile this same pointer-down begins a scroll
@@ -646,6 +649,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // character before it reaches the session, so e.g. arming Ctrl then typing
     // "c" on the soft keyboard sends 0x03 (SIGINT) instead of a literal "c".
     if (_ctrlArmed) {
+      _mobileAutoSpace.reset();
       // Disarm on the very next chunk regardless of its length; only fold Ctrl
       // into a lone character. A multi-character IME chunk (paste, suggestion
       // commit) still consumes the armed Ctrl (untransformed) so a latched
@@ -661,10 +665,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     // or Gboard on mobile). Intercept so multi-line text is formatted with bracketed
     // paste or verified with the confirmation dialog rather than executing line by line.
     if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
+      _mobileAutoSpace.reset();
       unawaited(_handlePaste(data));
       return;
     }
-    widget.controller.sendInput(data);
+    final effectiveData =
+        _isMobile ? _mobileAutoSpace.processInput(data) : data;
+    widget.controller.sendInput(effectiveData);
   }
 
   void _armCtrl() {
@@ -688,6 +695,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _sendAccessory(String bytes) {
     widget.controller.sendInput(bytes);
     _disarmCtrl();
+    _mobileAutoSpace.reset();
   }
 
   void _toggleCtrl() {
@@ -726,6 +734,15 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (width != _terminal.viewWidth) {
         _selectionAnchor = null;
         _selectionAnchorBuffer = null;
+      }
+      if (!_scrollAnchor.hasAnchor && _scrollController.hasClients) {
+        scheduleMicrotask(() {
+          if (mounted &&
+              _scrollController.hasClients &&
+              !_scrollAnchor.hasAnchor) {
+            _snapToBottom(_scrollController.position);
+          }
+        });
       }
       // This fires from inside RenderTerminal.performLayout (the view auto-fits
       // by calling terminal.resize). Replaying history writes to the terminal,
@@ -885,6 +902,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalContentChanged() {
+    _mobileAutoSpace.reset();
     // Reposition the copy button as content arrives. The scroll listener alone
     // is not enough: xterm's stick-to-bottom runs through `correctBy` during
     // layout, which moves the viewport without notifying the ScrollController,
@@ -990,7 +1008,14 @@ class _TerminalPaneState extends State<TerminalPane> {
           target = position.maxScrollExtent;
         }
         if ((position.pixels - target).abs() > 0.5) {
-          position.jumpTo(target);
+          final wasSuppressed = _suppressAnchorCapture;
+          _suppressAnchorCapture = true;
+          try {
+            position.jumpTo(target);
+          } finally {
+            _suppressAnchorCapture = wasSuppressed;
+            _lastScrollPixels = position.pixels;
+          }
         }
       }
       if (requestFocus) {

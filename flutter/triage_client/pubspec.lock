@@ -713,8 +713,8 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: "43069c44931e842b5fbad5c0fa88cf21664ee8e0"
-      resolved-ref: "43069c44931e842b5fbad5c0fa88cf21664ee8e0"
+      ref: f43cd66be3d6070be08a95c693502e53d4a4eee7
+      resolved-ref: f43cd66be3d6070be08a95c693502e53d4a4eee7
       url: "https://github.com/hyeons-lab/xterm.dart.git"
     source: git
     version: "4.0.0"
