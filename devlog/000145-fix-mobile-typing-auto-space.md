@@ -19,6 +19,9 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - `2026-09-10T22:14-0400 crates/triaged/src/summarizer.rs`: Configured gpu_depthformer: false for cera EngineConfig.
 - `2026-09-11T00:05-0400 flutter/triage_client/pubspec.yaml, pubspec.lock`: Updated xterm dependency override to commit 7cb984f87ffa583d878858217717d48326b7c3d8 containing DEC Mode 2026 synchronized output and OS IME caret rect suppression.
 - `2026-09-11T00:05-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Preserved session scroll position and relative distance from bottom across session switches, preventing abrupt jumps or snapping to the top.
+- `2026-09-11T00:37-0400 flutter/triage_client/pubspec.yaml, pubspec.lock`: Updated xterm dependency override to commit 6964d2250a8052207f5a7ffa3df92a9863992ad5 supporting CSI s (SCP) and CSI u (RCP) cursor save/restore, 1-based ANSI Cursor Position Report (CPR), and initial scroll offset preservation in RenderTerminal without forced jump to bottom.
+- `2026-09-11T00:37-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Guarded _scrollToCursor against maxScrollExtent <= 0, tracked _sessionSavedScrollFractions, preserved scrollback offset and distance from bottom when pressing fit or switching sessions, and filtered automated terminal query responses with isEmulatorQueryResponse.
+- `2026-09-11T00:37-0400 flutter/triage_client/test/widget_test.dart`: Added widget tests verifying scroll offset preservation when pressing the fit button while scrolled up, and bottom stickiness when switching sessions.
 
 ## Decisions
 
@@ -29,6 +32,9 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - 2026-09-10T22:07-0400 Guard RenderTerminal layout in render.dart (xterm.dart): Sets _isPerformingLayout flag during performLayout so applyContentDimensions does not prematurely drop _stickToBottom before correctBy adjusts scroll offset.
 - 2026-09-11T00:05-0400 Implement DEC Mode 2026 (Synchronized Output) in xterm.dart: Buffers terminal listener notifications during synchronized batches emitted by CLI tools like Antigravity, and suppresses erratic cursor rect notifications to OS IME while the pen is moving or hidden.
 - 2026-09-11T00:05-0400 Retain distance from bottom and capture anchor on session save: Guarantees that returning to a session accurately restores the visible text or relative position from bottom rather than jumping to line 0 or raw stale offsets.
+- 2026-09-11T00:37-0400 Support CSI s/u and 1-based CPR in xterm.dart: Fixes cursor dancing and character insertion displacement during terminal waiting/spinner animations (such as Antigravity/Bubbletea) where cursor save/restore sequences were previously ignored by the parser.
+- 2026-09-11T00:37-0400 Guard maxScrollExtent <= 0 in _scrollToCursor: Prevents premature post-frame jumps to offset 0 during initial layout passes or before content dimensions are reported, keeping bottom sessions sticky and scrolled-up sessions anchored.
+- 2026-09-11T00:37-0400 Preserve relative fraction and distance from bottom on resize and fit: Avoids falling back to maxScrollExtent when buffer lines are reflowed or detached, ensuring the user stays at their exact scrollback position when clicking Fit or resizing.
 
 ## Issues
 
@@ -38,4 +44,5 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 ## Commits
 
 - a0c3217: fix(client): auto-space words on mobile, fix terminal resize clipping and cursor drift, update cera to 0.5.6
-- HEAD: fix(client): support Mode 2026 synchronized output and persist session scroll position
+- c3a19a5: fix(client): support Mode 2026 synchronized output and persist session scroll position
+- HEAD: fix(terminal): support CSI s/u cursor save/restore, 1-index CPR, and prevent scroll loss on fit and switch

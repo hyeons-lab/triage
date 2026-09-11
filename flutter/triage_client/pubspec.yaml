@@ -104,6 +104,10 @@ dependencies:
 # notifications during synchronized batches, and guard OS IME caret rect
 # notifications when the cursor is hidden or during synchronized updates.
 #
+# 6. Support CSI s (Save Cursor) and CSI u (Restore Cursor) in escape parser, fix
+# 1-based indexing for ANSI Cursor Position Report (CPR), and preserve initial
+# scroll offset in RenderTerminal layout without forced jump to bottom.
+#
 # Branched from the `v4.0.0` tag rather than upstream master. Master carries
 # unreleased commits beyond the tag, two of them behavioural (colour rendering
 # in `palette_builder.dart`, Android enter-key handling in `terminal_view.dart`),
@@ -113,14 +117,14 @@ dependencies:
 # Pinned by commit, not by branch name: a branch ref would let a force-push or
 # a new commit change the terminal emulator this app ships with no diff here.
 #
-# Fix 1 can be dropped once a release contains PR 225. Fixes 2, 3, 4, and 5 have
+# Fix 1 can be dropped once a release contains PR 225. Fixes 2, 3, 4, 5, and 6 have
 # not been filed upstream yet, so nothing will carry them until that happens;
 # drop the override only once a release contains all of them.
 dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: 7cb984f87ffa583d878858217717d48326b7c3d8
+      ref: 6964d2250a8052207f5a7ffa3df92a9863992ad5
 
 dev_dependencies:
   flutter_test:
