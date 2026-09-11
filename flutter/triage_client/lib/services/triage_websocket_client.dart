@@ -349,20 +349,23 @@ class TriageWebSocketClient {
     });
 
     try {
+      var sentFlatBuffers = false;
       if (isFlatBuffersNegotiated) {
         try {
           final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
           _channel!.sink.add(bytes);
-          return completer.future;
+          sentFlatBuffers = true;
         } on UnimplementedError {
           // Fall through to JSON text frame for request types without FlatBuffers builders.
         }
       }
-      final payload = <String, dynamic>{'id': id, 'type': type};
-      if (extra != null) {
-        payload.addAll(extra);
+      if (!sentFlatBuffers) {
+        final payload = <String, dynamic>{'id': id, 'type': type};
+        if (extra != null) {
+          payload.addAll(extra);
+        }
+        _channel!.sink.add(jsonEncode(payload));
       }
-      _channel!.sink.add(jsonEncode(payload));
     } catch (e) {
       _pendingRequests.remove(id);
       _pendingRequestTypes.remove(id);

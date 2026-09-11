@@ -17,12 +17,15 @@ import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
+import 'package:triage_client/terminal/emulator_query_response.dart';
+import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/platform_env_io.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
+import 'package:triage_client/widgets/terminal_scrollbar.dart';
 import 'terminal_pane.dart';
 
 /// Native terminal view. A thin presentation layer over the persistent
@@ -64,6 +67,8 @@ class TerminalPane extends StatefulWidget {
   static void destroySession(String terminalId) {
     _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
     _TerminalPaneState._sessionSavedScrollAnchors.remove(terminalId);
+    _TerminalPaneState._sessionSavedDistanceFromBottom.remove(terminalId);
+    _TerminalPaneState._sessionSavedScrollFractions.remove(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
   }
 
@@ -89,6 +94,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
   static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
       {};
+  static final Map<String, double> _sessionSavedDistanceFromBottom = {};
+  static final Map<String, double> _sessionSavedScrollFractions = {};
 
   /// A finite initial scroll offset sentinel (1 billion pixels) that complies
   /// with Flutter's ScrollController bounds checking (`assert(initialScrollOffset.isFinite)`),
@@ -148,6 +155,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _ctrlArmed = false;
   bool _isPasting = false;
   bool _isPasteDialogShowing = false;
+  final MobileAutoSpaceTracker _mobileAutoSpace = MobileAutoSpaceTracker();
 
   // The selection the floating Copy button is offering (mobile only), or null
   // when there is none. Not a visibility flag: it stays set while the button is
@@ -264,6 +272,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       _scrollAnchor.copyFrom(savedAnchor);
     }
     _scrollController = ScrollController(initialScrollOffset: initialOffset);
+    _suppressAnchorCapture = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _suppressAnchorCapture = false;
+      }
+    });
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
@@ -337,6 +351,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       // Drop any latched sticky Ctrl so it can't fold into the new session's
       // first keystroke (a Ctrl armed for session A must not reach session B).
       _ctrlArmed = false;
+      _mobileAutoSpace.reset();
       _endDrag();
       _scrollToCursor(requestFocus: true);
     }
@@ -450,6 +465,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
+    _mobileAutoSpace.reset();
     _activePointers.add(event.pointer);
     // Desktop only: focus on pointer-down so a mouse click focuses the terminal
     // before a drag-select. On mobile this same pointer-down begins a scroll
@@ -636,8 +652,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _onTerminalOutput(String data) {
+    // Automated emulator responses (such as Cursor Position Report \x1b[...R,
+    // Device Attributes \x1b[?...c, Operating Status \x1b[0n, window size \x1b[8;...t)
+    // are replies to host queries, not user typing. Forward them directly without
+    // resetting scroll state or jumping the viewport.
+    if (isEmulatorQueryResponse(data)) {
+      widget.controller.sendInput(data);
+      return;
+    }
+
     _sessionSavedScrollOffsets.remove(widget.terminalId);
     _sessionSavedScrollAnchors.remove(widget.terminalId);
+    _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+    _sessionSavedScrollFractions.remove(widget.terminalId);
     _scrollAnchor.clear();
     if (_scrollController.hasClients) {
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
@@ -646,6 +673,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // character before it reaches the session, so e.g. arming Ctrl then typing
     // "c" on the soft keyboard sends 0x03 (SIGINT) instead of a literal "c".
     if (_ctrlArmed) {
+      _mobileAutoSpace.reset();
       // Disarm on the very next chunk regardless of its length; only fold Ctrl
       // into a lone character. A multi-character IME chunk (paste, suggestion
       // commit) still consumes the armed Ctrl (untransformed) so a latched
@@ -661,10 +689,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     // or Gboard on mobile). Intercept so multi-line text is formatted with bracketed
     // paste or verified with the confirmation dialog rather than executing line by line.
     if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
+      _mobileAutoSpace.reset();
       unawaited(_handlePaste(data));
       return;
     }
-    widget.controller.sendInput(data);
+    final effectiveData = _isMobile
+        ? _mobileAutoSpace.processInput(data)
+        : data;
+    widget.controller.sendInput(effectiveData);
   }
 
   void _armCtrl() {
@@ -688,6 +720,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _sendAccessory(String bytes) {
     widget.controller.sendInput(bytes);
     _disarmCtrl();
+    _mobileAutoSpace.reset();
   }
 
   void _toggleCtrl() {
@@ -727,9 +760,60 @@ class _TerminalPaneState extends State<TerminalPane> {
         _selectionAnchor = null;
         _selectionAnchorBuffer = null;
       }
+      final lh = _lineHeight() ?? 2.0;
+      final isScrolledUp =
+          _scrollController.hasClients &&
+          _scrollController.position.hasContentDimensions &&
+          _scrollController.position.pixels <
+              _scrollController.position.maxScrollExtent - 2 * lh;
+      if (!isScrolledUp &&
+          !_scrollAnchor.hasAnchor &&
+          !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId) &&
+          _scrollController.hasClients) {
+        scheduleMicrotask(() {
+          if (mounted &&
+              _scrollController.hasClients &&
+              !_scrollAnchor.hasAnchor &&
+              !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId)) {
+            _snapToBottom(_scrollController.position);
+          }
+        });
+      } else if (isScrolledUp) {
+        scheduleMicrotask(() {
+          if (mounted && _scrollController.hasClients) {
+            final pos = _scrollController.position;
+            if (!pos.hasContentDimensions || pos.maxScrollExtent <= 0) return;
+            double? target;
+            if (_scrollAnchor.hasAnchor) {
+              target = _scrollAnchor.desiredOffset(
+                maxScrollExtent: pos.maxScrollExtent,
+                lineHeight: lh,
+              );
+            }
+            final dist = _sessionSavedDistanceFromBottom[widget.terminalId];
+            final frac = _sessionSavedScrollFractions[widget.terminalId];
+            final saved = _sessionSavedScrollOffsets[widget.terminalId];
+            target ??= dist != null
+                ? (pos.maxScrollExtent - dist).clamp(0.0, pos.maxScrollExtent)
+                : frac != null
+                ? (pos.maxScrollExtent * frac).clamp(0.0, pos.maxScrollExtent)
+                : saved?.clamp(0.0, pos.maxScrollExtent);
+            if (target != null && (pos.pixels - target).abs() > 0.5) {
+              final wasSuppressed = _suppressAnchorCapture;
+              _suppressAnchorCapture = true;
+              try {
+                pos.jumpTo(target);
+              } finally {
+                _suppressAnchorCapture = wasSuppressed;
+                _lastScrollPixels = pos.pixels;
+              }
+            }
+          }
+        });
+      }
       // This fires from inside RenderTerminal.performLayout (the view auto-fits
       // by calling terminal.resize). Replaying history writes to the terminal,
-      // which would mark the render object dirty during its own layout — illegal.
+      // which would mark the render object dirty during its own layout: illegal.
       // Defer out of the layout pass via a microtask so the write lands after
       // layout completes (the terminal is already at the fitted size by then).
       scheduleMicrotask(() {
@@ -802,19 +886,35 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _saveScrollOffset([String? terminalId, double? lineHeight]) {
     if (!_scrollController.hasClients) return;
-    final id = terminalId ?? widget.terminalId;
     final position = _scrollController.position;
+    if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
+    final id = terminalId ?? widget.terminalId;
     final lh = lineHeight ?? _lineHeight() ?? 2.0;
     if (position.pixels < position.maxScrollExtent - lh) {
       _sessionSavedScrollOffsets[id] = position.pixels;
+      if (!_scrollAnchor.hasAnchor) {
+        _scrollAnchor.capture(
+          buffer: _terminal.buffer,
+          pixels: position.pixels,
+          maxScrollExtent: position.maxScrollExtent,
+          lineHeight: lh,
+        );
+      }
       if (_scrollAnchor.hasAnchor) {
         _sessionSavedScrollAnchors[id] = _scrollAnchor.clone();
       } else {
         _sessionSavedScrollAnchors.remove(id);
       }
+      _sessionSavedDistanceFromBottom[id] =
+          position.maxScrollExtent - position.pixels;
+      _sessionSavedScrollFractions[id] = position.maxScrollExtent > 0
+          ? (position.pixels / position.maxScrollExtent).clamp(0.0, 1.0)
+          : 0.0;
     } else {
       _sessionSavedScrollOffsets.remove(id);
       _sessionSavedScrollAnchors.remove(id);
+      _sessionSavedDistanceFromBottom.remove(id);
+      _sessionSavedScrollFractions.remove(id);
     }
   }
 
@@ -864,6 +964,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _snapToBottom(ScrollPosition position) {
+    if (!position.hasContentDimensions) return;
     // Suppressed like our own re-pin correction so the snap's notification
     // cannot re-capture an anchor from it. Saved and restored rather than
     // forced false, so a nested call cannot clear an outer suppressed region.
@@ -881,6 +982,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Saving at the bottom retires this session's stored offset and anchor, so
     // a later revisit follows live output instead of being pulled back to the
     // position the user just scrolled away from.
+    _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+    _sessionSavedScrollFractions.remove(widget.terminalId);
     _saveScrollOffset(widget.terminalId, _lineHeight());
   }
 
@@ -969,28 +1072,66 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (!mounted) return;
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
+        if (!position.hasContentDimensions || position.maxScrollExtent <= 0) {
+          if (requestFocus) {
+            _focusNode.requestFocus();
+          }
+          return;
+        }
         // A jump of our own must not read as a user scroll direction, so the
         // capture it triggers can pin (or clear at the bottom) normally.
         _lastScrollPixels = null;
         final saved = _sessionSavedScrollOffsets[widget.terminalId];
+        final savedDistance =
+            _sessionSavedDistanceFromBottom[widget.terminalId];
+        final savedFraction = _sessionSavedScrollFractions[widget.terminalId];
         final lineHeight = _lineHeight();
+
+        final wasScrolledUp =
+            saved != null ||
+            savedDistance != null ||
+            savedFraction != null ||
+            _scrollAnchor.hasAnchor;
+
         double target;
-        if (_scrollAnchor.hasAnchor && lineHeight != null) {
-          final anchored = _scrollAnchor.desiredOffset(
-            maxScrollExtent: position.maxScrollExtent,
-            lineHeight: lineHeight,
-          );
-          target =
-              anchored ??
-              (saved?.clamp(0.0, position.maxScrollExtent) ??
-                  position.maxScrollExtent);
-        } else if (saved != null) {
-          target = saved.clamp(0.0, position.maxScrollExtent);
-        } else {
+        if (!wasScrolledUp) {
           target = position.maxScrollExtent;
+        } else {
+          double? desired;
+          if (_scrollAnchor.hasAnchor && lineHeight != null) {
+            desired = _scrollAnchor.desiredOffset(
+              maxScrollExtent: position.maxScrollExtent,
+              lineHeight: lineHeight,
+            );
+          }
+          if (desired != null) {
+            target = desired;
+          } else if (savedDistance != null) {
+            target = (position.maxScrollExtent - savedDistance).clamp(
+              0.0,
+              position.maxScrollExtent,
+            );
+          } else if (savedFraction != null) {
+            target = (position.maxScrollExtent * savedFraction).clamp(
+              0.0,
+              position.maxScrollExtent,
+            );
+          } else if (saved != null) {
+            target = saved.clamp(0.0, position.maxScrollExtent);
+          } else {
+            target = position.pixels.clamp(0.0, position.maxScrollExtent);
+          }
         }
+
         if ((position.pixels - target).abs() > 0.5) {
-          position.jumpTo(target);
+          final wasSuppressed = _suppressAnchorCapture;
+          _suppressAnchorCapture = true;
+          try {
+            position.jumpTo(target);
+          } finally {
+            _suppressAnchorCapture = wasSuppressed;
+            _lastScrollPixels = position.pixels;
+          }
         }
       }
       if (requestFocus) {
@@ -1374,7 +1515,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // already separates the terminal from the keyboard.
     final padding = _isMobile
         ? const EdgeInsets.all(8)
-        : const EdgeInsets.all(22);
+        : const EdgeInsets.only(left: 22, top: 22, bottom: 22, right: 18);
 
     // Null whenever there is nothing to offer: no selection, desktop, a
     // selection scrolled out of view, or a terminal not yet laid out (this
@@ -1393,43 +1534,52 @@ class _TerminalPaneState extends State<TerminalPane> {
               // Overlay entry: it is then torn down with this pane, cannot
               // outlive a session swap, and sits outside the Listener below, so
               // tapping it never enters the pointer paths that drive selection.
-              child: Stack(
-                key: _copyOverlayKey,
-                // Without this the terminal would receive loose constraints and
-                // shrink-wrap; it previously sat under Expanded and filled the
-                // pane, and the grid size is derived from those pixels.
-                fit: StackFit.expand,
-                children: [
-                  Padding(
-                    padding: padding,
-                    child: Listener(
-                      onPointerDown: _handlePointerDown,
-                      onPointerMove: _handlePointerMove,
-                      onPointerUp: _handlePointerUp,
-                      onPointerCancel: _handlePointerCancel,
-                      child: xt.TerminalView(
-                        _terminal,
-                        key: _terminalViewKey,
-                        controller: _xtermController,
-                        theme: _theme,
-                        focusNode: _focusNode,
-                        autofocus: true,
-                        scrollController: _scrollController,
-                        onKeyEvent: _handleTerminalKeyEvent,
-                        textStyle: _textStyle,
-                        // Desktop uses the hardware-keyboard path instead of
-                        // xterm's hidden IME TextInput connection: on macOS the
-                        // IME path desyncs Flutter's HardwareKeyboard state
-                        // ("physical key already pressed") and swallows
-                        // keystrokes. Mobile must use the IME path, though — it
-                        // is what raises the soft keyboard, so disabling it
-                        // leaves a phone unable to type.
-                        hardwareKeyboardOnly: !_isMobile,
+              child: TerminalScrollbar(
+                controller: _scrollController,
+                enabled: !_isMobile,
+                child: Stack(
+                  key: _copyOverlayKey,
+                  // Without this the terminal would receive loose constraints and
+                  // shrink-wrap; it previously sat under Expanded and filled the
+                  // pane, and the grid size is derived from those pixels.
+                  fit: StackFit.expand,
+                  children: [
+                    Padding(
+                      padding: padding,
+                      child: Listener(
+                        onPointerDown: _handlePointerDown,
+                        onPointerMove: _handlePointerMove,
+                        onPointerUp: _handlePointerUp,
+                        onPointerCancel: _handlePointerCancel,
+                        child: ScrollConfiguration(
+                          behavior: ScrollConfiguration.of(
+                            context,
+                          ).copyWith(scrollbars: false),
+                          child: xt.TerminalView(
+                            _terminal,
+                            key: _terminalViewKey,
+                            controller: _xtermController,
+                            theme: _theme,
+                            focusNode: _focusNode,
+                            autofocus: true,
+                            scrollController: _scrollController,
+                            onKeyEvent: _handleTerminalKeyEvent,
+                            textStyle: _textStyle,
+                            // Desktop uses the hardware-keyboard path instead of
+                            // xterm's hidden IME TextInput connection: on macOS the
+                            // IME path desyncs Flutter's HardwareKeyboard state
+                            // ("physical key already pressed") and swallows
+                            // keystrokes. Mobile must use the IME path, though: it
+                            // is what raises the soft keyboard, so disabling it
+                            // leaves a phone unable to type.
+                            hardwareKeyboardOnly: !_isMobile,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                  if (copyButton != null) copyButton,
-                ],
+                    if (copyButton != null) copyButton,
+                  ],
+                ),
               ),
             ),
           ),

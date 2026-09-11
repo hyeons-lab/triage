@@ -494,6 +494,7 @@ fn load_engine(config: &SummarizerConfig) -> Result<cera::CeraEngine, cera::sess
         backend: cera::BackendPreference::Auto,
         bundle_repo: Some(repo),
         draft_model: None,
+        gpu_depthformer: false,
     };
     cera::CeraEngine::from_bundle_id(&config.bundle_id, &config.quant, engine_config)
 }

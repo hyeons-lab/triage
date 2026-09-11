@@ -3802,6 +3802,84 @@ void main() {
       },
     );
 
+    testWidgets(
+      'pressing fit button while scrolled up preserves scroll offset',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        expect(scrollViewFinder, findsOneWidget);
+
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        expect(controller.hasClients, isTrue);
+        expect(controller.position.maxScrollExtent, greaterThan(100.0));
+
+        // Scroll up away from bottom
+        controller.jumpTo(60.0);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, 60.0);
+
+        // Tap the fit button
+        final fitFinder = find.byIcon(Icons.fit_screen);
+        if (fitFinder.evaluate().isNotEmpty) {
+          await tester.tap(fitFinder.first);
+          await tester.pumpAndSettle();
+
+          // Scroll position should still be preserved, not snapped to bottom
+          expect(controller.position.pixels, 60.0);
+        }
+      },
+    );
+
+    testWidgets(
+      'session at bottom stays sticky at bottom when switching sessions',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        // Switch to another session
+        await tester.tap(find.text('triage / main').first);
+        await tester.pumpAndSettle();
+
+        // Switch back to flutter-spike
+        await tester.tap(find.text('triage / flutter-spike').first);
+        await tester.pumpAndSettle();
+
+        final restoredController = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        expect(
+          restoredController.position.pixels,
+          restoredController.position.maxScrollExtent,
+        );
+      },
+    );
+
     testWidgets('sending input while scrolled up resets scroll to bottom', (
       WidgetTester tester,
     ) async {
