@@ -17,6 +17,8 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - `2026-09-10T22:08-0400 flutter/triage_client/pubspec.yaml`: Updated xterm dependency override to commit f43cd66be3d6070be08a95c693502e53d4a4eee7 containing Buffer.resize and RenderTerminal fixes.
 - `2026-09-10T22:12-0400 Cargo.toml, Cargo.lock`: Upgraded cera dependency to 0.5.6.
 - `2026-09-10T22:14-0400 crates/triaged/src/summarizer.rs`: Configured gpu_depthformer: false for cera EngineConfig.
+- `2026-09-11T00:05-0400 flutter/triage_client/pubspec.yaml, pubspec.lock`: Updated xterm dependency override to commit 7cb984f87ffa583d878858217717d48326b7c3d8 containing DEC Mode 2026 synchronized output and OS IME caret rect suppression.
+- `2026-09-11T00:05-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Preserved session scroll position and relative distance from bottom across session switches, preventing abrupt jumps or snapping to the top.
 
 ## Decisions
 
@@ -25,6 +27,8 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 - 2026-09-10T22:04-0400 Eliminate lines.pop() on content lines in Buffer.resize (xterm.dart): Preserves prompt composers and screen rows below cursor during height reduction, only trimming trailing blank lines.
 - 2026-09-10T22:06-0400 Anchor cursor during width reflow in Buffer.resize (xterm.dart): Attaches a CellAnchor to cursor before reflow so cursor moves to the exact reflowed character position.
 - 2026-09-10T22:07-0400 Guard RenderTerminal layout in render.dart (xterm.dart): Sets _isPerformingLayout flag during performLayout so applyContentDimensions does not prematurely drop _stickToBottom before correctBy adjusts scroll offset.
+- 2026-09-11T00:05-0400 Implement DEC Mode 2026 (Synchronized Output) in xterm.dart: Buffers terminal listener notifications during synchronized batches emitted by CLI tools like Antigravity, and suppresses erratic cursor rect notifications to OS IME while the pen is moving or hidden.
+- 2026-09-11T00:05-0400 Retain distance from bottom and capture anchor on session save: Guarantees that returning to a session accurately restores the visible text or relative position from bottom rather than jumping to line 0 or raw stale offsets.
 
 ## Issues
 
@@ -33,4 +37,5 @@ Auto-insert spaces between words during mobile typing, eliminate terminal resize
 
 ## Commits
 
-HEAD: fix(client): auto-space words on mobile, fix terminal resize clipping and cursor drift, update cera to 0.5.6
+- a0c3217: fix(client): auto-space words on mobile, fix terminal resize clipping and cursor drift, update cera to 0.5.6
+- HEAD: fix(client): support Mode 2026 synchronized output and persist session scroll position

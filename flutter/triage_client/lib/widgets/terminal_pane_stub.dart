@@ -65,6 +65,7 @@ class TerminalPane extends StatefulWidget {
   static void destroySession(String terminalId) {
     _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
     _TerminalPaneState._sessionSavedScrollAnchors.remove(terminalId);
+    _TerminalPaneState._sessionSavedDistanceFromBottom.remove(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
   }
 
@@ -90,6 +91,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
   static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
       {};
+  static final Map<String, double> _sessionSavedDistanceFromBottom = {};
 
   /// A finite initial scroll offset sentinel (1 billion pixels) that complies
   /// with Flutter's ScrollController bounds checking (`assert(initialScrollOffset.isFinite)`),
@@ -641,6 +643,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onTerminalOutput(String data) {
     _sessionSavedScrollOffsets.remove(widget.terminalId);
     _sessionSavedScrollAnchors.remove(widget.terminalId);
+    _sessionSavedDistanceFromBottom.remove(widget.terminalId);
     _scrollAnchor.clear();
     if (_scrollController.hasClients) {
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
@@ -735,11 +738,14 @@ class _TerminalPaneState extends State<TerminalPane> {
         _selectionAnchor = null;
         _selectionAnchorBuffer = null;
       }
-      if (!_scrollAnchor.hasAnchor && _scrollController.hasClients) {
+      if (!_scrollAnchor.hasAnchor &&
+          !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId) &&
+          _scrollController.hasClients) {
         scheduleMicrotask(() {
           if (mounted &&
               _scrollController.hasClients &&
-              !_scrollAnchor.hasAnchor) {
+              !_scrollAnchor.hasAnchor &&
+              !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId)) {
             _snapToBottom(_scrollController.position);
           }
         });
@@ -824,14 +830,25 @@ class _TerminalPaneState extends State<TerminalPane> {
     final lh = lineHeight ?? _lineHeight() ?? 2.0;
     if (position.pixels < position.maxScrollExtent - lh) {
       _sessionSavedScrollOffsets[id] = position.pixels;
+      if (!_scrollAnchor.hasAnchor) {
+        _scrollAnchor.capture(
+          buffer: _terminal.buffer,
+          pixels: position.pixels,
+          maxScrollExtent: position.maxScrollExtent,
+          lineHeight: lh,
+        );
+      }
       if (_scrollAnchor.hasAnchor) {
         _sessionSavedScrollAnchors[id] = _scrollAnchor.clone();
       } else {
         _sessionSavedScrollAnchors.remove(id);
       }
+      _sessionSavedDistanceFromBottom[id] =
+          position.maxScrollExtent - position.pixels;
     } else {
       _sessionSavedScrollOffsets.remove(id);
       _sessionSavedScrollAnchors.remove(id);
+      _sessionSavedDistanceFromBottom.remove(id);
     }
   }
 
@@ -898,6 +915,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Saving at the bottom retires this session's stored offset and anchor, so
     // a later revisit follows live output instead of being pulled back to the
     // position the user just scrolled away from.
+    _sessionSavedDistanceFromBottom.remove(widget.terminalId);
     _saveScrollOffset(widget.terminalId, _lineHeight());
   }
 
@@ -991,6 +1009,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         // capture it triggers can pin (or clear at the bottom) normally.
         _lastScrollPixels = null;
         final saved = _sessionSavedScrollOffsets[widget.terminalId];
+        final savedDistance =
+            _sessionSavedDistanceFromBottom[widget.terminalId];
         final lineHeight = _lineHeight();
         double target;
         if (_scrollAnchor.hasAnchor && lineHeight != null) {
@@ -1000,8 +1020,14 @@ class _TerminalPaneState extends State<TerminalPane> {
           );
           target =
               anchored ??
-              (saved?.clamp(0.0, position.maxScrollExtent) ??
-                  position.maxScrollExtent);
+              (savedDistance != null
+                  ? (position.maxScrollExtent - savedDistance)
+                      .clamp(0.0, position.maxScrollExtent)
+                  : (saved?.clamp(0.0, position.maxScrollExtent) ??
+                      position.maxScrollExtent));
+        } else if (savedDistance != null) {
+          target = (position.maxScrollExtent - savedDistance)
+              .clamp(0.0, position.maxScrollExtent);
         } else if (saved != null) {
           target = saved.clamp(0.0, position.maxScrollExtent);
         } else {

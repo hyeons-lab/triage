@@ -100,6 +100,10 @@ dependencies:
 # 4. `RenderTerminal` layout race condition where `_stickToBottom` was cleared during
 # `applyContentDimensions` before `correctBy` executed during viewport resizing.
 #
+# 5. Support DEC Private Mode 2026 (Synchronized Output) to buffer UI listener
+# notifications during synchronized batches, and guard OS IME caret rect
+# notifications when the cursor is hidden or during synchronized updates.
+#
 # Branched from the `v4.0.0` tag rather than upstream master. Master carries
 # unreleased commits beyond the tag, two of them behavioural (colour rendering
 # in `palette_builder.dart`, Android enter-key handling in `terminal_view.dart`),
@@ -109,14 +113,14 @@ dependencies:
 # Pinned by commit, not by branch name: a branch ref would let a force-push or
 # a new commit change the terminal emulator this app ships with no diff here.
 #
-# Fix 1 can be dropped once a release contains PR 225. Fixes 2, 3, and 4 have not
-# been filed upstream yet, so nothing will carry them until that happens; drop the
-# override only once a release contains all of them.
+# Fix 1 can be dropped once a release contains PR 225. Fixes 2, 3, 4, and 5 have
+# not been filed upstream yet, so nothing will carry them until that happens;
+# drop the override only once a release contains all of them.
 dependency_overrides:
   xterm:
     git:
       url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: f43cd66be3d6070be08a95c693502e53d4a4eee7
+      ref: 7cb984f87ffa583d878858217717d48326b7c3d8
 
 dev_dependencies:
   flutter_test:
