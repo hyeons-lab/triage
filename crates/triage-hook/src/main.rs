@@ -200,6 +200,9 @@ fn extract_session_id(val: &serde_json::Value) -> SessionId {
 }
 
 fn extract_command_line(args: &serde_json::Value) -> Option<String> {
+    if let Some(s) = args.as_str() {
+        return Some(s.to_string());
+    }
     for key in [
         "CommandLine",
         "command_line",
@@ -1896,6 +1899,53 @@ mod tests {
     }
 
     #[test]
+    fn agy_contract_read_and_manage_subagents() {
+        let verdict = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "read-only tool call: Read".to_string(),
+        };
+        let request = JudgeRequest {
+            session_id: SessionId::new("123").unwrap(),
+            tool_name: "Read".to_string(),
+            command_line: None,
+            path: Some("~/.gemini/review-refinements.md".to_string()),
+            cwd: None,
+        };
+        let encoded = encode_response(
+            AgentFormat::Antigravity,
+            &verdict,
+            Some(&request),
+            None,
+            None,
+        );
+        assert!(encoded.contains("file(~/.gemini/review-refinements.md)"));
+        assert!(encoded.contains("Read(~/.gemini/review-refinements.md)"));
+
+        let verdict_manage = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: "read-only tool call: ManageSubagents".to_string(),
+        };
+        let request_manage = JudgeRequest {
+            session_id: SessionId::new("123").unwrap(),
+            tool_name: "ManageSubagents".to_string(),
+            command_line: Some("list".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let encoded_manage = encode_response(
+            AgentFormat::Antigravity,
+            &verdict_manage,
+            Some(&request_manage),
+            None,
+            None,
+        );
+        assert!(encoded_manage.contains("ManageSubagents(list)"));
+        assert!(encoded_manage.contains("managesubagents(list)"));
+    }
+
+    #[test]
     fn an_empty_reason_is_omitted_rather_than_sent_blank() {
         let verdict = JudgeVerdict {
             decision: JudgeDecision::Deny,
@@ -2595,5 +2645,46 @@ mod tests {
             overrides.iter().any(|s| s == "research:ListDir(*)"),
             "missing agent wildcard PascalCase override: {overrides:?}"
         );
+    }
+
+    #[test]
+    fn permission_overrides_windows_style_paths() {
+        let req_tilde = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "view_file".to_string(),
+            command_line: None,
+            path: Some(r"~\AppData\Local\Triage\config.toml".to_string()),
+            cwd: None,
+        };
+        let overrides = compute_permission_overrides(&req_tilde, None);
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == r"file(~\AppData\Local\Triage\config.toml)")
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|s| s == r"view_file(~\AppData\Local\Triage\config.toml)")
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_info_stringified_escaped_json() {
+        let val: serde_json::Value = serde_json::from_str(
+            r#"{
+                "tool_name": "run_command",
+                "tool_input": "{\"command\": \"git log -n 5 --format=\\\"%h\\\"\", \"flags\": [\"-n\", \"5\"]}",
+                "cwd": "/work/project"
+            }"#,
+        )
+        .expect("payload parses");
+        let (name, args) = extract_tool_info(&val).expect("tool call present");
+        assert_eq!(name, "run_command");
+        assert_eq!(
+            extract_command_line(&args).as_deref(),
+            Some("git log -n 5 --format=\"%h\"")
+        );
+        assert_eq!(extract_cwd(&val).as_deref(), Some("/work/project"));
     }
 }

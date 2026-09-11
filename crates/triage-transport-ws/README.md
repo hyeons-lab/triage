@@ -1,11 +1,12 @@
 # triage-transport-ws
 
-WebSocket transport adapter, server-side protocol implementation, and stress benchmarking suite for **Triage** remote clients.
+WebSocket transport adapter, server-side protocol implementation, and benchmarking suite for **Triage** remote clients.
 
-This crate manages serializing and parsing Flatbuffers-over-WebSocket session API frames between the `triaged` daemon and remote web/mobile clients.
+This crate manages serializing and parsing FlatBuffers-over-WebSocket session API frames between the `triaged` daemon and remote web, desktop, and mobile clients.
 
 ## Features
 
 *   **WebSocket Engine**: High-performance asynchronous WebSocket protocol layer.
-*   **Flatbuffers Framing**: High-efficiency framing of state snapshots and user input.
-*   **Benchmarking Tools**: Integrated stress testing tools and performance benchmarks.
+*   **FlatBuffers Framing**: Zero-copy framing of terminal state snapshots, delta streams, and user input.
+*   **Approval Judge Push Events**: Real-time broadcast of tool-call verdicts, audit streams, and policy changes to connected remote clients.
+*   **Benchmarking Tools**: Integrated stress testing tools and throughput benchmarks.

@@ -12,6 +12,9 @@ worktrees/
 *.swp
 *.swo
 
+# Agent local hooks
+.agents/
+
 # Triage daemon pre-built web client assets
 /crates/triaged/dist/
 

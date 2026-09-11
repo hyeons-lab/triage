@@ -20,6 +20,29 @@ pub fn normalize_tool_name(tool_name: &str) -> &str {
     s.trim()
 }
 
+fn normalize_tool_key(name: &str) -> String {
+    let mut cleaned = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b != b'_' && b != b'-' {
+            cleaned.push((b as char).to_ascii_lowercase());
+        }
+    }
+    cleaned
+}
+
+fn tool_list_matches(name: &str, list: &[&str]) -> bool {
+    let cleaned = normalize_tool_key(name);
+    list.iter().any(|&tool| {
+        name.eq_ignore_ascii_case(tool) || {
+            let tool_chars = tool
+                .chars()
+                .filter(|&c| c != '_' && c != '-')
+                .flat_map(|c| c.to_lowercase());
+            cleaned.chars().eq(tool_chars)
+        }
+    })
+}
+
 /// True if `tool_name` is a read-only inspection, search, web, or agent coordination tool.
 pub fn is_read_only_tool(raw: &str) -> bool {
     let name = normalize_tool_name(raw);
@@ -92,9 +115,7 @@ pub fn is_read_only_tool(raw: &str) -> bool {
         "refactor_tool",
         "refactortool",
     ];
-    READ_ONLY_TOOLS
-        .iter()
-        .any(|tool| name.eq_ignore_ascii_case(tool))
+    tool_list_matches(name, READ_ONLY_TOOLS)
 }
 
 /// True if `tool_name` is an editing or writing tool.
@@ -107,10 +128,10 @@ pub fn is_edit_tool(raw: &str) -> bool {
         "write_file",
         "patch_file",
         "create_file",
+        "edit",
+        "write",
     ];
-    EDIT_TOOLS
-        .iter()
-        .any(|tool| name.eq_ignore_ascii_case(tool))
+    tool_list_matches(name, EDIT_TOOLS)
 }
 
 /// True if `tool_name` is a shell command execution tool.
@@ -134,9 +155,7 @@ pub fn is_command_tool(raw: &str) -> bool {
         "managetask",
         "managetasks",
     ];
-    COMMAND_TOOLS
-        .iter()
-        .any(|tool| name.eq_ignore_ascii_case(tool))
+    tool_list_matches(name, COMMAND_TOOLS)
 }
 
 pub const MAX_COMMAND_CHARS: usize = 8192;
@@ -575,8 +594,14 @@ impl JudgeRules {
     pub fn evaluate(&self, request: &JudgeRequest) -> Option<JudgeVerdict> {
         let tool_name = request.tool_name.trim();
 
-        // 1. Read-only inspection tools (when not carrying a command line).
-        if is_read_only_tool(tool_name) && request.command_line.is_none() {
+        // 1. Read-only inspection tools (when not carrying an active mutation command).
+        if is_read_only_tool(tool_name)
+            && (request.command_line.is_none()
+                || matches!(
+                    request.command_line.as_deref().map(str::trim),
+                    Some("list" | "status" | "")
+                ))
+        {
             if let Some(secret) = check_target_credential_path(request) {
                 return Some(JudgeVerdict::fallback(format!(
                     "requires manual approval for credential path: {secret}"
@@ -3834,6 +3859,34 @@ mod tests {
         };
         assert_eq!(
             rules.evaluate(&mcp_req).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn test_antigravity_tools_and_paths() {
+        let rules = JudgeRules::new(&JudgeConfig::default());
+        let req_read = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "Read".to_string(),
+            command_line: None,
+            path: Some("~/.gemini/review-refinements.md".to_string()),
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&req_read).map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        let req_manage = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "ManageSubagents".to_string(),
+            command_line: Some("list".to_string()),
+            path: None,
+            cwd: None,
+        };
+        assert_eq!(
+            rules.evaluate(&req_manage).map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }
