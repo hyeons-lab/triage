@@ -21,6 +21,9 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - `2026-09-13T09:20-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Added scroll save suppression timer and flag, guarded scroll notifications during refit and fit passes, checked bottom stickiness in _onFit and _onRefit, cleared stale offsets and anchor when at bottom, and supported forceBottom in _scrollToCursor to eliminate refit snap to top.
 - `2026-09-13T09:20-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: In _onFit, evaluated wasAtBottom directly from _viewportIsAtBottom so stale entries in _sessionSavedViewportY do not lock wasAtBottom to false.
 - `2026-09-13T09:20-0400 flutter/triage_client/lib/main.dart`: Inserted a 60ms delay between rows - 1 and rows in native _refitActiveSession to prevent POSIX kernel SIGWINCH coalescing.
+- `2026-09-13T10:09-0400 devlog/plans/000147-03-fix-per-session-resize-and-refit-snap.md`: Authored implementation plan for per-session resize out tracking, scroll preservation, and refit stickiness.
+- `2026-09-13T10:09-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Tracked _sessionLastResizeOutCols, _sessionLastResizeOutRows, and _sessionLastGridSize per terminalId, implemented getCachedTerminalSize, guarded _saveScrollOffset against saving position 0.0, derived isAtBottom directly from scroll position in _onFit and _onRefit, and removed redundant terminal.viewWidth resize out from didUpdateWidget and _onRefit.
+- `2026-09-13T10:09-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Widened _viewportIsAtBottom tolerance to 30px (or baseY - 1), removed saved viewport on refit, and fell back to current viewportY when restoring scroll.
 
 ## Decisions
 
@@ -35,6 +38,8 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T08:54-0400 Reset last refit dimensions at the start of each refit generation: When resuming from sleep with zero initial dimensions, clearing _lastRefitCols and _lastRefitRows allows the first retry that measures positive dimensions to send the SIGWINCH jiggle.
 - 2026-09-13T09:20-0400 Suppress native scroll saves during refit: In TerminalView, layout recalculation triggers transient scroll position updates before RenderTerminal corrects the offset. Suppressing scroll saves for 1000ms during refit prevents transient 0.0 offsets from polluting session scroll state.
 - 2026-09-13T09:20-0400 Stagger native _refitActiveSession by 60ms: Native platforms (macOS, iOS, Android) also communicate with the remote daemon PTY over WebSocket. Staggering the resize restore by 60ms on native ensures POSIX kernels on the daemon host deliver distinct SIGWINCH events to CLI children.
+- 2026-09-13T10:09-0400 Track resize out per session: Tracking _sessionLastResizeOutCols and _sessionLastResizeOutRows in a map keyed by terminalId prevents viewport resize events on one session from blocking needed resize-out transmissions on another.
+- 2026-09-13T10:09-0400 Derive bottom stickiness from live scroll metrics rather than saved maps: Evaluating isAtBottom directly from position.pixels >= position.maxScrollExtent - graceLines * lineHeight prevents historical 0.0 entries in saved offset maps from erroneously flagging the terminal as scrolled up, ensuring refit consistently sticks to the bottom.
 
 ## Issues
 
@@ -46,10 +51,13 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T08:54-0400 Resumed sessions missing window resize events: Identified that cached containers had their ResizeObserver disconnected on session switch and never re-bound on resume. Resolved by calling _setupResizeObserver on cached container adoption in initState.
 - 2026-09-13T09:20-0400 Native refit snapping to top: Diagnosed that on native macOS desktop, tapping refit triggered _onRefit() which called _scrollToCursor without bottom stickiness, jumping to 0.0 because an earlier layout pass had populated _sessionSavedScrollOffsets with 0.0. Resolved by suppressing scroll saves across refit, checking isScrolledUp, and passing forceBottom when at the bottom.
 - 2026-09-13T09:20-0400 Web _onFit wasAtBottom locked to false: Diagnosed that _onFit initialized wasAtBottom based on whether _sessionSavedViewportY contained the key. If an entry existed, wasAtBottom remained false even if the viewport was currently at the bottom, repeatedly snapping to line 0. Resolved by querying _viewportIsAtBottom directly.
+- 2026-09-13T10:09-0400 Session refit snapping to top: Diagnosed that checking _sessionSavedScrollOffsets in _onRefit caused any session with a 0.0 offset to be treated as scrolled up, forcing _scrollToCursor to jump to 0.0. In addition, xterm.js strict 3px threshold treated sub-pixel offsets near the bottom as scrolled up. Resolved by computing bottom stickiness from current scroll metrics and widening web bottom tolerance to 30px.
+- 2026-09-13T10:09-0400 Premature resize out in didUpdateWidget: Diagnosed that reading _terminal.viewWidth and _terminal.viewHeight in didUpdateWidget transmitted un-fitted 80x24 dimensions during session attachment, corrupting session fit state and causing widget test failures. Resolved by removing premature resize-out calls from didUpdateWidget and letting layout determine terminal dimensions.
 
 ## Commits
 
 - b6eb059: fix(terminal): resolve session resume layout corruption and refit snap to top
 - ab85b52: fix(terminal): eliminate duplicate text blocks on session resume via staggered pty jiggle and buffer clear
 - 00e71fe: fix(terminal): harden web refit lifecycle, prevent pty stranding, and rebind resize observer
-- HEAD: fix(terminal): preserve bottom scroll on native refit and delay pty jiggle
+- 6d29e5d: fix(terminal): preserve bottom scroll on native refit and delay pty jiggle
+- HEAD: fix(terminal): isolate per-session resize out and eliminate snap to top on refit

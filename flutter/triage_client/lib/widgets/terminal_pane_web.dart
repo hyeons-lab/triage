@@ -132,14 +132,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     int viewportY,
     int baseY,
   ) {
-    if (viewportY >= baseY) return true;
+    if (viewportY >= baseY - 1) return true;
     final viewportElem = container.querySelector('.xterm-viewport');
     if (viewportElem != null) {
       final remainingPixels =
           viewportElem.scrollHeight -
           viewportElem.scrollTop -
           viewportElem.clientHeight;
-      if (remainingPixels <= 3) {
+      if (remainingPixels <= 30) {
         return true;
       }
     }
@@ -1449,7 +1449,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _clearRefitRetryTimers();
     _lastRefitCols = null;
     _lastRefitRows = null;
-    _suppressScrollSaveFor(const Duration(milliseconds: 1000));
+    _sessionSavedViewportY.remove(_sanitizedId);
+    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     _refitAndSend(force: true);
     for (final ms in const [120, 300, 700, 1500]) {
       _refitRetryTimers.add(
@@ -2181,13 +2182,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
         bool wasAtBottom = true;
+        int? viewportY;
         final term = _term;
         if (term != null) {
           try {
             final buffer = js_util.getProperty(term, 'buffer');
             final active = js_util.getProperty(buffer, 'active');
             final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-            final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+            viewportY = (js_util.getProperty(active, 'viewportY') as num)
                 .toInt();
             wasAtBottom = _viewportIsAtBottom(_container, viewportY, baseY);
           } catch (_) {
@@ -2215,7 +2217,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             js_util.callMethod(_term, 'scrollToBottom', []);
           } catch (_) {}
         } else {
-          final savedY = _sessionSavedViewportY[_sanitizedId];
+          final savedY = _sessionSavedViewportY[_sanitizedId] ?? viewportY;
           if (savedY != null) {
             try {
               js_util.callMethod(_term, 'scrollToLine', [savedY]);

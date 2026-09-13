@@ -65,11 +65,16 @@ class TerminalPane extends StatefulWidget {
   final bool isExited;
 
   static void destroySession(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
     _TerminalPaneState._sessionSavedScrollAnchors.remove(terminalId);
     _TerminalPaneState._sessionSavedDistanceFromBottom.remove(terminalId);
     _TerminalPaneState._sessionSavedScrollFractions.remove(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
+    _TerminalPaneState._sessionLastResizeOutCols.remove(terminalId);
+    _TerminalPaneState._sessionLastResizeOutRows.remove(terminalId);
+    _TerminalPaneState._sessionLastGridSize.remove(sanitizedId);
+    _TerminalPaneState._sessionLastGridSize.remove(terminalId);
   }
 
   static void setBracketedPasteMode(String terminalId, bool enabled) {
@@ -84,7 +89,11 @@ class TerminalPane extends StatefulWidget {
     TerminalController controller,
   ) {}
 
-  static (int, int)? getCachedTerminalSize(String terminalId) => null;
+  static (int, int)? getCachedTerminalSize(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    return _TerminalPaneState._sessionLastGridSize[sanitizedId] ??
+        _TerminalPaneState._sessionLastGridSize[terminalId];
+  }
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -96,6 +105,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       {};
   static final Map<String, double> _sessionSavedDistanceFromBottom = {};
   static final Map<String, double> _sessionSavedScrollFractions = {};
+  static final Map<String, int> _sessionLastResizeOutCols = {};
+  static final Map<String, int> _sessionLastResizeOutRows = {};
+  static final Map<String, (int, int)> _sessionLastGridSize = {};
 
   /// A finite initial scroll offset sentinel (1 billion pixels) that complies
   /// with Flutter's ScrollController bounds checking (`assert(initialScrollOffset.isFinite)`),
@@ -146,8 +158,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   Timer? _scrollToCursorTimer;
   int? _pendingResizeOutCols;
   int? _pendingResizeOutRows;
-  int? _lastResizeOutCols;
-  int? _lastResizeOutRows;
 
   // Selection state. The view owns selection through this xterm controller; we
   // observe it to keep the live anchor (the cell a selection started from) so a
@@ -331,7 +341,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.onTerminalResizeBind?.call(null);
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
-    if (!identical(oldWidget.terminal, widget.terminal)) {
+    if (!identical(oldWidget.terminal, widget.terminal) ||
+        oldWidget.terminalId != widget.terminalId) {
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -406,16 +417,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         ? _scrollController.position
         : null;
     final lh = _lineHeight() ?? 2.0;
-    final isScrolledUp =
-        pos != null &&
-        pos.hasContentDimensions &&
-        pos.pixels < pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh &&
-        (_sessionSavedScrollOffsets.containsKey(widget.terminalId) ||
-            _scrollAnchor.hasAnchor ||
-            _sessionSavedDistanceFromBottom.containsKey(widget.terminalId));
+    final isAtBottom = pos == null ||
+        !pos.hasContentDimensions ||
+        pos.maxScrollExtent <= 0 ||
+        pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
 
     _suppressScrollSaveFor(const Duration(milliseconds: 500));
-    if (!isScrolledUp) {
+    if (isAtBottom) {
       _scrollAnchor.clear();
       _sessionSavedScrollOffsets.remove(widget.terminalId);
       _sessionSavedScrollAnchors.remove(widget.terminalId);
@@ -423,6 +431,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedScrollFractions.remove(widget.terminalId);
     }
     setState(() {});
+    _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
   }
 
   void _onRefit() {
@@ -431,16 +440,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         ? _scrollController.position
         : null;
     final lh = _lineHeight() ?? 2.0;
-    final isScrolledUp =
-        pos != null &&
-        pos.hasContentDimensions &&
-        pos.pixels < pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh &&
-        (_sessionSavedScrollOffsets.containsKey(widget.terminalId) ||
-            _scrollAnchor.hasAnchor ||
-            _sessionSavedDistanceFromBottom.containsKey(widget.terminalId));
+    final isAtBottom = pos == null ||
+        !pos.hasContentDimensions ||
+        pos.maxScrollExtent <= 0 ||
+        pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
 
-    _suppressScrollSaveFor(const Duration(milliseconds: 1000));
-    if (!isScrolledUp) {
+    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
+    if (isAtBottom) {
       _scrollAnchor.clear();
       _sessionSavedScrollOffsets.remove(widget.terminalId);
       _sessionSavedScrollAnchors.remove(widget.terminalId);
@@ -448,7 +454,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedScrollFractions.remove(widget.terminalId);
     }
     setState(() {});
-    _scrollToCursor(requestFocus: false, forceBottom: !isScrolledUp);
+    _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -811,6 +817,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelHeight,
   ) {
     if (width > 0 && height > 0) {
+      final sanitizedId =
+          widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+      _sessionLastGridSize[sanitizedId] = (height, width);
+      _sessionLastGridSize[widget.terminalId] = (height, width);
       // Reflow (reflowEnabled is on) runs only on a column change, moving content
       // between rows and staling the cached shift-click anchor — a buffer
       // coordinate the identity guard in _extendSelectionTo can't detect as stale,
@@ -889,7 +899,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _scheduleResizeOut(int cols, int rows) {
-    if (_lastResizeOutCols == cols && _lastResizeOutRows == rows) {
+    if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
+        _sessionLastResizeOutRows[widget.terminalId] == rows) {
       return;
     }
     _pendingResizeOutCols = cols;
@@ -910,11 +921,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     _resizeOutDebounceTimer?.cancel();
     _pendingResizeOutCols = null;
     _pendingResizeOutRows = null;
-    if (_lastResizeOutCols == cols && _lastResizeOutRows == rows) {
+    final sanitizedId =
+        widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _sessionLastGridSize[sanitizedId] = (rows, cols);
+    _sessionLastGridSize[widget.terminalId] = (rows, cols);
+    if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
+        _sessionLastResizeOutRows[widget.terminalId] == rows) {
       return;
     }
-    _lastResizeOutCols = cols;
-    _lastResizeOutRows = rows;
+    _sessionLastResizeOutCols[widget.terminalId] = cols;
+    _sessionLastResizeOutRows[widget.terminalId] = rows;
     widget.controller.sendResizeOut(cols, rows);
   }
 
@@ -957,6 +973,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         position.pixels >=
         position.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
     if (!isAtBottom) {
+      if (position.pixels <= 0.0) {
+        return;
+      }
       _sessionSavedScrollOffsets[id] = position.pixels;
       if (!_scrollAnchor.hasAnchor) {
         _scrollAnchor.capture(
