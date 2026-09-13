@@ -305,6 +305,7 @@ impl IpcServer {
         loop {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    crate::handover::configure_unix_stream(&stream);
                     let manager = Arc::clone(&self.manager);
                     let web_cache = Arc::clone(&self.web_cache);
                     spawn_client_handler(move || handle_connection(manager, web_cache, stream));
@@ -1422,10 +1423,12 @@ fn handle_handover_server(
 ) -> Result<()> {
     use crate::handover::{
         HANDOVER_BUSY_MESSAGE, HANDOVER_COMMIT_BYTE, HANDOVER_DONE_BYTE, HANDOVER_FDS_READY_BYTE,
-        MAX_FDS_PER_SEND, get_active_tcp_listener_fd, send_data_frame, send_fd_chunks, send_fds,
-        send_handover_fds,
+        MAX_FDS_PER_SEND, configure_unix_stream, get_active_tcp_listener_fd, send_data_frame,
+        send_fd_chunks, send_fds, send_handover_fds,
     };
     use std::io::{Read, Write};
+
+    configure_unix_stream(&stream);
 
     // Claim before serializing anything. The guard lives on the manager so it
     // also gates session creation: while a handover is in flight, start_session

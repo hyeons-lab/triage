@@ -30,6 +30,10 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - `2026-09-13T16:26-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Removed scrollToBottom counter-scroll call from onScrollCallback, and guarded effectiveSavedY > 0 in _restoreScrollPosition.
 - `2026-09-13T16:26-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart`: Added unit tests for zero/negative offset rejection and row 0 anchor drop.
 - `2026-09-13T16:26-0400 flutter/triage_client/test/widget_test.dart`: Added widget test verifying that focusCursorRevision changes while at the bottom preserve bottom scroll and never jump to line 0.
+- `2026-09-13T16:38-0400 devlog/plans/000147-05-fix-handover-socket-buffer-emsgsize.md`: Authored plan to fix handover socket buffer saturation on Darwin and add legacy protocol fallback for zero-downtime upgrades.
+- `2026-09-13T16:43-0400 crates/triaged/src/handover.rs`: Added configure_unix_stream setting SO_SNDBUF and SO_RCVBUF to 2 MiB, configured streams on connect, and added legacy Handover fallback in perform_handover_client and release_handover_peer when descriptor chunk transfers fail with empty descriptors.
+- `2026-09-13T16:43-0400 crates/triaged/src/ipc.rs`: Called configure_unix_stream on accepted listener sockets and in handle_handover_server to prevent socket buffer exhaustion during handover.
+- `2026-09-13T16:43-0400 crates/triaged/src/handover_tests.rs`: Added failed_descriptor_chunks_fall_back_to_legacy_handover test verifying seamless fallback to legacy Handover when descriptor chunks fail on initial metadata-first attempt.
 
 ## Decisions
 
@@ -48,6 +52,8 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T10:09-0400 Derive bottom stickiness from live scroll metrics rather than saved maps: Evaluating isAtBottom directly from position.pixels >= position.maxScrollExtent - graceLines * lineHeight prevents historical 0.0 entries in saved offset maps from erroneously flagging the terminal as scrolled up, ensuring refit consistently sticks to the bottom.
 - 2026-09-13T16:26-0400 Guard _repinScrollAnchor against interrupting active scroll gestures: jumpTo calls goIdle on Flutter's active ScrollActivity, which forcefully kills trackpad swipe and mouse fling gestures mid-flight whenever background output or cursor blinks occur. Returning early when isScrollingNotifier.value or _activePointers.isNotEmpty allows user scroll gestures to complete smoothly.
 - 2026-09-13T16:26-0400 Reject degenerate zero offsets in TerminalScrollAnchor: A scroll anchor represents an offset into scrollback; returning 0.0 when a line trims to row 0 forces the viewport to snap to the top of the buffer. Dropping the anchor when line.index <= 0 or desired <= 0.0 releases the viewport back to natural stick-to-bottom tracking.
+- 2026-09-13T16:43-0400 Configure 2 MiB socket buffers for Unix domain streams: Default Darwin Unix domain stream sockets have 8192-byte send and receive buffers. When transferring handover metadata and file descriptors via SCM_RIGHTS, a full send buffer causes sendmsg to immediately return EMSGSIZE. Setting 2 MiB buffer sizes eliminates buffer saturation.
+- 2026-09-13T16:43-0400 Fall back to legacy Handover on empty descriptor chunk failure: When upgrading an existing running daemon that has the default 8192-byte buffer, HandoverV2 sends the state frame first and fails with EMSGSIZE on the subsequent descriptor chunk send. Falling back to the legacy Handover protocol on empty chunk failure establishes a clean connection that transmits descriptors first while the buffer is empty, enabling seamless zero-downtime upgrades from older daemons.
 
 ## Issues
 
@@ -63,6 +69,7 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T10:09-0400 Premature resize out in didUpdateWidget: Diagnosed that reading _terminal.viewWidth and _terminal.viewHeight in didUpdateWidget transmitted un-fitted 80x24 dimensions during session attachment, corrupting session fit state and causing widget test failures. Resolved by removing premature resize-out calls from didUpdateWidget and letting layout determine terminal dimensions.
 - 2026-09-13T16:26-0400 Upward scroll gesture freezing when viewing input composer: In interactive CLIs with blinking cursors or spinners, terminal content changes triggered _repinScrollAnchor via post-frame callbacks. Calling jumpTo aborted the user's upward scroll swipe, freezing the viewport until an anchor was dropped or snap occurred. Resolved by checking isScrollingNotifier.value and active pointers before re-pinning.
 - 2026-09-13T16:26-0400 Viewport snapping to line 0 on refit or scroll: When focusCursorRevision changed or refit occurred, _scrollToCursor with default forceBottom: false treated stale or degenerate anchor offsets as scrolled-up state, computing target = 0.0 and snapping to the top. Resolved by deriving forceBottom from live viewport metrics, guarding target > 0.0, and clearing stale maps when pixels <= 0.0.
+- 2026-09-13T16:43-0400 Handover EMSGSIZE os error 40 on Darwin: During triaged reload, handing over from an existing daemon supervising 29 sessions failed with "sending handover state and FDs via SCM_RIGHTS: Caused by: Message too long (os error 40)". Diagnosed that Darwin sendmsg with SCM_RIGHTS returns EMSGSIZE when the send buffer has less space than the control message. Resolved by enlarging socket buffers to 2 MiB and adding automatic fallback to the legacy single-frame Handover protocol on chunk failure.
 
 ## Commits
 
@@ -71,4 +78,5 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 00e71fe: fix(terminal): harden web refit lifecycle, prevent pty stranding, and rebind resize observer
 - 6d29e5d: fix(terminal): preserve bottom scroll on native refit and delay pty jiggle
 - fed543e: fix(terminal): isolate per-session resize out and eliminate snap to top on refit
-- HEAD: fix(terminal): prevent scroll gesture interruption and eliminate refit snap to top
+- 37bedbc: fix(terminal): prevent scroll gesture interruption and eliminate refit snap to top
+- HEAD: fix(triaged): resolve handover socket buffer saturation and add legacy protocol fallback
