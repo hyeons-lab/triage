@@ -2131,7 +2131,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _reconnectAttempt = 0;
       if (kIsWeb && !_disposed && _sessions.isNotEmpty) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!_disposed && _client.isConnected) {
+          if (!_disposed &&
+              generation == _connectGeneration &&
+              serverId == _activeServerId &&
+              _client.isConnected) {
             _refitActiveSession();
           }
         });

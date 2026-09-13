@@ -264,13 +264,43 @@ class _TerminalPaneState extends State<TerminalPane> {
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
   Timer? _suppressScrollSaveTimer;
+  Timer? _jiggleRestoreTimer;
+  int? _pendingJiggleCols;
+  int? _pendingJiggleRows;
+  String? _pendingJiggleTargetId;
   final List<Timer> _focusRetryTimers = [];
+  final List<Timer> _refitRetryTimers = [];
 
   void _clearFocusRetryTimers() {
     for (final timer in _focusRetryTimers) {
       timer.cancel();
     }
     _focusRetryTimers.clear();
+  }
+
+  void _clearRefitRetryTimers() {
+    for (final timer in _refitRetryTimers) {
+      timer.cancel();
+    }
+    _refitRetryTimers.clear();
+  }
+
+  void _flushPendingJiggleRestore() {
+    if (_jiggleRestoreTimer != null) {
+      _jiggleRestoreTimer?.cancel();
+      _jiggleRestoreTimer = null;
+      if (_pendingJiggleCols != null && _pendingJiggleRows != null) {
+        final targetId = _pendingJiggleTargetId ?? _sanitizedId;
+        _sessionInputRouter.sendResizeOut(
+          targetId,
+          _pendingJiggleCols!,
+          _pendingJiggleRows!,
+        );
+        _pendingJiggleCols = null;
+        _pendingJiggleRows = null;
+        _pendingJiggleTargetId = null;
+      }
+    }
   }
 
   void _suppressScrollSaveFor(Duration duration) {
@@ -344,13 +374,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
+      _setupResizeObserver();
       if (_lastFittedCols != null && _lastFittedRows != null) {
         _writeInitialContent(
           overrideCols: _lastFittedCols,
           overrideRows: _lastFittedRows,
         );
       }
-      _onRefit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
       }
@@ -1315,7 +1345,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (term != null) {
         try {
           js_util.callMethod(term, 'clear', []);
-          js_util.callMethod(term, 'write', ['\x1b[H\x1b[2J\x1b[3J']);
+          // Exit alternate screen buffer if active, home cursor, and wipe display.
+          js_util.callMethod(term, 'write', [
+            '\x1b[?1049l\x1b[H\x1b[2J\x1b[3J',
+          ]);
         } catch (_) {}
       }
     }
@@ -1413,15 +1446,20 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onRefit() {
     if (!_initialized) return;
     final generation = ++_refitGeneration;
+    _clearRefitRetryTimers();
+    _lastRefitCols = null;
+    _lastRefitRows = null;
     _suppressScrollSaveFor(const Duration(milliseconds: 1000));
     _refitAndSend(force: true);
-    for (final ms in const [50, 200, 600, 1500]) {
-      Future.delayed(Duration(milliseconds: ms), () {
-        if (mounted && _initialized && generation == _refitGeneration) {
-          _suppressScrollSaveFor(const Duration(milliseconds: 500));
-          _refitAndSend(force: false);
-        }
-      });
+    for (final ms in const [120, 300, 700, 1500]) {
+      _refitRetryTimers.add(
+        Timer(Duration(milliseconds: ms), () {
+          if (mounted && _initialized && generation == _refitGeneration) {
+            _suppressScrollSaveFor(const Duration(milliseconds: 500));
+            _refitAndSend(force: false);
+          }
+        }),
+      );
     }
   }
 
@@ -1431,21 +1469,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   // does not jiggle the host on every tick, only when a tick actually changes
   // the fitted size.
   void _refitAndSend({required bool force}) {
-    final wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
     _onFit();
-    if (wasAtBottom) {
-      _sessionSavedViewportY.remove(_sanitizedId);
-      try {
-        js_util.callMethod(_term, 'scrollToBottom', []);
-      } catch (_) {}
-    } else {
-      final savedY = _sessionSavedViewportY[_sanitizedId];
-      if (savedY != null) {
-        try {
-          js_util.callMethod(_term, 'scrollToLine', [savedY]);
-        } catch (_) {}
-      }
-    }
+    _resizeDebounceTimer?.cancel();
     if (!_initialContentWritten) {
       final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt();
       final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt();
@@ -1454,25 +1479,35 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       return;
     }
-    final cols = (js_util.getProperty(_term, 'cols') as num).toInt();
-    final rows = (js_util.getProperty(_term, 'rows') as num).toInt();
+    final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt() ?? 0;
+    final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt() ?? 0;
     if (cols < 2 || rows < 2) return;
+    final width = _terminalWrapper.clientWidth;
+    final height = _terminalWrapper.clientHeight;
+    if (width <= 0 || height <= 0) return;
     try {
       js_util.callMethod(_term, 'refresh', [0, rows - 1]);
     } catch (_) {}
-    final width = _terminalWrapper.clientWidth;
-    final height = _terminalWrapper.clientHeight;
-    final hasValidDimensions = width > 0 && height > 0;
     if (!force && cols == _lastRefitCols && rows == _lastRefitRows) return;
-    if (hasValidDimensions) {
-      _lastRefitCols = cols;
-      _lastRefitRows = rows;
-    }
+    _lastRefitCols = cols;
+    _lastRefitRows = rows;
+    _flushPendingJiggleRestore();
     final targetId = _sanitizedId;
+    _pendingJiggleCols = cols;
+    _pendingJiggleRows = rows;
+    _pendingJiggleTargetId = targetId;
     _sessionInputRouter.sendResizeOut(targetId, cols, rows - 1);
-    Future.delayed(const Duration(milliseconds: 60), () {
-      if (mounted && _initialized) {
-        _sessionInputRouter.sendResizeOut(targetId, cols, rows);
+    _jiggleRestoreTimer = Timer(const Duration(milliseconds: 60), () {
+      _jiggleRestoreTimer = null;
+      if (_pendingJiggleCols != null && _pendingJiggleRows != null) {
+        _sessionInputRouter.sendResizeOut(
+          targetId,
+          _pendingJiggleCols!,
+          _pendingJiggleRows!,
+        );
+        _pendingJiggleCols = null;
+        _pendingJiggleRows = null;
+        _pendingJiggleTargetId = null;
       }
     });
   }
@@ -2177,6 +2212,13 @@ class _TerminalPaneState extends State<TerminalPane> {
           try {
             js_util.callMethod(_term, 'scrollToBottom', []);
           } catch (_) {}
+        } else {
+          final savedY = _sessionSavedViewportY[_sanitizedId];
+          if (savedY != null) {
+            try {
+              js_util.callMethod(_term, 'scrollToLine', [savedY]);
+            } catch (_) {}
+          }
         }
 
         if (fittedRows >= 5 && fittedCols >= 10) {
@@ -2365,6 +2407,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(oldWidget.controller)} -> '
             'ctrl#${identityHashCode(widget.controller)}',
       );
+      _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
       _inputRouteToken = _sessionInputRouter.bind(
@@ -2408,11 +2451,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     _suppressScrollSaveTimer?.cancel();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _unbindContainerEvents();
+    _clearRefitRetryTimers();
+    _flushPendingJiggleRestore();
     _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
     if (_resizeObserver != null) {
       try {
         js_util.callMethod(_resizeObserver, 'disconnect', []);
       } catch (_) {}
+      _resizeObserver = null;
     }
     _focusNode.dispose();
     _unbindController();
