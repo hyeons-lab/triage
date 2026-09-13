@@ -24,6 +24,12 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - `2026-09-13T10:09-0400 devlog/plans/000147-03-fix-per-session-resize-and-refit-snap.md`: Authored implementation plan for per-session resize out tracking, scroll preservation, and refit stickiness.
 - `2026-09-13T10:09-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Tracked _sessionLastResizeOutCols, _sessionLastResizeOutRows, and _sessionLastGridSize per terminalId, implemented getCachedTerminalSize, guarded _saveScrollOffset against saving position 0.0, derived isAtBottom directly from scroll position in _onFit and _onRefit, and removed redundant terminal.viewWidth resize out from didUpdateWidget and _onRefit.
 - `2026-09-13T10:09-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Widened _viewportIsAtBottom tolerance to 30px (or baseY - 1), removed saved viewport on refit, and fell back to current viewportY when restoring scroll.
+- `2026-09-13T16:26-0400 devlog/plans/000147-04-fix-composer-scroll-up-snap-to-top.md`: Authored implementation plan for fixing composer upward scroll gesture interruption and refit snap to top.
+- `2026-09-13T16:26-0400 flutter/triage_client/lib/terminal/terminal_scroll_anchor.dart`: Prevented capturing an anchor when pixels <= 0.0 or topRow <= 0, and dropped anchor in desiredOffset when line.index <= 0 or desired <= 0.0 to prevent ever returning degenerate zero offsets.
+- `2026-09-13T16:26-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Early-returned from _repinScrollAnchor when position.isScrollingNotifier.value or _activePointers.isNotEmpty to prevent interrupting active scroll gestures, passed forceBottom based on current scroll metrics on focusCursorRevision changes, guarded _scrollToCursor against falling back to 0.0 target, cleared stale maps and anchors in _onTerminalResize when at bottom, and cleared anchor and saved maps in _saveScrollOffset when pixels <= 0.0.
+- `2026-09-13T16:26-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Removed scrollToBottom counter-scroll call from onScrollCallback, and guarded effectiveSavedY > 0 in _restoreScrollPosition.
+- `2026-09-13T16:26-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart`: Added unit tests for zero/negative offset rejection and row 0 anchor drop.
+- `2026-09-13T16:26-0400 flutter/triage_client/test/widget_test.dart`: Added widget test verifying that focusCursorRevision changes while at the bottom preserve bottom scroll and never jump to line 0.
 
 ## Decisions
 
@@ -40,6 +46,8 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T09:20-0400 Stagger native _refitActiveSession by 60ms: Native platforms (macOS, iOS, Android) also communicate with the remote daemon PTY over WebSocket. Staggering the resize restore by 60ms on native ensures POSIX kernels on the daemon host deliver distinct SIGWINCH events to CLI children.
 - 2026-09-13T10:09-0400 Track resize out per session: Tracking _sessionLastResizeOutCols and _sessionLastResizeOutRows in a map keyed by terminalId prevents viewport resize events on one session from blocking needed resize-out transmissions on another.
 - 2026-09-13T10:09-0400 Derive bottom stickiness from live scroll metrics rather than saved maps: Evaluating isAtBottom directly from position.pixels >= position.maxScrollExtent - graceLines * lineHeight prevents historical 0.0 entries in saved offset maps from erroneously flagging the terminal as scrolled up, ensuring refit consistently sticks to the bottom.
+- 2026-09-13T16:26-0400 Guard _repinScrollAnchor against interrupting active scroll gestures: jumpTo calls goIdle on Flutter's active ScrollActivity, which forcefully kills trackpad swipe and mouse fling gestures mid-flight whenever background output or cursor blinks occur. Returning early when isScrollingNotifier.value or _activePointers.isNotEmpty allows user scroll gestures to complete smoothly.
+- 2026-09-13T16:26-0400 Reject degenerate zero offsets in TerminalScrollAnchor: A scroll anchor represents an offset into scrollback; returning 0.0 when a line trims to row 0 forces the viewport to snap to the top of the buffer. Dropping the anchor when line.index <= 0 or desired <= 0.0 releases the viewport back to natural stick-to-bottom tracking.
 
 ## Issues
 
@@ -53,6 +61,8 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T09:20-0400 Web _onFit wasAtBottom locked to false: Diagnosed that _onFit initialized wasAtBottom based on whether _sessionSavedViewportY contained the key. If an entry existed, wasAtBottom remained false even if the viewport was currently at the bottom, repeatedly snapping to line 0. Resolved by querying _viewportIsAtBottom directly.
 - 2026-09-13T10:09-0400 Session refit snapping to top: Diagnosed that checking _sessionSavedScrollOffsets in _onRefit caused any session with a 0.0 offset to be treated as scrolled up, forcing _scrollToCursor to jump to 0.0. In addition, xterm.js strict 3px threshold treated sub-pixel offsets near the bottom as scrolled up. Resolved by computing bottom stickiness from current scroll metrics and widening web bottom tolerance to 30px.
 - 2026-09-13T10:09-0400 Premature resize out in didUpdateWidget: Diagnosed that reading _terminal.viewWidth and _terminal.viewHeight in didUpdateWidget transmitted un-fitted 80x24 dimensions during session attachment, corrupting session fit state and causing widget test failures. Resolved by removing premature resize-out calls from didUpdateWidget and letting layout determine terminal dimensions.
+- 2026-09-13T16:26-0400 Upward scroll gesture freezing when viewing input composer: In interactive CLIs with blinking cursors or spinners, terminal content changes triggered _repinScrollAnchor via post-frame callbacks. Calling jumpTo aborted the user's upward scroll swipe, freezing the viewport until an anchor was dropped or snap occurred. Resolved by checking isScrollingNotifier.value and active pointers before re-pinning.
+- 2026-09-13T16:26-0400 Viewport snapping to line 0 on refit or scroll: When focusCursorRevision changed or refit occurred, _scrollToCursor with default forceBottom: false treated stale or degenerate anchor offsets as scrolled-up state, computing target = 0.0 and snapping to the top. Resolved by deriving forceBottom from live viewport metrics, guarding target > 0.0, and clearing stale maps when pixels <= 0.0.
 
 ## Commits
 
@@ -60,4 +70,5 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - ab85b52: fix(terminal): eliminate duplicate text blocks on session resume via staggered pty jiggle and buffer clear
 - 00e71fe: fix(terminal): harden web refit lifecycle, prevent pty stranding, and rebind resize observer
 - 6d29e5d: fix(terminal): preserve bottom scroll on native refit and delay pty jiggle
-- HEAD: fix(terminal): isolate per-session resize out and eliminate snap to top on refit
+- fed543e: fix(terminal): isolate per-session resize out and eliminate snap to top on refit
+- HEAD: fix(terminal): prevent scroll gesture interruption and eliminate refit snap to top

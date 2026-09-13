@@ -1134,10 +1134,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
           if (isAtBottom) {
             _sessionSavedViewportY.remove(sessionId);
-            if (viewportY < baseY) {
-              js_util.callMethod(term, 'scrollToBottom', []);
-            }
-          } else if (viewportY >= 0) {
+          } else if (viewportY > 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
         } catch (_) {}
@@ -2328,13 +2325,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         final buffer = js_util.getProperty(_term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-        if (savedY != null && savedY >= baseY) {
+        if (savedY != null && (savedY >= baseY || savedY <= 0)) {
           _sessionSavedViewportY.remove(_sanitizedId);
         }
       } catch (_) {}
       final effectiveSavedY = _sessionSavedViewportY[_sanitizedId];
       try {
-        if (effectiveSavedY != null) {
+        if (effectiveSavedY != null && effectiveSavedY > 0) {
           js_util.callMethod(_term, 'scrollToLine', [effectiveSavedY]);
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);

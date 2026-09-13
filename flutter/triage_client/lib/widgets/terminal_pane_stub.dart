@@ -387,7 +387,16 @@ class _TerminalPaneState extends State<TerminalPane> {
       widget.controller.addRefitListener(_onRefit);
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
-      _scrollToCursor(requestFocus: true);
+      final pos = _scrollController.hasClients
+          ? _scrollController.position
+          : null;
+      final lh = _lineHeight() ?? 2.0;
+      final isAtBottom =
+          pos == null ||
+          !pos.hasContentDimensions ||
+          pos.maxScrollExtent <= 0 ||
+          pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+      _scrollToCursor(requestFocus: true, forceBottom: isAtBottom);
     }
   }
 
@@ -417,7 +426,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         ? _scrollController.position
         : null;
     final lh = _lineHeight() ?? 2.0;
-    final isAtBottom = pos == null ||
+    final isAtBottom =
+        pos == null ||
         !pos.hasContentDimensions ||
         pos.maxScrollExtent <= 0 ||
         pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
@@ -440,7 +450,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         ? _scrollController.position
         : null;
     final lh = _lineHeight() ?? 2.0;
-    final isAtBottom = pos == null ||
+    final isAtBottom =
+        pos == null ||
         !pos.hasContentDimensions ||
         pos.maxScrollExtent <= 0 ||
         pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
@@ -817,8 +828,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelHeight,
   ) {
     if (width > 0 && height > 0) {
-      final sanitizedId =
-          widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+      final sanitizedId = widget.terminalId.replaceAll(
+        RegExp(r'[^a-zA-Z0-9-]'),
+        '_',
+      );
       _sessionLastGridSize[sanitizedId] = (height, width);
       _sessionLastGridSize[widget.terminalId] = (height, width);
       // Reflow (reflowEnabled is on) runs only on a column change, moving content
@@ -828,7 +841,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       // width change so a later shift-click won't extend from a pre-reflow row
       // (with no anchor the extend is a no-op until the next fresh select). A
       // height-only resize doesn't reflow, so the anchor stays valid and is left
-      // alone. `viewWidth` is still the old width here — onResize fires before the
+      // alone. `viewWidth` is still the old width here: onResize fires before the
       // terminal stores the new one. The live highlight is unaffected; only the
       // extend-from point is invalidated.
       if (width != _terminal.viewWidth) {
@@ -836,49 +849,64 @@ class _TerminalPaneState extends State<TerminalPane> {
         _selectionAnchorBuffer = null;
       }
       final lh = _lineHeight() ?? 2.0;
-      final hasSavedOffset =
-          _scrollAnchor.hasAnchor ||
-          _sessionSavedDistanceFromBottom.containsKey(widget.terminalId) ||
-          _sessionSavedScrollFractions.containsKey(widget.terminalId) ||
-          _sessionSavedScrollOffsets.containsKey(widget.terminalId);
-      if (!hasSavedOffset && _scrollController.hasClients) {
-        scheduleMicrotask(() {
-          if (mounted &&
-              _scrollController.hasClients &&
-              !_scrollAnchor.hasAnchor &&
-              !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId) &&
-              !_sessionSavedScrollOffsets.containsKey(widget.terminalId)) {
-            _snapToBottom(_scrollController.position);
-          }
-        });
-      } else if (hasSavedOffset) {
+      final pos = _scrollController.hasClients
+          ? _scrollController.position
+          : null;
+      final isAtBottom =
+          pos == null ||
+          !pos.hasContentDimensions ||
+          pos.maxScrollExtent <= 0 ||
+          pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+      if (isAtBottom) {
+        _scrollAnchor.clear();
+        _sessionSavedScrollOffsets.remove(widget.terminalId);
+        _sessionSavedScrollAnchors.remove(widget.terminalId);
+        _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+        _sessionSavedScrollFractions.remove(widget.terminalId);
+        if (_scrollController.hasClients) {
+          scheduleMicrotask(() {
+            if (mounted && _scrollController.hasClients) {
+              _snapToBottom(_scrollController.position);
+            }
+          });
+        }
+      } else {
         scheduleMicrotask(() {
           if (mounted && _scrollController.hasClients) {
-            final pos = _scrollController.position;
-            if (!pos.hasContentDimensions || pos.maxScrollExtent <= 0) return;
+            final p = _scrollController.position;
+            if (!p.hasContentDimensions || p.maxScrollExtent <= 0) return;
+            if (p.isScrollingNotifier.value ||
+                _activePointers.isNotEmpty ||
+                _dragSelecting) {
+              return;
+            }
             double? target;
             if (_scrollAnchor.hasAnchor) {
               target = _scrollAnchor.desiredOffset(
-                maxScrollExtent: pos.maxScrollExtent,
+                maxScrollExtent: p.maxScrollExtent,
                 lineHeight: lh,
               );
             }
             final dist = _sessionSavedDistanceFromBottom[widget.terminalId];
             final frac = _sessionSavedScrollFractions[widget.terminalId];
             final saved = _sessionSavedScrollOffsets[widget.terminalId];
-            target ??= dist != null
-                ? (pos.maxScrollExtent - dist).clamp(0.0, pos.maxScrollExtent)
-                : frac != null
-                ? (pos.maxScrollExtent * frac).clamp(0.0, pos.maxScrollExtent)
-                : saved?.clamp(0.0, pos.maxScrollExtent);
-            if (target != null && (pos.pixels - target).abs() > 0.5) {
+            target ??= (dist != null && dist > 0.0)
+                ? (p.maxScrollExtent - dist).clamp(0.0, p.maxScrollExtent)
+                : (frac != null && frac > 0.0)
+                ? (p.maxScrollExtent * frac).clamp(0.0, p.maxScrollExtent)
+                : (saved != null && saved > 0.0)
+                ? saved.clamp(0.0, p.maxScrollExtent)
+                : null;
+            if (target != null &&
+                target > 0.0 &&
+                (p.pixels - target).abs() > 0.5) {
               final wasSuppressed = _suppressAnchorCapture;
               _suppressAnchorCapture = true;
               try {
-                pos.jumpTo(target);
+                p.jumpTo(target);
               } finally {
                 _suppressAnchorCapture = wasSuppressed;
-                _lastScrollPixels = pos.pixels;
+                _lastScrollPixels = p.pixels;
               }
             }
           }
@@ -921,8 +949,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     _resizeOutDebounceTimer?.cancel();
     _pendingResizeOutCols = null;
     _pendingResizeOutRows = null;
-    final sanitizedId =
-        widget.terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    final sanitizedId = widget.terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
     _sessionLastGridSize[sanitizedId] = (rows, cols);
     _sessionLastGridSize[widget.terminalId] = (rows, cols);
     if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
@@ -972,10 +1002,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     final isAtBottom =
         position.pixels >=
         position.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
-    if (!isAtBottom) {
-      if (position.pixels <= 0.0) {
-        return;
-      }
+    if (!isAtBottom && position.pixels > 0.0) {
       _sessionSavedScrollOffsets[id] = position.pixels;
       if (!_scrollAnchor.hasAnchor) {
         _scrollAnchor.capture(
@@ -1000,6 +1027,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedScrollAnchors.remove(id);
       _sessionSavedDistanceFromBottom.remove(id);
       _sessionSavedScrollFractions.remove(id);
+      if (id == widget.terminalId) {
+        _scrollAnchor.clear();
+      }
     }
   }
 
@@ -1130,14 +1160,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // drift that would otherwise scroll the user's content out from under them.
   void _repinScrollAnchor() {
     if (!mounted || !_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (position.isScrollingNotifier.value ||
+        _activePointers.isNotEmpty ||
+        _dragSelecting) {
+      return;
+    }
     final lineHeight = _lineHeight();
     if (lineHeight == null) return;
-    final position = _scrollController.position;
     final desired = _scrollAnchor.desiredOffset(
       maxScrollExtent: position.maxScrollExtent,
       lineHeight: lineHeight,
     );
-    if (desired == null) return;
+    if (desired == null || desired <= 0.0) return;
     if ((desired - position.pixels).abs() < 0.5) return;
     final wasSuppressed = _suppressAnchorCapture;
     _suppressAnchorCapture = true;
@@ -1194,23 +1229,42 @@ class _TerminalPaneState extends State<TerminalPane> {
               lineHeight: lineHeight,
             );
           }
-          if (desired != null) {
+          if (desired != null && desired > 0.0) {
             target = desired;
-          } else if (savedDistance != null) {
+          } else if (savedDistance != null && savedDistance > 0.0) {
             target = (position.maxScrollExtent - savedDistance).clamp(
               0.0,
               position.maxScrollExtent,
             );
-          } else if (savedFraction != null) {
+          } else if (savedFraction != null && savedFraction > 0.0) {
             target = (position.maxScrollExtent * savedFraction).clamp(
               0.0,
               position.maxScrollExtent,
             );
-          } else if (saved != null) {
+          } else if (saved != null && saved > 0.0) {
             target = saved.clamp(0.0, position.maxScrollExtent);
           } else {
-            target = position.pixels.clamp(0.0, position.maxScrollExtent);
+            final isNearBottom =
+                position.pixels >=
+                position.maxScrollExtent -
+                    kScrollPinReleaseGraceLines * (lineHeight ?? 2.0);
+            target = isNearBottom
+                ? position.maxScrollExtent
+                : position.pixels.clamp(0.0, position.maxScrollExtent);
           }
+          if (target <= 0.0 && position.maxScrollExtent > 0) {
+            target = position.maxScrollExtent;
+          }
+        }
+
+        if (target >=
+            position.maxScrollExtent -
+                kScrollPinReleaseGraceLines * (lineHeight ?? 2.0)) {
+          _scrollAnchor.clear();
+          _sessionSavedScrollOffsets.remove(widget.terminalId);
+          _sessionSavedScrollAnchors.remove(widget.terminalId);
+          _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+          _sessionSavedScrollFractions.remove(widget.terminalId);
         }
 
         if ((position.pixels - target).abs() > 0.5) {
@@ -1235,12 +1289,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   // xterm.dart copies selected text via BufferLine.getText, which drops every
-  // blank (codePoint 0) cell — so columns a TUI lays out by moving the cursor
+  // blank (codePoint 0) cell: so columns a TUI lays out by moving the cursor
   // (rather than writing literal spaces) concatenate on copy. Intercept the
   // copy chord before xterm's shortcut manager runs (TerminalView.onKeyEvent
   // short-circuits it when we return a non-ignored result) and rebuild the text
   // with the gap spaces restored. Returning `ignored` for everything else
-  // leaves xterm's normal key handling — including Ctrl+C -> SIGINT — untouched.
+  // leaves xterm's normal key handling, including Ctrl+C -> SIGINT, untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
     if (ModalRoute.of(context)?.isCurrent == false) {
       return KeyEventResult.ignored;
