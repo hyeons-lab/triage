@@ -349,15 +349,8 @@ class _TerminalPaneState extends State<TerminalPane> {
           overrideCols: _lastFittedCols,
           overrideRows: _lastFittedRows,
         );
-        if (_lastFittedRows! >= 5 && _lastFittedCols! >= 10) {
-          _sessionInputRouter.sendResizeOut(
-            sanitizedId,
-            _lastFittedCols!,
-            _lastFittedRows!,
-          );
-        }
       }
-      _triggerFitWithDelayedRetries();
+      _onRefit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
       }
@@ -1322,6 +1315,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (term != null) {
         try {
           js_util.callMethod(term, 'clear', []);
+          js_util.callMethod(term, 'write', ['\x1b[H\x1b[2J\x1b[3J']);
         } catch (_) {}
       }
     }
@@ -1444,6 +1438,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       try {
         js_util.callMethod(_term, 'scrollToBottom', []);
       } catch (_) {}
+    } else {
+      final savedY = _sessionSavedViewportY[_sanitizedId];
+      if (savedY != null) {
+        try {
+          js_util.callMethod(_term, 'scrollToLine', [savedY]);
+        } catch (_) {}
+      }
     }
     if (!_initialContentWritten) {
       final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt();
@@ -1459,11 +1460,21 @@ class _TerminalPaneState extends State<TerminalPane> {
     try {
       js_util.callMethod(_term, 'refresh', [0, rows - 1]);
     } catch (_) {}
+    final width = _terminalWrapper.clientWidth;
+    final height = _terminalWrapper.clientHeight;
+    final hasValidDimensions = width > 0 && height > 0;
     if (!force && cols == _lastRefitCols && rows == _lastRefitRows) return;
-    _lastRefitCols = cols;
-    _lastRefitRows = rows;
-    _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows - 1);
-    _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
+    if (hasValidDimensions) {
+      _lastRefitCols = cols;
+      _lastRefitRows = rows;
+    }
+    final targetId = _sanitizedId;
+    _sessionInputRouter.sendResizeOut(targetId, cols, rows - 1);
+    Future.delayed(const Duration(milliseconds: 60), () {
+      if (mounted && _initialized) {
+        _sessionInputRouter.sendResizeOut(targetId, cols, rows);
+      }
+    });
   }
 
   void _syncInitialBracketedPasteMode() {
@@ -2141,8 +2152,8 @@ class _TerminalPaneState extends State<TerminalPane> {
             final buffer = js_util.getProperty(term, 'buffer');
             final active = js_util.getProperty(buffer, 'active');
             final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-            final viewportY =
-                (js_util.getProperty(active, 'viewportY') as num).toInt();
+            final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+                .toInt();
             if (!_viewportIsAtBottom(_container, viewportY, baseY)) {
               wasAtBottom = false;
             }
