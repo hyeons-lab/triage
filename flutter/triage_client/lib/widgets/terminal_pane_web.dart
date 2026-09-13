@@ -357,7 +357,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           );
         }
       }
-      _onFit();
+      _triggerFitWithDelayedRetries();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
       }
@@ -428,6 +428,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
           _writeInitialContent();
+          _onFit();
         }
         _activateTerminal();
         _scheduleFocusRetries();
@@ -1204,6 +1205,16 @@ class _TerminalPaneState extends State<TerminalPane> {
       ]);
     } catch (_) {}
 
+    _setupResizeObserver();
+  }
+
+  void _setupResizeObserver() {
+    if (_resizeObserver != null) {
+      try {
+        js_util.callMethod(_resizeObserver, 'disconnect', []);
+      } catch (_) {}
+      _resizeObserver = null;
+    }
     try {
       final resizeObserverConstructor = js_util.getProperty(
         html.window,
@@ -1408,10 +1419,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onRefit() {
     if (!_initialized) return;
     final generation = ++_refitGeneration;
+    _suppressScrollSaveFor(const Duration(milliseconds: 1000));
     _refitAndSend(force: true);
     for (final ms in const [50, 200, 600, 1500]) {
       Future.delayed(Duration(milliseconds: ms), () {
         if (mounted && _initialized && generation == _refitGeneration) {
+          _suppressScrollSaveFor(const Duration(milliseconds: 500));
           _refitAndSend(force: false);
         }
       });
@@ -1424,7 +1437,14 @@ class _TerminalPaneState extends State<TerminalPane> {
   // does not jiggle the host on every tick, only when a tick actually changes
   // the fitted size.
   void _refitAndSend({required bool force}) {
+    final wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
     _onFit();
+    if (wasAtBottom) {
+      _sessionSavedViewportY.remove(_sanitizedId);
+      try {
+        js_util.callMethod(_term, 'scrollToBottom', []);
+      } catch (_) {}
+    }
     if (!_initialContentWritten) {
       final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt();
       final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt();
@@ -1436,6 +1456,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     final cols = (js_util.getProperty(_term, 'cols') as num).toInt();
     final rows = (js_util.getProperty(_term, 'rows') as num).toInt();
     if (cols < 2 || rows < 2) return;
+    try {
+      js_util.callMethod(_term, 'refresh', [0, rows - 1]);
+    } catch (_) {}
     if (!force && cols == _lastRefitCols && rows == _lastRefitRows) return;
     _lastRefitCols = cols;
     _lastRefitRows = rows;
@@ -2111,12 +2134,39 @@ class _TerminalPaneState extends State<TerminalPane> {
       final width = _terminalWrapper.clientWidth;
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
+        bool wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
+        final term = _term;
+        if (term != null) {
+          try {
+            final buffer = js_util.getProperty(term, 'buffer');
+            final active = js_util.getProperty(buffer, 'active');
+            final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+            final viewportY =
+                (js_util.getProperty(active, 'viewportY') as num).toInt();
+            if (!_viewportIsAtBottom(_container, viewportY, baseY)) {
+              wasAtBottom = false;
+            }
+          } catch (_) {}
+        }
+        _suppressScrollSaveFor(const Duration(milliseconds: 500));
         js_util.callMethod(_fitAddon, 'fit', []);
         _activateTerminal();
         final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
         final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
         final fittedRows = fittedRowsNum.toInt();
         final fittedCols = fittedColsNum.toInt();
+
+        if (fittedRows > 0) {
+          try {
+            js_util.callMethod(_term, 'refresh', [0, fittedRows - 1]);
+          } catch (_) {}
+        }
+        if (wasAtBottom) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+          try {
+            js_util.callMethod(_term, 'scrollToBottom', []);
+          } catch (_) {}
+        }
 
         if (fittedRows >= 5 && fittedCols >= 10) {
           final sizeChanged =

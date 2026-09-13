@@ -282,6 +282,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
     widget.controller.addFitListener(_onFit);
+    widget.controller.addRefitListener(_onRefit);
     _xtermController.addListener(_recordSelectionAnchor);
     _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
@@ -357,7 +358,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeFitListener(_onFit);
+      oldWidget.controller.removeRefitListener(_onRefit);
       widget.controller.addFitListener(_onFit);
+      widget.controller.addRefitListener(_onRefit);
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       _scrollToCursor(requestFocus: true);
@@ -370,6 +373,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _saveScrollOffset();
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
+    widget.controller.removeRefitListener(_onRefit);
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
@@ -384,6 +388,12 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _onFit() {
     setState(() {});
+  }
+
+  void _onRefit() {
+    if (!mounted) return;
+    setState(() {});
+    _scrollToCursor(requestFocus: false);
   }
 
   // Remember where the current selection is anchored so a shift-click can extend

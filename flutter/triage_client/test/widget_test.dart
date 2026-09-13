@@ -3843,6 +3843,74 @@ void main() {
     );
 
     testWidgets(
+      'pressing fit button while at bottom keeps scroll at bottom',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        expect(scrollViewFinder, findsOneWidget);
+
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        expect(controller.hasClients, isTrue);
+        expect(controller.position.maxScrollExtent, greaterThan(100.0));
+
+        // Viewport is initially at the bottom
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        // Tap the fit button
+        final fitFinder = find.byIcon(Icons.fit_screen);
+        expect(fitFinder, findsOneWidget);
+        await tester.tap(fitFinder.first);
+        await tester.pumpAndSettle();
+
+        // Scroll position must remain at bottom and not jump to top (0.0)
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
+
+    testWidgets(
+      'controller refit triggers pane refit listener and preserves bottom scroll',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        // Trigger refit on the controller directly
+        pane.controller.refit();
+        await tester.pumpAndSettle();
+
+        // Must remain at the bottom
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
+
+    testWidgets(
       'session at bottom stays sticky at bottom when switching sessions',
       (WidgetTester tester) async {
         final client = FakeTriageWebSocketClient();

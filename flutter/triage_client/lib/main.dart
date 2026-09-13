@@ -3948,6 +3948,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (session.hasFitted) {
       // Already fitted: refresh metadata without clearing and replaying history.
       unawaited(_refreshSessionSnapshot(session, includeHistory: false));
+      if (kIsWeb) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!_disposed &&
+              identical(_selectedSession, session) &&
+              _client.isConnected) {
+            _refitActiveSession();
+          }
+        });
+      }
     } else {
       // Not yet fitted: the first view-fit issues the initial refresh at the
       // real size; refreshing here too would race it with an estimated size.
