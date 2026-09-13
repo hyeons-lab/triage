@@ -17,7 +17,10 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - `2026-09-13T08:17-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: In _onClear, wrote escape sequence \x1b[H\x1b[2J\x1b[3J to erase the active screen buffer and reset the cursor to home alongside term.clear; on cached container adoption in initState, called _onRefit; in _refitAndSend, restored saved viewport offset via scrollToLine when not at bottom, avoided latching _lastRefitCols and _lastRefitRows when DOM width or height is 0, and staggered the restoring sendResizeOut(targetId, cols, rows) by 60ms after rows - 1 to guarantee distinct SIGWINCH delivery to the host.
 - `2026-09-13T08:17-0400 flutter/triage_client/lib/main.dart`: Scheduled post-frame _refitActiveSession in _connectWebSocket under kIsWeb after daemon sessions finish loading.
 - `2026-09-13T08:54-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: Tracked _jiggleRestoreTimer, _pendingJiggleCols, _pendingJiggleRows, and _pendingJiggleTargetId, flushed pending restore in didUpdateWidget and dispose prior to route unbinding to prevent PTY stranding, shifted refit retry ladder to [120, 300, 700, 1500] outside the 60ms jiggle window, tracked retries in _refitRetryTimers, guarded zero DOM dimensions in _refitAndSend before refresh and resize, reset _lastRefitCols and _lastRefitRows on refit, cancelled _resizeDebounceTimer in _refitAndSend, re-attached _setupResizeObserver on cached container adoption in initState, restored non-bottom lines in _onFit via scrollToLine, and added alternate buffer exit \x1b[?1049l in onClear.
-- `2026-09-13T08:54-0400 flutter/triage_client/lib/main.dart`: Guarded post-frame refit callback in _connectWebSocket with generation == _connectGeneration and serverId == _activeServerId.
+- `2026-09-13T09:20-0400 devlog/plans/000147-02-fix-native-refit-and-snap-to-top.md`: Authored implementation plan for native refit scroll preservation and PTY jiggle signal separation.
+- `2026-09-13T09:20-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Added scroll save suppression timer and flag, guarded scroll notifications during refit and fit passes, checked bottom stickiness in _onFit and _onRefit, cleared stale offsets and anchor when at bottom, and supported forceBottom in _scrollToCursor to eliminate refit snap to top.
+- `2026-09-13T09:20-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart`: In _onFit, evaluated wasAtBottom directly from _viewportIsAtBottom so stale entries in _sessionSavedViewportY do not lock wasAtBottom to false.
+- `2026-09-13T09:20-0400 flutter/triage_client/lib/main.dart`: Inserted a 60ms delay between rows - 1 and rows in native _refitActiveSession to prevent POSIX kernel SIGWINCH coalescing.
 
 ## Decisions
 
@@ -30,6 +33,8 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T08:54-0400 Flush pending PTY restore before unbinding input routes: When dispose or didUpdateWidget unbinds a controller from _sessionInputRouter, any pending jiggle restore must be flushed beforehand, otherwise _routes no longer contains the session id and the restoring resize is dropped.
 - 2026-09-13T08:54-0400 De-overlap refit retry ladder from jiggle duration: Shifting retry ladder intervals to [120, 300, 700, 1500] prevents the first retry from firing during the 60ms jiggle cycle, avoiding signal coalescing when initial DOM layout is 0ms.
 - 2026-09-13T08:54-0400 Reset last refit dimensions at the start of each refit generation: When resuming from sleep with zero initial dimensions, clearing _lastRefitCols and _lastRefitRows allows the first retry that measures positive dimensions to send the SIGWINCH jiggle.
+- 2026-09-13T09:20-0400 Suppress native scroll saves during refit: In TerminalView, layout recalculation triggers transient scroll position updates before RenderTerminal corrects the offset. Suppressing scroll saves for 1000ms during refit prevents transient 0.0 offsets from polluting session scroll state.
+- 2026-09-13T09:20-0400 Stagger native _refitActiveSession by 60ms: Native platforms (macOS, iOS, Android) also communicate with the remote daemon PTY over WebSocket. Staggering the resize restore by 60ms on native ensures POSIX kernels on the daemon host deliver distinct SIGWINCH events to CLI children.
 
 ## Issues
 
@@ -39,9 +44,12 @@ Resolve terminal rendering and layout corruption when resuming sessions (especia
 - 2026-09-13T08:17-0400 Native test failure on session selection: Guarded post-frame refit calls with kIsWeb so desktop/native platforms (which auto-fit via TerminalView and test mock assertions) are not subjected to redundant PTY jiggles.
 - 2026-09-13T08:54-0400 PTY stranding hazard on unmount during jiggle: Identified that if a pane was disposed within the 60ms jiggle window, unmanaged delayed futures bailed out on unmount, leaving the remote PTY at rows - 1. Resolved by tracking timers and flushing pending restores synchronously before route destruction.
 - 2026-09-13T08:54-0400 Resumed sessions missing window resize events: Identified that cached containers had their ResizeObserver disconnected on session switch and never re-bound on resume. Resolved by calling _setupResizeObserver on cached container adoption in initState.
+- 2026-09-13T09:20-0400 Native refit snapping to top: Diagnosed that on native macOS desktop, tapping refit triggered _onRefit() which called _scrollToCursor without bottom stickiness, jumping to 0.0 because an earlier layout pass had populated _sessionSavedScrollOffsets with 0.0. Resolved by suppressing scroll saves across refit, checking isScrolledUp, and passing forceBottom when at the bottom.
+- 2026-09-13T09:20-0400 Web _onFit wasAtBottom locked to false: Diagnosed that _onFit initialized wasAtBottom based on whether _sessionSavedViewportY contained the key. If an entry existed, wasAtBottom remained false even if the viewport was currently at the bottom, repeatedly snapping to line 0. Resolved by querying _viewportIsAtBottom directly.
 
 ## Commits
 
 - b6eb059: fix(terminal): resolve session resume layout corruption and refit snap to top
 - ab85b52: fix(terminal): eliminate duplicate text blocks on session resume via staggered pty jiggle and buffer clear
-- HEAD: fix(terminal): harden web refit lifecycle, prevent pty stranding, and rebind resize observer
+- 00e71fe: fix(terminal): harden web refit lifecycle, prevent pty stranding, and rebind resize observer
+- HEAD: fix(terminal): preserve bottom scroll on native refit and delay pty jiggle

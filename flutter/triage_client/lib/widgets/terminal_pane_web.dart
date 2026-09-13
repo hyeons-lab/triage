@@ -2180,7 +2180,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       final width = _terminalWrapper.clientWidth;
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
-        bool wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
+        bool wasAtBottom = true;
         final term = _term;
         if (term != null) {
           try {
@@ -2189,10 +2189,12 @@ class _TerminalPaneState extends State<TerminalPane> {
             final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
             final viewportY = (js_util.getProperty(active, 'viewportY') as num)
                 .toInt();
-            if (!_viewportIsAtBottom(_container, viewportY, baseY)) {
-              wasAtBottom = false;
-            }
-          } catch (_) {}
+            wasAtBottom = _viewportIsAtBottom(_container, viewportY, baseY);
+          } catch (_) {
+            wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
+          }
+        } else {
+          wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
         }
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         js_util.callMethod(_fitAddon, 'fit', []);

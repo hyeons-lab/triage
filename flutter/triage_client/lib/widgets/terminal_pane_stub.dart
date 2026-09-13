@@ -112,6 +112,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // True while we drive `_scrollController` ourselves, so the resulting scroll
   // notification doesn't re-capture the anchor from our own correction.
   bool _suppressAnchorCapture = false;
+  bool _suppressScrollSave = false;
+  Timer? _suppressScrollSaveTimer;
+
+  void _suppressScrollSaveFor(Duration duration) {
+    _suppressScrollSave = true;
+    _suppressScrollSaveTimer?.cancel();
+    _suppressScrollSaveTimer = Timer(duration, () {
+      if (mounted) {
+        _suppressScrollSave = false;
+      }
+    });
+  }
+
   bool _repinScheduled = false;
   // Viewport pixels at the previous scroll event, to tell a downward chase
   // (release the pin near the bottom) from upward reading (keep it).
@@ -383,17 +396,59 @@ class _TerminalPaneState extends State<TerminalPane> {
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
+    _suppressScrollSaveTimer?.cancel();
     super.dispose();
   }
 
   void _onFit() {
+    if (!mounted) return;
+    final pos = _scrollController.hasClients
+        ? _scrollController.position
+        : null;
+    final lh = _lineHeight() ?? 2.0;
+    final isScrolledUp =
+        pos != null &&
+        pos.hasContentDimensions &&
+        pos.pixels < pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh &&
+        (_sessionSavedScrollOffsets.containsKey(widget.terminalId) ||
+            _scrollAnchor.hasAnchor ||
+            _sessionSavedDistanceFromBottom.containsKey(widget.terminalId));
+
+    _suppressScrollSaveFor(const Duration(milliseconds: 500));
+    if (!isScrolledUp) {
+      _scrollAnchor.clear();
+      _sessionSavedScrollOffsets.remove(widget.terminalId);
+      _sessionSavedScrollAnchors.remove(widget.terminalId);
+      _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+      _sessionSavedScrollFractions.remove(widget.terminalId);
+    }
     setState(() {});
   }
 
   void _onRefit() {
     if (!mounted) return;
+    final pos = _scrollController.hasClients
+        ? _scrollController.position
+        : null;
+    final lh = _lineHeight() ?? 2.0;
+    final isScrolledUp =
+        pos != null &&
+        pos.hasContentDimensions &&
+        pos.pixels < pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh &&
+        (_sessionSavedScrollOffsets.containsKey(widget.terminalId) ||
+            _scrollAnchor.hasAnchor ||
+            _sessionSavedDistanceFromBottom.containsKey(widget.terminalId));
+
+    _suppressScrollSaveFor(const Duration(milliseconds: 1000));
+    if (!isScrolledUp) {
+      _scrollAnchor.clear();
+      _sessionSavedScrollOffsets.remove(widget.terminalId);
+      _sessionSavedScrollAnchors.remove(widget.terminalId);
+      _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+      _sessionSavedScrollFractions.remove(widget.terminalId);
+    }
     setState(() {});
-    _scrollToCursor(requestFocus: false);
+    _scrollToCursor(requestFocus: false, forceBottom: !isScrolledUp);
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -771,24 +826,22 @@ class _TerminalPaneState extends State<TerminalPane> {
         _selectionAnchorBuffer = null;
       }
       final lh = _lineHeight() ?? 2.0;
-      final isScrolledUp =
-          _scrollController.hasClients &&
-          _scrollController.position.hasContentDimensions &&
-          _scrollController.position.pixels <
-              _scrollController.position.maxScrollExtent - 2 * lh;
-      if (!isScrolledUp &&
-          !_scrollAnchor.hasAnchor &&
-          !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId) &&
-          _scrollController.hasClients) {
+      final hasSavedOffset =
+          _scrollAnchor.hasAnchor ||
+          _sessionSavedDistanceFromBottom.containsKey(widget.terminalId) ||
+          _sessionSavedScrollFractions.containsKey(widget.terminalId) ||
+          _sessionSavedScrollOffsets.containsKey(widget.terminalId);
+      if (!hasSavedOffset && _scrollController.hasClients) {
         scheduleMicrotask(() {
           if (mounted &&
               _scrollController.hasClients &&
               !_scrollAnchor.hasAnchor &&
-              !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId)) {
+              !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId) &&
+              !_sessionSavedScrollOffsets.containsKey(widget.terminalId)) {
             _snapToBottom(_scrollController.position);
           }
         });
-      } else if (isScrolledUp) {
+      } else if (hasSavedOffset) {
         scheduleMicrotask(() {
           if (mounted && _scrollController.hasClients) {
             final pos = _scrollController.position;
@@ -890,7 +943,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_copyTarget != null) {
       _rebuildForCopyButton();
     }
-    if (_suppressAnchorCapture || _dragSelecting) return;
+    if (_suppressAnchorCapture || _suppressScrollSave || _dragSelecting) return;
     _captureScrollAnchor();
   }
 
@@ -900,7 +953,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
     final id = terminalId ?? widget.terminalId;
     final lh = lineHeight ?? _lineHeight() ?? 2.0;
-    if (position.pixels < position.maxScrollExtent - lh) {
+    final isAtBottom =
+        position.pixels >=
+        position.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+    if (!isAtBottom) {
       _sessionSavedScrollOffsets[id] = position.pixels;
       if (!_scrollAnchor.hasAnchor) {
         _scrollAnchor.capture(
@@ -1077,7 +1133,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
-  void _scrollToCursor({required bool requestFocus}) {
+  void _scrollToCursor({required bool requestFocus, bool forceBottom = false}) {
     void jump() {
       if (!mounted) return;
       if (_scrollController.hasClients) {
@@ -1096,15 +1152,20 @@ class _TerminalPaneState extends State<TerminalPane> {
             _sessionSavedDistanceFromBottom[widget.terminalId];
         final savedFraction = _sessionSavedScrollFractions[widget.terminalId];
         final lineHeight = _lineHeight();
-
         final wasScrolledUp =
-            saved != null ||
-            savedDistance != null ||
-            savedFraction != null ||
-            _scrollAnchor.hasAnchor;
+            !forceBottom &&
+            (saved != null ||
+                savedDistance != null ||
+                savedFraction != null ||
+                _scrollAnchor.hasAnchor);
 
         double target;
         if (!wasScrolledUp) {
+          _scrollAnchor.clear();
+          _sessionSavedScrollOffsets.remove(widget.terminalId);
+          _sessionSavedScrollAnchors.remove(widget.terminalId);
+          _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+          _sessionSavedScrollFractions.remove(widget.terminalId);
           target = position.maxScrollExtent;
         } else {
           double? desired;

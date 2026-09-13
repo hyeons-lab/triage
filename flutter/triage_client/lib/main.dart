@@ -1604,6 +1604,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           rows: rows - 1,
         );
         if (_disposed) return;
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+        if (_disposed) return;
         await _client.resizeSession(
           sessionId: sessionId,
           cols: cols,
