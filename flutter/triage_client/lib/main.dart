@@ -9241,6 +9241,7 @@ class SessionWorkspace extends StatelessWidget {
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
+            isLoading: session.status == 'loading' || !session.loaded,
           ),
         ),
       ],

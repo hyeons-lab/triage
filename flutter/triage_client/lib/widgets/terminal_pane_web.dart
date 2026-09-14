@@ -3,6 +3,7 @@ import '../terminal/debug_log.dart';
 
 import 'dart:async';
 import 'dart:html' as html;
+import 'dart:math' as math;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
 
@@ -31,6 +32,7 @@ class TerminalPane extends StatefulWidget {
     this.onViewFit,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
+    this.isLoading = false,
   });
 
   final String terminalId;
@@ -51,6 +53,7 @@ class TerminalPane extends StatefulWidget {
 
   final int focusCursorRevision;
   final bool isExited;
+  final bool isLoading;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -231,8 +234,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // below it.
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchStartSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchCancelSubscription;
+  StreamSubscription<html.Event>? _containerPointerDownSubscription;
+  StreamSubscription<html.Event>? _containerPointerUpSubscription;
+  StreamSubscription<html.Event>? _containerPointerCancelSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
+  int _activeTouchCount = 0;
+  int _activePointerCount = 0;
+  bool _pendingScrollToBottomOnRelease = false;
+
+  bool get _isUserGestureActive =>
+      _activeTouchCount > 0 || _activePointerCount > 0;
   void Function(html.Event)? _containerPasteListener;
   void Function(html.Event)? _textareaBeforeInputListener;
   void Function(html.Event)? _textareaInputListener;
@@ -589,7 +603,8 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _syncPointerEvents() {
     final isCurrent = _currentRoute?.isCurrent ?? true;
-    final target = isCurrent ? 'auto' : 'none';
+    final isInteractive = isCurrent && !widget.isLoading;
+    final target = isInteractive ? 'auto' : 'none';
     if (_initialized || _sessionContainers.containsKey(_sanitizedId)) {
       if (_container.style.pointerEvents != target) {
         _container.style.pointerEvents = target;
@@ -1333,7 +1348,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedViewportY.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {
-        activePane._suppressScrollSaveFor(const Duration(milliseconds: 1000));
+        activePane._pendingScrollToBottomOnRelease = true;
+        activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
           activePane._pendingLiveWriteBuffer.clear();
         }
@@ -1569,7 +1585,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
+    _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
+      _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
+    });
+
     _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
+      _activeTouchCount =
+          event.touches?.length ?? math.max(0, _activeTouchCount - 1);
+      _handleUserGestureEnded();
       if (_initialized) {
         try {
           _activateTerminal(force: true);
@@ -1577,6 +1600,34 @@ class _TerminalPaneState extends State<TerminalPane> {
         } catch (_) {}
       }
     });
+
+    _containerTouchCancelSubscription = _container.onTouchCancel.listen((
+      event,
+    ) {
+      _activeTouchCount =
+          event.touches?.length ?? math.max(0, _activeTouchCount - 1);
+      _handleUserGestureEnded();
+    });
+
+    _containerPointerDownSubscription = _container.on['pointerdown'].listen((
+      event,
+    ) {
+      _activePointerCount++;
+    });
+
+    _containerPointerUpSubscription = _container.on['pointerup'].listen((
+      event,
+    ) {
+      _activePointerCount = math.max(0, _activePointerCount - 1);
+      _handleUserGestureEnded();
+    });
+
+    _containerPointerCancelSubscription = _container.on['pointercancel'].listen(
+      (event) {
+        _activePointerCount = math.max(0, _activePointerCount - 1);
+        _handleUserGestureEnded();
+      },
+    );
 
     _containerWheelSubscription = _container.onWheel.listen((event) {
       if (_currentRoute?.isCurrent == false) {
@@ -1818,6 +1869,33 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  final List<Timer> _pointerReleaseTimers = [];
+
+  void _clearPointerReleaseTimers() {
+    for (final timer in _pointerReleaseTimers) {
+      timer.cancel();
+    }
+    _pointerReleaseTimers.clear();
+  }
+
+  void _handleUserGestureEnded() {
+    if (_isUserGestureActive) return;
+    if (_pendingScrollToBottomOnRelease) {
+      _pendingScrollToBottomOnRelease = false;
+      _restoreScrollPosition(requestFocus: false);
+      _clearPointerReleaseTimers();
+      for (final ms in const [80, 250]) {
+        _pointerReleaseTimers.add(
+          Timer(Duration(milliseconds: ms), () {
+            if (mounted && _initialized && !_isUserGestureActive) {
+              _restoreScrollPosition(requestFocus: false);
+            }
+          }),
+        );
+      }
+    }
+  }
+
   /// Releases the listeners [_bindContainerEvents] attached, and is safe to call
   /// when there are none: an adopted container may already have been handed on
   /// to a newer pane, which unbinds this one as it takes over.
@@ -1847,10 +1925,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerMouseDownSubscription = null;
     _containerClickSubscription?.cancel();
     _containerClickSubscription = null;
+    _containerTouchStartSubscription?.cancel();
+    _containerTouchStartSubscription = null;
     _containerTouchEndSubscription?.cancel();
     _containerTouchEndSubscription = null;
+    _containerTouchCancelSubscription?.cancel();
+    _containerTouchCancelSubscription = null;
+    _containerPointerDownSubscription?.cancel();
+    _containerPointerDownSubscription = null;
+    _containerPointerUpSubscription?.cancel();
+    _containerPointerUpSubscription = null;
+    _containerPointerCancelSubscription?.cancel();
+    _containerPointerCancelSubscription = null;
     _containerWheelSubscription?.cancel();
     _containerWheelSubscription = null;
+    _activeTouchCount = 0;
+    _activePointerCount = 0;
     final pasteListener = _containerPasteListener;
     if (pasteListener != null) {
       _container.removeEventListener('paste', pasteListener, true);
@@ -2210,9 +2300,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         }
         if (wasAtBottom) {
           _sessionSavedViewportY.remove(_sanitizedId);
-          try {
-            js_util.callMethod(_term, 'scrollToBottom', []);
-          } catch (_) {}
+          if (_isUserGestureActive) {
+            _pendingScrollToBottomOnRelease = true;
+          } else {
+            try {
+              js_util.callMethod(_term, 'scrollToBottom', []);
+            } catch (_) {}
+          }
         } else {
           final savedY = _sessionSavedViewportY[_sanitizedId] ?? viewportY;
           if (savedY != null) {
@@ -2313,6 +2407,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _restoreScrollPosition({required bool requestFocus}) {
+    if (_isUserGestureActive) {
+      _pendingScrollToBottomOnRelease = true;
+      return;
+    }
     var jumped = false;
     void jump() {
       if (jumped || !mounted || !_initialized) return;
@@ -2401,6 +2499,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       _focusCursorNowAndAfterReplay();
       _scheduleFocusRetries(force: true);
     }
+    if (oldWidget.isLoading != widget.isLoading) {
+      _syncPointerEvents();
+      if (!widget.isLoading) {
+        _restoreScrollPosition(requestFocus: false);
+      }
+    }
     if (oldWidget.controller != widget.controller) {
       tdbg(
         'pane.didUpdate',
@@ -2450,6 +2554,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _suppressScrollSaveTimer?.cancel();
+    _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _unbindContainerEvents();
     _clearRefitRetryTimers();
@@ -2523,24 +2628,47 @@ class _TerminalPaneState extends State<TerminalPane> {
             });
           }
           final terminal = SizedBox.expand(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapDown: (_) {
-                widget.controller.notifyInteraction();
-                if (mounted &&
-                    _focusNode.canRequestFocus &&
-                    !_focusNode.hasFocus) {
-                  _focusNode.requestFocus();
-                }
-                _activateTerminal(force: true);
-                _scheduleFocusRetries(force: true);
-              },
-              child: Container(
-                width: double.infinity,
-                height: double.infinity,
-                color: const Color(0xff0d1113),
-                child: HtmlElementView(viewType: _viewType),
-              ),
+            child: Stack(
+              children: [
+                IgnorePointer(
+                  ignoring: widget.isLoading,
+                  child: AnimatedOpacity(
+                    opacity: widget.isLoading ? 0.7 : 1.0,
+                    duration: const Duration(milliseconds: 150),
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: (_) {
+                        widget.controller.notifyInteraction();
+                        if (mounted &&
+                            _focusNode.canRequestFocus &&
+                            !_focusNode.hasFocus) {
+                          _focusNode.requestFocus();
+                        }
+                        _activateTerminal(force: true);
+                        _scheduleFocusRetries(force: true);
+                      },
+                      child: Container(
+                        width: double.infinity,
+                        height: double.infinity,
+                        color: const Color(0xff0d1113),
+                        child: HtmlElementView(viewType: _viewType),
+                      ),
+                    ),
+                  ),
+                ),
+                if (widget.isLoading)
+                  const Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    height: 2,
+                    child: LinearProgressIndicator(
+                      minHeight: 2,
+                      backgroundColor: Colors.transparent,
+                      color: Color(0xffffc857),
+                    ),
+                  ),
+              ],
             ),
           );
           // Desktop browsers keep the full-height terminal; only a mobile-OS

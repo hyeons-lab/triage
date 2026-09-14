@@ -44,6 +44,7 @@ class TerminalPane extends StatefulWidget {
     this.onViewFit,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
+    this.isLoading = false,
   });
 
   final String terminalId;
@@ -63,6 +64,7 @@ class TerminalPane extends StatefulWidget {
 
   final int focusCursorRevision;
   final bool isExited;
+  final bool isLoading;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -153,6 +155,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // scrolling, so the scroll state alone would treat a finger resting on a
   // stopped fling as settled.
   final Set<int> _activePointers = <int>{};
+  bool _pendingBottomSnapOnPointerUp = false;
 
   Timer? _resizeOutDebounceTimer;
   Timer? _scrollToCursorTimer;
@@ -306,6 +309,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _bindTerminal(_terminal);
     widget.controller.addFitListener(_onFit);
     widget.controller.addRefitListener(_onRefit);
+    widget.controller.addClearListener(_onClear);
+    widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
     _xtermController.addListener(_recordSelectionAnchor);
     _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
@@ -383,8 +388,18 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeFitListener(_onFit);
       oldWidget.controller.removeRefitListener(_onRefit);
+      oldWidget.controller.removeClearListener(_onClear);
+      oldWidget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
       widget.controller.addFitListener(_onFit);
       widget.controller.addRefitListener(_onRefit);
+      widget.controller.addClearListener(_onClear);
+      widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
+    }
+    if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
+      if (_pendingBottomSnapOnPointerUp) {
+        _pendingBottomSnapOnPointerUp = false;
+        _scrollToCursor(requestFocus: false, forceBottom: true);
+      }
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       final pos = _scrollController.hasClients
@@ -407,6 +422,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
     widget.controller.removeRefitListener(_onRefit);
+    widget.controller.removeClearListener(_onClear);
+    widget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
@@ -417,6 +434,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
     _suppressScrollSaveTimer?.cancel();
+    _clearPointerReleaseTimers();
     super.dispose();
   }
 
@@ -466,6 +484,31 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     setState(() {});
     _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
+  }
+
+  void _onClear() {
+    if (!mounted) return;
+    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
+    _scrollAnchor.clear();
+    _sessionSavedScrollOffsets.remove(widget.terminalId);
+    _sessionSavedScrollAnchors.remove(widget.terminalId);
+    _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+    _sessionSavedScrollFractions.remove(widget.terminalId);
+    _pendingBottomSnapOnPointerUp = true;
+  }
+
+  void _onHistoryReplayed() {
+    if (!mounted) return;
+    final isGestureActive =
+        _activePointers.isNotEmpty ||
+        (_scrollController.hasClients &&
+            _scrollController.position.isScrollingNotifier.value);
+    if (isGestureActive) {
+      _pendingBottomSnapOnPointerUp = true;
+    } else {
+      _pendingBottomSnapOnPointerUp = false;
+      _scrollToCursor(requestFocus: false, forceBottom: true);
+    }
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -600,8 +643,35 @@ class _TerminalPaneState extends State<TerminalPane> {
   // Done from raw pointer events because TerminalView.onTapUp is dead in xterm
   // 4.0.0; raw pointer handling also sidesteps the gesture arena, so normal
   // drag-select keeps working.
+  final List<Timer> _pointerReleaseTimers = [];
+
+  void _clearPointerReleaseTimers() {
+    for (final timer in _pointerReleaseTimers) {
+      timer.cancel();
+    }
+    _pointerReleaseTimers.clear();
+  }
+
+  void _checkDeferredBottomSnapOnPointerRelease() {
+    if (_activePointers.isEmpty && _pendingBottomSnapOnPointerUp) {
+      _pendingBottomSnapOnPointerUp = false;
+      _scrollToCursor(requestFocus: false, forceBottom: true);
+      _clearPointerReleaseTimers();
+      for (final ms in const [80, 250]) {
+        _pointerReleaseTimers.add(
+          Timer(Duration(milliseconds: ms), () {
+            if (mounted && _activePointers.isEmpty) {
+              _scrollToCursor(requestFocus: false, forceBottom: true);
+            }
+          }),
+        );
+      }
+    }
+  }
+
   void _handlePointerUp(PointerUpEvent event) {
     _activePointers.remove(event.pointer);
+    _checkDeferredBottomSnapOnPointerRelease();
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -619,6 +689,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _handlePointerCancel(PointerCancelEvent event) {
     _activePointers.remove(event.pointer);
+    _checkDeferredBottomSnapOnPointerRelease();
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -1610,47 +1681,79 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (isTest) {
       return Container(
         color: const Color(0xff0d1113),
-        alignment: Alignment.topLeft,
-        child: SingleChildScrollView(
-          controller: _scrollController,
-          padding: const EdgeInsets.all(22),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final row in widget.fallbackRows)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 7),
-                  child: SelectableText.rich(
-                    TextSpan(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            IgnorePointer(
+              ignoring: widget.isLoading,
+              child: AnimatedOpacity(
+                opacity: widget.isLoading ? 0.7 : 1.0,
+                duration: const Duration(milliseconds: 150),
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: _handlePointerDown,
+                  onPointerMove: _handlePointerMove,
+                  onPointerUp: _handlePointerUp,
+                  onPointerCancel: _handlePointerCancel,
+                  child: SingleChildScrollView(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.all(22),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        for (final span in row.spans)
-                          TextSpan(
-                            text: span.text.isEmpty ? ' ' : span.text,
-                            style: TextStyle(
-                              fontFamily: 'JetBrains Mono',
-                              fontSize: 15,
-                              height: 1.35,
-                              color:
-                                  span.style.foreground?.toColor() ??
-                                  const Color(0xffd9e5e3),
-                              backgroundColor: span.style.background?.toColor(),
-                              fontWeight: span.style.bold
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                              fontStyle: span.style.italic
-                                  ? FontStyle.italic
-                                  : FontStyle.normal,
-                              decoration: span.style.underline
-                                  ? TextDecoration.underline
-                                  : TextDecoration.none,
+                        for (final row in widget.fallbackRows)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 7),
+                            child: SelectableText.rich(
+                              TextSpan(
+                                children: [
+                                  for (final span in row.spans)
+                                    TextSpan(
+                                      text: span.text.isEmpty ? ' ' : span.text,
+                                      style: TextStyle(
+                                        fontFamily: 'JetBrains Mono',
+                                        fontSize: 15,
+                                        height: 1.35,
+                                        color:
+                                            span.style.foreground?.toColor() ??
+                                            const Color(0xffd9e5e3),
+                                        backgroundColor:
+                                            span.style.background?.toColor(),
+                                        fontWeight: span.style.bold
+                                            ? FontWeight.bold
+                                            : FontWeight.normal,
+                                        fontStyle: span.style.italic
+                                            ? FontStyle.italic
+                                            : FontStyle.normal,
+                                        decoration: span.style.underline
+                                            ? TextDecoration.underline
+                                            : TextDecoration.none,
+                                      ),
+                                    ),
+                                ],
+                              ),
                             ),
                           ),
                       ],
                     ),
                   ),
                 ),
-            ],
-          ),
+              ),
+            ),
+            if (widget.isLoading)
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                height: 2,
+                child: LinearProgressIndicator(
+                  value: isTest ? 0.5 : null,
+                  minHeight: 2,
+                  backgroundColor: Colors.transparent,
+                  color: const Color(0xffffc857),
+                ),
+              ),
+          ],
         ),
       );
     }
@@ -1688,39 +1791,60 @@ class _TerminalPaneState extends State<TerminalPane> {
                   // pane, and the grid size is derived from those pixels.
                   fit: StackFit.expand,
                   children: [
-                    Padding(
-                      padding: padding,
-                      child: Listener(
-                        onPointerDown: _handlePointerDown,
-                        onPointerMove: _handlePointerMove,
-                        onPointerUp: _handlePointerUp,
-                        onPointerCancel: _handlePointerCancel,
-                        child: ScrollConfiguration(
-                          behavior: ScrollConfiguration.of(
-                            context,
-                          ).copyWith(scrollbars: false),
-                          child: xt.TerminalView(
-                            _terminal,
-                            key: _terminalViewKey,
-                            controller: _xtermController,
-                            theme: _theme,
-                            focusNode: _focusNode,
-                            autofocus: true,
-                            scrollController: _scrollController,
-                            onKeyEvent: _handleTerminalKeyEvent,
-                            textStyle: _textStyle,
-                            // Desktop uses the hardware-keyboard path instead of
-                            // xterm's hidden IME TextInput connection: on macOS the
-                            // IME path desyncs Flutter's HardwareKeyboard state
-                            // ("physical key already pressed") and swallows
-                            // keystrokes. Mobile must use the IME path, though: it
-                            // is what raises the soft keyboard, so disabling it
-                            // leaves a phone unable to type.
-                            hardwareKeyboardOnly: !_isMobile,
+                    IgnorePointer(
+                      ignoring: widget.isLoading,
+                      child: AnimatedOpacity(
+                        opacity: widget.isLoading ? 0.7 : 1.0,
+                        duration: const Duration(milliseconds: 150),
+                        child: Padding(
+                          padding: padding,
+                          child: Listener(
+                            behavior: HitTestBehavior.translucent,
+                            onPointerDown: _handlePointerDown,
+                            onPointerMove: _handlePointerMove,
+                            onPointerUp: _handlePointerUp,
+                            onPointerCancel: _handlePointerCancel,
+                            child: ScrollConfiguration(
+                              behavior: ScrollConfiguration.of(
+                                context,
+                              ).copyWith(scrollbars: false),
+                              child: xt.TerminalView(
+                                _terminal,
+                                key: _terminalViewKey,
+                                controller: _xtermController,
+                                theme: _theme,
+                                focusNode: _focusNode,
+                                autofocus: true,
+                                scrollController: _scrollController,
+                                onKeyEvent: _handleTerminalKeyEvent,
+                                textStyle: _textStyle,
+                                // Desktop uses the hardware-keyboard path instead of
+                                // xterm's hidden IME TextInput connection: on macOS the
+                                // IME path desyncs Flutter's HardwareKeyboard state
+                                // ("physical key already pressed") and swallows
+                                // keystrokes. Mobile must use the IME path, though: it
+                                // is what raises the soft keyboard, so disabling it
+                                // leaves a phone unable to type.
+                                hardwareKeyboardOnly: !_isMobile,
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
+                    if (widget.isLoading)
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        height: 2,
+                        child: LinearProgressIndicator(
+                          value: isTest ? 0.5 : null,
+                          minHeight: 2,
+                          backgroundColor: Colors.transparent,
+                          color: const Color(0xffffc857),
+                        ),
+                      ),
                     if (copyButton != null) copyButton,
                   ],
                 ),

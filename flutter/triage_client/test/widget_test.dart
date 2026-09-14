@@ -9,6 +9,7 @@ import 'package:flutter/material.dart'
         CheckedPopupMenuItem,
         FilledButton,
         Icons,
+        LinearProgressIndicator,
         MaterialApp,
         Scaffold,
         Switch,
@@ -4021,6 +4022,78 @@ void main() {
 
       expect(controller.position.pixels, controller.position.maxScrollExtent);
     });
+
+    testWidgets(
+      'loading state ignores pointer events and displays progress indicator',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        final delayedSnapshot = Completer<Map<String, dynamic>>();
+        client.snapshotCompleters['flutter-spike'] = delayedSnapshot;
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = find.byType(TerminalPane);
+        expect(pane, findsOneWidget);
+
+        final ignorePointer = tester.widget<IgnorePointer>(
+          find.descendant(
+            of: pane,
+            matching: find.byType(IgnorePointer),
+          ).first,
+        );
+        expect(ignorePointer.ignoring, isTrue);
+        expect(find.byType(LinearProgressIndicator), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'clearing buffer during pointer interaction defers bottom snap until pointer release',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+
+        // Scroll up away from bottom
+        controller.jumpTo(60.0);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, 60.0);
+
+        // Start touch or pointer gesture
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byType(TerminalPane)),
+        );
+        await tester.pump();
+
+        // Clear terminal buffer while gesture is active
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.controller.clear();
+        await tester.pump();
+
+        // Viewport remains at current offset during gesture
+        expect(controller.position.pixels, 60.0);
+
+        // Release pointer
+        await gesture.up();
+        await tester.pump(const Duration(milliseconds: 300));
+        await tester.pumpAndSettle();
+
+        // Viewport snaps to bottom after release
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
   });
 
   group('SessionVm exited lifecycle', () {
