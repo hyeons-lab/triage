@@ -739,6 +739,24 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         custom_label: Option<String>,
     },
+    /// Connection-wide push: a new session was started on the daemon.
+    SessionStarted {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default)]
+        last_activity_ms: u64,
+    },
+    /// Connection-wide push: an existing session was shut down or deleted.
+    SessionTerminated {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1955,5 +1973,66 @@ mod tests {
                 custom_label: None,
             }
         );
+    }
+
+    #[test]
+    fn flatbuffers_session_started_roundtrip() {
+        let msg = ServerMessage::SessionStarted {
+            session_id: SessionId::new("s-new").unwrap(),
+            current_working_directory: Some("/path/to/cwd".to_string()),
+            repository_root: Some("/path/to/repo".to_string()),
+            worktree_root: Some("/path/to/worktree".to_string()),
+            branch: Some("feat/sync".to_string()),
+            last_activity_ms: 1720000000000,
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::SessionStarted {
+                session_id: "s-new",
+                current_working_directory: Some("/path/to/cwd"),
+                repository_root: Some("/path/to/repo"),
+                worktree_root: Some("/path/to/worktree"),
+                branch: Some("feat/sync"),
+                last_activity_ms: 1720000000000,
+            }
+        );
+    }
+
+    #[test]
+    fn flatbuffers_session_terminated_roundtrip() {
+        let msg = ServerMessage::SessionTerminated {
+            session_id: SessionId::new("s-old").unwrap(),
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::SessionTerminated {
+                session_id: "s-old",
+            }
+        );
+    }
+
+    #[test]
+    fn json_session_lifecycle_roundtrip() {
+        let started = ServerMessage::SessionStarted {
+            session_id: SessionId::new("s-1").unwrap(),
+            current_working_directory: Some("/dir".to_string()),
+            repository_root: Some("/repo".to_string()),
+            worktree_root: None,
+            branch: Some("main".to_string()),
+            last_activity_ms: 123456789,
+        };
+        let started_json = serde_json::to_string(&started).unwrap();
+        let started_deserialized: ServerMessage = serde_json::from_str(&started_json).unwrap();
+        assert_eq!(started, started_deserialized);
+
+        let terminated = ServerMessage::SessionTerminated {
+            session_id: SessionId::new("s-1").unwrap(),
+        };
+        let terminated_json = serde_json::to_string(&terminated).unwrap();
+        let terminated_deserialized: ServerMessage =
+            serde_json::from_str(&terminated_json).unwrap();
+        assert_eq!(terminated, terminated_deserialized);
     }
 }

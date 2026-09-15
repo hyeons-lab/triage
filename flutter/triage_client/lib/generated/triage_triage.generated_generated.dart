@@ -335,7 +335,9 @@ enum ServerMessagePayloadTypeId {
   UpdateAvailablePayload(7),
   SessionJudgePolicyUpdatedPayload(8),
   RailPinsUpdatedPayload(9),
-  SessionCustomLabelUpdatedPayload(10);
+  SessionCustomLabelUpdatedPayload(10),
+  SessionStartedPayload(11),
+  SessionTerminatedPayload(12);
 
   final int value;
   const ServerMessagePayloadTypeId(this.value);
@@ -353,6 +355,8 @@ enum ServerMessagePayloadTypeId {
       case 8: return ServerMessagePayloadTypeId.SessionJudgePolicyUpdatedPayload;
       case 9: return ServerMessagePayloadTypeId.RailPinsUpdatedPayload;
       case 10: return ServerMessagePayloadTypeId.SessionCustomLabelUpdatedPayload;
+      case 11: return ServerMessagePayloadTypeId.SessionStartedPayload;
+      case 12: return ServerMessagePayloadTypeId.SessionTerminatedPayload;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -361,7 +365,7 @@ enum ServerMessagePayloadTypeId {
       value == null ? null : ServerMessagePayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 10;
+  static const int maxValue = 12;
   static const fb.Reader<ServerMessagePayloadTypeId> reader = _ServerMessagePayloadTypeIdReader();
 }
 
@@ -7591,6 +7595,205 @@ class SessionCustomLabelUpdatedPayloadObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SessionStartedPayload {
+  SessionStartedPayload._(this._bc, this._bcOffset);
+  factory SessionStartedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionStartedPayload> reader = _SessionStartedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get currentWorkingDirectory => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get repositoryRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
+  String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+  int get lastActivityMs => fbjs.readUint64(_bc, _bcOffset, 14, 0);
+
+  @override
+  String toString() {
+    return 'SessionStartedPayload{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}, lastActivityMs: ${lastActivityMs}}';
+  }
+}
+
+class _SessionStartedPayloadReader extends fb.TableReader<SessionStartedPayload> {
+  const _SessionStartedPayloadReader();
+
+  @override
+  SessionStartedPayload createObject(fb.BufferContext bc, int offset) => 
+    SessionStartedPayload._(bc, offset);
+}
+
+class SessionStartedPayloadBuilder {
+  SessionStartedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(6);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addCurrentWorkingDirectoryOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addRepositoryRootOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addWorktreeRootOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+  int addBranchOffset(int? offset) {
+    fbBuilder.addOffset(4, offset);
+    return fbBuilder.offset;
+  }
+  int addLastActivityMs(int? lastActivityMs) {
+    fbjs.addUint64(fbBuilder, 5, lastActivityMs);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionStartedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _currentWorkingDirectory;
+  final String? _repositoryRoot;
+  final String? _worktreeRoot;
+  final String? _branch;
+  final int? _lastActivityMs;
+
+  SessionStartedPayloadObjectBuilder({
+    String? sessionId,
+    String? currentWorkingDirectory,
+    String? repositoryRoot,
+    String? worktreeRoot,
+    String? branch,
+    int? lastActivityMs,
+  })
+      : _sessionId = sessionId,
+        _currentWorkingDirectory = currentWorkingDirectory,
+        _repositoryRoot = repositoryRoot,
+        _worktreeRoot = worktreeRoot,
+        _branch = branch,
+        _lastActivityMs = lastActivityMs;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? currentWorkingDirectoryOffset = _currentWorkingDirectory == null ? null
+        : fbBuilder.writeString(_currentWorkingDirectory!);
+    final int? repositoryRootOffset = _repositoryRoot == null ? null
+        : fbBuilder.writeString(_repositoryRoot!);
+    final int? worktreeRootOffset = _worktreeRoot == null ? null
+        : fbBuilder.writeString(_worktreeRoot!);
+    final int? branchOffset = _branch == null ? null
+        : fbBuilder.writeString(_branch!);
+    fbBuilder.startTable(6);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, currentWorkingDirectoryOffset);
+    fbBuilder.addOffset(2, repositoryRootOffset);
+    fbBuilder.addOffset(3, worktreeRootOffset);
+    fbBuilder.addOffset(4, branchOffset);
+    fbjs.addUint64(fbBuilder, 5, _lastActivityMs);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SessionTerminatedPayload {
+  SessionTerminatedPayload._(this._bc, this._bcOffset);
+  factory SessionTerminatedPayload(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SessionTerminatedPayload> reader = _SessionTerminatedPayloadReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'SessionTerminatedPayload{sessionId: ${sessionId}}';
+  }
+}
+
+class _SessionTerminatedPayloadReader extends fb.TableReader<SessionTerminatedPayload> {
+  const _SessionTerminatedPayloadReader();
+
+  @override
+  SessionTerminatedPayload createObject(fb.BufferContext bc, int offset) => 
+    SessionTerminatedPayload._(bc, offset);
+}
+
+class SessionTerminatedPayloadBuilder {
+  SessionTerminatedPayloadBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SessionTerminatedPayloadObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+
+  SessionTerminatedPayloadObjectBuilder({
+    String? sessionId,
+  })
+      : _sessionId = sessionId;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ServerMessage {
   ServerMessage._(this._bc, this._bcOffset);
   factory ServerMessage(List<int> bytes) {
@@ -7616,6 +7819,8 @@ class ServerMessage {
       case 8: return SessionJudgePolicyUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 9: return RailPinsUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       case 10: return SessionCustomLabelUpdatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 11: return SessionStartedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
+      case 12: return SessionTerminatedPayload.reader.vTableGetNullable(_bc, _bcOffset, 6);
       default: return null;
     }
   }

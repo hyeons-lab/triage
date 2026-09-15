@@ -659,6 +659,32 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     });
   }
 
+  void emitSessionStarted(
+    String sessionId, {
+    String? repositoryRoot,
+    String? worktreeRoot,
+    String? branch,
+    String? cwd,
+    int? lastActivityMs,
+  }) {
+    _testEventController.add({
+      'type': 'session_started',
+      'session_id': sessionId,
+      if (repositoryRoot != null) 'repository_root': repositoryRoot,
+      if (worktreeRoot != null) 'worktree_root': worktreeRoot,
+      if (branch != null) 'branch': branch,
+      if (cwd != null) 'current_working_directory': cwd,
+      if (lastActivityMs != null) 'last_activity_ms': lastActivityMs,
+    });
+  }
+
+  void emitSessionTerminated(String sessionId) {
+    _testEventController.add({
+      'type': 'session_terminated',
+      'session_id': sessionId,
+    });
+  }
+
   void emitOutput(String sessionId, String text, {int outputSeq = 1}) {
     _testEventController.add({
       'type': 'event',
@@ -1722,6 +1748,42 @@ void main() {
     // Verify session was removed and selected index was updated
     expect(find.text('triage / flutter-spike'), findsNothing);
   });
+
+  testWidgets(
+    'dynamically adds new session to rail on session_started event',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(find.text('feat/remote-sync'), findsNothing);
+
+      client.emitSessionStarted(
+        'remote-sync-test',
+        repositoryRoot: '/repo/triage',
+        branch: 'feat/remote-sync',
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('feat/remote-sync'), findsWidgets);
+    },
+  );
+
+  testWidgets(
+    'dynamically removes session from rail on session_terminated event',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / websocket-session-api'), findsWidgets);
+
+      client.emitSessionTerminated('websocket-session-api');
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / websocket-session-api'), findsNothing);
+    },
+  );
 
   testWidgets('uses a persisted per-install client id for authentication', (
     WidgetTester tester,

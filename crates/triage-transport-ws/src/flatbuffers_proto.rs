@@ -1754,6 +1754,50 @@ pub fn build_server_message<'a>(
                 payload.as_union_value(),
             )
         }
+        ServerMessage::SessionStarted {
+            session_id,
+            current_working_directory,
+            repository_root,
+            worktree_root,
+            branch,
+            last_activity_ms,
+        } => {
+            let sid = builder.create_string(session_id.as_str());
+            let cwd = current_working_directory
+                .as_ref()
+                .map(|s| builder.create_string(s));
+            let repo = repository_root.as_ref().map(|s| builder.create_string(s));
+            let worktree = worktree_root.as_ref().map(|s| builder.create_string(s));
+            let branch = branch.as_ref().map(|s| builder.create_string(s));
+            let payload = fb::SessionStartedPayload::create(
+                builder,
+                &fb::SessionStartedPayloadArgs {
+                    session_id: Some(sid),
+                    current_working_directory: cwd,
+                    repository_root: repo,
+                    worktree_root: worktree,
+                    branch,
+                    last_activity_ms: *last_activity_ms,
+                },
+            );
+            (
+                fb::ServerMessagePayload::SessionStartedPayload,
+                payload.as_union_value(),
+            )
+        }
+        ServerMessage::SessionTerminated { session_id } => {
+            let sid = builder.create_string(session_id.as_str());
+            let payload = fb::SessionTerminatedPayload::create(
+                builder,
+                &fb::SessionTerminatedPayloadArgs {
+                    session_id: Some(sid),
+                },
+            );
+            (
+                fb::ServerMessagePayload::SessionTerminatedPayload,
+                payload.as_union_value(),
+            )
+        }
     };
 
     fb::ServerMessage::create(
@@ -1892,6 +1936,17 @@ pub enum ServerMessageBorrowed<'a> {
     SessionCustomLabelUpdated {
         session_id: &'a str,
         custom_label: Option<&'a str>,
+    },
+    SessionStarted {
+        session_id: &'a str,
+        current_working_directory: Option<&'a str>,
+        repository_root: Option<&'a str>,
+        worktree_root: Option<&'a str>,
+        branch: Option<&'a str>,
+        last_activity_ms: u64,
+    },
+    SessionTerminated {
+        session_id: &'a str,
     },
 }
 
@@ -2236,6 +2291,36 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 session_id,
                 custom_label,
             })
+        }
+        fb::ServerMessagePayload::SessionStartedPayload => {
+            let payload = root.payload_as_session_started_payload().ok_or_else(|| {
+                crate::ProtocolError::new("invalid_flatbuffer", "missing session started payload")
+            })?;
+            let session_id = payload.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            Ok(ServerMessageBorrowed::SessionStarted {
+                session_id,
+                current_working_directory: payload.current_working_directory(),
+                repository_root: payload.repository_root(),
+                worktree_root: payload.worktree_root(),
+                branch: payload.branch(),
+                last_activity_ms: payload.last_activity_ms(),
+            })
+        }
+        fb::ServerMessagePayload::SessionTerminatedPayload => {
+            let payload = root
+                .payload_as_session_terminated_payload()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "missing session terminated payload",
+                    )
+                })?;
+            let session_id = payload.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            Ok(ServerMessageBorrowed::SessionTerminated { session_id })
         }
         _ => Err(crate::ProtocolError::new(
             "invalid_flatbuffer",

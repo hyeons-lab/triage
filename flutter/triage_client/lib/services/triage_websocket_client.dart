@@ -289,6 +289,12 @@ class TriageWebSocketClient {
       } else if (type == 'session_custom_label_updated') {
         // Connection-wide push: a session's custom label changed.
         _eventController.add(message);
+      } else if (type == 'session_started') {
+        // Connection-wide push: a new session was started on the daemon.
+        _eventController.add(message);
+      } else if (type == 'session_terminated') {
+        // Connection-wide push: a session was shut down or deleted.
+        _eventController.add(message);
       }
       // No branch for `update_available`: this client has never forwarded that
       // push, on JSON any more than on FlatBuffers, and nothing subscribes to
@@ -1070,6 +1076,25 @@ class TriageWebSocketClient {
         'type': 'session_custom_label_updated',
         'session_id': updated.sessionId,
         'custom_label': updated.hasLabel ? updated.label : null,
+      };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.SessionStartedPayload) {
+      final started = payload as fbs.SessionStartedPayload;
+      return {
+        'type': 'session_started',
+        'session_id': started.sessionId,
+        'current_working_directory': started.currentWorkingDirectory,
+        'repository_root': started.repositoryRoot,
+        'worktree_root': started.worktreeRoot,
+        'branch': started.branch,
+        'last_activity_ms': started.lastActivityMs,
+      };
+    } else if (payloadType ==
+        fbs.ServerMessagePayloadTypeId.SessionTerminatedPayload) {
+      final terminated = payload as fbs.SessionTerminatedPayload;
+      return {
+        'type': 'session_terminated',
+        'session_id': terminated.sessionId,
       };
     }
     // Reached for `NONE`, or for a union member the bindings know but the

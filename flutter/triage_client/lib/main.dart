@@ -3571,6 +3571,105 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
 
+    if (type == 'session_started') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null || sessionId.trim().isEmpty) return;
+      final existingIndex =
+          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (existingIndex != -1) return;
+
+      final session = _loadingDaemonSession(sessionId, loading: false);
+      session.applyContext(
+        repoRoot: message['repository_root']?.toString(),
+        worktreeRoot: message['worktree_root']?.toString(),
+        branch: message['branch']?.toString(),
+        cwd: message['current_working_directory']?.toString(),
+        updateCwd: message['current_working_directory'] != null,
+      );
+      final lastActivity = message['last_activity_ms'];
+      if (lastActivity is int) {
+        session.lastActivityMs = lastActivity;
+      } else if (lastActivity is num) {
+        session.lastActivityMs = lastActivity.toInt();
+      }
+      _setupSessionInputListener(session);
+
+      void apply() {
+        _sessions.add(session);
+        _regroupRail();
+      }
+
+      if (mounted) {
+        setState(apply);
+      } else {
+        apply();
+      }
+      return;
+    }
+
+    if (type == 'session_terminated') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null || sessionId.trim().isEmpty) return;
+      final index =
+          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (index == -1) return;
+
+      final session = _sessions[index];
+      session.dispose();
+      TerminalPane.destroySession(session.title);
+
+      final wasSelected = index == _selectedIndex;
+
+      void apply() {
+        _sessions.removeAt(index);
+        if (_selectedIndex >= _sessions.length) {
+          _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+        }
+        _regroupRail();
+      }
+
+      if (mounted) {
+        setState(apply);
+      } else {
+        apply();
+      }
+
+      if (_pins.sessionIds.contains(sessionId)) {
+        _applyPins(unpin(_pins, sessionId: sessionId));
+      }
+      if (_customLabels.containsKey(sessionId) ||
+          _customLabels.containsKey('triage / $sessionId')) {
+        _customLabels.remove(sessionId);
+        _customLabels.remove('triage / $sessionId');
+        unawaited(_persistCustomLabels());
+      }
+
+      if (wasSelected &&
+          _sessions.isNotEmpty &&
+          _selectedIndex >= 0 &&
+          _selectedIndex < _sessions.length) {
+        final nextSelected = _sessions[_selectedIndex];
+        if (!nextSelected.loaded) {
+          final sid = _sessionIdFor(nextSelected);
+          if (sid != null) {
+            unawaited(
+              _loadDaemonSessionInto(
+                sid,
+                includeHistory: true,
+                failedSessionIds: <String>[],
+              ).catchError((Object e) {
+                if (e is! TriageAuthException || _disposed || _needsPairing) return;
+                unawaited(
+                  _showPairingChallenge(_connectGeneration, _activeServerId),
+                );
+              }),
+            );
+          }
+        }
+      }
+      return;
+    }
+
     if (type == 'event') {
       final envelope = message['envelope'] as Map<String, dynamic>?;
       final event = envelope?['event'] as Map<String, dynamic>?;

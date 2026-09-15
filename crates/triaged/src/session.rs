@@ -2891,11 +2891,14 @@ impl SessionApi for SessionManager {
             Some(self.global_senders()),
             self.compression_tx(),
         )?;
+        let actor_tx = actor.tx.clone();
+        let last_activity_ms = actor.last_activity_ms();
+        let initial_cwd = last_known_cwd.clone();
 
         let mut sessions = self.sessions()?;
 
         // Authoritative handover gate. The check at the top of this function ran
-        // before `spawn_managed` forked the PTY — tens of milliseconds ago — so a
+        // before `spawn_managed` forked the PTY (tens of milliseconds ago), so a
         // handover that began in the meantime would have snapshotted the session
         // set without this session, and `detach_all_live_sessions` would then drop
         // it on the floor when the outgoing daemon exits. Re-checking here closes
@@ -2907,7 +2910,7 @@ impl SessionApi for SessionManager {
         // the wrong reason to trust this gate.)
         //
         // The forked child is killed by dropping `actor` on this path, which is
-        // correct — it never became a session anyone can reach.
+        // correct: it never became a session anyone can reach.
         if self.handover_in_flight() {
             drop(sessions);
             bail!("a handover is in progress; try again once the daemon swap completes");
@@ -2935,6 +2938,30 @@ impl SessionApi for SessionManager {
             }
             return Err(error);
         }
+        drop(sessions);
+
+        let context = request_session_context(&actor_tx).ok().flatten();
+        let (repository_root, worktree_root, branch) = match &context {
+            Some(ctx) => (
+                ctx.repository_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                ctx.worktree_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                ctx.branch_name().map(str::to_string),
+            ),
+            None => (None, None, None),
+        };
+        let current_working_directory = initial_cwd.map(|p| p.to_string_lossy().into_owned());
+        self.broadcast_global(ServerMessage::SessionStarted {
+            session_id: session_id.clone(),
+            current_working_directory,
+            repository_root,
+            worktree_root,
+            branch,
+            last_activity_ms,
+        });
         Ok(session_id)
     }
 
@@ -3467,6 +3494,9 @@ impl SessionApi for SessionManager {
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
         remove_session_log(&session_id, &log_path);
+        self.broadcast_global(ServerMessage::SessionTerminated {
+            session_id: session_id.clone(),
+        });
         Ok(completed)
     }
 
@@ -13849,5 +13879,51 @@ mod tests {
         assert!(!SessionManager::logs_belong_to_same_session(
             path1, path2, &other_sid
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_lifecycle_broadcasts_started_and_terminated() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config);
+        let rx = manager.register_global_receiver();
+
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+
+        let mut started = false;
+        let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < start_deadline {
+            if let Ok(ServerMessage::SessionStarted {
+                session_id: sid, ..
+            }) = rx.recv_timeout(std::time::Duration::from_millis(100))
+            {
+                assert_eq!(sid, session_id);
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "expected SessionStarted message");
+
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown session");
+
+        let mut terminated = false;
+        let term_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < term_deadline {
+            if let Ok(ServerMessage::SessionTerminated { session_id: sid }) =
+                rx.recv_timeout(std::time::Duration::from_millis(100))
+            {
+                assert_eq!(sid, session_id);
+                terminated = true;
+                break;
+            }
+        }
+        assert!(terminated, "expected SessionTerminated message");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 }

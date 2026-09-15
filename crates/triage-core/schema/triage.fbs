@@ -566,6 +566,25 @@ table SessionCustomLabelUpdatedPayload {
     has_label: bool;
 }
 
+// Connection-wide push (not tied to a session subscription): a new session was
+// started on the daemon. Broadcast to every connected client so the session
+// list / siderail updates in real-time.
+table SessionStartedPayload {
+    session_id: string;
+    current_working_directory: string;
+    repository_root: string;
+    worktree_root: string;
+    branch: string;
+    last_activity_ms: ulong;
+}
+
+// Connection-wide push (not tied to a session subscription): a session was shut
+// down or deleted on the daemon. Broadcast to every connected client so the
+// session list / siderail updates in real-time.
+table SessionTerminatedPayload {
+    session_id: string;
+}
+
 union ServerMessagePayload {
     ResponsePayload,
     ErrorPayload,
@@ -576,7 +595,9 @@ union ServerMessagePayload {
     UpdateAvailablePayload,
     SessionJudgePolicyUpdatedPayload,
     RailPinsUpdatedPayload,
-    SessionCustomLabelUpdatedPayload
+    SessionCustomLabelUpdatedPayload,
+    SessionStartedPayload,
+    SessionTerminatedPayload
 }
 
 table ServerMessage {
@@ -584,3 +605,4 @@ table ServerMessage {
 }
 
 root_type ServerMessage;
+
