@@ -18,6 +18,13 @@ analyzer:
     # is machine-written, and its `ignore_for_file` header is reset on every
     # regeneration, so excluding it here is the only durable fix.
     - lib/generated/**
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the

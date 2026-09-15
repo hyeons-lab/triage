@@ -3939,7 +3939,9 @@ name = "triage-core"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "flatbuffers",
+ "flate2",
  "libc",
  "serde",
  "serde_json",

@@ -523,8 +523,10 @@ where
         }
     };
 
-    // Subprotocol negotiation per RFC 6455
-    let mut selected_format = triage_transport_ws::ProtocolFormat::Json;
+    // Subprotocol negotiation per RFC 6455.
+    // Default to FlatBuffers for performance. The client can negotiate JSON
+    // by explicitly requesting triage-json without triage-flatbuffers.
+    let mut selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
     let mut selected_proto_header = None;
 
     if let Some(protocol_header) = req
@@ -532,17 +534,15 @@ where
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
     {
-        for token in protocol_header.split(',') {
-            let trimmed = token.trim();
-            if trimmed == "triage-flatbuffers" {
-                selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
-                selected_proto_header = Some(HeaderValue::from_static("triage-flatbuffers"));
-                break;
-            } else if trimmed == "triage-json" {
-                selected_format = triage_transport_ws::ProtocolFormat::Json;
-                selected_proto_header = Some(HeaderValue::from_static("triage-json"));
-                break;
-            }
+        let tokens: Vec<&str> = protocol_header.split(',').map(|s| s.trim()).collect();
+        if tokens.contains(&"triage-flatbuffers") {
+            selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
+            selected_proto_header = Some(HeaderValue::from_static("triage-flatbuffers"));
+        } else if tokens.contains(&"triage-json") {
+            selected_format = triage_transport_ws::ProtocolFormat::Json;
+            selected_proto_header = Some(HeaderValue::from_static("triage-json"));
+        } else {
+            selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
         }
     }
 

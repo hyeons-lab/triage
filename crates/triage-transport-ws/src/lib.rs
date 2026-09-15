@@ -133,7 +133,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
             global_rx: None,
-            format: ProtocolFormat::Json,
+            format: ProtocolFormat::Flatbuffers,
         }
     }
 }
@@ -147,7 +147,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
             global_rx: None,
-            format: ProtocolFormat::Json,
+            format: ProtocolFormat::Flatbuffers,
         }
     }
 

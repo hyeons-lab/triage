@@ -115,11 +115,11 @@ pub struct SessionSnapshot {
     pub context: Option<SessionContext>,
     pub bracketed_paste_enabled: bool,
     pub exited: bool,
-    /// Raw (untranslated) PTY output tail for client-side re-emulation — the
+    /// Raw (untranslated) PTY output tail for client-side re-emulation (the
     /// single source of truth for history, byte-identical to the live Output
-    /// stream. Empty when history is not carried (e.g. resize broadcasts) or
+    /// stream). Empty when history is not carried (e.g. resize broadcasts) or
     /// from old hosts.
-    #[serde(default)]
+    #[serde(default, with = "compressed_bytes")]
     pub raw_output: Vec<u8>,
     /// Byte offset of the first byte of [`Self::raw_output`] within the
     /// session's full output log (`bytes_logged` is the end offset).
@@ -133,6 +133,80 @@ pub struct SessionSnapshot {
     /// popover and future search. `None` until the detail pass produces it.
     #[serde(default)]
     pub snippet_detail: Option<String>,
+}
+
+mod compressed_bytes {
+    use base64::Engine;
+    use flate2::Compression;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use serde::{Deserializer, Serializer, de};
+    use std::io::{Read, Write};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.is_empty() {
+            return serializer.serialize_str("");
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(bytes)
+            .map_err(serde::ser::Error::custom)?;
+        let compressed = encoder.finish().map_err(serde::ser::Error::custom)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisitor;
+
+        impl<'de> de::Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a base64 gzipped string or an array of byte values")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(de::Error::custom)?;
+
+                let mut decoder = GzDecoder::new(&decoded[..]);
+                let mut decompressed = Vec::new();
+                if decoder.read_to_end(&mut decompressed).is_ok() {
+                    Ok(decompressed)
+                } else {
+                    Ok(decoded)
+                }
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element()? {
+                    bytes.push(b);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(BytesVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -960,5 +1034,126 @@ mod tests {
 
         // No git context at all: no label.
         assert_eq!(ctx(None, None, None).localization_label(), None);
+    }
+
+    #[test]
+    fn session_snapshot_json_compresses_raw_output() {
+        let original_bytes =
+            b"Hello world! Terminal scrollback line 1\nTerminal scrollback line 2\n".to_vec();
+        let snapshot = SessionSnapshot {
+            output_seq: 10,
+            bytes_logged: 100,
+            size: SessionSize::default(),
+            visible_rows: vec!["row1".to_string()],
+            styled_rows_start: 0,
+            styled_rows: Vec::new(),
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            context: None,
+            bracketed_paste_enabled: false,
+            exited: false,
+            raw_output: original_bytes.clone(),
+            raw_output_start: 0,
+            snippet: None,
+            snippet_detail: None,
+        };
+
+        let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let json_val: serde_json::Value = serde_json::from_str(&json_str).expect("parse json");
+
+        // Verify it was serialized as a base64 string, not an array of numbers
+        assert!(json_val["raw_output"].is_string());
+        let encoded_str = json_val["raw_output"].as_str().unwrap();
+        assert!(!encoded_str.is_empty());
+
+        let round_trip: SessionSnapshot =
+            serde_json::from_str(&json_str).expect("deserialize snapshot");
+        assert_eq!(round_trip.raw_output, original_bytes);
+    }
+
+    #[test]
+    fn session_snapshot_json_handles_empty_raw_output() {
+        let snapshot = SessionSnapshot {
+            output_seq: 0,
+            bytes_logged: 0,
+            size: SessionSize::default(),
+            visible_rows: Vec::new(),
+            styled_rows_start: 0,
+            styled_rows: Vec::new(),
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            context: None,
+            bracketed_paste_enabled: false,
+            exited: false,
+            raw_output: Vec::new(),
+            raw_output_start: 0,
+            snippet: None,
+            snippet_detail: None,
+        };
+
+        let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let json_val: serde_json::Value = serde_json::from_str(&json_str).expect("parse json");
+        assert_eq!(json_val["raw_output"], "");
+
+        let round_trip: SessionSnapshot =
+            serde_json::from_str(&json_str).expect("deserialize snapshot");
+        assert!(round_trip.raw_output.is_empty());
+    }
+
+    #[test]
+    fn session_snapshot_json_deserializes_legacy_array() {
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        let legacy_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": [65, 66, 67, 68],
+            "raw_output_start": 0
+        });
+
+        let deserialized: SessionSnapshot =
+            serde_json::from_value(legacy_json).expect("deserialize legacy snapshot");
+        assert_eq!(deserialized.raw_output, b"ABCD");
+    }
+
+    #[test]
+    fn session_snapshot_json_deserializes_uncompressed_base64() {
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        // "QUJDRA==" is standard base64 for b"ABCD" without gzip compression
+        let base64_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": "QUJDRA==",
+            "raw_output_start": 0
+        });
+
+        let deserialized: SessionSnapshot =
+            serde_json::from_value(base64_json).expect("deserialize uncompressed base64 snapshot");
+        assert_eq!(deserialized.raw_output, b"ABCD");
     }
 }
