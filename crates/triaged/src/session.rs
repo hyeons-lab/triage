@@ -2882,7 +2882,7 @@ impl SessionApi for SessionManager {
             session_id: Some(session_id.clone()),
         };
         let launch = PersistedSessionLaunch::from(&config);
-        let last_known_cwd = launch.cwd.clone();
+        let last_known_cwd = launch.cwd.clone().or_else(|| std::env::current_dir().ok());
         let actor = SessionActor::spawn_managed(
             config,
             session_id.clone(),
@@ -2988,7 +2988,7 @@ impl SessionApi for SessionManager {
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
-                let snapshot = request_snapshot(&cmd_tx)?;
+                let snapshot = request_snapshot_with_history(&cmd_tx)?;
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
                     lease,
@@ -3313,9 +3313,7 @@ impl SessionApi for SessionManager {
             .with_context(|| format!("session {session_id} not found"))?;
         let resolved = match session {
             ManagedSession::Live { actor, .. } => Resolved::Live(actor.tx.clone()),
-            ManagedSession::Historical { session, .. } => {
-                Resolved::Ready(session.snapshot_with_history())
-            }
+            ManagedSession::Historical { session, .. } => Resolved::Ready(session.snapshot()),
             ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
         };
         // Release before the round-trip: see `request_snapshot`.
@@ -5280,6 +5278,9 @@ enum ActorCommand {
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
+    SnapshotWithHistory {
+        response: Sender<ActorResult<SessionSnapshot>>,
+    },
     /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
     /// no raw-output-history disk read, so it never blocks on I/O. Returns a
     /// `(rows, output_seq, context)` tuple: the plain visible rows, the current
@@ -5694,6 +5695,10 @@ impl ActorState {
                 false
             }
             ActorCommand::Snapshot { response } => {
+                let _ = response.send(Ok(self.snapshot()));
+                false
+            }
+            ActorCommand::SnapshotWithHistory { response } => {
                 let _ = response.send(Ok(self.snapshot_with_history()));
                 false
             }
@@ -6902,10 +6907,10 @@ const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Maximum bytes of raw output history carried in a snapshot for client-side
-/// re-emulation. 4 MiB matches a 50,000-line terminal scrollback buffer while
+/// re-emulation. 1 MiB matches ~15,000 to 25,000 lines of scrollback while
 /// remaining safely within WebSocket frame and memory limits during snapshot
 /// serialization.
-const RAW_OUTPUT_TAIL_CAP: u64 = 4 * 1024 * 1024;
+const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
 
 /// Maximum bytes of a session log replayed through the terminal emulator when a
 /// session is adopted, restored, or reflowed after a resize.
@@ -6918,11 +6923,11 @@ const RAW_OUTPUT_TAIL_CAP: u64 = 4 * 1024 * 1024;
 /// This is therefore `>= MAX_SESSION_LOG_BYTES`, so replay never discards bytes
 /// the log still holds: whatever survives on disk is replayed in full, exactly
 /// like the full-file read this replaces. What the cap buys is a ceiling on a
-/// legacy log written before trimming existed — 16 MiB of work instead of 100 MB.
+/// legacy log written before trimming existed: 16 MiB of work instead of 100 MB.
 ///
 /// Note what this does *not* promise. Trimming drops the front of the log, so a
 /// session that outgrows [`MAX_SESSION_LOG_BYTES`] does lose the early bytes
-/// where those modes were set — the loss moves from replay time to trim time,
+/// where those modes were set: the loss moves from replay time to trim time,
 /// it does not disappear. That is the accepted cost of bounding the log at all;
 /// shells and full-screen TUIs re-assert their modes on the next repaint, and
 /// `last_known_cwd` outranks the replayed OSC 7 cwd precisely because the replay
@@ -7349,6 +7354,13 @@ fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     recv_actor_result(resp_rx, "reading session snapshot")
 }
 
+fn request_snapshot_with_history(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::SnapshotWithHistory { response: resp_tx })
+        .context("sending session snapshot with history command")?;
+    recv_actor_result(resp_rx, "reading session snapshot with history")
+}
+
 fn request_actor_shutdown(tx: &Sender<ActorCommand>) -> Result<CompletedSession> {
     let (response_tx, response_rx) = mpsc::channel();
     tx.send(ActorCommand::Shutdown {
@@ -7369,6 +7381,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SnapshotWithHistory { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::SummaryRows { response } => {
@@ -13897,15 +13912,34 @@ mod tests {
         let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while std::time::Instant::now() < start_deadline {
             if let Ok(ServerMessage::SessionStarted {
-                session_id: sid, ..
+                session_id: sid,
+                current_working_directory: cwd,
+                ..
             }) = rx.recv_timeout(std::time::Duration::from_millis(100))
             {
                 assert_eq!(sid, session_id);
+                assert!(cwd.is_some(), "expected default cwd to be set");
                 started = true;
                 break;
             }
         }
         assert!(started, "expected SessionStarted message");
+
+        let snap = manager
+            .snapshot_session(session_id.clone())
+            .expect("snapshot session");
+        assert!(
+            snap.raw_output.is_empty(),
+            "snapshot_session should omit raw_output history"
+        );
+
+        let _attached = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("test-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+            })
+            .expect("attach session");
 
         manager
             .shutdown_session(session_id.clone())

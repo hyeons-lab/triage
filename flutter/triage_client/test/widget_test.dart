@@ -165,12 +165,14 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     return 'paired-token';
   }
 
+  List<String>? initialSessions;
+
   @override
   Future<List<String>> listSessions() async {
     if (listSessionsUnauthorized) {
       throw TriageAuthException('unauthorized');
     }
-    return ['flutter-spike', 'websocket-session-api', 'main'];
+    return initialSessions ?? ['flutter-spike', 'websocket-session-api', 'main'];
   }
 
   /// Per-session rail metadata, as `list_session_contexts` reports it.
@@ -682,6 +684,13 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     _testEventController.add({
       'type': 'session_terminated',
       'session_id': sessionId,
+    });
+  }
+
+  void emitErrorMessage(String message) {
+    _testEventController.add({
+      'type': 'error',
+      'error': {'message': message},
     });
   }
 
@@ -1782,6 +1791,82 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('triage / websocket-session-api'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'dynamically auto-loads session when session_started arrives on empty session list',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      client.initialSessions = <String>[];
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(client.attachSessionCalls, isEmpty);
+
+      client.emitSessionStarted(
+        'first-session',
+        repositoryRoot: '/repo/triage',
+        branch: 'feat/new-branch',
+      );
+      await tester.pumpAndSettle();
+
+      expect(client.attachSessionCalls, contains('first-session'));
+      expect(find.text('experiment/flutter-spike'), findsWidgets);
+    },
+  );
+
+  testWidgets(
+    'session_terminated adjusts selected index when prior session is terminated',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('triage / websocket-session-api'));
+      await tester.pumpAndSettle();
+
+      client.emitSessionTerminated('flutter-spike');
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / flutter-spike'), findsNothing);
+      expect(find.text('triage / websocket-session-api'), findsWidgets);
+    },
+  );
+
+  testWidgets(
+    'input lease error does not crash when session list is empty',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      client.initialSessions = <String>[];
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      client.emitErrorMessage('missing input lease for write');
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'rapid-fire session started and terminated events maintain valid selection without crashing',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      client.emitSessionStarted('quick-1', branch: 'feat/q1');
+      client.emitSessionStarted('quick-2', branch: 'feat/q2');
+      client.emitSessionTerminated('flutter-spike');
+      client.emitSessionTerminated('quick-1');
+      client.emitSessionStarted('quick-3', branch: 'feat/q3');
+      client.emitSessionTerminated('websocket-session-api');
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('feat/q2'), findsWidgets);
+      expect(find.text('feat/q3'), findsWidgets);
     },
   );
 
