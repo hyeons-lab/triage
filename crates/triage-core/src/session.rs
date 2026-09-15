@@ -192,7 +192,9 @@ mod compressed_bytes {
 
                 if decoded.starts_with(&GZIP_MAGIC) {
                     let decoder = GzDecoder::new(&decoded[..]);
-                    let mut decompressed = Vec::new();
+                    let estimated_capacity =
+                        (decoded.len() * 4).clamp(1024, MAX_DECOMPRESSED_BYTES as usize);
+                    let mut decompressed = Vec::with_capacity(estimated_capacity);
                     let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
                     limited
                         .read_to_end(&mut decompressed)
@@ -207,6 +209,20 @@ mod compressed_bytes {
                     // Genuine uncompressed base64 payload
                     Ok(decoded)
                 }
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v)
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -1237,5 +1253,32 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("exceeds maximum size limit"));
+    }
+
+    #[test]
+    fn session_snapshot_json_deserializes_raw_byte_buf() {
+        struct RawBytesDeserializer<'a>(&'a [u8]);
+
+        impl<'de, 'a> serde::Deserializer<'de> for RawBytesDeserializer<'a> {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+            where
+                V: serde::de::Visitor<'de>,
+            {
+                visitor.visit_bytes(self.0)
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map struct enum identifier ignored_any
+            }
+        }
+
+        let raw = b"native binary bytes";
+        let deserialized = compressed_bytes::deserialize(RawBytesDeserializer(raw))
+            .expect("deserialize raw bytes");
+        assert_eq!(deserialized, raw);
     }
 }

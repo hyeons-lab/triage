@@ -48,12 +48,14 @@ unit tests for negotiation defaults and snapshot decompression in `test/triage_w
 - Added 16 MiB size guard and wrapped list element casting in `try / catch` in Flutter's `rawOutputFromSnapshot` to prevent unhandled `TypeError` crashes on malformed snapshot arrays.
 - Removed fallthrough from FlatBuffers to JSON text frames in Flutter `_send` to ensure binary sockets never send invalid text frames to the daemon.
 - Replaced heap allocations in `triaged/src/http.rs` subprotocol negotiation with single-pass token matching.
-- Added comprehensive unit tests in Rust and Dart for corrupted gzip stream rejection, oversized zip bomb defense, and malformed list error handling.
+- Supported native raw byte buffers (`visit_bytes`, `visit_byte_buf`) and pre-allocated decompression capacity in `crates/triage-core/src/session.rs`.
+- Added comprehensive unit tests in Rust and Dart for corrupted gzip stream rejection, oversized zip bomb defense, native byte buffer deserialization, and malformed list error handling.
 
 ## Commits
 
-- acb3bc3: feat(transport): default to flatbuffers and compress json snapshots
-- HEAD: fix(transport): harden snapshot decompression and subprotocol handling
+- f5ed488: feat(transport): default to flatbuffers and compress json snapshots
+- 4595517: fix(transport): harden snapshot decompression and subprotocol handling
+- HEAD: fix(core): add raw byte buffer support to snapshot deserializer
 
 ## Progress
 
