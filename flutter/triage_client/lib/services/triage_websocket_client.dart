@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:triage_client/generated/triage_triage.generated_generated.dart'
@@ -11,8 +12,8 @@ typedef WebSocketChannelFactory = WebSocketChannel Function(Uri uri);
 /// Thrown when the daemon refuses a request because this client is not paired:
 /// the bearer token was revoked or expired, or it belongs to a different client
 /// id (a reinstall wipes the keystore-backed client id, so the stored token no
-/// longer matches the id we send). Retrying is futile — the same token fails
-/// identically forever — so callers must re-pair rather than reconnect.
+/// longer matches the id we send). Retrying is futile (the same token fails
+/// identically forever), so callers must re-pair rather than reconnect.
 ///
 /// A distinct type rather than a message substring, so that routing to the
 /// pairing screen does not depend on how the daemon words the error.
@@ -35,16 +36,14 @@ bool _isUnauthorized(String value) =>
     value.trim().toLowerCase() == _unauthorizedCode;
 
 /// WebSocket subprotocols offered at connect, in descending preference.
-///
 /// Order is the whole mechanism: the daemon walks the client's offered tokens
 /// and takes the first it recognizes, so listing FlatBuffers first is what makes
-/// it the default. JSON stays as the second offer rather than being dropped —
-/// a daemon that predates the binary format, or one that ignores the header
-/// entirely, then still negotiates something this client can speak.
+/// it the default. JSON stays as the second offer rather than being dropped:
+/// a client or daemon wanting JSON can explicitly negotiate it.
 ///
-/// Nothing keys off this list directly. [TriageWebSocketClient.isFlatBuffersNegotiated]
-/// reads the protocol the server actually *selected*, so a peer that declines
-/// the binary format transparently gets the JSON encoder with no version check.
+/// [TriageWebSocketClient.isFlatBuffersNegotiated] defaults to FlatBuffers unless
+/// the server explicitly selected JSON (`triage-json`). This ensures proxies
+/// that strip subprotocol headers continue using the high-performance binary transport.
 const websocketSubprotocols = <String>[flatBuffersSubprotocol, jsonSubprotocol];
 
 /// The subprotocol token that selects the binary encoding.
@@ -104,6 +103,49 @@ typedef RailLayoutRecord = ({
   Map<String, String> customLabels,
 });
 
+/// Extracts and decompresses the raw output-history tail from a parsed snapshot map.
+///
+/// Supports:
+/// - Uint8List: decoded binary FlatBuffers payloads.
+/// - String: field-level compressed base64 gzip string from JSON payloads,
+///   falling back to raw base64 bytes if uncompressed.
+/// - `List<dynamic>`: legacy uncompressed JSON integer byte arrays.
+Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
+  final raw = snapshot['raw_output'];
+  if (raw is Uint8List) return raw;
+  if (raw is String) {
+    if (raw.isEmpty) return Uint8List(0);
+    try {
+      final decoded = base64Decode(raw);
+      final isGzip =
+          decoded.length >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b;
+      if (isGzip) {
+        try {
+          final decompressed = GZipDecoder().decodeBytes(decoded, verify: true);
+          if (decompressed.length > 16 * 1024 * 1024) {
+            return Uint8List(0);
+          }
+          return Uint8List.fromList(decompressed);
+        } catch (_) {
+          // Corrupted or truncated gzip stream; reject rather than feeding garbage bytes to xterm.
+          return Uint8List(0);
+        }
+      }
+      return decoded;
+    } catch (_) {
+      return Uint8List(0);
+    }
+  }
+  if (raw is List) {
+    try {
+      return Uint8List.fromList(raw.cast<int>());
+    } catch (_) {
+      return Uint8List(0);
+    }
+  }
+  return Uint8List(0);
+}
+
 class TriageWebSocketClient {
   TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
     : _channelFactory =
@@ -132,14 +174,17 @@ class TriageWebSocketClient {
 
   bool get isConnected => _channel != null;
 
+  /// Default to FlatBuffers unless the server explicitly negotiated JSON.
+  /// This ensures connections through reverse proxies that strip
+  /// Sec-WebSocket-Protocol headers still default to binary FlatBuffers.
   bool get isFlatBuffersNegotiated =>
-      _channel?.protocol == flatBuffersSubprotocol;
+      isConnected && _channel?.protocol != jsonSubprotocol;
 
   /// How long [connect] waits for the WebSocket handshake before failing.
   ///
   /// `WebSocketChannel.ready` has no deadline of its own, so a half-open socket
-  /// — routine on a phone whose network changed while the app was backgrounded
-  /// — leaves it pending for as long as the OS keeps retransmitting. Callers
+  /// (routine on a phone whose network changed while the app was backgrounded)
+  /// leaves it pending for as long as the OS keeps retransmitting. Callers
   /// treat a connect that is still in flight as "one is already running, don't
   /// start another", so a `ready` that never settles wedges reconnection
   /// entirely. Bounding it guarantees every attempt terminates and can retry.
@@ -355,17 +400,10 @@ class TriageWebSocketClient {
     });
 
     try {
-      var sentFlatBuffers = false;
       if (isFlatBuffersNegotiated) {
-        try {
-          final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
-          _channel!.sink.add(bytes);
-          sentFlatBuffers = true;
-        } on UnimplementedError {
-          // Fall through to JSON text frame for request types without FlatBuffers builders.
-        }
-      }
-      if (!sentFlatBuffers) {
+        final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
+        _channel!.sink.add(bytes);
+      } else {
         final payload = <String, dynamic>{'id': id, 'type': type};
         if (extra != null) {
           payload.addAll(extra);
@@ -854,7 +892,7 @@ class TriageWebSocketClient {
       throw StateError('WebSocket is not connected');
     }
     try {
-      final isFb = channel.protocol == flatBuffersSubprotocol;
+      final isFb = isFlatBuffersNegotiated;
       if (isFb) {
         final bytesPayload = fbs.WriteInputRequestTableObjectBuilder(
           sessionId: sessionId,

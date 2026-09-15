@@ -115,11 +115,11 @@ pub struct SessionSnapshot {
     pub context: Option<SessionContext>,
     pub bracketed_paste_enabled: bool,
     pub exited: bool,
-    /// Raw (untranslated) PTY output tail for client-side re-emulation — the
+    /// Raw (untranslated) PTY output tail for client-side re-emulation (the
     /// single source of truth for history, byte-identical to the live Output
-    /// stream. Empty when history is not carried (e.g. resize broadcasts) or
+    /// stream). Empty when history is not carried (e.g. resize broadcasts) or
     /// from old hosts.
-    #[serde(default)]
+    #[serde(default, with = "compressed_bytes")]
     pub raw_output: Vec<u8>,
     /// Byte offset of the first byte of [`Self::raw_output`] within the
     /// session's full output log (`bytes_logged` is the end offset).
@@ -133,6 +133,112 @@ pub struct SessionSnapshot {
     /// popover and future search. `None` until the detail pass produces it.
     #[serde(default)]
     pub snippet_detail: Option<String>,
+}
+
+mod compressed_bytes {
+    use base64::Engine;
+    use flate2::Compression;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use serde::{Deserializer, Serializer, de};
+    use std::io::{Read, Write};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.is_empty() {
+            return serializer.serialize_str("");
+        }
+
+        // Fast compression provides low latency with minimal ratio difference on terminal text.
+        let estimated_capacity = (bytes.len() / 2).clamp(1024, 256 * 1024);
+        let mut encoder =
+            GzEncoder::new(Vec::with_capacity(estimated_capacity), Compression::fast());
+        encoder
+            .write_all(bytes)
+            .map_err(serde::ser::Error::custom)?;
+        let compressed = encoder.finish().map_err(serde::ser::Error::custom)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisitor;
+
+        impl<'de> de::Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a base64 gzipped string or an array of byte values")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(de::Error::custom)?;
+
+                const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+                const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB ceiling
+
+                if decoded.starts_with(&GZIP_MAGIC) {
+                    let decoder = GzDecoder::new(&decoded[..]);
+                    let estimated_capacity =
+                        (decoded.len() * 4).clamp(1024, MAX_DECOMPRESSED_BYTES as usize);
+                    let mut decompressed = Vec::with_capacity(estimated_capacity);
+                    let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
+                    limited
+                        .read_to_end(&mut decompressed)
+                        .map_err(|e| de::Error::custom(format!("corrupted gzip payload: {e}")))?;
+                    if decompressed.len() as u64 > MAX_DECOMPRESSED_BYTES {
+                        return Err(de::Error::custom(
+                            "decompressed raw_output exceeds maximum size limit (16 MiB)",
+                        ));
+                    }
+                    Ok(decompressed)
+                } else {
+                    // Genuine uncompressed base64 payload
+                    Ok(decoded)
+                }
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element()? {
+                    bytes.push(b);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(BytesVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -960,5 +1066,219 @@ mod tests {
 
         // No git context at all: no label.
         assert_eq!(ctx(None, None, None).localization_label(), None);
+    }
+
+    #[test]
+    fn session_snapshot_json_compresses_raw_output() {
+        let original_bytes =
+            b"Hello world! Terminal scrollback line 1\nTerminal scrollback line 2\n".to_vec();
+        let snapshot = SessionSnapshot {
+            output_seq: 10,
+            bytes_logged: 100,
+            size: SessionSize::default(),
+            visible_rows: vec!["row1".to_string()],
+            styled_rows_start: 0,
+            styled_rows: Vec::new(),
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            context: None,
+            bracketed_paste_enabled: false,
+            exited: false,
+            raw_output: original_bytes.clone(),
+            raw_output_start: 0,
+            snippet: None,
+            snippet_detail: None,
+        };
+
+        let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let json_val: serde_json::Value = serde_json::from_str(&json_str).expect("parse json");
+
+        // Verify it was serialized as a base64 string, not an array of numbers
+        assert!(json_val["raw_output"].is_string());
+        let encoded_str = json_val["raw_output"].as_str().unwrap();
+        assert!(!encoded_str.is_empty());
+
+        let round_trip: SessionSnapshot =
+            serde_json::from_str(&json_str).expect("deserialize snapshot");
+        assert_eq!(round_trip.raw_output, original_bytes);
+    }
+
+    #[test]
+    fn session_snapshot_json_handles_empty_raw_output() {
+        let snapshot = SessionSnapshot {
+            output_seq: 0,
+            bytes_logged: 0,
+            size: SessionSize::default(),
+            visible_rows: Vec::new(),
+            styled_rows_start: 0,
+            styled_rows: Vec::new(),
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: None,
+            context: None,
+            bracketed_paste_enabled: false,
+            exited: false,
+            raw_output: Vec::new(),
+            raw_output_start: 0,
+            snippet: None,
+            snippet_detail: None,
+        };
+
+        let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let json_val: serde_json::Value = serde_json::from_str(&json_str).expect("parse json");
+        assert_eq!(json_val["raw_output"], "");
+
+        let round_trip: SessionSnapshot =
+            serde_json::from_str(&json_str).expect("deserialize snapshot");
+        assert!(round_trip.raw_output.is_empty());
+    }
+
+    #[test]
+    fn session_snapshot_json_deserializes_legacy_array() {
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        let legacy_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": [65, 66, 67, 68],
+            "raw_output_start": 0
+        });
+
+        let deserialized: SessionSnapshot =
+            serde_json::from_value(legacy_json).expect("deserialize legacy snapshot");
+        assert_eq!(deserialized.raw_output, b"ABCD");
+    }
+
+    #[test]
+    fn session_snapshot_json_deserializes_uncompressed_base64() {
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        // "QUJDRA==" is standard base64 for b"ABCD" without gzip compression
+        let base64_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": "QUJDRA==",
+            "raw_output_start": 0
+        });
+
+        let deserialized: SessionSnapshot =
+            serde_json::from_value(base64_json).expect("deserialize uncompressed base64 snapshot");
+        assert_eq!(deserialized.raw_output, b"ABCD");
+    }
+
+    #[test]
+    fn session_snapshot_json_rejects_corrupted_gzip() {
+        use base64::Engine;
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        // Starts with gzip magic bytes 0x1f, 0x8b but has corrupt payload
+        let corrupt_bytes = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&corrupt_bytes);
+        let corrupt_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": encoded,
+            "raw_output_start": 0
+        });
+
+        let result: Result<SessionSnapshot, _> = serde_json::from_value(corrupt_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_snapshot_json_rejects_oversized_decompression() {
+        use base64::Engine;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        // 17.4 MiB of zeroes (> 16 MiB limit) compresses to ~17 KiB
+        let chunk = [0u8; 64 * 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        for _ in 0..272 {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+        let bomb_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": encoded,
+            "raw_output_start": 0
+        });
+
+        let result: Result<SessionSnapshot, _> = serde_json::from_value(bomb_json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("exceeds maximum size limit"));
+    }
+
+    #[test]
+    fn session_snapshot_json_deserializes_raw_byte_buf() {
+        struct RawBytesDeserializer<'a>(&'a [u8]);
+
+        impl<'de, 'a> serde::Deserializer<'de> for RawBytesDeserializer<'a> {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+            where
+                V: serde::de::Visitor<'de>,
+            {
+                visitor.visit_bytes(self.0)
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map struct enum identifier ignored_any
+            }
+        }
+
+        let raw = b"native binary bytes";
+        let deserialized = compressed_bytes::deserialize(RawBytesDeserializer(raw))
+            .expect("deserialize raw bytes");
+        assert_eq!(deserialized, raw);
     }
 }

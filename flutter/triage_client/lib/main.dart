@@ -3902,14 +3902,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   /// Extracts the raw output-history tail from a parsed snapshot map. Empty when
   /// the host did not carry history (old host, or a resize broadcast).
-  Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
-    final raw = snapshot['raw_output'];
-    if (raw is Uint8List) return raw;
-    if (raw is List) {
-      return Uint8List.fromList(raw.cast<int>());
-    }
-    return Uint8List(0);
-  }
+  Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) =>
+      rawOutputFromSnapshot(snapshot);
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/generated/triage_triage.generated_generated.dart'
@@ -245,7 +246,7 @@ void main() {
       final client = TriageWebSocketClient(
         Uri.parse('ws://localhost/ws'),
         channelFactory: (_) {
-          channel = FakeWebSocketChannel(sink: sink);
+          channel = FakeWebSocketChannel(sink: sink, protocol: 'triage-json');
           return channel;
         },
       );
@@ -285,7 +286,7 @@ void main() {
       final client = TriageWebSocketClient(
         Uri.parse('ws://localhost/ws'),
         channelFactory: (_) {
-          channel = FakeWebSocketChannel(sink: sink);
+          channel = FakeWebSocketChannel(sink: sink, protocol: 'triage-json');
           return channel;
         },
       );
@@ -1184,4 +1185,120 @@ void main() {
       });
     },
   );
+
+  group('Default FlatBuffers Negotiation', () {
+    test('defaults to FlatBuffers when protocol is omitted or null', () async {
+      final sink = RecordingWebSocketSink();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => FakeWebSocketChannel(sink: sink),
+      );
+      await client.connect();
+
+      expect(client.isConnected, isTrue);
+      expect(client.isFlatBuffersNegotiated, isTrue);
+    });
+
+    test('defaults to FlatBuffers when protocol is empty string', () async {
+      final sink = RecordingWebSocketSink();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => FakeWebSocketChannel(sink: sink, protocol: ''),
+      );
+      await client.connect();
+
+      expect(client.isConnected, isTrue);
+      expect(client.isFlatBuffersNegotiated, isTrue);
+    });
+
+    test('uses FlatBuffers when triage-flatbuffers is selected', () async {
+      final sink = RecordingWebSocketSink();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) =>
+            FakeWebSocketChannel(sink: sink, protocol: 'triage-flatbuffers'),
+      );
+      await client.connect();
+
+      expect(client.isConnected, isTrue);
+      expect(client.isFlatBuffersNegotiated, isTrue);
+    });
+
+    test('uses JSON only when triage-json is explicitly negotiated', () async {
+      final sink = RecordingWebSocketSink();
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) =>
+            FakeWebSocketChannel(sink: sink, protocol: 'triage-json'),
+      );
+      await client.connect();
+
+      expect(client.isConnected, isTrue);
+      expect(client.isFlatBuffersNegotiated, isFalse);
+    });
+  });
+
+  group('rawOutputFromSnapshot decompression', () {
+    test('decompresses gzip base64 encoded raw_output', () {
+      final original = utf8.encode('Terminal history scrollback\nLine 2\n');
+      final gzipped = GZipEncoder().encode(original);
+      final encoded = base64Encode(gzipped);
+
+      final snapshot = <String, dynamic>{'raw_output': encoded};
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, equals(Uint8List.fromList(original)));
+    });
+
+    test('decodes uncompressed base64 raw_output fallback', () {
+      final original = utf8.encode('Uncompressed text');
+      final encoded = base64Encode(original);
+
+      final snapshot = <String, dynamic>{'raw_output': encoded};
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, equals(Uint8List.fromList(original)));
+    });
+
+    test('accepts legacy integer list raw_output', () {
+      final original = [65, 66, 67, 68];
+      final snapshot = <String, dynamic>{'raw_output': original};
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, equals(Uint8List.fromList(original)));
+    });
+
+    test('passes through existing Uint8List directly', () {
+      final original = Uint8List.fromList([1, 2, 3, 4]);
+      final snapshot = <String, dynamic>{'raw_output': original};
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(identical(result, original), isTrue);
+    });
+
+    test('returns empty Uint8List on empty string or missing field', () {
+      expect(rawOutputFromSnapshot({'raw_output': ''}), isEmpty);
+      expect(rawOutputFromSnapshot({}), isEmpty);
+      expect(rawOutputFromSnapshot({'raw_output': null}), isEmpty);
+    });
+
+    test('rejects corrupted gzip stream and returns empty Uint8List', () {
+      final corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
+      final encoded = base64Encode(corrupt);
+
+      final snapshot = <String, dynamic>{'raw_output': encoded};
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, isEmpty);
+    });
+
+    test('handles malformed list gracefully without throwing TypeError', () {
+      final snapshot = <String, dynamic>{
+        'raw_output': [65, null, 'invalid', 68],
+      };
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, isEmpty);
+    });
+  });
 }
