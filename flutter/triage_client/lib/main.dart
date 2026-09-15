@@ -1604,6 +1604,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           rows: rows - 1,
         );
         if (_disposed) return;
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+        if (_disposed) return;
         await _client.resizeSession(
           sessionId: sessionId,
           cols: cols,
@@ -2129,6 +2131,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       await _loadDaemonSessions();
       _reconnectAttempt = 0;
+      if (kIsWeb && !_disposed && _sessions.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!_disposed &&
+              generation == _connectGeneration &&
+              serverId == _activeServerId &&
+              _client.isConnected) {
+            _refitActiveSession();
+          }
+        });
+      }
     } catch (e) {
       if (_disposed ||
           generation != _connectGeneration ||
@@ -3948,6 +3960,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (session.hasFitted) {
       // Already fitted: refresh metadata without clearing and replaying history.
       unawaited(_refreshSessionSnapshot(session, includeHistory: false));
+      if (kIsWeb) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!_disposed &&
+              identical(_selectedSession, session) &&
+              _client.isConnected) {
+            _refitActiveSession();
+          }
+        });
+      }
     } else {
       // Not yet fitted: the first view-fit issues the initial refresh at the
       // real size; refreshing here too would race it with an estimated size.
@@ -9220,6 +9241,7 @@ class SessionWorkspace extends StatelessWidget {
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
+            isLoading: session.status == 'loading' || !session.loaded,
           ),
         ),
       ],

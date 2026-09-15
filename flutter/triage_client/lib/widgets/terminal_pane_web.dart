@@ -3,6 +3,7 @@ import '../terminal/debug_log.dart';
 
 import 'dart:async';
 import 'dart:html' as html;
+import 'dart:math' as math;
 import 'dart:js_util' as js_util;
 import 'dart:ui_web' as ui_web;
 
@@ -31,6 +32,7 @@ class TerminalPane extends StatefulWidget {
     this.onViewFit,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
+    this.isLoading = false,
   });
 
   final String terminalId;
@@ -51,6 +53,7 @@ class TerminalPane extends StatefulWidget {
 
   final int focusCursorRevision;
   final bool isExited;
+  final bool isLoading;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -132,14 +135,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     int viewportY,
     int baseY,
   ) {
-    if (viewportY >= baseY) return true;
+    if (viewportY >= baseY - 1) return true;
     final viewportElem = container.querySelector('.xterm-viewport');
     if (viewportElem != null) {
       final remainingPixels =
           viewportElem.scrollHeight -
           viewportElem.scrollTop -
           viewportElem.clientHeight;
-      if (remainingPixels <= 3) {
+      if (remainingPixels <= 30) {
         return true;
       }
     }
@@ -231,8 +234,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // below it.
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchStartSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchCancelSubscription;
+  StreamSubscription<html.Event>? _containerPointerDownSubscription;
+  StreamSubscription<html.Event>? _containerPointerUpSubscription;
+  StreamSubscription<html.Event>? _containerPointerCancelSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
+  int _activeTouchCount = 0;
+  int _activePointerCount = 0;
+  bool _pendingScrollToBottomOnRelease = false;
+
+  bool get _isUserGestureActive =>
+      _activeTouchCount > 0 || _activePointerCount > 0;
   void Function(html.Event)? _containerPasteListener;
   void Function(html.Event)? _textareaBeforeInputListener;
   void Function(html.Event)? _textareaInputListener;
@@ -264,13 +278,43 @@ class _TerminalPaneState extends State<TerminalPane> {
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
   Timer? _suppressScrollSaveTimer;
+  Timer? _jiggleRestoreTimer;
+  int? _pendingJiggleCols;
+  int? _pendingJiggleRows;
+  String? _pendingJiggleTargetId;
   final List<Timer> _focusRetryTimers = [];
+  final List<Timer> _refitRetryTimers = [];
 
   void _clearFocusRetryTimers() {
     for (final timer in _focusRetryTimers) {
       timer.cancel();
     }
     _focusRetryTimers.clear();
+  }
+
+  void _clearRefitRetryTimers() {
+    for (final timer in _refitRetryTimers) {
+      timer.cancel();
+    }
+    _refitRetryTimers.clear();
+  }
+
+  void _flushPendingJiggleRestore() {
+    if (_jiggleRestoreTimer != null) {
+      _jiggleRestoreTimer?.cancel();
+      _jiggleRestoreTimer = null;
+      if (_pendingJiggleCols != null && _pendingJiggleRows != null) {
+        final targetId = _pendingJiggleTargetId ?? _sanitizedId;
+        _sessionInputRouter.sendResizeOut(
+          targetId,
+          _pendingJiggleCols!,
+          _pendingJiggleRows!,
+        );
+        _pendingJiggleCols = null;
+        _pendingJiggleRows = null;
+        _pendingJiggleTargetId = null;
+      }
+    }
   }
 
   void _suppressScrollSaveFor(Duration duration) {
@@ -344,20 +388,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       _bindController();
       _bindTerminalSubscriptions();
       _bindContainerEvents();
+      _setupResizeObserver();
       if (_lastFittedCols != null && _lastFittedRows != null) {
         _writeInitialContent(
           overrideCols: _lastFittedCols,
           overrideRows: _lastFittedRows,
         );
-        if (_lastFittedRows! >= 5 && _lastFittedCols! >= 10) {
-          _sessionInputRouter.sendResizeOut(
-            sanitizedId,
-            _lastFittedCols!,
-            _lastFittedRows!,
-          );
-        }
       }
-      _onFit();
       if (widget.focusCursorRevision > 0) {
         _restoreScrollPosition(requestFocus: true);
       }
@@ -428,6 +465,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
           _writeInitialContent();
+          _onFit();
         }
         _activateTerminal();
         _scheduleFocusRetries();
@@ -565,7 +603,8 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _syncPointerEvents() {
     final isCurrent = _currentRoute?.isCurrent ?? true;
-    final target = isCurrent ? 'auto' : 'none';
+    final isInteractive = isCurrent && !widget.isLoading;
+    final target = isInteractive ? 'auto' : 'none';
     if (_initialized || _sessionContainers.containsKey(_sanitizedId)) {
       if (_container.style.pointerEvents != target) {
         _container.style.pointerEvents = target;
@@ -1110,10 +1149,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
           if (isAtBottom) {
             _sessionSavedViewportY.remove(sessionId);
-            if (viewportY < baseY) {
-              js_util.callMethod(term, 'scrollToBottom', []);
-            }
-          } else if (viewportY >= 0) {
+          } else if (viewportY > 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
         } catch (_) {}
@@ -1204,6 +1240,16 @@ class _TerminalPaneState extends State<TerminalPane> {
       ]);
     } catch (_) {}
 
+    _setupResizeObserver();
+  }
+
+  void _setupResizeObserver() {
+    if (_resizeObserver != null) {
+      try {
+        js_util.callMethod(_resizeObserver, 'disconnect', []);
+      } catch (_) {}
+      _resizeObserver = null;
+    }
     try {
       final resizeObserverConstructor = js_util.getProperty(
         html.window,
@@ -1302,7 +1348,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedViewportY.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {
-        activePane._suppressScrollSaveFor(const Duration(milliseconds: 1000));
+        activePane._pendingScrollToBottomOnRelease = true;
+        activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
           activePane._pendingLiveWriteBuffer.clear();
         }
@@ -1311,6 +1358,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (term != null) {
         try {
           js_util.callMethod(term, 'clear', []);
+          // Exit alternate screen buffer if active, home cursor, and wipe display.
+          js_util.callMethod(term, 'write', [
+            '\x1b[?1049l\x1b[H\x1b[2J\x1b[3J',
+          ]);
         } catch (_) {}
       }
     }
@@ -1408,13 +1459,21 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onRefit() {
     if (!_initialized) return;
     final generation = ++_refitGeneration;
+    _clearRefitRetryTimers();
+    _lastRefitCols = null;
+    _lastRefitRows = null;
+    _sessionSavedViewportY.remove(_sanitizedId);
+    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     _refitAndSend(force: true);
-    for (final ms in const [50, 200, 600, 1500]) {
-      Future.delayed(Duration(milliseconds: ms), () {
-        if (mounted && _initialized && generation == _refitGeneration) {
-          _refitAndSend(force: false);
-        }
-      });
+    for (final ms in const [120, 300, 700, 1500]) {
+      _refitRetryTimers.add(
+        Timer(Duration(milliseconds: ms), () {
+          if (mounted && _initialized && generation == _refitGeneration) {
+            _suppressScrollSaveFor(const Duration(milliseconds: 500));
+            _refitAndSend(force: false);
+          }
+        }),
+      );
     }
   }
 
@@ -1425,6 +1484,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // the fitted size.
   void _refitAndSend({required bool force}) {
     _onFit();
+    _resizeDebounceTimer?.cancel();
     if (!_initialContentWritten) {
       final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt();
       final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt();
@@ -1433,14 +1493,37 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       return;
     }
-    final cols = (js_util.getProperty(_term, 'cols') as num).toInt();
-    final rows = (js_util.getProperty(_term, 'rows') as num).toInt();
+    final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt() ?? 0;
+    final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt() ?? 0;
     if (cols < 2 || rows < 2) return;
+    final width = _terminalWrapper.clientWidth;
+    final height = _terminalWrapper.clientHeight;
+    if (width <= 0 || height <= 0) return;
+    try {
+      js_util.callMethod(_term, 'refresh', [0, rows - 1]);
+    } catch (_) {}
     if (!force && cols == _lastRefitCols && rows == _lastRefitRows) return;
     _lastRefitCols = cols;
     _lastRefitRows = rows;
-    _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows - 1);
-    _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
+    _flushPendingJiggleRestore();
+    final targetId = _sanitizedId;
+    _pendingJiggleCols = cols;
+    _pendingJiggleRows = rows;
+    _pendingJiggleTargetId = targetId;
+    _sessionInputRouter.sendResizeOut(targetId, cols, rows - 1);
+    _jiggleRestoreTimer = Timer(const Duration(milliseconds: 60), () {
+      _jiggleRestoreTimer = null;
+      if (_pendingJiggleCols != null && _pendingJiggleRows != null) {
+        _sessionInputRouter.sendResizeOut(
+          targetId,
+          _pendingJiggleCols!,
+          _pendingJiggleRows!,
+        );
+        _pendingJiggleCols = null;
+        _pendingJiggleRows = null;
+        _pendingJiggleTargetId = null;
+      }
+    });
   }
 
   void _syncInitialBracketedPasteMode() {
@@ -1502,7 +1585,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
     });
 
+    _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
+      _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
+    });
+
     _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
+      _activeTouchCount =
+          event.touches?.length ?? math.max(0, _activeTouchCount - 1);
+      _handleUserGestureEnded();
       if (_initialized) {
         try {
           _activateTerminal(force: true);
@@ -1510,6 +1600,34 @@ class _TerminalPaneState extends State<TerminalPane> {
         } catch (_) {}
       }
     });
+
+    _containerTouchCancelSubscription = _container.onTouchCancel.listen((
+      event,
+    ) {
+      _activeTouchCount =
+          event.touches?.length ?? math.max(0, _activeTouchCount - 1);
+      _handleUserGestureEnded();
+    });
+
+    _containerPointerDownSubscription = _container.on['pointerdown'].listen((
+      event,
+    ) {
+      _activePointerCount++;
+    });
+
+    _containerPointerUpSubscription = _container.on['pointerup'].listen((
+      event,
+    ) {
+      _activePointerCount = math.max(0, _activePointerCount - 1);
+      _handleUserGestureEnded();
+    });
+
+    _containerPointerCancelSubscription = _container.on['pointercancel'].listen(
+      (event) {
+        _activePointerCount = math.max(0, _activePointerCount - 1);
+        _handleUserGestureEnded();
+      },
+    );
 
     _containerWheelSubscription = _container.onWheel.listen((event) {
       if (_currentRoute?.isCurrent == false) {
@@ -1751,6 +1869,33 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  final List<Timer> _pointerReleaseTimers = [];
+
+  void _clearPointerReleaseTimers() {
+    for (final timer in _pointerReleaseTimers) {
+      timer.cancel();
+    }
+    _pointerReleaseTimers.clear();
+  }
+
+  void _handleUserGestureEnded() {
+    if (_isUserGestureActive) return;
+    if (_pendingScrollToBottomOnRelease) {
+      _pendingScrollToBottomOnRelease = false;
+      _restoreScrollPosition(requestFocus: false);
+      _clearPointerReleaseTimers();
+      for (final ms in const [80, 250]) {
+        _pointerReleaseTimers.add(
+          Timer(Duration(milliseconds: ms), () {
+            if (mounted && _initialized && !_isUserGestureActive) {
+              _restoreScrollPosition(requestFocus: false);
+            }
+          }),
+        );
+      }
+    }
+  }
+
   /// Releases the listeners [_bindContainerEvents] attached, and is safe to call
   /// when there are none: an adopted container may already have been handed on
   /// to a newer pane, which unbinds this one as it takes over.
@@ -1780,10 +1925,22 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerMouseDownSubscription = null;
     _containerClickSubscription?.cancel();
     _containerClickSubscription = null;
+    _containerTouchStartSubscription?.cancel();
+    _containerTouchStartSubscription = null;
     _containerTouchEndSubscription?.cancel();
     _containerTouchEndSubscription = null;
+    _containerTouchCancelSubscription?.cancel();
+    _containerTouchCancelSubscription = null;
+    _containerPointerDownSubscription?.cancel();
+    _containerPointerDownSubscription = null;
+    _containerPointerUpSubscription?.cancel();
+    _containerPointerUpSubscription = null;
+    _containerPointerCancelSubscription?.cancel();
+    _containerPointerCancelSubscription = null;
     _containerWheelSubscription?.cancel();
     _containerWheelSubscription = null;
+    _activeTouchCount = 0;
+    _activePointerCount = 0;
     final pasteListener = _containerPasteListener;
     if (pasteListener != null) {
       _container.removeEventListener('paste', pasteListener, true);
@@ -2111,12 +2268,53 @@ class _TerminalPaneState extends State<TerminalPane> {
       final width = _terminalWrapper.clientWidth;
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
+        bool wasAtBottom = true;
+        int? viewportY;
+        final term = _term;
+        if (term != null) {
+          try {
+            final buffer = js_util.getProperty(term, 'buffer');
+            final active = js_util.getProperty(buffer, 'active');
+            final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+            viewportY = (js_util.getProperty(active, 'viewportY') as num)
+                .toInt();
+            wasAtBottom = _viewportIsAtBottom(_container, viewportY, baseY);
+          } catch (_) {
+            wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
+          }
+        } else {
+          wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
+        }
+        _suppressScrollSaveFor(const Duration(milliseconds: 500));
         js_util.callMethod(_fitAddon, 'fit', []);
         _activateTerminal();
         final fittedRowsNum = js_util.getProperty(_term, 'rows') as num;
         final fittedColsNum = js_util.getProperty(_term, 'cols') as num;
         final fittedRows = fittedRowsNum.toInt();
         final fittedCols = fittedColsNum.toInt();
+
+        if (fittedRows > 0) {
+          try {
+            js_util.callMethod(_term, 'refresh', [0, fittedRows - 1]);
+          } catch (_) {}
+        }
+        if (wasAtBottom) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+          if (_isUserGestureActive) {
+            _pendingScrollToBottomOnRelease = true;
+          } else {
+            try {
+              js_util.callMethod(_term, 'scrollToBottom', []);
+            } catch (_) {}
+          }
+        } else {
+          final savedY = _sessionSavedViewportY[_sanitizedId] ?? viewportY;
+          if (savedY != null) {
+            try {
+              js_util.callMethod(_term, 'scrollToLine', [savedY]);
+            } catch (_) {}
+          }
+        }
 
         if (fittedRows >= 5 && fittedCols >= 10) {
           final sizeChanged =
@@ -2209,6 +2407,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _restoreScrollPosition({required bool requestFocus}) {
+    if (_isUserGestureActive) {
+      _pendingScrollToBottomOnRelease = true;
+      return;
+    }
     var jumped = false;
     void jump() {
       if (jumped || !mounted || !_initialized) return;
@@ -2221,13 +2423,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         final buffer = js_util.getProperty(_term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-        if (savedY != null && savedY >= baseY) {
+        if (savedY != null && (savedY >= baseY || savedY <= 0)) {
           _sessionSavedViewportY.remove(_sanitizedId);
         }
       } catch (_) {}
       final effectiveSavedY = _sessionSavedViewportY[_sanitizedId];
       try {
-        if (effectiveSavedY != null) {
+        if (effectiveSavedY != null && effectiveSavedY > 0) {
           js_util.callMethod(_term, 'scrollToLine', [effectiveSavedY]);
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);
@@ -2297,6 +2499,12 @@ class _TerminalPaneState extends State<TerminalPane> {
       _focusCursorNowAndAfterReplay();
       _scheduleFocusRetries(force: true);
     }
+    if (oldWidget.isLoading != widget.isLoading) {
+      _syncPointerEvents();
+      if (!widget.isLoading) {
+        _restoreScrollPosition(requestFocus: false);
+      }
+    }
     if (oldWidget.controller != widget.controller) {
       tdbg(
         'pane.didUpdate',
@@ -2304,6 +2512,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(oldWidget.controller)} -> '
             'ctrl#${identityHashCode(widget.controller)}',
       );
+      _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
       _inputRouteToken = _sessionInputRouter.bind(
@@ -2345,13 +2554,17 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _suppressScrollSaveTimer?.cancel();
+    _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _unbindContainerEvents();
+    _clearRefitRetryTimers();
+    _flushPendingJiggleRestore();
     _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
     if (_resizeObserver != null) {
       try {
         js_util.callMethod(_resizeObserver, 'disconnect', []);
       } catch (_) {}
+      _resizeObserver = null;
     }
     _focusNode.dispose();
     _unbindController();
@@ -2415,24 +2628,47 @@ class _TerminalPaneState extends State<TerminalPane> {
             });
           }
           final terminal = SizedBox.expand(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapDown: (_) {
-                widget.controller.notifyInteraction();
-                if (mounted &&
-                    _focusNode.canRequestFocus &&
-                    !_focusNode.hasFocus) {
-                  _focusNode.requestFocus();
-                }
-                _activateTerminal(force: true);
-                _scheduleFocusRetries(force: true);
-              },
-              child: Container(
-                width: double.infinity,
-                height: double.infinity,
-                color: const Color(0xff0d1113),
-                child: HtmlElementView(viewType: _viewType),
-              ),
+            child: Stack(
+              children: [
+                IgnorePointer(
+                  ignoring: widget.isLoading,
+                  child: AnimatedOpacity(
+                    opacity: widget.isLoading ? 0.7 : 1.0,
+                    duration: const Duration(milliseconds: 150),
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: (_) {
+                        widget.controller.notifyInteraction();
+                        if (mounted &&
+                            _focusNode.canRequestFocus &&
+                            !_focusNode.hasFocus) {
+                          _focusNode.requestFocus();
+                        }
+                        _activateTerminal(force: true);
+                        _scheduleFocusRetries(force: true);
+                      },
+                      child: Container(
+                        width: double.infinity,
+                        height: double.infinity,
+                        color: const Color(0xff0d1113),
+                        child: HtmlElementView(viewType: _viewType),
+                      ),
+                    ),
+                  ),
+                ),
+                if (widget.isLoading)
+                  const Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    height: 2,
+                    child: LinearProgressIndicator(
+                      minHeight: 2,
+                      backgroundColor: Colors.transparent,
+                      color: Color(0xffffc857),
+                    ),
+                  ),
+              ],
             ),
           );
           // Desktop browsers keep the full-height terminal; only a mobile-OS

@@ -400,6 +400,35 @@ mod unix_impl {
         }
     }
 
+    /// Configure socket send and receive buffers for handover transfers.
+    ///
+    /// On Darwin, Unix domain stream sockets default to an 8192-byte buffer.
+    /// When sending handover metadata and file descriptors via SCM_RIGHTS,
+    /// a full or near-full send buffer causes sendmsg to fail with EMSGSIZE
+    /// (os error 40, "Message too long"). Raising both buffers to 2 MiB prevents
+    /// descriptor transmission failures.
+    pub(crate) fn configure_unix_stream(stream: &UnixStream) {
+        let fd = stream.as_raw_fd();
+        let buf_size: libc::c_int = 2 * 1024 * 1024;
+        // SAFETY: setsockopt with valid socket descriptor and integer buffer size.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buf_size) as libc::socklen_t,
+            );
+        }
+    }
+
     pub fn send_fds(socket: &UnixStream, fds: &[RawFd], data: &[u8]) -> io::Result<()> {
         send_initial_frame(socket, fds, data)
     }
@@ -1135,6 +1164,7 @@ mod unix_impl {
             |request: &[u8]| -> Result<(UnixStream, Option<crate::ipc::PeerProcessIdentity>)> {
                 let stream = UnixStream::connect(socket_path)
                     .context("connecting to running daemon Unix socket")?;
+                configure_unix_stream(&stream);
                 let peer_process_identity = crate::ipc::peer_process_identity(&stream);
                 stream
                     .set_read_timeout(Some(HANDOVER_TRANSFER_TIMEOUT))
@@ -1153,7 +1183,7 @@ mod unix_impl {
         // receiver then has to discard without enough metadata to adopt them.
         // A predecessor that does not recognize HandoverV2 closes the connection;
         // reconnect with the published legacy request for rolling upgrades.
-        let (stream, peer_process_identity, data, mut fds, metadata_first) = {
+        let (mut stream, mut peer_process_identity, mut data, mut fds, metadata_first) = {
             let (stream, identity) = connect(b"{\"HandoverV2\":null}\n")?;
             match recv_data_frame(&stream) {
                 Ok(data) => (stream, identity, data, ReceivedFds(Vec::new()), true),
@@ -1212,7 +1242,7 @@ mod unix_impl {
 
         let mut handover_state = serde_json::from_value::<HandoverState>(state_val.clone())
             .context("decoding handover state identity")?;
-        let expected_fd_count =
+        let mut expected_fd_count =
             handover_state.sessions.len() + usize::from(handover_state.has_tcp_listener);
         if metadata_first {
             // The metadata-first response carries no ancillary data. All
@@ -1221,36 +1251,73 @@ mod unix_impl {
         }
         if let Err(error) = recv_remaining_fds(&stream, expected_fd_count, &mut fds) {
             if fds.is_empty() {
-                return Err(error).context("receiving remaining handover descriptor chunks");
+                if metadata_first {
+                    tracing::warn!(
+                        %error,
+                        "HandoverV2 descriptor chunks failed; retrying with legacy handover protocol."
+                    );
+                    ensure_fd_capacity(MAX_HANDOVER_FDS)
+                        .context("reserving descriptor capacity for legacy handover")?;
+                    let (legacy_stream, identity) = connect(b"{\"Handover\":null}\n")?;
+                    let (legacy_data, legacy_fds) =
+                        recv_fds_guarded(&legacy_stream, MAX_HANDOVER_FDS)
+                            .context("receiving legacy handover descriptors and state")?;
+                    stream = legacy_stream;
+                    peer_process_identity = identity;
+                    data = legacy_data;
+                    fds = legacy_fds;
+
+                    let response_str = std::str::from_utf8(&data)
+                        .context("decoding legacy handover JSON response")?;
+                    let wire_resp: serde_json::Value = serde_json::from_str(response_str)
+                        .context("parsing legacy handover response JSON")?;
+                    let state_val = wire_resp
+                        .get("Ok")
+                        .and_then(|ok| ok.get("HandoverState"))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Legacy handover request failed: {:?}", wire_resp)
+                        })?;
+                    handover_state = serde_json::from_value::<HandoverState>(state_val.clone())
+                        .context("decoding legacy handover state identity")?;
+                    expected_fd_count = handover_state.sessions.len()
+                        + usize::from(handover_state.has_tcp_listener);
+                    if fds.len() < expected_fd_count {
+                        recv_remaining_fds(&stream, expected_fd_count, &mut fds)
+                            .context("receiving remaining legacy descriptor chunks")?;
+                    }
+                } else {
+                    return Err(error).context("receiving remaining handover descriptor chunks");
+                }
+            } else {
+                truncate_state_to_received_fds(&mut handover_state, fds.len());
+                let peer_token = handover_state.handover_owner_token;
+                remember_handover_peer_identity(peer_token, peer_process_identity);
+                RECOVERED_HANDOVERS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
+                *INHERITED_STATE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(serde_json::to_string(&handover_state)?);
+                *INHERITED_FDS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fds.into_raw());
+                *HANDOVER_STREAM
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *PHASE1_COMPLETED_AT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+                tracing::warn!(
+                    %error,
+                    received = handover_state.sessions.len(),
+                    expected = expected_fd_count,
+                    "Handover owner disappeared during descriptor chunks; retaining the mapped prefix for socket-owner recovery."
+                );
+                adoption_attempt.retain();
+                return Ok(HandoverClientOutcome::Transferred);
             }
-            truncate_state_to_received_fds(&mut handover_state, fds.len());
-            let peer_token = handover_state.handover_owner_token;
-            remember_handover_peer_identity(peer_token, peer_process_identity);
-            RECOVERED_HANDOVERS
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear();
-            *INHERITED_STATE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(serde_json::to_string(&handover_state)?);
-            *INHERITED_FDS
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fds.into_raw());
-            *HANDOVER_STREAM
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            *PHASE1_COMPLETED_AT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
-            tracing::warn!(
-                %error,
-                received = handover_state.sessions.len(),
-                expected = expected_fd_count,
-                "Handover owner disappeared during descriptor chunks; retaining the mapped prefix for socket-owner recovery."
-            );
-            adoption_attempt.retain();
-            return Ok(HandoverClientOutcome::Transferred);
         }
         if fds.len() != expected_fd_count {
             bail!(
@@ -1456,6 +1523,7 @@ mod unix_impl {
         let Ok(mut stream) = UnixStream::connect(socket_path) else {
             return ReplacementRelease::Unavailable;
         };
+        configure_unix_stream(&stream);
         let socket_identity_after = crate::ipc::socket_path_identity(socket_path);
         let mut socket_identity = (socket_identity_before.is_some()
             && socket_identity_before == socket_identity_after)
@@ -1474,11 +1542,12 @@ mod unix_impl {
         let handover = (|| -> Result<ReplacementRelease> {
             stream.write_all(b"{\"HandoverV2\":null}\n")?;
             stream.flush()?;
-            let (data, mut received_fds) = match recv_data_frame(&stream) {
-                Ok(data) => (data, ReceivedFds(Vec::new())),
+            let (data, mut received_fds, metadata_first) = match recv_data_frame(&stream) {
+                Ok(data) => (data, ReceivedFds(Vec::new()), true),
                 Err(_) => {
                     ensure_fd_capacity(MAX_HANDOVER_FDS)?;
                     stream = UnixStream::connect(socket_path)?;
+                    configure_unix_stream(&stream);
                     stream.set_read_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))?;
                     stream.set_write_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))?;
                     process_identity = crate::ipc::peer_process_identity(&stream);
@@ -1489,7 +1558,8 @@ mod unix_impl {
                         .flatten();
                     stream.write_all(b"{\"Handover\":null}\n")?;
                     stream.flush()?;
-                    recv_fds_guarded(&stream, MAX_HANDOVER_FDS)?
+                    let (data, fds) = recv_fds_guarded(&stream, MAX_HANDOVER_FDS)?;
+                    (data, fds, false)
                 }
             };
             let response: serde_json::Value = serde_json::from_slice(&data)?;
@@ -1499,19 +1569,53 @@ mod unix_impl {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("replacement declined empty handover"))?;
             let mut state: HandoverState = serde_json::from_value(state)?;
-            let expected_fd_count = state.sessions.len() + usize::from(state.has_tcp_listener);
+            let mut expected_fd_count = state.sessions.len() + usize::from(state.has_tcp_listener);
             if let Err(error) = recv_remaining_fds(&stream, expected_fd_count, &mut received_fds) {
                 if received_fds.is_empty() {
-                    return Err(error.into());
+                    if metadata_first {
+                        ensure_fd_capacity(MAX_HANDOVER_FDS)?;
+                        stream = UnixStream::connect(socket_path)?;
+                        configure_unix_stream(&stream);
+                        stream.set_read_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))?;
+                        stream.set_write_timeout(Some(HANDOVER_TEARDOWN_TIMEOUT))?;
+                        process_identity = crate::ipc::peer_process_identity(&stream);
+                        let rebound_identity = crate::ipc::socket_path_identity(socket_path);
+                        socket_identity = (socket_identity_before.is_some()
+                            && socket_identity_before == rebound_identity)
+                            .then_some(socket_identity_before)
+                            .flatten();
+                        stream.write_all(b"{\"Handover\":null}\n")?;
+                        stream.flush()?;
+                        let (legacy_data, legacy_fds) =
+                            recv_fds_guarded(&stream, MAX_HANDOVER_FDS)?;
+                        received_fds = legacy_fds;
+                        let response: serde_json::Value = serde_json::from_slice(&legacy_data)?;
+                        let state_val = response
+                            .get("Ok")
+                            .and_then(|ok| ok.get("HandoverState"))
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("replacement declined empty handover")
+                            })?;
+                        state = serde_json::from_value(state_val)?;
+                        expected_fd_count =
+                            state.sessions.len() + usize::from(state.has_tcp_listener);
+                        if received_fds.len() < expected_fd_count {
+                            recv_remaining_fds(&stream, expected_fd_count, &mut received_fds)?;
+                        }
+                    } else {
+                        return Err(error.into());
+                    }
+                } else {
+                    truncate_state_to_received_fds(&mut state, received_fds.len());
+                    remember_recovered_handover(
+                        process_identity,
+                        socket_identity,
+                        state,
+                        received_fds,
+                    )?;
+                    return Ok(ReplacementRelease::Unavailable);
                 }
-                truncate_state_to_received_fds(&mut state, received_fds.len());
-                remember_recovered_handover(
-                    process_identity,
-                    socket_identity,
-                    state,
-                    received_fds,
-                )?;
-                return Ok(ReplacementRelease::Unavailable);
             }
             if received_fds.len() != expected_fd_count {
                 anyhow::bail!(

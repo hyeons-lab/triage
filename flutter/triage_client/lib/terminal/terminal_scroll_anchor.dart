@@ -54,7 +54,7 @@ bool shouldReleaseScrollPin({
 /// xterm.dart measures the scroll offset from the top of the buffer and does
 /// not compensate `offset.pixels` when a full buffer trims lines off the top
 /// (once `maxLines` is reached, every new line drops the oldest). A scrolled-up
-/// viewport therefore creeps upward — one line per trimmed line.
+/// viewport therefore creeps upward, one line per trimmed line.
 ///
 /// We exploit xterm.dart's `BufferLine.index`, which is the line's current row
 /// in the buffer and decreases by exactly the number of lines trimmed above it.
@@ -94,8 +94,9 @@ class TerminalScrollAnchor {
   }
 
   /// Capture an anchor from the current scroll metrics. Clears the anchor when
-  /// the viewport is at (or within a line of) the bottom, so the caller follows
-  /// new output instead of pinning just shy of the bottom.
+  /// the viewport is at (or within a line of) the bottom, or at or above row 0,
+  /// so the caller follows new output instead of pinning just shy of the bottom
+  /// or latching to the top line.
   void capture({
     required xt.Buffer buffer,
     required double pixels,
@@ -105,17 +106,22 @@ class TerminalScrollAnchor {
     final lineCount = buffer.lines.length;
     if (lineHeight <= 0 ||
         lineCount <= 0 ||
+        pixels <= 0.0 ||
         pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight) {
       _line = null;
       return;
     }
-    final topRow = (pixels ~/ lineHeight).clamp(0, lineCount - 1);
+    final topRow = pixels ~/ lineHeight;
+    if (topRow <= 0 || topRow >= lineCount) {
+      _line = null;
+      return;
+    }
     _line = buffer.lines[topRow];
     _withinLine = pixels - topRow * lineHeight;
   }
 
   /// The scroll offset that keeps the anchored line pinned, clamped to
-  /// `[0, maxScrollExtent]`. Returns null when there is no live anchor — either
+  /// `[0, maxScrollExtent]`. Returns null when there is no live anchor: either
   /// none was captured, or the anchored line has been trimmed out of the buffer
   /// (in which case the anchor is dropped and the caller should stop tracking).
   double? desiredOffset({
@@ -128,15 +134,19 @@ class TerminalScrollAnchor {
       _line = null;
       return null;
     }
-    // Cleared out of the scrollback rather than aged out. Without this the
-    // negative row would compute a negative offset, clamp to zero, and pin the
-    // viewport to the top of the buffer instead of releasing it.
-    if (line.index < 0) {
+    // Cleared out of the scrollback rather than aged out, or trimmed up to
+    // row 0. Without this the row would compute a non-positive offset, clamp to
+    // zero, and pin the viewport to the top of the buffer instead of releasing it.
+    if (line.index <= 0) {
       _line = null;
       return null;
     }
     if (lineHeight <= 0) return null;
     final desired = line.index * lineHeight + _withinLine;
+    if (desired <= 0.0) {
+      _line = null;
+      return null;
+    }
     return desired.clamp(0.0, maxScrollExtent);
   }
 }

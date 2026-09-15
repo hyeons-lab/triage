@@ -215,6 +215,89 @@ mod tests {
     }
 
     #[test]
+    fn failed_descriptor_chunks_fall_back_to_legacy_handover() -> anyhow::Result<()> {
+        use std::io::{BufRead, BufReader};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixListener;
+
+        let _handover_lock = handover_state_lock();
+        let temp_dir = TempDir::new()?;
+        let socket_path = temp_dir.path.join("fallback.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let session = crate::handover::HandoverSession {
+            id: SessionId::new("session-fallback").unwrap(),
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: temp_dir.path.join("session-fallback.log"),
+            output_seq: 0,
+            bytes_logged: 0,
+            pid: 20_001,
+            process_identity: None,
+            last_activity_ms: 0,
+            judge_override: None,
+        };
+        let state = crate::handover::HandoverState {
+            sessions: vec![session],
+            has_tcp_listener: false,
+            sends_teardown_commit: true,
+            handover_owner_token: Some([6; 16]),
+            handover_lineage_token: Some([7; 16]),
+            judge_history: Vec::new(),
+            ..Default::default()
+        };
+        let response = serde_json::json!({"Ok": {"HandoverState": state}});
+        let response = serde_json::to_vec(&response)?;
+        let file = std::fs::File::open("/dev/null")?;
+        let raw_fds = vec![file.as_raw_fd()];
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            // First connection: peer requests HandoverV2. Send metadata frame then drop stream
+            // without sending descriptor chunks (simulating EMSGSIZE on Darwin).
+            let (stream1, _) = listener.accept()?;
+            let mut request1 = String::new();
+            BufReader::new(stream1.try_clone()?).read_line(&mut request1)?;
+            assert!(request1.contains("HandoverV2"));
+            crate::handover::send_data_frame(&stream1, &response)?;
+            drop(stream1);
+
+            // Second connection: client should retry with legacy Handover request.
+            let (stream2, _) = listener.accept()?;
+            let mut request2 = String::new();
+            BufReader::new(stream2.try_clone()?).read_line(&mut request2)?;
+            assert!(request2.contains("Handover"));
+            assert!(!request2.contains("HandoverV2"));
+            crate::handover::send_handover_fds(&stream2, &raw_fds, &response)
+        });
+
+        assert_eq!(
+            crate::handover::perform_handover_client(&socket_path)?,
+            crate::handover::HandoverClientOutcome::Transferred
+        );
+        server.join().expect("handover fallback server")?;
+        let state: crate::handover::HandoverState = serde_json::from_str(
+            &crate::handover::INHERITED_STATE
+                .lock()
+                .unwrap()
+                .take()
+                .expect("retained handover fallback state"),
+        )?;
+        assert_eq!(state.sessions.len(), 1);
+        let retained = crate::handover::INHERITED_FDS
+            .lock()
+            .unwrap()
+            .take()
+            .expect("retained handover fallback descriptors");
+        assert_eq!(retained.len(), 1);
+        for fd in retained {
+            // SAFETY: the test owns every descriptor removed from INHERITED_FDS.
+            unsafe { libc::close(fd) };
+        }
+        crate::handover::finish_handover_adoption();
+        Ok(())
+    }
+
+    #[test]
     fn completed_descriptor_transfer_survives_readiness_failure() -> anyhow::Result<()> {
         use std::io::{BufRead, BufReader};
         use std::os::fd::AsRawFd;

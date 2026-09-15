@@ -9,6 +9,7 @@ import 'package:flutter/material.dart'
         CheckedPopupMenuItem,
         FilledButton,
         Icons,
+        LinearProgressIndicator,
         MaterialApp,
         Scaffold,
         Switch,
@@ -3842,6 +3843,116 @@ void main() {
       },
     );
 
+    testWidgets('pressing fit button while at bottom keeps scroll at bottom', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      client.snapshotVisibleRows['flutter-spike'] = List.generate(
+        100,
+        (i) => 'Log line $i',
+      );
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      expect(scrollViewFinder, findsOneWidget);
+
+      final controller = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      expect(controller.hasClients, isTrue);
+      expect(controller.position.maxScrollExtent, greaterThan(100.0));
+
+      // Viewport is initially at the bottom
+      expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+      // Tap the fit button
+      final fitFinder = find.byIcon(Icons.fit_screen);
+      expect(fitFinder, findsOneWidget);
+      await tester.tap(fitFinder.first);
+      await tester.pumpAndSettle();
+
+      // Scroll position must remain at bottom and not jump to top (0.0)
+      expect(controller.position.pixels, controller.position.maxScrollExtent);
+    });
+
+    testWidgets(
+      'controller refit triggers pane refit listener and preserves bottom scroll',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        // Trigger refit on the controller directly
+        pane.controller.refit();
+        await tester.pumpAndSettle();
+
+        // Must remain at the bottom
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
+
+    testWidgets(
+      'focusCursorRevision while at bottom preserves bottom scroll and does not snap to line zero',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+        expect(controller.position.maxScrollExtent, greaterThan(0));
+
+        // Trigger an occlusion cycle that bumps focusCursorRevision
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        await tester.pump();
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        await tester.pump();
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        await tester.pump();
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await tester.pumpAndSettle();
+
+        // Must still be at the bottom and must never have jumped to line 0
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
+
     testWidgets(
       'session at bottom stays sticky at bottom when switching sessions',
       (WidgetTester tester) async {
@@ -3911,6 +4022,78 @@ void main() {
 
       expect(controller.position.pixels, controller.position.maxScrollExtent);
     });
+
+    testWidgets(
+      'loading state ignores pointer events and displays progress indicator',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        final delayedSnapshot = Completer<Map<String, dynamic>>();
+        client.snapshotCompleters['flutter-spike'] = delayedSnapshot;
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = find.byType(TerminalPane);
+        expect(pane, findsOneWidget);
+
+        final ignorePointer = tester.widget<IgnorePointer>(
+          find.descendant(
+            of: pane,
+            matching: find.byType(IgnorePointer),
+          ).first,
+        );
+        expect(ignorePointer.ignoring, isTrue);
+        expect(find.byType(LinearProgressIndicator), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'clearing buffer during pointer interaction defers bottom snap until pointer release',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+
+        // Scroll up away from bottom
+        controller.jumpTo(60.0);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, 60.0);
+
+        // Start touch or pointer gesture
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byType(TerminalPane)),
+        );
+        await tester.pump();
+
+        // Clear terminal buffer while gesture is active
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.controller.clear();
+        await tester.pump();
+
+        // Viewport remains at current offset during gesture
+        expect(controller.position.pixels, 60.0);
+
+        // Release pointer
+        await gesture.up();
+        await tester.pump(const Duration(milliseconds: 300));
+        await tester.pumpAndSettle();
+
+        // Viewport snaps to bottom after release
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
   });
 
   group('SessionVm exited lifecycle', () {

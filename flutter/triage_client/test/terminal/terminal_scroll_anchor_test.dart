@@ -24,7 +24,7 @@ xt.Terminal _fullTerminal({
 }
 
 /// The scroll position's `maxScrollExtent` is the content height minus the
-/// viewport height — not the full content height — so anchor clamping and
+/// viewport height, not the full content height, so anchor clamping and
 /// bottom detection see the same value the widget wiring passes in.
 double _maxExtent(xt.Terminal terminal, double lineHeight) =>
     (terminal.buffer.lines.length - _viewHeight) * lineHeight;
@@ -109,7 +109,7 @@ void main() {
       expect(pinnedLine.index, lessThan(anchorRow));
 
       // The anchor's desired offset must equal the pinned line's current
-      // position — i.e. it cancels the trim drift instead of staying at the old
+      // position: it cancels the trim drift instead of staying at the old
       // pixel offset.
       expect(
         anchor.desiredOffset(
@@ -119,6 +119,76 @@ void main() {
         pinnedLine.index * lineHeight,
       );
     });
+
+    test('capturing at or below zero pixels does not hold an anchor', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      final maxExtent = _maxExtent(terminal, lineHeight);
+
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: 0.0,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isFalse);
+
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: -10.0,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isFalse);
+    });
+
+    test('capturing at top row 0 does not hold an anchor', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      final maxExtent = _maxExtent(terminal, lineHeight);
+
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: lineHeight / 2,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isFalse);
+    });
+
+    test(
+      'anchor is dropped when trimmed up to row 0 or non-positive desired offset',
+      () {
+        final terminal = _fullTerminal(maxLines: 30);
+        final buffer = terminal.buffer;
+        final maxExtent = _maxExtent(terminal, lineHeight);
+        const anchorRow = 2;
+
+        final anchor = TerminalScrollAnchor();
+        anchor.capture(
+          buffer: buffer,
+          pixels: anchorRow * lineHeight,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        );
+        expect(anchor.hasAnchor, isTrue);
+
+        // Trim buffer lines until the anchor row reaches row 0
+        for (var i = 0; i < anchorRow; i++) {
+          terminal.write('trim$i\r\n');
+        }
+
+        // At row 0 or less, desiredOffset must return null and drop anchor
+        expect(
+          anchor.desiredOffset(
+            maxScrollExtent: maxExtent,
+            lineHeight: lineHeight,
+          ),
+          isNull,
+        );
+        expect(anchor.hasAnchor, isFalse);
+      },
+    );
 
     test('anchor is dropped once its line is trimmed out of the buffer', () {
       final terminal = _fullTerminal(maxLines: 30);

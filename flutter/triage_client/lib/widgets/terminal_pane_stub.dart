@@ -44,6 +44,7 @@ class TerminalPane extends StatefulWidget {
     this.onViewFit,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
+    this.isLoading = false,
   });
 
   final String terminalId;
@@ -63,13 +64,19 @@ class TerminalPane extends StatefulWidget {
 
   final int focusCursorRevision;
   final bool isExited;
+  final bool isLoading;
 
   static void destroySession(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     _TerminalPaneState._sessionSavedScrollOffsets.remove(terminalId);
     _TerminalPaneState._sessionSavedScrollAnchors.remove(terminalId);
     _TerminalPaneState._sessionSavedDistanceFromBottom.remove(terminalId);
     _TerminalPaneState._sessionSavedScrollFractions.remove(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
+    _TerminalPaneState._sessionLastResizeOutCols.remove(terminalId);
+    _TerminalPaneState._sessionLastResizeOutRows.remove(terminalId);
+    _TerminalPaneState._sessionLastGridSize.remove(sanitizedId);
+    _TerminalPaneState._sessionLastGridSize.remove(terminalId);
   }
 
   static void setBracketedPasteMode(String terminalId, bool enabled) {
@@ -84,7 +91,11 @@ class TerminalPane extends StatefulWidget {
     TerminalController controller,
   ) {}
 
-  static (int, int)? getCachedTerminalSize(String terminalId) => null;
+  static (int, int)? getCachedTerminalSize(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    return _TerminalPaneState._sessionLastGridSize[sanitizedId] ??
+        _TerminalPaneState._sessionLastGridSize[terminalId];
+  }
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -96,6 +107,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       {};
   static final Map<String, double> _sessionSavedDistanceFromBottom = {};
   static final Map<String, double> _sessionSavedScrollFractions = {};
+  static final Map<String, int> _sessionLastResizeOutCols = {};
+  static final Map<String, int> _sessionLastResizeOutRows = {};
+  static final Map<String, (int, int)> _sessionLastGridSize = {};
 
   /// A finite initial scroll offset sentinel (1 billion pixels) that complies
   /// with Flutter's ScrollController bounds checking (`assert(initialScrollOffset.isFinite)`),
@@ -112,6 +126,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // True while we drive `_scrollController` ourselves, so the resulting scroll
   // notification doesn't re-capture the anchor from our own correction.
   bool _suppressAnchorCapture = false;
+  bool _suppressScrollSave = false;
+  Timer? _suppressScrollSaveTimer;
+
+  void _suppressScrollSaveFor(Duration duration) {
+    _suppressScrollSave = true;
+    _suppressScrollSaveTimer?.cancel();
+    _suppressScrollSaveTimer = Timer(duration, () {
+      if (mounted) {
+        _suppressScrollSave = false;
+      }
+    });
+  }
+
   bool _repinScheduled = false;
   // Viewport pixels at the previous scroll event, to tell a downward chase
   // (release the pin near the bottom) from upward reading (keep it).
@@ -128,13 +155,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   // scrolling, so the scroll state alone would treat a finger resting on a
   // stopped fling as settled.
   final Set<int> _activePointers = <int>{};
+  bool _pendingBottomSnapOnPointerUp = false;
 
   Timer? _resizeOutDebounceTimer;
   Timer? _scrollToCursorTimer;
   int? _pendingResizeOutCols;
   int? _pendingResizeOutRows;
-  int? _lastResizeOutCols;
-  int? _lastResizeOutRows;
 
   // Selection state. The view owns selection through this xterm controller; we
   // observe it to keep the live anchor (the cell a selection started from) so a
@@ -282,6 +308,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
     widget.controller.addFitListener(_onFit);
+    widget.controller.addRefitListener(_onRefit);
+    widget.controller.addClearListener(_onClear);
+    widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
     _xtermController.addListener(_recordSelectionAnchor);
     _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
@@ -317,7 +346,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.onTerminalResizeBind?.call(null);
       widget.onTerminalResizeBind?.call(_onTerminalResize);
     }
-    if (!identical(oldWidget.terminal, widget.terminal)) {
+    if (!identical(oldWidget.terminal, widget.terminal) ||
+        oldWidget.terminalId != widget.terminalId) {
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -357,10 +387,31 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeFitListener(_onFit);
+      oldWidget.controller.removeRefitListener(_onRefit);
+      oldWidget.controller.removeClearListener(_onClear);
+      oldWidget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
       widget.controller.addFitListener(_onFit);
+      widget.controller.addRefitListener(_onRefit);
+      widget.controller.addClearListener(_onClear);
+      widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
+    }
+    if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
+      if (_pendingBottomSnapOnPointerUp) {
+        _pendingBottomSnapOnPointerUp = false;
+        _scrollToCursor(requestFocus: false, forceBottom: true);
+      }
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
-      _scrollToCursor(requestFocus: true);
+      final pos = _scrollController.hasClients
+          ? _scrollController.position
+          : null;
+      final lh = _lineHeight() ?? 2.0;
+      final isAtBottom =
+          pos == null ||
+          !pos.hasContentDimensions ||
+          pos.maxScrollExtent <= 0 ||
+          pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+      _scrollToCursor(requestFocus: true, forceBottom: isAtBottom);
     }
   }
 
@@ -370,6 +421,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _saveScrollOffset();
     _unbindTerminal(_terminal);
     widget.controller.removeFitListener(_onFit);
+    widget.controller.removeRefitListener(_onRefit);
+    widget.controller.removeClearListener(_onClear);
+    widget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
@@ -379,11 +433,82 @@ class _TerminalPaneState extends State<TerminalPane> {
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
+    _suppressScrollSaveTimer?.cancel();
+    _clearPointerReleaseTimers();
     super.dispose();
   }
 
   void _onFit() {
+    if (!mounted) return;
+    final pos = _scrollController.hasClients
+        ? _scrollController.position
+        : null;
+    final lh = _lineHeight() ?? 2.0;
+    final isAtBottom =
+        pos == null ||
+        !pos.hasContentDimensions ||
+        pos.maxScrollExtent <= 0 ||
+        pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+
+    _suppressScrollSaveFor(const Duration(milliseconds: 500));
+    if (isAtBottom) {
+      _scrollAnchor.clear();
+      _sessionSavedScrollOffsets.remove(widget.terminalId);
+      _sessionSavedScrollAnchors.remove(widget.terminalId);
+      _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+      _sessionSavedScrollFractions.remove(widget.terminalId);
+    }
     setState(() {});
+    _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
+  }
+
+  void _onRefit() {
+    if (!mounted) return;
+    final pos = _scrollController.hasClients
+        ? _scrollController.position
+        : null;
+    final lh = _lineHeight() ?? 2.0;
+    final isAtBottom =
+        pos == null ||
+        !pos.hasContentDimensions ||
+        pos.maxScrollExtent <= 0 ||
+        pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+
+    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
+    if (isAtBottom) {
+      _scrollAnchor.clear();
+      _sessionSavedScrollOffsets.remove(widget.terminalId);
+      _sessionSavedScrollAnchors.remove(widget.terminalId);
+      _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+      _sessionSavedScrollFractions.remove(widget.terminalId);
+    }
+    setState(() {});
+    _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
+  }
+
+  void _onClear() {
+    if (!mounted) return;
+    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
+    _scrollAnchor.clear();
+    _sessionSavedScrollOffsets.remove(widget.terminalId);
+    _sessionSavedScrollAnchors.remove(widget.terminalId);
+    _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+    _sessionSavedScrollFractions.remove(widget.terminalId);
+    _pendingBottomSnapOnPointerUp = true;
+  }
+
+  void _onHistoryReplayed() {
+    if (!mounted) return;
+    final isGestureActive =
+        _activePointers.isNotEmpty ||
+        (_scrollController.hasClients &&
+            _scrollController.position.isScrollingNotifier.value);
+    if (isGestureActive) {
+      _pendingBottomSnapOnPointerUp = true;
+    } else {
+      _pendingBottomSnapOnPointerUp = false;
+      _scrollToCursor(requestFocus: false, forceBottom: true);
+    }
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -518,8 +643,35 @@ class _TerminalPaneState extends State<TerminalPane> {
   // Done from raw pointer events because TerminalView.onTapUp is dead in xterm
   // 4.0.0; raw pointer handling also sidesteps the gesture arena, so normal
   // drag-select keeps working.
+  final List<Timer> _pointerReleaseTimers = [];
+
+  void _clearPointerReleaseTimers() {
+    for (final timer in _pointerReleaseTimers) {
+      timer.cancel();
+    }
+    _pointerReleaseTimers.clear();
+  }
+
+  void _checkDeferredBottomSnapOnPointerRelease() {
+    if (_activePointers.isEmpty && _pendingBottomSnapOnPointerUp) {
+      _pendingBottomSnapOnPointerUp = false;
+      _scrollToCursor(requestFocus: false, forceBottom: true);
+      _clearPointerReleaseTimers();
+      for (final ms in const [80, 250]) {
+        _pointerReleaseTimers.add(
+          Timer(Duration(milliseconds: ms), () {
+            if (mounted && _activePointers.isEmpty) {
+              _scrollToCursor(requestFocus: false, forceBottom: true);
+            }
+          }),
+        );
+      }
+    }
+  }
+
   void _handlePointerUp(PointerUpEvent event) {
     _activePointers.remove(event.pointer);
+    _checkDeferredBottomSnapOnPointerRelease();
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -537,6 +689,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _handlePointerCancel(PointerCancelEvent event) {
     _activePointers.remove(event.pointer);
+    _checkDeferredBottomSnapOnPointerRelease();
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -746,6 +899,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     int pixelHeight,
   ) {
     if (width > 0 && height > 0) {
+      final sanitizedId = widget.terminalId.replaceAll(
+        RegExp(r'[^a-zA-Z0-9-]'),
+        '_',
+      );
+      _sessionLastGridSize[sanitizedId] = (height, width);
+      _sessionLastGridSize[widget.terminalId] = (height, width);
       // Reflow (reflowEnabled is on) runs only on a column change, moving content
       // between rows and staling the cached shift-click anchor — a buffer
       // coordinate the identity guard in _extendSelectionTo can't detect as stale,
@@ -753,7 +912,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       // width change so a later shift-click won't extend from a pre-reflow row
       // (with no anchor the extend is a no-op until the next fresh select). A
       // height-only resize doesn't reflow, so the anchor stays valid and is left
-      // alone. `viewWidth` is still the old width here — onResize fires before the
+      // alone. `viewWidth` is still the old width here: onResize fires before the
       // terminal stores the new one. The live highlight is unaffected; only the
       // extend-from point is invalidated.
       if (width != _terminal.viewWidth) {
@@ -761,51 +920,64 @@ class _TerminalPaneState extends State<TerminalPane> {
         _selectionAnchorBuffer = null;
       }
       final lh = _lineHeight() ?? 2.0;
-      final isScrolledUp =
-          _scrollController.hasClients &&
-          _scrollController.position.hasContentDimensions &&
-          _scrollController.position.pixels <
-              _scrollController.position.maxScrollExtent - 2 * lh;
-      if (!isScrolledUp &&
-          !_scrollAnchor.hasAnchor &&
-          !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId) &&
-          _scrollController.hasClients) {
-        scheduleMicrotask(() {
-          if (mounted &&
-              _scrollController.hasClients &&
-              !_scrollAnchor.hasAnchor &&
-              !_sessionSavedDistanceFromBottom.containsKey(widget.terminalId)) {
-            _snapToBottom(_scrollController.position);
-          }
-        });
-      } else if (isScrolledUp) {
+      final pos = _scrollController.hasClients
+          ? _scrollController.position
+          : null;
+      final isAtBottom =
+          pos == null ||
+          !pos.hasContentDimensions ||
+          pos.maxScrollExtent <= 0 ||
+          pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+      if (isAtBottom) {
+        _scrollAnchor.clear();
+        _sessionSavedScrollOffsets.remove(widget.terminalId);
+        _sessionSavedScrollAnchors.remove(widget.terminalId);
+        _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+        _sessionSavedScrollFractions.remove(widget.terminalId);
+        if (_scrollController.hasClients) {
+          scheduleMicrotask(() {
+            if (mounted && _scrollController.hasClients) {
+              _snapToBottom(_scrollController.position);
+            }
+          });
+        }
+      } else {
         scheduleMicrotask(() {
           if (mounted && _scrollController.hasClients) {
-            final pos = _scrollController.position;
-            if (!pos.hasContentDimensions || pos.maxScrollExtent <= 0) return;
+            final p = _scrollController.position;
+            if (!p.hasContentDimensions || p.maxScrollExtent <= 0) return;
+            if (p.isScrollingNotifier.value ||
+                _activePointers.isNotEmpty ||
+                _dragSelecting) {
+              return;
+            }
             double? target;
             if (_scrollAnchor.hasAnchor) {
               target = _scrollAnchor.desiredOffset(
-                maxScrollExtent: pos.maxScrollExtent,
+                maxScrollExtent: p.maxScrollExtent,
                 lineHeight: lh,
               );
             }
             final dist = _sessionSavedDistanceFromBottom[widget.terminalId];
             final frac = _sessionSavedScrollFractions[widget.terminalId];
             final saved = _sessionSavedScrollOffsets[widget.terminalId];
-            target ??= dist != null
-                ? (pos.maxScrollExtent - dist).clamp(0.0, pos.maxScrollExtent)
-                : frac != null
-                ? (pos.maxScrollExtent * frac).clamp(0.0, pos.maxScrollExtent)
-                : saved?.clamp(0.0, pos.maxScrollExtent);
-            if (target != null && (pos.pixels - target).abs() > 0.5) {
+            target ??= (dist != null && dist > 0.0)
+                ? (p.maxScrollExtent - dist).clamp(0.0, p.maxScrollExtent)
+                : (frac != null && frac > 0.0)
+                ? (p.maxScrollExtent * frac).clamp(0.0, p.maxScrollExtent)
+                : (saved != null && saved > 0.0)
+                ? saved.clamp(0.0, p.maxScrollExtent)
+                : null;
+            if (target != null &&
+                target > 0.0 &&
+                (p.pixels - target).abs() > 0.5) {
               final wasSuppressed = _suppressAnchorCapture;
               _suppressAnchorCapture = true;
               try {
-                pos.jumpTo(target);
+                p.jumpTo(target);
               } finally {
                 _suppressAnchorCapture = wasSuppressed;
-                _lastScrollPixels = pos.pixels;
+                _lastScrollPixels = p.pixels;
               }
             }
           }
@@ -826,7 +998,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   void _scheduleResizeOut(int cols, int rows) {
-    if (_lastResizeOutCols == cols && _lastResizeOutRows == rows) {
+    if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
+        _sessionLastResizeOutRows[widget.terminalId] == rows) {
       return;
     }
     _pendingResizeOutCols = cols;
@@ -847,11 +1020,18 @@ class _TerminalPaneState extends State<TerminalPane> {
     _resizeOutDebounceTimer?.cancel();
     _pendingResizeOutCols = null;
     _pendingResizeOutRows = null;
-    if (_lastResizeOutCols == cols && _lastResizeOutRows == rows) {
+    final sanitizedId = widget.terminalId.replaceAll(
+      RegExp(r'[^a-zA-Z0-9-]'),
+      '_',
+    );
+    _sessionLastGridSize[sanitizedId] = (rows, cols);
+    _sessionLastGridSize[widget.terminalId] = (rows, cols);
+    if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
+        _sessionLastResizeOutRows[widget.terminalId] == rows) {
       return;
     }
-    _lastResizeOutCols = cols;
-    _lastResizeOutRows = rows;
+    _sessionLastResizeOutCols[widget.terminalId] = cols;
+    _sessionLastResizeOutRows[widget.terminalId] = rows;
     widget.controller.sendResizeOut(cols, rows);
   }
 
@@ -880,7 +1060,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (_copyTarget != null) {
       _rebuildForCopyButton();
     }
-    if (_suppressAnchorCapture || _dragSelecting) return;
+    if (_suppressAnchorCapture || _suppressScrollSave || _dragSelecting) return;
     _captureScrollAnchor();
   }
 
@@ -890,7 +1070,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
     final id = terminalId ?? widget.terminalId;
     final lh = lineHeight ?? _lineHeight() ?? 2.0;
-    if (position.pixels < position.maxScrollExtent - lh) {
+    final isAtBottom =
+        position.pixels >=
+        position.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+    if (!isAtBottom && position.pixels > 0.0) {
       _sessionSavedScrollOffsets[id] = position.pixels;
       if (!_scrollAnchor.hasAnchor) {
         _scrollAnchor.capture(
@@ -915,6 +1098,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedScrollAnchors.remove(id);
       _sessionSavedDistanceFromBottom.remove(id);
       _sessionSavedScrollFractions.remove(id);
+      if (id == widget.terminalId) {
+        _scrollAnchor.clear();
+      }
     }
   }
 
@@ -1045,14 +1231,19 @@ class _TerminalPaneState extends State<TerminalPane> {
   // drift that would otherwise scroll the user's content out from under them.
   void _repinScrollAnchor() {
     if (!mounted || !_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (position.isScrollingNotifier.value ||
+        _activePointers.isNotEmpty ||
+        _dragSelecting) {
+      return;
+    }
     final lineHeight = _lineHeight();
     if (lineHeight == null) return;
-    final position = _scrollController.position;
     final desired = _scrollAnchor.desiredOffset(
       maxScrollExtent: position.maxScrollExtent,
       lineHeight: lineHeight,
     );
-    if (desired == null) return;
+    if (desired == null || desired <= 0.0) return;
     if ((desired - position.pixels).abs() < 0.5) return;
     final wasSuppressed = _suppressAnchorCapture;
     _suppressAnchorCapture = true;
@@ -1067,7 +1258,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
-  void _scrollToCursor({required bool requestFocus}) {
+  void _scrollToCursor({required bool requestFocus, bool forceBottom = false}) {
     void jump() {
       if (!mounted) return;
       if (_scrollController.hasClients) {
@@ -1086,15 +1277,20 @@ class _TerminalPaneState extends State<TerminalPane> {
             _sessionSavedDistanceFromBottom[widget.terminalId];
         final savedFraction = _sessionSavedScrollFractions[widget.terminalId];
         final lineHeight = _lineHeight();
-
         final wasScrolledUp =
-            saved != null ||
-            savedDistance != null ||
-            savedFraction != null ||
-            _scrollAnchor.hasAnchor;
+            !forceBottom &&
+            (saved != null ||
+                savedDistance != null ||
+                savedFraction != null ||
+                _scrollAnchor.hasAnchor);
 
         double target;
         if (!wasScrolledUp) {
+          _scrollAnchor.clear();
+          _sessionSavedScrollOffsets.remove(widget.terminalId);
+          _sessionSavedScrollAnchors.remove(widget.terminalId);
+          _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+          _sessionSavedScrollFractions.remove(widget.terminalId);
           target = position.maxScrollExtent;
         } else {
           double? desired;
@@ -1104,23 +1300,42 @@ class _TerminalPaneState extends State<TerminalPane> {
               lineHeight: lineHeight,
             );
           }
-          if (desired != null) {
+          if (desired != null && desired > 0.0) {
             target = desired;
-          } else if (savedDistance != null) {
+          } else if (savedDistance != null && savedDistance > 0.0) {
             target = (position.maxScrollExtent - savedDistance).clamp(
               0.0,
               position.maxScrollExtent,
             );
-          } else if (savedFraction != null) {
+          } else if (savedFraction != null && savedFraction > 0.0) {
             target = (position.maxScrollExtent * savedFraction).clamp(
               0.0,
               position.maxScrollExtent,
             );
-          } else if (saved != null) {
+          } else if (saved != null && saved > 0.0) {
             target = saved.clamp(0.0, position.maxScrollExtent);
           } else {
-            target = position.pixels.clamp(0.0, position.maxScrollExtent);
+            final isNearBottom =
+                position.pixels >=
+                position.maxScrollExtent -
+                    kScrollPinReleaseGraceLines * (lineHeight ?? 2.0);
+            target = isNearBottom
+                ? position.maxScrollExtent
+                : position.pixels.clamp(0.0, position.maxScrollExtent);
           }
+          if (target <= 0.0 && position.maxScrollExtent > 0) {
+            target = position.maxScrollExtent;
+          }
+        }
+
+        if (target >=
+            position.maxScrollExtent -
+                kScrollPinReleaseGraceLines * (lineHeight ?? 2.0)) {
+          _scrollAnchor.clear();
+          _sessionSavedScrollOffsets.remove(widget.terminalId);
+          _sessionSavedScrollAnchors.remove(widget.terminalId);
+          _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+          _sessionSavedScrollFractions.remove(widget.terminalId);
         }
 
         if ((position.pixels - target).abs() > 0.5) {
@@ -1145,12 +1360,12 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   // xterm.dart copies selected text via BufferLine.getText, which drops every
-  // blank (codePoint 0) cell — so columns a TUI lays out by moving the cursor
+  // blank (codePoint 0) cell: so columns a TUI lays out by moving the cursor
   // (rather than writing literal spaces) concatenate on copy. Intercept the
   // copy chord before xterm's shortcut manager runs (TerminalView.onKeyEvent
   // short-circuits it when we return a non-ignored result) and rebuild the text
   // with the gap spaces restored. Returning `ignored` for everything else
-  // leaves xterm's normal key handling — including Ctrl+C -> SIGINT — untouched.
+  // leaves xterm's normal key handling, including Ctrl+C -> SIGINT, untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
     if (ModalRoute.of(context)?.isCurrent == false) {
       return KeyEventResult.ignored;
@@ -1466,47 +1681,79 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (isTest) {
       return Container(
         color: const Color(0xff0d1113),
-        alignment: Alignment.topLeft,
-        child: SingleChildScrollView(
-          controller: _scrollController,
-          padding: const EdgeInsets.all(22),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final row in widget.fallbackRows)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 7),
-                  child: SelectableText.rich(
-                    TextSpan(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            IgnorePointer(
+              ignoring: widget.isLoading,
+              child: AnimatedOpacity(
+                opacity: widget.isLoading ? 0.7 : 1.0,
+                duration: const Duration(milliseconds: 150),
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: _handlePointerDown,
+                  onPointerMove: _handlePointerMove,
+                  onPointerUp: _handlePointerUp,
+                  onPointerCancel: _handlePointerCancel,
+                  child: SingleChildScrollView(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.all(22),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        for (final span in row.spans)
-                          TextSpan(
-                            text: span.text.isEmpty ? ' ' : span.text,
-                            style: TextStyle(
-                              fontFamily: 'JetBrains Mono',
-                              fontSize: 15,
-                              height: 1.35,
-                              color:
-                                  span.style.foreground?.toColor() ??
-                                  const Color(0xffd9e5e3),
-                              backgroundColor: span.style.background?.toColor(),
-                              fontWeight: span.style.bold
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                              fontStyle: span.style.italic
-                                  ? FontStyle.italic
-                                  : FontStyle.normal,
-                              decoration: span.style.underline
-                                  ? TextDecoration.underline
-                                  : TextDecoration.none,
+                        for (final row in widget.fallbackRows)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 7),
+                            child: SelectableText.rich(
+                              TextSpan(
+                                children: [
+                                  for (final span in row.spans)
+                                    TextSpan(
+                                      text: span.text.isEmpty ? ' ' : span.text,
+                                      style: TextStyle(
+                                        fontFamily: 'JetBrains Mono',
+                                        fontSize: 15,
+                                        height: 1.35,
+                                        color:
+                                            span.style.foreground?.toColor() ??
+                                            const Color(0xffd9e5e3),
+                                        backgroundColor:
+                                            span.style.background?.toColor(),
+                                        fontWeight: span.style.bold
+                                            ? FontWeight.bold
+                                            : FontWeight.normal,
+                                        fontStyle: span.style.italic
+                                            ? FontStyle.italic
+                                            : FontStyle.normal,
+                                        decoration: span.style.underline
+                                            ? TextDecoration.underline
+                                            : TextDecoration.none,
+                                      ),
+                                    ),
+                                ],
+                              ),
                             ),
                           ),
                       ],
                     ),
                   ),
                 ),
-            ],
-          ),
+              ),
+            ),
+            if (widget.isLoading)
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                height: 2,
+                child: LinearProgressIndicator(
+                  value: isTest ? 0.5 : null,
+                  minHeight: 2,
+                  backgroundColor: Colors.transparent,
+                  color: const Color(0xffffc857),
+                ),
+              ),
+          ],
         ),
       );
     }
@@ -1544,39 +1791,60 @@ class _TerminalPaneState extends State<TerminalPane> {
                   // pane, and the grid size is derived from those pixels.
                   fit: StackFit.expand,
                   children: [
-                    Padding(
-                      padding: padding,
-                      child: Listener(
-                        onPointerDown: _handlePointerDown,
-                        onPointerMove: _handlePointerMove,
-                        onPointerUp: _handlePointerUp,
-                        onPointerCancel: _handlePointerCancel,
-                        child: ScrollConfiguration(
-                          behavior: ScrollConfiguration.of(
-                            context,
-                          ).copyWith(scrollbars: false),
-                          child: xt.TerminalView(
-                            _terminal,
-                            key: _terminalViewKey,
-                            controller: _xtermController,
-                            theme: _theme,
-                            focusNode: _focusNode,
-                            autofocus: true,
-                            scrollController: _scrollController,
-                            onKeyEvent: _handleTerminalKeyEvent,
-                            textStyle: _textStyle,
-                            // Desktop uses the hardware-keyboard path instead of
-                            // xterm's hidden IME TextInput connection: on macOS the
-                            // IME path desyncs Flutter's HardwareKeyboard state
-                            // ("physical key already pressed") and swallows
-                            // keystrokes. Mobile must use the IME path, though: it
-                            // is what raises the soft keyboard, so disabling it
-                            // leaves a phone unable to type.
-                            hardwareKeyboardOnly: !_isMobile,
+                    IgnorePointer(
+                      ignoring: widget.isLoading,
+                      child: AnimatedOpacity(
+                        opacity: widget.isLoading ? 0.7 : 1.0,
+                        duration: const Duration(milliseconds: 150),
+                        child: Padding(
+                          padding: padding,
+                          child: Listener(
+                            behavior: HitTestBehavior.translucent,
+                            onPointerDown: _handlePointerDown,
+                            onPointerMove: _handlePointerMove,
+                            onPointerUp: _handlePointerUp,
+                            onPointerCancel: _handlePointerCancel,
+                            child: ScrollConfiguration(
+                              behavior: ScrollConfiguration.of(
+                                context,
+                              ).copyWith(scrollbars: false),
+                              child: xt.TerminalView(
+                                _terminal,
+                                key: _terminalViewKey,
+                                controller: _xtermController,
+                                theme: _theme,
+                                focusNode: _focusNode,
+                                autofocus: true,
+                                scrollController: _scrollController,
+                                onKeyEvent: _handleTerminalKeyEvent,
+                                textStyle: _textStyle,
+                                // Desktop uses the hardware-keyboard path instead of
+                                // xterm's hidden IME TextInput connection: on macOS the
+                                // IME path desyncs Flutter's HardwareKeyboard state
+                                // ("physical key already pressed") and swallows
+                                // keystrokes. Mobile must use the IME path, though: it
+                                // is what raises the soft keyboard, so disabling it
+                                // leaves a phone unable to type.
+                                hardwareKeyboardOnly: !_isMobile,
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
+                    if (widget.isLoading)
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        height: 2,
+                        child: LinearProgressIndicator(
+                          value: isTest ? 0.5 : null,
+                          minHeight: 2,
+                          backgroundColor: Colors.transparent,
+                          color: const Color(0xffffc857),
+                        ),
+                      ),
                     if (copyButton != null) copyButton,
                   ],
                 ),
