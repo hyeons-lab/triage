@@ -1281,5 +1281,24 @@ void main() {
       expect(rawOutputFromSnapshot({}), isEmpty);
       expect(rawOutputFromSnapshot({'raw_output': null}), isEmpty);
     });
+
+    test('rejects corrupted gzip stream and returns empty Uint8List', () {
+      final corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
+      final encoded = base64Encode(corrupt);
+
+      final snapshot = <String, dynamic>{'raw_output': encoded};
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, isEmpty);
+    });
+
+    test('handles malformed list gracefully without throwing TypeError', () {
+      final snapshot = <String, dynamic>{
+        'raw_output': [65, null, 'invalid', 68],
+      };
+      final result = rawOutputFromSnapshot(snapshot);
+
+      expect(result, isEmpty);
+    });
   });
 }

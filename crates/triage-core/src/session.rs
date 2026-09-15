@@ -151,7 +151,10 @@ mod compressed_bytes {
             return serializer.serialize_str("");
         }
 
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        // Fast compression provides low latency with minimal ratio difference on terminal text.
+        let estimated_capacity = (bytes.len() / 2).clamp(1024, 256 * 1024);
+        let mut encoder =
+            GzEncoder::new(Vec::with_capacity(estimated_capacity), Compression::fast());
         encoder
             .write_all(bytes)
             .map_err(serde::ser::Error::custom)?;
@@ -184,11 +187,24 @@ mod compressed_bytes {
                     .decode(value)
                     .map_err(de::Error::custom)?;
 
-                let mut decoder = GzDecoder::new(&decoded[..]);
-                let mut decompressed = Vec::new();
-                if decoder.read_to_end(&mut decompressed).is_ok() {
+                const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+                const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB ceiling
+
+                if decoded.starts_with(&GZIP_MAGIC) {
+                    let decoder = GzDecoder::new(&decoded[..]);
+                    let mut decompressed = Vec::new();
+                    let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
+                    limited
+                        .read_to_end(&mut decompressed)
+                        .map_err(|e| de::Error::custom(format!("corrupted gzip payload: {e}")))?;
+                    if decompressed.len() as u64 > MAX_DECOMPRESSED_BYTES {
+                        return Err(de::Error::custom(
+                            "decompressed raw_output exceeds maximum size limit (16 MiB)",
+                        ));
+                    }
                     Ok(decompressed)
                 } else {
+                    // Genuine uncompressed base64 payload
                     Ok(decoded)
                 }
             }
@@ -1155,5 +1171,71 @@ mod tests {
         let deserialized: SessionSnapshot =
             serde_json::from_value(base64_json).expect("deserialize uncompressed base64 snapshot");
         assert_eq!(deserialized.raw_output, b"ABCD");
+    }
+
+    #[test]
+    fn session_snapshot_json_rejects_corrupted_gzip() {
+        use base64::Engine;
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        // Starts with gzip magic bytes 0x1f, 0x8b but has corrupt payload
+        let corrupt_bytes = vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&corrupt_bytes);
+        let corrupt_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": encoded,
+            "raw_output_start": 0
+        });
+
+        let result: Result<SessionSnapshot, _> = serde_json::from_value(corrupt_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_snapshot_json_rejects_oversized_decompression() {
+        use base64::Engine;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let size = serde_json::to_value(SessionSize::default()).unwrap();
+        // 17.4 MiB of zeroes (> 16 MiB limit) compresses to ~17 KiB
+        let chunk = [0u8; 64 * 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        for _ in 0..272 {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+
+        let bomb_json = serde_json::json!({
+            "output_seq": 1,
+            "bytes_logged": 4,
+            "size": size,
+            "visible_rows": [],
+            "styled_rows_start": 0,
+            "styled_rows": [],
+            "cursor": { "col": 0, "row": 0, "visible": true },
+            "current_working_directory": null,
+            "context": null,
+            "bracketed_paste_enabled": false,
+            "exited": false,
+            "raw_output": encoded,
+            "raw_output_start": 0
+        });
+
+        let result: Result<SessionSnapshot, _> = serde_json::from_value(bomb_json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("exceeds maximum size limit"));
     }
 }

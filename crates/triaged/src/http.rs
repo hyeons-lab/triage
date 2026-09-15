@@ -534,11 +534,20 @@ where
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok())
     {
-        let tokens: Vec<&str> = protocol_header.split(',').map(|s| s.trim()).collect();
-        if tokens.contains(&"triage-flatbuffers") {
+        let mut has_fb = false;
+        let mut has_json = false;
+        for token in protocol_header.split(',') {
+            match token.trim() {
+                "triage-flatbuffers" => has_fb = true,
+                "triage-json" => has_json = true,
+                _ => {}
+            }
+        }
+
+        if has_fb {
             selected_format = triage_transport_ws::ProtocolFormat::Flatbuffers;
             selected_proto_header = Some(HeaderValue::from_static("triage-flatbuffers"));
-        } else if tokens.contains(&"triage-json") {
+        } else if has_json {
             selected_format = triage_transport_ws::ProtocolFormat::Json;
             selected_proto_header = Some(HeaderValue::from_static("triage-json"));
         } else {

@@ -117,17 +117,31 @@ Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
     if (raw.isEmpty) return Uint8List(0);
     try {
       final decoded = base64Decode(raw);
-      try {
-        return Uint8List.fromList(GZipDecoder().decodeBytes(decoded));
-      } catch (_) {
-        return decoded;
+      final isGzip =
+          decoded.length >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b;
+      if (isGzip) {
+        try {
+          final decompressed = GZipDecoder().decodeBytes(decoded, verify: true);
+          if (decompressed.length > 16 * 1024 * 1024) {
+            return Uint8List(0);
+          }
+          return Uint8List.fromList(decompressed);
+        } catch (_) {
+          // Corrupted or truncated gzip stream; reject rather than feeding garbage bytes to xterm.
+          return Uint8List(0);
+        }
       }
+      return decoded;
     } catch (_) {
       return Uint8List(0);
     }
   }
   if (raw is List) {
-    return Uint8List.fromList(raw.cast<int>());
+    try {
+      return Uint8List.fromList(raw.cast<int>());
+    } catch (_) {
+      return Uint8List(0);
+    }
   }
   return Uint8List(0);
 }
@@ -386,17 +400,10 @@ class TriageWebSocketClient {
     });
 
     try {
-      var sentFlatBuffers = false;
       if (isFlatBuffersNegotiated) {
-        try {
-          final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
-          _channel!.sink.add(bytes);
-          sentFlatBuffers = true;
-        } on UnimplementedError {
-          // Fall through to JSON text frame for request types without FlatBuffers builders.
-        }
-      }
-      if (!sentFlatBuffers) {
+        final List<int> bytes = _serializeFlatBuffersRequest(id, type, extra);
+        _channel!.sink.add(bytes);
+      } else {
         final payload = <String, dynamic>{'id': id, 'type': type};
         if (extra != null) {
           payload.addAll(extra);

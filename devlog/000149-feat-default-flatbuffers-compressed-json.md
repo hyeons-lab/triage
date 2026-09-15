@@ -42,9 +42,18 @@ unless `triage-json` is explicitly negotiated. Implemented `rawOutputFromSnapsho
 supporting gzip decompression, uncompressed base64, and legacy integer list formats. Added
 unit tests for negotiation defaults and snapshot decompression in `test/triage_websocket_client_test.dart`.
 
+2026-09-15T13:35-0400 Hardened gzip decompression and protocol handling following local code review:
+- Added RFC 1952 gzip magic byte check (`[0x1f, 0x8b]`) and bounded decompression ceiling (16 MiB via `.take(16 * 1024 * 1024 + 1)`) in `crates/triage-core/src/session.rs` to guard against zip bombs and avoid returning corrupted archives as raw terminal bytes.
+- Switched compression to `Compression::fast()` with pre-allocated buffer sizing to minimize snapshot serialization latency.
+- Added 16 MiB size guard and wrapped list element casting in `try / catch` in Flutter's `rawOutputFromSnapshot` to prevent unhandled `TypeError` crashes on malformed snapshot arrays.
+- Removed fallthrough from FlatBuffers to JSON text frames in Flutter `_send` to ensure binary sockets never send invalid text frames to the daemon.
+- Replaced heap allocations in `triaged/src/http.rs` subprotocol negotiation with single-pass token matching.
+- Added comprehensive unit tests in Rust and Dart for corrupted gzip stream rejection, oversized zip bomb defense, and malformed list error handling.
+
 ## Commits
 
-- HEAD: feat(transport): default to flatbuffers and compress json snapshots
+- acb3bc3: feat(transport): default to flatbuffers and compress json snapshots
+- HEAD: fix(transport): harden snapshot decompression and subprotocol handling
 
 ## Progress
 
@@ -58,3 +67,5 @@ unit tests for negotiation defaults and snapshot decompression in `test/triage_w
 - [x] Add `archive` dependency and implement gzip base64 decompression in Flutter client
 - [x] Add Flutter unit tests for snapshot decompression and protocol selection
 - [x] Validate workspace formatting, lints, Rust tests, and Flutter tests
+- [x] Execute Antigravity local review fix loop at max depth
+- [x] Harden decompression bounding, corrupted stream defense, and text frame safety
