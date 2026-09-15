@@ -828,36 +828,44 @@ class TerminalStore extends ChangeNotifier {
   String _translateNewlines(String input) {
     if (input.isEmpty) return input;
 
+    final len = input.length;
     var needsTranslation = false;
-    for (var i = 0; i < input.length; i++) {
-      final isLf = input[i] == '\n';
-      final precededByCr =
-          (i > 0 && input[i - 1] == '\r') || (i == 0 && _pendingCarriageReturn);
-      if (isLf && !precededByCr) {
-        if (!_isFollowedByRelativeCursorMovement(input, i + 1)) {
+    for (var i = 0; i < len; i++) {
+      if (input.codeUnitAt(i) == 0x0A) {
+        final precededByCr =
+            (i > 0 && input.codeUnitAt(i - 1) == 0x0D) ||
+            (i == 0 && _pendingCarriageReturn);
+        if (!precededByCr && !_isFollowedByRelativeCursorMovement(input, i + 1)) {
           needsTranslation = true;
           break;
         }
       }
     }
 
-    final endsWithCr = input.endsWith('\r');
+    final endsWithCr = input.codeUnitAt(len - 1) == 0x0D;
     if (!needsTranslation) {
       _pendingCarriageReturn = endsWithCr;
       return input;
     }
 
     final buffer = StringBuffer();
-    for (var i = 0; i < input.length; i++) {
-      final isLf = input[i] == '\n';
-      final precededByCr =
-          (i > 0 && input[i - 1] == '\r') || (i == 0 && _pendingCarriageReturn);
-      if (isLf && !precededByCr) {
-        if (!_isFollowedByRelativeCursorMovement(input, i + 1)) {
+    var lastFlush = 0;
+    for (var i = 0; i < len; i++) {
+      if (input.codeUnitAt(i) == 0x0A) {
+        final precededByCr =
+            (i > 0 && input.codeUnitAt(i - 1) == 0x0D) ||
+            (i == 0 && _pendingCarriageReturn);
+        if (!precededByCr && !_isFollowedByRelativeCursorMovement(input, i + 1)) {
+          if (i > lastFlush) {
+            buffer.write(input.substring(lastFlush, i));
+          }
           buffer.write('\r');
+          lastFlush = i;
         }
       }
-      buffer.write(input[i]);
+    }
+    if (lastFlush < len) {
+      buffer.write(input.substring(lastFlush));
     }
     _pendingCarriageReturn = endsWithCr;
     return buffer.toString();

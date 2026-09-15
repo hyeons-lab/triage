@@ -1292,4 +1292,21 @@ void main() {
     store.dispatch(LiveBytes(b('more'), outputSeq: 2));
     expect(sink.ops, ['write:after', 'write:more']);
   });
+
+  test('large payload newline translation completes quickly without stalling', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('init'), cols: 80, rows: 24, throughOutputSeq: 1),
+    );
+    sink.ops.clear();
+
+    final pattern = 'line of terminal output\nand another line\r\n';
+    final repeated = pattern * 10000;
+    final stopwatch = Stopwatch()..start();
+    store.dispatch(LiveBytes(utf8.encode(repeated), outputSeq: 2));
+    stopwatch.stop();
+
+    expect(sink.written.toString(), contains('line of terminal output\r\n'));
+    expect(stopwatch.elapsedMilliseconds, lessThan(2000));
+  });
 }

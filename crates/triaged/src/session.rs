@@ -2882,7 +2882,7 @@ impl SessionApi for SessionManager {
             session_id: Some(session_id.clone()),
         };
         let launch = PersistedSessionLaunch::from(&config);
-        let last_known_cwd = launch.cwd.clone();
+        let last_known_cwd = launch.cwd.clone().or_else(|| std::env::current_dir().ok());
         let actor = SessionActor::spawn_managed(
             config,
             session_id.clone(),
@@ -2891,11 +2891,14 @@ impl SessionApi for SessionManager {
             Some(self.global_senders()),
             self.compression_tx(),
         )?;
+        let actor_tx = actor.tx.clone();
+        let last_activity_ms = actor.last_activity_ms();
+        let initial_cwd = last_known_cwd.clone();
 
         let mut sessions = self.sessions()?;
 
         // Authoritative handover gate. The check at the top of this function ran
-        // before `spawn_managed` forked the PTY — tens of milliseconds ago — so a
+        // before `spawn_managed` forked the PTY (tens of milliseconds ago), so a
         // handover that began in the meantime would have snapshotted the session
         // set without this session, and `detach_all_live_sessions` would then drop
         // it on the floor when the outgoing daemon exits. Re-checking here closes
@@ -2907,7 +2910,7 @@ impl SessionApi for SessionManager {
         // the wrong reason to trust this gate.)
         //
         // The forked child is killed by dropping `actor` on this path, which is
-        // correct — it never became a session anyone can reach.
+        // correct: it never became a session anyone can reach.
         if self.handover_in_flight() {
             drop(sessions);
             bail!("a handover is in progress; try again once the daemon swap completes");
@@ -2935,6 +2938,30 @@ impl SessionApi for SessionManager {
             }
             return Err(error);
         }
+        drop(sessions);
+
+        let context = request_session_context(&actor_tx).ok().flatten();
+        let (repository_root, worktree_root, branch) = match &context {
+            Some(ctx) => (
+                ctx.repository_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                ctx.worktree_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                ctx.branch_name().map(str::to_string),
+            ),
+            None => (None, None, None),
+        };
+        let current_working_directory = initial_cwd.map(|p| p.to_string_lossy().into_owned());
+        self.broadcast_global(ServerMessage::SessionStarted {
+            session_id: session_id.clone(),
+            current_working_directory,
+            repository_root,
+            worktree_root,
+            branch,
+            last_activity_ms,
+        });
         Ok(session_id)
     }
 
@@ -2961,7 +2988,7 @@ impl SessionApi for SessionManager {
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
-                let snapshot = request_snapshot(&cmd_tx)?;
+                let snapshot = request_snapshot_with_history(&cmd_tx)?;
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
                     lease,
@@ -3286,9 +3313,7 @@ impl SessionApi for SessionManager {
             .with_context(|| format!("session {session_id} not found"))?;
         let resolved = match session {
             ManagedSession::Live { actor, .. } => Resolved::Live(actor.tx.clone()),
-            ManagedSession::Historical { session, .. } => {
-                Resolved::Ready(session.snapshot_with_history())
-            }
+            ManagedSession::Historical { session, .. } => Resolved::Ready(session.snapshot()),
             ManagedSession::Restoring { .. } => bail!("session {session_id} is being restored"),
         };
         // Release before the round-trip: see `request_snapshot`.
@@ -3467,6 +3492,9 @@ impl SessionApi for SessionManager {
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
         remove_session_log(&session_id, &log_path);
+        self.broadcast_global(ServerMessage::SessionTerminated {
+            session_id: session_id.clone(),
+        });
         Ok(completed)
     }
 
@@ -5250,6 +5278,9 @@ enum ActorCommand {
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
+    SnapshotWithHistory {
+        response: Sender<ActorResult<SessionSnapshot>>,
+    },
     /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
     /// no raw-output-history disk read, so it never blocks on I/O. Returns a
     /// `(rows, output_seq, context)` tuple: the plain visible rows, the current
@@ -5664,6 +5695,10 @@ impl ActorState {
                 false
             }
             ActorCommand::Snapshot { response } => {
+                let _ = response.send(Ok(self.snapshot()));
+                false
+            }
+            ActorCommand::SnapshotWithHistory { response } => {
                 let _ = response.send(Ok(self.snapshot_with_history()));
                 false
             }
@@ -6872,10 +6907,10 @@ const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Maximum bytes of raw output history carried in a snapshot for client-side
-/// re-emulation. 4 MiB matches a 50,000-line terminal scrollback buffer while
+/// re-emulation. 1 MiB matches ~15,000 to 25,000 lines of scrollback while
 /// remaining safely within WebSocket frame and memory limits during snapshot
 /// serialization.
-const RAW_OUTPUT_TAIL_CAP: u64 = 4 * 1024 * 1024;
+const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
 
 /// Maximum bytes of a session log replayed through the terminal emulator when a
 /// session is adopted, restored, or reflowed after a resize.
@@ -6888,11 +6923,11 @@ const RAW_OUTPUT_TAIL_CAP: u64 = 4 * 1024 * 1024;
 /// This is therefore `>= MAX_SESSION_LOG_BYTES`, so replay never discards bytes
 /// the log still holds: whatever survives on disk is replayed in full, exactly
 /// like the full-file read this replaces. What the cap buys is a ceiling on a
-/// legacy log written before trimming existed — 16 MiB of work instead of 100 MB.
+/// legacy log written before trimming existed: 16 MiB of work instead of 100 MB.
 ///
 /// Note what this does *not* promise. Trimming drops the front of the log, so a
 /// session that outgrows [`MAX_SESSION_LOG_BYTES`] does lose the early bytes
-/// where those modes were set — the loss moves from replay time to trim time,
+/// where those modes were set: the loss moves from replay time to trim time,
 /// it does not disappear. That is the accepted cost of bounding the log at all;
 /// shells and full-screen TUIs re-assert their modes on the next repaint, and
 /// `last_known_cwd` outranks the replayed OSC 7 cwd precisely because the replay
@@ -7319,6 +7354,13 @@ fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     recv_actor_result(resp_rx, "reading session snapshot")
 }
 
+fn request_snapshot_with_history(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::SnapshotWithHistory { response: resp_tx })
+        .context("sending session snapshot with history command")?;
+    recv_actor_result(resp_rx, "reading session snapshot with history")
+}
+
 fn request_actor_shutdown(tx: &Sender<ActorCommand>) -> Result<CompletedSession> {
     let (response_tx, response_rx) = mpsc::channel();
     tx.send(ActorCommand::Shutdown {
@@ -7339,6 +7381,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SnapshotWithHistory { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::SummaryRows { response } => {
@@ -13849,5 +13894,70 @@ mod tests {
         assert!(!SessionManager::logs_belong_to_same_session(
             path1, path2, &other_sid
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_lifecycle_broadcasts_started_and_terminated() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config);
+        let rx = manager.register_global_receiver();
+
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+
+        let mut started = false;
+        let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < start_deadline {
+            if let Ok(ServerMessage::SessionStarted {
+                session_id: sid,
+                current_working_directory: cwd,
+                ..
+            }) = rx.recv_timeout(std::time::Duration::from_millis(100))
+            {
+                assert_eq!(sid, session_id);
+                assert!(cwd.is_some(), "expected default cwd to be set");
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "expected SessionStarted message");
+
+        let snap = manager
+            .snapshot_session(session_id.clone())
+            .expect("snapshot session");
+        assert!(
+            snap.raw_output.is_empty(),
+            "snapshot_session should omit raw_output history"
+        );
+
+        let _attached = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("test-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+            })
+            .expect("attach session");
+
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown session");
+
+        let mut terminated = false;
+        let term_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < term_deadline {
+            if let Ok(ServerMessage::SessionTerminated { session_id: sid }) =
+                rx.recv_timeout(std::time::Duration::from_millis(100))
+            {
+                assert_eq!(sid, session_id);
+                terminated = true;
+                break;
+            }
+        }
+        assert!(terminated, "expected SessionTerminated message");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 }

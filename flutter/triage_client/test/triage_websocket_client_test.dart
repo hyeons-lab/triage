@@ -1082,5 +1082,106 @@ void main() {
       expect(layout.sessionIds, ['session-x']);
       expect(layout.customLabels, {'session-x': 'Primary Task'});
     });
+
+    test(
+      'decodes SessionStartedPayload and SessionTerminatedPayload push broadcast',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final events = <Map<String, dynamic>>[];
+        client.events.listen(events.add);
+
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType: fbs.ServerMessagePayloadTypeId.SessionStartedPayload,
+            payload: fbs.SessionStartedPayloadObjectBuilder(
+              sessionId: 'session-remote-1',
+              repositoryRoot: '/home/user/project',
+              branch: 'main',
+              lastActivityMs: 1720000000000,
+            ),
+          ).toBytes(),
+        );
+
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType:
+                fbs.ServerMessagePayloadTypeId.SessionTerminatedPayload,
+            payload: fbs.SessionTerminatedPayloadObjectBuilder(
+              sessionId: 'session-remote-1',
+            ),
+          ).toBytes(),
+        );
+
+        await pumpEventQueue();
+        expect(events, hasLength(2));
+        expect(events[0], {
+          'type': 'session_started',
+          'session_id': 'session-remote-1',
+          'current_working_directory': null,
+          'repository_root': '/home/user/project',
+          'worktree_root': null,
+          'branch': 'main',
+          'last_activity_ms': 1720000000000,
+        });
+        expect(events[1], {
+          'type': 'session_terminated',
+          'session_id': 'session-remote-1',
+        });
+      },
+    );
   });
+
+  test(
+    'dispatches session_started and session_terminated text events',
+    () async {
+      final sink = RecordingWebSocketSink();
+      final channel = FakeWebSocketChannel(sink: sink);
+      final textClient = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await textClient.connect();
+
+      final events = <Map<String, dynamic>>[];
+      textClient.events.listen(events.add);
+
+      channel.addIncoming(
+        jsonEncode({
+          'type': 'session_started',
+          'session_id': 'session-text-1',
+          'repository_root': '/home/user/repo',
+          'branch': 'feature',
+        }),
+      );
+
+      channel.addIncoming(
+        jsonEncode({
+          'type': 'session_terminated',
+          'session_id': 'session-text-1',
+        }),
+      );
+
+      await pumpEventQueue();
+      expect(events, hasLength(2));
+      expect(events[0], {
+        'type': 'session_started',
+        'session_id': 'session-text-1',
+        'repository_root': '/home/user/repo',
+        'branch': 'feature',
+      });
+      expect(events[1], {
+        'type': 'session_terminated',
+        'session_id': 'session-text-1',
+      });
+    },
+  );
 }

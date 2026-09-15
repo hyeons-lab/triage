@@ -3418,6 +3418,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final error = message['error'] as Map<String, dynamic>?;
       final msg = error?['message']?.toString() ?? '';
       if (msg.contains('input lease')) {
+        if (_sessions.isEmpty ||
+            _selectedIndex < 0 ||
+            _selectedIndex >= _sessions.length) {
+          return;
+        }
         final current = _selectedSession;
         final sid = _sessionIdFor(current) ?? current.remoteSessionId;
         if (sid != null && !current.isExited) {
@@ -3568,6 +3573,116 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       unawaited(_persistCustomLabels());
       if (mounted) setState(() {});
+      return;
+    }
+
+    if (type == 'session_started') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null || sessionId.trim().isEmpty) return;
+      final existingIndex =
+          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (existingIndex != -1) return;
+
+      final wasEmpty = _sessions.isEmpty;
+      final session = _loadingDaemonSession(sessionId, loading: wasEmpty);
+      session.applyContext(
+        repoRoot: message['repository_root']?.toString(),
+        worktreeRoot: message['worktree_root']?.toString(),
+        branch: message['branch']?.toString(),
+        cwd: message['current_working_directory']?.toString(),
+        updateCwd: message['current_working_directory'] != null,
+      );
+      final lastActivity = message['last_activity_ms'];
+      if (lastActivity is int) {
+        session.lastActivityMs = lastActivity;
+      } else if (lastActivity is num) {
+        session.lastActivityMs = lastActivity.toInt();
+      }
+      _setupSessionInputListener(session);
+
+      void apply() {
+        _sessions.add(session);
+        _regroupRail();
+      }
+
+      if (mounted) {
+        setState(apply);
+      } else {
+        apply();
+      }
+
+      if (wasEmpty && !_disposed) {
+        unawaited(
+          _loadDaemonSessionInto(
+            sessionId,
+            includeHistory: true,
+            failedSessionIds: <String>[],
+          ).catchError((Object e) {
+            if (e is! TriageAuthException || _disposed || _needsPairing) return;
+            unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+          }),
+        );
+      }
+      return;
+    }
+
+    if (type == 'session_terminated') {
+      final sessionId = message['session_id'] as String?;
+      if (sessionId == null || sessionId.trim().isEmpty) return;
+      final index =
+          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      if (index == -1) return;
+
+      final session = _sessions[index];
+      session.dispose();
+      TerminalPane.destroySession(session.title);
+
+      final wasSelected = index == _selectedIndex;
+      if (index < _selectedIndex) {
+        _selectedIndex--;
+      }
+      _sessions.removeAt(index);
+      if (_selectedIndex >= _sessions.length) {
+        _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+      }
+
+      var newPins = _pins;
+      if (_pins.sessionIds.contains(sessionId)) {
+        newPins = unpin(_pins, sessionId: sessionId);
+        unawaited(_persistPins(newPins));
+      }
+      if (_customLabels.containsKey(sessionId) ||
+          _customLabels.containsKey('triage / $sessionId')) {
+        _customLabels.remove(sessionId);
+        _customLabels.remove('triage / $sessionId');
+        unawaited(_persistCustomLabels());
+      }
+
+      _applyPins(newPins, persist: false);
+
+      if (wasSelected &&
+          _sessions.isNotEmpty &&
+          _selectedIndex >= 0 &&
+          _selectedIndex < _sessions.length) {
+        final nextSelected = _sessions[_selectedIndex];
+        if (!nextSelected.loaded) {
+          final sid = _sessionIdFor(nextSelected);
+          if (sid != null) {
+            unawaited(
+              _loadDaemonSessionInto(
+                sid,
+                includeHistory: true,
+                failedSessionIds: <String>[],
+              ).catchError((Object e) {
+                if (e is! TriageAuthException || _disposed || _needsPairing) return;
+                unawaited(
+                  _showPairingChallenge(_connectGeneration, _activeServerId),
+                );
+              }),
+            );
+          }
+        }
+      }
       return;
     }
 
@@ -3963,7 +4078,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (kIsWeb) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!_disposed &&
-              identical(_selectedSession, session) &&
+              _selectedIndex >= 0 &&
+              _selectedIndex < _sessions.length &&
+              identical(_sessions[_selectedIndex], session) &&
               _client.isConnected) {
             _refitActiveSession();
           }
@@ -3978,9 +4095,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!_disposed &&
             !session.hasFitted &&
-            identical(_selectedSession, session) &&
+            _selectedIndex >= 0 &&
+            _selectedIndex < _sessions.length &&
+            identical(_sessions[_selectedIndex], session) &&
             _client.isConnected) {
-          unawaited(_refreshSessionSnapshot(session, includeHistory: true));
+          unawaited(_refreshSessionSnapshot(session, includeHistory: false));
         }
       });
     }
@@ -4769,14 +4888,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         ),
       );
 
-      final workspace = _sessions.isEmpty
+      final currentSession = _sessions.isEmpty ? null : _selectedSession;
+      final workspace = currentSession == null
           ? emptyWorkspace
           : SessionWorkspace(
-              session: _selectedSession,
-              onCloseSession: () => _closeSession(_selectedSession),
+              session: currentSession,
+              onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
-                  _onSessionViewFit(_selectedSession, cols, rows),
-              onToggleJudge: () => _toggleSessionJudgePolicy(_selectedSession),
+                  _onSessionViewFit(currentSession, cols, rows),
+              onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
             );
