@@ -263,6 +263,19 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   double? _lastWidth;
   double? _lastHeight;
+  bool _tabDispatchInProgress = false;
+
+  bool _shouldDispatchTab() {
+    if (_tabDispatchInProgress) {
+      return false;
+    }
+    _tabDispatchInProgress = true;
+    scheduleMicrotask(() {
+      _tabDispatchInProgress = false;
+    });
+    return true;
+  }
+
   int? _lastFittedRows;
   int? _lastFittedCols;
   bool _focusCursorAfterReplay = false;
@@ -555,10 +568,15 @@ class _TerminalPaneState extends State<TerminalPane> {
           if (event.key == 'Tab' || event.code == 'Tab' || event.keyCode == 9) {
             event.preventDefault();
             event.stopPropagation();
-            widget.controller.notifyInteraction();
-            final shiftKey = event.shiftKey;
-            _sendInput(shiftKey ? '\x1b[Z' : '\t');
-            _activateTerminal();
+            try {
+              event.stopImmediatePropagation();
+            } catch (_) {}
+            if (_shouldDispatchTab()) {
+              widget.controller.notifyInteraction();
+              final shiftKey = event.shiftKey;
+              _sendInput(shiftKey ? '\x1b[Z' : '\t');
+              _activateTerminal();
+            }
             return;
           }
 
@@ -1201,12 +1219,17 @@ class _TerminalPaneState extends State<TerminalPane> {
           if (key == 'Tab' || code == 'Tab' || keyCode == 9) {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
-            final shiftKey =
-                js_util.getProperty(event, 'shiftKey') as bool? ?? false;
-            if (shiftKey) {
-              _sessionInputRouter.sendInput(sessionId, '\x1b[Z');
-            } else {
-              _sessionInputRouter.sendInput(sessionId, '\t');
+            try {
+              js_util.callMethod(event, 'stopImmediatePropagation', []);
+            } catch (_) {}
+            if (_shouldDispatchTab()) {
+              final shiftKey =
+                  js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+              if (shiftKey) {
+                _sessionInputRouter.sendInput(sessionId, '\x1b[Z');
+              } else {
+                _sessionInputRouter.sendInput(sessionId, '\t');
+              }
             }
             return false;
           }
@@ -2599,11 +2622,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       },
       onKeyEvent: (node, event) {
         if (event.logicalKey == LogicalKeyboardKey.tab) {
-          if (event is KeyDownEvent) {
-            widget.controller.notifyInteraction();
-            final shiftKey = HardwareKeyboard.instance.isShiftPressed;
-            _sendInput(shiftKey ? '\x1b[Z' : '\t');
-            _activateTerminal();
+          if (event is KeyDownEvent || event is KeyRepeatEvent) {
+            if (_shouldDispatchTab()) {
+              widget.controller.notifyInteraction();
+              final shiftKey = HardwareKeyboard.instance.isShiftPressed;
+              _sendInput(shiftKey ? '\x1b[Z' : '\t');
+              _activateTerminal();
+            }
           }
           return KeyEventResult.handled;
         }
