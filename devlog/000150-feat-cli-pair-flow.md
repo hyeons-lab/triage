@@ -22,6 +22,8 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - `2026-09-16T12:20-0400 flutter/triage_client/test/widget_test.dart`: Updated pairing widget tests to assert CLI command display and copy functionality without `/pair` URLs.
 - `2026-09-16T12:20-0400 crates/triaged/README.md, docs/remote-access.md, docs/configuration.md`: Updated documentation to describe CLI pairing, multi-user IPC security, and mark legacy `/pair` config options as deprecated.
 - `2026-09-16T12:35-0400 crates/triaged/src/ipc.rs`: Removed redundant uid_t to u32 cast in `peer_euid` on Linux to satisfy clippy warnings.
+- `2026-09-16T12:54-0400 crates/triaged/src/ipc.rs`: Logged warning on unsupported Unix platforms when peer UID verification fallback is used, and asserted simulated UID mismatch in unit tests.
+- `2026-09-16T12:54-0400 crates/triage/src/main.rs`: Checked `is_terminal` before reading stdin to fail immediately in non-interactive environments, avoided temporary allocation during trimming, and added unit test.
 
 ## Decisions
 
@@ -41,8 +43,10 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - [x] Update Flutter widget tests and verify 100% test pass
 - [x] Update documentation across README and docs
 - [x] Validate workspace with clippy, formatting checks, and full test suites
+- [x] Address CI review items: terminal check on stdin, safe trimming, and unsupported platform warning
 
 ## Commits
 
 - e49f2b8: feat(security): secure cli pair flow with peer credential verification
-- HEAD: fix(ipc): remove redundant cast in peer_euid on linux
+- b07082a: fix(ipc): remove redundant cast in peer_euid on linux
+- HEAD: fix(cli): guard non-interactive stdin and log warning on unsupported unix

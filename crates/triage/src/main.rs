@@ -136,18 +136,23 @@ fn run_pair(socket_path: Option<PathBuf>, device_code: Option<String>) -> Result
     let code = match device_code {
         Some(code) if !code.trim().is_empty() => code.trim().to_string(),
         _ => {
-            use std::io::Write;
+            use std::io::{IsTerminal, Write};
+            if !io::stdin().is_terminal() {
+                bail!(
+                    "Device code is required in non-interactive environments; usage: triage pair <device-code>"
+                );
+            }
             print!("Enter device code from Triage client: ");
             io::stdout().flush().context("flushing stdout")?;
             let mut input = String::new();
             io::stdin()
                 .read_line(&mut input)
                 .context("reading device code from stdin")?;
-            let trimmed = input.trim().to_string();
+            let trimmed = input.trim();
             if trimmed.is_empty() {
                 bail!("Device code is required; usage: triage pair [device-code]");
             }
-            trimmed
+            trimmed.to_string()
         }
     };
 
@@ -3010,5 +3015,18 @@ mod tests {
             .expect_err("ambiguous mode should fail");
 
         assert!(error.to_string().contains("cannot combine multiple modes"));
+    }
+
+    #[test]
+    fn run_pair_fails_when_device_code_missing_in_non_interactive_env() {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            let err = run_pair(None, None)
+                .expect_err("should reject missing device code when non-interactive");
+            assert!(
+                err.to_string()
+                    .contains("Device code is required in non-interactive environments")
+            );
+        }
     }
 }

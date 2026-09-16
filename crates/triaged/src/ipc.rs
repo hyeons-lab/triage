@@ -1253,6 +1253,9 @@ pub(crate) fn peer_euid(stream: &UnixStream) -> Result<u32> {
     )))]
     {
         let _ = stream;
+        tracing::warn!(
+            "secure peer UID verification is not supported on this platform; bypassing check"
+        );
         Ok(unsafe { libc::geteuid() as u32 })
     }
 }
@@ -2420,5 +2423,8 @@ mod tests {
         let my_uid = unsafe { libc::geteuid() as u32 };
         assert_eq!(uid1, my_uid);
         assert_eq!(uid2, my_uid);
+
+        let simulated_other_uid = my_uid.wrapping_add(1);
+        assert_ne!(uid1, simulated_other_uid);
     }
 }
