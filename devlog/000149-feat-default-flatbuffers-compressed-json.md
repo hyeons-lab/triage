@@ -18,6 +18,8 @@ and prevent session attach timeouts.
   Rust and Dart for uncompressed legacy integer arrays.
 - 2026-09-15T11:42-0400: Use `package:archive` in Flutter to support gzip decompression
   across all platforms including Flutter Web without requiring `dart:io`.
+- 2026-09-16T08:42-0400: Check gzip footer ISIZE before calling in-memory decompression in Flutter client. On mobile devices with memory constraints, inspecting the trailing 4 bytes avoids unconstrained memory allocations for giant compressed payloads before the decompression length check can run.
+- 2026-09-16T08:42-0400: Upgrade automated PR code reviews to `gemini-3.8-flash` in the GitHub Actions workflow and comment formatter.
 
 ## What Changed
 
@@ -51,11 +53,18 @@ unit tests for negotiation defaults and snapshot decompression in `test/triage_w
 - Supported native raw byte buffers (`visit_bytes`, `visit_byte_buf`) and pre-allocated decompression capacity in `crates/triage-core/src/session.rs`.
 - Added comprehensive unit tests in Rust and Dart for corrupted gzip stream rejection, oversized zip bomb defense, native byte buffer deserialization, and malformed list error handling.
 
+2026-09-16T08:42-0400 Addressed PR review comments and upgraded PR code review model:
+- `.github/workflows/code-review.yml` and `scripts/format_review_comment.py`: Updated review model from `gemini-3.7-flash` to `gemini-3.8-flash`.
+- `crates/triage-core/src/session.rs`: Used `saturating_mul(4)` in `visit_str` to prevent integer overflow during capacity calculation, and bounded legacy sequence visitor pre-allocation in `visit_seq` via `.min(1024 * 1024)` to defend against malicious `size_hint` payloads.
+- `flutter/triage_client/lib/services/triage_websocket_client.dart`: Added fast-path RFC 1952 gzip footer ISIZE check (last 4 bytes) in `rawOutputFromSnapshot` to reject payloads with uncompressed sizes exceeding the 16 MiB ceiling prior to in-memory decompression. Clarified `websocketSubprotocols` documentation regarding server-side FlatBuffers preference.
+- `flutter/triage_client/test/triage_websocket_client_test.dart`: Added unit test verifying early rejection of gzip payloads with ISIZE footers exceeding 16 MiB.
+
 ## Commits
 
 - f5ed488: feat(transport): default to flatbuffers and compress json snapshots
 - 4595517: fix(transport): harden snapshot decompression and subprotocol handling
-- HEAD: fix(core): add raw byte buffer support to snapshot deserializer
+- 02c8083: fix(core): add raw byte buffer support to snapshot deserializer
+- HEAD: fix(transport): address PR review comments and upgrade review model to 3.8 flash
 
 ## Progress
 

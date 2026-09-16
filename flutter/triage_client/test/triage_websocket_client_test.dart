@@ -1300,5 +1300,26 @@ void main() {
 
       expect(result, isEmpty);
     });
+
+    test(
+      'rejects gzip payload whose footer ISIZE exceeds 16 MiB ceiling without decompressing',
+      () {
+        final original = utf8.encode('Small payload');
+        final gzipped = List<int>.from(GZipEncoder().encode(original));
+        expect(gzipped.length, greaterThanOrEqualTo(8));
+        // Overwrite ISIZE with 32 MiB (0x02000000 in little-endian)
+        final len = gzipped.length;
+        gzipped[len - 4] = 0x00;
+        gzipped[len - 3] = 0x00;
+        gzipped[len - 2] = 0x00;
+        gzipped[len - 1] = 0x02;
+
+        final encoded = base64Encode(gzipped);
+        final snapshot = <String, dynamic>{'raw_output': encoded};
+        final result = rawOutputFromSnapshot(snapshot);
+
+        expect(result, isEmpty);
+      },
+    );
   });
 }

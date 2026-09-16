@@ -192,8 +192,10 @@ mod compressed_bytes {
 
                 if decoded.starts_with(&GZIP_MAGIC) {
                     let decoder = GzDecoder::new(&decoded[..]);
-                    let estimated_capacity =
-                        (decoded.len() * 4).clamp(1024, MAX_DECOMPRESSED_BYTES as usize);
+                    let estimated_capacity = decoded
+                        .len()
+                        .saturating_mul(4)
+                        .clamp(1024, MAX_DECOMPRESSED_BYTES as usize);
                     let mut decompressed = Vec::with_capacity(estimated_capacity);
                     let mut limited = decoder.take(MAX_DECOMPRESSED_BYTES + 1);
                     limited
@@ -229,7 +231,8 @@ mod compressed_bytes {
             where
                 A: de::SeqAccess<'de>,
             {
-                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                let capacity = seq.size_hint().unwrap_or(0).min(1024 * 1024);
+                let mut bytes = Vec::with_capacity(capacity);
                 while let Some(b) = seq.next_element()? {
                     bytes.push(b);
                 }

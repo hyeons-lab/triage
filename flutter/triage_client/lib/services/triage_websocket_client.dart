@@ -36,10 +36,10 @@ bool _isUnauthorized(String value) =>
     value.trim().toLowerCase() == _unauthorizedCode;
 
 /// WebSocket subprotocols offered at connect, in descending preference.
-/// Order is the whole mechanism: the daemon walks the client's offered tokens
-/// and takes the first it recognizes, so listing FlatBuffers first is what makes
-/// it the default. JSON stays as the second offer rather than being dropped:
-/// a client or daemon wanting JSON can explicitly negotiate it.
+/// The daemon defaults to FlatBuffers whenever `triage-flatbuffers` is offered
+/// or when no subprotocol header is received. JSON is offered as a fallback
+/// for daemons that predate the binary format, or can be explicitly negotiated
+/// by requesting `triage-json` alone.
 ///
 /// [TriageWebSocketClient.isFlatBuffersNegotiated] defaults to FlatBuffers unless
 /// the server explicitly selected JSON (`triage-json`). This ensures proxies
@@ -120,6 +120,16 @@ Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
       final isGzip =
           decoded.length >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b;
       if (isGzip) {
+        // Fast-path gzip footer ISIZE check (last 4 bytes of RFC 1952 payload)
+        if (decoded.length >= 8) {
+          final isize = ByteData.sublistView(
+            decoded,
+            decoded.length - 4,
+          ).getUint32(0, Endian.little);
+          if (isize > 16 * 1024 * 1024) {
+            return Uint8List(0);
+          }
+        }
         try {
           final decompressed = GZipDecoder().decodeBytes(decoded, verify: true);
           if (decompressed.length > 16 * 1024 * 1024) {
@@ -1130,10 +1140,7 @@ class TriageWebSocketClient {
     } else if (payloadType ==
         fbs.ServerMessagePayloadTypeId.SessionTerminatedPayload) {
       final terminated = payload as fbs.SessionTerminatedPayload;
-      return {
-        'type': 'session_terminated',
-        'session_id': terminated.sessionId,
-      };
+      return {'type': 'session_terminated', 'session_id': terminated.sessionId};
     }
     // Reached for `NONE`, or for a union member the bindings know but the
     // branches above have not been taught — which is exactly how the missing
