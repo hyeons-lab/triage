@@ -50,7 +50,7 @@ http-body-util = "0.1"
 rust-embed = { version = "8", features = ["compression"] }
 bytes = "1"
 http = "1"
-flate2 = "1"
+flate2 = { workspace = true }
 zstd = { workspace = true }
 
 [lints]

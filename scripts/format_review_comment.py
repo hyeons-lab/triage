@@ -213,7 +213,7 @@ def build_comment_body(
     if commit_link:
         meta_parts.append(f"Reviewed commit {commit_link}")
     meta_parts.append(timestamp_str)
-    meta_parts.append(f"Antigravity Deep Reasoning Audit (Gemini 3.7 Flash • {effort} effort)")
+    meta_parts.append(f"Antigravity Deep Reasoning Audit (Gemini 3.8 Flash • {effort} effort)")
 
     meta_header = f"> *{' • '.join(meta_parts)}*"
     full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n{meta_header}\n\n{review_text}"

@@ -405,4 +405,111 @@ mod tests {
             "pairing authorizer must not run for a non-GET request"
         );
     }
+
+    #[tokio::test]
+    async fn test_ws_upgrade_subprotocol_negotiation_defaults_to_flatbuffers() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(WebAssetCache::new(Some(temp_dir.path.clone())));
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            temp_dir.path.clone(),
+        )));
+
+        // 1. Both offered: selects FlatBuffers
+        let req = Request::builder()
+            .method("GET")
+            .uri("/ws")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-protocol", "triage-flatbuffers, triage-json")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let res = serve_http(req, Arc::clone(&cache), Arc::clone(&manager), || async {
+            false
+        })
+        .await
+        .unwrap();
+        assert_eq!(res.status(), hyper::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            res.headers().get("sec-websocket-protocol").unwrap(),
+            "triage-flatbuffers"
+        );
+
+        // 2. Omitted subprotocol header: defaults to FlatBuffers with no response header
+        let req_omitted = Request::builder()
+            .method("GET")
+            .uri("/ws")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let res_omitted = serve_http(
+            req_omitted,
+            Arc::clone(&cache),
+            Arc::clone(&manager),
+            || async { false },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res_omitted.status(), hyper::StatusCode::SWITCHING_PROTOCOLS);
+        assert!(
+            res_omitted
+                .headers()
+                .get("sec-websocket-protocol")
+                .is_none()
+        );
+
+        // 3. Client explicitly requested only triage-json: negotiates JSON
+        let req_json = Request::builder()
+            .method("GET")
+            .uri("/ws")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-protocol", "triage-json")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let res_json = serve_http(
+            req_json,
+            Arc::clone(&cache),
+            Arc::clone(&manager),
+            || async { false },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res_json.status(), hyper::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            res_json.headers().get("sec-websocket-protocol").unwrap(),
+            "triage-json"
+        );
+
+        // 4. json listed first but flatbuffers offered: selects FlatBuffers
+        let req_both = Request::builder()
+            .method("GET")
+            .uri("/ws")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-protocol", "triage-json, triage-flatbuffers")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let res_both = serve_http(
+            req_both,
+            Arc::clone(&cache),
+            Arc::clone(&manager),
+            || async { false },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res_both.status(), hyper::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            res_both.headers().get("sec-websocket-protocol").unwrap(),
+            "triage-flatbuffers"
+        );
+    }
 }
