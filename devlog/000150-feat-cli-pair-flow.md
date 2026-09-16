@@ -21,6 +21,7 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - `2026-09-16T12:20-0400 flutter/triage_client/lib/main.dart`: Removed `/pair` URL generation helpers and updated pairing UI to show the `triage pair <DEVICE_CODE>` CLI command with a copy button alongside the device code and PIN input form.
 - `2026-09-16T12:20-0400 flutter/triage_client/test/widget_test.dart`: Updated pairing widget tests to assert CLI command display and copy functionality without `/pair` URLs.
 - `2026-09-16T12:20-0400 crates/triaged/README.md, docs/remote-access.md, docs/configuration.md`: Updated documentation to describe CLI pairing, multi-user IPC security, and mark legacy `/pair` config options as deprecated.
+- `2026-09-16T12:35-0400 crates/triaged/src/ipc.rs`: Removed redundant uid_t to u32 cast in `peer_euid` on Linux to satisfy clippy warnings.
 
 ## Decisions
 
@@ -43,4 +44,5 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 
 ## Commits
 
-- HEAD: feat(security): secure cli pair flow with peer credential verification
+- e49f2b8: feat(security): secure cli pair flow with peer credential verification
+- HEAD: fix(ipc): remove redundant cast in peer_euid on linux

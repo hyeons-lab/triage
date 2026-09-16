@@ -1217,7 +1217,7 @@ pub(crate) fn peer_euid(stream: &UnixStream) -> Result<u32> {
             return Err(std::io::Error::last_os_error())
                 .context("reading peer credentials via getpeereid");
         }
-        Ok(euid as u32)
+        Ok(euid)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1239,7 +1239,7 @@ pub(crate) fn peer_euid(stream: &UnixStream) -> Result<u32> {
                 .context("reading peer credentials via SO_PEERCRED");
         }
         let ucred = unsafe { credentials.assume_init() };
-        Ok(ucred.uid as u32)
+        Ok(ucred.uid)
     }
 
     #[cfg(not(any(
