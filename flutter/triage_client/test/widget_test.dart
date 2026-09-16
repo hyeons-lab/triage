@@ -1935,16 +1935,11 @@ void main() {
 
     expect(find.text('Pair Remote Device'), findsOneWidget);
     expect(find.text('ABCD1234'), findsOneWidget);
-    expect(
-      find.textContaining('localhost:8080/pair', findRichText: true),
-      findsOneWidget,
-    );
-    expect(
-      find.textContaining('device_code=ABCD1234', findRichText: true),
-      findsOneWidget,
-    );
-    expect(find.byTooltip('Open verification URL'), findsOneWidget);
+    expect(find.text('Run on the computer running triaged'), findsOneWidget);
+    expect(find.text('triage pair ABCD1234'), findsOneWidget);
+    expect(find.byTooltip('Copy CLI command'), findsOneWidget);
     expect(find.byTooltip('Copy device code'), findsOneWidget);
+    expect(find.textContaining('/pair', findRichText: true), findsNothing);
     expect(client.pairingChallengeClientIds, client.helloClientIds);
 
     await tester.enterText(find.byType(TextField), 'WXYZ9876');
@@ -1969,20 +1964,10 @@ void main() {
 
     expect(find.text('Pair Remote Device'), findsOneWidget);
     expect(find.text('ABCD1234'), findsOneWidget);
-    // The URL to open on the daemon host is shown as an instruction, carrying
-    // the device code, using the fixed loopback literal and the connect port.
-    expect(find.text('Open on the computer running triaged'), findsOneWidget);
-    expect(
-      find.textContaining('127.0.0.1:7777/pair', findRichText: true),
-      findsOneWidget,
-    );
-    expect(
-      find.textContaining('device_code=ABCD1234', findRichText: true),
-      findsOneWidget,
-    );
-    // Instruction only — never a clickable button, which would hit this
-    // client's own loopback rather than the daemon's.
-    expect(find.byTooltip('Open verification URL'), findsNothing);
+    expect(find.text('Run on the computer running triaged'), findsOneWidget);
+    expect(find.text('triage pair ABCD1234'), findsOneWidget);
+    expect(find.byTooltip('Copy CLI command'), findsOneWidget);
+    expect(find.textContaining('/pair', findRichText: true), findsNothing);
     expect(
       find.textContaining('192.168.1.10:7777/pair', findRichText: true),
       findsNothing,
@@ -1992,11 +1977,6 @@ void main() {
   testWidgets('a DNS name starting with "127." is not treated as local', (
     WidgetTester tester,
   ) async {
-    // The pairing URL is only offered for a daemon on this machine, because a
-    // remote user's browser cannot usefully open it. `127.0.0.1.evil.com` is a
-    // legal, resolvable DNS name, and a `startsWith('127.')` host test would
-    // present it as local — rendering an attacker-controlled URL as a trusted
-    // "Verification URL" button carrying the device code.
     final client = FakeTriageWebSocketClient(
       uri: Uri.parse('ws://127.0.0.1.evil.com:7777/ws'),
       authenticated: false,
@@ -2004,14 +1984,10 @@ void main() {
     await tester.pumpWidget(TriageClientApp(client: client));
     await tester.pumpAndSettle();
 
-    // The instruction still renders — but with the fixed loopback literal, never
-    // the attacker-influenced claimed host, and never as a clickable button.
-    expect(find.text('Open on the computer running triaged'), findsOneWidget);
-    expect(find.byTooltip('Open verification URL'), findsNothing);
-    expect(
-      find.textContaining('127.0.0.1:7777/pair', findRichText: true),
-      findsOneWidget,
-    );
+    expect(find.text('Run on the computer running triaged'), findsOneWidget);
+    expect(find.text('triage pair ABCD1234'), findsOneWidget);
+    expect(find.byTooltip('Copy CLI command'), findsOneWidget);
+    expect(find.textContaining('/pair', findRichText: true), findsNothing);
     expect(
       find.textContaining('127.0.0.1.evil.com', findRichText: true),
       findsNothing,
@@ -2021,11 +1997,6 @@ void main() {
   testWidgets(
     'omits the pairing URL when the connection carries no explicit port',
     (WidgetTester tester) async {
-      // Behind a TLS reverse proxy (wss on the default 443, no explicit port),
-      // the daemon's real loopback listen port is unknowable from here. Printing
-      // one would confidently name the proxy's public port, not the daemon's, so
-      // the URL would not resolve on the daemon box. Fall back to guidance
-      // instead of showing a wrong URL.
       final client = FakeTriageWebSocketClient(
         uri: Uri.parse('wss://proxy.example.com/ws'),
         authenticated: false,
@@ -2033,15 +2004,10 @@ void main() {
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
-      expect(find.text('Open on the computer running triaged'), findsOneWidget);
-      expect(
-        find.text('Use the daemon host pairing page or run triage pair.'),
-        findsOneWidget,
-      );
-      // No pairing URL is asserted at all — neither the loopback literal nor the
-      // claimed host — and never a clickable button.
+      expect(find.text('Run on the computer running triaged'), findsOneWidget);
+      expect(find.text('triage pair ABCD1234'), findsOneWidget);
+      expect(find.byTooltip('Copy CLI command'), findsOneWidget);
       expect(find.textContaining('/pair', findRichText: true), findsNothing);
-      expect(find.byTooltip('Open verification URL'), findsNothing);
     },
   );
 

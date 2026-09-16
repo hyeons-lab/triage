@@ -144,9 +144,9 @@ Remote WebSocket and HTTP server configuration.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `bind` | string | `"0.0.0.0:7777"` | Network address and port to bind for HTTP/WebSocket traffic. Set to `"127.0.0.1:7777"` for local loopback only. |
-| `require_pairing` | boolean | `true` | When `true`, remote clients must complete a device-code + PIN authentication handshake. |
-| `pair_approval_tailnet_users` | array of strings | `[]` | List of Tailscale user logins (e.g. `["you@example.com"]`) allowed to approve pairing remotely via `/pair`. |
-| `pair_approval_trust_local_peers` | boolean | `true` | Whether same-host / loopback requests to `/pair` are auto-trusted. Set to `false` when running behind a local reverse proxy. |
+| `require_pairing` | boolean | `true` | When `true`, remote clients must complete a device-code + PIN authentication handshake approved via `triage pair`. |
+| `pair_approval_tailnet_users` | array of strings | `[]` | Deprecated. Legacy option for web `/pair` route; pairing approval is now handled exclusively via `triage pair`. |
+| `pair_approval_trust_local_peers` | boolean | `true` | Deprecated. Legacy option for web `/pair` route. |
 | `tls_cert` | string (optional) | `None` | Path to TLS certificate file (must be set alongside `tls_key`). |
 | `tls_key` | string (optional) | `None` | Path to TLS private key file (must be set alongside `tls_cert`). |
 | `web_assets_path` | string (optional) | `None` | Custom filesystem path to override embedded web client assets. |

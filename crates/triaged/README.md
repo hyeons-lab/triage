@@ -133,14 +133,13 @@ For the complete list of configuration options, defaults, and validation rules, 
 `0.0.0.0:7777` — all interfaces, so the client can connect from another device
 on your LAN/tailnet. Access is gated by device-code + PIN pairing
 (`require_pairing`, default true), and the daemon logs a warning at startup when
-bound to an unspecified address. A single TCP port serves three things:
+bound to an unspecified address. A single TCP port serves two things:
 
-- **Web client** — a built-in browser UI is served at `/`. Open
+- **Web client**: a built-in browser UI is served at `/`. Open
   <http://127.0.0.1:7777> (or `http://<daemon-host>:7777` from another device) to
   attach to your sessions from a browser, no separate install required.
-- **WebSocket API** — clients (the web UI, the native desktop/mobile clients, or
+- **WebSocket API**: clients (the web UI, the native desktop/mobile clients, or
   your own integration) attach over `ws://<daemon-host>:7777/ws`.
-- **Pairing approval page** — served at `/pair` (see [Pairing](#pairing) below).
 
 ### Connecting from another device
 
@@ -156,14 +155,14 @@ require_pairing = true
 
 Then point a client at `http://<daemon-host>:7777` (web UI) or
 `ws://<daemon-host>:7777/ws` (API). The daemon serves plain HTTP and WebSocket
-only — it does not terminate TLS, so front it with a reverse proxy (e.g. Caddy
+only: it does not terminate TLS, so front it with a reverse proxy (e.g. Caddy
 or nginx) if you need `https`/`wss`. Because the daemon owns live PTYs and
 scrollback, you can detach and re-attach from any client without disturbing the
 running shells.
 
-> **Pairing approval is host-only by default.** Even with a routable bind, the
-> `/pair` approval page is only served to loopback / same-host connections unless
-> you opt in to tailnet identity approval (see [Pairing](#pairing)).
+> **Pairing requires local CLI approval.** Pairing PINs are never exposed over
+> unauthenticated HTTP. To pair a new client, approve its device code securely
+> via the CLI on the daemon host (see [Pairing](#pairing)).
 
 ### Prebuilt desktop clients
 
@@ -251,27 +250,30 @@ for the scheme, key custody, and rotation policy.
 
 When `require_pairing` is enabled (the default), every client must complete a
 one-time PIN exchange before it can attach. This is a device-authorization-style
-flow, and the **approval step is restricted to the daemon host by default**. You
-can also opt in to approval from allowlisted Tailscale identities.
+flow, and the **approval step is performed securely via the CLI on the daemon host**.
+To protect multi-user systems where multiple users share the same machine, pairing
+PINs are never generated or exposed over unauthenticated HTTP. Approval requires
+local IPC with kernel-authenticated peer credentials (`SO_PEERCRED` on Linux,
+`getpeereid` on macOS/BSD), ensuring only the user running `triaged` can approve
+a pairing request.
 
 1. **Challenge.** A new client connects to `/ws` and sends a `hello` with its
    `client_id` (and a stored token, if it has one). With no valid token the
    daemon treats it as unauthenticated, and the client requests a *pairing
    challenge*. The daemon returns a short-lived `device_code`.
-2. **Approve.** The client surfaces the device code. By default, open the
-   approval URL **on the machine running the daemon** —
-   `http://127.0.0.1:7777/pair?device_code=<device_code>`. By default the `/pair`
-   page is served to **loopback / same-host connections** (`is_local_pairing_peer`).
-   If `pair_approval_tailnet_users` is configured, it is also served to remote
-   peers whose authenticated Tailscale login is on that allowlist. (Setting
-   `pair_approval_trust_local_peers = false` — for a loopback reverse-proxy
-   deployment — drops the loopback/same-host shortcut entirely, so even
-   `127.0.0.1` requests must be on the tailnet allowlist or `/pair` returns 404.)
-   The page validates the device code and displays a one-time, **device-bound
-   PIN** with an expiry.
-3. **Enter the PIN.** That PIN is typed back into the waiting client. The client
-   exchanges it (`pair(pin, client_id)`) and the daemon — after verifying the PIN
-   is bound to that exact client/device — issues a **bearer token**.
+2. **Approve via CLI.** The client displays the device code and the command to run.
+   On the machine running the daemon, run:
+   ```bash
+   triage pair <device-code>
+   ```
+   (If the device code argument is omitted, `triage pair` prompts for it on standard input).
+   The CLI connects to `triaged` over the local control socket. The daemon
+   verifies that the caller's effective UID matches the daemon process UID.
+   Upon approval, the CLI prints the one-time, **device-bound PIN** and its
+   expiration time.
+3. **Enter the PIN.** That PIN is typed into the waiting client. The client
+   exchanges it (`pair(pin, client_id)`) and the daemon, after verifying the PIN
+   is bound to that exact client/device, issues a **bearer token**.
 4. **Attach.** The client stores the token and reconnects with
    `hello { client_id, token }`; the daemon authenticates it and the session
    attaches. The token is reused on subsequent launches, so pairing is a
@@ -280,53 +282,6 @@ can also opt in to approval from allowlisted Tailscale identities.
 Pairing can be disabled for trusted, isolated setups by setting
 `require_pairing = false` under `[remote]`, in which case clients attach without
 the PIN exchange.
-
-To approve pairing from your own tailnet devices, add the Tailscale login names
-that may open `/pair`:
-
-```toml
-[remote]
-# Bind to this host's Tailscale IP so only tailnet traffic can reach /pair
-# (see the security caveats below); avoid 0.0.0.0 with tailnet approval.
-bind = "100.x.y.z:7777"
-require_pairing = true
-pair_approval_tailnet_users = ["you@example.com"]
-# Optional. Set false when a loopback reverse proxy fronts the daemon, so
-# forwarded requests are NOT auto-trusted as local and must pass the allowlist.
-# pair_approval_trust_local_peers = false
-```
-
-When a non-local peer requests `/pair`, `triaged` runs
-`tailscale whois --json <peer-ip>:<peer-port>` on the daemon host, reads
-`UserProfile.LoginName`, and compares it with the allowlist. If the `tailscale`
-CLI is missing, the lookup times out, or the login is not allowlisted, `/pair`
-remains unavailable to that peer. A successful lookup is cached per peer IP for
-a few seconds; a *failed* lookup is cached only briefly, so a transient
-`tailscale` hiccup won't lock out a legitimate user for long. `triaged` logs a
-startup warning if the allowlist is set but `tailscale` isn't runnable, or if it
-is bound to an unspecified address.
-
-> **Security caveats for tailnet approval.** Identity is derived from the
-> peer's TCP connection, so deploy accordingly:
->
-> - **Bind to the tailnet interface, not `0.0.0.0`.** With an all-interfaces
->   bind the daemon trusts the connection's source IP as the identity input;
->   bind to the host's Tailscale IP (e.g. `bind = "100.x.y.z:7777"`) so only
->   traffic that actually arrives over tailscale can reach `/pair`. `triaged`
->   warns at startup when an allowlist is configured on an unspecified bind.
-> - **A loopback reverse proxy bypasses the local-peer check.** `triaged`
->   terminates no TLS, so an HTTPS reverse proxy forwards over loopback — every
->   proxied request then looks like a same-host connection. By default such
->   peers are auto-approved; set `pair_approval_trust_local_peers = false` so
->   that even loopback peers must pass the tailnet allowlist (the proxy must
->   then forward genuine tailnet source IPs, or enforce the allowlist itself).
-> - **Tagged nodes share one identity.** Tailscale reports every tag-owned
->   (non-user) node with the synthetic login `tagged-devices`, so it is rejected
->   from the allowlist — list real user logins, not shared/service identities.
-> - **Allowlisted identities can self-approve.** An allowlisted device can both
->   request *and* approve its own pairing, so list only identities you trust to
->   authorize new devices — the allowlist replaces, it does not add to, the
->   "approval requires host access" guarantee.
 
 ---
 

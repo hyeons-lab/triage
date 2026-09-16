@@ -49,14 +49,6 @@ bind = "100.x.y.z:7777"    # the tailnet IP from step 1, NOT 0.0.0.0
 require_pairing = true
 ```
 
-> **This moves the pairing page.** Binding to a specific non-loopback address
-> means `127.0.0.1:7777` is no longer listening — a loopback connection gets
-> `ECONNREFUSED`. Use `http://100.x.y.z:7777/pair` on the daemon host instead.
-> Approval still works there: a host connecting to its own interface IP is seen
-> by the listener with that same IP as the source, which satisfies the
-> same-host check in `is_local_pairing_peer`
-> ([`crates/triaged/src/ws.rs`](../crates/triaged/src/ws.rs)).
-
 ### 3. Each client device joins the tailnet
 
 Install the Tailscale app (iOS / Android / macOS / Windows / Linux) and log in
@@ -68,33 +60,17 @@ change.
 
 ### 4. Pair the device
 
-1. The client shows a device code. (It connects to `/ws`; it never hits
-   `/pair`.)
-2. On the **daemon host**, open `http://100.x.y.z:7777/pair`, enter the device
-   code, and get a PIN.
+1. The client connects to `/ws` and displays a device code alongside the CLI
+   command to run.
+2. On the **daemon host**, run the CLI pairing command as the user running `triaged`:
+   ```bash
+   triage pair <device-code>
+   ```
+   The CLI connects over local IPC with kernel-authenticated credentials,
+   approves the device code, and prints the 8-character PIN and expiration time.
 3. Type the PIN into the client. It receives a persistent per-device token.
 
-The PIN is 8 Crockford Base32 characters — roughly 1.1 trillion combinations
-with a 5-minute TTL, so it is sound without brute-force throttling.
-
-### Optional: approve pairing without host access
-
-To approve a new device from your phone rather than walking to the daemon host,
-allowlist your tailnet identity:
-
-```toml
-[remote]
-pair_approval_tailnet_users = ["you@example.com"]
-```
-
-The daemon resolves the peer's identity with `tailscale whois` and matches it
-against this list. Read the security caveats in
-[`crates/triaged/README.md`](../crates/triaged/README.md#pairing) first — in
-particular, an allowlisted device can approve *its own* pairing, so this
-replaces rather than adds to the "approval requires host access" guarantee.
-
-If `tailscale` is not runnable on `PATH`, the gate fails closed (every remote
-peer denied) and the daemon warns at startup.
+The PIN is 8 Crockford Base32 characters with a 5-minute TTL.
 
 ## Security notes
 
@@ -104,11 +80,8 @@ peer denied) and the daemon warns at startup.
   warns at startup in this configuration.
 - **No TLS inside the tunnel, by design.** Traffic on the wire is
   WireGuard-encrypted; on the host it is plain HTTP bound to the tailnet
-  interface. Anything already running as your user on that host can reach it —
+  interface. Anything already running as your user on that host can reach it:
   unchanged from a LAN/tailnet setup today.
-- **Tagged nodes share one identity.** Tailscale reports tag-owned nodes as the
-  synthetic login `tagged-devices`, which is rejected from the allowlist. List
-  real user logins.
 - **Host firewalls apply.** Some hosts filter inbound traffic to the daemon
   even on a tailnet interface. On WSL2 in particular, the Hyper-V firewall for
   the VM defaults to blocking inbound connections, which silently drops tailnet
@@ -116,12 +89,6 @@ peer denied) and the daemon warns at startup.
 
 ## What this does not cover
 
-Bare-browser access from a machine with no Tailscale client — a borrowed
+Bare-browser access from a machine with no Tailscale client: a borrowed
 laptop, say. That requires the reverse-proxy shape, and with it the pre-auth
 exposure described above.
-
-It also needs a config option that does not exist yet: a way to require a PIN
-even for apparently-local peers. Setting `pair_approval_trust_local_peers =
-false` currently demands a non-empty tailnet allowlist
-([`crates/triage-core/src/config.rs`](../crates/triage-core/src/config.rs)),
-which a proxy-only deployment has no way to satisfy.

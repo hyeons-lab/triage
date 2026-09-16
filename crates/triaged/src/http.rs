@@ -193,16 +193,13 @@ fn sha2_hash(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub async fn serve_http<B, F, Fut>(
+pub async fn serve_http<B>(
     req: Request<B>,
     cache: Arc<WebAssetCache>,
     manager: Arc<crate::session::SessionManager>,
-    authorize_pairing: F,
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     B: hyper::body::Body + Send + 'static,
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = bool>,
 {
     let method = req.method();
     let path = req.uri().path();
@@ -221,18 +218,6 @@ where
             .is_some_and(|val| val == "websocket")
     {
         return Ok(handle_ws_upgrade(req, manager));
-    }
-
-    // `/pair` is the single source of truth for the pairing route. The
-    // authorizer (which may run `tailscale whois`) is invoked lazily here —
-    // only after the method check above — so non-GET requests never trigger it.
-    if path == "/pair" || path == "/pair/" {
-        if !authorize_pairing().await {
-            let mut res = Response::new(Full::new(Bytes::from("Not Found")));
-            *res.status_mut() = StatusCode::NOT_FOUND;
-            return Ok(res);
-        }
-        return Ok(pairing_page_response(req.uri().query(), manager));
     }
 
     // 2. Resolve requested clean relative asset path
@@ -300,211 +285,6 @@ where
     }
 
     Ok(res)
-}
-
-fn pairing_page_response(
-    query: Option<&str>,
-    manager: Arc<crate::session::SessionManager>,
-) -> Response<Full<Bytes>> {
-    let device_code = query.and_then(|query| query_param(query, "device_code"));
-    let (status, body) = match device_code {
-        Some(device_code) if !device_code.trim().is_empty() => {
-            match manager.approve_pairing_device_code(&device_code) {
-                Ok(pin) => (
-                    StatusCode::OK,
-                    render_pairing_pin_page(&pin.pin, pin.expires_at),
-                ),
-                Err(error) => (
-                    StatusCode::BAD_REQUEST,
-                    render_pairing_error_page(&error.to_string()),
-                ),
-            }
-        }
-        _ => (StatusCode::OK, render_pairing_form_page(None)),
-    };
-
-    let body = Bytes::from(body);
-    let mut res = Response::new(Full::new(body.clone()));
-    *res.status_mut() = status;
-    let headers = res.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-    );
-    res
-}
-
-fn query_param(query: &str, name: &str) -> Option<String> {
-    query.split('&').find_map(|part| {
-        let mut pieces = part.splitn(2, '=');
-        let key = pieces.next()?;
-        let value = pieces.next().unwrap_or_default();
-        if key == name {
-            Some(percent_decode_query_value(value))
-        } else {
-            None
-        }
-    })
-}
-
-fn percent_decode_query_value(value: &str) -> String {
-    let mut output = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                output.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) =
-                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-                {
-                    output.push((high << 4) | low);
-                    index += 3;
-                } else {
-                    output.push(bytes[index]);
-                    index += 1;
-                }
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn render_pairing_form_page(error: Option<&str>) -> String {
-    let error_html = error.map_or_else(String::new, |message| {
-        format!("<p class=\"error\">{}</p>", html_escape(message))
-    });
-    format!(
-        "{}{}{}{}",
-        pairing_page_prefix("Pair Triage Device"),
-        error_html,
-        r#"
-      <p>Enter the device code shown by the Triage client to create a pairing PIN for that device.</p>
-      <form method="get" action="/pair">
-        <label for="device_code">Device code</label>
-        <input id="device_code" name="device_code" autocomplete="one-time-code" autofocus required />
-        <button type="submit">Get PIN</button>
-      </form>
-"#,
-        pairing_page_suffix()
-    )
-}
-
-fn render_pairing_pin_page(pin: &str, expires_at: u64) -> String {
-    let pin = html_escape(pin);
-    format!(
-        r#"{}
-      <p>Enter this PIN in the Triage client that showed the device code.</p>
-      <div class="pin">{}</div>
-      <button type="button" class="copy-button" data-copy="{}" data-label="Copy PIN" onclick="copyPairingValue(this)">Copy PIN</button>
-      <p class="muted">This PIN expires at Unix time {}.</p>
-      <a href="/pair">Pair another device</a>
-{}"#,
-        pairing_page_prefix("Pairing PIN"),
-        pin,
-        pin,
-        expires_at,
-        pairing_page_suffix()
-    )
-}
-
-fn render_pairing_error_page(message: &str) -> String {
-    render_pairing_form_page(Some(message))
-}
-
-fn pairing_page_prefix(title: &str) -> String {
-    let title = html_escape(title);
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{}</title>
-  <style>
-    :root {{ color-scheme: dark; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f1416; color: #edf7f6; }}
-    main {{ width: min(92vw, 440px); padding: 28px; border: 1px solid #2a3437; border-radius: 8px; background: #161b1d; }}
-    h1 {{ margin: 0 0 16px; font-size: 24px; }}
-    p {{ color: #a5b1b4; line-height: 1.45; }}
-    label {{ display: block; margin: 20px 0 8px; color: #cdd7d6; }}
-    input {{ box-sizing: border-box; width: 100%; padding: 13px 14px; border: 1px solid #344145; border-radius: 6px; background: #101517; color: #edf7f6; font-size: 20px; letter-spacing: 4px; text-transform: uppercase; }}
-    button {{ margin-top: 16px; width: 100%; padding: 12px 14px; border: 0; border-radius: 6px; background: #2b6f6f; color: #fff; font-weight: 700; cursor: pointer; }}
-    button.copy-button {{ margin-top: 0; background: #344145; }}
-    button.copy-button.copied {{ background: #2b6f6f; }}
-    a {{ color: #7fd1c7; }}
-    .pin {{ margin: 20px 0 10px; padding: 18px; border: 1px solid #344145; border-radius: 8px; background: #101517; color: #7fd1c7; font-size: 34px; font-weight: 800; letter-spacing: 8px; text-align: center; }}
-    .muted {{ font-size: 13px; }}
-    .error {{ color: #ff8a8a; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>{}</h1>
-"#,
-        title, title
-    )
-}
-
-fn pairing_page_suffix() -> &'static str {
-    r#"  </main>
-  <script>
-    async function copyPairingValue(button) {
-      const value = button.getAttribute("data-copy") || "";
-      const label = button.getAttribute("data-label") || "Copy";
-      try {
-        await navigator.clipboard.writeText(value);
-        button.textContent = "Copied";
-        button.classList.add("copied");
-        setTimeout(function() {
-          button.textContent = label;
-          button.classList.remove("copied");
-        }, 1400);
-      } catch (_) {
-        const target = button.previousElementSibling;
-        if (target && window.getSelection) {
-          const range = document.createRange();
-          range.selectNodeContents(target);
-          const selection = window.getSelection();
-          selection.removeAllRanges();
-          selection.addRange(range);
-        }
-      }
-    }
-  </script>
-</body>
-</html>
-"#
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 fn handle_ws_upgrade<B>(
