@@ -415,6 +415,31 @@ void main() {
         isFalse,
       );
     });
+
+    test(
+      'successive downward scroll events in grace band consistently release',
+      () {
+        final terminal = _fullTerminal(maxLines: 30);
+        final maxExtent = _maxExtent(terminal, lineHeight);
+        final graceThreshold =
+            maxExtent - kScrollPinReleaseGraceLines * lineHeight;
+
+        var last = graceThreshold;
+        for (final delta in const [2.0, 5.0, 8.0, 10.0]) {
+          final current = (graceThreshold + delta).clamp(0.0, maxExtent);
+          expect(
+            shouldReleaseScrollPin(
+              lastPixels: last,
+              pixels: current,
+              maxScrollExtent: maxExtent,
+              lineHeight: lineHeight,
+            ),
+            isTrue,
+          );
+          last = current;
+        }
+      },
+    );
   });
 
   group('shouldFinishBottomSnap', () {
