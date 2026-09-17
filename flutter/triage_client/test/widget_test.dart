@@ -4317,6 +4317,13 @@ void main() {
 
         // Viewport remains at scrolled-up offset
         expect(controller.position.pixels, scrolledUp);
+
+        // Background session termination arrives
+        client.emitSessionTerminated('bg-session');
+        await tester.pumpAndSettle();
+
+        // Viewport remains at scrolled-up offset
+        expect(controller.position.pixels, scrolledUp);
       },
     );
   });
