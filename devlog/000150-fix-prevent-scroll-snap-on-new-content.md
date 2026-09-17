@@ -12,6 +12,10 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T08:27-0400 Precision bottom detection in web client: Update `_viewportIsAtBottom` in `terminal_pane_web.dart` to require `viewportY >= baseY` and `remainingPixels <= 2` instead of 30 pixels, avoiding premature bottom classification when scrolling up.
 - 2026-09-17T08:27-0400 Guard pointer-release bottom snap on web: Only set `_pendingScrollToBottomOnRelease = true` if `!_sessionSavedViewportY.containsKey(_sanitizedId)` so active gestures while scrolled up do not force a bottom snap upon pointer release.
 - 2026-09-17T09:22-0400 Widen web subpixel remaining distance threshold to 4px: Accommodate subpixel layout rounding on high-DPI (Retina) screens and browser zoom levels in terminal_pane_web.dart so maxed-out viewports are reliably classified as at bottom.
+- 2026-09-17T10:24-0400 Hook scroll end notification for inertial fling settling: Wrapped TerminalView with NotificationListener<ScrollEndNotification> in terminal_pane_stub.dart so that when a fling finishes and isScrollingNotifier transitions to false, scroll anchors are reliably re-pinned and deferred bottom snaps complete.
+- 2026-09-17T10:24-0400 Continuous grace-band downward release: In _captureScrollAnchor, removed _scrollAnchor.hasAnchor guard so consecutive downward scroll events inside the 3-line grace band consistently clear the anchor and arm deferred bottom snap rather than ping-ponging into capturing a new anchor.
+- 2026-09-17T10:24-0400 Preserve web row 0 history scroll position: In terminal_pane_web.dart, updated onScrollCallback and _restoreScrollPosition to treat row 0 (savedY == 0 with baseY > 0) as a valid scrolled-up position and restore via scrollToLine(0) rather than purging the entry and snapping to bottom.
+- 2026-09-17T10:24-0400 Unified session scroll cleanup: Extracted _clearSavedSessionScroll helper in terminal_pane_stub.dart to atomically remove all 4 session scroll maps across fit, refit, clear, input, and snap paths.
 
 ## Progress
 - [x] Create worktree and plan file
@@ -20,6 +24,8 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - [x] Fix web bottom detection and gesture release snap in `terminal_pane_web.dart`
 - [x] Add unit and widget tests for scroll-up stability during live streaming output
 - [x] Run full test suite and analysis
+- [x] Address CI review feedback and local review findings across Rounds 1-4
+- [x] Update review refinements in `~/.gemini/review-refinements.md`
 
 ## Issues
 - None.
@@ -33,7 +39,12 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T09:22-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: widened remainingPixels check in _viewportIsAtBottom from 2px to 4px to accommodate high-DPI fractional layout rounding.
 - 2026-09-17T09:22-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: updated test description to clarify that anchor capture is asserted just above the bottom rather than within grace band.
 - 2026-09-17T09:22-0400 flutter/triage_client/test/widget_test.dart: added session termination assertion to test both session start and termination events.
+- 2026-09-17T10:24-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart: wrapped TerminalView in NotificationListener<ScrollEndNotification> to handle fling settling; removed anchor re-capture in saveScrollOffset; removed _scrollAnchor.hasAnchor guard in _captureScrollAnchor to prevent downward ping-pong; extracted _clearSavedSessionScroll helper.
+- 2026-09-17T10:24-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: preserved row 0 history in onScrollCallback and _restoreScrollPosition; widened remainingPixels check in _viewportIsAtBottom.
+- 2026-09-17T10:24-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: added unit tests verifying consecutive downward events in grace band consistently report shouldReleaseScrollPin == true.
+- 2026-09-17T10:24-0400 flutter/triage_client/test/widget_test.dart: added widget tests verifying fling scroll settling anchor preservation, grace zone streaming output stability, and grace band fling snap to bottom.
 
 ## Commits
 - d16b007: fix(terminal): prevent scroll snapping to bottom on new content while scrolling up
-- HEAD: test(terminal): refine test assertions and widen web subpixel scroll epsilon
+- 02e4187: test(terminal): refine test assertions and widen web subpixel scroll epsilon
+- HEAD: fix(terminal): eliminate anchor resurrection, preserve row 0 scroll, and hook fling settling

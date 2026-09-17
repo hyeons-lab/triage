@@ -172,7 +172,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (listSessionsUnauthorized) {
       throw TriageAuthException('unauthorized');
     }
-    return initialSessions ?? ['flutter-spike', 'websocket-session-api', 'main'];
+    return initialSessions ??
+        ['flutter-spike', 'websocket-session-api', 'main'];
   }
 
   /// Per-session rail metadata, as `list_session_contexts` reports it.
@@ -1758,25 +1759,24 @@ void main() {
     expect(find.text('triage / flutter-spike'), findsNothing);
   });
 
-  testWidgets(
-    'dynamically adds new session to rail on session_started event',
-    (WidgetTester tester) async {
-      final client = FakeTriageWebSocketClient();
-      await tester.pumpWidget(TriageClientApp(client: client));
-      await tester.pumpAndSettle();
+  testWidgets('dynamically adds new session to rail on session_started event', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
 
-      expect(find.text('feat/remote-sync'), findsNothing);
+    expect(find.text('feat/remote-sync'), findsNothing);
 
-      client.emitSessionStarted(
-        'remote-sync-test',
-        repositoryRoot: '/repo/triage',
-        branch: 'feat/remote-sync',
-      );
-      await tester.pumpAndSettle();
+    client.emitSessionStarted(
+      'remote-sync-test',
+      repositoryRoot: '/repo/triage',
+      branch: 'feat/remote-sync',
+    );
+    await tester.pumpAndSettle();
 
-      expect(find.text('feat/remote-sync'), findsWidgets);
-    },
-  );
+    expect(find.text('feat/remote-sync'), findsWidgets);
+  });
 
   testWidgets(
     'dynamically removes session from rail on session_terminated event',
@@ -1834,20 +1834,19 @@ void main() {
     },
   );
 
-  testWidgets(
-    'input lease error does not crash when session list is empty',
-    (WidgetTester tester) async {
-      final client = FakeTriageWebSocketClient();
-      client.initialSessions = <String>[];
-      await tester.pumpWidget(TriageClientApp(client: client));
-      await tester.pumpAndSettle();
+  testWidgets('input lease error does not crash when session list is empty', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    client.initialSessions = <String>[];
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
 
-      client.emitErrorMessage('missing input lease for write');
-      await tester.pumpAndSettle();
+    client.emitErrorMessage('missing input lease for write');
+    await tester.pumpAndSettle();
 
-      expect(tester.takeException(), isNull);
-    },
-  );
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets(
     'rapid-fire session started and terminated events maintain valid selection without crashing',
@@ -4184,10 +4183,7 @@ void main() {
         expect(pane, findsOneWidget);
 
         final ignorePointer = tester.widget<IgnorePointer>(
-          find.descendant(
-            of: pane,
-            matching: find.byType(IgnorePointer),
-          ).first,
+          find.descendant(of: pane, matching: find.byType(IgnorePointer)).first,
         );
         expect(ignorePointer.ignoring, isTrue);
         expect(find.byType(LinearProgressIndicator), findsOneWidget);
@@ -4324,6 +4320,133 @@ void main() {
 
         // Viewport remains at scrolled-up offset
         expect(controller.position.pixels, scrolledUp);
+      },
+    );
+
+    testWidgets(
+      'fling scroll settling triggers re-pinning and preserves anchor position',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Perform a fling gesture to scroll up
+        await tester.fling(scrollViewFinder, const Offset(0.0, 300.0), 1000.0);
+        await tester.pumpAndSettle();
+
+        // The fling settled and should hold an anchor above the bottom
+        final scrolledUp = controller.position.pixels;
+        expect(scrolledUp, lessThan(initialMax));
+
+        // Trigger refit after settling
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.controller.refit();
+        await tester.pumpAndSettle();
+
+        // Viewport retains position across refit
+        expect(controller.position.pixels, scrolledUp);
+      },
+    );
+
+    testWidgets(
+      'live streaming output preserves scrolled-up position within grace zone',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Scroll up by 20px (within grace band)
+        final scrolledUp = initialMax - 20.0;
+        controller.jumpTo(scrolledUp);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, scrolledUp);
+
+        // Emit new live output to the active session
+        client.emitOutput(
+          'flutter-spike',
+          'Live streaming line 1\r\n',
+          outputSeq: 2,
+        );
+        await tester.pumpAndSettle();
+
+        // Viewport must retain offset and not snap to new bottom
+        expect(controller.position.pixels, scrolledUp);
+      },
+    );
+
+    testWidgets(
+      'downward fling settling inside grace band completes snap to bottom',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Scroll up to row 30
+        controller.jumpTo(600.0);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, 600.0);
+
+        // Fling down toward the bottom, landing near the bottom
+        await tester.fling(
+          scrollViewFinder,
+          const Offset(0.0, -1000.0),
+          3000.0,
+        );
+        await tester.pumpAndSettle();
+
+        // The deferred snap finishes and viewport is at the bottom
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        // Subsequent live output follows bottom
+        client.emitOutput(
+          'flutter-spike',
+          'Live line after downward fling\r\n',
+          outputSeq: 3,
+        );
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
       },
     );
   });

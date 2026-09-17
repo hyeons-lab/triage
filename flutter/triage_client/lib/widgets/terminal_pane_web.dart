@@ -142,11 +142,11 @@ class _TerminalPaneState extends State<TerminalPane> {
           viewportElem.scrollHeight -
           viewportElem.scrollTop -
           viewportElem.clientHeight;
-      if (remainingPixels > 4) {
+      if (remainingPixels > 10) {
         return false;
       }
     }
-    return viewportY >= baseY;
+    return true;
   }
 
   static final Map<String, void Function(String)>
@@ -1149,7 +1149,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
           if (isAtBottom) {
             _sessionSavedViewportY.remove(sessionId);
-          } else if (viewportY > 0) {
+          } else if (viewportY >= 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
         } catch (_) {}
@@ -2424,13 +2424,13 @@ class _TerminalPaneState extends State<TerminalPane> {
         final buffer = js_util.getProperty(_term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-        if (savedY != null && (savedY >= baseY || savedY <= 0)) {
+        if (savedY != null && (savedY >= baseY || savedY < 0)) {
           _sessionSavedViewportY.remove(_sanitizedId);
         }
       } catch (_) {}
       final effectiveSavedY = _sessionSavedViewportY[_sanitizedId];
       try {
-        if (effectiveSavedY != null && effectiveSavedY > 0) {
+        if (effectiveSavedY != null && effectiveSavedY >= 0) {
           js_util.callMethod(_term, 'scrollToLine', [effectiveSavedY]);
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);
