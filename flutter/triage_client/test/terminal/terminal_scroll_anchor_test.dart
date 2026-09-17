@@ -57,6 +57,64 @@ void main() {
       expect(anchor.hasAnchor, isFalse);
     });
 
+    test('capturing just above the bottom holds an anchor', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      final maxExtent = _maxExtent(terminal, lineHeight);
+
+      // 1 line above bottom: must capture an anchor
+      final oneLineAbove = maxExtent - lineHeight;
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: oneLineAbove,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+      expect(
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        oneLineAbove,
+      );
+
+      // 2 lines above bottom: must capture an anchor
+      final twoLinesAbove = maxExtent - 2 * lineHeight;
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: twoLinesAbove,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+      expect(
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        twoLinesAbove,
+      );
+
+      // Just outside the 0.5px threshold: must capture an anchor
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: maxExtent - 0.6,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+
+      // Within 0.5px of bottom: considered at bottom, no anchor
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: maxExtent - 0.3,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isFalse);
+    });
+
     test('capturing above the bottom pins the top viewport line', () {
       final terminal = _fullTerminal(maxLines: 30);
       final anchor = TerminalScrollAnchor();
@@ -77,6 +135,26 @@ void main() {
           lineHeight: lineHeight,
         ),
         pixels,
+      );
+    });
+
+    test('desiredOffset returns null when maxScrollExtent is non-positive', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: 100.0,
+        maxScrollExtent: 300.0,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+      expect(
+        anchor.desiredOffset(maxScrollExtent: 0.0, lineHeight: lineHeight),
+        isNull,
+      );
+      expect(
+        anchor.desiredOffset(maxScrollExtent: -10.0, lineHeight: lineHeight),
+        isNull,
       );
     });
 
@@ -357,6 +435,31 @@ void main() {
         isFalse,
       );
     });
+
+    test(
+      'successive downward scroll events in grace band consistently release',
+      () {
+        final terminal = _fullTerminal(maxLines: 30);
+        final maxExtent = _maxExtent(terminal, lineHeight);
+        final graceThreshold =
+            maxExtent - kScrollPinReleaseGraceLines * lineHeight;
+
+        var last = graceThreshold;
+        for (final delta in const [2.0, 5.0, 8.0, 10.0]) {
+          final current = (graceThreshold + delta).clamp(0.0, maxExtent);
+          expect(
+            shouldReleaseScrollPin(
+              lastPixels: last,
+              pixels: current,
+              maxScrollExtent: maxExtent,
+              lineHeight: lineHeight,
+            ),
+            isTrue,
+          );
+          last = current;
+        }
+      },
+    );
   });
 
   group('shouldFinishBottomSnap', () {
