@@ -4241,6 +4241,84 @@ void main() {
         expect(controller.position.pixels, controller.position.maxScrollExtent);
       },
     );
+
+    testWidgets(
+      'scrolling up near bottom does not snap to bottom on refit or fit',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Scroll up by 25 pixels (near bottom, within the 3 grace lines)
+        final scrolledUp = initialMax - 25.0;
+        controller.jumpTo(scrolledUp);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, scrolledUp);
+
+        // Trigger refit
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.controller.refit();
+        await tester.pumpAndSettle();
+
+        // Viewport retains scrolled-up offset and does not snap to bottom
+        expect(controller.position.pixels, scrolledUp);
+
+        // Trigger fit
+        pane.controller.fit();
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, scrolledUp);
+      },
+    );
+
+    testWidgets(
+      'scrolling up near bottom does not snap to bottom when other sessions start or terminate',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Scroll up by 20 pixels
+        final scrolledUp = initialMax - 20.0;
+        controller.jumpTo(scrolledUp);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, scrolledUp);
+
+        // Background session event arrives
+        client.emitSessionStarted('bg-session', branch: 'feat/bg');
+        await tester.pumpAndSettle();
+
+        // Viewport remains at scrolled-up offset
+        expect(controller.position.pixels, scrolledUp);
+      },
+    );
   });
 
   group('SessionVm exited lifecycle', () {

@@ -94,9 +94,8 @@ class TerminalScrollAnchor {
   }
 
   /// Capture an anchor from the current scroll metrics. Clears the anchor when
-  /// the viewport is at (or within a line of) the bottom, or at or above row 0,
-  /// so the caller follows new output instead of pinning just shy of the bottom
-  /// or latching to the top line.
+  /// the viewport is at the bottom, or at or above row 0, so the caller follows
+  /// new output instead of pinning at the bottom or latching to the top line.
   void capture({
     required xt.Buffer buffer,
     required double pixels,
@@ -107,7 +106,7 @@ class TerminalScrollAnchor {
     if (lineHeight <= 0 ||
         lineCount <= 0 ||
         pixels <= 0.0 ||
-        pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight) {
+        pixels >= maxScrollExtent - 0.5) {
       _line = null;
       return;
     }

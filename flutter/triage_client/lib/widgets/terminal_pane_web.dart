@@ -135,18 +135,18 @@ class _TerminalPaneState extends State<TerminalPane> {
     int viewportY,
     int baseY,
   ) {
-    if (viewportY >= baseY - 1) return true;
+    if (viewportY < baseY) return false;
     final viewportElem = container.querySelector('.xterm-viewport');
     if (viewportElem != null) {
       final remainingPixels =
           viewportElem.scrollHeight -
           viewportElem.scrollTop -
           viewportElem.clientHeight;
-      if (remainingPixels <= 30) {
-        return true;
+      if (remainingPixels > 2) {
+        return false;
       }
     }
-    return false;
+    return viewportY >= baseY;
   }
 
   static final Map<String, void Function(String)>
@@ -1462,7 +1462,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _clearRefitRetryTimers();
     _lastRefitCols = null;
     _lastRefitRows = null;
-    _sessionSavedViewportY.remove(_sanitizedId);
     _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     _refitAndSend(force: true);
     for (final ms in const [120, 300, 700, 1500]) {
@@ -2408,7 +2407,9 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _restoreScrollPosition({required bool requestFocus}) {
     if (_isUserGestureActive) {
-      _pendingScrollToBottomOnRelease = true;
+      if (!_sessionSavedViewportY.containsKey(_sanitizedId)) {
+        _pendingScrollToBottomOnRelease = true;
+      }
       return;
     }
     var jumped = false;
