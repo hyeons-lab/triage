@@ -1027,16 +1027,18 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   // --- Scroll anchoring: keep the viewport stable across scrollback trims ---
 
-  /// Height of one rendered terminal line in pixels, or null if the view isn't
-  /// laid out yet (the render object asserts a present viewport).
+  /// Height of one rendered terminal line in pixels, falling back to style metrics
+  /// if the view isn't laid out yet or runs in a headless test. Always returns a
+  /// finite positive double.
   double? _lineHeight() {
     final state = _terminalViewKey.currentState;
-    if (state == null) return null;
-    try {
-      return state.renderTerminal.lineHeight;
-    } catch (_) {
-      return null;
+    if (state != null) {
+      try {
+        final lh = state.renderTerminal.lineHeight;
+        if (lh > 0) return lh;
+      } catch (_) {}
     }
+    return _textStyle.fontSize * 1.2;
   }
 
   // The user scrolled: pin to the buffer line at the top of the viewport, or
@@ -1114,6 +1116,15 @@ class _TerminalPaneState extends State<TerminalPane> {
         } else {
           _pendingBottomSnapOnPointerUp = true;
         }
+        return;
+      } else if (_pendingBottomSnapOnPointerUp &&
+          _lastScrollPixels != null &&
+          position.pixels >= _lastScrollPixels! &&
+          position.pixels >=
+              position.maxScrollExtent -
+                  kScrollPinReleaseGraceLines * lineHeight) {
+        // Retain pending snap and suppress capture while stationary in grace band without reversing upward.
+        _lastScrollPixels = position.pixels;
         return;
       } else {
         _pendingBottomSnapOnPointerUp = false;
@@ -1214,6 +1225,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _repinScrollAnchor() {
     if (!mounted || !_scrollController.hasClients) return;
     final position = _scrollController.position;
+    if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
     if (position.isScrollingNotifier.value ||
         _activePointers.isNotEmpty ||
         _dragSelecting) {
@@ -1791,18 +1803,22 @@ class _TerminalPaneState extends State<TerminalPane> {
                             onPointerCancel: _handlePointerCancel,
                             child: NotificationListener<ScrollEndNotification>(
                               onNotification: (notification) {
-                                if (_scrollAnchor.hasAnchor) {
-                                  _repinScrollAnchor();
-                                } else if (_pendingBottomSnapOnPointerUp &&
-                                    _scrollController.hasClients) {
-                                  final pos = _scrollController.position;
-                                  if (pos.hasContentDimensions &&
-                                      !pos.isScrollingNotifier.value &&
-                                      _activePointers.isEmpty) {
-                                    _pendingBottomSnapOnPointerUp = false;
-                                    _snapToBottom(pos);
+                                scheduleMicrotask(() {
+                                  if (!mounted || !_scrollController.hasClients) {
+                                    return;
                                   }
-                                }
+                                  if (_scrollAnchor.hasAnchor) {
+                                    _repinScrollAnchor();
+                                  } else if (_pendingBottomSnapOnPointerUp) {
+                                    final pos = _scrollController.position;
+                                    if (pos.hasContentDimensions &&
+                                        !pos.isScrollingNotifier.value &&
+                                        _activePointers.isEmpty) {
+                                      _pendingBottomSnapOnPointerUp = false;
+                                      _snapToBottom(pos);
+                                    }
+                                  }
+                                });
                                 return false;
                               },
                               child: ScrollConfiguration(

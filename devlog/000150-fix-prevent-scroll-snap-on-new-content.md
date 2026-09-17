@@ -16,6 +16,9 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T10:24-0400 Continuous grace-band downward release: In _captureScrollAnchor, removed _scrollAnchor.hasAnchor guard so consecutive downward scroll events inside the 3-line grace band consistently clear the anchor and arm deferred bottom snap rather than ping-ponging into capturing a new anchor.
 - 2026-09-17T10:24-0400 Preserve web row 0 history scroll position: In terminal_pane_web.dart, updated onScrollCallback and _restoreScrollPosition to treat row 0 (savedY == 0 with baseY > 0) as a valid scrolled-up position and restore via scrollToLine(0) rather than purging the entry and snapping to bottom.
 - 2026-09-17T10:24-0400 Unified session scroll cleanup: Extracted _clearSavedSessionScroll helper in terminal_pane_stub.dart to atomically remove all 4 session scroll maps across fit, refit, clear, input, and snap paths.
+- 2026-09-17T11:40-0400 Microtask settling evaluation on scroll end: Wrap ScrollEndNotification handling in scheduleMicrotask to avoid evaluating stale isScrollingNotifier.value before ScrollPosition.beginActivity finishes updating the notifier.
+- 2026-09-17T11:40-0400 Stationary grace band retention: Retain pending bottom snap and suppress scroll anchor capture while resting stationary in the grace band unless reversing upward, preventing spurious anchor creation.
+- 2026-09-17T11:40-0400 Non-positive extent and headless font metric guards: Guard desiredOffset against non-positive maxScrollExtent, guard _repinScrollAnchor against unmeasured extents, and fall back to style metrics in _lineHeight() when renderTerminal is unmeasured in headless testing.
 
 ## Progress
 - [x] Create worktree and plan file
@@ -26,6 +29,7 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - [x] Run full test suite and analysis
 - [x] Address CI review feedback and local review findings across Rounds 1-4
 - [x] Update review refinements in `~/.gemini/review-refinements.md`
+- [x] Run /antigravity-local-review-fix-loop max to clean approval
 
 ## Issues
 - None.
@@ -43,8 +47,14 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T10:24-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: preserved row 0 history in onScrollCallback and _restoreScrollPosition; widened remainingPixels check in _viewportIsAtBottom.
 - 2026-09-17T10:24-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: added unit tests verifying consecutive downward events in grace band consistently report shouldReleaseScrollPin == true.
 - 2026-09-17T10:24-0400 flutter/triage_client/test/widget_test.dart: added widget tests verifying fling scroll settling anchor preservation, grace zone streaming output stability, and grace band fling snap to bottom.
+- 2026-09-17T11:40-0400 flutter/triage_client/lib/terminal/terminal_scroll_anchor.dart: defined kNativeScrollSubpixelTolerance constant; guarded desiredOffset against non-positive maxScrollExtent.
+- 2026-09-17T11:40-0400 flutter/triage_client/lib/widgets/terminal_pane_stub.dart: wrapped NotificationListener<ScrollEndNotification> handling in scheduleMicrotask; retained pending bottom snap during stationary touch in grace band; guarded _repinScrollAnchor against unmeasured extents; provided font metric fallback in _lineHeight.
+- 2026-09-17T11:40-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: tracked _sessionSavedViewportY on fit restoration; documented 10px threshold distinguishing web DOM scaling from native subpixel scroll physics.
+- 2026-09-17T11:40-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: added unit test for desiredOffset with non-positive maxScrollExtent.
+- 2026-09-17T11:40-0400 flutter/triage_client/test/widget_test.dart: added widget tests for stationary touch in grace band, upward reversal after dragging down in grace band, and microtask anchor re-pinning on fling settling.
 
 ## Commits
 - d16b007: fix(terminal): prevent scroll snapping to bottom on new content while scrolling up
 - 02e4187: test(terminal): refine test assertions and widen web subpixel scroll epsilon
-- HEAD: fix(terminal): eliminate anchor resurrection, preserve row 0 scroll, and hook fling settling
+- 759f171: fix(terminal): eliminate anchor resurrection, preserve row 0 scroll, and hook fling settling
+- HEAD: fix(terminal): defer scroll settling to microtask, retain stationary grace band touch, and guard unmeasured extents

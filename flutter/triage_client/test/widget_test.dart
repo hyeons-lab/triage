@@ -1390,11 +1390,9 @@ void main() {
     // Only the calls the re-selection itself made. Asserting on `.last` would
     // be satisfied by the first-fit resize emitted at the top of this test,
     // even if re-selecting stopped resizing altogether.
-    expect(
-      client.resizeSessionCalls.skip(beforeReselect.length),
-      ['flutter-spike:95:34'],
-      reason: 'the replay size must come from this device\'s own fit',
-    );
+    expect(client.resizeSessionCalls.skip(beforeReselect.length), [
+      'flutter-spike:95:34',
+    ], reason: 'the replay size must come from this device\'s own fit');
   });
 
   testWidgets('a backgrounded refresh records the host size, not its own', (
@@ -4447,6 +4445,155 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
+
+    testWidgets(
+      'stationary pointer in grace band retains pending bottom snap and follows on release',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Scroll near the grace band (60px above bottom)
+        controller.jumpTo(initialMax - 60.0);
+        await tester.pumpAndSettle();
+
+        // Start touch gesture and drag downward in multiple steps to establish direction
+        final gesture = await tester.startGesture(
+          tester.getCenter(scrollViewFinder),
+          kind: PointerDeviceKind.touch,
+        );
+        // Drag downward past kTouchSlop
+        await gesture.moveBy(const Offset(0.0, -25.0));
+        await tester.pump();
+        // Continue dragging downward into the grace band
+        await gesture.moveBy(const Offset(0.0, -25.0));
+        await tester.pump();
+
+        // Hold stationary without movement
+        await tester.pump(const Duration(milliseconds: 50));
+
+        // Release pointer: pending snap to bottom must complete
+        await gesture.up();
+        await tester.pumpAndSettle();
+
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        // Verify subsequent live output follows bottom
+        client.emitOutput(
+          'flutter-spike',
+          'Live line after stationary release\r\n',
+          outputSeq: 4,
+        );
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+      },
+    );
+
+    testWidgets(
+      'reversing upward after dragging downward in grace band cancels pending snap and captures anchor',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Scroll near the grace band (50px above bottom)
+        controller.jumpTo(initialMax - 50.0);
+        await tester.pumpAndSettle();
+
+        // Start touch gesture and drag downward (increasing scroll pixels toward bottom)
+        final gesture = await tester.startGesture(
+          tester.getCenter(scrollViewFinder),
+          kind: PointerDeviceKind.touch,
+        );
+        // Drag downward past kTouchSlop
+        await gesture.moveBy(const Offset(0.0, -25.0));
+        await tester.pump();
+        // Now reverse upward (decreasing scroll pixels away from bottom)
+        await gesture.moveBy(const Offset(0.0, 40.0));
+        await tester.pump();
+
+        // Release pointer: pending snap must be cancelled, and anchor captured
+        await gesture.up();
+        await tester.pumpAndSettle();
+
+        final restingPixels = controller.position.pixels;
+        expect(restingPixels, lessThan(initialMax));
+
+        // Subsequent live output must NOT snap to bottom
+        client.emitOutput(
+          'flutter-spike',
+          'Live line after upward reversal\r\n',
+          outputSeq: 5,
+        );
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, restingPixels);
+      },
+    );
+
+    testWidgets(
+      'fling settling triggers microtask re-pinning and preserves anchor position across refit',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        final initialMax = controller.position.maxScrollExtent;
+        expect(controller.position.pixels, initialMax);
+
+        // Perform a moderate fling upward
+        await tester.fling(scrollViewFinder, const Offset(0.0, 250.0), 800.0);
+        await tester.pumpAndSettle();
+
+        final scrolledUp = controller.position.pixels;
+        expect(scrolledUp, lessThan(initialMax - 100.0));
+
+        // Re-fit pane: the re-pinned anchor from the microtask must keep position stable
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.controller.refit();
+        await tester.pumpAndSettle();
+
+        expect(controller.position.pixels, scrolledUp);
       },
     );
   });
