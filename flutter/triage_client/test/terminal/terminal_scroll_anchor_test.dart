@@ -57,7 +57,7 @@ void main() {
       expect(anchor.hasAnchor, isFalse);
     });
 
-    test('capturing within grace band near the bottom holds an anchor', () {
+    test('capturing just above the bottom holds an anchor', () {
       final terminal = _fullTerminal(maxLines: 30);
       final anchor = TerminalScrollAnchor();
       final maxExtent = _maxExtent(terminal, lineHeight);

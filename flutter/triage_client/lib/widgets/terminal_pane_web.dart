@@ -142,7 +142,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           viewportElem.scrollHeight -
           viewportElem.scrollTop -
           viewportElem.clientHeight;
-      if (remainingPixels > 2) {
+      if (remainingPixels > 4) {
         return false;
       }
     }

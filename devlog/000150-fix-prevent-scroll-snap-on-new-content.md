@@ -11,6 +11,7 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T08:27-0400 Maintain downward release grace: Keep the 3-line grace band in `shouldReleaseScrollPin` exclusively for downward scrolling (`pixels > lastPixels`) to prevent treadmill drift when intentionally chasing live output.
 - 2026-09-17T08:27-0400 Precision bottom detection in web client: Update `_viewportIsAtBottom` in `terminal_pane_web.dart` to require `viewportY >= baseY` and `remainingPixels <= 2` instead of 30 pixels, avoiding premature bottom classification when scrolling up.
 - 2026-09-17T08:27-0400 Guard pointer-release bottom snap on web: Only set `_pendingScrollToBottomOnRelease = true` if `!_sessionSavedViewportY.containsKey(_sanitizedId)` so active gestures while scrolled up do not force a bottom snap upon pointer release.
+- 2026-09-17T09:22-0400 Widen web subpixel remaining distance threshold to 4px: Accommodate subpixel layout rounding on high-DPI (Retina) screens and browser zoom levels in terminal_pane_web.dart so maxed-out viewports are reliably classified as at bottom.
 
 ## Progress
 - [x] Create worktree and plan file
@@ -29,6 +30,10 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T08:33-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: updated viewportIsAtBottom to require viewportY >= baseY and remaining scroll distance <= 2px instead of 30px; guarded pointer-release bottom snap to only trigger when no scrolled-up position is saved.
 - 2026-09-17T08:33-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: added unit tests asserting capture behavior within and outside the 3-line grace band near bottom.
 - 2026-09-17T08:33-0400 flutter/triage_client/test/widget_test.dart: added widget tests verifying that scrolling up near the bottom retains scroll position across refit, fit, and session lifecycle events without snapping to bottom.
+- 2026-09-17T09:22-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: widened remainingPixels check in _viewportIsAtBottom from 2px to 4px to accommodate high-DPI fractional layout rounding.
+- 2026-09-17T09:22-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: updated test description to clarify that anchor capture is asserted just above the bottom rather than within grace band.
+- 2026-09-17T09:22-0400 flutter/triage_client/test/widget_test.dart: added session termination assertion to test both session start and termination events.
 
 ## Commits
-- HEAD: fix(terminal): prevent scroll snapping to bottom on new content while scrolling up
+- d16b007: fix(terminal): prevent scroll snapping to bottom on new content while scrolling up
+- HEAD: test(terminal): refine test assertions and widen web subpixel scroll epsilon
