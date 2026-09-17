@@ -142,6 +142,8 @@ class _TerminalPaneState extends State<TerminalPane> {
           viewportElem.scrollHeight -
           viewportElem.scrollTop -
           viewportElem.clientHeight;
+      // Web DOM scroll uses a 10px threshold to account for high-DPI scaling and zoom.
+      // Native client uses a 0.5px subpixel threshold.
       if (remainingPixels > 10) {
         return false;
       }
@@ -2309,6 +2311,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         } else {
           final savedY = _sessionSavedViewportY[_sanitizedId] ?? viewportY;
           if (savedY != null) {
+            _sessionSavedViewportY[_sanitizedId] = savedY;
             try {
               js_util.callMethod(_term, 'scrollToLine', [savedY]);
             } catch (_) {}

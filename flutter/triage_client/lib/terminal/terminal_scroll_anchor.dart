@@ -6,6 +6,10 @@ import 'package:xterm/xterm.dart' as xt;
 /// over before the pin can re-apply.
 const int kScrollPinReleaseGraceLines = 3;
 
+/// Subpixel tolerance in logical pixels used to decide if the viewport has
+/// reached the bottom on native Flutter scroll physics.
+const double kNativeScrollSubpixelTolerance = 0.5;
+
 /// Whether a released pin's deferred trip to the bottom should now complete.
 ///
 /// The snap cannot run while the user is still working the viewport: `jumpTo`
@@ -103,10 +107,12 @@ class TerminalScrollAnchor {
     required double lineHeight,
   }) {
     final lineCount = buffer.lines.length;
+    // Use a 0.5px subpixel tolerance for native Flutter scroll physics.
+    // The web DOM adapter uses a 10px tolerance to absorb browser zoom jitter.
     if (lineHeight <= 0 ||
         lineCount <= 0 ||
         pixels <= 0.0 ||
-        pixels >= maxScrollExtent - 0.5) {
+        pixels >= maxScrollExtent - kNativeScrollSubpixelTolerance) {
       _line = null;
       return;
     }
@@ -140,7 +146,7 @@ class TerminalScrollAnchor {
       _line = null;
       return null;
     }
-    if (lineHeight <= 0) return null;
+    if (lineHeight <= 0 || maxScrollExtent <= 0.0) return null;
     final desired = line.index * lineHeight + _withinLine;
     if (desired <= 0.0) {
       _line = null;

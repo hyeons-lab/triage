@@ -138,6 +138,26 @@ void main() {
       );
     });
 
+    test('desiredOffset returns null when maxScrollExtent is non-positive', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: 100.0,
+        maxScrollExtent: 300.0,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+      expect(
+        anchor.desiredOffset(maxScrollExtent: 0.0, lineHeight: lineHeight),
+        isNull,
+      );
+      expect(
+        anchor.desiredOffset(maxScrollExtent: -10.0, lineHeight: lineHeight),
+        isNull,
+      );
+    });
+
     test('pinned offset tracks the anchored line as scrollback trims', () {
       final terminal = _fullTerminal(maxLines: 30);
       final buffer = terminal.buffer;
