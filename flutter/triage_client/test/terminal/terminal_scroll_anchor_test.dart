@@ -57,6 +57,64 @@ void main() {
       expect(anchor.hasAnchor, isFalse);
     });
 
+    test('capturing within grace band near the bottom holds an anchor', () {
+      final terminal = _fullTerminal(maxLines: 30);
+      final anchor = TerminalScrollAnchor();
+      final maxExtent = _maxExtent(terminal, lineHeight);
+
+      // 1 line above bottom: must capture an anchor
+      final oneLineAbove = maxExtent - lineHeight;
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: oneLineAbove,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+      expect(
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        oneLineAbove,
+      );
+
+      // 2 lines above bottom: must capture an anchor
+      final twoLinesAbove = maxExtent - 2 * lineHeight;
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: twoLinesAbove,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+      expect(
+        anchor.desiredOffset(
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        ),
+        twoLinesAbove,
+      );
+
+      // Just outside the 0.5px threshold: must capture an anchor
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: maxExtent - 0.6,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isTrue);
+
+      // Within 0.5px of bottom: considered at bottom, no anchor
+      anchor.capture(
+        buffer: terminal.buffer,
+        pixels: maxExtent - 0.3,
+        maxScrollExtent: maxExtent,
+        lineHeight: lineHeight,
+      );
+      expect(anchor.hasAnchor, isFalse);
+    });
+
     test('capturing above the bottom pins the top viewport line', () {
       final terminal = _fullTerminal(maxLines: 30);
       final anchor = TerminalScrollAnchor();

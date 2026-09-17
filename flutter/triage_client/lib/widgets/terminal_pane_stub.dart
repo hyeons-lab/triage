@@ -405,12 +405,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       final pos = _scrollController.hasClients
           ? _scrollController.position
           : null;
-      final lh = _lineHeight() ?? 2.0;
       final isAtBottom =
           pos == null ||
           !pos.hasContentDimensions ||
           pos.maxScrollExtent <= 0 ||
-          pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+          pos.pixels >= pos.maxScrollExtent - 0.5;
       _scrollToCursor(requestFocus: true, forceBottom: isAtBottom);
     }
   }
@@ -443,12 +442,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     final pos = _scrollController.hasClients
         ? _scrollController.position
         : null;
-    final lh = _lineHeight() ?? 2.0;
     final isAtBottom =
         pos == null ||
         !pos.hasContentDimensions ||
         pos.maxScrollExtent <= 0 ||
-        pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+        pos.pixels >= pos.maxScrollExtent - 0.5;
 
     _suppressScrollSaveFor(const Duration(milliseconds: 500));
     if (isAtBottom) {
@@ -467,12 +465,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     final pos = _scrollController.hasClients
         ? _scrollController.position
         : null;
-    final lh = _lineHeight() ?? 2.0;
     final isAtBottom =
         pos == null ||
         !pos.hasContentDimensions ||
         pos.maxScrollExtent <= 0 ||
-        pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+        pos.pixels >= pos.maxScrollExtent - 0.5;
 
     _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     if (isAtBottom) {
@@ -672,6 +669,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _handlePointerUp(PointerUpEvent event) {
     _activePointers.remove(event.pointer);
     _checkDeferredBottomSnapOnPointerRelease();
+    if (_activePointers.isEmpty && _scrollAnchor.hasAnchor) {
+      _repinScrollAnchor();
+    }
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -690,6 +690,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _handlePointerCancel(PointerCancelEvent event) {
     _activePointers.remove(event.pointer);
     _checkDeferredBottomSnapOnPointerRelease();
+    if (_activePointers.isEmpty && _scrollAnchor.hasAnchor) {
+      _repinScrollAnchor();
+    }
     if (event.pointer == _dragPointer) {
       _endDrag();
       return;
@@ -927,7 +930,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           pos == null ||
           !pos.hasContentDimensions ||
           pos.maxScrollExtent <= 0 ||
-          pos.pixels >= pos.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+          pos.pixels >= pos.maxScrollExtent - 0.5;
       if (isAtBottom) {
         _scrollAnchor.clear();
         _sessionSavedScrollOffsets.remove(widget.terminalId);
@@ -1071,8 +1074,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     final id = terminalId ?? widget.terminalId;
     final lh = lineHeight ?? _lineHeight() ?? 2.0;
     final isAtBottom =
-        position.pixels >=
-        position.maxScrollExtent - kScrollPinReleaseGraceLines * lh;
+        position.pixels >= position.maxScrollExtent - 0.5;
     if (!isAtBottom && position.pixels > 0.0) {
       _sessionSavedScrollOffsets[id] = position.pixels;
       if (!_scrollAnchor.hasAnchor) {
@@ -1316,9 +1318,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             target = saved.clamp(0.0, position.maxScrollExtent);
           } else {
             final isNearBottom =
-                position.pixels >=
-                position.maxScrollExtent -
-                    kScrollPinReleaseGraceLines * (lineHeight ?? 2.0);
+                position.pixels >= position.maxScrollExtent - 0.5;
             target = isNearBottom
                 ? position.maxScrollExtent
                 : position.pixels.clamp(0.0, position.maxScrollExtent);
@@ -1328,9 +1328,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           }
         }
 
-        if (target >=
-            position.maxScrollExtent -
-                kScrollPinReleaseGraceLines * (lineHeight ?? 2.0)) {
+        if (target >= position.maxScrollExtent - 0.5) {
           _scrollAnchor.clear();
           _sessionSavedScrollOffsets.remove(widget.terminalId);
           _sessionSavedScrollAnchors.remove(widget.terminalId);
