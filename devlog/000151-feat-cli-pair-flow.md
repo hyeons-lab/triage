@@ -30,6 +30,8 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - `2026-09-17T20:18-0400 flutter/triage_client/lib/main.dart`: Guarded clipboard copy operations in `_copyText` with `unawaited` and `.catchError(...)` to survive restrictive browser environments, and added `messenger.hideCurrentSnackBar()` for immediate feedback.
 - `2026-09-17T20:18-0400 flutter/triage_client/test/widget_test.dart`: Added widget test coverage for copy button interactions and snackbar presentations.
 - `2026-09-17T20:27-0400 crates/triage/src/main.rs`: Formatted remaining expiry seconds with two-digit zero padding (`{secs:02}s`).
+- `2026-09-18T00:24-0400 crates/triaged/src/ipc.rs`: Fail closed with error on unsupported Unix platforms instead of returning `geteuid()`, strictly enforcing authentication boundaries.
+- `2026-09-18T00:24-0400 docs/configuration.md`: Clarified that deprecated pairing keys should be removed from configuration files and are still validated during configuration load.
 
 ## Decisions
 
@@ -39,6 +41,7 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - 2026-09-17T20:06-0400 Renumber devlog from 000150 to 000151: PR #172 merged to main with sequence number 000150, so rebasing onto main requires incrementing this branch sequence number to 000151 per AGENTS.md conventions.
 - 2026-09-17T20:18-0400 Resilient unawaited clipboard handling: In Flutter web environments or embedded frames where clipboard write permissions might be restricted or throw unhandled DOM exceptions, clipboard write operations should be wrapped with `.catchError(...)` so UI interactions never block or throw unhandled exceptions.
 - 2026-09-17T20:18-0400 SnackBar queue clearing: Immediate snackbar clearing via `ScaffoldMessenger.of(context).hideCurrentSnackBar()` ensures responsive UI feedback when tapping multiple copy buttons in sequence.
+- 2026-09-18T00:24-0400 Fail-closed peer UID verification: On Unix targets lacking platform-specific peer credential inspection syscalls, incoming IPC connections must fail closed with an explicit error rather than bypassing checks with the daemon's own UID.
 
 ## Progress
 
@@ -56,6 +59,7 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - [x] Rebase onto origin/main and renumber devlog to 000151
 - [x] Round 1 local review hardening: deprecated config warnings, verify_peer_uid unit test, unawaited clipboard copy, and widget tests
 - [x] Round 2 local review: clean review (0 critical, 0 warnings, zero padding nitpick applied)
+- [x] Address PR review comments: fail closed on unsupported Unix and clarify deprecated config documentation
 
 ## Commits
 
@@ -63,4 +67,5 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - 7a5b74b: fix(ipc): remove redundant cast in peer_euid on linux
 - aab20bf: fix(cli): guard non-interactive stdin and log warning on unsupported unix
 - c54afa5: chore(devlog): renumber devlog to 000151 following rebase onto origin/main
-- HEAD: fix(pairing): harden ipc peer credentials, clipboard handling, and cli formatting
+- 775db08: fix(pairing): harden ipc peer credentials, clipboard handling, and cli formatting
+- HEAD: fix(review): fail closed on unsupported unix and clarify deprecated config

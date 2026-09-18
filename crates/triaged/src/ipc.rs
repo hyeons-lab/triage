@@ -1253,10 +1253,7 @@ pub(crate) fn peer_euid(stream: &UnixStream) -> Result<u32> {
     )))]
     {
         let _ = stream;
-        tracing::warn!(
-            "secure peer UID verification is not supported on this platform; bypassing check"
-        );
-        Ok(unsafe { libc::geteuid() as u32 })
+        bail!("secure peer UID verification is not supported on this platform");
     }
 }
 
