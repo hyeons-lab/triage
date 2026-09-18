@@ -1370,6 +1370,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (ModalRoute.of(context)?.isCurrent == false) {
       return KeyEventResult.ignored;
     }
+    if (event.logicalKey == LogicalKeyboardKey.tab) {
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        widget.controller.notifyInteraction();
+        final shiftKey = HardwareKeyboard.instance.isShiftPressed;
+        widget.controller.sendInput(shiftKey ? '\x1b[Z' : '\t');
+      }
+      return KeyEventResult.handled;
+    }
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
@@ -1679,81 +1687,86 @@ class _TerminalPaneState extends State<TerminalPane> {
     // finder-based assertions on the plain fallback rows.
     final isTest = runningUnderFlutterTest();
     if (isTest) {
-      return Container(
-        color: const Color(0xff0d1113),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            IgnorePointer(
-              ignoring: widget.isLoading,
-              child: AnimatedOpacity(
-                opacity: widget.isLoading ? 0.7 : 1.0,
-                duration: const Duration(milliseconds: 150),
-                child: Listener(
-                  behavior: HitTestBehavior.translucent,
-                  onPointerDown: _handlePointerDown,
-                  onPointerMove: _handlePointerMove,
-                  onPointerUp: _handlePointerUp,
-                  onPointerCancel: _handlePointerCancel,
-                  child: SingleChildScrollView(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.all(22),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        for (final row in widget.fallbackRows)
-                          Padding(
-                            padding: const EdgeInsets.only(bottom: 7),
-                            child: SelectableText.rich(
-                              TextSpan(
-                                children: [
-                                  for (final span in row.spans)
-                                    TextSpan(
-                                      text: span.text.isEmpty ? ' ' : span.text,
-                                      style: TextStyle(
-                                        fontFamily: 'JetBrains Mono',
-                                        fontSize: 15,
-                                        height: 1.35,
-                                        color:
-                                            span.style.foreground?.toColor() ??
-                                            const Color(0xffd9e5e3),
-                                        backgroundColor:
-                                            span.style.background?.toColor(),
-                                        fontWeight: span.style.bold
-                                            ? FontWeight.bold
-                                            : FontWeight.normal,
-                                        fontStyle: span.style.italic
-                                            ? FontStyle.italic
-                                            : FontStyle.normal,
-                                        decoration: span.style.underline
-                                            ? TextDecoration.underline
-                                            : TextDecoration.none,
+      return Focus(
+        focusNode: _focusNode,
+        autofocus: true,
+        onKeyEvent: _handleTerminalKeyEvent,
+        child: Container(
+          color: const Color(0xff0d1113),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              IgnorePointer(
+                ignoring: widget.isLoading,
+                child: AnimatedOpacity(
+                  opacity: widget.isLoading ? 0.7 : 1.0,
+                  duration: const Duration(milliseconds: 150),
+                  child: Listener(
+                    behavior: HitTestBehavior.translucent,
+                    onPointerDown: _handlePointerDown,
+                    onPointerMove: _handlePointerMove,
+                    onPointerUp: _handlePointerUp,
+                    onPointerCancel: _handlePointerCancel,
+                    child: SingleChildScrollView(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.all(22),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          for (final row in widget.fallbackRows)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 7),
+                              child: SelectableText.rich(
+                                TextSpan(
+                                  children: [
+                                    for (final span in row.spans)
+                                      TextSpan(
+                                        text: span.text.isEmpty ? ' ' : span.text,
+                                        style: TextStyle(
+                                          fontFamily: 'JetBrains Mono',
+                                          fontSize: 15,
+                                          height: 1.35,
+                                          color:
+                                              span.style.foreground?.toColor() ??
+                                              const Color(0xffd9e5e3),
+                                          backgroundColor:
+                                              span.style.background?.toColor(),
+                                          fontWeight: span.style.bold
+                                              ? FontWeight.bold
+                                              : FontWeight.normal,
+                                          fontStyle: span.style.italic
+                                              ? FontStyle.italic
+                                              : FontStyle.normal,
+                                          decoration: span.style.underline
+                                              ? TextDecoration.underline
+                                              : TextDecoration.none,
+                                        ),
                                       ),
-                                    ),
-                                ],
+                                  ],
+                                ),
                               ),
                             ),
-                          ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-            if (widget.isLoading)
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                height: 2,
-                child: LinearProgressIndicator(
-                  value: isTest ? 0.5 : null,
-                  minHeight: 2,
-                  backgroundColor: Colors.transparent,
-                  color: const Color(0xffffc857),
+              if (widget.isLoading)
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  height: 2,
+                  child: LinearProgressIndicator(
+                    value: isTest ? 0.5 : null,
+                    minHeight: 2,
+                    backgroundColor: Colors.transparent,
+                    color: const Color(0xffffc857),
+                  ),
                 ),
-              ),
-          ],
+            ],
+          ),
         ),
       );
     }
