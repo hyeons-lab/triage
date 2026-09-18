@@ -175,7 +175,7 @@ fn run_pair(socket_path: Option<PathBuf>, device_code: Option<String>) -> Result
     println!();
     println!("  Pairing PIN: \x1b[1;36m{}\x1b[0m", pin_info.pin);
     if remaining_secs > 0 {
-        println!("  Expires in:  {mins}m {secs}s");
+        println!("  Expires in:  {mins}m {secs:02}s");
     }
     println!();
     println!("Enter this PIN in the Triage client that displayed the device code.");

@@ -3500,8 +3500,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'session_started') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final existingIndex =
-          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      final existingIndex = _sessions.indexWhere(
+        (s) => s.remoteSessionId == sessionId,
+      );
       if (existingIndex != -1) return;
 
       final wasEmpty = _sessions.isEmpty;
@@ -3540,7 +3541,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             failedSessionIds: <String>[],
           ).catchError((Object e) {
             if (e is! TriageAuthException || _disposed || _needsPairing) return;
-            unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+            unawaited(
+              _showPairingChallenge(_connectGeneration, _activeServerId),
+            );
           }),
         );
       }
@@ -3550,8 +3553,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'session_terminated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final index =
-          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
       if (index == -1) return;
 
       final session = _sessions[index];
@@ -3595,7 +3597,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 includeHistory: true,
                 failedSessionIds: <String>[],
               ).catchError((Object e) {
-                if (e is! TriageAuthException || _disposed || _needsPairing) return;
+                if (e is! TriageAuthException || _disposed || _needsPairing) {
+                  return;
+                }
                 unawaited(
                   _showPairingChallenge(_connectGeneration, _activeServerId),
                 );
@@ -4664,10 +4668,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           child: SingleChildScrollView(
             child: Container(
               width: 520,
-              padding: const EdgeInsets.symmetric(
-                horizontal: 28,
-                vertical: 20,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 20),
               decoration: BoxDecoration(
                 color: const Color(0xff161b1d),
                 borderRadius: BorderRadius.circular(16),
@@ -9557,10 +9558,14 @@ class _PairingViewState extends State<_PairingView> {
     return 'triage pair $deviceCode';
   }
 
-  Future<void> _copyText(String label, String value) async {
-    await Clipboard.setData(ClipboardData(text: value));
+  void _copyText(String label, String value) {
+    unawaited(
+      Clipboard.setData(ClipboardData(text: value)).catchError((Object _) {}),
+    );
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
       SnackBar(
         content: Text('$label copied'),
         duration: const Duration(milliseconds: 1400),
@@ -9595,11 +9600,7 @@ class _PairingViewState extends State<_PairingView> {
         const SizedBox(height: 12),
         const Text(
           'This client is not paired with the Triage daemon. Run the command below on the computer running triaged to approve pairing and receive a PIN, then enter the PIN below.',
-          style: TextStyle(
-            color: Color(0xffa5b1b4),
-            fontSize: 14,
-            height: 1.4,
-          ),
+          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
         ),
         const SizedBox(height: 12),
         if (widget.isChallengeLoading && deviceCode == null)
@@ -9619,10 +9620,7 @@ class _PairingViewState extends State<_PairingView> {
           ),
           const SizedBox(height: 6),
           Container(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 14,
-              vertical: 10,
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             decoration: BoxDecoration(
               color: const Color(0xff101517),
               borderRadius: BorderRadius.circular(8),

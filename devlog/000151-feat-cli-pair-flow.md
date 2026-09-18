@@ -25,6 +25,11 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - `2026-09-16T12:54-0400 crates/triaged/src/ipc.rs`: Logged warning on unsupported Unix platforms when peer UID verification fallback is used, and asserted simulated UID mismatch in unit tests.
 - `2026-09-16T12:54-0400 crates/triage/src/main.rs`: Checked `is_terminal` before reading stdin to fail immediately in non-interactive environments, avoided temporary allocation during trimming, and added unit test.
 - `2026-09-17T20:06-0400 devlog/000151-feat-cli-pair-flow.md, devlog/plans/000151-01-cli-pair-flow.md`: Rebased onto origin/main and renumbered sequence from 000150 to 000151 to resolve collision with merged PR #172.
+- `2026-09-17T20:18-0400 crates/triaged/src/main.rs`: Added startup diagnostics warning when deprecated configuration options (`remote.pair_approval_tailnet_users` or `remote.pair_approval_trust_local_peers`) are detected.
+- `2026-09-17T20:18-0400 crates/triaged/src/ipc.rs`: Factored out and hardened `verify_peer_uid` helper with dedicated unit test asserting unauthorized peer UID rejection.
+- `2026-09-17T20:18-0400 flutter/triage_client/lib/main.dart`: Guarded clipboard copy operations in `_copyText` with `unawaited` and `.catchError(...)` to survive restrictive browser environments, and added `messenger.hideCurrentSnackBar()` for immediate feedback.
+- `2026-09-17T20:18-0400 flutter/triage_client/test/widget_test.dart`: Added widget test coverage for copy button interactions and snackbar presentations.
+- `2026-09-17T20:27-0400 crates/triage/src/main.rs`: Formatted remaining expiry seconds with two-digit zero padding (`{secs:02}s`).
 
 ## Decisions
 
@@ -32,6 +37,8 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - 2026-09-16T10:20-0400 CLI pairing approval: The `triage pair <DEVICE_CODE>` command talks to `triaged` over local IPC. If `<DEVICE_CODE>` is omitted on interactive terminals, `triage pair` prompts the user for it on stdin.
 - 2026-09-16T10:20-0400 Removal of `/pair` HTTP endpoint: Rather than maintaining a complex and incomplete network authorization layer (like Tailscale whois) for an HTTP pairing page, the HTTP server drops the `/pair` route entirely. The web client displays the CLI command to execute on the daemon host.
 - 2026-09-17T20:06-0400 Renumber devlog from 000150 to 000151: PR #172 merged to main with sequence number 000150, so rebasing onto main requires incrementing this branch sequence number to 000151 per AGENTS.md conventions.
+- 2026-09-17T20:18-0400 Resilient unawaited clipboard handling: In Flutter web environments or embedded frames where clipboard write permissions might be restricted or throw unhandled DOM exceptions, clipboard write operations should be wrapped with `.catchError(...)` so UI interactions never block or throw unhandled exceptions.
+- 2026-09-17T20:18-0400 SnackBar queue clearing: Immediate snackbar clearing via `ScaffoldMessenger.of(context).hideCurrentSnackBar()` ensures responsive UI feedback when tapping multiple copy buttons in sequence.
 
 ## Progress
 
@@ -47,10 +54,13 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - [x] Validate workspace with clippy, formatting checks, and full test suites
 - [x] Address CI review items: terminal check on stdin, safe trimming, and unsupported platform warning
 - [x] Rebase onto origin/main and renumber devlog to 000151
+- [x] Round 1 local review hardening: deprecated config warnings, verify_peer_uid unit test, unawaited clipboard copy, and widget tests
+- [x] Round 2 local review: clean review (0 critical, 0 warnings, zero padding nitpick applied)
 
 ## Commits
 
 - b3302d2: feat(security): secure cli pair flow with peer credential verification
 - 7a5b74b: fix(ipc): remove redundant cast in peer_euid on linux
 - aab20bf: fix(cli): guard non-interactive stdin and log warning on unsupported unix
-- HEAD: chore(devlog): renumber devlog to 000151 following rebase onto origin/main
+- c54afa5: chore(devlog): renumber devlog to 000151 following rebase onto origin/main
+- HEAD: fix(pairing): harden ipc peer credentials, clipboard handling, and cli formatting

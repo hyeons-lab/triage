@@ -1260,6 +1260,20 @@ pub(crate) fn peer_euid(stream: &UnixStream) -> Result<u32> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn verify_peer_uid(stream: &UnixStream, daemon_uid: u32) -> Result<()> {
+    let peer_uid = peer_euid(stream)?;
+    if peer_uid != daemon_uid {
+        tracing::warn!(
+            peer_uid,
+            daemon_uid,
+            "Rejected IPC connection from unauthorized user"
+        );
+        bail!("unauthorized peer UID {peer_uid}: must match daemon UID {daemon_uid}");
+    }
+    Ok(())
+}
+
 /// Return a non-reusable process identity authenticated by a Unix-domain socket.
 /// macOS provides an audit token containing its PID version; Linux combines the
 /// kernel-authenticated PID with `/proc`'s process start time.
@@ -1392,16 +1406,7 @@ fn handle_connection(
     web_cache: Arc<crate::http::WebAssetCache>,
     stream: UnixStream,
 ) -> Result<()> {
-    let peer_uid = peer_euid(&stream)?;
-    let daemon_uid = unsafe { libc::geteuid() as u32 };
-    if peer_uid != daemon_uid {
-        tracing::warn!(
-            peer_uid,
-            daemon_uid,
-            "Rejected IPC connection from unauthorized user"
-        );
-        bail!("unauthorized peer UID {peer_uid}: must match daemon UID {daemon_uid}");
-    }
+    verify_peer_uid(&stream, unsafe { libc::geteuid() as u32 })?;
 
     let mut reader = BufReader::new(stream.try_clone().context("cloning Unix socket stream")?);
     // A client that connects then closes without sending a request line (e.g. a
@@ -2426,5 +2431,16 @@ mod tests {
 
         let simulated_other_uid = my_uid.wrapping_add(1);
         assert_ne!(uid1, simulated_other_uid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_peer_uid_validation_rejects_mismatch() {
+        let (s1, _s2) = UnixStream::pair().expect("UnixStream::pair");
+        let my_uid = unsafe { libc::geteuid() as u32 };
+        let other_uid = my_uid.wrapping_add(1);
+        assert!(verify_peer_uid(&s1, my_uid).is_ok());
+        let err = verify_peer_uid(&s1, other_uid).unwrap_err();
+        assert!(err.to_string().contains("unauthorized peer UID"));
     }
 }
