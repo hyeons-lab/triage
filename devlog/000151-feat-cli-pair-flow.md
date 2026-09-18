@@ -10,7 +10,7 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 
 ## What Changed
 
-- `2026-09-16T10:20-0400 devlog/plans/000150-01-cli-pair-flow.md`: Authored plan for removing `/pair` web endpoint, implementing `triage pair <DEVICE_CODE>` over secure IPC, adding peer credential checks, and updating client UI.
+- `2026-09-16T10:20-0400 devlog/plans/000151-01-cli-pair-flow.md`: Authored plan for removing `/pair` web endpoint, implementing `triage pair <DEVICE_CODE>` over secure IPC, adding peer credential checks, and updating client UI.
 - `2026-09-16T12:20-0400 crates/triaged/src/session.rs`: Added `Serialize, Deserialize, PartialEq, Eq` derives to `PairingPinInfo`.
 - `2026-09-16T12:20-0400 crates/triaged/src/ipc.rs`: Added `ApprovePairingDeviceCode` to `WireRequest`, `PairingPin` to `WireSuccess`, `approve_pairing_device_code` method to `IpcClient`, and kernel peer credential verification (`libc::getpeereid` on macOS/BSD, `SO_PEERCRED` on Linux) to enforce same-UID access on incoming IPC connections.
 - `2026-09-16T12:20-0400 crates/triaged/src/http.rs`: Removed `/pair` route dispatch and pairing HTML page rendering helpers.
@@ -24,12 +24,14 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - `2026-09-16T12:35-0400 crates/triaged/src/ipc.rs`: Removed redundant uid_t to u32 cast in `peer_euid` on Linux to satisfy clippy warnings.
 - `2026-09-16T12:54-0400 crates/triaged/src/ipc.rs`: Logged warning on unsupported Unix platforms when peer UID verification fallback is used, and asserted simulated UID mismatch in unit tests.
 - `2026-09-16T12:54-0400 crates/triage/src/main.rs`: Checked `is_terminal` before reading stdin to fail immediately in non-interactive environments, avoided temporary allocation during trimming, and added unit test.
+- `2026-09-17T20:06-0400 devlog/000151-feat-cli-pair-flow.md, devlog/plans/000151-01-cli-pair-flow.md`: Rebased onto origin/main and renumbered sequence from 000150 to 000151 to resolve collision with merged PR #172.
 
 ## Decisions
 
 - 2026-09-16T10:20-0400 Peer credential validation on IPC: Filesystem socket permissions (`0o700` dir, `0o600` socket) provide basic protection, but multi-user systems require kernel-level authentication. Incoming IPC connections will be checked using `libc::getpeereid` on macOS/BSD and `SO_PEERCRED` on Linux, ensuring callers have the exact same effective UID as the daemon.
 - 2026-09-16T10:20-0400 CLI pairing approval: The `triage pair <DEVICE_CODE>` command talks to `triaged` over local IPC. If `<DEVICE_CODE>` is omitted on interactive terminals, `triage pair` prompts the user for it on stdin.
 - 2026-09-16T10:20-0400 Removal of `/pair` HTTP endpoint: Rather than maintaining a complex and incomplete network authorization layer (like Tailscale whois) for an HTTP pairing page, the HTTP server drops the `/pair` route entirely. The web client displays the CLI command to execute on the daemon host.
+- 2026-09-17T20:06-0400 Renumber devlog from 000150 to 000151: PR #172 merged to main with sequence number 000150, so rebasing onto main requires incrementing this branch sequence number to 000151 per AGENTS.md conventions.
 
 ## Progress
 
@@ -44,9 +46,11 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - [x] Update documentation across README and docs
 - [x] Validate workspace with clippy, formatting checks, and full test suites
 - [x] Address CI review items: terminal check on stdin, safe trimming, and unsupported platform warning
+- [x] Rebase onto origin/main and renumber devlog to 000151
 
 ## Commits
 
-- e49f2b8: feat(security): secure cli pair flow with peer credential verification
-- b07082a: fix(ipc): remove redundant cast in peer_euid on linux
-- HEAD: fix(cli): guard non-interactive stdin and log warning on unsupported unix
+- b3302d2: feat(security): secure cli pair flow with peer credential verification
+- 7a5b74b: fix(ipc): remove redundant cast in peer_euid on linux
+- aab20bf: fix(cli): guard non-interactive stdin and log warning on unsupported unix
+- HEAD: chore(devlog): renumber devlog to 000151 following rebase onto origin/main
