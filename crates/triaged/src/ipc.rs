@@ -422,6 +422,16 @@ impl IpcClient {
             .unwrap_or_else(|error| JudgeVerdict::fallback(format!("daemon unreachable: {error}")))
     }
 
+    /// Approves a pairing device code and returns the generated PIN.
+    pub fn approve_pairing_device_code(&self, device_code: &str) -> Result<PairingPinInfo> {
+        match self.round_trip(WireRequest::ApprovePairingDeviceCode {
+            device_code: device_code.to_string(),
+        })? {
+            WireSuccess::PairingPin(pin_info) => Ok(pin_info),
+            other => bail!("unexpected approve pairing response: {other:?}"),
+        }
+    }
+
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
         let mut stream = transport::connect(&self.socket_path)
             .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
@@ -434,6 +444,7 @@ impl IpcClient {
     }
 }
 
+pub use crate::session::PairingPinInfo;
 pub use triage_core::ipc::default_socket_path;
 
 impl SessionApi for IpcClient {
@@ -669,6 +680,9 @@ enum WireRequest {
         session_id: SessionId,
         enabled: Option<bool>,
     },
+    ApprovePairingDeviceCode {
+        device_code: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +726,7 @@ enum WireSuccess {
     ServerUpdateInfo(ServerUpdateInfo),
     JudgeVerdict(JudgeVerdict),
     SessionJudgePolicy(SessionJudgePolicy),
+    PairingPin(PairingPinInfo),
 }
 
 #[cfg(unix)]
@@ -1180,6 +1195,82 @@ pub(crate) fn definitely_dead_peer_process_identity_for_test() -> PeerProcessIde
     identity
 }
 
+/// Query the kernel-authenticated effective UID of a connected peer on a Unix domain socket.
+///
+/// On macOS and BSD systems, `libc::getpeereid` returns the effective UID and GID.
+/// On Linux and Android, `SO_PEERCRED` returns `libc::ucred` containing the UID.
+#[cfg(unix)]
+pub(crate) fn peer_euid(stream: &UnixStream) -> Result<u32> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        let mut euid: libc::uid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        // SAFETY: `stream` holds a valid connected Unix socket descriptor.
+        let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading peer credentials via getpeereid");
+        }
+        Ok(euid)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `stream` holds a valid connected Unix socket descriptor and `credentials` is adequately sized.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if result != 0 || len != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+            return Err(std::io::Error::last_os_error())
+                .context("reading peer credentials via SO_PEERCRED");
+        }
+        let ucred = unsafe { credentials.assume_init() };
+        Ok(ucred.uid)
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
+        let _ = stream;
+        bail!("secure peer UID verification is not supported on this platform");
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_peer_uid(stream: &UnixStream, daemon_uid: u32) -> Result<()> {
+    let peer_uid = peer_euid(stream)?;
+    if peer_uid != daemon_uid {
+        tracing::warn!(
+            peer_uid,
+            daemon_uid,
+            "Rejected IPC connection from unauthorized user"
+        );
+        bail!("unauthorized peer UID {peer_uid}: must match daemon UID {daemon_uid}");
+    }
+    Ok(())
+}
+
 /// Return a non-reusable process identity authenticated by a Unix-domain socket.
 /// macOS provides an audit token containing its PID version; Linux combines the
 /// kernel-authenticated PID with `/proc`'s process start time.
@@ -1312,6 +1403,8 @@ fn handle_connection(
     web_cache: Arc<crate::http::WebAssetCache>,
     stream: UnixStream,
 ) -> Result<()> {
+    verify_peer_uid(&stream, unsafe { libc::geteuid() as u32 })?;
+
     let mut reader = BufReader::new(stream.try_clone().context("cloning Unix socket stream")?);
     // A client that connects then closes without sending a request line (e.g. a
     // liveness probe, or the Windows "already in use" preflight) yields EOF here;
@@ -1750,6 +1843,9 @@ fn handle_request(
         } => manager
             .set_session_judge_policy(session_id, enabled)
             .map(WireSuccess::SessionJudgePolicy),
+        WireRequest::ApprovePairingDeviceCode { device_code } => manager
+            .approve_pairing_device_code(&device_code)
+            .map(WireSuccess::PairingPin),
     }
 }
 
@@ -2280,5 +2376,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ipc_approve_pairing_device_code_flow() {
+        let socket_path = unique_socket_path("ipc-pair");
+        let log_dir = unique_dir("ipc-pair-logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
+        let server = IpcServer::new(
+            Arc::clone(&manager),
+            cache,
+            IpcConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+
+        let client = IpcClient::new(&socket_path);
+        let client_id = ClientId::new("browser-client").unwrap();
+        let other_client_id = ClientId::new("imposter-client").unwrap();
+        let challenge = manager
+            .request_pairing_challenge(&client_id)
+            .expect("request challenge");
+
+        let pin_info = client
+            .approve_pairing_device_code(&challenge.device_code)
+            .expect("approve pairing code via IPC");
+
+        assert_eq!(pin_info.client_id, client_id);
+        assert!(!pin_info.pin.is_empty());
+
+        use triage_transport_ws::WebSocketAuthenticator;
+        assert!(
+            WebSocketAuthenticator::pair(manager.as_ref(), &pin_info.pin, &other_client_id)
+                .is_err()
+        );
+        WebSocketAuthenticator::pair(manager.as_ref(), &pin_info.pin, &client_id)
+            .expect("pin pairs intended client");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_peer_euid_matches_current_process() {
+        let (s1, s2) = UnixStream::pair().expect("UnixStream::pair");
+        let uid1 = peer_euid(&s1).expect("peer_euid for s1");
+        let uid2 = peer_euid(&s2).expect("peer_euid for s2");
+        let my_uid = unsafe { libc::geteuid() as u32 };
+        assert_eq!(uid1, my_uid);
+        assert_eq!(uid2, my_uid);
+
+        let simulated_other_uid = my_uid.wrapping_add(1);
+        assert_ne!(uid1, simulated_other_uid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_peer_uid_validation_rejects_mismatch() {
+        let (s1, _s2) = UnixStream::pair().expect("UnixStream::pair");
+        let my_uid = unsafe { libc::geteuid() as u32 };
+        let other_uid = my_uid.wrapping_add(1);
+        assert!(verify_peer_uid(&s1, my_uid).is_ok());
+        let err = verify_peer_uid(&s1, other_uid).unwrap_err();
+        assert!(err.to_string().contains("unauthorized peer UID"));
     }
 }

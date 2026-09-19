@@ -641,8 +641,14 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // Spawn Multiplexed HTTP & WebSocket Server in a background thread
     let ws_manager = Arc::clone(&manager);
     let ws_cache = Arc::clone(&web_cache);
-    let pair_approval_tailnet_users = config.remote.pair_approval_tailnet_users.clone();
-    let pair_approval_trust_local_peers = config.remote.pair_approval_trust_local_peers;
+    if !config.remote.pair_approval_tailnet_users.is_empty()
+        || !config.remote.pair_approval_trust_local_peers
+    {
+        tracing::warn!(
+            "remote.pair_approval_tailnet_users and remote.pair_approval_trust_local_peers are deprecated; \
+             pairing approval via HTTP /pair has been removed. Approve client pairing requests using `triage pair <device-code>` on the daemon host."
+        );
+    }
     if let Err(error) = std::thread::Builder::new()
         .name("triage-websocket-server".to_string())
         .spawn(move || {
@@ -676,8 +682,6 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                 ws_manager,
                 tcp_listener,
                 ws_cache,
-                pair_approval_tailnet_users,
-                pair_approval_trust_local_peers,
             ) {
                 tracing::error!(error = ?error, "Multiplexed HTTP + WebSocket server failed");
             }

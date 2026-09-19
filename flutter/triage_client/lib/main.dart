@@ -12,7 +12,6 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -933,11 +932,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   bool _needsPairing = false;
   bool _pairingChallengeLoading = false;
   String? _pairingDeviceCode;
-  Uri? _pairingVerificationUri;
-  // The `127.0.0.1:<port>/pair` URL to open on the daemon host, shown for a
-  // remote daemon where `_pairingVerificationUri` (the clickable, loopback-only
-  // one) is null.
-  Uri? _pairingDaemonHostUri;
   DateTime? _pairingExpiresAt;
   String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
@@ -1722,68 +1716,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     return defaultWebSocketUriForBase(Uri.base);
   }
 
-  Uri? _verificationUriForClient(
-    TriageWebSocketClient client, {
-    String? deviceCode,
-  }) {
-    final wsUri = client.uri;
-    if (!_isLoopbackHost(wsUri.host)) {
-      return null;
-    }
-
-    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
-    final verificationUri = wsUri.replace(
-      scheme: scheme,
-      path: '/pair',
-      query: '',
-      fragment: '',
-    );
-    if (deviceCode == null || deviceCode.trim().isEmpty) {
-      return verificationUri;
-    }
-    return verificationUri.replace(
-      queryParameters: {'device_code': deviceCode},
-    );
-  }
-
-  /// The URL to open *on the machine running triaged* to approve pairing, shown
-  /// even for a remote daemon (where [_verificationUriForClient] is null because
-  /// clicking it here would hit this client's own loopback).
-  ///
-  /// Always the fixed loopback literal `127.0.0.1:<port>` — never the daemon's
-  /// claimed host. `/pair` only authorizes a same-host request, so loopback *is*
-  /// the address to use on the daemon box; and echoing the claimed host would
-  /// render an attacker-influenced name (e.g. `127.0.0.1.evil.com`) as a
-  /// pairing URL carrying the device code. The device code is the daemon-issued
-  /// challenge already on screen.
-  ///
-  /// Returns null when the connection carries no explicit port (e.g. a
-  /// `wss://host/ws` reverse proxy on the default 443): the daemon's real
-  /// loopback listen port is unknowable from here, so any port we printed would
-  /// be the proxy's public port, not the daemon's. Callers fall back to generic
-  /// guidance rather than show a URL that won't resolve on the daemon box. Only
-  /// the port the user actually typed to connect is trustworthy enough to render.
-  Uri? _daemonHostPairingUri(
-    TriageWebSocketClient client, {
-    String? deviceCode,
-  }) {
-    final wsUri = client.uri;
-    if (!wsUri.hasPort) {
-      return null;
-    }
-    final scheme = wsUri.scheme == 'wss' ? 'https' : 'http';
-    final base = Uri(
-      scheme: scheme,
-      host: '127.0.0.1',
-      port: wsUri.port,
-      path: '/pair',
-    );
-    if (deviceCode == null || deviceCode.trim().isEmpty) {
-      return base;
-    }
-    return base.replace(queryParameters: {'device_code': deviceCode});
-  }
-
   bool _isRemoteSession(SessionVm session) {
     return session.isRemote;
   }
@@ -2219,12 +2151,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _pairingChallengeLoading = true;
       _pairingChallengeError = null;
       // Drop the prior challenge so a refresh renders the loading spinner
-      // instead of the previous device code and pairing URL — the URL now embeds
-      // the device code, so a stale one would point at a challenge that no
-      // longer exists. The build shows the spinner only while the code is null.
+      // instead of the previous device code. The build shows the spinner only
+      // while the code is null.
       _pairingDeviceCode = null;
-      _pairingVerificationUri = null;
-      _pairingDaemonHostUri = null;
       _pairingExpiresAt = null;
     });
 
@@ -2238,14 +2167,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final expiresAtSeconds = challenge['expires_at'];
       setState(() {
         _pairingDeviceCode = challenge['device_code']?.toString();
-        _pairingVerificationUri = _verificationUriForClient(
-          _client,
-          deviceCode: _pairingDeviceCode,
-        );
-        _pairingDaemonHostUri = _daemonHostPairingUri(
-          _client,
-          deviceCode: _pairingDeviceCode,
-        );
         _pairingExpiresAt = expiresAtSeconds is int
             ? DateTime.fromMillisecondsSinceEpoch(
                 expiresAtSeconds * 1000,
@@ -3579,8 +3500,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'session_started') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final existingIndex =
-          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      final existingIndex = _sessions.indexWhere(
+        (s) => s.remoteSessionId == sessionId,
+      );
       if (existingIndex != -1) return;
 
       final wasEmpty = _sessions.isEmpty;
@@ -3619,7 +3541,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             failedSessionIds: <String>[],
           ).catchError((Object e) {
             if (e is! TriageAuthException || _disposed || _needsPairing) return;
-            unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+            unawaited(
+              _showPairingChallenge(_connectGeneration, _activeServerId),
+            );
           }),
         );
       }
@@ -3629,8 +3553,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'session_terminated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final index =
-          _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
       if (index == -1) return;
 
       final session = _sessions[index];
@@ -3674,7 +3597,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 includeHistory: true,
                 failedSessionIds: <String>[],
               ).catchError((Object e) {
-                if (e is! TriageAuthException || _disposed || _needsPairing) return;
+                if (e is! TriageAuthException || _disposed || _needsPairing) {
+                  return;
+                }
                 unawaited(
                   _showPairingChallenge(_connectGeneration, _activeServerId),
                 );
@@ -4743,7 +4668,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           child: SingleChildScrollView(
             child: Container(
               width: 520,
-              padding: const EdgeInsets.all(32),
+              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 20),
               decoration: BoxDecoration(
                 color: const Color(0xff161b1d),
                 borderRadius: BorderRadius.circular(16),
@@ -4758,8 +4683,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               ),
               child: _PairingView(
                 deviceCode: _pairingDeviceCode,
-                verificationUri: _pairingVerificationUri,
-                daemonHostUri: _pairingDaemonHostUri,
                 expiresAt: _pairingExpiresAt,
                 isChallengeLoading: _pairingChallengeLoading,
                 challengeError: _pairingChallengeError,
@@ -9560,8 +9483,6 @@ class WorkspaceHeader extends StatelessWidget {
 class _PairingView extends StatefulWidget {
   const _PairingView({
     required this.deviceCode,
-    required this.verificationUri,
-    required this.daemonHostUri,
     required this.expiresAt,
     required this.isChallengeLoading,
     required this.challengeError,
@@ -9571,11 +9492,6 @@ class _PairingView extends StatefulWidget {
   });
 
   final String? deviceCode;
-  // The clickable pairing URL, non-null only when the daemon is on this machine.
-  final Uri? verificationUri;
-  // The `127.0.0.1:<port>/pair` URL to open on the daemon host, shown as an
-  // instruction when `verificationUri` is null (a remote daemon).
-  final Uri? daemonHostUri;
   final DateTime? expiresAt;
   final bool isChallengeLoading;
   final String? challengeError;
@@ -9635,25 +9551,23 @@ class _PairingViewState extends State<_PairingView> {
     return 'Expires at $hour:$minute';
   }
 
-  Future<void> _copyText(String label, String value) async {
-    await Clipboard.setData(ClipboardData(text: value));
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('$label copied'),
-        duration: const Duration(milliseconds: 1400),
-      ),
-    );
+  String _cliCommand(String? deviceCode) {
+    if (deviceCode == null || deviceCode.trim().isEmpty) {
+      return 'triage pair';
+    }
+    return 'triage pair $deviceCode';
   }
 
-  Future<void> _openVerificationUri(Uri uri) async {
-    final opened = await openExternalUri(uri);
+  void _copyText(String label, String value) {
+    unawaited(
+      Clipboard.setData(ClipboardData(text: value)).catchError((Object _) {}),
+    );
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
       SnackBar(
-        content: Text(
-          opened ? 'Verification page opened' : 'Open this URL in a browser',
-        ),
+        content: Text('$label copied'),
         duration: const Duration(milliseconds: 1400),
       ),
     );
@@ -9662,10 +9576,8 @@ class _PairingViewState extends State<_PairingView> {
   @override
   Widget build(BuildContext context) {
     final deviceCode = widget.deviceCode;
-    final verificationUri = widget.verificationUri;
-    final hasVerificationUri = verificationUri != null;
-    final daemonHostUri = widget.daemonHostUri;
     final expiryLabel = _expiryLabel(widget.expiresAt);
+    final cliCommand = _cliCommand(deviceCode);
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -9685,20 +9597,12 @@ class _PairingViewState extends State<_PairingView> {
             ),
           ],
         ),
-        const SizedBox(height: 16),
-        Text(
-          hasVerificationUri
-              ? 'This browser is not paired with the Triage daemon. Open the verification URL, enter this device code to get a PIN, then enter the PIN below.'
-              : daemonHostUri != null
-              ? 'This browser is not paired with the Triage daemon. On the computer running triaged, open the URL below and enter this device code to get a PIN, then enter the PIN below.'
-              : 'This browser is not paired with the Triage daemon. On the computer running triaged, open the daemon pairing page and enter this device code to get a PIN, then enter the PIN below.',
-          style: const TextStyle(
-            color: Color(0xffa5b1b4),
-            fontSize: 14,
-            height: 1.4,
-          ),
+        const SizedBox(height: 12),
+        const Text(
+          'This client is not paired with the Triage daemon. Run the command below on the computer running triaged to approve pairing and receive a PIN, then enter the PIN below.',
+          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
         ),
-        const SizedBox(height: 18),
+        const SizedBox(height: 12),
         if (widget.isChallengeLoading && deviceCode == null)
           const Center(
             child: Padding(
@@ -9710,92 +9614,55 @@ class _PairingViewState extends State<_PairingView> {
             ),
           )
         else ...[
-          if (hasVerificationUri) ...[
-            const Text(
-              'Verification URL',
-              style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+          const Text(
+            'Run on the computer running triaged',
+            style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
+          ),
+          const SizedBox(height: 6),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              color: const Color(0xff101517),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xff344145)),
             ),
-            const SizedBox(height: 6),
-            Tooltip(
-              message: 'Open verification URL',
-              child: SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: () => _openVerificationUri(verificationUri),
-                  icon: const Icon(Icons.open_in_new, size: 18),
-                  label: Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      verificationUri.toString(),
-                      overflow: TextOverflow.ellipsis,
-                      maxLines: 1,
-                    ),
-                  ),
-                  style: OutlinedButton.styleFrom(
-                    alignment: Alignment.centerLeft,
-                    foregroundColor: const Color(0xff7fd1c7),
-                    side: const BorderSide(color: Color(0xff344145)),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 12,
+            child: Row(
+              children: [
+                Expanded(
+                  child: SelectableText(
+                    cliCommand,
+                    style: const TextStyle(
+                      color: Color(0xffcdd7d6),
+                      fontFamily: 'monospace',
+                      fontSize: 14,
                     ),
                   ),
                 ),
-              ),
-            ),
-          ] else ...[
-            const Text(
-              'Open on the computer running triaged',
-              style: TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
-            ),
-            const SizedBox(height: 6),
-            if (daemonHostUri != null)
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: SelectableText(
-                      daemonHostUri.toString(),
-                      style: const TextStyle(
-                        color: Color(0xffcdd7d6),
-                        fontSize: 14,
-                      ),
-                    ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Copy CLI command',
+                  icon: const Icon(
+                    Icons.copy,
+                    size: 18,
+                    color: Color(0xff7fd1c7),
                   ),
-                  const SizedBox(width: 8),
-                  Tooltip(
-                    message: 'Copy pairing URL',
-                    child: IconButton(
-                      icon: const Icon(
-                        Icons.copy,
-                        size: 18,
-                        color: Color(0xff7f8b8d),
-                      ),
-                      onPressed: () =>
-                          _copyText('Pairing URL', daemonHostUri.toString()),
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                    ),
-                  ),
-                ],
-              )
-            else
-              const Text(
-                'Use the daemon host pairing page or run triage pair.',
-                style: TextStyle(color: Color(0xffcdd7d6), fontSize: 14),
-              ),
-          ],
-          const SizedBox(height: 14),
+                  onPressed: deviceCode == null
+                      ? null
+                      : () => _copyText('CLI command', cliCommand),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
           Row(
             children: [
               Expanded(
                 child: Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 14,
-                    vertical: 12,
+                    vertical: 8,
                   ),
                   decoration: BoxDecoration(
                     color: const Color(0xff101517),
@@ -9880,13 +9747,13 @@ class _PairingViewState extends State<_PairingView> {
             style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
           ),
         ],
-        const SizedBox(height: 24),
+        const SizedBox(height: 16),
         TextField(
           controller: _pinController,
           maxLength: 8,
           textCapitalization: TextCapitalization.characters,
           style: const TextStyle(
-            fontSize: 22,
+            fontSize: 20,
             letterSpacing: 6,
             fontWeight: FontWeight.bold,
             color: Color(0xff7fd1c7),
@@ -9916,7 +9783,7 @@ class _PairingViewState extends State<_PairingView> {
             style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
           ),
         ],
-        const SizedBox(height: 24),
+        const SizedBox(height: 16),
         Wrap(
           alignment: WrapAlignment.end,
           spacing: 12,

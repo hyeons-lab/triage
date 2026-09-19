@@ -39,8 +39,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if startup_mode == StartupMode::Pair {
-        run_pairing_display()?;
+    if let StartupMode::Pair {
+        socket_path,
+        device_code,
+    } = startup_mode
+    {
+        run_pair(socket_path, device_code)?;
         return Ok(());
     }
 
@@ -125,44 +129,58 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> 
     Ok(())
 }
 
-fn run_pairing_display() -> Result<()> {
-    let config_path = triage_core::config::Config::default_path().unwrap_or_else(|_| {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        home.join(".config/triage/config.toml")
-    });
-    let config = if config_path.exists() {
-        triage_core::config::Config::load_from_path(&config_path).unwrap_or_default()
-    } else {
-        triage_core::config::Config::default()
-    };
-    let bind_addr = config.remote.bind_addr()?;
-    let verification_url = pairing_url_for_bind(bind_addr);
+fn run_pair(socket_path: Option<PathBuf>, device_code: Option<String>) -> Result<()> {
+    let path = socket_path.unwrap_or_else(triaged::ipc::default_socket_path);
+    let endpoint = triaged::ipc::display_endpoint(&path);
 
-    println!("\x1b[1;36m====================================================\x1b[0m");
-    println!("\x1b[1;36m               TRIAGE REMOTE PAIRING                \x1b[0m");
-    println!("\x1b[1;36m====================================================\x1b[0m");
+    let code = match device_code {
+        Some(code) if !code.trim().is_empty() => code.trim().to_string(),
+        _ => {
+            use std::io::{IsTerminal, Write};
+            if !io::stdin().is_terminal() {
+                bail!(
+                    "Device code is required in non-interactive environments; usage: triage pair <device-code>"
+                );
+            }
+            print!("Enter device code from Triage client: ");
+            io::stdout().flush().context("flushing stdout")?;
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .context("reading device code from stdin")?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                bail!("Device code is required; usage: triage pair [device-code]");
+            }
+            trimmed.to_string()
+        }
+    };
+
+    let client = triaged::ipc::IpcClient::new(&path);
+    let pin_info = client.approve_pairing_device_code(&code).with_context(|| {
+        format!(
+            "failed to approve pairing device code with daemon at {endpoint}. Is the daemon running as your user?"
+        )
+    })?;
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let remaining_secs = pin_info.expires_at.saturating_sub(now_unix);
+    let mins = remaining_secs / 60;
+    let secs = remaining_secs % 60;
+
+    println!("\x1b[1;32mDevice code approved.\x1b[0m");
     println!();
-    println!("  Verification URL: \x1b[1;33m{}\x1b[0m", verification_url);
+    println!("  Pairing PIN: \x1b[1;36m{}\x1b[0m", pin_info.pin);
+    if remaining_secs > 0 {
+        println!("  Expires in:  {mins}m {secs:02}s");
+    }
     println!();
-    println!("  Open the Triage client. If it is not paired, it will show a device code.");
-    println!("  Enter that device code at the verification URL to get a pairing PIN.");
-    println!("  Then enter the PIN back in that same Triage client.");
-    println!("\x1b[1;36m====================================================\x1b[0m");
+    println!("Enter this PIN in the Triage client that displayed the device code.");
 
     Ok(())
-}
-
-fn pairing_url_for_bind(bind_addr: std::net::SocketAddr) -> String {
-    let ip = match bind_addr.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
-        std::net::IpAddr::V4(ip) => ip.to_string(),
-        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-    };
-    format!("http://{}:{}/pair", ip, bind_addr.port())
 }
 
 #[cfg(any(unix, windows))]
@@ -179,7 +197,7 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
             tracing::warn!("starting embedded local session manager");
             LocalSessionApp::start(size)
         }
-        StartupMode::Pair => unreachable!("pair mode exits before startup"),
+        StartupMode::Pair { .. } => unreachable!("pair mode exits before startup"),
         StartupMode::Help => unreachable!("help mode exits before startup"),
         StartupMode::ClientReload { .. } | StartupMode::ClientUpgrade { .. } => {
             unreachable!("client subcommands exit before starting app")
@@ -196,7 +214,7 @@ fn start_app(size: SessionSize, startup_mode: StartupMode) -> Result<LocalSessio
             )
         }
         StartupMode::Embedded => LocalSessionApp::start(size),
-        StartupMode::Pair => unreachable!("pair mode exits before startup"),
+        StartupMode::Pair { .. } => unreachable!("pair mode exits before startup"),
         StartupMode::Help => unreachable!("help mode exits before startup"),
         StartupMode::ClientReload { .. } | StartupMode::ClientUpgrade { .. } => {
             unreachable!("client subcommands exit before starting app")
@@ -241,7 +259,10 @@ enum StartupMode {
         socket_path: PathBuf,
     },
     Embedded,
-    Pair,
+    Pair {
+        socket_path: Option<PathBuf>,
+        device_code: Option<String>,
+    },
     ClientReload {
         socket_path: Option<PathBuf>,
     },
@@ -254,17 +275,17 @@ enum StartupMode {
 
 impl StartupMode {
     const HELP: &'static str = "\
-usage: triage [--socket <path>] [--embedded] [pair] [client reload] [client upgrade --src <dir>]
+usage: triage [--socket <path>] [--embedded] [pair [device-code]] [client reload] [client upgrade --src <dir>]
 
 Options:
-  pair              Display remote client pairing instructions
-  client reload     Reload in-memory web asset cache inside running daemon
-  client upgrade    Upgrade web client assets from a source directory
-  --src <dir>       Source directory for web client upgrade (required for client upgrade)
-  --socket <path>   Connect to a daemon control socket at <path>
-                    (Unix domain socket on Unix, named pipe on Windows)
-  --embedded        Run an isolated in-process session manager
-  -h, --help        Print this help text
+  pair [device-code] Approve a client pairing device code and display the pairing PIN
+  client reload      Reload in-memory web asset cache inside running daemon
+  client upgrade     Upgrade web client assets from a source directory
+  --src <dir>        Source directory for web client upgrade (required for client upgrade)
+  --socket <path>    Connect to a daemon control socket at <path>
+                     (Unix domain socket on Unix, named pipe on Windows)
+  --embedded         Run an isolated in-process session manager
+  -h, --help         Print this help text
 
 By default triage connects to the running daemon (Unix domain socket on Unix,
 named pipe on Windows). Use --embedded for an isolated in-process session
@@ -274,12 +295,33 @@ manager when no daemon is running.";
         let mut mode = None;
         let mut socket_path = None;
         let mut src_path = None;
-        let mut args = args.into_iter();
+        let mut args = args.into_iter().peekable();
 
         while let Some(arg) = args.next() {
             match arg.to_str() {
                 Some("pair") | Some("--pair") => {
-                    if mode.replace(StartupMode::Pair).is_some() {
+                    let device_code = if let Some(next) = args.peek() {
+                        if let Some(s) = next.to_str() {
+                            if !s.starts_with('-') {
+                                let code = s.to_string();
+                                args.next();
+                                Some(code)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if mode
+                        .replace(StartupMode::Pair {
+                            socket_path: None,
+                            device_code,
+                        })
+                        .is_some()
+                    {
                         bail!("cannot combine multiple modes; pass --help for usage");
                     }
                 }
@@ -323,7 +365,7 @@ manager when no daemon is running.";
                 }
                 Some("--embedded") => {
                     if mode.replace(StartupMode::Embedded).is_some() {
-                        bail!("--embedded can only be passed once; pass --help for usage");
+                        bail!("cannot combine multiple modes; pass --help for usage");
                     }
                 }
                 Some("--socket") => {
@@ -347,15 +389,15 @@ manager when no daemon is running.";
             }
         }
 
-        if mode == Some(StartupMode::Pair) && socket_path.is_some() {
-            bail!("pair mode cannot be combined with --socket; pass --help for usage");
-        }
-
         if mode == Some(StartupMode::Embedded) && socket_path.is_some() {
             bail!("--embedded cannot be combined with --socket; pass --help for usage");
         }
 
         match mode {
+            Some(StartupMode::Pair { device_code, .. }) => Ok(StartupMode::Pair {
+                socket_path,
+                device_code,
+            }),
             Some(StartupMode::ClientReload { .. }) => Ok(StartupMode::ClientReload { socket_path }),
             Some(StartupMode::ClientUpgrade { .. }) => {
                 let Some(src) = src_path else {
@@ -2925,5 +2967,66 @@ mod tests {
             StartupMode::from_args([OsString::from("-h")]).expect("startup mode"),
             StartupMode::Help
         );
+    }
+
+    #[test]
+    fn startup_mode_accepts_pair_without_args() {
+        assert_eq!(
+            StartupMode::from_args([OsString::from("pair")]).expect("startup mode"),
+            StartupMode::Pair {
+                socket_path: None,
+                device_code: None,
+            }
+        );
+    }
+
+    #[test]
+    fn startup_mode_accepts_pair_with_device_code() {
+        assert_eq!(
+            StartupMode::from_args([OsString::from("pair"), OsString::from("ABCD-EFGH"),])
+                .expect("startup mode"),
+            StartupMode::Pair {
+                socket_path: None,
+                device_code: Some("ABCD-EFGH".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn startup_mode_accepts_pair_with_socket_and_device_code() {
+        assert_eq!(
+            StartupMode::from_args([
+                OsString::from("--socket"),
+                OsString::from("/tmp/custom.sock"),
+                OsString::from("pair"),
+                OsString::from("WXYZ-1234"),
+            ])
+            .expect("startup mode"),
+            StartupMode::Pair {
+                socket_path: Some(PathBuf::from("/tmp/custom.sock")),
+                device_code: Some("WXYZ-1234".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn startup_mode_rejects_pair_combined_with_embedded() {
+        let error = StartupMode::from_args([OsString::from("pair"), OsString::from("--embedded")])
+            .expect_err("ambiguous mode should fail");
+
+        assert!(error.to_string().contains("cannot combine multiple modes"));
+    }
+
+    #[test]
+    fn run_pair_fails_when_device_code_missing_in_non_interactive_env() {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            let err = run_pair(None, None)
+                .expect_err("should reject missing device code when non-interactive");
+            assert!(
+                err.to_string()
+                    .contains("Device code is required in non-interactive environments")
+            );
+        }
     }
 }
