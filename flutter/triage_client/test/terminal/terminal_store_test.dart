@@ -1555,6 +1555,88 @@ void main() {
     expect(sink.ops, ['write:after', 'write:more']);
   });
 
+  // The epoch-reset window (1024) never trips for a fresh session: a baseline
+  // of 500 renumbered to 0/1 scores `0 < 500 - 1024` as false, so without the
+  // low-baseline clause every renumbered chunk looks like a duplicate and the
+  // terminal goes permanently deaf.
+  test('live seq reset to 0/1 on a fresh session still renders (handover)', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 495),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 500));
+    expect(sink.ops, ['resize:80,24', 'clear', 'write:OLD', 'write:pre']);
+
+    // Successor daemon adopts the session and renumbers from scratch.
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('after'), outputSeq: 1));
+    store.dispatch(LiveBytes(b('more'), outputSeq: 2));
+    expect(sink.ops, ['write:after', 'write:more']);
+  });
+
+  test('startup redelivery of seq 1 at a tiny baseline stays a duplicate', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 8),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 10));
+    sink.ops.clear();
+
+    // Baseline is 10: seq 1 is an old duplicate, not a new epoch.
+    store.dispatch(LiveBytes(b('stale'), outputSeq: 1));
+    expect(sink.ops, isEmpty);
+  });
+
+  test(
+    'delta merge mid-frame flushes without closing the synchronized block',
+    () {
+      final deltaSink = FakeTerminalSink();
+      final deltaStore = TerminalStore(deltaSink);
+      addTearDown(deltaStore.dispose);
+      deltaStore.dispatch(const Resize(80, 24));
+
+      const seed = 'seed ';
+      const frameStart = '\x1b[?2026hframe ';
+      const delta = 'delta ';
+      deltaStore.dispatch(
+        HistoryBytes(
+          b(seed),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      // Open a Mode 2026 frame over the live stream: buffered, nothing written.
+      deltaStore.dispatch(LiveBytes(b(frameStart), outputSeq: 6));
+      final bufferedOpCount = deltaSink.ops.length;
+
+      // Overlapping snapshot covering seed + live + unseen delta bytes.
+      deltaStore.dispatch(
+        HistoryBytes(
+          b('$seed$frameStart$delta'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 7,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Delta merge: no clear, and the buffered frame paints verbatim.
+      expect(deltaSink.ops.where((op) => op == 'clear').length, 1);
+      expect(deltaSink.ops.length, bufferedOpCount + 1);
+      expect(deltaSink.ops.last, 'write:$frameStart$delta');
+
+      // The block is still open: mid-frame live bytes buffer instead of writing.
+      deltaStore.dispatch(LiveBytes(b('more\n'), outputSeq: 8));
+      expect(deltaSink.ops.last, 'write:$frameStart$delta');
+
+      // The real end marker still closes the frame atomically.
+      deltaStore.dispatch(LiveBytes(b('\x1b[?2026l'), outputSeq: 9));
+      expect(deltaSink.ops.last, 'write:more\n\x1b[?2026l');
+    },
+  );
+
   test('large payload newline translation completes quickly without stalling', () {
     store.dispatch(const Attach());
     store.dispatch(

@@ -410,7 +410,11 @@ class TerminalStore extends ChangeNotifier {
             if (next.sized) {
               _flushPendingLive(resolvedSeq);
             }
-            _closeSyncBlockAndFlush();
+            // Paint any buffered Mode 2026 frame content without closing the
+            // block: a snapshot can land mid-frame during streaming, and
+            // closing here would break atomic frame semantics. The end marker,
+            // capacity cap, and idle watchdog still close it.
+            _flushSyncBuffer();
             return next.copyWith(
               phase: AttachPhase.live,
               scrollbackReady: true,
@@ -602,12 +606,16 @@ class TerminalStore extends ChangeNotifier {
   /// further below the dedup baseline than the daemon could ever replay — the
   /// signature of a handover renumbering an adopted session. See
   /// [kSeqEpochResetWindow]; the history path makes the same call via
-  /// `isSequenceRegressed`.
+  /// `isSequenceRegressed`. A fresh session whose baseline never reached the
+  /// window still resets to 0/1 after a handover, so a regression to the start
+  /// of a new epoch counts regardless of the window once the baseline is past
+  /// single digits (guarding startup redeliveries of seq 0/1 against reset).
   bool _isSeqEpochReset(int? outputSeq, int? highWaterSeq) {
     if (outputSeq == null) return false;
     final baseline = max(highWaterSeq ?? 0, _appliedLiveSeq ?? 0);
     if (baseline == 0) return false;
-    return outputSeq < baseline - kSeqEpochResetWindow;
+    return outputSeq < baseline - kSeqEpochResetWindow ||
+        (outputSeq <= 1 && baseline > 10);
   }
 
   void _beginHostInputSuppression() {

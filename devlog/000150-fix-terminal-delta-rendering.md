@@ -11,6 +11,9 @@ Fix terminal rendering in the Triage client so it does not clear and re-render t
 - 2026-09-16T15:21-0400: Retain existing `SessionVm` instances and terminal buffers across reconnects to the same daemon in `_loadDaemonSessions`. Reconcile metadata and grouping in place instead of disposing active terminals, wiping the sessions list, and forcing a full screen clear and replay.
 - 2026-09-16T15:21-0400: Guard against spurious reconnect loops in `_checkCredentialStorageStillMatches`. Normalize credential string comparisons with trimming, and avoid tearing down active authenticated connections when storage is temporarily unhydrated.
 - 2026-09-16T17:16-0400: Address review findings across multi-round audits. Gated `_hidePopover()` teardown to unconditionally invoke `entry.remove()` and `entry.dispose()`, debounced resubscription requests via `_resubscribeInFlight`, handled auth challenges cleanly in background snapshot refreshes, and rolled back subscription state and pending events on resubscription failure.
+- 2026-09-19T13:08-0400: Address Copilot inline review (`terminal_store.dart` delta-append path): paint buffered Mode 2026 frame content with `_flushSyncBuffer()` instead of closing the block, so a snapshot landing mid-frame no longer breaks atomic frame semantics; the end marker, capacity cap, and idle watchdog still close it.
+- 2026-09-19T13:08-0400: Address Antigravity Risk 1 (`_isSeqEpochReset` low-baseline window failure): a regression to seq 0/1 with baseline > 10 now counts as an epoch reset regardless of `kSeqEpochResetWindow`, so a fresh session adopted after a handover cannot go permanently deaf. The baseline guard keeps startup redeliveries of seq 0/1 as duplicates.
+- 2026-09-19T13:08-0400: Decline Antigravity overlay suggestion: the proposed prop comparison omits `glanceTitle`, `repoName`, `worktreeName`, `cwd`, and `snippetDetail` that the popover builder reads, so gating rebuilds on its subset would show stale hover cards. The unconditional `markNeedsBuild()` only runs while the hover popover is mounted and stays.
 
 ## What Changed
 
@@ -20,10 +23,13 @@ Fix terminal rendering in the Triage client so it does not clear and re-render t
 - 2026-09-16T17:16-0400 flutter/triage_client/lib/terminal/terminal_store.dart: Refined sequence 0 reset detection for null `rawOutputStart`, added `lastSnapshotSeq == null` handling in `isLogShrunk`, and called `_closeSyncBlockAndFlush()` on delta append.
 - 2026-09-16T17:16-0400 flutter/triage_client/lib/main.dart: Cleared `_subscriptionIds` on disconnect, added `_resubscribeInFlight` debounce set, safely routed `TriageAuthException` in background snapshot refreshes, styled load failures in red upon selection resubscription failure, and cleaned up popover overlay teardown.
 - 2026-09-16T17:16-0400 flutter/triage_client/test/terminal/terminal_store_test.dart: Added tests for sequence fallback without rawOutputStart, unchanged snapshot sequences, UTF-8 rune splitting across delta boundaries, and empty snapshot payloads.
+- 2026-09-19T13:08-0400 flutter/triage_client/lib/terminal/terminal_store.dart: Replaced `_closeSyncBlockAndFlush()` with `_flushSyncBuffer()` on the delta-append path and added the low-baseline `(outputSeq <= 1 && baseline > 10)` clause to `_isSeqEpochReset`.
+- 2026-09-19T13:08-0400 flutter/triage_client/test/terminal/terminal_store_test.dart: Added three failing-first regression tests: low-baseline handover live seq reset renders, tiny-baseline seq 1 redelivery stays a duplicate, and delta merge mid-frame flushes without closing the synchronized block.
 
 ## Commits
 
-- HEAD: fix(client): resolve terminal flicker and preserve session buffer on reconnect
+- dcc89b7: fix(client): resolve terminal flicker and preserve session buffer on reconnect
+- HEAD: fix(client): address PR 174 review findings on delta sync flush and epoch reset
 
 ## Progress
 
@@ -36,3 +42,5 @@ Fix terminal rendering in the Triage client so it does not clear and re-render t
 - [x] Verify Flutter test suite and analyze checks (518 tests passing, 0 analyze issues)
 - [x] Verify Rust tests and workspace checks (331 tests passing, 0 clippy warnings)
 - [x] Run iterative Antigravity Code Review loops to clean status
+- [x] Address PR 174 review findings (Copilot DEC 2026 delta flush, Antigravity low-baseline epoch window) with failing-first regression tests
+- [x] Verify terminal-store suite (68 tests passing) and `flutter analyze` (0 issues) after the review fixes
