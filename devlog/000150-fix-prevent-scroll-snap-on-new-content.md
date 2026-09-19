@@ -52,9 +52,12 @@ Prevent the terminal viewport from snapping to the bottom (near the composer) wh
 - 2026-09-17T11:40-0400 flutter/triage_client/lib/widgets/terminal_pane_web.dart: tracked _sessionSavedViewportY on fit restoration; documented 10px threshold distinguishing web DOM scaling from native subpixel scroll physics.
 - 2026-09-17T11:40-0400 flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart: added unit test for desiredOffset with non-positive maxScrollExtent.
 - 2026-09-17T11:40-0400 flutter/triage_client/test/widget_test.dart: added widget tests for stationary touch in grace band, upward reversal after dragging down in grace band, and microtask anchor re-pinning on fling settling.
+- 2026-09-18T22:11-0400 rebase onto main (7db2935, #172 hardware shift-tab): one conflict in terminal_pane_stub.dart isTest fallback, resolved by keeping #172's Focus wrapper (hardware backtab key handling) around identical fallback content; #172's tab-dispatch deltas in both panes are independent of scroll anchoring. Verified rebased Dart files are byte-identical to the CI-green tree outside #172's hunks; dart analyze and dart format clean.
+- 2026-09-18T22:11-0400 Copilot review dispositions: devlog HEAD entry fixed to em-dash rule; anchor capture test name ('capturing just above the bottom holds an anchor') already renamed in 02e4187 so the grace-band comment is satisfied with no further change; widget 'start or terminate' test already covers both emitSessionStarted and emitSessionTerminated so that comment needs no change.
 
 ## Commits
-- d16b007: fix(terminal): prevent scroll snapping to bottom on new content while scrolling up
-- 02e4187: test(terminal): refine test assertions and widen web subpixel scroll epsilon
-- 759f171: fix(terminal): eliminate anchor resurrection, preserve row 0 scroll, and hook fling settling
-- HEAD: fix(terminal): defer scroll settling to microtask, retain stationary grace band touch, and guard unmeasured extents
+- b9ebab2: fix(terminal): prevent scroll snapping to bottom on new content while scrolling up
+- e1203c8: test(terminal): refine test assertions and widen web subpixel scroll epsilon
+- db2f093: fix(terminal): eliminate anchor resurrection, preserve row 0 scroll, and hook fling settling
+- 0bc60af: fix(terminal): defer scroll settling to microtask, retain stationary grace band touch, and guard unmeasured extents
+- HEAD — docs(devlog): apply HEAD rule and record rebase onto main with Copilot review dispositions
