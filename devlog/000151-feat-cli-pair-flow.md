@@ -68,4 +68,5 @@ Remove the unauthenticated HTTP `/pair` web endpoint from the daemon to eliminat
 - aab20bf: fix(cli): guard non-interactive stdin and log warning on unsupported unix
 - c54afa5: chore(devlog): renumber devlog to 000151 following rebase onto origin/main
 - 775db08: fix(pairing): harden ipc peer credentials, clipboard handling, and cli formatting
-- HEAD: fix(review): fail closed on unsupported unix and clarify deprecated config
+- 9348388: fix(review): fail closed on unsupported unix and clarify deprecated config
+- HEAD — fix(review): ignore deprecated pair_approval keys and fix devlog HEAD format

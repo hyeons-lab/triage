@@ -239,27 +239,14 @@ pub struct RemoteConfig {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub web_assets_path: Option<String>,
-    /// Tailnet login names (e.g. `you@example.com`) permitted to approve pairing
-    /// from a remote device. When non-empty, a `/pair` request whose tailnet
-    /// identity (`tailscale whois`) matches an entry is allowed to approve, in
-    /// addition to loopback / same-host. Empty (the default) keeps approval
-    /// loopback-only.
+    /// Deprecated: legacy allowlist for the removed web `/pair` approval route.
+    /// Pairing approval is handled exclusively via `triage pair` now. Kept for
+    /// config-file compatibility; the value is ignored (never validated).
     pub pair_approval_tailnet_users: Vec<String>,
-    /// Whether loopback / same-host peers are auto-trusted to approve pairing.
-    /// Defaults to `true`. Set to `false` when a loopback reverse proxy (or any
-    /// intermediary that makes remote requests appear local) terminates TLS in
-    /// front of the daemon — otherwise every forwarded request looks like a
-    /// loopback peer and bypasses the tailnet identity check. When `false`,
-    /// `pair_approval_tailnet_users` must be non-empty (otherwise nothing could
-    /// ever approve pairing).
+    /// Deprecated: legacy toggle for the removed web `/pair` approval route.
+    /// Kept for config-file compatibility; the value is ignored (never validated).
     pub pair_approval_trust_local_peers: bool,
 }
-
-/// Tailscale reports tag-owned (non-user) nodes with this synthetic login. It is
-/// shared by *every* tagged node on a tailnet, so it must never be treated as an
-/// approvable identity — it is rejected by remote-config validation and the
-/// `/pair` gate.
-pub const TAGGED_DEVICES_LOGIN: &str = "tagged-devices";
 
 impl RemoteConfig {
     pub fn bind_addr(&self) -> Result<SocketAddr> {
@@ -271,31 +258,9 @@ impl RemoteConfig {
         if let Some(ref path) = self.web_assets_path {
             ensure_non_empty("remote.web_assets_path", path)?;
         }
-        ensure_non_empty_items(
-            "remote.pair_approval_tailnet_users",
-            &self.pair_approval_tailnet_users,
-        )?;
-        for (index, user) in self.pair_approval_tailnet_users.iter().enumerate() {
-            if user.trim().eq_ignore_ascii_case(TAGGED_DEVICES_LOGIN) {
-                bail!(
-                    "remote.pair_approval_tailnet_users[{index}] must not be \"{TAGGED_DEVICES_LOGIN}\": \
-                     this is Tailscale's shared pseudo-login for every tag-owned node, so listing it \
-                     would grant pairing approval to all tagged devices on the tailnet"
-                );
-            }
-        }
-        if !self.pair_approval_tailnet_users.is_empty() && !self.require_pairing {
-            bail!(
-                "remote.pair_approval_tailnet_users requires remote.require_pairing = true \
-                 (pairing approval is meaningless when pairing is disabled)"
-            );
-        }
-        if !self.pair_approval_trust_local_peers && self.pair_approval_tailnet_users.is_empty() {
-            bail!(
-                "remote.pair_approval_trust_local_peers = false requires a non-empty \
-                 remote.pair_approval_tailnet_users (otherwise no peer could ever approve pairing)"
-            );
-        }
+        // `pair_approval_*` keys are deprecated no-ops (the web `/pair` route no
+        // longer exists), so they are parsed for compatibility but never
+        // validated — a stale value must not fail daemon startup.
         match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => {
                 ensure_non_empty("remote.tls_cert", cert)?;
@@ -319,11 +284,9 @@ impl Default for RemoteConfig {
             tls_cert: None,
             tls_key: None,
             web_assets_path: None,
-            // Loopback-only pairing approval by default; opt in to remote
-            // (tailnet) approval by listing tailnet login names here.
+            // Deprecated no-op; kept at the default for config compatibility.
             pair_approval_tailnet_users: Vec::new(),
-            // Trust loopback / same-host peers to approve pairing by default;
-            // disable only when a loopback reverse proxy fronts the daemon.
+            // Deprecated no-op; kept at the default for config compatibility.
             pair_approval_trust_local_peers: true,
         }
     }
@@ -819,72 +782,24 @@ tls_cert = "server.crt"
     }
 
     #[test]
-    fn empty_tailnet_pair_approval_user_fails_validation() {
-        let error = Config::from_toml_str(
-            r#"
-[remote]
-pair_approval_tailnet_users = ["alice@example.com", " "]
-"#,
-        )
-        .expect_err("empty tailnet pair approval user should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("remote.pair_approval_tailnet_users[1] must not be empty")
-        );
-    }
-
-    #[test]
-    fn tailnet_pair_approval_requires_require_pairing() {
-        let error = Config::from_toml_str(
+    fn deprecated_pair_approval_keys_are_parsed_but_ignored() {
+        // Stale values that validation used to reject must not fail startup now
+        // that the web `/pair` route (their only consumer) is gone.
+        let config = Config::from_toml_str(
             r#"
 [remote]
 require_pairing = false
-pair_approval_tailnet_users = ["alice@example.com"]
-"#,
-        )
-        .expect_err("tailnet pair approval without require_pairing should fail");
-
-        assert!(
-            error.to_string().contains(
-                "remote.pair_approval_tailnet_users requires remote.require_pairing = true"
-            )
-        );
-    }
-
-    #[test]
-    fn tagged_devices_pseudo_login_is_rejected() {
-        let error = Config::from_toml_str(
-            r#"
-[remote]
-pair_approval_tailnet_users = ["alice@example.com", " Tagged-Devices "]
-"#,
-        )
-        .expect_err("tagged-devices pseudo-login should fail");
-
-        assert!(
-            error.to_string().contains("must not be \"tagged-devices\""),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn distrusting_local_peers_requires_an_allowlist() {
-        let error = Config::from_toml_str(
-            r#"
-[remote]
+pair_approval_tailnet_users = ["alice@example.com", " ", " Tagged-Devices "]
 pair_approval_trust_local_peers = false
 "#,
         )
-        .expect_err("distrusting local peers with no allowlist should fail");
+        .expect("deprecated pair_approval keys should load without validation");
 
-        assert!(
-            error
-                .to_string()
-                .contains("remote.pair_approval_trust_local_peers = false requires a non-empty"),
-            "unexpected error: {error}"
+        assert_eq!(
+            config.remote.pair_approval_tailnet_users,
+            ["alice@example.com", " ", " Tagged-Devices "]
         );
+        assert!(!config.remote.pair_approval_trust_local_peers);
     }
 
     #[test]

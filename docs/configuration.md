@@ -145,8 +145,8 @@ Remote WebSocket and HTTP server configuration.
 | --- | --- | --- | --- |
 | `bind` | string | `"0.0.0.0:7777"` | Network address and port to bind for HTTP/WebSocket traffic. Set to `"127.0.0.1:7777"` for local loopback only. |
 | `require_pairing` | boolean | `true` | When `true`, remote clients must complete a device-code + PIN authentication handshake approved via `triage pair`. |
-| `pair_approval_tailnet_users` | array of strings | `[]` | Deprecated. Legacy option for the former web `/pair` route; remove this key from your configuration as pairing approval is now handled exclusively via `triage pair`. Existing keys are still validated during configuration load. |
-| `pair_approval_trust_local_peers` | boolean | `true` | Deprecated. Legacy option for the former web `/pair` route; remove this key from your configuration. Existing keys are still validated during configuration load. |
+| `pair_approval_tailnet_users` | array of strings | `[]` | Deprecated and ignored. Legacy option for the former web `/pair` route; pairing approval is now handled exclusively via `triage pair`. Safe to remove from your configuration (the daemon warns while it is set). |
+| `pair_approval_trust_local_peers` | boolean | `true` | Deprecated and ignored. Legacy option for the former web `/pair` route. Safe to remove from your configuration. |
 | `tls_cert` | string (optional) | `None` | Path to TLS certificate file (must be set alongside `tls_key`). |
 | `tls_key` | string (optional) | `None` | Path to TLS private key file (must be set alongside `tls_cert`). |
 | `web_assets_path` | string (optional) | `None` | Custom filesystem path to override embedded web client assets. |
