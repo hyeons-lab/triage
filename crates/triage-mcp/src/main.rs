@@ -772,6 +772,7 @@ mod tests {
                     raw_output_prefix: Vec::new(),
                     snippet: None,
                     snippet_detail: None,
+                    agent: None,
                 },
                 snapshot_error: None,
                 inbox: RefCell::new(Vec::new()),

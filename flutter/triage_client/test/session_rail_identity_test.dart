@@ -455,6 +455,49 @@ void main() {
       expect(find.text('triage'), findsNWidgets(2));
     });
 
+    testWidgets('agent badge shows kind and short conversation id', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {
+              'kind': 'claude',
+              'conversation_id': 'abc12345ef',
+            },
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('claude abc12345'), findsOneWidget);
+    });
+
+    testWidgets('kind-only agent badge marks most-recent fallback', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'muse'},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('muse (recent)'), findsOneWidget);
+    });
+
     testWidgets('the meta line never repeats the title', (tester) async {
       await tester.pumpWidget(
         host(
