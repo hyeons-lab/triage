@@ -474,6 +474,11 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // than at their launch dir. Always on, independent of the summarizer.
     manager.start_cwd_persistence();
 
+    // Start recording each live session's foreground agent into the manifest
+    // as it changes, so a daemon kill restores the session by resuming the
+    // same conversation. Always on, independent of the summarizer.
+    manager.start_agent_persistence();
+
     // Start periodically recording each live session's last-output time into the
     // manifest, so the client rail's activity ordering survives a daemon kill.
     // A session that only ever produces output (a build, a running agent) never

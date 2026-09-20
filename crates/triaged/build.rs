@@ -25,6 +25,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(embed_real_client)");
     println!("cargo:rustc-check-cfg=cfg(embed_packaged_client)");
     println!("cargo:rerun-if-env-changed=TRIAGE_SKIP_FLUTTER_BUILD");
+    build_stub_agent();
 
     // Watch the crate root so that staging a `dist/` (release packaging) is
     // noticed. `dist` itself must only be watched once it exists: cargo treats a
@@ -413,6 +414,42 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+/// Compile the stub-agent test helper (`src/stub_agent.rs`, not a module)
+/// into OUT_DIR with the same rustc cargo uses. Skipped when the binary is
+/// already newer than the source, so normal builds pay nothing. Only unit
+/// and integration tests use it, via `env!("OUT_DIR")`; production code
+/// never references it.
+fn build_stub_agent() {
+    let src = Path::new("src/stub_agent.rs");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set"));
+    let exe_suffix = std::env::var("CARGO_CFG_TARGET_EXE_SUFFIX").unwrap_or_default();
+    let out = out_dir.join(format!("triage-stub-agent{exe_suffix}"));
+    let fresh = fs::metadata(&out)
+        .and_then(|o| o.modified())
+        .ok()
+        .zip(fs::metadata(src).and_then(|s| s.modified()).ok())
+        .is_some_and(|(out_mtime, src_mtime)| out_mtime >= src_mtime);
+    if fresh {
+        return;
+    }
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let target = std::env::var("TARGET").expect("TARGET is set");
+    let status = Command::new(&rustc)
+        .arg("--edition=2021")
+        .arg("--target")
+        .arg(&target)
+        .arg("-O")
+        .arg(src)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to spawn {rustc} for stub agent: {error}"));
+    assert!(
+        status.success(),
+        "compiling the stub agent test helper failed"
+    );
 }
 
 fn warn(message: &str) {

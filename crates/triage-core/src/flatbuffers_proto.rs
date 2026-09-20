@@ -145,6 +145,10 @@ pub fn build_session_snapshot<'a>(
         .snippet_detail
         .as_ref()
         .map(|s| builder.create_string(s));
+    let agent = snap
+        .agent
+        .as_ref()
+        .map(|a| build_agent_attachment(builder, a));
 
     fb::SessionSnapshot::create(
         builder,
@@ -165,6 +169,41 @@ pub fn build_session_snapshot<'a>(
             raw_output_prefix,
             snippet,
             snippet_detail,
+            agent,
+        },
+    )
+}
+
+pub fn build_agent_attachment<'a>(
+    builder: &mut FlatBufferBuilder<'a>,
+    attach: &crate::agent::AgentAttachment,
+) -> flatbuffers::WIPOffset<fb::AgentAttachment<'a>> {
+    let conversation_id = attach
+        .conversation_id
+        .as_ref()
+        .map(|s| builder.create_string(s));
+    let transcript_path = attach
+        .transcript_path
+        .as_ref()
+        .map(|p| builder.create_string(&p.to_string_lossy()));
+    let exe_path = attach
+        .exe_path
+        .as_ref()
+        .map(|p| builder.create_string(&p.to_string_lossy()));
+    let kind = match attach.kind {
+        crate::agent::AgentKind::Claude => fb::AgentKind::Claude,
+        crate::agent::AgentKind::Codex => fb::AgentKind::Codex,
+        crate::agent::AgentKind::Antigravity => fb::AgentKind::Antigravity,
+        crate::agent::AgentKind::Muse => fb::AgentKind::Muse,
+    };
+    fb::AgentAttachment::create(
+        builder,
+        &fb::AgentAttachmentArgs {
+            kind,
+            conversation_id,
+            transcript_path,
+            exe_path,
+            last_seen_ms: attach.last_seen_ms,
         },
     )
 }
@@ -316,6 +355,7 @@ mod tests {
             raw_output_prefix,
             snippet: None,
             snippet_detail: None,
+            agent: None,
         }
     }
 
@@ -351,9 +391,41 @@ mod tests {
         // follow declaration order, so a mid-table insert silently
         // renumbers them and corrupts both skew directions (old readers
         // decode prefix bytes as snippet; new readers decode an old
-        // snippet string as prefix). The prefix must stay last.
+        // snippet string as prefix). The prefix and agent must stay last.
         assert_eq!(fb::SessionSnapshot::VT_SNIPPET, 30);
         assert_eq!(fb::SessionSnapshot::VT_SNIPPET_DETAIL, 32);
         assert_eq!(fb::SessionSnapshot::VT_RAW_OUTPUT_PREFIX, 34);
+        assert_eq!(fb::SessionSnapshot::VT_AGENT, 36);
+    }
+
+    #[test]
+    fn session_snapshot_round_trips_agent_attachment() {
+        let mut snap = sample(Vec::new(), 0, Vec::new());
+        snap.agent = Some(crate::agent::AgentAttachment {
+            kind: crate::agent::AgentKind::Muse,
+            conversation_id: Some("abc".to_string()),
+            transcript_path: Some(std::path::PathBuf::from("/tmp/t.jsonl")),
+            exe_path: None,
+            last_seen_ms: 42,
+        });
+        let mut builder = FlatBufferBuilder::new();
+        let off = build_session_snapshot(&mut builder, &snap);
+        builder.finish(off, None);
+        let decoded = flatbuffers::root::<fb::SessionSnapshot>(builder.finished_data()).unwrap();
+        let agent = decoded.agent().expect("agent table");
+        assert_eq!(agent.kind(), fb::AgentKind::Muse);
+        assert_eq!(agent.conversation_id(), Some("abc"));
+        assert_eq!(agent.transcript_path(), Some("/tmp/t.jsonl"));
+        assert_eq!(agent.exe_path(), None);
+        assert_eq!(agent.last_seen_ms(), 42);
+    }
+
+    #[test]
+    fn absent_agent_is_omitted_for_old_client_compat() {
+        let mut builder = FlatBufferBuilder::new();
+        let off = build_session_snapshot(&mut builder, &sample(Vec::new(), 0, Vec::new()));
+        builder.finish(off, None);
+        let snap = flatbuffers::root::<fb::SessionSnapshot>(builder.finished_data()).unwrap();
+        assert!(snap.agent().is_none());
     }
 }
