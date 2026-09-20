@@ -8428,7 +8428,11 @@ class _CustomLabelDialogState extends State<_CustomLabelDialog> {
 /// id, or `(recent)` when only the kind is known (restore falls back to the
 /// agent's most-recent conversation).
 String _agentBadgeText(Map<String, dynamic> agent) {
-  final kind = agent['kind'] as String? ?? 'agent';
+  // Display names match the TUI badge (`primary_binary` style), not the
+  // raw serde kind strings, so both clients render one identity. Unknown
+  // kinds render raw so a future agent stays recognizable.
+  final rawKind = agent['kind'] as String? ?? 'agent';
+  final kind = rawKind == 'antigravity' ? 'agy' : rawKind;
   final id = agent['conversation_id'] as String?;
   if (id == null || id.isEmpty) return '$kind (recent)';
   return '$kind ${id.length <= 8 ? id : id.substring(0, 8)}';

@@ -80,32 +80,52 @@ fn long_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
     None
 }
 
+/// True when any arg is one of the given flags.
+fn has_any(args: &[&str], flags: &[&str]) -> bool {
+    args.iter().any(|a| flags.contains(a))
+}
+
+/// Value of the short flag's next token (`-r <id>`), or `None` when the
+/// flag is absent or its value looks like another flag.
+fn short_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if *arg == flag {
+            let value = iter.next().copied()?;
+            return (!value.starts_with('-')).then_some(value);
+        }
+    }
+    None
+}
+
 fn classify_claude(args: &[&str]) -> Option<AgentArgv> {
-    if args.iter().any(|a| *a == "--help" || *a == "-h") {
+    if has_any(args, &["--help", "-h"]) {
         return None;
     }
-    if args.iter().any(|a| *a == "--version" || *a == "-V") {
+    if has_any(args, &["--version", "-V"]) {
         return None;
     }
     if positional_tokens(args).first() == Some(&"mcp") {
         return None;
     }
-    let mode = if args.iter().any(|a| *a == "--print" || *a == "-p") {
+    let mode = if has_any(args, &["--print", "-p"]) {
         AgentRunMode::Headless
     } else {
         AgentRunMode::Interactive
     };
     Some(AgentArgv {
         mode,
-        conversation_id: long_flag_value(args, "--resume").map(str::to_string),
+        conversation_id: long_flag_value(args, "--resume")
+            .or_else(|| short_flag_value(args, "-r"))
+            .map(str::to_string),
     })
 }
 
 fn classify_codex(args: &[&str]) -> Option<AgentArgv> {
-    if args.iter().any(|a| *a == "--help" || *a == "-h") {
+    if has_any(args, &["--help", "-h"]) {
         return None;
     }
-    if args.iter().any(|a| *a == "--version" || *a == "-V") {
+    if has_any(args, &["--version", "-V"]) {
         return None;
     }
     let positionals = positional_tokens(args);
@@ -137,10 +157,7 @@ fn classify_codex(args: &[&str]) -> Option<AgentArgv> {
 }
 
 fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
-    if args
-        .iter()
-        .any(|a| *a == "--help" || *a == "-h" || *a == "help")
-    {
+    if has_any(args, &["--help", "-h", "help"]) {
         return None;
     }
     if positional_tokens(args).first().is_some_and(|sub| {
@@ -162,10 +179,7 @@ fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
     }) {
         return None;
     }
-    let mode = if args
-        .iter()
-        .any(|a| *a == "--print" || *a == "-p" || *a == "--prompt")
-    {
+    let mode = if has_any(args, &["--print", "-p", "--prompt"]) {
         AgentRunMode::Headless
     } else {
         AgentRunMode::Interactive
@@ -177,10 +191,10 @@ fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
 }
 
 fn classify_muse(args: &[&str]) -> Option<AgentArgv> {
-    if args.iter().any(|a| *a == "--help" || *a == "-h") {
+    if has_any(args, &["--help", "-h"]) {
         return None;
     }
-    if args.iter().any(|a| *a == "--version" || *a == "-V") {
+    if has_any(args, &["--version", "-V"]) {
         return None;
     }
     let positionals = positional_tokens(args);
@@ -232,21 +246,21 @@ fn home_dir() -> Option<PathBuf> {
 /// Root of an agent's local transcript store, or `None` when the home
 /// directory is unknown (Antigravity has no known local store at all).
 pub fn transcript_store_root(kind: AgentKind) -> Option<PathBuf> {
+    // Single exhaustive match: a future `AgentKind` fails closed at
+    // compile time instead of hitting a runtime `unreachable!` on the
+    // observation path.
+    let home = home_dir()?;
     match kind {
+        AgentKind::Claude => Some(home.join(".claude").join("projects")),
+        AgentKind::Codex => Some(home.join(".codex").join("sessions")),
+        AgentKind::Muse => Some(
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local").join("share"))
+                .join("muse")
+                .join("sessions"),
+        ),
         AgentKind::Antigravity => None,
-        _ => {
-            let home = home_dir()?;
-            Some(match kind {
-                AgentKind::Claude => home.join(".claude").join("projects"),
-                AgentKind::Codex => home.join(".codex").join("sessions"),
-                AgentKind::Muse => std::env::var_os("XDG_DATA_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local").join("share"))
-                    .join("muse")
-                    .join("sessions"),
-                AgentKind::Antigravity => unreachable!("handled above"),
-            })
-        }
     }
 }
 
@@ -315,10 +329,11 @@ pub fn correlate(
         AgentKind::Antigravity => return Correlation::None,
         AgentKind::Muse => muse_candidates(root, cwd, pid, now, max_age),
     };
-    match candidates.len() {
-        0 => Correlation::None,
-        1 => Correlation::Single(candidates.into_iter().next().unwrap()),
-        _ => Correlation::Multiple,
+    let mut hits = candidates.into_iter();
+    match (hits.next(), hits.next()) {
+        (None, _) => Correlation::None,
+        (Some(hit), None) => Correlation::Single(hit),
+        (Some(_), Some(_)) => Correlation::Multiple,
     }
 }
 
@@ -328,13 +343,49 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn is_fresh(path: &Path, now: std::time::SystemTime, max_age: std::time::Duration) -> bool {
-    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+/// Fresh regular file within `max_age` of `now`, in a single metadata
+/// fetch: the candidate scans run on the actor thread, so the
+/// regular-file check rides along instead of stat-ing twice.
+fn is_fresh_file(path: &Path, now: std::time::SystemTime, max_age: std::time::Duration) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(modified) = metadata.modified() else {
         return false;
     };
     // A transcript newer than `now` (clock skew) counts as fresh: its age
     // saturates at zero rather than reading as ancient.
     now.duration_since(modified).unwrap_or_default() <= max_age
+}
+
+/// Visit every leaf under a `YYYY/MM/DD` date-sharded store (codex
+/// rollouts, muse session dirs): four nested directory levels with
+/// unreadable levels skipped, so one walk serves both scanners.
+fn for_each_shard_leaf(root: &Path, mut visit: impl FnMut(&Path)) {
+    let Ok(years) = std::fs::read_dir(root) else {
+        return;
+    };
+    for year in years.flatten() {
+        let Ok(months) = std::fs::read_dir(year.path()) else {
+            continue;
+        };
+        for month in months.flatten() {
+            let Ok(days) = std::fs::read_dir(month.path()) else {
+                continue;
+            };
+            for day in days.flatten() {
+                let Ok(leaves) = std::fs::read_dir(day.path()) else {
+                    continue;
+                };
+                for leaf in leaves.flatten() {
+                    visit(&leaf.path());
+                }
+            }
+        }
+    }
 }
 
 fn claude_candidates(
@@ -354,8 +405,7 @@ fn claude_candidates(
         .filter_map(|entry| {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "jsonl")
-                && path.is_file()
-                && is_fresh(&path, now, max_age)
+                && is_fresh_file(&path, now, max_age)
             {
                 Some(TranscriptHit {
                     conversation_id: path.file_stem()?.to_string_lossy().into_owned(),
@@ -388,38 +438,19 @@ fn codex_candidates(
     // Rollouts shard by date (`YYYY/MM/DD/rollout-*.jsonl`); only fresh
     // files matter, and only the first line (session_meta) is ever read.
     let mut hits = Vec::new();
-    let Ok(years) = std::fs::read_dir(sessions_root) else {
-        return hits;
-    };
     let want = canonical_or_raw(cwd);
-    for year in years.flatten() {
-        let Ok(months) = std::fs::read_dir(year.path()) else {
-            continue;
-        };
-        for month in months.flatten() {
-            let Ok(days) = std::fs::read_dir(month.path()) else {
-                continue;
-            };
-            for day in days.flatten() {
-                let Ok(files) = std::fs::read_dir(day.path()) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let path = file.path();
-                    if !path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
-                        || !is_fresh(&path, now, max_age)
-                    {
-                        continue;
-                    }
-                    if let Some(hit) = codex_hit(&path, &want) {
-                        hits.push(hit);
-                    }
-                }
-            }
+    for_each_shard_leaf(sessions_root, |leaf| {
+        if !leaf
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
+            || !is_fresh_file(leaf, now, max_age)
+        {
+            return;
         }
-    }
+        if let Some(hit) = codex_hit(leaf, &want) {
+            hits.push(hit);
+        }
+    });
     hits
 }
 
@@ -457,34 +488,16 @@ fn muse_candidates(
 ) -> Vec<TranscriptHit> {
     // Sessions shard by date (`YYYY/MM/DD/<uuid>/session.jsonl`).
     let mut hits = Vec::new();
-    let Ok(years) = std::fs::read_dir(sessions_root) else {
-        return hits;
-    };
     let want = canonical_or_raw(cwd);
-    for year in years.flatten() {
-        let Ok(months) = std::fs::read_dir(year.path()) else {
-            continue;
-        };
-        for month in months.flatten() {
-            let Ok(days) = std::fs::read_dir(month.path()) else {
-                continue;
-            };
-            for day in days.flatten() {
-                let Ok(sessions) = std::fs::read_dir(day.path()) else {
-                    continue;
-                };
-                for session in sessions.flatten() {
-                    let path = session.path().join("session.jsonl");
-                    if !path.is_file() || !is_fresh(&path, now, max_age) {
-                        continue;
-                    }
-                    if let Some(hit) = muse_hit(&path, &want, pid) {
-                        hits.push(hit);
-                    }
-                }
-            }
+    for_each_shard_leaf(sessions_root, |leaf| {
+        let path = leaf.join("session.jsonl");
+        if !is_fresh_file(&path, now, max_age) {
+            return;
         }
-    }
+        if let Some(hit) = muse_hit(&path, &want, pid) {
+            hits.push(hit);
+        }
+    });
     hits
 }
 
@@ -510,7 +523,12 @@ fn muse_hit(path: &Path, want_cwd: &Path, pid: Option<u32>) -> Option<Transcript
                     .get("cwd")
                     .and_then(|c| c.as_str())
                     .map(PathBuf::from);
-                recorded_pid = record.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
+                // `try_from` (not `as`): a huge pid must degrade to a
+                // cwd-only candidate, never wrap into a false pid match.
+                recorded_pid = record
+                    .get("pid")
+                    .and_then(|p| p.as_u64())
+                    .and_then(|p| u32::try_from(p).ok());
             }
             Some("runtime.session") => {
                 let record = value.get("payload")?.get("record")?;
@@ -650,22 +668,17 @@ fn observe_process(
         ),
         None => Correlation::None,
     };
-    match correlation {
-        Correlation::Single(hit) => Some(ObservedAgent {
-            kind,
-            pid: process.pid,
-            exe_path: process.exe_path.clone(),
-            conversation_id: Some(hit.conversation_id),
-            transcript_path: Some(hit.path),
-        }),
-        Correlation::None | Correlation::Multiple => Some(ObservedAgent {
-            kind,
-            pid: process.pid,
-            exe_path: process.exe_path.clone(),
-            conversation_id: None,
-            transcript_path: None,
-        }),
-    }
+    let (conversation_id, transcript_path) = match correlation {
+        Correlation::Single(hit) => (Some(hit.conversation_id), Some(hit.path)),
+        Correlation::None | Correlation::Multiple => (None, None),
+    };
+    Some(ObservedAgent {
+        kind,
+        pid: process.pid,
+        exe_path: process.exe_path.clone(),
+        conversation_id,
+        transcript_path,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -695,16 +708,13 @@ fn read_process_platform(pid: u32) -> Option<PidProcess> {
 
 #[cfg(target_os = "macos")]
 fn mac_exe_path(pid: u32) -> Option<PathBuf> {
+    // Kernel pids fit `c_int`; refuse to wrap instead of querying the
+    // wrong process at the FFI boundary.
+    let pid = libc::c_int::try_from(pid).ok()?;
     let mut buf = vec![0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: `buf` is a writable `PROC_PIDPATHINFO_MAXSIZE` buffer, the
     // documented size for `proc_pidpath`.
-    let len = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            buf.as_mut_ptr().cast(),
-            buf.len() as u32,
-        )
-    };
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if len <= 0 {
         return None;
     }
@@ -719,11 +729,10 @@ fn mac_exe_path(pid: u32) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 fn mac_argv(pid: u32) -> Option<Vec<String>> {
     use std::os::raw::c_int;
-    let mut mib = [
-        libc::CTL_KERN as c_int,
-        libc::KERN_PROCARGS2 as c_int,
-        pid as c_int,
-    ];
+    // Kernel pids fit `c_int`; refuse to wrap instead of querying the
+    // wrong process at the FFI boundary.
+    let pid = c_int::try_from(pid).ok()?;
+    let mut mib = [libc::CTL_KERN as c_int, libc::KERN_PROCARGS2 as c_int, pid];
     let mut size: libc::size_t = 0;
     // SAFETY: size query with null buffer, the documented two-call idiom.
     if unsafe {
@@ -838,23 +847,41 @@ fn enabled_from(value: Option<&str>) -> bool {
 /// `None` means no change. Resolution (process reads, transcript scans)
 /// runs only on foreground changes and kind-only re-correlation, never on
 /// every poll.
+#[derive(Default)]
 pub struct FgAgentTracker {
     last_poll: Option<std::time::Instant>,
     last_fg_pid: Option<u32>,
     candidate: Option<(ObservedAgent, std::time::Instant)>,
     reported: Option<AgentAttachment>,
     last_correlate: Option<std::time::Instant>,
+    /// A foreground pid whose first resolution failed and is owed one
+    /// retry: transient read misses (process mid-exec, /proc races) must
+    /// neither wedge attach nor emit a spurious detach.
+    pending_resolve: Option<u32>,
 }
 
 impl FgAgentTracker {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A tracker that already reports `initial`, for restores and handover
+    /// adoption: seeding the live entry alone would strand the attachment,
+    /// since a fresh tracker has nothing to clear it with when the
+    /// foreground turns out not to be that agent.
+    pub fn seeded(initial: Option<AgentAttachment>) -> Self {
         Self {
-            last_poll: None,
-            last_fg_pid: None,
-            candidate: None,
-            reported: None,
-            last_correlate: None,
+            reported: initial,
+            ..Self::default()
         }
+    }
+
+    /// True when a poll now would do work rather than hit the throttle.
+    /// Lets the actor skip its `tcgetpgrp` on ticks the tracker would
+    /// discard.
+    pub fn poll_due(&self, now: std::time::Instant) -> bool {
+        self.last_poll
+            .is_none_or(|last| now.duration_since(last) >= AGENT_POLL_INTERVAL)
     }
 
     pub fn poll(
@@ -864,19 +891,37 @@ impl FgAgentTracker {
         now: std::time::Instant,
         now_ms: u64,
     ) -> Option<Option<AgentAttachment>> {
-        if let Some(last) = self.last_poll
-            && now.duration_since(last) < AGENT_POLL_INTERVAL
-        {
+        if !self.poll_due(now) {
             return None;
         }
         self.last_poll = Some(now);
         if fg_pid != self.last_fg_pid {
             self.last_fg_pid = fg_pid;
             self.candidate = match fg_pid {
-                Some(pid) => resolve(pid).map(|obs| (obs, now)),
-                None => None,
+                Some(pid) => {
+                    let observed = resolve(pid).map(|obs| (obs, now));
+                    // A failed first read is owed one retry, not a
+                    // verdict: definitively-non-agent pids resolve None
+                    // again on the retry and detach one poll late.
+                    self.pending_resolve = if observed.is_none() { fg_pid } else { None };
+                    observed
+                }
+                None => {
+                    self.pending_resolve = None;
+                    None
+                }
             };
             self.last_correlate = Some(now);
+        } else if let Some(pid) = fg_pid
+            && self.pending_resolve == Some(pid)
+        {
+            // Second sample for a pid whose first resolution failed: a
+            // transient miss attaches now, a definitive None detaches.
+            self.pending_resolve = None;
+            if let Some(obs) = resolve(pid) {
+                self.candidate = Some((obs, now));
+                self.last_correlate = Some(now);
+            }
         } else if let Some(pid) = fg_pid
             && self.needs_recorrelate(now)
             && let Some(obs) = resolve(pid)
@@ -887,26 +932,34 @@ impl FgAgentTracker {
         }
         match &self.candidate {
             Some((obs, first)) if now.duration_since(*first) >= AGENT_ATTACH_AFTER => {
-                let attachment = AgentAttachment {
-                    kind: obs.kind,
-                    conversation_id: obs.conversation_id.clone(),
-                    transcript_path: obs.transcript_path.clone(),
-                    exe_path: Some(obs.exe_path.clone()),
-                    last_seen_ms: now_ms,
-                };
-                if self
-                    .reported
-                    .as_ref()
-                    .is_some_and(|reported| reported.same_observation(&attachment))
-                {
+                // Borrowed `same_observation`: steady-state polls must not
+                // clone only to discover nothing changed. Must mirror
+                // `AgentAttachment::same_observation` exactly (kind,
+                // conversation, transcript, binary path).
+                let unchanged = self.reported.as_ref().is_some_and(|reported| {
+                    reported.kind == obs.kind
+                        && reported.conversation_id == obs.conversation_id
+                        && reported.transcript_path == obs.transcript_path
+                        && reported.exe_path.as_deref() == Some(obs.exe_path.as_path())
+                });
+                if unchanged {
                     None
                 } else {
+                    let attachment = AgentAttachment {
+                        kind: obs.kind,
+                        conversation_id: obs.conversation_id.clone(),
+                        transcript_path: obs.transcript_path.clone(),
+                        exe_path: Some(obs.exe_path.clone()),
+                        last_seen_ms: now_ms,
+                    };
                     self.reported = Some(attachment.clone());
                     Some(Some(attachment))
                 }
             }
             Some(_) => None,
-            None if self.reported.is_some() => {
+            // No detach while a retry is owed: the None may be a
+            // transient read miss, not a real foreground change.
+            None if self.reported.is_some() && self.pending_resolve.is_none() => {
                 self.reported = None;
                 Some(None)
             }
@@ -921,12 +974,6 @@ impl FgAgentTracker {
             && self
                 .last_correlate
                 .is_some_and(|at| now.duration_since(at) >= AGENT_RECORRELATE_AFTER)
-    }
-}
-
-impl Default for FgAgentTracker {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1328,6 +1375,7 @@ mod tests {
 
     /// Path to the stub-agent helper binary the build script compiles into
     /// OUT_DIR. It ignores argv and blocks quietly until killed.
+    #[cfg(unix)]
     fn stub_agent_bin() -> PathBuf {
         PathBuf::from(env!("OUT_DIR"))
             .join(format!("triage-stub-agent{}", std::env::consts::EXE_SUFFIX))
@@ -1632,5 +1680,61 @@ mod tests {
         assert_eq!(observed.pid, 999_999_999);
         assert_eq!(observed.conversation_id, None);
         assert_eq!(observed.transcript_path, None);
+    }
+
+    fn seed_attachment() -> AgentAttachment {
+        AgentAttachment {
+            kind: AgentKind::Claude,
+            conversation_id: Some("abc".to_string()),
+            transcript_path: Some(PathBuf::from("/tmp/triage-seed-transcript.jsonl")),
+            exe_path: Some(PathBuf::from("/usr/local/bin/claude")),
+            last_seen_ms: 1,
+        }
+    }
+
+    #[test]
+    fn seeded_tracker_detaches_when_foreground_is_not_the_agent() {
+        let mut tracker = FgAgentTracker::seeded(Some(seed_attachment()));
+        let resolve = |_pid: u32| -> Option<ObservedAgent> { None };
+        let start = std::time::Instant::now();
+        // First poll owes the new pid one retry rather than detaching on a
+        // possibly transient read miss.
+        assert_eq!(tracker.poll(Some(999), &resolve, start, 2), None);
+        assert_eq!(
+            tracker.poll(Some(999), &resolve, start + AGENT_POLL_INTERVAL, 3),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn seeded_tracker_stays_quiet_when_seed_matches_foreground() {
+        let seed = seed_attachment();
+        let mut tracker = FgAgentTracker::seeded(Some(seed.clone()));
+        let resolve = |pid: u32| -> Option<ObservedAgent> {
+            Some(ObservedAgent {
+                kind: seed.kind,
+                pid,
+                exe_path: seed.exe_path.clone().unwrap(),
+                conversation_id: seed.conversation_id.clone(),
+                transcript_path: seed.transcript_path.clone(),
+            })
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(tracker.poll(Some(42), &resolve, start, 2), None);
+        assert_eq!(
+            tracker.poll(Some(42), &resolve, start + AGENT_POLL_INTERVAL, 3),
+            None
+        );
+        // Past the attach debounce the observation matches the seed exactly,
+        // so the seeded report stands and nothing is emitted.
+        assert_eq!(
+            tracker.poll(
+                Some(42),
+                &resolve,
+                start + AGENT_ATTACH_AFTER + AGENT_POLL_INTERVAL,
+                4
+            ),
+            None
+        );
     }
 }

@@ -127,6 +127,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         let original = session.clone();
 
@@ -163,6 +164,7 @@ mod tests {
                 process_identity: None,
                 last_activity_ms: 0,
                 judge_override: None,
+                agent: None,
             })
             .collect();
         let state = crate::handover::HandoverState {
@@ -237,6 +239,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session],
@@ -321,6 +324,7 @@ mod tests {
                 process_identity: None,
                 last_activity_ms: 0,
                 judge_override: None,
+                agent: None,
             }],
             has_tcp_listener: false,
             sends_teardown_commit: true,
@@ -690,6 +694,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],
@@ -781,6 +786,7 @@ mod tests {
                 }),
                 last_activity_ms: 0,
                 judge_override: None,
+                agent: None,
             })
         };
 
@@ -909,6 +915,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -963,6 +970,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1023,6 +1031,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
             socket_identity,
@@ -1092,6 +1101,7 @@ mod tests {
             process_identity: None,
             last_activity_ms: 0,
             judge_override: None,
+            agent: None,
         };
         let snapshot = |owner_token, fd| {
             crate::handover::remember_recovered_handover_for_test(

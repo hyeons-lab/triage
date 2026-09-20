@@ -1403,7 +1403,15 @@ class TriageWebSocketClient {
   Map<String, dynamic>? _parseAgentAttachment(fbs.AgentAttachment? agent) {
     if (agent == null) return null;
     return {
-      'kind': agent.kind.name.toLowerCase(),
+      // Explicit strings, not `kind.name.toLowerCase()`: the first
+      // multi-word kind would otherwise report a different string than
+      // the JSON transport's serde `snake_case`.
+      'kind': switch (agent.kind) {
+        fbs.AgentKind.Claude => 'claude',
+        fbs.AgentKind.Codex => 'codex',
+        fbs.AgentKind.Antigravity => 'antigravity',
+        fbs.AgentKind.Muse => 'muse',
+      },
       'conversation_id': agent.conversationId,
       'transcript_path': agent.transcriptPath,
       'exe_path': agent.exePath,

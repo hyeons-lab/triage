@@ -977,12 +977,7 @@ fn session_sidebar_rows(
 /// conversation id, or `(recent)` when only the kind is known (restore
 /// falls back to the agent's most-recent conversation).
 fn agent_badge_text(agent: &triage_core::agent::AgentAttachment) -> String {
-    let kind = match agent.kind {
-        triage_core::agent::AgentKind::Claude => "claude",
-        triage_core::agent::AgentKind::Codex => "codex",
-        triage_core::agent::AgentKind::Antigravity => "agy",
-        triage_core::agent::AgentKind::Muse => "muse",
-    };
+    let kind = agent.kind.primary_binary();
     match agent.conversation_id.as_deref() {
         Some(id) => format!("{kind} {}", id.chars().take(8).collect::<String>()),
         None => format!("{kind} (recent)"),
