@@ -71,10 +71,15 @@ status; exited sessions carry no agent state.
   no agent). HTTPS remote works for fetch; use
   `git -c url."https://github.com/".insteadOf="git@github.com:"` for
   fetch/push commands from this environment.
+- CI Format-and-Lint failed on a rustdoc broken intra-doc link
+  (`argv[0]` in `agent_detect.rs` docs); Copilot flagged the `mac_argv`
+  slicing and the agent-launch restore fallback (PR #177 comments
+  4057908648, 4057908658). All three fixed in the follow-up commit below.
 
 ## Commits
 
-- HEAD — feat(session): track foreground AI agents and resume conversations on restore
+- ea0d979 — feat(session): track foreground AI agents and resume conversations on restore
+- HEAD — fix(session): harden agent restore fallback and macOS argv parsing
 
 ## Progress
 
@@ -86,7 +91,9 @@ status; exited sessions carry no agent state.
 - [x] Restore agent branch + stub-agent E2E (work item 5)
 - [x] Snapshot/IPC/client surfacing (work item 6)
 - [x] Docs and config (work item 7)
-- [ ] Final validation, commit, push, PR
+- [x] Final validation, commit, push, PR (#177)
+- [x] 2026-09-20T13:27-0700 resumed: synced worktree to origin branch
+  (ea0d979), fixed lint failure + Copilot findings with regression tests
 
 ## Research & Discoveries
 
@@ -104,7 +111,10 @@ See plan file and spike findings (to be appended).
 - PTY tests cannot run under the sandboxed shell (`openpty: Operation
   not permitted`, same for pre-existing session tests); they need an
   unsandboxed run.
+- `cargo doc -D warnings` is a CI gate the fmt/clippy/test trio does not
+  cover; run it locally before pushing Rust doc changes (a bare
+  `argv[0]` in a doc comment broke the PR #177 lint job).
 
 ## Next Steps
 
-Final validation (fmt, clippy, workspace tests), commit, push, open PR.
+Await CI + Copilot re-review on PR #177, merge, remove the worktree.

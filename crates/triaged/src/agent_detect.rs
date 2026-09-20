@@ -30,7 +30,7 @@ pub struct AgentArgv {
     pub conversation_id: Option<String>,
 }
 
-/// Classify an agent command line. `argv` includes argv[0].
+/// Classify an agent command line. `argv` includes `argv[0]`.
 ///
 /// Returns `None` when the invocation is not a trackable agent run at all
 /// (`--help`, `--version`, `mcp`/`login` bookkeeping subcommands, ...),
@@ -729,20 +729,27 @@ fn mac_argv(pid: u32) -> Option<Vec<String>> {
         return None;
     }
     buf.truncate(size);
-    // Layout: argc (int), exec path cstring, then argc argv cstrings, then
-    // the environment. NUL padding sits between the strings, so each read
-    // skips a NUL run first. Only argv is read.
-    if buf.len() < 4 {
-        return None;
-    }
-    let argc = i32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
+    parse_procargs2_argv(&buf)
+}
+
+/// Parse a `KERN_PROCARGS2` buffer into argv. Layout: argc (int), exec path
+/// cstring, then argc argv cstrings, then the environment. NUL padding sits
+/// between the strings, so each read skips a NUL run first. Only argv is
+/// read. Split from the sysctl call so truncated or inconsistent kernel
+/// buffers get unit coverage on every platform; every slice is checked, so
+/// a short buffer yields `None`, never a panic.
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs2_argv(buf: &[u8]) -> Option<Vec<String>> {
+    let argc_bytes: [u8; 4] = buf.get(0..4)?.try_into().ok()?;
+    let argc = i32::from_ne_bytes(argc_bytes) as usize;
     let mut offset = 4;
     let next_cstring = |offset: &mut usize| -> Option<String> {
         while buf.get(*offset) == Some(&0) {
             *offset += 1;
         }
-        let end = buf[*offset..].iter().position(|b| *b == 0)? + *offset;
-        let s = String::from_utf8_lossy(&buf[*offset..end]).into_owned();
+        let rest = buf.get(*offset..)?;
+        let end = rest.iter().position(|b| *b == 0)? + *offset;
+        let s = String::from_utf8_lossy(buf.get(*offset..end)?).into_owned();
         *offset = end + 1;
         Some(s)
     };
@@ -1516,5 +1523,46 @@ mod tests {
             correlate(AgentKind::Antigravity, None, &cwd, None, now, max_age),
             Correlation::None
         );
+    }
+
+    /// Build a `KERN_PROCARGS2`-shaped buffer: argc plus NUL-terminated
+    /// strings with `pad` extra NULs between them, like the kernel emits.
+    fn procargs2(argc: i32, strings: &[&str], pad: usize) -> Vec<u8> {
+        let mut buf = argc.to_ne_bytes().to_vec();
+        for s in strings {
+            buf.extend_from_slice(s.as_bytes());
+            buf.resize(buf.len() + 1 + pad, 0);
+        }
+        buf
+    }
+
+    #[test]
+    fn procargs2_parses_argv_with_nul_padding() {
+        let buf = procargs2(2, &["/bin/claude", "claude", "--resume"], 2);
+        assert_eq!(
+            parse_procargs2_argv(&buf),
+            Some(vec!["claude".to_string(), "--resume".to_string()])
+        );
+    }
+
+    #[test]
+    fn procargs2_truncated_buffer_returns_none() {
+        // argc promises two argv entries; the buffer ends mid-string.
+        let mut buf = procargs2(2, &["/bin/claude", "claude"], 0);
+        buf.truncate(buf.len() - 3);
+        assert_eq!(parse_procargs2_argv(&buf), None);
+    }
+
+    #[test]
+    fn procargs2_inconsistent_argc_returns_none() {
+        // argc far beyond what the buffer holds: no panic, just None.
+        let buf = procargs2(i32::MAX, &["/bin/claude"], 0);
+        assert_eq!(parse_procargs2_argv(&buf), None);
+    }
+
+    #[test]
+    fn procargs2_short_buffer_returns_none() {
+        assert_eq!(parse_procargs2_argv(&[]), None);
+        assert_eq!(parse_procargs2_argv(&[1, 0, 0]), None);
     }
 }
