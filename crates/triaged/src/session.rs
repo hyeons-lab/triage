@@ -3332,10 +3332,16 @@ impl SessionApi for SessionManager {
                 if session.persisted.agent.is_some() {
                     tracing::info!(
                         session_id = %request.session_id,
-                        "persisted agent attachment is stale; restoring the shell baseline",
+                        "persisted agent attachment is stale; restoring the launch baseline",
                     );
                 }
-                if !is_restorable_shell_launch(&session.persisted) {
+                // A stale attachment still restores: the baseline below is
+                // the original launch command, a fresh agent for
+                // agent-launched sessions. Only sessions with neither a
+                // shell launch nor any agent history stay unrestorable.
+                if !is_restorable_shell_launch(&session.persisted)
+                    && session.persisted.agent.is_none()
+                {
                     sessions.insert(
                         request.session_id.clone(),
                         ManagedSession::Historical { session, lease },
@@ -3383,8 +3389,10 @@ impl SessionApi for SessionManager {
         let restored_activity_ms =
             (persisted.last_activity_ms != 0).then_some(persisted.last_activity_ms);
         // Spawn attempts in order: the agent resume first when attached,
-        // then the shell baseline once (a missing agent binary must not
-        // strand a restorable shell).
+        // then the launch baseline once — the shell for shell launches,
+        // the original agent command (a fresh agent) for agent-launched
+        // sessions. Every session reaching here has one of the two, so a
+        // failed resume degrades instead of stranding the session.
         let mut spawn_configs = Vec::with_capacity(2);
         if let Some((command, args)) = agent_resume {
             tracing::info!(
@@ -3398,9 +3406,7 @@ impl SessionApi for SessionManager {
                 ..shell_config.clone()
             });
         }
-        if spawn_configs.is_empty() || is_restorable_shell_launch(&persisted) {
-            spawn_configs.push(shell_config);
-        }
+        spawn_configs.push(shell_config);
         let mut actor = None;
         let mut spawn_error = None;
         for config in spawn_configs {
@@ -14479,6 +14485,170 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "resumed agent never re-attached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// A session launched directly into an agent restores through its
+    /// original launch command when the attachment is stale (recorded
+    /// binary gone): restore degrades to a fresh agent instead of failing
+    /// as a non-shell launch.
+    #[test]
+    fn restore_falls_back_to_original_launch_when_attachment_stale() {
+        let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
+        let bin_dir = unique_log_dir().join("stubbin");
+        std::fs::create_dir_all(&bin_dir).expect("stub bin dir");
+        let agent_bin = bin_dir.join("codex");
+        std::fs::copy(&stub_src, &agent_bin).expect("copy stub agent");
+        let conversation = format!(
+            "stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-stale-agent").expect("session id");
+        let log_path = log_dir.join("session-stale-agent.log");
+        std::fs::write(&log_path, b"stale agent\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: agent_bin.to_string_lossy().into_owned(),
+                args: vec!["resume".to_string(), conversation.clone()],
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                agent: Some(AgentAttachment {
+                    kind: triage_core::agent::AgentKind::Codex,
+                    conversation_id: Some(conversation.clone()),
+                    transcript_path: None,
+                    // Stale: the recorded binary no longer exists, so no
+                    // resume command is built.
+                    exe_path: Some(bin_dir.join("codex-gone")),
+                    last_seen_ms: 1,
+                }),
+            },
+        );
+
+        let manager = std::sync::Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_agent_persistence();
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("stale attachment restores through the original launch");
+        assert!(!snapshot.exited);
+        // The fallback respawns the original launch argv, so the actor
+        // re-observes the same conversation id.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(agent) = live_agent(&manager, &session_id) {
+                assert_eq!(
+                    agent.conversation_id.as_deref(),
+                    Some(conversation.as_str())
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fallback agent never re-attached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// A failed agent-resume spawn falls back to the original launch
+    /// command for agent-launched sessions: the resume binary exists but
+    /// cannot spawn, so restore runs the bare original launch and the
+    /// re-attached agent is kind-only (no conversation id).
+    #[test]
+    fn restore_falls_back_to_original_launch_when_resume_spawn_fails() {
+        let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
+        let bin_dir = unique_log_dir().join("stubbin");
+        std::fs::create_dir_all(&bin_dir).expect("stub bin dir");
+        let agent_bin = bin_dir.join("claude");
+        std::fs::copy(&stub_src, &agent_bin).expect("copy stub agent");
+        // Exists on disk (so a resume command is built) but is not
+        // executable (so spawning it fails).
+        let broken_exe = bin_dir.join("claude-broken");
+        std::fs::write(&broken_exe, b"not an executable").expect("write broken exe");
+        let conversation = format!(
+            "fallback-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-resume-fallback").expect("session id");
+        let log_path = log_dir.join("session-resume-fallback.log");
+        std::fs::write(&log_path, b"resume fallback\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: agent_bin.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                agent: Some(AgentAttachment {
+                    kind: triage_core::agent::AgentKind::Claude,
+                    conversation_id: Some(conversation),
+                    transcript_path: None,
+                    exe_path: Some(broken_exe),
+                    last_seen_ms: 1,
+                }),
+            },
+        );
+
+        let manager = std::sync::Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_agent_persistence();
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("failed resume restores through the original launch");
+        assert!(!snapshot.exited);
+        // The fallback runs the bare original launch, so the
+        // re-attached agent carries no conversation id: this proves the
+        // fallback ran, not the resume.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(agent) = live_agent(&manager, &session_id) {
+                assert_eq!(agent.conversation_id.as_deref(), None);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fallback agent never re-attached"
             );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
