@@ -65,6 +65,12 @@ pub struct HandoverSession {
     /// existed.
     #[serde(default)]
     pub parked_input: Vec<(ClientId, Vec<u8>)>,
+    /// Last-known foreground-agent attachment, carried so adoption seeds
+    /// the live entry and its tracker instead of re-observing from
+    /// scratch. Defaults to `None` for blobs written before this field
+    /// existed.
+    #[serde(default)]
+    pub agent: Option<triage_core::agent::AgentAttachment>,
 }
 
 impl HandoverSession {
