@@ -1109,7 +1109,10 @@ mod tests {
         );
     }
 
+    // Unix path contract (`/Users/...` is not absolute on Windows); the
+    // Windows slug mapping rides with the Windows observation follow-up.
     #[test]
+    #[cfg(unix)]
     fn claude_project_slug_replaces_separators() {
         let root = Path::new("/home/me/.claude/projects");
         assert_eq!(
@@ -1181,6 +1184,9 @@ mod tests {
         let cwd = root.join("work");
         std::fs::create_dir_all(&cwd).unwrap();
         let meta = |id: &str, parent: &str, cwd: &str| {
+            // Real transcripts JSON-escape the cwd; raw Windows backslashes
+            // would be invalid escapes and fail to parse.
+            let cwd = cwd.replace('\\', "\\\\");
             format!(
                 "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\
                  \"parent_thread_id\":{parent},\"originator\":\"codex-tui\",\"cwd\":\"{cwd}\"}}}}\n"
@@ -1228,6 +1234,9 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let session = |facts: &str, session: &str| format!("{facts}\n{session}\n");
         let facts = |cwd: &str, pid: u32| {
+            // Real transcripts JSON-escape the cwd; raw Windows backslashes
+            // would be invalid escapes and fail to parse.
+            let cwd = cwd.replace('\\', "\\\\");
             format!(
                 "{{\"payload_type\":\"runtime.session.route_facts\",\
              \"payload\":{{\"record\":{{\"cwd\":\"{cwd}\",\"pid\":{pid}}}}}}}"

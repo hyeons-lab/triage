@@ -14500,7 +14500,10 @@ mod tests {
     /// original launch command when the attachment is stale (recorded
     /// binary gone): restore degrades to a fresh agent instead of failing
     /// as a non-shell launch.
+    // Unix-only: Windows has no process observation, so the respawned
+    // agent never re-attaches there.
     #[test]
+    #[cfg(unix)]
     fn restore_falls_back_to_original_launch_when_attachment_stale() {
         let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
         let bin_dir = unique_log_dir().join("stubbin");
@@ -14582,7 +14585,10 @@ mod tests {
     /// command for agent-launched sessions: the resume binary exists but
     /// cannot spawn, so restore runs the bare original launch and the
     /// re-attached agent is kind-only (no conversation id).
+    // Unix-only: Windows has no process observation, so the respawned
+    // agent never re-attaches there.
     #[test]
+    #[cfg(unix)]
     fn restore_falls_back_to_original_launch_when_resume_spawn_fails() {
         let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
         let bin_dir = unique_log_dir().join("stubbin");
