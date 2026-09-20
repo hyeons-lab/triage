@@ -1402,13 +1402,22 @@ mod tests {
     #[cfg(unix)]
     fn observe_pid_stub_agent_with_argv_id() {
         let (mut child, _dir) = spawn_stub_agent("claude", &["--resume", "abc123"]);
-        let observed = observe_pid(
-            child.id(),
-            None,
-            std::time::SystemTime::now(),
-            std::time::Duration::from_secs(900),
-        )
-        .expect("observe stub agent");
+        // The child may not have exec'd when the parent first reads /proc —
+        // a loaded runner schedules it late — and the pre-exec image
+        // observes as nothing. Retry briefly rather than flaking.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let observed = loop {
+            if let Some(observed) = observe_pid(
+                child.id(),
+                None,
+                std::time::SystemTime::now(),
+                std::time::Duration::from_secs(900),
+            ) {
+                break observed;
+            }
+            assert!(std::time::Instant::now() < deadline, "observe stub agent");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert_eq!(observed.kind, AgentKind::Claude);
         assert_eq!(observed.conversation_id.as_deref(), Some("abc123"));
         let _ = child.kill();

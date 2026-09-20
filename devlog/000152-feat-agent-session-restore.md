@@ -91,7 +91,8 @@ status; exited sessions carry no agent state.
 - e1fdd70 — fix(session): harden agent restore fallback and macOS argv parsing
 - 9ed4566 — fix(session): gate Windows-observation tests and escape fixture paths
 - e77ab6c — fix(session): address Antigravity review findings
-- HEAD — fix(session): address R1 agent-review-loop findings
+- 40ccaec — fix(session): address R1 agent-review-loop findings
+- HEAD — fix(session): retry stub-agent observation for exec race
 
 ## Progress
 
@@ -140,6 +141,11 @@ See plan file and spike findings (to be appended).
 - A multi-agent review synthesis can arrive non-compiling: budget a
   repair pass (missing struct initializers, borrow errors, new lints)
   plus regression tests for the synthesized behavior before committing.
+- `observe_pid_stub_agent_with_argv_id` failed Ubuntu CI twice after
+  one pass with identical exercised code: the parent can read /proc
+  before the child execs, observing the pre-exec image as nothing.
+  Retry briefly (2s) instead of observing once; production observation
+  targets long-exec'd foreground pids, so the race is test-only.
 
 ## Next Steps
 
