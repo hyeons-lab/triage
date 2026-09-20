@@ -74,12 +74,18 @@ status; exited sessions carry no agent state.
 - CI Format-and-Lint failed on a rustdoc broken intra-doc link
   (`argv[0]` in `agent_detect.rs` docs); Copilot flagged the `mac_argv`
   slicing and the agent-launch restore fallback (PR #177 comments
-  4057908648, 4057908658). All three fixed in the follow-up commit below.
+  4057908648, 4057908658). All three fixed in e1fdd70.
+- Windows CI failed 5 tests: the two new restore tests (no process
+  observation on Windows, so nothing re-attaches) plus three
+  pre-existing correlate/slug tests (Unix-path assumptions and
+  unescaped `\` in JSON fixtures). Fixed by `#[cfg(unix)]` gates and
+  fixture escaping.
 
 ## Commits
 
 - ea0d979 — feat(session): track foreground AI agents and resume conversations on restore
-- HEAD — fix(session): harden agent restore fallback and macOS argv parsing
+- e1fdd70 — fix(session): harden agent restore fallback and macOS argv parsing
+- HEAD — fix(session): gate Windows-observation tests and escape fixture paths
 
 ## Progress
 
