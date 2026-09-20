@@ -80,12 +80,17 @@ status; exited sessions carry no agent state.
   pre-existing correlate/slug tests (Unix-path assumptions and
   unescaped `\` in JSON fixtures). Fixed by `#[cfg(unix)]` gates and
   fixture escaping.
+- The Antigravity review (PR conversation comment, not inline threads)
+  was missed on the first resume pass: triage had only pulled inline
+  threads plus failing checks, and the advisory check reads SUCCESS.
+  Lesson: PR triage must pull conversation comments too.
 
 ## Commits
 
 - ea0d979 — feat(session): track foreground AI agents and resume conversations on restore
 - e1fdd70 — fix(session): harden agent restore fallback and macOS argv parsing
-- HEAD — fix(session): gate Windows-observation tests and escape fixture paths
+- 9ed4566 — fix(session): gate Windows-observation tests and escape fixture paths
+- HEAD — fix(session): address Antigravity review findings
 
 ## Progress
 
