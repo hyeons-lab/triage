@@ -292,6 +292,12 @@ pub enum Correlation {
 /// so tests run against fixture dirs.
 ///
 /// Antigravity has no known local store and always correlates `None`.
+///
+/// The candidate scans below are deliberately exhaustive rather than
+/// pruned by shard date: a still-active session keeps appending to its
+/// start-date shard, so pruning could hide a fresh contender and flip
+/// `Multiple` to a wrong `Single`. Stale files cost only a stat, and
+/// the scan measures milliseconds at realistic store sizes.
 pub fn correlate(
     kind: AgentKind,
     store_root: Option<&Path>,
@@ -582,7 +588,8 @@ pub struct ObservedAgent {
 ///
 /// Only interactive runs observe; headless invocations and bookkeeping
 /// subcommands return `None`. `session_cwd` backs correlation when the
-/// agent's own cwd is unreadable.
+/// agent's own cwd is unreadable, and when neither resolves a bare run
+/// still observes kind-only.
 pub fn observe_pid(
     pid: u32,
     session_cwd: Option<&Path>,
@@ -590,17 +597,30 @@ pub fn observe_pid(
     max_transcript_age: std::time::Duration,
 ) -> Option<ObservedAgent> {
     let process = read_process(pid)?;
+    let cwd = crate::session::child_cwd(pid).or_else(|| session_cwd.map(Path::to_path_buf));
+    observe_process(&process, cwd.as_deref(), now, max_transcript_age)
+}
+
+/// Classify an already-read process, correlating a bare run to its
+/// transcript when the cwd is known. Split from [`observe_pid`] so the
+/// unresolvable-cwd path gets unit coverage without a live pid: it
+/// yields kind-only tracking rather than dropping the observation.
+fn observe_process(
+    process: &PidProcess,
+    cwd: Option<&Path>,
+    now: std::time::SystemTime,
+    max_transcript_age: std::time::Duration,
+) -> Option<ObservedAgent> {
     let kind = AgentKind::detect(&process.exe_name())?;
     let classified = classify_argv(kind, &process.argv)?;
     if classified.mode != AgentRunMode::Interactive {
         return None;
     }
-    let cwd = crate::session::child_cwd(pid).or_else(|| session_cwd.map(Path::to_path_buf));
     if let Some(id) = classified.conversation_id {
         // Claude's transcript path is deterministic from the id, so argv
         // observations still get a staleness-checkable path.
         let transcript_path = match kind {
-            AgentKind::Claude => cwd.as_ref().and_then(|cwd| {
+            AgentKind::Claude => cwd.and_then(|cwd| {
                 let path = claude_project_dir(&transcript_store_root(kind)?, cwd)?
                     .join(format!("{id}.jsonl"));
                 path.is_file().then_some(path)
@@ -609,33 +629,39 @@ pub fn observe_pid(
         };
         return Some(ObservedAgent {
             kind,
-            pid,
-            exe_path: process.exe_path,
+            pid: process.pid,
+            exe_path: process.exe_path.clone(),
             conversation_id: Some(id),
             transcript_path,
         });
     }
     let root = transcript_store_root(kind);
-    let cwd = cwd?;
-    match correlate(
-        kind,
-        root.as_deref(),
-        &cwd,
-        Some(pid),
-        now,
-        max_transcript_age,
-    ) {
+    // No resolvable cwd skips correlation instead of dropping the
+    // observation: kind-only tracking still restores the agent's
+    // most-recent conversation.
+    let correlation = match cwd {
+        Some(cwd) => correlate(
+            kind,
+            root.as_deref(),
+            cwd,
+            Some(process.pid),
+            now,
+            max_transcript_age,
+        ),
+        None => Correlation::None,
+    };
+    match correlation {
         Correlation::Single(hit) => Some(ObservedAgent {
             kind,
-            pid,
-            exe_path: process.exe_path,
+            pid: process.pid,
+            exe_path: process.exe_path.clone(),
             conversation_id: Some(hit.conversation_id),
             transcript_path: Some(hit.path),
         }),
         Correlation::None | Correlation::Multiple => Some(ObservedAgent {
             kind,
-            pid,
-            exe_path: process.exe_path,
+            pid: process.pid,
+            exe_path: process.exe_path.clone(),
             conversation_id: None,
             transcript_path: None,
         }),
@@ -741,7 +767,11 @@ fn mac_argv(pid: u32) -> Option<Vec<String>> {
 #[cfg(any(target_os = "macos", test))]
 fn parse_procargs2_argv(buf: &[u8]) -> Option<Vec<String>> {
     let argc_bytes: [u8; 4] = buf.get(0..4)?.try_into().ok()?;
-    let argc = i32::from_ne_bytes(argc_bytes) as usize;
+    let argc_i32 = i32::from_ne_bytes(argc_bytes);
+    if argc_i32 < 0 {
+        return None;
+    }
+    let argc = argc_i32 as usize;
     let mut offset = 4;
     let next_cstring = |offset: &mut usize| -> Option<String> {
         while buf.get(*offset) == Some(&0) {
@@ -1573,5 +1603,34 @@ mod tests {
     fn procargs2_short_buffer_returns_none() {
         assert_eq!(parse_procargs2_argv(&[]), None);
         assert_eq!(parse_procargs2_argv(&[1, 0, 0]), None);
+    }
+
+    #[test]
+    fn procargs2_negative_argc_returns_none() {
+        let buf = procargs2(-1, &["/bin/claude", "claude"], 0);
+        assert_eq!(parse_procargs2_argv(&buf), None);
+    }
+
+    #[test]
+    fn observe_process_without_cwd_yields_kind_only() {
+        // A bare run whose cwd is unresolvable (sandboxed or exited
+        // process) still observes: correlation is skipped, tracking is
+        // kind-only, and nothing touches the transcript store.
+        let process = PidProcess {
+            pid: 999_999_999,
+            exe_path: PathBuf::from("/usr/local/bin/codex"),
+            argv: argv(&["codex"]),
+        };
+        let observed = observe_process(
+            &process,
+            None,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(900),
+        )
+        .expect("bare agent without cwd still observes");
+        assert_eq!(observed.kind, AgentKind::Codex);
+        assert_eq!(observed.pid, 999_999_999);
+        assert_eq!(observed.conversation_id, None);
+        assert_eq!(observed.transcript_path, None);
     }
 }
