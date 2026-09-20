@@ -55,14 +55,11 @@ impl AgentKind {
     /// Match a process executable file name (any case, `.exe` tolerated)
     /// against the known agent binaries.
     pub fn detect(exe_file_name: &str) -> Option<AgentKind> {
-        let stem = exe_file_name
-            .strip_suffix(".exe")
-            .or_else(|| exe_file_name.strip_suffix(".EXE"))
-            .unwrap_or(exe_file_name)
-            .to_ascii_lowercase();
+        let lowered = exe_file_name.to_ascii_lowercase();
+        let stem = lowered.strip_suffix(".exe").unwrap_or(&lowered);
         AgentKind::all()
             .into_iter()
-            .find(|kind| kind.binary_names().contains(&stem.as_str()))
+            .find(|kind| kind.binary_names().contains(&stem))
     }
 }
 
@@ -92,12 +89,16 @@ pub struct AgentAttachment {
 
 impl AgentAttachment {
     /// Identity for change detection: two attachments are the same
-    /// observation when kind, conversation, and transcript match, ignoring
-    /// the timestamp so re-reports do not churn the manifest.
+    /// observation when kind, conversation, transcript, and binary path
+    /// match, ignoring only the timestamp so re-reports do not churn the
+    /// manifest. The binary path is compared so a moved binary refreshes
+    /// the manifest instead of pinning a dead path that later vetoes
+    /// resume; paths are stable per process, so this cannot flap.
     pub fn same_observation(&self, other: &AgentAttachment) -> bool {
         self.kind == other.kind
             && self.conversation_id == other.conversation_id
             && self.transcript_path == other.transcript_path
+            && self.exe_path == other.exe_path
     }
 }
 

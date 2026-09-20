@@ -135,6 +135,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         let original = session.clone();
 
@@ -176,6 +177,7 @@ mod tests {
                 judge_override: None,
                 lease: InputLeaseState::default(),
                 parked_input: Vec::new(),
+                agent: None,
             })
             .collect();
         let state = crate::handover::HandoverState {
@@ -255,6 +257,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session],
@@ -344,6 +347,7 @@ mod tests {
                 judge_override: None,
                 lease: InputLeaseState::default(),
                 parked_input: Vec::new(),
+                agent: None,
             }],
             has_tcp_listener: false,
             sends_teardown_commit: true,
@@ -663,6 +667,7 @@ mod tests {
             judge_override: None,
             lease: triage_core::session::InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         let mut value = serde_json::to_value(crate::handover::HandoverState {
             sessions: vec![session],
@@ -828,6 +833,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],
@@ -927,6 +933,7 @@ mod tests {
                 judge_override: None,
                 lease: InputLeaseState::default(),
                 parked_input: Vec::new(),
+                agent: None,
             })
         };
 
@@ -1060,6 +1067,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1119,6 +1127,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1184,6 +1193,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
             socket_identity,
@@ -1258,6 +1268,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         let snapshot = |owner_token, fd| {
             crate::handover::remember_recovered_handover_for_test(
@@ -1759,6 +1770,7 @@ mod tests {
             judge_override: None,
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
+            agent: None,
         };
         assert_eq!(session.logged_output_seq(), 42);
         assert_eq!(session.logged_tail_bytes(), 16);
