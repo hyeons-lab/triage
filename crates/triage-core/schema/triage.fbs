@@ -89,6 +89,25 @@ table SessionSnapshot {
     // Local-LLM longer-form summary (a few sentences) for the side-rail hover
     // popover and future session search. Empty/absent when not yet produced.
     snippet_detail: string;
+    // The AI coding agent in the session's foreground, if the daemon
+    // observed one. Absent for plain shells, exited agents, and old hosts.
+    agent: AgentAttachment;
+}
+
+enum AgentKind : byte { Claude, Codex, Antigravity, Muse }
+
+table AgentAttachment {
+    kind: AgentKind;
+    // Absent for kind-only observations (fresh agents whose transcript did
+    // not correlate unambiguously); restore falls back to most-recent.
+    conversation_id: string;
+    // Absent when unknown (kind-only, argv ids for non-Claude agents, and
+    // always for Antigravity, whose local store is unknown).
+    transcript_path: string;
+    // Absolute path of the running agent binary; absent for legacy hosts.
+    exe_path: string;
+    // Wall-clock attach time, milliseconds since the Unix epoch.
+    last_seen_ms: uint64;
 }
 
 table CompletedSession {

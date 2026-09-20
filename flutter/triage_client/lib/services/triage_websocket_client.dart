@@ -1394,6 +1394,20 @@ class TriageWebSocketClient {
       'snippet': snap.snippet,
       // Local-LLM longer-form summary for the hover popover / search.
       'snippet_detail': snap.snippetDetail,
+      // Foreground AI coding agent observed by the daemon, if any. Shape
+      // matches the JSON protocol's serde keys.
+      'agent': _parseAgentAttachment(snap.agent),
+    };
+  }
+
+  Map<String, dynamic>? _parseAgentAttachment(fbs.AgentAttachment? agent) {
+    if (agent == null) return null;
+    return {
+      'kind': agent.kind.name.toLowerCase(),
+      'conversation_id': agent.conversationId,
+      'transcript_path': agent.transcriptPath,
+      'exe_path': agent.exePath,
+      'last_seen_ms': agent.lastSeenMs,
     };
   }
 

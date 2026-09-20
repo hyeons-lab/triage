@@ -5,6 +5,8 @@ use std::sync::mpsc::Receiver;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentAttachment;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);
 
@@ -133,6 +135,11 @@ pub struct SessionSnapshot {
     /// popover and future search. `None` until the detail pass produces it.
     #[serde(default)]
     pub snippet_detail: Option<String>,
+    /// The AI coding agent in the session's foreground, if the daemon
+    /// observed one. `None` for plain shells, for agents that exited, and
+    /// from old hosts.
+    #[serde(default)]
+    pub agent: Option<AgentAttachment>,
 }
 
 mod compressed_bytes {
@@ -1095,6 +1102,7 @@ mod tests {
             raw_output_start: 0,
             snippet: None,
             snippet_detail: None,
+            agent: None,
         };
 
         let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");
@@ -1132,6 +1140,7 @@ mod tests {
             raw_output_start: 0,
             snippet: None,
             snippet_detail: None,
+            agent: None,
         };
 
         let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");

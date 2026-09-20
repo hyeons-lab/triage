@@ -116,6 +116,44 @@ class _LeaseChangeActionReader extends fb.Reader<LeaseChangeAction> {
       LeaseChangeAction.fromValue(const fb.Int8Reader().read(bc, offset));
 }
 
+enum AgentKind {
+  Claude(0),
+  Codex(1),
+  Antigravity(2),
+  Muse(3);
+
+  final int value;
+  const AgentKind(this.value);
+
+  factory AgentKind.fromValue(int value) {
+    switch (value) {
+      case 0: return AgentKind.Claude;
+      case 1: return AgentKind.Codex;
+      case 2: return AgentKind.Antigravity;
+      case 3: return AgentKind.Muse;
+      default: throw StateError('Invalid value $value for bit flag enum');
+    }
+  }
+
+  static AgentKind? _createOrNull(int? value) =>
+      value == null ? null : AgentKind.fromValue(value);
+
+  static const int minValue = 0;
+  static const int maxValue = 3;
+  static const fb.Reader<AgentKind> reader = _AgentKindReader();
+}
+
+class _AgentKindReader extends fb.Reader<AgentKind> {
+  const _AgentKindReader();
+
+  @override
+  int get size => 1;
+
+  @override
+  AgentKind read(fb.BufferContext bc, int offset) =>
+      AgentKind.fromValue(const fb.Int8Reader().read(bc, offset));
+}
+
 enum ClientRequestPayloadTypeId {
   NONE(0),
   HelloRequest(1),
@@ -1005,10 +1043,11 @@ class SessionSnapshot {
   int get rawOutputStart => fbjs.readUint64(_bc, _bcOffset, 28, 0);
   String? get snippet => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 30);
   String? get snippetDetail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 32);
+  AgentAttachment? get agent => AgentAttachment.reader.vTableGetNullable(_bc, _bcOffset, 34);
 
   @override
   String toString() {
-    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}, snippetDetail: ${snippetDetail}}';
+    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}, snippetDetail: ${snippetDetail}, agent: ${agent}}';
   }
 }
 
@@ -1026,7 +1065,7 @@ class SessionSnapshotBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(15);
+    fbBuilder.startTable(16);
   }
 
   int addOutputSeq(int? outputSeq) {
@@ -1089,6 +1128,10 @@ class SessionSnapshotBuilder {
     fbBuilder.addOffset(14, offset);
     return fbBuilder.offset;
   }
+  int addAgentOffset(int? offset) {
+    fbBuilder.addOffset(15, offset);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -1111,6 +1154,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
   final int? _rawOutputStart;
   final String? _snippet;
   final String? _snippetDetail;
+  final AgentAttachmentObjectBuilder? _agent;
 
   SessionSnapshotObjectBuilder({
     int? outputSeq,
@@ -1128,6 +1172,7 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     int? rawOutputStart,
     String? snippet,
     String? snippetDetail,
+    AgentAttachmentObjectBuilder? agent,
   })
       : _outputSeq = outputSeq,
         _bytesLogged = bytesLogged,
@@ -1143,7 +1188,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
         _rawOutput = rawOutput,
         _rawOutputStart = rawOutputStart,
         _snippet = snippet,
-        _snippetDetail = snippetDetail;
+        _snippetDetail = snippetDetail,
+        _agent = agent;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -1161,7 +1207,8 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_snippet!);
     final int? snippetDetailOffset = _snippetDetail == null ? null
         : fbBuilder.writeString(_snippetDetail!);
-    fbBuilder.startTable(15);
+    final int? agentOffset = _agent?.getOrCreateOffset(fbBuilder);
+    fbBuilder.startTable(16);
     fbjs.addUint64(fbBuilder, 0, _outputSeq);
     fbjs.addUint64(fbBuilder, 1, _bytesLogged);
     if (_size != null) {
@@ -1181,6 +1228,120 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     fbjs.addUint64(fbBuilder, 12, _rawOutputStart);
     fbBuilder.addOffset(13, snippetOffset);
     fbBuilder.addOffset(14, snippetDetailOffset);
+    fbBuilder.addOffset(15, agentOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class AgentAttachment {
+  AgentAttachment._(this._bc, this._bcOffset);
+  factory AgentAttachment(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<AgentAttachment> reader = _AgentAttachmentReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  AgentKind get kind => AgentKind.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 4, 0));
+  String? get conversationId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  String? get transcriptPath => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
+  String? get exePath => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
+  int get lastSeenMs => fbjs.readUint64(_bc, _bcOffset, 12, 0);
+
+  @override
+  String toString() {
+    return 'AgentAttachment{kind: ${kind}, conversationId: ${conversationId}, transcriptPath: ${transcriptPath}, exePath: ${exePath}, lastSeenMs: ${lastSeenMs}}';
+  }
+}
+
+class _AgentAttachmentReader extends fb.TableReader<AgentAttachment> {
+  const _AgentAttachmentReader();
+
+  @override
+  AgentAttachment createObject(fb.BufferContext bc, int offset) => 
+    AgentAttachment._(bc, offset);
+}
+
+class AgentAttachmentBuilder {
+  AgentAttachmentBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(5);
+  }
+
+  int addKind(AgentKind? kind) {
+    fbBuilder.addInt8(0, kind?.value);
+    return fbBuilder.offset;
+  }
+  int addConversationIdOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addTranscriptPathOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addExePathOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+  int addLastSeenMs(int? lastSeenMs) {
+    fbjs.addUint64(fbBuilder, 4, lastSeenMs);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class AgentAttachmentObjectBuilder extends fb.ObjectBuilder {
+  final AgentKind? _kind;
+  final String? _conversationId;
+  final String? _transcriptPath;
+  final String? _exePath;
+  final int? _lastSeenMs;
+
+  AgentAttachmentObjectBuilder({
+    AgentKind? kind,
+    String? conversationId,
+    String? transcriptPath,
+    String? exePath,
+    int? lastSeenMs,
+  })
+      : _kind = kind,
+        _conversationId = conversationId,
+        _transcriptPath = transcriptPath,
+        _exePath = exePath,
+        _lastSeenMs = lastSeenMs;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? conversationIdOffset = _conversationId == null ? null
+        : fbBuilder.writeString(_conversationId!);
+    final int? transcriptPathOffset = _transcriptPath == null ? null
+        : fbBuilder.writeString(_transcriptPath!);
+    final int? exePathOffset = _exePath == null ? null
+        : fbBuilder.writeString(_exePath!);
+    fbBuilder.startTable(5);
+    fbBuilder.addInt8(0, _kind?.value);
+    fbBuilder.addOffset(1, conversationIdOffset);
+    fbBuilder.addOffset(2, transcriptPathOffset);
+    fbBuilder.addOffset(3, exePathOffset);
+    fbjs.addUint64(fbBuilder, 4, _lastSeenMs);
     return fbBuilder.endTable();
   }
 

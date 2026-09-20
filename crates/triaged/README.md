@@ -349,3 +349,31 @@ relies on low-level file-descriptor passing (`SCM_RIGHTS`) that is native to
 POSIX platforms. On Windows, upgrading or restarting the daemon falls back
 gracefully to Triage's robust **Session Restore** flow, which saves session
 metadata and restores shell/workspace layout structures on restart.
+
+## Agent Tracking & Conversation Restore
+
+Each session actor watches its PTY's foreground process for a known AI coding
+agent (Claude Code, Codex, Antigravity's `agy`, Muse). When one holds the
+foreground, the daemon records an attachment — agent kind, conversation id,
+transcript path, and binary path — against the session and persists it in the
+session manifest. Restoring such a session (after a reboot, a daemon kill, or
+from history) relaunches the agent resumed into the same conversation instead
+of a fresh shell.
+
+Attachments are live-state only. Exiting the agent clears the attachment, so
+going back to the shell and rebooting restores a shell; exited sessions never
+carry one. When the attachment is provably stale (binary or transcript gone),
+or the agent binary fails to spawn, restore falls back to the shell the
+session was launched with. Conversation ids come from argv when the agent was
+started with a resume flag, else from transcript correlation — and only on a
+single unambiguous candidate, so a wrong guess never resumes the wrong
+conversation.
+
+Detection is read-only observation (process names, argv, transcript metadata);
+transcript content is never read. Agents behind wrappers (`sudo`, `just`),
+inside tmux/screen, on remote hosts, or in the Antigravity IDE (as opposed to
+its CLI) are not visible to the foreground check and are not tracked.
+Detection currently runs on macOS and Linux; other platforms skip it.
+
+To opt out entirely, set `TRIAGE_DISABLE_AGENT_TRACKING` to anything but
+empty, `0`, or `false` in the daemon's environment.

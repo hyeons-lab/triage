@@ -957,6 +957,12 @@ fn session_sidebar_rows(
             width,
         )),
     ];
+    if let Some(agent) = &view.snapshot.agent {
+        rows.push(Line::from(truncate_to_width(
+            format!("  {}", agent_badge_text(agent)),
+            width,
+        )));
+    }
     rows.extend(session_context_rows(
         view,
         width,
@@ -965,6 +971,22 @@ fn session_sidebar_rows(
     ));
     rows.push(Line::from(""));
     rows
+}
+
+/// Sidebar badge for the observed foreground agent: kind plus a short
+/// conversation id, or `(recent)` when only the kind is known (restore
+/// falls back to the agent's most-recent conversation).
+fn agent_badge_text(agent: &triage_core::agent::AgentAttachment) -> String {
+    let kind = match agent.kind {
+        triage_core::agent::AgentKind::Claude => "claude",
+        triage_core::agent::AgentKind::Codex => "codex",
+        triage_core::agent::AgentKind::Antigravity => "agy",
+        triage_core::agent::AgentKind::Muse => "muse",
+    };
+    match agent.conversation_id.as_deref() {
+        Some(id) => format!("{kind} {}", id.chars().take(8).collect::<String>()),
+        None => format!("{kind} (recent)"),
+    }
 }
 
 fn session_context_rows(
@@ -2285,6 +2307,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2306,6 +2329,62 @@ mod tests {
             "  w websocket-session-api"
         );
         assert_eq!(rows[4].spans[0].content.as_ref(), "  b session-context");
+    }
+
+    #[test]
+    fn sidebar_rows_include_agent_badge() {
+        let view = SessionView {
+            session_id: triage_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: triage_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: Vec::new(),
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: triage_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: None,
+                context: None,
+                bracketed_paste_enabled: false,
+                exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
+                snippet: None,
+                snippet_detail: None,
+                agent: Some(triage_core::agent::AgentAttachment {
+                    kind: triage_core::agent::AgentKind::Claude,
+                    conversation_id: Some("abc12345ef".to_string()),
+                    transcript_path: None,
+                    exe_path: None,
+                    last_seen_ms: 1,
+                }),
+            },
+            lease: triage_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+
+        let rows = session_sidebar_rows(0, 1, &view, None, 40, 0);
+
+        assert_eq!(rows[2].spans[0].content.as_ref(), "  claude abc12345");
+    }
+
+    #[test]
+    fn sidebar_rows_mark_kind_only_agent_as_recent() {
+        assert_eq!(
+            agent_badge_text(&triage_core::agent::AgentAttachment {
+                kind: triage_core::agent::AgentKind::Muse,
+                conversation_id: None,
+                transcript_path: None,
+                exe_path: None,
+                last_seen_ms: 1,
+            }),
+            "muse (recent)"
+        );
     }
 
     #[test]
@@ -2336,6 +2415,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2383,6 +2463,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2466,6 +2547,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2509,6 +2591,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
@@ -2794,6 +2877,7 @@ mod tests {
             raw_output_start: 0,
             snippet: None,
             snippet_detail: None,
+            agent: None,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 2).is_some());
@@ -2827,6 +2911,7 @@ mod tests {
             raw_output_start: 0,
             snippet: None,
             snippet_detail: None,
+            agent: None,
         };
 
         assert!(styled_rows_for_visible_range(&snapshot, 0, 1).is_none());
@@ -2880,6 +2965,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
