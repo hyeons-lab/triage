@@ -260,6 +260,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   bool _initialContentWritten = false;
   bool _styleSheetLoaded = false;
   bool _isPasteDialogShowing = false;
+  bool _isPasting = false;
   final List<String> _pendingLiveWriteBuffer = [];
   bool _suppressScrollSave = false;
 
@@ -1893,6 +1894,26 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
   }
 
+  // Accessory-bar paste key (mobile web): read the clipboard and route it
+  // through the paste path. Mirrors the native pane; a denied clipboard
+  // read just no-ops, leaving the browser textarea paste path untouched.
+  Future<void> _pasteFromClipboard() async {
+    if (_isPasting) return;
+    _isPasting = true;
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      if (!mounted) return;
+      final text = data?.text;
+      if (text != null && text.isNotEmpty) {
+        await _handlePaste(text);
+      }
+    } catch (e) {
+      debugPrint('TerminalPane: failed to read clipboard on web paste: $e');
+    } finally {
+      _isPasting = false;
+    }
+  }
+
   final List<Timer> _pointerReleaseTimers = [];
 
   void _clearPointerReleaseTimers() {
@@ -2718,6 +2739,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                 child: TerminalAccessoryBar(
                   onSend: _sendAccessory,
                   onToggleCtrl: _toggleCtrl,
+                  onPaste: () => unawaited(_pasteFromClipboard()),
                   ctrlArmed: _ctrlArmed,
                 ),
               ),

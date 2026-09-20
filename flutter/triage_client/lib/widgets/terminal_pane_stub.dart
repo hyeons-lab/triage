@@ -1661,6 +1661,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     return TerminalAccessoryBar(
       onSend: _sendAccessory,
       onToggleCtrl: _toggleCtrl,
+      onPaste: () => unawaited(_pasteFromClipboard()),
       ctrlArmed: _ctrlArmed,
     );
   }
