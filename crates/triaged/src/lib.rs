@@ -1,5 +1,6 @@
 #![cfg_attr(unix, allow(unsafe_code))]
 
+pub mod agent_detect;
 pub mod handover;
 pub mod http;
 #[cfg(any(unix, windows))]

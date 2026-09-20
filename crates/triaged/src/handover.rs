@@ -36,6 +36,12 @@ pub struct HandoverSession {
     pub last_activity_ms: u64,
     #[serde(default)]
     pub judge_override: Option<bool>,
+    /// Last-known foreground-agent attachment, carried so adoption seeds
+    /// the live entry and its tracker instead of re-observing from
+    /// scratch. Defaults to `None` for blobs written before this field
+    /// existed.
+    #[serde(default)]
+    pub agent: Option<triage_core::agent::AgentAttachment>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

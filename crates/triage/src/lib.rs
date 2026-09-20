@@ -717,16 +717,16 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
             snapshot,
             ..
         } if session_id == view.session_id => {
-            replace_snapshot_preserving_scroll(view, snapshot);
-            false
+            merge_push_snapshot(view, snapshot);
+            true
         }
         SessionEvent::Output { session_id, .. } if session_id == view.session_id => true,
         SessionEvent::Snapshot {
             session_id,
             snapshot,
         } if session_id == view.session_id => {
-            replace_snapshot_preserving_scroll(view, snapshot);
-            false
+            merge_push_snapshot(view, snapshot);
+            true
         }
         SessionEvent::LeaseChanged { session_id, change } if session_id == view.session_id => {
             view.lease = InputLeaseState {
@@ -750,6 +750,18 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
         }
         _ => false,
     }
+}
+
+/// Merge an actor-built push snapshot into the view: the actor never sets
+/// manager-overlaid fields, so a push `None` is "unknown", not "absent",
+/// and must not wipe a good attachment. The caller re-fetches right after
+/// (these arms return true), so a real detach still clears the badge on
+/// the next pass.
+fn merge_push_snapshot(view: &mut SessionView, mut snapshot: SessionSnapshot) {
+    if snapshot.agent.is_none() {
+        snapshot.agent = view.snapshot.agent.clone();
+    }
+    replace_snapshot_preserving_scroll(view, snapshot);
 }
 
 fn replace_snapshot_preserving_scroll(view: &mut SessionView, snapshot: SessionSnapshot) {
@@ -1002,6 +1014,7 @@ mod tests {
             raw_output_start: 0,
             snippet: None,
             snippet_detail: None,
+            agent: None,
         };
 
         let mut app = LocalSessionApp::start_with_manager(
@@ -1096,13 +1109,65 @@ mod tests {
 
         let snapshot_session_id = view.session_id.clone();
         let snapshot = view.snapshot.clone();
-        assert!(!apply_event_to_view(
+        // Push snapshots re-fetch so manager-overlaid fields converge to
+        // authoritative state (see below).
+        assert!(apply_event_to_view(
             &mut view,
             SessionEvent::Snapshot {
                 session_id: snapshot_session_id,
                 snapshot,
             },
         ));
+    }
+
+    #[test]
+    fn push_snapshots_preserve_agent_and_request_refresh() {
+        use triage_core::agent::{AgentAttachment, AgentKind};
+
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut view = test_view(session_id.clone());
+        view.snapshot.agent = Some(AgentAttachment {
+            kind: AgentKind::Claude,
+            conversation_id: Some("abc123".to_string()),
+            transcript_path: None,
+            exe_path: None,
+            last_seen_ms: 1,
+        });
+
+        // Actor-built pushes never set the agent: a push `None` must not
+        // wipe the view's good attachment.
+        let mut push = view.snapshot.clone();
+        push.agent = None;
+        push.visible_rows = vec!["a".into()];
+        assert!(apply_event_to_view(
+            &mut view,
+            SessionEvent::Snapshot {
+                session_id: session_id.clone(),
+                snapshot: push.clone(),
+            },
+        ));
+        assert_eq!(
+            view.snapshot
+                .agent
+                .as_ref()
+                .and_then(|a| a.conversation_id.as_deref()),
+            Some("abc123")
+        );
+        assert!(apply_event_to_view(
+            &mut view,
+            SessionEvent::ResyncRequired {
+                session_id,
+                latest_event_seq: 0,
+                snapshot: push,
+            },
+        ));
+        assert_eq!(
+            view.snapshot
+                .agent
+                .as_ref()
+                .and_then(|a| a.conversation_id.as_deref()),
+            Some("abc123")
+        );
     }
 
     #[test]
@@ -1683,6 +1748,7 @@ mod tests {
                 raw_output_start: 0,
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: InputLeaseState::default(),
             last_completed: None,
@@ -1775,6 +1841,7 @@ mod tests {
                     raw_output_start: 0,
                     snippet: None,
                     snippet_detail: None,
+                    agent: None,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
@@ -1956,6 +2023,7 @@ mod tests {
                     raw_output_start: 0,
                     snippet: None,
                     snippet_detail: None,
+                    agent: None,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {

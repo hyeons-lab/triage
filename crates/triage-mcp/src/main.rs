@@ -599,6 +599,7 @@ mod tests {
                     raw_output_start: 0,
                     snippet: None,
                     snippet_detail: None,
+                    agent: None,
                 },
                 snapshot_error: None,
             }
