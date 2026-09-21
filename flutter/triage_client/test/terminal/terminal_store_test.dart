@@ -301,6 +301,22 @@ void main() {
     expect(sink.written.toString(), 'hithere');
   });
 
+  test('history replay ending mid-escape releases the trailing partial', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      // The history tail is cut at an arbitrary byte offset, so it routinely
+      // ends mid-sequence. The hold itself is correct — the next live chunk
+      // may complete a strippable CSI > join — but with no live following,
+      // the watchdog must still release it. (The replay's own sync-block
+      // close used to cancel that watchdog, stranding the tail.)
+      const tail = 'ok\x1b[38;2;118;123;131;4';
+      store.dispatch(HistoryBytes(b(tail), cols: 80, rows: 24));
+      expect(sink.written.toString(), 'ok');
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(sink.written.toString(), tail);
+    });
+  });
+
   test('re-delivered live outputSeq is dropped (re-delivery de-dup)', () {
     store.dispatch(const Attach());
     store.dispatch(const HistoryBytes([], cols: 80, rows: 24));

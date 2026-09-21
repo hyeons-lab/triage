@@ -480,6 +480,14 @@ class TerminalStore extends ChangeNotifier {
     // time this fires, and its web bottom-restore depends on it. A replay
     // ending mid-frame would otherwise still be sitting in _syncBuffer.
     _closeSyncBlockAndFlush();
+    // A replay ending mid-escape holds its tail in _escapeCarry for the next
+    // live chunk to complete (the CSI > strip needs the joined sequence, so
+    // it cannot flush eagerly here). The close above cancelled the watchdog
+    // guarding it — re-arm, so with no live following the carry still reaches
+    // the sink instead of stranding until a later chunk or never.
+    if (_escapeCarry.isNotEmpty) {
+      _rearmSyncWatchdog();
+    }
     if (!_disposed) _sink.onHistoryReplayed();
     return next;
   }

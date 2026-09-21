@@ -23,6 +23,7 @@ import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
 import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
+import 'package:triage_client/terminal/size_drift.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
@@ -1538,7 +1539,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _reclaimTerminalSizeIfDrifted() {
     if (_disposed || _sessions.isEmpty) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
-    if (!_selectedSession.hostSizeDriftedFromOwnFit) return;
+    if (!_selectedSession.hostSizeDriftedFromOwnFit &&
+        !_selectedSessionGridDriftedFromHost()) {
+      return;
+    }
     // Refit and refocus together, through the shared helper so this keeps its
     // carve-out: on mobile the refocus raises the soft keyboard, which insets
     // the Scaffold, shrinks the viewport and fires another fit at the smaller
@@ -1546,6 +1550,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // PTY. Desktop needs the refocus, since a refit alone leaves the terminal
     // ignoring input until the session is switched away from and back.
     _refitAndFocusActiveSession();
+  }
+
+  /// Web-only companion to [SessionVm.hostSizeDriftedFromOwnFit]: true when
+  /// the selected session's live xterm.js grid disagrees with the host size.
+  /// A fit that applied locally but never reached the host reads as healthy
+  /// to the last-sent comparison (term 46, PTY 80, sent 80) while rendering
+  /// narrow; this catches it so the foreground reclaim heals it. Native
+  /// `TerminalView` auto-fit owns its grid, so there is no equivalent gap.
+  bool _selectedSessionGridDriftedFromHost() {
+    if (!kIsWeb) return false;
+    final session = _selectedSession;
+    // NOTE: the cached size is (rows, cols), not (cols, rows).
+    final grid = TerminalPane.getCachedTerminalSize(session.title);
+    if (grid == null) return false;
+    return liveGridDriftedFromHost(
+      gridCols: grid.$2,
+      gridRows: grid.$1,
+      hostCols: session.hostSizeCols,
+      hostRows: session.hostSizeRows,
+    );
   }
 
   // Re-fit this device's terminal to its real size and re-assert it on the
