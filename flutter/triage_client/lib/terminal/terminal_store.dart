@@ -24,13 +24,14 @@ const int kPendingLiveByteCap = 1024 * 1024;
 /// How far below the dedup baseline an `output_seq` may fall and still be a
 /// re-delivery rather than a fresh numbering epoch.
 ///
-/// `output_seq` counts events within one daemon *instance*: a handover restarts
-/// it low for an adopted session while the byte log continues unbroken (the same
-/// session observed either side of an adoption reports one `bytes_logged` under
-/// two very different `output_seq`). A client that kept the pre-handover
-/// high-water would score every renumbered chunk as a duplicate and go
-/// permanently deaf — history frozen on screen, cursor still blinking, typing
-/// still reaching the PTY with nothing it produces ever drawn.
+/// `output_seq` counts events within one daemon *instance*: a cold restore or a
+/// session revive restarts it at 0 while the byte log continues unbroken (the
+/// same session observed either side of a restart reports one `bytes_logged`
+/// under two very different `output_seq`; a handover, by contrast, preserves
+/// both counters). A client that kept the pre-restart high-water would score
+/// every renumbered chunk as a duplicate and go permanently deaf: history
+/// frozen on screen, cursor still blinking, typing still reaching the PTY
+/// with nothing it produces ever drawn.
 ///
 /// The daemon replays at most `EVENT_REPLAY_BUFFER` (1024) events to a lagging
 /// subscriber and sends `ResyncRequired` beyond that, so no genuine re-delivery
@@ -192,6 +193,9 @@ class TerminalStore extends ChangeNotifier {
   void dispatch(TerminalIntent intent) {
     if (_disposed) return;
     final next = _reduce(_state, intent);
+    // A sink listener reacting to a mid-reduce write can dispose us before we
+    // get here; notifying a disposed ChangeNotifier would throw.
+    if (_disposed) return;
     if (next != _state) {
       _state = next;
       notifyListeners();
@@ -322,6 +326,29 @@ class TerminalStore extends ChangeNotifier {
       }
     }
 
+    // Empty payloads carry no paintable information: never clear, re-anchor,
+    // or advance baselines on them. A history-less resync snapshot (old host,
+    // resize-shaped response) must not wipe a live terminal, and advancing
+    // the seq baseline past in-flight live would drop the replayed bytes as
+    // duplicates. First history and exited sessions still fall through to the
+    // full replay below; a genuinely truncated log replays on its first
+    // non-empty tail, which still carries the regression evidence.
+    if (bytes.isEmpty && s.scrollbackReady && !s.exited) {
+      if (next.sized) {
+        _flushPendingLive(next.historyHighWaterSeq);
+      }
+      return next.copyWith(
+        phase: AttachPhase.live,
+        scrollbackReady: true,
+        exited: false,
+      );
+    }
+
+    // Sanitize before the byte arithmetic below; unknowns take the seq
+    // fallback or a full replay (see [_sanitizeCounter]).
+    final throughSeq = _sanitizeCounter(throughOutputSeq);
+    final rawStart = _sanitizeCounter(rawOutputStart);
+
     final currentSeq = _appliedLiveSeq ?? s.historyHighWaterSeq;
     final currentLogBytes = _appliedLogBytes;
     final lastSnapshotSeq = s.historyHighWaterSeq;
@@ -329,38 +356,39 @@ class TerminalStore extends ChangeNotifier {
     // A snapshot sequence regression occurs when:
     // 1. The new snapshot's sequence drops below the previous snapshot's sequence.
     // 2. The sequence drops far below the live baseline (an epoch reset).
-    // 3. rawOutputStart is null, both previous and new snapshots are at sequence 0,
-    //    and the live stream has already advanced (_appliedLiveSeq > 0), indicating
-    //    a daemon sequence reset back to 0.
-    final isSnapshotSeqRegressed =
-        throughOutputSeq != null &&
-        ((lastSnapshotSeq != null && throughOutputSeq < lastSnapshotSeq) ||
-            _isSeqEpochReset(throughOutputSeq, _appliedLiveSeq) ||
-            (rawOutputStart == null &&
+    // 3. rawStart is null, the previous snapshot is at sequence 0, the new
+    //    snapshot restarts at 0/1, and the live stream has already advanced
+    //    (_appliedLiveSeq > 0), indicating a daemon counter restart.
+    final isSnapshotSeqRegressed = throughSeq != null &&
+        ((lastSnapshotSeq != null && throughSeq < lastSnapshotSeq) ||
+            _isSeqEpochReset(throughSeq, _appliedLiveSeq) ||
+            (rawStart == null &&
                 lastSnapshotSeq == 0 &&
-                throughOutputSeq == 0 &&
+                (throughSeq == 0 || throughSeq == 1) &&
                 _appliedLiveSeq != null &&
                 _appliedLiveSeq! > 0));
 
     // A log byte regression occurs when:
     // 1. There is a forward gap: the client has only seen up to currentLogBytes,
-    //    but the new tail starts at rawOutputStart > currentLogBytes.
-    // 2. The log shrunk from byte 0 (truncation/restart): rawOutputStart == 0
-    //    and snapshotEndBytes < currentLogBytes, with no advancing sequence.
+    //    but the new tail starts at rawStart > currentLogBytes.
+    // 2. The log end moved backward under a fresh sequence: the daemon rebases
+    //    `bytes_logged` when it trims while `output_seq` stays monotonic, so a
+    //    trim presents as an advanced (or unchanged) sequence with fewer bytes.
+    //    A stale snapshot also ends behind the live head, but its sequence
+    //    trails the applied baselines, and that combination stays a no-op below.
+    //    An unknown sequence fails toward replay, as before.
     final snapshotEndBytes =
-        rawOutputStart != null ? rawOutputStart + bytes.length : null;
-    final hasLogByteGap =
-        rawOutputStart != null &&
+        rawStart != null ? rawStart + bytes.length : null;
+    final hasLogByteGap = rawStart != null &&
         currentLogBytes != null &&
-        currentLogBytes < rawOutputStart;
-    final isLogShrunk =
-        rawOutputStart == 0 &&
-        currentLogBytes != null &&
+        currentLogBytes < rawStart;
+    final isSeqFresh = throughSeq != null &&
+        (lastSnapshotSeq == null || throughSeq >= lastSnapshotSeq) &&
+        (_appliedLiveSeq == null || throughSeq >= _appliedLiveSeq!);
+    final isLogShrunk = currentLogBytes != null &&
         snapshotEndBytes != null &&
         snapshotEndBytes < currentLogBytes &&
-        (throughOutputSeq == null ||
-            lastSnapshotSeq == null ||
-            throughOutputSeq < lastSnapshotSeq);
+        (throughSeq == null || isSeqFresh);
 
     final isRegressed =
         isSnapshotSeqRegressed ||
@@ -370,21 +398,23 @@ class TerminalStore extends ChangeNotifier {
     // Delta merge: if the store already has scrollback content, is not exited,
     // and is not regressed, check whether the new snapshot overlaps with what
     // we already applied.
+    // Delta paths intentionally skip onHistoryReplayed: nothing was cleared,
+    // so the viewport stays and both panes follow the tail on live writes.
     if (!s.exited &&
         !isRegressed &&
         s.scrollbackReady &&
         (currentSeq != null || currentLogBytes != null)) {
-      if (rawOutputStart != null &&
+      if (rawStart != null &&
           currentLogBytes != null &&
           snapshotEndBytes != null) {
         if (currentLogBytes >= snapshotEndBytes) {
-          final resolvedSeq = throughOutputSeq != null
-              ? max(next.historyHighWaterSeq ?? 0, throughOutputSeq)
+          final resolvedSeq = throughSeq != null
+              ? max(next.historyHighWaterSeq ?? 0, throughSeq)
               : next.historyHighWaterSeq;
-          if (throughOutputSeq != null) {
+          if (throughSeq != null) {
             _appliedLiveSeq = _appliedLiveSeq == null
-                ? throughOutputSeq
-                : max(_appliedLiveSeq!, throughOutputSeq);
+                ? throughSeq
+                : max(_appliedLiveSeq!, throughSeq);
           }
           if (next.sized) {
             _flushPendingLive(resolvedSeq);
@@ -397,15 +427,18 @@ class TerminalStore extends ChangeNotifier {
           );
         }
 
-        if (currentLogBytes >= rawOutputStart) {
-          final deltaOffset = currentLogBytes - rawOutputStart;
+        if (currentLogBytes >= rawStart) {
+          final deltaOffset = currentLogBytes - rawStart;
           if (deltaOffset >= 0 && deltaOffset < bytes.length) {
             final deltaBytes = bytes is Uint8List
                 ? Uint8List.sublistView(bytes, deltaOffset)
                 : bytes.sublist(deltaOffset);
-            _applyLive(deltaBytes, throughOutputSeq);
-            final resolvedSeq = throughOutputSeq != null
-                ? max(next.historyHighWaterSeq ?? 0, throughOutputSeq)
+            // As in the full-replay path below: suppress the emulator's
+            // answers to the re-fed queries so they never reach the host.
+            _beginHostInputSuppression();
+            _applyLive(deltaBytes, throughSeq);
+            final resolvedSeq = throughSeq != null
+                ? max(next.historyHighWaterSeq ?? 0, throughSeq)
                 : next.historyHighWaterSeq;
             if (next.sized) {
               _flushPendingLive(resolvedSeq);
@@ -423,14 +456,14 @@ class TerminalStore extends ChangeNotifier {
             );
           }
         }
-      } else if (throughOutputSeq != null &&
+      } else if (throughSeq != null &&
           currentSeq != null &&
-          currentSeq >= throughOutputSeq) {
+          currentSeq >= throughSeq) {
         final resolvedSeq =
-            max(next.historyHighWaterSeq ?? 0, throughOutputSeq);
+            max(next.historyHighWaterSeq ?? 0, throughSeq);
         _appliedLiveSeq = _appliedLiveSeq == null
-            ? throughOutputSeq
-            : max(_appliedLiveSeq!, throughOutputSeq);
+            ? throughSeq
+            : max(_appliedLiveSeq!, throughSeq);
         if (next.sized) {
           _flushPendingLive(resolvedSeq);
         }
@@ -446,7 +479,7 @@ class TerminalStore extends ChangeNotifier {
     tdbg(
       'store.history',
       'FULL REPLAY ${bytes.length}B at ${cols}x$rows '
-          'throughSeq=$throughOutputSeq rawStart=$rawOutputStart',
+          'throughSeq=$throughSeq rawStart=$rawStart',
     );
     _sink.clear();
     // Reset carries so history starts a fresh decode stream; history then
@@ -460,8 +493,8 @@ class TerminalStore extends ChangeNotifier {
     _beginHostInputSuppression();
     _writeDecoded(bytes);
 
-    if (rawOutputStart != null) {
-      _appliedLogBytes = rawOutputStart + bytes.length;
+    if (rawStart != null) {
+      _appliedLogBytes = rawStart + bytes.length;
     } else {
       _appliedLogBytes = bytes.length;
     }
@@ -469,12 +502,12 @@ class TerminalStore extends ChangeNotifier {
     next = next.copyWith(
       phase: AttachPhase.live,
       scrollbackReady: true,
-      historyHighWaterSeq: throughOutputSeq,
+      historyHighWaterSeq: throughSeq,
       exited: false,
     );
 
     if (next.sized) {
-      _flushPendingLive(throughOutputSeq);
+      _flushPendingLive(throughSeq);
     }
     // #162's contract is that every decoded byte has reached the sink by the
     // time this fires, and its web bottom-restore depends on it. A replay
@@ -488,29 +521,32 @@ class TerminalStore extends ChangeNotifier {
     if (s.phase == AttachPhase.detached) {
       return s;
     }
+    // As in _reduceHistory: a negative is corrupt, so null keeps it off
+    // the baselines instead of epoch-resetting onto it.
+    final seq = _sanitizeCounter(outputSeq);
     var next = s;
-    if (_isSeqEpochReset(outputSeq, s.historyHighWaterSeq)) {
+    if (_isSeqEpochReset(seq, s.historyHighWaterSeq)) {
       // The counter this baseline described no longer exists. Drop it and
       // rebase on the new epoch; `_appliedLogBytes` is deliberately kept,
-      // because log byte offsets — unlike `output_seq` — survive a handover
+      // because log byte offsets (unlike `output_seq`) survive a restart
       // and still anchor the next history delta-merge.
       _appliedLiveSeq = null;
       next = s.copyWith(resetHistoryHighWaterSeq: true);
     }
-    if (_isDuplicate(outputSeq, next.historyHighWaterSeq)) {
+    if (_isDuplicate(seq, next.historyHighWaterSeq)) {
       return next;
     }
     if (!next.sized || next.phase == AttachPhase.awaitingHistory) {
       tdbg(
         'store.live',
-        'QUEUED seq=$outputSeq ${bytes.length}B '
+        'QUEUED seq=$seq ${bytes.length}B '
             '(sized=${next.sized} phase=${next.phase})',
       );
-      _enqueuePendingLive(_QueuedLive(bytes, outputSeq));
+      _enqueuePendingLive(_QueuedLive(bytes, seq));
       return next;
     }
-    tdbg('store.live', 'APPLY seq=$outputSeq ${bytes.length}B');
-    _applyLive(bytes, outputSeq);
+    tdbg('store.live', 'APPLY seq=$seq ${bytes.length}B');
+    _applyLive(bytes, seq);
     return next;
   }
 
@@ -604,18 +640,20 @@ class TerminalStore extends ChangeNotifier {
 
   /// A live chunk starts a new numbering epoch when its `output_seq` falls
   /// further below the dedup baseline than the daemon could ever replay — the
-  /// signature of a handover renumbering an adopted session. See
-  /// [kSeqEpochResetWindow]; the history path makes the same call via
-  /// `isSequenceRegressed`. A fresh session whose baseline never reached the
-  /// window still resets to 0/1 after a handover, so a regression to the start
-  /// of a new epoch counts regardless of the window once the baseline is past
-  /// single digits (guarding startup redeliveries of seq 0/1 against reset).
+  /// signature of the daemon restarting its counter (a cold restore or a
+  /// session revive resets it to 0 while `bytes_logged` is re-derived from
+  /// the log; a handover preserves both). See [kSeqEpochResetWindow]; the
+  /// history path makes the same call via `isSnapshotSeqRegressed`. A fresh
+  /// session whose baseline never reached the window still resets to 0/1
+  /// after a restart, so a regression to the start of a new epoch counts
+  /// regardless of the window once the baseline is past single digits
+  /// (guarding startup redeliveries of seq 0/1 against reset).
   bool _isSeqEpochReset(int? outputSeq, int? highWaterSeq) {
     if (outputSeq == null) return false;
     final baseline = max(highWaterSeq ?? 0, _appliedLiveSeq ?? 0);
     if (baseline == 0) return false;
     return outputSeq < baseline - kSeqEpochResetWindow ||
-        (outputSeq <= 1 && baseline > 10);
+        ((outputSeq == 0 || outputSeq == 1) && baseline > 10);
   }
 
   void _beginHostInputSuppression() {
@@ -634,8 +672,11 @@ class TerminalStore extends ChangeNotifier {
   /// history→live boundary — is decoded correctly. [Attach]/[Clear]/history
   /// reset the carries to start a fresh stream.
   void _writeDecoded(List<int> bytes) {
+    // `toDecode` is only ever read (decode) or replaced (sublist copies), so
+    // aliasing the input when there is no carry is safe and keeps the common
+    // case zero-copy.
     var toDecode = _utf8Carry.isEmpty
-        ? List<int>.from(bytes)
+        ? bytes
         : <int>[..._utf8Carry, ...bytes];
     _utf8Carry.clear();
     final trailing = _trailingIncompleteUtf8ByteCount(toDecode);
@@ -992,6 +1033,12 @@ class TerminalStore extends ChangeNotifier {
     _inSynchronizedOutput = false;
     _closeFrameOnWire();
     _syncBuffer.clear();
+    // A suppression window armed by the previous lifecycle's replay must not
+    // leak into the new one and swallow its early input. Safe for the
+    // full-replay path, which re-arms after calling this.
+    _suppressTimer?.cancel();
+    _suppressTimer = null;
+    _suppressHostInput = false;
     _appliedLiveSeq = null;
     _appliedLogBytes = null;
   }
@@ -1054,3 +1101,8 @@ int _utf8SequenceLength(int byte) {
 }
 
 bool _isUtf8ContinuationByte(int byte) => byte >= 0x80 && byte <= 0xBF;
+
+/// Schema counters are uint64: a negative is corrupt, so treat it as
+/// unknown (null) rather than letting it poison watermarks.
+int? _sanitizeCounter(int? value) =>
+    value != null && value < 0 ? null : value;

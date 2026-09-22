@@ -928,6 +928,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   String? _bearerToken;
   bool _storageBackedClientId = false;
   bool _needsPairing = false;
+  // The connect generation a displayed pairing challenge belongs to. A
+  // stale-401 probe's hello can resolve before the connect hello and pair
+  // first; the connect path skips refiring for that generation, since a
+  // second challenge would burn a single-use code the user might be
+  // reading. Every server change and every connect bumps the generation,
+  // which only increases, so a stale tag can never match a later connect
+  // and no server tag is needed.
+  int? _pairingGeneration;
   bool _pairingChallengeLoading = false;
   String? _pairingDeviceCode;
   DateTime? _pairingExpiresAt;
@@ -950,7 +958,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // same session race and the second blanks the first (e.g. the select + first
   // view-fit refreshes that both fire on a session's initial load).
   final Set<String> _refreshInFlight = {};
-  final Set<String> _resubscribeInFlight = {};
+  // Session ids with a dropped history refresh owed: a `_refresh(true)` that
+  // lost the `_refreshInFlight` race to a metadata refresh is re-run once the
+  // in-flight refresh lands, so the history baseline is never silently
+  // skipped while the caller reports success.
+  final Set<String> _refreshHistoryFollowUp = {};
+  // Session ids with an in-flight resubscribe, mapped to the attempt token
+  // that owns them. A purge clears the map mid-flight, so a stale attempt
+  // must only release its own token, never a newer one.
+  final Map<String, int> _resubscribeInFlight = {};
+  int _resubscribeAttemptCounter = 0;
   final Map<String, List<Map<String, dynamic>>> _pendingEvents = {};
   final Queue<Map<String, dynamic>> _websocketEventQueue = Queue();
   bool _websocketProcessingEvent = false;
@@ -1329,6 +1346,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _websocketEventQueue.clear();
     _subscriptionIds.clear();
     _refreshInFlight.clear();
+    _refreshHistoryFollowUp.clear();
     _resubscribeInFlight.clear();
     _loadingSessionIds.clear();
     _pendingInputBytes.clear();
@@ -1643,8 +1661,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   String _loadOrCreateClientId() {
-    final storedClientId = retrieveClientId();
-    if (storedClientId != null && storedClientId.trim().isNotEmpty) {
+    // As in _refreshBearerTokenFromStorage: the watcher compares trimmed
+    // values, so trim once at the boundary here too.
+    final storedClientId = retrieveClientId()?.trim();
+    if (storedClientId != null && storedClientId.isNotEmpty) {
       _storageBackedClientId = true;
       return storedClientId;
     }
@@ -1661,19 +1681,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   void _refreshBearerTokenFromStorage() {
-    final storedClientId = retrieveClientId();
-    final storedToken = retrieveTokenFor(_activeServerId);
+    final storedClientId = retrieveClientId()?.trim();
+    // Trim once at the boundary: the storage watcher compares trimmed
+    // values, so the credentials in use must be trimmed too, or padded
+    // storage would pass the watcher forever while failing every request.
+    final storedToken = retrieveTokenFor(_activeServerId)?.trim();
     if (!_storageBackedClientId) {
       if (storedClientId == _clientId) {
         _storageBackedClientId = true;
       }
-      if (storedToken?.trim().isNotEmpty == true) {
+      if (storedToken != null && storedToken.isNotEmpty) {
         _bearerToken = storedToken;
       }
       return;
     }
 
-    if (storedClientId == null || storedClientId.trim().isEmpty) {
+    if (storedClientId == null || storedClientId.isEmpty) {
       _bearerToken = null;
       persistClientId(_clientId);
       _storageBackedClientId = retrieveClientId() == _clientId;
@@ -1683,7 +1706,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _bearerToken = null;
       return;
     }
-    _bearerToken = storedToken?.trim().isEmpty == false ? storedToken : null;
+    _bearerToken = storedToken != null && storedToken.isNotEmpty
+        ? storedToken
+        : null;
   }
 
   void _startCredentialStorageWatcher() {
@@ -1841,12 +1866,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   ) async {
     if (!_clientInitialized || !_client.isConnected || session.isExited) return;
     if (!_leaseAcquisitionInFlight.add(sessionId)) return;
+    final acquireGeneration = _connectGeneration;
     try {
       await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'InteractiveController',
       );
+      // A disconnect in between resets leases: a zombie `true` here would
+      // bypass the buffer-and-acquire path and drop input.
+      if (_isStale(acquireGeneration)) return;
       session.hasInputLease = true;
       if (!_disposed &&
           mounted &&
@@ -1988,6 +2017,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } catch (_) {}
     }
     _subscriptionIds.clear();
+    // Leases are daemon-side: a reconnected daemon may have dropped them, and
+    // a stale `true` bypasses the buffer-and-acquire path and drops input.
+    // Re-acquired on the next select, keystroke, or refresh.
+    for (final s in _sessions) {
+      s.hasInputLease = false;
+    }
 
     // Disposed, or superseded by a newer generation — which then owns
     // `_isConnecting` (and the replay hook in its own `finally`). Clearing the
@@ -2053,6 +2088,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
 
       if (!authenticated) {
+        // A racing probe may have paired this generation already.
+        if (_needsPairing && _pairingGeneration == generation) return;
         await _showPairingChallenge(generation, serverId);
         return;
       }
@@ -2086,6 +2123,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // A rejected token never recovers by retrying, so re-pair instead of
       // falling into the reconnect backoff.
       if (e is TriageAuthException) {
+        // A racing probe may have paired this generation already.
+        if (_needsPairing && _pairingGeneration == generation) return;
         await _showPairingChallenge(generation, serverId);
       } else {
         setState(() {
@@ -2124,6 +2163,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         serverId != _activeServerId) {
       return;
     }
+    _pairingGeneration = generation;
 
     setState(() {
       _needsPairing = true;
@@ -2134,6 +2174,37 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
 
     await _requestPairingChallenge(generation: generation);
+  }
+
+  /// Re-checks the current token after a stale-context 401, pairing only when
+  /// the current daemon confirms the rejection.
+  ///
+  /// A load that straddles a reconnect re-reads the mutable [_client] per
+  /// await, so its RPCs can land on the new daemon after that generation's
+  /// hello passed; dropping the result as stale would then swallow a genuine
+  /// current-daemon 401 with no other trigger to re-pair. The hello probe
+  /// closes that window without reopening the wipe the staleness guard
+  /// fixes: pairing fires only when the current daemon rejects the current
+  /// token, and the challenge call below re-reads the generation and server
+  /// synchronously with the call, so no await can slip a switch between the
+  /// check and the clear.
+  Future<void> _revalidateTokenAndMaybePair() async {
+    if (_disposed || _needsPairing || !_client.isConnected) return;
+    final generation = _connectGeneration;
+    final token = _bearerToken;
+    debugPrint('Stale-context 401: revalidating the current token.');
+    try {
+      final helloRes = await _client.hello(clientId: _clientId, token: token);
+      if (helloRes['authenticated'] as bool? ?? false) return;
+    } on TriageAuthException {
+      // Fall through to pairing below.
+    } catch (e) {
+      // Transport failure, not auth: the reconnect path owns it.
+      debugPrint('Token revalidation failed (transport): $e');
+      return;
+    }
+    if (_isStale(generation) || _needsPairing || token != _bearerToken) return;
+    unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
   }
 
   Future<void> _requestPairingChallenge({int? generation}) async {
@@ -2198,13 +2269,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final serverId = _activeServerId;
     final String token;
     try {
-      token = await _client.pair(code: pin, clientId: _clientId);
+      // Trim at ingress: a whitespace-only token must fail the empty check
+      // instead of persisting. The empty check throws inside the try so the
+      // consumed single-use challenge refreshes like any other pair failure,
+      // instead of stranding a dead code on screen.
+      token = (await _client.pair(code: pin, clientId: _clientId)).trim();
+      if (token.isEmpty) {
+        throw Exception('Server $serverId returned empty pairing token');
+      }
     } catch (_) {
-      await _requestPairingChallenge();
+      // Best effort: a refresh failure here must not mask the pair error.
+      try {
+        await _requestPairingChallenge();
+      } catch (e, stack) {
+        debugPrint('Pairing challenge refresh failed: $e\n$stack');
+      }
       rethrow;
-    }
-    if (token.isEmpty) {
-      throw Exception('Server returned empty pairing token');
     }
     // Store the token before the switched-away guard. It is keyed by the
     // captured serverId, so it belongs to *that* daemon no matter which one is
@@ -2400,25 +2480,43 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // over a network link, and only one session is ever shown at a time.
       if (sessionIds.isNotEmpty) {
         final selectedSession = _sessions[targetSelectedIndex];
+        final selectedSid = sessionIds[targetSelectedIndex];
         if (!selectedSession.loaded) {
           await _loadDaemonSessionInto(
-            sessionIds[targetSelectedIndex],
+            selectedSid,
             includeHistory: true,
             failedSessionIds: failedSessionIds,
           );
-        } else {
+        } else if (_claimResubscribe(selectedSid)) {
+          // A racing select owns the identical unit; skip on claim failure.
+          final attempt = _resubscribeInFlight[selectedSid]!;
           try {
-            await _resubscribeSessionEvents(sessionIds[targetSelectedIndex]);
-            await _refreshSessionSnapshot(selectedSession, includeHistory: true);
-            _drainPendingEvents(sessionIds[targetSelectedIndex]);
+            await _resubscribeAndRefreshHistory(
+              selectedSession,
+              selectedSid,
+              owningGeneration: generation,
+            );
+            if (_isStale(generation)) return;
+            _drainPendingEvents(selectedSid);
           } on TriageAuthException {
             rethrow;
-          } catch (_) {
-            failedSessionIds.add(sessionIds[targetSelectedIndex]);
-            setState(() {
-              selectedSession.status = 'load failed';
-              selectedSession.statusColor = const Color(0xffff6b6b);
-            });
+          } catch (e, stack) {
+            debugPrint(
+              'Failed to reload session $selectedSid on reconnect: $e\n$stack',
+            );
+            // As in _loadDaemonSessionInto: a failure that outlived its
+            // daemon must not paint the session now sitting under that id.
+            // Guarded, not returned: the status block and seed wait below
+            // make their own generation checks.
+            if (!_isStale(generation)) {
+              failedSessionIds.add(selectedSid);
+              setState(() {
+                selectedSession.status = 'load failed';
+                selectedSession.statusColor = const Color(0xffff6b6b);
+              });
+            }
+          } finally {
+            _releaseResubscribe(selectedSid, attempt);
           }
         }
       }
@@ -2941,6 +3039,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     );
   }
 
+  // Loads the session detached, routing a rejected token to pairing. A stale
+  // daemon's 401 must not wipe the new daemon's good token, since pairing
+  // clears the stored credential before its own check runs. But a load
+  // straddling a reconnect can earn a genuine 401 from the current daemon,
+  // so stale context revalidates instead of dropping.
+  void _loadSessionWithPairingFallback(String sid) {
+    final loadGeneration = _connectGeneration;
+    unawaited(
+      _loadDaemonSessionInto(
+        sid,
+        includeHistory: true,
+        failedSessionIds: <String>[],
+      ).catchError((Object e) {
+        if (e is! TriageAuthException || _needsPairing) return;
+        if (_isStale(loadGeneration)) {
+          unawaited(_revalidateTokenAndMaybePair());
+          return;
+        }
+        unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+      }),
+    );
+  }
+
   // Attaches one daemon session (subscribe + attach + snapshot) and swaps it into
   // the rail in place, or marks it failed. Guarded against concurrent re-entry so
   // a double-select can't open two subscriptions. Extracted so both the connect
@@ -3183,10 +3304,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
 
       // Subscribe to events first so we don't miss anything printed during attach
-      subId = await _client.subscribeSessionEvents(sessionId: sid);
-      if (subId.isNotEmpty) {
-        _subscriptionIds[subId] = sid;
-      }
+      subId = await _checkedSubscribeSessionEvents(sid);
+      _subscriptionIds[subId] = sid;
 
       final attachRes = await _client.attachSession(
         sessionId: sid,
@@ -3213,7 +3332,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       final plainRows = _plainRowsFromSnapshot(snapshot);
       final exited = snapshot?['exited'] as bool? ?? false;
-      final outputSeq = snapshot?['output_seq'] as int? ?? 0;
+      final outputSeq = snapshot?['output_seq'] as int?;
 
       final customLabel = _lookupCustomLabel(sid);
       final session = SessionVm(
@@ -3566,18 +3685,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
 
       if (wasEmpty && !_disposed) {
-        unawaited(
-          _loadDaemonSessionInto(
-            sessionId,
-            includeHistory: true,
-            failedSessionIds: <String>[],
-          ).catchError((Object e) {
-            if (e is! TriageAuthException || _disposed || _needsPairing) return;
-            unawaited(
-              _showPairingChallenge(_connectGeneration, _activeServerId),
-            );
-          }),
-        );
+        _loadSessionWithPairingFallback(sessionId);
       }
       return;
     }
@@ -3623,20 +3731,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (!nextSelected.loaded) {
           final sid = _sessionIdFor(nextSelected);
           if (sid != null) {
-            unawaited(
-              _loadDaemonSessionInto(
-                sid,
-                includeHistory: true,
-                failedSessionIds: <String>[],
-              ).catchError((Object e) {
-                if (e is! TriageAuthException || _disposed || _needsPairing) {
-                  return;
-                }
-                unawaited(
-                  _showPairingChallenge(_connectGeneration, _activeServerId),
-                );
-              }),
-            );
+            _loadSessionWithPairingFallback(sid);
           }
         }
       }
@@ -3692,7 +3787,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       if (event.containsKey('Output')) {
         final output = event['Output'] as Map<String, dynamic>;
-        final outputSeq = output['output_seq'] as int? ?? 0;
+        final outputSeq = output['output_seq'] as int?;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
 
         // Single write path: raw bytes flow through the store, which owns UTF-8
@@ -3735,7 +3830,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
         final currentHolder = change?['current'] as Map<String, dynamic>?;
         final holderClientId = currentHolder?['client_id'] as String?;
-        session.hasInputLease = holderClientId == _clientId;
+        session.hasInputLease = holderClientId?.trim() == _clientId;
         if (session.hasInputLease) {
           final buffered = _pendingInputBytes.remove(sessionId);
           if (buffered != null &&
@@ -3791,6 +3886,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final snapshotRawOutputStart = snapshot['raw_output_start'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
+    // Reused view models skip the fresh-VM seeding and the bulk seed carries
+    // no cwd, so seed it from every snapshot that has one.
+    final snapshotCwd = snapshot['current_working_directory']?.toString();
+    if (snapshotCwd != null) session.cwd = snapshotCwd;
 
     // Replay history through the single write path: raw PTY bytes, not the
     // lossy styled-row reconstruction. When re-selecting an already-loaded live
@@ -3808,6 +3907,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (exited) {
         session.markExited();
       } else {
+        // Unreachable via the current callers: refresh forces a replay on
+        // revive and resync always replays. A bare Attach with no history
+        // strands the store in awaitingHistory, so any future
+        // replayHistory:false path that can revive must replay instead.
         session.store.dispatch(const Attach());
       }
     }
@@ -3956,7 +4059,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!session.hasFitted) {
       session.hasFitted = true;
       if (session.isRemote && _client.isConnected) {
-        unawaited(_refreshSessionSnapshot(session, includeHistory: false));
+        unawaited(
+          _refreshSessionSnapshot(
+            session,
+            includeHistory: false,
+            owningGeneration: _connectGeneration,
+          ),
+        );
       }
     }
   }
@@ -3990,45 +4099,50 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final sid = _sessionIdFor(session);
       if (sid != null) {
         // Selecting a session runs outside the connect path, so a rejected token
-        // has to be routed to pairing here — nothing upstream will see it.
-        unawaited(
-          _loadDaemonSessionInto(
-            sid,
-            includeHistory: true,
-            failedSessionIds: <String>[],
-          ).catchError((Object e) {
-            if (e is! TriageAuthException || _disposed || _needsPairing) return;
-            // Outside the connect path, so the daemon that rejected the token is
-            // the one we are attached to right now.
-            unawaited(
-              _showPairingChallenge(_connectGeneration, _activeServerId),
-            );
-          }),
-        );
+        // has to be routed to pairing here: nothing upstream will see it.
+        _loadSessionWithPairingFallback(sid);
       }
       return;
     }
     final sid = _sessionIdFor(session);
-    if (sid != null &&
-        !_subscriptionIds.containsValue(sid) &&
-        _resubscribeInFlight.add(sid)) {
+    final subscribed = sid != null && _subscriptionIds.containsValue(sid);
+    if (sid != null && !subscribed && _claimResubscribe(sid)) {
+      final attempt = _resubscribeInFlight[sid]!;
+      final selectGeneration = _connectGeneration;
       unawaited(() async {
+        var step = 'resubscribe';
         try {
-          await _resubscribeSessionEvents(sid);
-          await _refreshSessionSnapshot(session, includeHistory: true);
+          await _resubscribeAndRefreshHistory(
+            session,
+            sid,
+            owningGeneration: selectGeneration,
+            onStep: (s) => step = s,
+          );
+          if (_isStale(selectGeneration)) return;
           _drainPendingEvents(sid);
         } on TriageAuthException {
-          if (!_disposed && !_needsPairing) {
-            unawaited(
-              _showPairingChallenge(_connectGeneration, _activeServerId),
-            );
+          // As in the generic catch below: a stale daemon's 401 must not
+          // clear the new daemon's good token or steal its pairing.
+          if (_needsPairing) return;
+          if (_isStale(selectGeneration)) {
+            // The resubscribe may straddle a reconnect and hold a genuine
+            // 401: revalidate rather than drop it.
+            unawaited(_revalidateTokenAndMaybePair());
+            return;
           }
-        } catch (e) {
-          debugPrint('Failed to resubscribe session $sid on selection: $e');
+          unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+        } catch (e, stack) {
+          // A select racing a switch or reconnect must not touch the new
+          // daemon's maps: session ids collide across daemons, and the
+          // reused view model would pass the identity check below.
+          if (_isStale(selectGeneration)) return;
+          debugPrint('Session $sid $step failed on selection: $e\n$stack');
+          // Drop the subscription so the next selection does a full
+          // resubscribe plus history refresh; keep pending events, since the
+          // retry's drain replays them and control-plane events (Exited,
+          // LeaseChanged) are not recoverable from history.
           _subscriptionIds.removeWhere((_, id) => id == sid);
-          _pendingEvents.remove(sid);
-          if (!_disposed &&
-              _selectedIndex >= 0 &&
+          if (_selectedIndex >= 0 &&
               _selectedIndex < _sessions.length &&
               identical(_sessions[_selectedIndex], session)) {
             setState(() {
@@ -4037,13 +4151,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             });
           }
         } finally {
-          _resubscribeInFlight.remove(sid);
+          _releaseResubscribe(sid, attempt);
         }
       }());
     }
-    if (sid != null &&
-        !session.isExited &&
-        _subscriptionIds.containsValue(sid)) {
+    if (sid != null && !session.isExited && subscribed) {
+      // A success arriving after a purge must not resurrect the lease the
+      // disconnect just reset; the catch below already fails safe to false.
+      final leaseGeneration = _connectGeneration;
       unawaited(
         _client
             .attachSession(
@@ -4052,14 +4167,30 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               mode: 'InteractiveController',
             )
             .then((_) {
+              if (_isStale(leaseGeneration)) return;
               session.hasInputLease = true;
             })
-            .catchError((_) {}),
+            .catchError((Object e) {
+              if (_isStale(leaseGeneration)) return;
+              debugPrint('Interactive lease attach failed for $sid: $e');
+              session.hasInputLease = false;
+            }),
       );
     }
-    if (session.hasFitted && (sid == null || _subscriptionIds.containsValue(sid))) {
+    if (session.hasFitted && (sid == null || subscribed)) {
       // Already fitted and subscribed: refresh metadata without clearing and replaying history.
-      unawaited(_refreshSessionSnapshot(session, includeHistory: false));
+      unawaited(
+        _refreshSessionSnapshot(
+          session,
+          includeHistory: false,
+          owningGeneration: _connectGeneration,
+        ),
+      );
+      // Web only: the native pane re-fits its terminal synchronously inside
+      // performLayout on the selection-driven remount. The xterm.js canvas
+      // also fits on remount, but that fit can land before layout settles
+      // (and skip on the zero-size guard) without forcing the size onto the
+      // host, so drive the explicit post-frame refit with its retry ladder.
       if (kIsWeb) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!_disposed &&
@@ -4084,7 +4215,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             _selectedIndex < _sessions.length &&
             identical(_sessions[_selectedIndex], session) &&
             _client.isConnected) {
-          unawaited(_refreshSessionSnapshot(session, includeHistory: false));
+          unawaited(
+            _refreshSessionSnapshot(
+              session,
+              includeHistory: false,
+              owningGeneration: _connectGeneration,
+            ),
+          );
         }
       });
     }
@@ -4093,19 +4230,35 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
     bool includeHistory = false,
+    required int owningGeneration,
   }) async {
     if (!_client.isConnected || !session.isRemote) return;
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
+    // A refresh superseded mid-flight must not claim the in-flight slot (it
+    // would make the current generation's refresh coalesce-drop behind a
+    // stale one) or issue daemon writes under a colliding id below.
+    if (_isStale(owningGeneration)) return;
     // Coalesce concurrent refreshes for the same session: a second one would
     // clear the terminal and replay history underneath the first, blanking it.
-    if (!_refreshInFlight.add(sessionId)) return;
+    if (!_refreshInFlight.add(sessionId)) {
+      if (includeHistory) _refreshHistoryFollowUp.add(sessionId);
+      debugPrint(
+        'Skipping ${includeHistory ? 'history' : 'metadata'} refresh for '
+        '$sessionId: refresh already in flight',
+      );
+      return;
+    }
     try {
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'InteractiveController',
       );
+      // The purge or reconnect may have landed during the attach: returning
+      // before the restore/resize branches keeps those writes off the new
+      // daemon, and skips a lease mark the disconnect just reset.
+      if (_isStale(owningGeneration)) return;
       session.hasInputLease = true;
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
@@ -4140,11 +4293,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             if (restoredSnapshot != null) {
               finalSnapshot = restoredSnapshot;
             }
-            // restoreSession re-spawns a brand-new daemon actor; our prior
-            // subscription was bound to the old (now shut-down) actor and
-            // receives no further output. Re-subscribe before the fresh attach
-            // so live updates from the revived shell keep flowing.
-            await _resubscribeSessionEvents(sessionId);
+            // A restore re-spawns the daemon actor, orphaning our subscription;
+            // re-subscribe before the fresh attach. The actor replacement
+            // requires it even when another path holds the resubscribe claim;
+            // a racing holder at worst orphans one dead-actor id.
+            await _resubscribeSessionEvents(
+              sessionId,
+              owningGeneration: owningGeneration,
+            );
+            // The resubscribe above bails silently when stale; without this
+            // recheck the fresh attach would fire at the new daemon under a
+            // colliding id and claim a lease there.
+            if (_isStale(owningGeneration)) return;
             final freshAttachRes = await _client.attachSession(
               sessionId: sessionId,
               clientId: _clientId,
@@ -4159,9 +4319,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 finalSnapshot = freshSnapshot;
               }
             }
+          } on TriageAuthException {
+            rethrow;
           } catch (e) {
             debugPrint(
-              'Failed to restore session $sessionId during refresh: ${e.toString()}',
+              'Failed to revive session $sessionId during refresh '
+              '(restore/resubscribe/attach): ${e.toString()}',
             );
           }
         } else if (_clientForeground &&
@@ -4184,38 +4347,172 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               cols: replayTargetSize.$2,
             );
             drivenSize = replayTargetSize;
+          } on TriageAuthException {
+            rethrow;
           } catch (_) {}
         }
+        // A restore inside this refresh may have revived an exited session.
+        // Without a replay the exited-to-live transition in the apply below
+        // dispatches a bare Attach and strands the store in awaitingHistory.
+        // Either side can record the exit (the push skips the VM flag when
+        // unmounted), and replaying when only the store says exited is safe
+        // since the delta paths refuse anyway.
+        final revivedNeedsReplay =
+            (session.isExited || session.store.state.exited) &&
+            finalSnapshot['exited'] != true;
+        // The restore/resize awaits above span a purge window: applying a
+        // superseded snapshot onto the reused VM would blank the new
+        // generation's load with old-daemon bytes.
+        if (_isStale(owningGeneration)) return;
         await _applySnapshotToSession(
           session,
           sessionId,
           finalSnapshot,
           renderSize: drivenSize,
           replayHistory:
-              includeHistory || (!session.loaded && snapshot['exited'] == true),
+              includeHistory ||
+              (!session.loaded && snapshot['exited'] == true) ||
+              revivedNeedsReplay,
         );
       }
     } on TriageAuthException {
-      if (!_disposed && !_needsPairing) {
-        unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+      // Awaited callers own routing (the connect path re-pairs in
+      // _connectWebSocket, the selection path in _selectSession); handling
+      // here too would fire a second pairing challenge. The detached
+      // follow-up below is the exception: it routes its own errors at the
+      // scheduling site.
+      if (includeHistory) rethrow;
+      // A stale daemon's 401 must not clear the new daemon's good token:
+      // pairing clears the stored credential before its own check runs.
+      if (_needsPairing) return;
+      if (_isStale(owningGeneration)) {
+        // The refresh may straddle a reconnect and hold a genuine 401:
+        // revalidate rather than drop it.
+        unawaited(_revalidateTokenAndMaybePair());
+        return;
       }
+      unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+    } catch (e) {
       if (includeHistory) rethrow;
-    } catch (_) {
-      if (includeHistory) rethrow;
+      debugPrint('Snapshot refresh failed for $sessionId: $e');
     } finally {
       _refreshInFlight.remove(sessionId);
+      _scheduleHistoryFollowUp(session, sessionId);
     }
   }
 
-  /// Re-subscribes to a session's events, dropping any stale subscription ids
-  /// for it. Used after a restore, whose new daemon actor leaves the previous
-  /// subscription bound to a shut-down actor that emits nothing further.
-  Future<void> _resubscribeSessionEvents(String sessionId) async {
-    _subscriptionIds.removeWhere((_, sid) => sid == sessionId);
-    final subId = await _client.subscribeSessionEvents(sessionId: sessionId);
-    if (subId.isNotEmpty) {
-      _subscriptionIds[subId] = sessionId;
+  /// Re-runs a history refresh that coalesce-dropped behind the one that just
+  /// landed. Detached: no awaited caller sees a rethrow, so a failure here
+  /// would be an unhandled async error and an auth failure would strand the
+  /// app "Connected" on a dead token. Route both locally.
+  void _scheduleHistoryFollowUp(SessionVm session, String sessionId) {
+    if (!_refreshHistoryFollowUp.remove(sessionId) ||
+        !_client.isConnected ||
+        !_sessions.contains(session)) {
+      return;
     }
+    final followUpGeneration = _connectGeneration;
+    unawaited(
+      _refreshSessionSnapshot(
+        session,
+        includeHistory: true,
+        owningGeneration: followUpGeneration,
+      ).catchError((Object e, StackTrace stack) {
+        if (e is! TriageAuthException) {
+          debugPrint(
+            'History follow-up refresh failed for $sessionId: $e\n$stack',
+          );
+          return;
+        }
+        // A stale 401 must not wipe the current token, but the follow-up
+        // may straddle a reconnect and hold a genuine one: revalidate
+        // rather than drop it.
+        if (_needsPairing) return;
+        if (_isStale(followUpGeneration)) {
+          unawaited(_revalidateTokenAndMaybePair());
+          return;
+        }
+        unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+      }),
+    );
+  }
+
+  /// True when the attempt owning [owningGeneration] is stale: the widget is
+  /// gone, or a switch or reconnect superseded it.
+  bool _isStale(int owningGeneration) =>
+      _disposed || owningGeneration != _connectGeneration;
+
+  /// Claims the resubscribe for [sessionId] for a new attempt. Returns false
+  /// when another path (a racing select or reconnect) already owns it and is
+  /// performing the identical work, in which case the caller must skip rather
+  /// than open a duplicate daemon subscription.
+  bool _claimResubscribe(String sessionId) {
+    if (_resubscribeInFlight.containsKey(sessionId)) return false;
+    _resubscribeInFlight[sessionId] = ++_resubscribeAttemptCounter;
+    return true;
+  }
+
+  /// Releases a resubscribe claim, but only when [attempt] still owns it: a
+  /// purge clears the map mid-flight, and a stale attempt must not delete a
+  /// newer attempt's token.
+  void _releaseResubscribe(String sessionId, int attempt) {
+    if (_resubscribeInFlight[sessionId] == attempt) {
+      _resubscribeInFlight.remove(sessionId);
+    }
+  }
+
+  /// The resubscribe unit both the select and reconnect paths perform:
+  /// re-subscribe, then refresh with history. Callers hold a
+  /// [_claimResubscribe] token across it, drain afterwards once they have
+  /// confirmed the attempt is still current, and own error routing.
+  /// [owningGeneration] bails the unit as soon as a switch or reconnect
+  /// supersedes it, so a stale attempt never mutates the new daemon's maps.
+  Future<void> _resubscribeAndRefreshHistory(
+    SessionVm session,
+    String sessionId, {
+    required int owningGeneration,
+    void Function(String step)? onStep,
+  }) async {
+    if (_isStale(owningGeneration)) return;
+    onStep?.call('resubscribe');
+    await _resubscribeSessionEvents(
+      sessionId,
+      owningGeneration: owningGeneration,
+    );
+    if (_isStale(owningGeneration)) return;
+    onStep?.call('refresh');
+    await _refreshSessionSnapshot(
+      session,
+      includeHistory: true,
+      owningGeneration: owningGeneration,
+    );
+  }
+
+  /// Subscribes to a session's events, throwing when the daemon answers
+  /// without an id: proceeding unsubscribed would leave a silently frozen
+  /// session. Callers roll back to load failed.
+  Future<String> _checkedSubscribeSessionEvents(String sessionId) async {
+    final subId = await _client.subscribeSessionEvents(sessionId: sessionId);
+    if (subId.isEmpty) {
+      throw Exception(
+        'subscribe_session_events returned no subscription id for $sessionId',
+      );
+    }
+    return subId;
+  }
+
+  /// Re-subscribes to a session's events, dropping any stale subscription ids
+  /// for it. The previous id is unusable: a restore strands it on a shut-down
+  /// actor, and a purge clears it before we get here.
+  Future<void> _resubscribeSessionEvents(
+    String sessionId, {
+    required int owningGeneration,
+  }) async {
+    if (_isStale(owningGeneration)) return;
+    _subscriptionIds.removeWhere((_, sid) => sid == sessionId);
+    final subId = await _checkedSubscribeSessionEvents(sessionId);
+    if (_isStale(owningGeneration)) return;
+    _subscriptionIds[subId] = sessionId;
   }
 
   String? _sessionIdFor(SessionVm session) {
@@ -4287,7 +4584,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
           final plainRows = _plainRowsFromSnapshot(snapshot);
           final exited = snapshot?['exited'] as bool? ?? false;
-          final outputSeq = snapshot?['output_seq'] as int? ?? 0;
+          final outputSeq = snapshot?['output_seq'] as int?;
 
           final session = SessionVm(
             title: 'triage / $sessionId',
@@ -8170,7 +8467,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 _CodeSnippetBox(
                   code:
                       widget.clientId ??
-                      retrieveClientId() ??
+                      retrieveClientId()?.trim() ??
                       'Initializing...',
                 ),
               ],
@@ -8613,7 +8910,7 @@ class _SessionListTileState extends State<SessionListTile> {
     final overlay = Overlay.maybeOf(context);
     if (overlay == null) return;
     final entry = OverlayEntry(
-      builder: (context) => Positioned(
+      builder: (_) => Positioned(
         width: 320,
         child: CompositedTransformFollower(
           link: _link,
@@ -8638,8 +8935,10 @@ class _SessionListTileState extends State<SessionListTile> {
         ),
       ),
     );
-    _popoverEntry = entry;
+    // Assign after the insert succeeds: a throwing insert must not leave a
+    // dead, never-mounted entry blocking future popovers.
     overlay.insert(entry);
+    _popoverEntry = entry;
   }
 
   void _hidePopover() {
@@ -8654,8 +8953,21 @@ class _SessionListTileState extends State<SessionListTile> {
   @override
   void didUpdateWidget(SessionListTile oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (_popoverEntry != null && _popoverEntry!.mounted) {
-      _popoverEntry!.markNeedsBuild();
+    final entry = _popoverEntry;
+    if (entry == null || !entry.mounted) return;
+    // Must cover every field the builder reads, or the card goes stale.
+    if (oldWidget.glanceTitle != widget.glanceTitle ||
+        oldWidget.title != widget.title ||
+        oldWidget.customLabel != widget.customLabel ||
+        oldWidget.subtitle != widget.subtitle ||
+        oldWidget.statusColor != widget.statusColor ||
+        oldWidget.repoName != widget.repoName ||
+        oldWidget.branch != widget.branch ||
+        oldWidget.worktreeName != widget.worktreeName ||
+        oldWidget.cwd != widget.cwd ||
+        oldWidget.snippet != widget.snippet ||
+        oldWidget.snippetDetail != widget.snippetDetail) {
+      entry.markNeedsBuild();
     }
   }
 
@@ -8698,149 +9010,149 @@ class _SessionListTileState extends State<SessionListTile> {
           // a screen reader has no meta line beside it to supply the repo.
           label: widget.glanceTitle ?? widget.title,
           child: InkWell(
-              canRequestFocus: false,
-              onTap: widget.onTap,
-              onTapDown: widget.onContextMenu != null
-                  ? (details) => _lastTapDownPosition = details.globalPosition
-                  : null,
-              onSecondaryTapDown: widget.onContextMenu != null
-                  ? (details) => widget.onContextMenu!(details.globalPosition)
-                  : null,
-              onLongPress: widget.onContextMenu != null
-                  ? () => widget.onContextMenu!(_contextMenuPosition())
-                  : null,
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
+            canRequestFocus: false,
+            onTap: widget.onTap,
+            onTapDown: widget.onContextMenu != null
+                ? (details) => _lastTapDownPosition = details.globalPosition
+                : null,
+            onSecondaryTapDown: widget.onContextMenu != null
+                ? (details) => widget.onContextMenu!(details.globalPosition)
+                : null,
+            onLongPress: widget.onContextMenu != null
+                ? () => widget.onContextMenu!(_contextMenuPosition())
+                : null,
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: widget.selected
+                    ? const Color(0xff233033)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
                   color: widget.selected
-                      ? const Color(0xff233033)
+                      ? const Color(0xff3b5356)
                       : Colors.transparent,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: widget.selected
-                        ? const Color(0xff3b5356)
-                        : Colors.transparent,
-                  ),
                 ),
-                child: Row(
-                  children: [
-                    Icon(widget.icon, size: 20, color: const Color(0xffcdd7d6)),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  widget.title,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w700,
-                                  ),
+              ),
+              child: Row(
+                children: [
+                  Icon(widget.icon, size: 20, color: const Color(0xffcdd7d6)),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                widget.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
                                 ),
                               ),
-                              if (widget.pinned && widget.onUnpin != null)
-                                _UnpinButton(
-                                  onUnpin: widget.onUnpin!,
-                                  what: widget.title,
-                                ),
-                              if (widget.onToggleJudge != null)
-                                _JudgeToggleButton(
-                                  effective: widget.judgeEffective,
-                                  explicit: widget.judgeExplicit,
-                                  onToggle: widget.onToggleJudge!,
-                                ),
-                            ],
-                          ),
-                          if (gitMeta != null || hasCwdFallback) ...[
-                            const SizedBox(height: 3),
-                            Row(
-                              children: [
-                                Icon(
-                                  metaIcon,
-                                  size: 12,
-                                  color: const Color(0xff7f8b8d),
-                                ),
-                                const SizedBox(width: 5),
-                                Expanded(
-                                  child: _MetaLineText(
-                                    // Git meta is already compact (leaf names);
-                                    // the cwd fallback shows the absolute path,
-                                    // collapsing to ~/… or scrolling when long.
-                                    full: gitMeta ?? cwd!,
-                                    abbreviated: gitMeta == null
-                                        ? _homeAbbreviatedPath(cwd!)
-                                        : null,
-                                    // Marquee only the selected row, to keep the
-                                    // rail quiet (per design).
-                                    animate: widget.selected,
-                                    style: const TextStyle(
-                                      color: Color(0xff8b9799),
-                                      fontSize: 11,
-                                    ),
-                                  ),
-                                ),
-                              ],
                             ),
-                          ],
-                          // Outranks the status line: for two sessions on one
-                          // branch this is the only field that differs, where
-                          // every row shares a status.
-                          if (widget.snippet != null &&
-                              widget.snippet!.isNotEmpty) ...[
-                            const SizedBox(height: 3),
-                            Text(
-                              widget.snippet!,
-                              // Indistinguishable rows get a second line rather
-                              // than ellipsising the one thing that would have
-                              // told them apart.
-                              maxLines: widget.indistinguishable ? 2 : 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Color(0xffc4cecd),
-                                fontSize: 12,
-                                fontStyle: FontStyle.italic,
+                            if (widget.pinned && widget.onUnpin != null)
+                              _UnpinButton(
+                                onUnpin: widget.onUnpin!,
+                                what: widget.title,
                               ),
-                            ),
+                            if (widget.onToggleJudge != null)
+                              _JudgeToggleButton(
+                                effective: widget.judgeEffective,
+                                explicit: widget.judgeExplicit,
+                                onToggle: widget.onToggleJudge!,
+                              ),
                           ],
+                        ),
+                        if (gitMeta != null || hasCwdFallback) ...[
                           const SizedBox(height: 3),
                           Row(
                             children: [
-                              Container(
-                                width: 8,
-                                height: 8,
-                                decoration: BoxDecoration(
-                                  color: widget.statusColor,
-                                  shape: BoxShape.circle,
-                                ),
+                              Icon(
+                                metaIcon,
+                                size: 12,
+                                color: const Color(0xff7f8b8d),
                               ),
-                              const SizedBox(width: 6),
+                              const SizedBox(width: 5),
                               Expanded(
-                                child: Text(
-                                  widget.subtitle,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
+                                child: _MetaLineText(
+                                  // Git meta is already compact (leaf names);
+                                  // the cwd fallback shows the absolute path,
+                                  // collapsing to ~/… or scrolling when long.
+                                  full: gitMeta ?? cwd!,
+                                  abbreviated: gitMeta == null
+                                      ? _homeAbbreviatedPath(cwd!)
+                                      : null,
+                                  // Marquee only the selected row, to keep the
+                                  // rail quiet (per design).
+                                  animate: widget.selected,
                                   style: const TextStyle(
-                                    color: Color(0xff9aa6a8),
+                                    color: Color(0xff8b9799),
+                                    fontSize: 11,
                                   ),
                                 ),
                               ),
-                              if (widget.activityAt != null) ...[
-                                const SizedBox(width: 6),
-                                _RelativeActivityText(at: widget.activityAt!),
-                              ],
                             ],
                           ),
                         ],
-                      ),
+                        // Outranks the status line: for two sessions on one
+                        // branch this is the only field that differs, where
+                        // every row shares a status.
+                        if (widget.snippet != null &&
+                            widget.snippet!.isNotEmpty) ...[
+                          const SizedBox(height: 3),
+                          Text(
+                            widget.snippet!,
+                            // Indistinguishable rows get a second line rather
+                            // than ellipsising the one thing that would have
+                            // told them apart.
+                            maxLines: widget.indistinguishable ? 2 : 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Color(0xffc4cecd),
+                              fontSize: 12,
+                              fontStyle: FontStyle.italic,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 3),
+                        Row(
+                          children: [
+                            Container(
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: widget.statusColor,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                widget.subtitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Color(0xff9aa6a8),
+                                ),
+                              ),
+                            ),
+                            if (widget.activityAt != null) ...[
+                              const SizedBox(width: 6),
+                              _RelativeActivityText(at: widget.activityAt!),
+                            ],
+                          ],
+                        ),
+                      ],
                     ),
-                  ],
-                ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
