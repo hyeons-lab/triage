@@ -324,26 +324,59 @@ class TerminalStore extends ChangeNotifier {
 
     final currentSeq = _appliedLiveSeq ?? s.historyHighWaterSeq;
     final currentLogBytes = _appliedLogBytes;
-    final baselineSeq = max(s.historyHighWaterSeq ?? 0, _appliedLiveSeq ?? 0);
-    final isSequenceRegressed =
+    final lastSnapshotSeq = s.historyHighWaterSeq;
+
+    // A snapshot sequence regression occurs when:
+    // 1. The new snapshot's sequence drops below the previous snapshot's sequence.
+    // 2. The sequence drops far below the live baseline (an epoch reset).
+    // 3. rawOutputStart is null, both previous and new snapshots are at sequence 0,
+    //    and the live stream has already advanced (_appliedLiveSeq > 0), indicating
+    //    a daemon sequence reset back to 0.
+    final isSnapshotSeqRegressed =
         throughOutputSeq != null &&
-        baselineSeq > 0 &&
-        throughOutputSeq < baselineSeq;
-    final isLogBytesRegressed =
+        ((lastSnapshotSeq != null && throughOutputSeq < lastSnapshotSeq) ||
+            _isSeqEpochReset(throughOutputSeq, _appliedLiveSeq) ||
+            (rawOutputStart == null &&
+                lastSnapshotSeq == 0 &&
+                throughOutputSeq == 0 &&
+                _appliedLiveSeq != null &&
+                _appliedLiveSeq! > 0));
+
+    // A log byte regression occurs when:
+    // 1. There is a forward gap: the client has only seen up to currentLogBytes,
+    //    but the new tail starts at rawOutputStart > currentLogBytes.
+    // 2. The log shrunk from byte 0 (truncation/restart): rawOutputStart == 0
+    //    and snapshotEndBytes < currentLogBytes, with no advancing sequence.
+    final snapshotEndBytes =
+        rawOutputStart != null ? rawOutputStart + bytes.length : null;
+    final hasLogByteGap =
         rawOutputStart != null &&
         currentLogBytes != null &&
-        rawOutputStart + bytes.length < currentLogBytes;
+        currentLogBytes < rawOutputStart;
+    final isLogShrunk =
+        rawOutputStart == 0 &&
+        currentLogBytes != null &&
+        snapshotEndBytes != null &&
+        snapshotEndBytes < currentLogBytes &&
+        (throughOutputSeq == null ||
+            lastSnapshotSeq == null ||
+            throughOutputSeq < lastSnapshotSeq);
 
-    // Delta merge: if the store is already live and sized with content, check
-    // whether the new snapshot overlaps with what we already applied.
+    final isRegressed =
+        isSnapshotSeqRegressed ||
+        hasLogByteGap ||
+        isLogShrunk;
+
+    // Delta merge: if the store already has scrollback content, is not exited,
+    // and is not regressed, check whether the new snapshot overlaps with what
+    // we already applied.
     if (!s.exited &&
-        !isSequenceRegressed &&
-        !isLogBytesRegressed &&
-        s.phase == AttachPhase.live &&
+        !isRegressed &&
         s.scrollbackReady &&
         (currentSeq != null || currentLogBytes != null)) {
-      if (rawOutputStart != null && currentLogBytes != null) {
-        final snapshotEndBytes = rawOutputStart + bytes.length;
+      if (rawOutputStart != null &&
+          currentLogBytes != null &&
+          snapshotEndBytes != null) {
         if (currentLogBytes >= snapshotEndBytes) {
           final resolvedSeq = throughOutputSeq != null
               ? max(next.historyHighWaterSeq ?? 0, throughOutputSeq)
@@ -356,7 +389,12 @@ class TerminalStore extends ChangeNotifier {
           if (next.sized) {
             _flushPendingLive(resolvedSeq);
           }
-          return next.copyWith(historyHighWaterSeq: resolvedSeq, exited: false);
+          return next.copyWith(
+            phase: AttachPhase.live,
+            scrollbackReady: true,
+            historyHighWaterSeq: resolvedSeq,
+            exited: false,
+          );
         }
 
         if (currentLogBytes >= rawOutputStart) {
@@ -372,7 +410,14 @@ class TerminalStore extends ChangeNotifier {
             if (next.sized) {
               _flushPendingLive(resolvedSeq);
             }
+            // Paint any buffered Mode 2026 frame content without closing the
+            // block: a snapshot can land mid-frame during streaming, and
+            // closing here would break atomic frame semantics. The end marker,
+            // capacity cap, and idle watchdog still close it.
+            _flushSyncBuffer();
             return next.copyWith(
+              phase: AttachPhase.live,
+              scrollbackReady: true,
               historyHighWaterSeq: resolvedSeq,
               exited: false,
             );
@@ -381,10 +426,20 @@ class TerminalStore extends ChangeNotifier {
       } else if (throughOutputSeq != null &&
           currentSeq != null &&
           currentSeq >= throughOutputSeq) {
+        final resolvedSeq =
+            max(next.historyHighWaterSeq ?? 0, throughOutputSeq);
+        _appliedLiveSeq = _appliedLiveSeq == null
+            ? throughOutputSeq
+            : max(_appliedLiveSeq!, throughOutputSeq);
         if (next.sized) {
-          _flushPendingLive(throughOutputSeq);
+          _flushPendingLive(resolvedSeq);
         }
-        return next;
+        return next.copyWith(
+          phase: AttachPhase.live,
+          scrollbackReady: true,
+          historyHighWaterSeq: resolvedSeq,
+          exited: false,
+        );
       }
     }
 
@@ -551,12 +606,16 @@ class TerminalStore extends ChangeNotifier {
   /// further below the dedup baseline than the daemon could ever replay — the
   /// signature of a handover renumbering an adopted session. See
   /// [kSeqEpochResetWindow]; the history path makes the same call via
-  /// `isSequenceRegressed`.
+  /// `isSequenceRegressed`. A fresh session whose baseline never reached the
+  /// window still resets to 0/1 after a handover, so a regression to the start
+  /// of a new epoch counts regardless of the window once the baseline is past
+  /// single digits (guarding startup redeliveries of seq 0/1 against reset).
   bool _isSeqEpochReset(int? outputSeq, int? highWaterSeq) {
     if (outputSeq == null) return false;
     final baseline = max(highWaterSeq ?? 0, _appliedLiveSeq ?? 0);
     if (baseline == 0) return false;
-    return outputSeq < baseline - kSeqEpochResetWindow;
+    return outputSeq < baseline - kSeqEpochResetWindow ||
+        (outputSeq <= 1 && baseline > 10);
   }
 
   void _beginHostInputSuppression() {

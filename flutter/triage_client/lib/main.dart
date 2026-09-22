@@ -24,7 +24,6 @@ import 'package:triage_client/session_rail_layout.dart';
 import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
-import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
@@ -803,13 +802,12 @@ class SessionVm {
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
     );
-    final wasExited = this.isExited || store.state.exited;
     tdbg(
       'vm.applyHistory',
       '$title ${rawOutput.length}B seq=$throughOutputSeq '
           'phase=${store.state.phase} viewReady=$_viewReady',
     );
-    if (store.state.phase != AttachPhase.live || wasExited) {
+    if (!store.state.scrollbackReady || store.appliedLogBytes == null) {
       store.dispatch(const Attach());
     }
     this.isExited = isExited;
@@ -952,6 +950,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // same session race and the second blanks the first (e.g. the select + first
   // view-fit refreshes that both fire on a session's initial load).
   final Set<String> _refreshInFlight = {};
+  final Set<String> _resubscribeInFlight = {};
   final Map<String, List<Map<String, dynamic>>> _pendingEvents = {};
   final Queue<Map<String, dynamic>> _websocketEventQueue = Queue();
   bool _websocketProcessingEvent = false;
@@ -1330,6 +1329,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _websocketEventQueue.clear();
     _subscriptionIds.clear();
     _refreshInFlight.clear();
+    _resubscribeInFlight.clear();
     _loadingSessionIds.clear();
     _pendingInputBytes.clear();
     _leaseAcquisitionInFlight.clear();
@@ -1702,8 +1702,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
 
-    if (retrieveClientId() == _clientId &&
-        retrieveTokenFor(_activeServerId) == _bearerToken) {
+    final storedClientId = retrieveClientId()?.trim();
+    final currentToken = _bearerToken?.trim();
+    final storedToken = retrieveTokenFor(_activeServerId)?.trim();
+
+    if (storedClientId == _clientId.trim() && storedToken == currentToken) {
       return;
     }
 
@@ -1984,6 +1987,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         await _client.disconnect();
       } catch (_) {}
     }
+    _subscriptionIds.clear();
 
     // Disposed, or superseded by a newer generation — which then owns
     // `_isConnecting` (and the replay hook in its own `finally`). Clearing the
@@ -2321,18 +2325,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // after a switch an identical title is a different machine's session — and
       // reusing its cached terminal would show the old daemon's scrollback.
       final sameServer = _sessionsServerId == _activeServerId;
-      final loadingSessionTitles = sameServer
-          ? {for (final sid in sessionIds) 'triage / $sid'}
-          : const <String>{};
-      setState(() {
+      final sessionIdsSet = sessionIds.toSet();
+      final existingSessionsBySid = <String, SessionVm>{};
+      if (sameServer) {
         for (final s in _sessions) {
-          // As in _purgeDaemonLocalState: dispose the view model so the store's
-          // timers are retired, not just the controller.
-          s.dispose();
-          if (!loadingSessionTitles.contains(s.title)) {
+          final sid = s.remoteSessionId;
+          if (sid != null && sessionIdsSet.contains(sid)) {
+            existingSessionsBySid[sid] = s;
+          } else {
+            s.dispose();
             TerminalPane.destroySession(s.title);
           }
         }
+      } else {
+        for (final s in _sessions) {
+          s.dispose();
+          TerminalPane.destroySession(s.title);
+        }
+      }
+      setState(() {
         _sessionsServerId = _activeServerId;
         _sessions.clear();
         _sessionGroups = groups;
@@ -2340,16 +2351,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // a background `_restorePins` may have completed during the awaits since,
         // and writing the stale capture back would silently discard it.
         for (var i = 0; i < sessionIds.length; i++) {
-          // Only the selected session loads now; the rest rest as rail rows
-          // until selected (see the lazy-load note below).
-          final session = _loadingDaemonSession(
-            sessionIds[i],
-            loading: i == targetSelectedIndex,
-          );
+          final sid = sessionIds[i];
+          final existing = existingSessionsBySid[sid];
+          final SessionVm session;
+          if (existing != null) {
+            session = existing;
+          } else {
+            session = _loadingDaemonSession(
+              sid,
+              loading: i == targetSelectedIndex,
+            );
+            _setupSessionInputListener(session);
+          }
           // Apply the context fetched above so the row renders with its final
           // "repo · worktree" title on the first frame, rather than showing a
           // session-id fallback that swaps out a moment later.
-          final entry = contexts[sessionIds[i]];
+          final entry = contexts[sid];
           if (entry != null) {
             session.applyContext(
               repoRoot: entry.repositoryRoot,
@@ -2360,7 +2377,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
             session.lastActivityMs = entry.lastActivityMs;
           }
-          _setupSessionInputListener(session);
           _sessions.add(session);
         }
         // `targetSelectedIndex` already clamps for a list that shrank, so the
@@ -2381,14 +2397,30 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // rest stay as lightweight rail rows (title + snippet + git context from
       // the list calls) and load on demand when selected. Subscribing to every
       // session at once saturates the single WebSocket and the requests time out
-      // over a network link — the "reconnect fails / load failed until I keep
-      // switching sessions" storm — and only one session is ever shown at a time.
+      // over a network link, and only one session is ever shown at a time.
       if (sessionIds.isNotEmpty) {
-        await _loadDaemonSessionInto(
-          sessionIds[targetSelectedIndex],
-          includeHistory: true,
-          failedSessionIds: failedSessionIds,
-        );
+        final selectedSession = _sessions[targetSelectedIndex];
+        if (!selectedSession.loaded) {
+          await _loadDaemonSessionInto(
+            sessionIds[targetSelectedIndex],
+            includeHistory: true,
+            failedSessionIds: failedSessionIds,
+          );
+        } else {
+          try {
+            await _resubscribeSessionEvents(sessionIds[targetSelectedIndex]);
+            await _refreshSessionSnapshot(selectedSession, includeHistory: true);
+            _drainPendingEvents(sessionIds[targetSelectedIndex]);
+          } on TriageAuthException {
+            rethrow;
+          } catch (_) {
+            failedSessionIds.add(sessionIds[targetSelectedIndex]);
+            setState(() {
+              selectedSession.status = 'load failed';
+              selectedSession.statusColor = const Color(0xffff6b6b);
+            });
+          }
+        }
       }
 
       if (!_disposed && generation == _connectGeneration) {
@@ -3977,7 +4009,41 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
     final sid = _sessionIdFor(session);
-    if (sid != null && !session.isExited) {
+    if (sid != null &&
+        !_subscriptionIds.containsValue(sid) &&
+        _resubscribeInFlight.add(sid)) {
+      unawaited(() async {
+        try {
+          await _resubscribeSessionEvents(sid);
+          await _refreshSessionSnapshot(session, includeHistory: true);
+          _drainPendingEvents(sid);
+        } on TriageAuthException {
+          if (!_disposed && !_needsPairing) {
+            unawaited(
+              _showPairingChallenge(_connectGeneration, _activeServerId),
+            );
+          }
+        } catch (e) {
+          debugPrint('Failed to resubscribe session $sid on selection: $e');
+          _subscriptionIds.removeWhere((_, id) => id == sid);
+          _pendingEvents.remove(sid);
+          if (!_disposed &&
+              _selectedIndex >= 0 &&
+              _selectedIndex < _sessions.length &&
+              identical(_sessions[_selectedIndex], session)) {
+            setState(() {
+              session.status = 'load failed';
+              session.statusColor = const Color(0xffff6b6b);
+            });
+          }
+        } finally {
+          _resubscribeInFlight.remove(sid);
+        }
+      }());
+    }
+    if (sid != null &&
+        !session.isExited &&
+        _subscriptionIds.containsValue(sid)) {
       unawaited(
         _client
             .attachSession(
@@ -3991,8 +4057,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             .catchError((_) {}),
       );
     }
-    if (session.hasFitted) {
-      // Already fitted: refresh metadata without clearing and replaying history.
+    if (session.hasFitted && (sid == null || _subscriptionIds.containsValue(sid))) {
+      // Already fitted and subscribed: refresh metadata without clearing and replaying history.
       unawaited(_refreshSessionSnapshot(session, includeHistory: false));
       if (kIsWeb) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4125,10 +4191,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId,
           finalSnapshot,
           renderSize: drivenSize,
-          replayHistory: includeHistory || snapshot['exited'] == true,
+          replayHistory:
+              includeHistory || (!session.loaded && snapshot['exited'] == true),
         );
       }
+    } on TriageAuthException {
+      if (!_disposed && !_needsPairing) {
+        unawaited(_showPairingChallenge(_connectGeneration, _activeServerId));
+      }
+      if (includeHistory) rethrow;
     } catch (_) {
+      if (includeHistory) rethrow;
     } finally {
       _refreshInFlight.remove(sessionId);
     }
@@ -8493,7 +8566,7 @@ class SessionListTile extends StatefulWidget {
 }
 
 class _SessionListTileState extends State<SessionListTile> {
-  final OverlayPortalController _popover = OverlayPortalController();
+  OverlayEntry? _popoverEntry;
   final LayerLink _link = LayerLink();
   Offset _lastTapDownPosition = Offset.zero;
 
@@ -8536,11 +8609,60 @@ class _SessionListTileState extends State<SessionListTile> {
   }
 
   void _showPopover() {
-    if (!_popover.isShowing) _popover.show();
+    if (_popoverEntry != null || !mounted) return;
+    final overlay = Overlay.maybeOf(context);
+    if (overlay == null) return;
+    final entry = OverlayEntry(
+      builder: (context) => Positioned(
+        width: 320,
+        child: CompositedTransformFollower(
+          link: _link,
+          showWhenUnlinked: false,
+          targetAnchor: Alignment.topRight,
+          followerAnchor: Alignment.topLeft,
+          offset: const Offset(10, 0),
+          child: IgnorePointer(
+            child: _SessionGlanceCard(
+              title: widget.glanceTitle ?? widget.title,
+              customLabel: widget.customLabel,
+              status: widget.subtitle,
+              statusColor: widget.statusColor,
+              repoName: widget.repoName,
+              branch: widget.branch,
+              worktreeName: widget.worktreeName,
+              cwd: widget.cwd,
+              snippet: widget.snippet,
+              detail: widget.snippetDetail,
+            ),
+          ),
+        ),
+      ),
+    );
+    _popoverEntry = entry;
+    overlay.insert(entry);
   }
 
   void _hidePopover() {
-    if (_popover.isShowing) _popover.hide();
+    final entry = _popoverEntry;
+    _popoverEntry = null;
+    if (entry != null) {
+      entry.remove();
+      entry.dispose();
+    }
+  }
+
+  @override
+  void didUpdateWidget(SessionListTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_popoverEntry != null && _popoverEntry!.mounted) {
+      _popoverEntry!.markNeedsBuild();
+    }
+  }
+
+  @override
+  void deactivate() {
+    _hidePopover();
+    super.deactivate();
   }
 
   @override
@@ -8569,39 +8691,13 @@ class _SessionListTileState extends State<SessionListTile> {
       child: MouseRegion(
         onEnter: (_) => _showPopover(),
         onExit: (_) => _hidePopover(),
-        child: OverlayPortal(
-          controller: _popover,
-          overlayChildBuilder: (context) => Positioned(
-            width: 320,
-            child: CompositedTransformFollower(
-              link: _link,
-              showWhenUnlinked: false,
-              targetAnchor: Alignment.topRight,
-              followerAnchor: Alignment.topLeft,
-              offset: const Offset(10, 0),
-              child: IgnorePointer(
-                child: _SessionGlanceCard(
-                  title: widget.glanceTitle ?? widget.title,
-                  customLabel: widget.customLabel,
-                  status: widget.subtitle,
-                  statusColor: widget.statusColor,
-                  repoName: widget.repoName,
-                  branch: widget.branch,
-                  worktreeName: widget.worktreeName,
-                  cwd: widget.cwd,
-                  snippet: widget.snippet,
-                  detail: widget.snippetDetail,
-                ),
-              ),
-            ),
-          ),
-          child: Semantics(
-            button: true,
-            selected: widget.selected,
-            // The full repo-first name: the visible title is a bare branch, and
-            // a screen reader has no meta line beside it to supply the repo.
-            label: widget.glanceTitle ?? widget.title,
-            child: InkWell(
+        child: Semantics(
+          button: true,
+          selected: widget.selected,
+          // The full repo-first name: the visible title is a bare branch, and
+          // a screen reader has no meta line beside it to supply the repo.
+          label: widget.glanceTitle ?? widget.title,
+          child: InkWell(
               canRequestFocus: false,
               onTap: widget.onTap,
               onTapDown: widget.onContextMenu != null
@@ -8745,7 +8841,6 @@ class _SessionListTileState extends State<SessionListTile> {
                     ),
                   ],
                 ),
-              ),
             ),
           ),
         ),

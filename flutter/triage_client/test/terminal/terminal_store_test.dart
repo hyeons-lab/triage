@@ -938,6 +938,268 @@ void main() {
   });
 
   test(
+    'delta merge: snapshot behind live stream is a no-op when bytes are already covered',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history replay at seq 5 with 50 bytes
+      final initialText = 'a' * 50;
+      store.dispatch(
+        HistoryBytes(
+          b(initialText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.appliedLogBytes, 50);
+
+      // Live streaming advances outputSeq to 8 and appliedLogBytes to 80
+      final liveText = 'b' * 30;
+      store.dispatch(LiveBytes(b(liveText), outputSeq: 8));
+      expect(store.appliedLiveSeq, 8);
+      expect(store.appliedLogBytes, 80);
+      final opCountBeforeSnapshot = sink.ops.length;
+
+      // An attach/resync snapshot arrives from daemon captured at seq 5 with 50 bytes.
+      // throughOutputSeq (5) <= appliedLiveSeq (8), and snapshotEndBytes (50) <= currentLogBytes (80).
+      // Must NOT trigger clear or replay.
+      store.dispatch(
+        HistoryBytes(
+          b(initialText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.ops.length, opCountBeforeSnapshot);
+      expect(store.appliedLogBytes, 80);
+      expect(store.appliedLiveSeq, 8);
+    },
+  );
+
+  test(
+    'delta merge: snapshot overlapping live stream appends only delta bytes without clearing',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history replay at seq 5 with 50 bytes
+      final initialText = 'a' * 50;
+      store.dispatch(
+        HistoryBytes(
+          b(initialText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(store.appliedLogBytes, 50);
+
+      // Live stream advances appliedLogBytes to 70 at seq 7
+      final liveText = 'b' * 20;
+      store.dispatch(LiveBytes(b(liveText), outputSeq: 7));
+      expect(store.appliedLogBytes, 70);
+
+      // Snapshot arrives covering 0..100 at seq 10.
+      // Client is at byte 70, so delta is 70..100 (30 bytes).
+      final deltaText = 'c' * 30;
+      final fullSnapshotText = '$initialText$liveText$deltaText';
+      store.dispatch(
+        HistoryBytes(
+          b(fullSnapshotText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Must NOT have cleared the sink
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      // Must only write the delta portion
+      expect(sink.ops.last, 'write:$deltaText');
+      expect(store.appliedLogBytes, 100);
+      expect(store.state.historyHighWaterSeq, 10);
+    },
+  );
+
+  test(
+    'delta merge: sequence fallback without rawOutputStart resolves high water and preserves buffer',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history replay without rawOutputStart at seq 5
+      store.dispatch(
+        HistoryBytes(
+          b('initial output'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.state.historyHighWaterSeq, 5);
+
+      // Live streaming advances to seq 8
+      store.dispatch(LiveBytes(b(' live'), outputSeq: 8));
+      expect(store.appliedLiveSeq, 8);
+      final opCount = sink.ops.length;
+
+      // Resync snapshot without rawOutputStart arrives at seq 6 (behind live stream 8)
+      store.dispatch(
+        HistoryBytes(
+          b('initial output'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 6,
+        ),
+      );
+
+      // Must NOT clear or replay
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.ops.length, opCount);
+      expect(store.state.historyHighWaterSeq, 6);
+      expect(store.appliedLiveSeq, 8);
+      expect(store.state.phase, AttachPhase.live);
+    },
+  );
+
+  test(
+    'delta merge: unchanged snapshot sequence without rawOutputStart preserves buffer',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history replay without rawOutputStart at seq 5
+      store.dispatch(
+        HistoryBytes(
+          b('initial output'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.state.historyHighWaterSeq, 5);
+
+      // Live streaming advances to seq 8
+      store.dispatch(LiveBytes(b(' live'), outputSeq: 8));
+      expect(store.appliedLiveSeq, 8);
+      final opCount = sink.ops.length;
+
+      // Resync snapshot without rawOutputStart arrives at unchanged seq 5
+      store.dispatch(
+        HistoryBytes(
+          b('initial output'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+        ),
+      );
+
+      // Must NOT clear or replay
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.ops.length, opCount);
+      expect(store.state.historyHighWaterSeq, 5);
+      expect(store.appliedLiveSeq, 8);
+      expect(store.state.phase, AttachPhase.live);
+    },
+  );
+
+  test(
+    'delta merge: UTF-8 rune split across snapshot delta boundary decodes correctly',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      // Initial history with 6 bytes ('hello ')
+      final prefix = utf8.encode('hello ');
+      store.dispatch(
+        HistoryBytes(
+          prefix,
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(store.appliedLogBytes, 6);
+
+      // Live stream emits 1 byte of 3-byte rune '日' (0xE6, 0x97, 0xA5)
+      final rune = utf8.encode('日');
+      store.dispatch(LiveBytes([rune[0]], outputSeq: 2));
+      expect(store.appliedLogBytes, 7);
+
+      // Subsequent snapshot arrives with full string ('hello 日', 9 bytes) starting at 0
+      final fullBytes = [...prefix, ...rune];
+      store.dispatch(
+        HistoryBytes(
+          fullBytes,
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 3,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Must NOT clear sink, must append remaining bytes, and must decode rune correctly
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.written.toString(), 'hello 日');
+      expect(store.appliedLogBytes, 9);
+    },
+  );
+
+  test(
+    'delta merge: empty snapshot payload is a clean no-op without clear',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      store.dispatch(
+        HistoryBytes(
+          b('initial'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      );
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      final opCount = sink.ops.length;
+
+      // Empty snapshot payload arrives at offset 0
+      store.dispatch(
+        HistoryBytes(
+          const <int>[],
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      );
+
+      expect(sink.ops.where((op) => op == 'clear').length, 1);
+      expect(sink.ops.length, opCount);
+    },
+  );
+
+  test(
     'delta merge fallback: gap in output log triggers full clear and replay',
     () {
       final sink = FakeTerminalSink();
@@ -1292,6 +1554,88 @@ void main() {
     store.dispatch(LiveBytes(b('more'), outputSeq: 2));
     expect(sink.ops, ['write:after', 'write:more']);
   });
+
+  // The epoch-reset window (1024) never trips for a fresh session: a baseline
+  // of 500 renumbered to 0/1 scores `0 < 500 - 1024` as false, so without the
+  // low-baseline clause every renumbered chunk looks like a duplicate and the
+  // terminal goes permanently deaf.
+  test('live seq reset to 0/1 on a fresh session still renders (handover)', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 495),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 500));
+    expect(sink.ops, ['resize:80,24', 'clear', 'write:OLD', 'write:pre']);
+
+    // Successor daemon adopts the session and renumbers from scratch.
+    sink.ops.clear();
+    store.dispatch(LiveBytes(b('after'), outputSeq: 1));
+    store.dispatch(LiveBytes(b('more'), outputSeq: 2));
+    expect(sink.ops, ['write:after', 'write:more']);
+  });
+
+  test('startup redelivery of seq 1 at a tiny baseline stays a duplicate', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 8),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 10));
+    sink.ops.clear();
+
+    // Baseline is 10: seq 1 is an old duplicate, not a new epoch.
+    store.dispatch(LiveBytes(b('stale'), outputSeq: 1));
+    expect(sink.ops, isEmpty);
+  });
+
+  test(
+    'delta merge mid-frame flushes without closing the synchronized block',
+    () {
+      final deltaSink = FakeTerminalSink();
+      final deltaStore = TerminalStore(deltaSink);
+      addTearDown(deltaStore.dispose);
+      deltaStore.dispatch(const Resize(80, 24));
+
+      const seed = 'seed ';
+      const frameStart = '\x1b[?2026hframe ';
+      const delta = 'delta ';
+      deltaStore.dispatch(
+        HistoryBytes(
+          b(seed),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      // Open a Mode 2026 frame over the live stream: buffered, nothing written.
+      deltaStore.dispatch(LiveBytes(b(frameStart), outputSeq: 6));
+      final bufferedOpCount = deltaSink.ops.length;
+
+      // Overlapping snapshot covering seed + live + unseen delta bytes.
+      deltaStore.dispatch(
+        HistoryBytes(
+          b('$seed$frameStart$delta'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 7,
+          rawOutputStart: 0,
+        ),
+      );
+
+      // Delta merge: no clear, and the buffered frame paints verbatim.
+      expect(deltaSink.ops.where((op) => op == 'clear').length, 1);
+      expect(deltaSink.ops.length, bufferedOpCount + 1);
+      expect(deltaSink.ops.last, 'write:$frameStart$delta');
+
+      // The block is still open: mid-frame live bytes buffer instead of writing.
+      deltaStore.dispatch(LiveBytes(b('more\n'), outputSeq: 8));
+      expect(deltaSink.ops.last, 'write:$frameStart$delta');
+
+      // The real end marker still closes the frame atomically.
+      deltaStore.dispatch(LiveBytes(b('\x1b[?2026l'), outputSeq: 9));
+      expect(deltaSink.ops.last, 'write:more\n\x1b[?2026l');
+    },
+  );
 
   test('large payload newline translation completes quickly without stalling', () {
     store.dispatch(const Attach());
