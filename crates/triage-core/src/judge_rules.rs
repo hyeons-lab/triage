@@ -3199,10 +3199,11 @@ fn segment_offsets(command: &str, segments: &[&str]) -> Option<(Vec<usize>, Vec<
 /// visible earlier in the command line, returning one optional
 /// `(name, value)` substitution per sanitized segment. Resolution is
 /// single-hop over literals only: assignments are recorded only on
-/// straight-line `&&`/`;` chains, the map is dropped across barrier gaps
-/// (such as pipelines, conditionals, subshells, and backgrounding),
-/// and substitution is disabled entirely when control keywords appear, so the
-/// judged program is always the program the shell executes. A program is
+/// straight-line `&&`/`;` chains, prior bindings are cleared across
+/// backgrounding, conditional failure branches, and exiting subshells
+/// or blocks, and pre-pipeline bindings remain available across downstream
+/// pipe stages. Substitution is disabled entirely when control keywords appear,
+/// so the judged program is always the program the shell executes. A program is
 /// resolved only when its argument tokens carry no `$` references, since a
 /// substituted program with variable arguments (e.g. `$G $H` with
 /// `H=publish`) would otherwise dodge the argument-sensitive checks.
@@ -4130,6 +4131,14 @@ mod tests {
         );
         assert_eq!(
             evaluate_cmd("G=git && timeout 5 $G status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("A=git && B=cargo && $A status && $B check").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("G=git && echo hi | $G status").map(|v| v.decision),
             Some(JudgeDecision::Allow)
         );
     }

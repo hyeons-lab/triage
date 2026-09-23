@@ -1,10 +1,15 @@
 # 000152: Fix approval judge prompts on shell variable program indirection
 
-- **Agent:** Muse Code (muse-spark) @ triage branch fix/judge-var-indirection
-- **Agent:** Antigravity (gemini-2.5-pro) @ triage branch fix/judge-var-indirection (2026-09-21T22:45-0700)
-- **Intent:** Auto-approve judge verdicts for commands that invoke allowlisted programs
-  through shell variables (e.g. `G95=$(echo <gradle-path>) && $G95 :app:ktfmtFormat`),
-  which currently fall through to Ask.
+## Agent
+
+Muse Code (muse-spark) @ triage branch fix/judge-var-indirection
+Antigravity (gemini-2.5-pro) @ triage branch fix/judge-var-indirection (2026-09-21T22:45-0700)
+
+## Intent
+
+Auto-approve judge verdicts for commands that invoke allowlisted programs
+through shell variables (e.g. `G95=$(echo <gradle-path>) && $G95 :app:ktfmtFormat`),
+which currently fall through to Ask.
 
 ## What Changed
 
@@ -40,6 +45,18 @@
   - Added non-vacuous regression tests covering wrapper preservation, argument
     check precedence, credential path protection on indirected programs,
     scope depth isolation, and quoted variable suppression.
+- **2026-09-22T16:58-0700** Addressed PR review feedback on PR #176:
+  - `docs/approval-judge.md`: aligned documentation with actual execution
+    semantics to clarify that assignments adjacent to barriers are not
+    recorded, prior bindings clear on backgrounding, conditionals, and scope
+    exits, and pre-pipeline bindings remain available across downstream pipe
+    stages.
+  - `crates/triage-core/src/judge_rules.rs`: aligned doc comments on
+    `resolve_program_var_substitutions` and added unit test coverage for
+    multiple consecutive straight-line assignments with literal arguments and
+    downstream pipeline binding usage.
+  - `devlog/000152-fix-judge-var-indirection.md`: restructured Agent and Intent
+    into dedicated markdown headings per AGENTS.md conventions.
 
 ## Decisions
 
@@ -70,7 +87,8 @@
 
 ## Commits
 
-- HEAD: fix(judge): resolve shell variable program indirection in allow rules
+- f2632d8: fix(judge): resolve shell variable program indirection in allow rules
+- HEAD: fix(judge): align variable resolution documentation and devlog structure
 
 ## Progress
 
