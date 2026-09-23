@@ -1896,7 +1896,8 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   // Accessory-bar paste key (mobile web): read the clipboard and route it
   // through the paste path. Mirrors the native pane; a denied clipboard
-  // read just no-ops, leaving the browser textarea paste path untouched.
+  // read only logs in debug builds, leaving the browser textarea paste
+  // path untouched.
   Future<void> _pasteFromClipboard() async {
     if (_isPasting) return;
     _isPasting = true;

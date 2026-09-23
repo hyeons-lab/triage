@@ -37,9 +37,22 @@ bar, wired to the clipboard-paste path in both terminal panes.
 
 ## Issues
 
+- Copilot review on PR #178: the web `_pasteFromClipboard` comment said a
+  denied clipboard read "just no-ops" while the catch block logs via
+  `debugPrint`. Fixed by rewording the comment to say the read only logs
+  in debug builds; the log stays, matching the native pane and the
+  Antigravity review's read of the same code.
+- Antigravity suggestion (declined): remove the outer `clearSelection()`
+  in the native `_pasteFromClipboard` as redundant. Declined because the
+  line predates the PR and is not purely redundant: `_handlePaste` clears
+  only on paths that send text, so the outer call is the sole clear when
+  the multi-line dialog is cancelled or already showing. Removing it
+  would change cancel-path behavior.
+
 ## Commits
 
-- HEAD — fix(terminal): add paste key to the mobile accessory bar
+- aaf6aee — fix(terminal): add paste key to the mobile accessory bar
+- HEAD — fix(terminal): align web paste comment with debug logging
 
 ## Progress
 
@@ -49,6 +62,8 @@ bar, wired to the clipboard-paste path in both terminal panes.
 - [x] Widget tests, analyze, full client test suite (529 green),
   `flutter build web --release` green
 - [x] Commit, push, PR (#178)
+- [x] PR review responses: Copilot comment/log mismatch fixed,
+  Antigravity redundancy suggestion declined with rationale
 
 ## Research & Discoveries
 
