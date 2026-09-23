@@ -23,6 +23,7 @@ import 'package:triage_client/session_grouping.dart';
 import 'package:triage_client/session_rail_layout.dart';
 import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
+import 'package:triage_client/terminal/size_drift.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
@@ -741,15 +742,12 @@ class SessionVm {
   ///
   /// False when either size is unknown: with nothing to compare, the quiet
   /// option is to leave the PTY alone.
-  bool get hostSizeDriftedFromOwnFit {
-    final ownCols = ownFittedCols;
-    final ownRows = ownFittedRows;
-    if (ownCols == null || ownRows == null) return false;
-    final hostCols = hostSizeCols;
-    final hostRows = hostSizeRows;
-    if (hostCols == null || hostRows == null) return false;
-    return hostCols != ownCols || hostRows != ownRows;
-  }
+  bool get hostSizeDriftedFromOwnFit => terminalSizesDrifted(
+    aCols: ownFittedCols,
+    aRows: ownFittedRows,
+    bCols: hostSizeCols,
+    bRows: hostSizeRows,
+  );
 
   // Set once the view first reports its real fitted size after a fresh attach.
   // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
@@ -1533,12 +1531,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Re-assert this device's terminal size when another device has resized the
-  /// shared PTY since we last fitted. No-op when the PTY already matches, so
-  /// regaining focus is free in the common single-device case.
+  /// shared PTY since we last fitted, or (web) when this device's live grid
+  /// disagrees with the host size. No-op when both match, so regaining focus
+  /// is free in the common single-device case.
   void _reclaimTerminalSizeIfDrifted() {
     if (_disposed || _sessions.isEmpty) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
-    if (!_selectedSession.hostSizeDriftedFromOwnFit) return;
+    if (!_selectedSession.hostSizeDriftedFromOwnFit &&
+        !_selectedSessionGridDriftedFromHost()) {
+      return;
+    }
     // Refit and refocus together, through the shared helper so this keeps its
     // carve-out: on mobile the refocus raises the soft keyboard, which insets
     // the Scaffold, shrinks the viewport and fires another fit at the smaller
@@ -1546,6 +1548,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // PTY. Desktop needs the refocus, since a refit alone leaves the terminal
     // ignoring input until the session is switched away from and back.
     _refitAndFocusActiveSession();
+  }
+
+  /// Web-only companion to [SessionVm.hostSizeDriftedFromOwnFit]: true when
+  /// the selected session's live xterm.js grid disagrees with the host size.
+  /// A fit that applied locally but never reached the host reads as healthy
+  /// to the last-sent comparison (term 46, PTY 80, sent 80) while rendering
+  /// narrow; this catches it so the foreground reclaim heals it. Native
+  /// `TerminalView` auto-fit owns its grid, so there is no equivalent gap.
+  bool _selectedSessionGridDriftedFromHost() {
+    if (!kIsWeb) return false;
+    final session = _selectedSession;
+    final grid = TerminalPane.getCachedTerminalSize(session.title);
+    return cachedGridDriftedFromHost(
+      gridRowsCols: grid,
+      hostCols: session.hostSizeCols,
+      hostRows: session.hostSizeRows,
+    );
   }
 
   // Re-fit this device's terminal to its real size and re-assert it on the

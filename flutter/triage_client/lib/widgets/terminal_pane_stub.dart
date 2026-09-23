@@ -88,6 +88,8 @@ class TerminalPane extends StatefulWidget {
     TerminalController controller,
   ) {}
 
+  /// Live grid size as (rows, cols); null when unknown.
+  /// Rows-first: destructure rows as $1, cols as $2.
   static (int, int)? getCachedTerminalSize(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     return _TerminalPaneState._sessionLastGridSize[sanitizedId] ??
