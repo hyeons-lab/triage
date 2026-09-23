@@ -742,15 +742,12 @@ class SessionVm {
   ///
   /// False when either size is unknown: with nothing to compare, the quiet
   /// option is to leave the PTY alone.
-  bool get hostSizeDriftedFromOwnFit {
-    final ownCols = ownFittedCols;
-    final ownRows = ownFittedRows;
-    if (ownCols == null || ownRows == null) return false;
-    final hostCols = hostSizeCols;
-    final hostRows = hostSizeRows;
-    if (hostCols == null || hostRows == null) return false;
-    return hostCols != ownCols || hostRows != ownRows;
-  }
+  bool get hostSizeDriftedFromOwnFit => terminalSizesDrifted(
+    aCols: ownFittedCols,
+    aRows: ownFittedRows,
+    bCols: hostSizeCols,
+    bRows: hostSizeRows,
+  );
 
   // Set once the view first reports its real fitted size after a fresh attach.
   // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
@@ -1534,8 +1531,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Re-assert this device's terminal size when another device has resized the
-  /// shared PTY since we last fitted. No-op when the PTY already matches, so
-  /// regaining focus is free in the common single-device case.
+  /// shared PTY since we last fitted, or (web) when this device's live grid
+  /// disagrees with the host size. No-op when both match, so regaining focus
+  /// is free in the common single-device case.
   void _reclaimTerminalSizeIfDrifted() {
     if (_disposed || _sessions.isEmpty) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
@@ -1561,12 +1559,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   bool _selectedSessionGridDriftedFromHost() {
     if (!kIsWeb) return false;
     final session = _selectedSession;
-    // NOTE: the cached size is (rows, cols), not (cols, rows).
     final grid = TerminalPane.getCachedTerminalSize(session.title);
-    if (grid == null) return false;
-    return liveGridDriftedFromHost(
-      gridCols: grid.$2,
-      gridRows: grid.$1,
+    return cachedGridDriftedFromHost(
+      gridRowsCols: grid,
       hostCols: session.hostSizeCols,
       hostRows: session.hostSizeRows,
     );

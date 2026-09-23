@@ -100,6 +100,8 @@ class TerminalPane extends StatefulWidget {
     pane?._rebindViewListenersTo(controller);
   }
 
+  /// Live grid size as (rows, cols); null when unknown or below minimum.
+  /// Rows-first: destructure rows as $1, cols as $2.
   static (int, int)? getCachedTerminalSize(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
     final term = _TerminalPaneState._sessionTerms[sanitizedId];
@@ -283,10 +285,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _lastFittedCols;
   bool _focusCursorAfterReplay = false;
   Timer? _resizeDebounceTimer;
-  // The size a pending debounce tick will send. Tracked alongside the timer
-  // (rather than re-reading _lastFittedCols/Rows) so a dispose-flush sends
-  // exactly what the tick would have, even if a later fit moved _lastFitted
-  // without re-arming.
+  // The size a pending debounce tick will send. Mirrored alongside the timer
+  // because the tick's values live in its closure locals, which a
+  // dispose-flush cannot reach: it sends exactly what the tick would have.
   int? _pendingResizeOutCols;
   int? _pendingResizeOutRows;
   double? _stableWidth;
@@ -1497,8 +1498,15 @@ class _TerminalPaneState extends State<TerminalPane> {
           (js_util.getProperty(proposal, 'rows') as num?)?.toInt() ?? 0;
       if (proposedCols < 10 || proposedRows < 5) return;
       if (proposedCols == cols && proposedRows == rows) return;
+      tdbg(
+        'pane.fit',
+        '$_sanitizedId reconcile grid $cols,$rows '
+            'to proposal $proposedCols,$proposedRows',
+      );
       _onFit();
-    } catch (_) {}
+    } catch (error, stack) {
+      tdbg('pane.fit', '$_sanitizedId reconcile THREW: $error\n$stack');
+    }
   }
 
   // The explicit refit — the header button and resume-from-occlusion — as
@@ -1549,7 +1557,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   // the fitted size.
   void _refitAndSend({required bool force}) {
     _onFit();
-    // The jiggle below supersedes any debounced send.
+    // The explicit send below (the jiggle, or the initial-content send on the
+    // early-return path) supersedes any debounced send.
     _resizeDebounceTimer?.cancel();
     _pendingResizeOutCols = null;
     _pendingResizeOutRows = null;
@@ -2331,7 +2340,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   /// Sends a debounced resize-out now instead of letting it die with this
   /// pane. A fit that lands just before unmount (session switch, rebuild)
-  /// would otherwise apply to the grid but never reach the host — the grid
+  /// would otherwise apply to the grid but never reach the host: the grid
   /// keeps a size the PTY never learns, which is one way a narrow grid ends
   /// up stuck under a wide pane. Routing is per session id, so a successor
   /// pane's rebind receives its own session's size and a destroyed session
@@ -2343,11 +2352,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     final rows = _pendingResizeOutRows;
     _pendingResizeOutCols = null;
     _pendingResizeOutRows = null;
-    if (timer == null || !timer.isActive || cols == null || rows == null) {
-      timer?.cancel();
-      return;
-    }
-    timer.cancel();
+    timer?.cancel();
+    // A pending size implies a live timer: every cancel site clears these
+    // fields alongside the timer, and the tick clears them when it fires.
+    if (cols == null || rows == null) return;
+    tdbg('pane.flush', '$_sanitizedId flushing pending resize $cols,$rows');
     _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
   }
 
@@ -2667,7 +2676,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   @override
   void dispose() {
     _flushPendingLiveWrites();
-    _flushPendingResizeOut();
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
@@ -2676,7 +2684,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
     _unbindContainerEvents();
     _clearRefitRetryTimers();
+    // Oldest-first: a live debounce is strictly newer than any pending
+    // jiggle-restore (a refit kills the debounce before arming the jiggle, and
+    // only a later fit can re-arm it), so the newer debounced size must be the
+    // last write before unbind.
     _flushPendingJiggleRestore();
+    _flushPendingResizeOut();
     _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
     if (_resizeObserver != null) {
       try {

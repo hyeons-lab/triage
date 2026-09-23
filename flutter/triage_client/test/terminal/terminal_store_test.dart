@@ -305,8 +305,8 @@ void main() {
     fakeAsync((async) {
       store.dispatch(const Attach());
       // The history tail is cut at an arbitrary byte offset, so it routinely
-      // ends mid-sequence. The hold itself is correct — the next live chunk
-      // may complete a strippable CSI > join — but with no live following,
+      // ends mid-sequence. The hold itself is correct: the next live chunk
+      // may complete a strippable CSI > join, but with no live following,
       // the watchdog must still release it. (The replay's own sync-block
       // close used to cancel that watchdog, stranding the tail.)
       const tail = 'ok\x1b[38;2;118;123;131;4';
@@ -314,6 +314,55 @@ void main() {
       expect(sink.written.toString(), 'ok');
       async.elapse(kSyncOutputWatchdogTimeout * 2);
       expect(sink.written.toString(), tail);
+    });
+  });
+
+  test('exit with a held escape carry still releases the trailing partial', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      // A live chunk ending mid-escape holds its tail for the next chunk.
+      const tail = 'ok\x1b[38;2;118;123;131;4';
+      store.dispatch(LiveBytes(b(tail)));
+      expect(sink.written.toString(), 'ok');
+      // The process exits with no live following: the exit flush must not
+      // cancel the watchdog guarding the carry.
+      store.dispatch(const Exited());
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(sink.written.toString(), tail);
+    });
+  });
+
+  test('end marker in the arming chunk does not strand the escape tail', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      // The strip pass holds the trailing partial and arms the watchdog;
+      // the sync pass then hits the end marker in the same chunk and closes.
+      // The close must re-arm rather than strand the tail.
+      const frame = '\x1b[?2026hFRAME\x1b[?2026l';
+      const tail = 'ok\x1b[38;2;118;123;131;4';
+      store.dispatch(LiveBytes(b('$frame$tail')));
+      expect(sink.written.toString(), '${frame}ok');
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(sink.written.toString(), '$frame$tail');
+    });
+  });
+
+  test('capacity cap close with a held escape carry still releases the tail', () {
+    fakeAsync((async) {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      // A frame past the 1 MiB cap force-flushes through the shared close
+      // while the strip pass still holds the chunk's trailing partial: the
+      // close must re-arm rather than strand it.
+      const tail = 'ok\x1b[38;2;118;123;131;4';
+      final frame = '\x1b[?2026h${'F' * (1024 * 1024)}$tail';
+      store.dispatch(LiveBytes(b(frame)));
+      expect(sink.written.length, greaterThan(1024 * 1024));
+      expect(sink.written.toString().endsWith('ok'), isTrue);
+      async.elapse(kSyncOutputWatchdogTimeout * 2);
+      expect(sink.written.toString().endsWith(tail), isTrue);
     });
   });
 
