@@ -54,6 +54,19 @@ it, `git status; rm -rf ~` cannot match the `git status` rule. Deny rules also
 inspect every segment a shell would run, not just the first, so a destructive
 command hidden behind a benign one is still caught.
 
+Commands that invoke an allowlisted program through a shell variable resolve
+before matching: in `G95=$(echo <gradle-path>) && $G95 :app:ktfmtFormat`, the
+judge binds `G95` to the echoed literal and evaluates the call as `gradle
+:app:ktfmtFormat`. Resolution is single-hop over visible `NAME=literal` and
+`NAME=$(echo literal)` assignments on straight-line `&&`/`;` chains. Assignments
+adjacent to barrier boundaries (pipes, conditionals, backgrounding, or grouping)
+are not recorded. Prior bindings are cleared across backgrounding (`&`),
+conditional branches (`||`), or exiting subshell/brace scopes (`)`, `}`), while
+pre-pipeline bindings remain available across downstream pipe stages.
+Resolution requires literal arguments and re-runs the substituted text through
+the deny checks, so a resolved call can only ever reproduce its literal verdict.
+The audit reason records the indirection (`gradle (via $G95)`).
+
 ## Setup
 
 Install the shim so it is on `PATH`:
