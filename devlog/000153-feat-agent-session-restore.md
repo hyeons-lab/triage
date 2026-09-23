@@ -1,8 +1,9 @@
-# 000152 feat/agent-session-restore
+# 000153: Track foreground AI agents and resume conversations on restore
 
 ## Agent
 
-Muse Code, 2026-09-20T10:26-0700.
+Muse Code (muse-spark) @ triage branch feat/agent-session-restore (2026-09-20T10:26-0700)
+Antigravity (gemini-2.5-pro) @ triage branch feat/agent-session-restore (2026-09-22T17:38-0700)
 
 ## Intent
 
@@ -36,6 +37,10 @@ status; exited sessions carry no agent state.
 - Deterministic stub-agent test helper compiled by `build.rs`; full
   lifecycle E2E test (observe, attach, daemon death, restore, re-attach
   with the same id).
+- **2026-09-22T17:38-0700** Rebased onto `origin/main` (incorporating PR #174
+  and PR #176). Resolved conflict in `flutter/triage_client/lib/main.dart`
+  (_SessionGlanceCard popover composition). Renumbered devlog and plan from
+  000152 to 000153 to resolve sequence collision with merged PR #176.
 
 ## Decisions
 
@@ -62,7 +67,7 @@ status; exited sessions carry no agent state.
   badges are present everywhere; Flutter remote shows badges after
   attach. A `list_session_agents` call (mirroring snippets) is the
   follow-up if attach-first proves insufficient there.
-- See `devlog/plans/000152-01-agent-session-restore.md` for the full plan
+- See `devlog/plans/000153-01-agent-session-restore.md` for the full plan
   and spike findings.
 
 ## Issues
@@ -87,12 +92,13 @@ status; exited sessions carry no agent state.
 
 ## Commits
 
-- ea0d979 — feat(session): track foreground AI agents and resume conversations on restore
-- e1fdd70 — fix(session): harden agent restore fallback and macOS argv parsing
-- 9ed4566 — fix(session): gate Windows-observation tests and escape fixture paths
-- e77ab6c — fix(session): address Antigravity review findings
-- 40ccaec — fix(session): address R1 agent-review-loop findings
-- HEAD — fix(session): retry stub-agent observation for exec race
+- ea1361e: feat(session): track foreground AI agents and resume conversations on restore
+- 3670726: fix(session): harden agent restore fallback and macOS argv parsing
+- c930466: fix(session): gate Windows-observation tests and escape fixture paths
+- 35892d8: fix(session): address Antigravity review findings
+- 04ef184: fix(session): address R1 agent-review-loop findings
+- 366f33b: fix(session): retry stub-agent observation for exec race
+- HEAD: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
 
 ## Progress
 
