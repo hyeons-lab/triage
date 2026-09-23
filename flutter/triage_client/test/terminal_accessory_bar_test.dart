@@ -4,13 +4,14 @@ import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 
 void main() {
   // Pumps the bar and returns the list of byte sequences it emits through
-  // onSend, plus a counter of onToggleCtrl taps.
-  Future<({List<String> sent, int Function() ctrlToggles})> pumpBar(
-    WidgetTester tester, {
-    bool ctrlArmed = false,
-  }) async {
+  // onSend, plus counters of onToggleCtrl and onPaste taps.
+  Future<
+    ({List<String> sent, int Function() ctrlToggles, int Function() pastes})
+  >
+  pumpBar(WidgetTester tester, {bool ctrlArmed = false}) async {
     final sent = <String>[];
     var toggles = 0;
+    var pastes = 0;
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -19,13 +20,14 @@ void main() {
             child: TerminalAccessoryBar(
               onSend: sent.add,
               onToggleCtrl: () => toggles++,
+              onPaste: () => pastes++,
               ctrlArmed: ctrlArmed,
             ),
           ),
         ),
       ),
     );
-    return (sent: sent, ctrlToggles: () => toggles);
+    return (sent: sent, ctrlToggles: () => toggles, pastes: () => pastes);
   }
 
   Future<void> tapKey(WidgetTester tester, String label) async {
@@ -105,5 +107,13 @@ void main() {
 
     await pumpBar(tester, ctrlArmed: true);
     expect(ctrlKeyColor(tester), const Color(0xff2b6a63));
+  });
+
+  testWidgets('paste reports through onPaste, not onSend', (tester) async {
+    final bar = await pumpBar(tester);
+    await tapKey(tester, 'paste');
+    expect(bar.pastes(), 1);
+    expect(bar.sent, isEmpty);
+    expect(bar.ctrlToggles(), 0);
   });
 }

@@ -6,14 +6,16 @@ import 'package:flutter/material.dart';
 /// horizontally so it fits narrow phones.
 ///
 /// Purely presentational: each key reports its byte sequence through [onSend],
-/// except the sticky Ctrl toggle, which reports through [onToggleCtrl]. The
-/// caller owns the armed state and passes it back as [ctrlArmed] to light the
-/// key. Keeping the two panes' bars as one widget means they can never drift.
+/// except the sticky Ctrl toggle, which reports through [onToggleCtrl], and
+/// the paste key, which reports through [onPaste]. The caller owns the armed
+/// state and passes it back as [ctrlArmed] to light the key. Keeping the two
+/// panes' bars as one widget means they can never drift.
 class TerminalAccessoryBar extends StatelessWidget {
   const TerminalAccessoryBar({
     super.key,
     required this.onSend,
     required this.onToggleCtrl,
+    required this.onPaste,
     required this.ctrlArmed,
   });
 
@@ -22,6 +24,12 @@ class TerminalAccessoryBar extends StatelessWidget {
 
   /// Called when the sticky Ctrl key is tapped; the caller flips [ctrlArmed].
   final VoidCallback onToggleCtrl;
+
+  /// Called when the paste key is tapped; the caller reads the clipboard
+  /// and routes the text through its paste path. The soft keyboard offers
+  /// no other paste affordance: the system edit menu never appears over
+  /// the terminal's hidden input.
+  final VoidCallback onPaste;
 
   /// Whether sticky Ctrl is currently armed, to highlight the key.
   final bool ctrlArmed;
@@ -45,6 +53,7 @@ class TerminalAccessoryBar extends StatelessWidget {
             // that never reaches the terminal, so a terminal needs an explicit
             // one. `\r` (carriage return) is what a terminal expects on Enter.
             _key('enter', () => onSend('\r')),
+            _key('paste', onPaste),
             _key('▲', () => onSend('\x1b[A')),
             _key('▼', () => onSend('\x1b[B')),
             _key('◀', () => onSend('\x1b[D')),
