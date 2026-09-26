@@ -174,14 +174,8 @@ List<SessionGroup> groupSessionsByRepo(
   final inputIndex = <String, int>{
     for (var i = 0; i < sessions.length; i++) sessions[i].sessionId: i,
   };
-  int byActivityThenInput(SessionOrderingInput a, SessionOrderingInput b) {
-    if (a.lastActivityMs != b.lastActivityMs) {
-      return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
-    }
-    return (inputIndex[a.sessionId] ?? 0).compareTo(
-      inputIndex[b.sessionId] ?? 0,
-    );
-  }
+  int byActivityThenInput(SessionOrderingInput a, SessionOrderingInput b) =>
+      compareByActivityThenInput(a, b, inputIndex);
 
   final groups = <SessionGroup>[];
   for (final entry in byRepo.entries) {
@@ -261,6 +255,67 @@ List<T> _hoistPinned<T>(
 List<String> flattenGroups(List<SessionGroup> groups) => [
   for (final group in groups) ...group.sessionIds,
 ];
+
+/// Orders sessions by activity, newest first, with ties keeping input order.
+///
+/// Shared by [groupSessionsByRepo] (within each group) and
+/// [orderSessionsByActivity] (across all of them): one rule in one place, so
+/// the two modes can never disagree about what "most recent" means.
+int compareByActivityThenInput(
+  SessionOrderingInput a,
+  SessionOrderingInput b,
+  Map<String, int> inputIndex,
+) {
+  if (a.lastActivityMs != b.lastActivityMs) {
+    return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
+  }
+  return (inputIndex[a.sessionId] ?? 0).compareTo(inputIndex[b.sessionId] ?? 0);
+}
+
+/// Orders [sessions] by most recent activity as one flat list, ignoring
+/// repositories.
+///
+/// The rail's "sort by activity" mode. Pinned sessions hoist to the front in
+/// pinned order (group pins have no meaning without groups); everything else
+/// flows by activity exactly as it would within a group.
+List<String> orderSessionsByActivity(
+  List<SessionOrderingInput> sessions, {
+  SessionPins pins = SessionPins.none,
+}) {
+  final inputIndex = <String, int>{
+    for (var i = 0; i < sessions.length; i++) sessions[i].sessionId: i,
+  };
+  final ordered = [...sessions]
+    ..sort((a, b) => compareByActivityThenInput(a, b, inputIndex));
+  return _hoistPinned(
+    ordered.map((s) => s.sessionId).toList(),
+    pins.sessionIds,
+    (id) => id,
+  );
+}
+
+/// Builds the rail's flat activity view: no groups for no sessions (matching
+/// [groupSessionsByRepo]), otherwise one group holding every session in
+/// activity order. A single group renders headerless via `buildRailItems`,
+/// and a drag there pins session ids across the whole list, which stays
+/// meaningful when the mode flips back.
+List<SessionGroup> flatSessionGroups(
+  List<SessionOrderingInput> sessions, {
+  SessionPins pins = SessionPins.none,
+}) {
+  if (sessions.isEmpty) return const [];
+  var newest = 0;
+  for (final session in sessions) {
+    if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+  }
+  return [
+    SessionGroup(
+      repoRoot: null,
+      sessionIds: orderSessionsByActivity(sessions, pins: pins),
+      lastActivityMs: newest,
+    ),
+  ];
+}
 
 /// Drops one trailing `/`, except from the filesystem root itself.
 ///

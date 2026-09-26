@@ -103,6 +103,20 @@ typedef RailLayoutRecord = ({
   Map<String, String> customLabels,
 });
 
+/// Daemon-host disk space for the volume holding the daemon's state.
+/// 0/0 means the daemon could not probe it (or predates stats entirely).
+typedef DaemonStatsRecord = ({int diskFreeBytes, int diskTotalBytes});
+
+/// Reads daemon stats out of a `hello` or `get_daemon_stats` response map.
+/// Both carry the same `disk_*` keys; absent keys read as unknown (0/0), so
+/// a hello from a daemon predating stats degrades to a hidden line.
+DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
+  return (
+    diskFreeBytes: (response['disk_free_bytes'] as num?)?.toInt() ?? 0,
+    diskTotalBytes: (response['disk_total_bytes'] as num?)?.toInt() ?? 0,
+  );
+}
+
 /// Extracts and decompresses the raw output-history tail from a parsed snapshot map.
 ///
 /// Supports:
@@ -845,6 +859,17 @@ class TriageWebSocketClient {
     }
   }
 
+  /// Fetches the daemon host's current disk stats. Polled while connected so
+  /// the daemon selector's free-space line tracks long sessions.
+  Future<DaemonStatsRecord?> getDaemonStats() async {
+    try {
+      final response = await _send('get_daemon_stats');
+      return daemonStatsFromResponse(response);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Updates the pinned group and session ordering on the daemon.
   Future<void> setRailPins({
     required List<String> groupKeys,
@@ -1190,6 +1215,8 @@ class TriageWebSocketClient {
           // `skip_serializing_if` on the JSON side.
           if (hello.latestVersion != null)
             'latest_version': hello.latestVersion,
+          'disk_free_bytes': hello.diskFreeBytes,
+          'disk_total_bytes': hello.diskTotalBytes,
         };
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
@@ -1350,6 +1377,13 @@ class TriageWebSocketClient {
               if (entry.sessionId != null && entry.label != null)
                 entry.sessionId!: entry.label!,
           },
+        };
+      case 21: // DaemonStatsResult
+        final stats = result as fbs.DaemonStatsResult;
+        return {
+          'result': 'daemon_stats',
+          'disk_free_bytes': stats.diskFreeBytes,
+          'disk_total_bytes': stats.diskTotalBytes,
         };
       default:
         return _unhandled('server result', type.value);
@@ -1803,6 +1837,11 @@ class TriageWebSocketClient {
       case 'get_rail_layout':
         payloadType = fbs.ClientRequestPayloadTypeId.GetRailLayoutRequest;
         payload = fbs.GetRailLayoutRequestObjectBuilder();
+        break;
+
+      case 'get_daemon_stats':
+        payloadType = fbs.ClientRequestPayloadTypeId.GetDaemonStatsRequest;
+        payload = fbs.GetDaemonStatsRequestObjectBuilder();
         break;
 
       case 'set_rail_pins':

@@ -206,6 +206,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     return sessionContexts;
   }
 
+  /// Rail layout the daemon reports, or null for a daemon predating layouts.
+  RailLayoutRecord? railLayout;
+
+  @override
+  Future<RailLayoutRecord?> getRailLayout() async => railLayout;
+
   @override
   Future<Map<String, dynamic>> attachSession({
     required String sessionId,
@@ -3185,6 +3191,40 @@ void main() {
       expect(
         find.byTooltip('Sort by activity (clears pinned order)'),
         findsOneWidget,
+      );
+    });
+
+    testWidgets('a stored activity sort flattens the rail under daemon pins', (
+      WidgetTester tester,
+    ) async {
+      // Pins sync down from the daemon on load; the sort mode is a purely
+      // local preference. Restoring byActivity must flatten the rail even when
+      // the daemon's pins are the active ones and local pins are absent: the
+      // mode must not wait for a pin change to take effect.
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = clientWithRepos()
+        ..railLayout = (
+          groupKeys: <String>[],
+          sessionIds: <String>['main'],
+          customLabels: <String, String>{},
+        );
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Flat: no group headers at all.
+      expect(header('/work/alpha'), findsNothing);
+      expect(header('/work/beta'), findsNothing);
+      // The daemon's session pin still hoists within the flat list: `main`
+      // leads despite `websocket-session-api` being more recently active.
+      expect(
+        tester.getTopLeft(row('main')).dy,
+        lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
+      );
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
       );
     });
   });

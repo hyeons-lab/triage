@@ -148,7 +148,8 @@ enum ClientRequestPayloadTypeId {
   RemoveJudgeDenySubstringRequest(28),
   GetRailLayoutRequest(29),
   SetRailPinsRequest(30),
-  SetSessionCustomLabelRequest(31);
+  SetSessionCustomLabelRequest(31),
+  GetDaemonStatsRequest(32);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -187,6 +188,7 @@ enum ClientRequestPayloadTypeId {
       case 29: return ClientRequestPayloadTypeId.GetRailLayoutRequest;
       case 30: return ClientRequestPayloadTypeId.SetRailPinsRequest;
       case 31: return ClientRequestPayloadTypeId.SetSessionCustomLabelRequest;
+      case 32: return ClientRequestPayloadTypeId.GetDaemonStatsRequest;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -195,7 +197,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 31;
+  static const int maxValue = 32;
   static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
@@ -231,7 +233,8 @@ enum ServerResultPayloadTypeId {
   JudgeHookStatusResult(17),
   JudgeHistoryResult(18),
   JudgeRulesResult(19),
-  RailLayoutResult(20);
+  RailLayoutResult(20),
+  DaemonStatsResult(21);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
@@ -259,6 +262,7 @@ enum ServerResultPayloadTypeId {
       case 18: return ServerResultPayloadTypeId.JudgeHistoryResult;
       case 19: return ServerResultPayloadTypeId.JudgeRulesResult;
       case 20: return ServerResultPayloadTypeId.RailLayoutResult;
+      case 21: return ServerResultPayloadTypeId.DaemonStatsResult;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -267,7 +271,7 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 20;
+  static const int maxValue = 21;
   static const fb.Reader<ServerResultPayloadTypeId> reader = _ServerResultPayloadTypeIdReader();
 }
 
@@ -3851,6 +3855,52 @@ class GetRailLayoutRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class GetDaemonStatsRequest {
+  GetDaemonStatsRequest._(this._bc, this._bcOffset);
+  factory GetDaemonStatsRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<GetDaemonStatsRequest> reader = _GetDaemonStatsRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+
+  @override
+  String toString() {
+    return 'GetDaemonStatsRequest{}';
+  }
+}
+
+class _GetDaemonStatsRequestReader extends fb.TableReader<GetDaemonStatsRequest> {
+  const _GetDaemonStatsRequestReader();
+
+  @override
+  GetDaemonStatsRequest createObject(fb.BufferContext bc, int offset) => 
+    GetDaemonStatsRequest._(bc, offset);
+}
+
+class GetDaemonStatsRequestObjectBuilder extends fb.ObjectBuilder {
+
+  GetDaemonStatsRequestObjectBuilder();
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(0);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class SetRailPinsRequest {
   SetRailPinsRequest._(this._bc, this._bcOffset);
   factory SetRailPinsRequest(List<int> bytes) {
@@ -4075,6 +4125,7 @@ class ClientMessage {
       case 29: return GetRailLayoutRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 30: return SetRailPinsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 31: return SetSessionCustomLabelRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 32: return GetDaemonStatsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -4218,10 +4269,12 @@ class HelloResult {
   String? get serverVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
   bool get updateAvailable => const fb.BoolReader().vTableGet(_bc, _bcOffset, 10, false);
   String? get latestVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+  int get diskFreeBytes => fbjs.readUint64(_bc, _bcOffset, 14, 0);
+  int get diskTotalBytes => fbjs.readUint64(_bc, _bcOffset, 16, 0);
 
   @override
   String toString() {
-    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}}';
+    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}, diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}}';
   }
 }
 
@@ -4239,7 +4292,7 @@ class HelloResultBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(5);
+    fbBuilder.startTable(7);
   }
 
   int addProtocolVersionOffset(int? offset) {
@@ -4262,6 +4315,14 @@ class HelloResultBuilder {
     fbBuilder.addOffset(4, offset);
     return fbBuilder.offset;
   }
+  int addDiskFreeBytes(int? diskFreeBytes) {
+    fbjs.addUint64(fbBuilder, 5, diskFreeBytes);
+    return fbBuilder.offset;
+  }
+  int addDiskTotalBytes(int? diskTotalBytes) {
+    fbjs.addUint64(fbBuilder, 6, diskTotalBytes);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -4274,6 +4335,8 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
   final String? _serverVersion;
   final bool? _updateAvailable;
   final String? _latestVersion;
+  final int? _diskFreeBytes;
+  final int? _diskTotalBytes;
 
   HelloResultObjectBuilder({
     String? protocolVersion,
@@ -4281,12 +4344,16 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
     String? serverVersion,
     bool? updateAvailable,
     String? latestVersion,
+    int? diskFreeBytes,
+    int? diskTotalBytes,
   })
       : _protocolVersion = protocolVersion,
         _authenticated = authenticated,
         _serverVersion = serverVersion,
         _updateAvailable = updateAvailable,
-        _latestVersion = latestVersion;
+        _latestVersion = latestVersion,
+        _diskFreeBytes = diskFreeBytes,
+        _diskTotalBytes = diskTotalBytes;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -4297,12 +4364,14 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_serverVersion!);
     final int? latestVersionOffset = _latestVersion == null ? null
         : fbBuilder.writeString(_latestVersion!);
-    fbBuilder.startTable(5);
+    fbBuilder.startTable(7);
     fbBuilder.addOffset(0, protocolVersionOffset);
     fbBuilder.addBool(1, _authenticated);
     fbBuilder.addOffset(2, serverVersionOffset);
     fbBuilder.addBool(3, _updateAvailable);
     fbBuilder.addOffset(4, latestVersionOffset);
+    fbjs.addUint64(fbBuilder, 5, _diskFreeBytes);
+    fbjs.addUint64(fbBuilder, 6, _diskTotalBytes);
     return fbBuilder.endTable();
   }
 
@@ -6185,6 +6254,86 @@ class RailLayoutResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class DaemonStatsResult {
+  DaemonStatsResult._(this._bc, this._bcOffset);
+  factory DaemonStatsResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<DaemonStatsResult> reader = _DaemonStatsResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  int get diskFreeBytes => fbjs.readUint64(_bc, _bcOffset, 4, 0);
+  int get diskTotalBytes => fbjs.readUint64(_bc, _bcOffset, 6, 0);
+
+  @override
+  String toString() {
+    return 'DaemonStatsResult{diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}}';
+  }
+}
+
+class _DaemonStatsResultReader extends fb.TableReader<DaemonStatsResult> {
+  const _DaemonStatsResultReader();
+
+  @override
+  DaemonStatsResult createObject(fb.BufferContext bc, int offset) => 
+    DaemonStatsResult._(bc, offset);
+}
+
+class DaemonStatsResultBuilder {
+  DaemonStatsResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addDiskFreeBytes(int? diskFreeBytes) {
+    fbjs.addUint64(fbBuilder, 0, diskFreeBytes);
+    return fbBuilder.offset;
+  }
+  int addDiskTotalBytes(int? diskTotalBytes) {
+    fbjs.addUint64(fbBuilder, 1, diskTotalBytes);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class DaemonStatsResultObjectBuilder extends fb.ObjectBuilder {
+  final int? _diskFreeBytes;
+  final int? _diskTotalBytes;
+
+  DaemonStatsResultObjectBuilder({
+    int? diskFreeBytes,
+    int? diskTotalBytes,
+  })
+      : _diskFreeBytes = diskFreeBytes,
+        _diskTotalBytes = diskTotalBytes;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    fbBuilder.startTable(2);
+    fbjs.addUint64(fbBuilder, 0, _diskFreeBytes);
+    fbjs.addUint64(fbBuilder, 1, _diskTotalBytes);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ResponsePayload {
   ResponsePayload._(this._bc, this._bcOffset);
   factory ResponsePayload(List<int> bytes) {
@@ -6221,6 +6370,7 @@ class ResponsePayload {
       case 18: return JudgeHistoryResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 19: return JudgeRulesResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 20: return RailLayoutResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 21: return DaemonStatsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
