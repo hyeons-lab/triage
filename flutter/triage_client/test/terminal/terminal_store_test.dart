@@ -1699,6 +1699,28 @@ void main() {
     expect(aheadSink.ops.last, 'write:late');
   });
 
+  test('empty snapshot on an exited store still replays and clears exited', () {
+    final exitedSink = FakeTerminalSink();
+    final exitedStore = TerminalStore(exitedSink);
+    addTearDown(exitedStore.dispose);
+    exitedStore.dispatch(const Resize(80, 24));
+    exitedStore.dispatch(
+      HistoryBytes(
+        b('old'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    exitedStore.dispatch(const Exited());
+    expect(exitedStore.state.exited, isTrue);
+    exitedStore.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    expect(exitedStore.state.exited, isFalse);
+    expect(exitedSink.ops.where((op) => op == 'clear').length, 2);
+    expect(exitedSink.historyReplayedCount, 2);
+  });
+
   test('empty snapshot at the applied byte offset is a no-op', () {
     final atSink = FakeTerminalSink();
     final atStore = TerminalStore(atSink);
@@ -1724,6 +1746,9 @@ void main() {
     expect(atSink.ops.where((op) => op == 'clear').length, 1);
     expect(atSink.ops.length, opCount);
     expect(atStore.appliedLogBytes, 50);
+    // The empty-snapshot guard must not advance the live baseline: without
+    // it, this input falls into the delta no-op path, which sets it to 5.
+    expect(atStore.appliedLiveSeq, isNull);
   });
 
   test('live without output_seq applies over sequenced history', () {
@@ -1768,6 +1793,38 @@ void main() {
     expect(negSink.ops.where((op) => op == 'clear').length, 2);
     expect(negStore.appliedLogBytes, 4);
     expect(negStore.state.historyHighWaterSeq, 6);
+  });
+
+  test('negative history throughOutputSeq replays without poisoning', () {
+    final negSeqSink = FakeTerminalSink();
+    final negSeqStore = TerminalStore(negSeqSink);
+    addTearDown(negSeqStore.dispose);
+    negSeqStore.dispatch(const Resize(80, 24));
+    negSeqStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+
+    // Mirror of the negative-rawOutputStart case: the corrupt seq sanitizes
+    // to null and must not poison the high-water mark.
+    negSeqStore.dispatch(
+      HistoryBytes(
+        b('junk'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: -7,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(negSeqSink.ops.where((op) => op == 'clear').length, 2);
+    expect(negSeqStore.state.historyHighWaterSeq, 5);
+    expect(negSeqStore.appliedLogBytes, 4);
   });
 
   test('negative live seq applies as unsequenced without baselines', () {

@@ -23,6 +23,8 @@ Follow-up hardening and optimizations for terminal delta rendering and session l
 - 2026-09-22T22:36-0700: Differentiate daemon log trims from stale snapshots in `isLogShrunk`. When snapshot end bytes are less than current log bytes, classify as a regression requiring replay only if the sequence is fresh (`throughSeq >= lastSnapshotSeq` and `throughSeq >= appliedLiveSeq`).
 - 2026-09-22T22:36-0700: Gate popover rebuilds in `SessionListTile.didUpdateWidget` on visual property changes. Include all properties read by the popover builder (`glanceTitle`, `title`, `customLabel`, `subtitle`, `statusColor`, `repoName`, `branch`, `worktreeName`, `cwd`, `snippet`, `snippetDetail`) to prevent stale hover cards while eliminating unnecessary rebuilds.
 - 2026-09-22T22:36-0700: Track coalesced history refreshes with `_refreshHistoryFollowUp`. When a history refresh is skipped because a metadata refresh is already in-flight, queue the session ID and trigger the history refresh once the in-flight refresh finishes.
+- 2026-09-25T10:58-0700: Round-4 review triage resolved two reviewer disagreements against the code before fixing. R2's stale-subscription-removal fix (skip on `_StaleLoad`) was refined: a late subscribe response installs post-switch, so the attach guard moved above the install and catch cleanup became staleness-predicated instead of type-predicated (covers late RPC errors too). R1's `_refreshInFlight` generational-migration call won over R2's leave-it verdict (reconnect never purges the set, so the stale holder vetoes the new generation outright). R2's entry-removeWhere reorder was rejected: moving cleanup across the subscribe await strands dead ids on stale failure with no retry, a regression worse than the narrow self-healing race it closes.
+- 2026-09-25T10:58-0700: PR 180 comment triage (Copilot x2, Antigravity review). Copilot's untrimmed client-id comparison is fixed in the working tree (facade trim in storage.dart plus simplified call sites). Copilot's devlog HEAD-marker nit is valid per AGENTS.md (`HEAD` with em dash, the 124-use majority form) and will be applied to the new HEAD entry at commit time; project convention wins over the review skill's punctuation invariant for this structured marker. Antigravity's popover-coupling warning and record-pattern suggestion are moot (field enumeration removed in favor of unconditional deferred rebuild); its suppress-timer note is pre-existing monitor-only design with no code change.
 
 ## What Changed
 
@@ -31,10 +33,14 @@ Follow-up hardening and optimizations for terminal delta rendering and session l
 - 2026-09-22T22:36-0700 flutter/triage_client/test/terminal/terminal_store_test.dart: Added regression tests for shorter snapshot replay, delta merge over List<int>, re-attach full replay, reentrant dispose during write, and sequence epoch reset boundaries.
 - 2026-09-22T22:36-0700 devlog/plans/000153-01-terminal-delta-followup.md: Created planning document for follow-up hardening.
 - 2026-09-22T22:36-0700 devlog/000153-fix-terminal-delta-followup.md: Created branch devlog tracking decisions and changes.
+- 2026-09-25T10:58-0700 flutter/triage_client/lib/main.dart (review round 4): Mirrored the select-path step-gated subscription rollback into the reconnect catch so a refresh-step failure retries the full unit; migrated `_refreshInFlight` to `GenerationClaims` and made `_scheduleHistoryFollowUp` check-then-remove so a superseded finisher cannot swipe the live flag; hoisted the attach staleness guard above the subscription install and made load-catch cleanup staleness-predicated; widened the revive comment to the step-severity contract; nested the select-path claim; added a routing debugPrint to `_routeStaleAuthFailure`.
+- 2026-09-25T10:58-0700 flutter/triage_client/lib/services/storage.dart (review round 4): Trim the stored client id once in the `retrieveClientId` facade so no reader can compare an untrimmed value; simplified the 7 call sites in main.dart accordingly.
+- 2026-09-25T10:58-0700 flutter/triage_client/test/widget_test.dart (review round 4): Added `subscribeSessionCalls` log and `emptyIdSubscribeSessions` control to the fake client, plus two regression tests (switch-while-load-hung issues no daemon writes; revive that cannot resubscribe fails the load), both proven non-vacuous by mutant runs.
 
 ## Commits
 
-- HEAD: fix(client): follow-up delta rendering and session lifecycle hardening
+- 28471b7: fix(client): follow-up delta rendering and session lifecycle hardening
+- HEAD — fix(client): harden session lifecycle against generation races
 
 ## Progress
 
@@ -48,3 +54,11 @@ Follow-up hardening and optimizations for terminal delta rendering and session l
 - [x] Add regression tests in `terminal_store_test.dart`
 - [x] Verify Flutter analyze and test suite (558 tests passing)
 - [x] Verify Cargo fmt, clippy, and test suite (328 tests passing)
+- [x] Review round 4 (full, high effort): 9 findings fixed, 1 rejected with reasoning; analyze clean, 571 flutter tests green, both new tests mutant-verified
+- [x] Review round 5 (full: all lenses dirty after round 4): P1/P2 and P3/P4 clean, 2 quality + 2 nitpicks fixed (trim boundary test, stale trim comment, alias removal, doc enumeration); analyze clean, 572 green, trim test mutant-verified; no new shared learnings (instances of codified bullets)
+- [x] Review round 6 (narrowed: P7/P8 lens only): 1 quality fixed (attach-leg revive test with exited re-mark and pump-until-awaiting error completion); analyze clean, 573 green, unconditional-rethrow mutant killed; no new shared learnings (codified leg coverage)
+- [x] Review round 7 (narrowed: P7/P8 lens only): 1 quality fixed (shared stageParkedReviveRetry helper for the two revive tests); analyze clean, 573 green; no new shared learnings (mechanical dedup)
+- [x] Review round 8 (narrowed: P7/P8 lens only): NO FINDINGS; both revive legs independently mutant-pinned, dead-predecessor grep clean; no new shared learnings (clean round)
+- [x] Review round 9 (full confirmation): P1/P2 and P5/P6 clean; 1 correctness (unguarded _createSession, E2E-demonstrated) + 2 quality (dartdoc misattach, untested creation empty-subscribe rollback) fixed with 3 committed tests; analyze clean, 576 green, mutants E/F/G kill; filed Pillar 3 Shared Map Writer Audit
+- [x] Review round 10 (narrowed: P3/P4 + P7/P8 lenses): NO FINDINGS both, with independent mutant re-verification; loop stops at round cap with a clean dirty set but a full confirmation still owed
+- [ ] Commit and push with approval, resolve PR threads, verify CI (note: chrome web-transport gate never completed locally, terminated after 80+ min with no output; it covers transport files this diff does not touch, and CI runs it on push)

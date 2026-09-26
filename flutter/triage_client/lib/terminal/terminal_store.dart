@@ -374,8 +374,9 @@ class TerminalStore extends ChangeNotifier {
     // 2. The log end moved backward under a fresh sequence: the daemon rebases
     //    `bytes_logged` when it trims while `output_seq` stays monotonic, so a
     //    trim presents as an advanced (or unchanged) sequence with fewer bytes.
-    //    A stale snapshot also ends behind the live head, but its sequence
-    //    trails the applied baselines, and that combination stays a no-op below.
+    //    A stale snapshot also ends behind the live head, but a sequence
+    //    that trails the live baseline without regressing below the snapshot
+    //    high-water stays a no-op below.
     //    An unknown sequence fails toward replay, as before.
     final snapshotEndBytes =
         rawStart != null ? rawStart + bytes.length : null;

@@ -546,6 +546,17 @@ void main() {
       },
     );
 
+    test('retrieveClientId trims padding whitespace at the boundary', () async {
+      FlutterSecureStorage.setMockInitialValues({});
+      SharedPreferences.setMockInitialValues({
+        'triage_client_id': '  padded-id  ',
+      });
+      resetCredentialCacheForTesting();
+      await loadCredentials();
+
+      expect(retrieveClientId(), 'padded-id');
+    });
+
     test(
       'writes through to SharedPreferences so ad-hoc sandboxed apps persist credentials',
       () async {
