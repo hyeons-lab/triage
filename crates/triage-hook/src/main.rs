@@ -312,8 +312,39 @@ enum AgentFormat {
     Generic,
 }
 
+/// The ambient process inputs to format detection, snapshotted once so the
+/// decision itself is a pure function of payload + env.
+///
+/// Split out because the payload-signature tests must run hermetically: with
+/// the env reads inline, running the suite inside a Muse session (where
+/// `MUSE_TOOL_USE_ID` is set) forces every payload to `Muse`, and a Claude
+/// Code session breaks the Muse/Antigravity assertions symmetrically.
+#[derive(Debug, Default)]
+struct FormatEnv {
+    argv: Vec<String>,
+    env_format: Option<String>,
+    claude_env: bool,
+    muse_env: bool,
+}
+
+impl FormatEnv {
+    fn from_process() -> Self {
+        Self {
+            argv: std::env::args().collect(),
+            env_format: std::env::var("TRIAGE_HOOK_FORMAT").ok(),
+            claude_env: std::env::var("CLAUDE_CODE_VERSION").is_ok()
+                || std::env::var("CLAUDE_PROJECT_DIR").is_ok(),
+            muse_env: std::env::var("MUSE_TOOL_USE_ID").is_ok(),
+        }
+    }
+}
+
 fn detect_format(val: &serde_json::Value) -> AgentFormat {
-    if let Ok(fmt) = std::env::var("TRIAGE_HOOK_FORMAT") {
+    detect_format_with_env(val, &FormatEnv::from_process())
+}
+
+fn detect_format_with_env(val: &serde_json::Value, env: &FormatEnv) -> AgentFormat {
+    if let Some(fmt) = env.env_format.as_deref() {
         match fmt.to_lowercase().as_str() {
             "claude" | "claude_code" | "claudecode" => return AgentFormat::ClaudeCode,
             "antigravity" | "gemini" | "agy" => return AgentFormat::Antigravity,
@@ -322,7 +353,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
             _ => {}
         }
     }
-    for arg in std::env::args() {
+    for arg in &env.argv {
         if arg == "--format=claude" {
             return AgentFormat::ClaudeCode;
         }
@@ -350,7 +381,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         return AgentFormat::Antigravity;
     }
 
-    if std::env::var("CLAUDE_CODE_VERSION").is_ok() || std::env::var("CLAUDE_PROJECT_DIR").is_ok() {
+    if env.claude_env {
         return AgentFormat::ClaudeCode;
     }
 
@@ -367,7 +398,7 @@ fn detect_format(val: &serde_json::Value) -> AgentFormat {
         || val.get("turn_id").is_some()
         || val.get("turnId").is_some()
         || is_muse_model
-        || std::env::var("MUSE_TOOL_USE_ID").is_ok()
+        || env.muse_env
     {
         return AgentFormat::Muse;
     }
@@ -1514,6 +1545,14 @@ mod tests {
     use super::*;
     use triage_core::judge::JudgeDecision;
 
+    /// Payload-only format detection, with an empty environment. The
+    /// signature tests use this so they pass no matter which agent session
+    /// (if any) the suite runs inside; env-override behavior is covered
+    /// separately with explicit snapshots.
+    fn detect_payload_format(val: &serde_json::Value) -> AgentFormat {
+        detect_format_with_env(val, &FormatEnv::default())
+    }
+
     #[test]
     fn parses_a_real_pre_tool_use_payload() {
         let val: serde_json::Value = serde_json::from_str(
@@ -1822,7 +1861,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(detect_format(&muse_model_payload), AgentFormat::Muse);
+        assert_eq!(
+            detect_payload_format(&muse_model_payload),
+            AgentFormat::Muse
+        );
 
         let muse_turn_payload: serde_json::Value = serde_json::from_str(
             r#"{
@@ -1833,7 +1875,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(detect_format(&muse_turn_payload), AgentFormat::Muse);
+        assert_eq!(detect_payload_format(&muse_turn_payload), AgentFormat::Muse);
 
         let muse_tool_use_id_payload: serde_json::Value = serde_json::from_str(
             r#"{
@@ -1844,7 +1886,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(detect_format(&muse_tool_use_id_payload), AgentFormat::Muse);
+        assert_eq!(
+            detect_payload_format(&muse_tool_use_id_payload),
+            AgentFormat::Muse
+        );
 
         let muse_camel_tool_use_id_payload: serde_json::Value = serde_json::from_str(
             r#"{
@@ -1856,7 +1901,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            detect_format(&muse_camel_tool_use_id_payload),
+            detect_payload_format(&muse_camel_tool_use_id_payload),
             AgentFormat::Muse
         );
     }
@@ -1865,15 +1910,21 @@ mod tests {
     fn detects_antigravity_and_claude_signatures() {
         let agy_val: serde_json::Value =
             serde_json::from_str(r#"{"conversationId": "123", "stepIdx": 1}"#).unwrap();
-        assert_eq!(detect_format(&agy_val), AgentFormat::Antigravity);
+        assert_eq!(detect_payload_format(&agy_val), AgentFormat::Antigravity);
 
         let tool_call_val: serde_json::Value =
             serde_json::from_str(r#"{"toolCall": {"name": "run_command"}}"#).unwrap();
-        assert_eq!(detect_format(&tool_call_val), AgentFormat::Antigravity);
+        assert_eq!(
+            detect_payload_format(&tool_call_val),
+            AgentFormat::Antigravity
+        );
 
         let hook_event_val: serde_json::Value =
             serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
-        assert_eq!(detect_format(&hook_event_val), AgentFormat::ClaudeCode);
+        assert_eq!(
+            detect_payload_format(&hook_event_val),
+            AgentFormat::ClaudeCode
+        );
 
         let claude_payload_with_transcript: serde_json::Value = serde_json::from_str(
             r#"{
@@ -1888,14 +1939,100 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            detect_format(&claude_payload_with_transcript),
+            detect_payload_format(&claude_payload_with_transcript),
             AgentFormat::ClaudeCode
         );
 
         let tool_input_val: serde_json::Value =
             serde_json::from_str(r#"{"tool_name": "Bash", "tool_input": {"command": "ls"}}"#)
                 .unwrap();
-        assert_eq!(detect_format(&tool_input_val), AgentFormat::Antigravity);
+        assert_eq!(
+            detect_payload_format(&tool_input_val),
+            AgentFormat::Antigravity
+        );
+    }
+
+    #[test]
+    fn session_env_forces_its_agent_over_payload_fields() {
+        let claude_shaped: serde_json::Value =
+            serde_json::from_str(r#"{"hook_event_name": "PreToolUse"}"#).unwrap();
+        let muse_shaped: serde_json::Value =
+            serde_json::from_str(r#"{"tool_use_id": "call_1"}"#).unwrap();
+
+        // A Muse session env wins over Claude-shaped payload fields.
+        let muse_env = FormatEnv {
+            muse_env: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            detect_format_with_env(&claude_shaped, &muse_env),
+            AgentFormat::Muse
+        );
+
+        // A Claude session env wins over Muse-shaped payload fields.
+        let claude_env = FormatEnv {
+            claude_env: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            detect_format_with_env(&muse_shaped, &claude_env),
+            AgentFormat::ClaudeCode
+        );
+
+        // Antigravity payload fields still win over either session env: they
+        // are checked before the env flags.
+        let agy_shaped: serde_json::Value =
+            serde_json::from_str(r#"{"conversationId": "123"}"#).unwrap();
+        assert_eq!(
+            detect_format_with_env(&agy_shaped, &muse_env),
+            AgentFormat::Antigravity
+        );
+        assert_eq!(
+            detect_format_with_env(&agy_shaped, &claude_env),
+            AgentFormat::Antigravity
+        );
+    }
+
+    #[test]
+    fn explicit_format_override_wins_over_everything() {
+        let agy_shaped: serde_json::Value =
+            serde_json::from_str(r#"{"conversationId": "123"}"#).unwrap();
+        for (flag, expected) in [
+            ("claude", AgentFormat::ClaudeCode),
+            ("muse", AgentFormat::Muse),
+            ("antigravity", AgentFormat::Antigravity),
+            ("generic", AgentFormat::Generic),
+        ] {
+            let via_env = FormatEnv {
+                env_format: Some(flag.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                detect_format_with_env(&agy_shaped, &via_env),
+                expected,
+                "TRIAGE_HOOK_FORMAT={flag}"
+            );
+
+            let via_argv = FormatEnv {
+                argv: vec!["triage-hook".to_string(), format!("--format={flag}")],
+                ..Default::default()
+            };
+            assert_eq!(
+                detect_format_with_env(&agy_shaped, &via_argv),
+                expected,
+                "--format={flag}"
+            );
+        }
+
+        // An unrecognized override falls through to payload detection.
+        let bogus = FormatEnv {
+            env_format: Some("bogus".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            detect_format_with_env(&agy_shaped, &bogus),
+            AgentFormat::Antigravity
+        );
     }
 
     #[test]
