@@ -47,8 +47,9 @@ Three Flutter client requests in one branch:
   60s poll keeps it current.
 - The daemon stats the filesystem holding its state dir
   (`$HOME/.local/state/triage`, falling back to `$HOME`, then `.`) via
-  `statvfs` on Unix; non-Unix reports unknown (0/0) and the client hides
-  the line.
+  `statvfs` on Unix and `GetDiskFreeSpaceExW` on Windows (caller-available
+  bytes, mirroring `f_bavail`); anything else reports unknown (0/0) and the
+  client hides the line.
 - Flat sort mode reuses the existing pin machinery: one synthetic group, no
   headers, rows by activity; drags pin session ids as usual.
 - Keyboard toggle lives on the shared accessory bar (`kbd` key), so native
@@ -68,7 +69,8 @@ Three Flutter client requests in one branch:
 ## Commits
 
 - 1601005 — feat(client): disk space line, rail sort toggle, keyboard kill switch
-- HEAD — fix(client): address PR review on disk stats, sort restore, keyboard routing
+- 456b5ca — fix(client): address PR review on disk stats, sort restore, keyboard routing
+- HEAD — feat(core): probe disk space on Windows via GetDiskFreeSpaceExW
 
 ## Progress
 
@@ -91,6 +93,14 @@ Three Flutter client requests in one branch:
   test env restores pre-load, so the race arm stays review-only). Gates:
   fmt, clippy, cargo tests, bindings check, `flutter analyze`, `flutter
   test` (607 passed); hook failure still the pre-existing ambient-env one.
+- 2026-09-26T13:10-0700: user asked why Windows disk reporting was scoped
+  out; fair point (same feature on a supported platform), so added it: new
+  target-scoped `windows-sys` dep, `#[cfg(windows)]` probe, shared
+  `disk_stats_from_bytes` tail, per-platform test gates. The Windows code is
+  validated locally via `cargo check/clippy --target
+  x86_64-pc-windows-msvc`, which caught a real bug (`PCWSTR` is a type
+  alias in windows-sys 0.61, not a constructor); execution coverage comes
+  from the CI windows leg.
 
 ## Research & Discoveries
 
