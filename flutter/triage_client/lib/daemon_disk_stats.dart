@@ -8,7 +8,9 @@ library;
 String? formatDiskFree(int freeBytes, int totalBytes) {
   if (freeBytes < 0 || totalBytes <= 0 || freeBytes > totalBytes) return null;
   final freeMb = freeBytes ~/ (1024 * 1024);
-  final percent = (freeBytes * 100 / totalBytes).round();
+  // Divide before scaling: `freeBytes * 100` overflows exact integer range on
+  // the web number type past ~90TB free, silently corrupting the percentage.
+  final percent = (freeBytes / totalBytes * 100).round();
   return '${_withThousandsSeparators(freeMb)} MB free ($percent%)';
 }
 

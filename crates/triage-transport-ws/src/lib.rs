@@ -901,6 +901,50 @@ mod tests {
 
     use super::*;
 
+    /// Disk stats in a response are a live probe: exact bytes can shift
+    /// between the handler's probe and any re-probe (other processes, temp
+    /// files), so assert the invariant rather than exact equality. Unknown
+    /// (0/0) is accepted: some platforms cannot probe at all.
+    fn assert_disk_invariant(free_bytes: u64, total_bytes: u64) {
+        if free_bytes == 0 && total_bytes == 0 {
+            return;
+        }
+        assert!(
+            total_bytes > 0,
+            "disk total must be positive, got {total_bytes}"
+        );
+        assert!(
+            free_bytes <= total_bytes,
+            "disk free {free_bytes} exceeds total {total_bytes}"
+        );
+    }
+
+    /// Asserts a hello result's stable fields exactly; disk stats go through
+    /// [`assert_disk_invariant`].
+    fn assert_hello_result(result: ServerResult, authenticated: bool) {
+        match result {
+            ServerResult::Hello {
+                protocol_version,
+                authenticated: actual,
+                server_version,
+                update_available,
+                latest_version,
+                disk_free_bytes,
+                disk_total_bytes,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(actual, authenticated);
+                // FakeSessionApi uses the default `server_update_info`: its
+                // own crate version and no newer release known.
+                assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
+                assert!(!update_available);
+                assert_eq!(latest_version, None);
+                assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     #[test]
     fn hello_reports_protocol_version() {
         let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
@@ -913,26 +957,26 @@ mod tests {
             },
         });
 
-        // The hello handler reports this machine's live disk stats; the
-        // expectation reads the same probe rather than a fixed number.
-        let disk = triage_core::disk::daemon_disk_stats();
-        assert_eq!(
-            response,
-            ServerMessage::Response {
-                id: Some(json!(1)),
-                result: ServerResult::Hello {
-                    protocol_version: PROTOCOL_VERSION.to_string(),
-                    authenticated: true,
-                    // FakeSessionApi uses the default `server_update_info`: its
-                    // own crate version and no newer release known.
-                    server_version: env!("CARGO_PKG_VERSION").to_string(),
-                    update_available: false,
-                    latest_version: None,
-                    disk_free_bytes: disk.map(|d| d.free_bytes).unwrap_or(0),
-                    disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
-                },
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!(1)));
+                assert_hello_result(result, true);
             }
-        );
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_invariant_accepts_unknown_and_valid_volumes() {
+        assert_disk_invariant(0, 0);
+        assert_disk_invariant(25, 100);
+        assert_disk_invariant(100, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds total")]
+    fn disk_invariant_rejects_free_above_total() {
+        assert_disk_invariant(101, 100);
     }
 
     #[test]
@@ -1566,19 +1610,7 @@ mod tests {
         match response {
             ServerMessage::Response { id, result } => {
                 assert_eq!(id, Some(json!("hello-req")));
-                let disk = triage_core::disk::daemon_disk_stats();
-                assert_eq!(
-                    result,
-                    ServerResult::Hello {
-                        protocol_version: PROTOCOL_VERSION.to_string(),
-                        authenticated: true,
-                        server_version: env!("CARGO_PKG_VERSION").to_string(),
-                        update_available: false,
-                        latest_version: None,
-                        disk_free_bytes: disk.map(|d| d.free_bytes).unwrap_or(0),
-                        disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
-                    }
-                );
+                assert_hello_result(result, true);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1614,19 +1646,7 @@ mod tests {
         match response {
             ServerMessage::Response { id, result } => {
                 assert_eq!(id, Some(json!("hello-req")));
-                let disk = triage_core::disk::daemon_disk_stats();
-                assert_eq!(
-                    result,
-                    ServerResult::Hello {
-                        protocol_version: PROTOCOL_VERSION.to_string(),
-                        authenticated: false,
-                        server_version: env!("CARGO_PKG_VERSION").to_string(),
-                        update_available: false,
-                        latest_version: None,
-                        disk_free_bytes: disk.map(|d| d.free_bytes).unwrap_or(0),
-                        disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
-                    }
-                );
+                assert_hello_result(result, false);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1676,16 +1696,9 @@ mod tests {
         assert_eq!(hello.server_version().unwrap(), env!("CARGO_PKG_VERSION"));
         assert!(!hello.update_available());
         assert!(hello.latest_version().is_none());
-        // Disk fields ride the handshake too: live probe, or 0/0 unknown.
-        let disk = triage_core::disk::daemon_disk_stats();
-        assert_eq!(
-            hello.disk_free_bytes(),
-            disk.map(|d| d.free_bytes).unwrap_or(0)
-        );
-        assert_eq!(
-            hello.disk_total_bytes(),
-            disk.map(|d| d.total_bytes).unwrap_or(0)
-        );
+        // Disk fields ride the handshake too, as a live probe: assert the
+        // invariant, not exact bytes.
+        assert_disk_invariant(hello.disk_free_bytes(), hello.disk_total_bytes());
     }
 
     #[test]
@@ -1921,7 +1934,6 @@ mod tests {
         let response =
             connection.handle_text_message(r#"{"id":"stats-1","type":"get_daemon_stats"}"#);
         let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
-        let expected = triage_core::disk::daemon_disk_stats();
         match decoded {
             ServerMessage::Response {
                 id: Some(id),
@@ -1932,11 +1944,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(id, json!("stats-1"));
-                assert_eq!(disk_free_bytes, expected.map(|d| d.free_bytes).unwrap_or(0));
-                assert_eq!(
-                    disk_total_bytes,
-                    expected.map(|d| d.total_bytes).unwrap_or(0)
-                );
+                assert_disk_invariant(disk_free_bytes, disk_total_bytes);
             }
             other => panic!("unexpected response: {other:?}"),
         }

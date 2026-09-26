@@ -41,6 +41,10 @@ Three Flutter client requests in one branch:
 - Disk stats ride the existing `hello` handshake (`HelloResult` gains
   `disk_free_bytes` / `disk_total_bytes`) rather than a new request type, so
   no new flatbuffers request/response plumbing is needed on either side.
+  Amended during the branch (see the plan amendment): a pollable
+  `get_daemon_stats` request was added alongside the hello fields, since the
+  figure must refresh during long sessions; hello seeds it on connect and a
+  60s poll keeps it current.
 - The daemon stats the filesystem holding its state dir
   (`$HOME/.local/state/triage`, falling back to `$HOME`, then `.`) via
   `statvfs` on Unix; non-Unix reports unknown (0/0) and the client hides
@@ -63,7 +67,8 @@ Three Flutter client requests in one branch:
 
 ## Commits
 
-- HEAD — feat(client): disk space line, rail sort toggle, keyboard kill switch
+- 1601005 — feat(client): disk space line, rail sort toggle, keyboard kill switch
+- HEAD — fix(client): address PR review on disk stats, sort restore, keyboard routing
 
 ## Progress
 
@@ -72,6 +77,20 @@ Three Flutter client requests in one branch:
   `cargo fmt --check`, clippy `-D warnings`, workspace tests (minus the
   pre-existing hook failure), Dart bindings `--check`, `flutter analyze`,
   `flutter test` (561 passed). Left uncommitted for review.
+- 2026-09-26T10:26-0700: addressed Copilot + Antigravity review on PR #181.
+  Disk-test flake fixed via invariant assertions; `hardwareKeyboardOnly`
+  desktop regression fixed via extracted `terminalHardwareKeyboardOnly`
+  predicate; `_restorePins` re-groups on restored sort mode; flat mode
+  returns no groups for no sessions; focus retries gated on suppression;
+  `f_frsize == 0` falls back to `f_bsize`; percent divides before scaling;
+  collapsed tooltip carries disk status; poll guard checks `mounted`.
+  Windows disk probing left out of scope (new platform feature; non-Unix
+  reports unknown by design and the client hides the line). New widget test
+  pins flat rail under daemon pins with stored byActivity; revert runs show
+  it fails without the mode restore and passes without the race branch (the
+  test env restores pre-load, so the race arm stays review-only). Gates:
+  fmt, clippy, cargo tests, bindings check, `flutter analyze`, `flutter
+  test` (607 passed); hook failure still the pre-existing ambient-env one.
 
 ## Research & Discoveries
 

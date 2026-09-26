@@ -19,6 +19,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/mobile_auto_space.dart';
+import 'package:triage_client/terminal/terminal_keyboard_mode.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/platform_env_io.dart';
@@ -1877,15 +1878,21 @@ class _TerminalPaneState extends State<TerminalPane> {
                                   scrollController: _scrollController,
                                   onKeyEvent: _handleTerminalKeyEvent,
                                   textStyle: _textStyle,
-                                  // Desktop uses the hardware-keyboard path instead of
-                                  // xterm's hidden IME TextInput connection: on macOS the
-                                  // IME path desyncs Flutter's HardwareKeyboard state
-                                  // ("physical key already pressed") and swallows
-                                  // keystrokes. Mobile must use the IME path, though: it
-                                  // is what raises the soft keyboard, so disabling it
-                                  // leaves a phone unable to type — which is exactly
-                                  // what the soft-keyboard kill switch asks for.
-                                  hardwareKeyboardOnly: !_mayTakeFocus,
+                                  // Desktop always takes the hardware-keyboard path
+                                  // instead of xterm's hidden IME TextInput connection:
+                                  // on macOS the IME path desyncs Flutter's
+                                  // HardwareKeyboard state ("physical key already
+                                  // pressed") and swallows keystrokes. Mobile must use
+                                  // the IME path, though: it is what raises the soft
+                                  // keyboard, so disabling it leaves a phone unable to
+                                  // type — which is exactly what the soft-keyboard kill
+                                  // switch asks for.
+                                  hardwareKeyboardOnly:
+                                      terminalHardwareKeyboardOnly(
+                                        isMobile: _isMobile,
+                                        softKeyboardEnabled:
+                                            widget.softKeyboardEnabled,
+                                      ),
                                 ),
                               ),
                             ),

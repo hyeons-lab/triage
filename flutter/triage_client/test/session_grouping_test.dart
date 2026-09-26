@@ -297,4 +297,30 @@ void main() {
       );
     });
   });
+
+  group('flatSessionGroups', () {
+    test('no sessions yields no groups, matching repo grouping', () {
+      expect(flatSessionGroups([]), isEmpty);
+    });
+
+    test('one group holds every session in activity order', () {
+      final groups = flatSessionGroups([
+        session('session-1', repo: '/a', activity: 100),
+        session('session-2', repo: '/b', activity: 300),
+        session('session-3', repo: '/a', activity: 200),
+      ]);
+      expect(groups, hasLength(1));
+      expect(groups.single.repoRoot, isNull);
+      expect(groups.single.sessionIds, ['session-2', 'session-3', 'session-1']);
+      expect(groups.single.lastActivityMs, 300);
+    });
+
+    test('session pins hoist within the single group', () {
+      final groups = flatSessionGroups([
+        session('session-1', repo: '/a', activity: 300),
+        session('session-2', repo: '/b', activity: 200),
+      ], pins: const SessionPins(sessionIds: ['session-2']));
+      expect(groups.single.sessionIds, ['session-2', 'session-1']);
+    });
+  });
 }

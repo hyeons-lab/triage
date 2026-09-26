@@ -2100,6 +2100,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       final stats = await _client.getDaemonStats();
       if (_disposed ||
+          !mounted ||
           generation != _connectGeneration ||
           serverId != _activeServerId ||
           stats == null) {
@@ -2839,13 +2840,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // order and assumes the pinned block already leads it, so the next drag
       // would compute its prefix against the wrong list and drop pins. Re-group
       // instead, without persisting, since this is what storage already says.
-      if (!restored.isEmpty && _sessionsServerId == serverId) {
-        _applyPins(restored, persist: false, syncToDaemon: false);
-      } else if (_pins.isEmpty) {
-        _pins = restored;
-        if (modeChanged && _sessionsServerId == serverId) {
+      // A restored sort mode re-groups on its own too: local pins may be
+      // absent while daemon-supplied pins are active (or none are), and the
+      // mode must not wait for a pin change to take effect.
+      if (_sessionsServerId == serverId) {
+        if (!restored.isEmpty) {
+          _applyPins(restored, persist: false, syncToDaemon: false);
+        } else if (modeChanged) {
           _applyPins(_pins, persist: false, syncToDaemon: false);
         }
+      } else if (_pins.isEmpty) {
+        _pins = restored;
       }
     } catch (_) {
       // Pinning is a best-effort convenience; ignore load failures.
@@ -3110,11 +3115,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _groupOrderingInputs(_orderingInputs(), pins);
 
   /// Groups [inputs] for the current [_railSortMode].
-  ///
-  /// Activity mode yields one group holding every session in flat
-  /// activity order: `buildRailItems` suppresses the header for a single
-  /// group, and a drag there pins session ids across the whole list, which
-  /// stays meaningful when the mode flips back.
   List<SessionGroup> _groupOrderingInputs(
     List<SessionOrderingInput> inputs,
     SessionPins pins,
@@ -3122,17 +3122,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (_railSortMode == SessionRailSortMode.byRepo) {
       return groupSessionsByRepo(inputs, pins: pins);
     }
-    var newest = 0;
-    for (final input in inputs) {
-      if (input.lastActivityMs > newest) newest = input.lastActivityMs;
-    }
-    return [
-      SessionGroup(
-        repoRoot: null,
-        sessionIds: orderSessionsByActivity(inputs, pins: pins),
-        lastActivityMs: newest,
-      ),
-    ];
+    return flatSessionGroups(inputs, pins: pins);
   }
 
   /// Re-applies [pins], reordering the rail and keeping the selection on the
@@ -5838,9 +5828,11 @@ class _SessionRailState extends State<SessionRail> {
         ),
         const SizedBox(height: 16),
         Tooltip(
-          message: widget.serverLabel == null
-              ? widget.connectionStatus
-              : '${widget.serverLabel} — ${widget.connectionStatus}',
+          message: [
+            if (widget.serverLabel != null) widget.serverLabel!,
+            widget.connectionStatus,
+            if (widget.diskStatus != null) widget.diskStatus!,
+          ].join(' — '),
           child: Container(
             width: 10,
             height: 10,

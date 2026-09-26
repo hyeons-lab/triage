@@ -863,6 +863,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _scheduleFocusRetries({bool force = false}) {
     _clearFocusRetryTimers();
+    // Suppressed on mobile: retries exist to land textarea focus, which the
+    // kill switch forbids — scheduling them would fire three pointless timer
+    // wakes per call. Gated here rather than at each call site so every
+    // present and future caller is covered.
+    if (!_mayTakeFocus) return;
     for (final delayMs in const [50, 150, 300]) {
       late final Timer timer;
       timer = Timer(Duration(milliseconds: delayMs), () {

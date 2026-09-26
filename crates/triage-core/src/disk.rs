@@ -37,14 +37,35 @@ fn filesystem_stats(path: &std::path::Path) -> Option<DiskStats> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    // `as u64` (not `u64::from`): these fields are u64 on Linux but u32 on
-    // macOS, and the widening cast compiles on both.
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
-    let block = (stat.f_frsize as u64).max(1);
+    stats_from_statvfs(&stat)
+}
+
+/// Converts a `statvfs` result into bytes. Split from the syscall so the
+/// arithmetic (including the zero-`f_frsize` fallback) is unit-testable
+/// without a filesystem that produces one.
+#[cfg(unix)]
+// The `as u64` casts below are each a no-op on exactly one of Linux/macOS
+// (the field widths differ per platform); the widening cast is what compiles
+// on both, so the lint is wrong on whichever platform it fires on.
+#[allow(clippy::unnecessary_cast)]
+fn stats_from_statvfs(stat: &libc::statvfs) -> Option<DiskStats> {
+    // `f_frsize` can read 0 on some kernels and network mounts; fall back
+    // to `f_bsize` rather than pricing every block at one byte. Both zero
+    // means no usable block size at all: report unknown rather than
+    // fabricating byte counts at an invented 1 byte/block.
+    let frsize = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else if stat.f_bsize > 0 {
+        stat.f_bsize
+    } else {
+        return None;
+    };
+    let block = frsize as u64;
     let total_bytes = (stat.f_blocks as u64).saturating_mul(block);
     // `f_bavail` (unprivileged-available), not `f_bfree`: the reserved
     // root blocks are not free space the daemon can use.
@@ -85,5 +106,65 @@ mod tests {
     fn missing_path_reports_unknown() {
         let missing = std::path::PathBuf::from("definitely-not-a-real-triage-dir-000154");
         assert_eq!(filesystem_stats(&missing), None);
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn zero_frsize_falls_back_to_bsize() {
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        stat.f_frsize = 0;
+        stat.f_bsize = 4096;
+        stat.f_blocks = 100;
+        stat.f_bavail = 25;
+        assert_eq!(
+            stats_from_statvfs(&stat),
+            Some(DiskStats {
+                free_bytes: 25 * 4096,
+                total_bytes: 100 * 4096,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn double_zero_block_size_reports_unknown() {
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        stat.f_frsize = 0;
+        stat.f_bsize = 0;
+        stat.f_blocks = 100;
+        stat.f_bavail = 25;
+        assert_eq!(stats_from_statvfs(&stat), None);
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn zero_blocks_reports_unknown() {
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        stat.f_frsize = 4096;
+        stat.f_bsize = 4096;
+        stat.f_blocks = 0;
+        stat.f_bavail = 0;
+        assert_eq!(stats_from_statvfs(&stat), None);
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn free_clamps_to_total() {
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        stat.f_frsize = 4096;
+        stat.f_bsize = 4096;
+        stat.f_blocks = 100;
+        stat.f_bavail = 150;
+        assert_eq!(
+            stats_from_statvfs(&stat),
+            Some(DiskStats {
+                free_bytes: 100 * 4096,
+                total_bytes: 100 * 4096,
+            })
+        );
     }
 }

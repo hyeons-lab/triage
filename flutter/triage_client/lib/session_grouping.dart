@@ -294,6 +294,29 @@ List<String> orderSessionsByActivity(
   );
 }
 
+/// Builds the rail's flat activity view: no groups for no sessions (matching
+/// [groupSessionsByRepo]), otherwise one group holding every session in
+/// activity order. A single group renders headerless via `buildRailItems`,
+/// and a drag there pins session ids across the whole list, which stays
+/// meaningful when the mode flips back.
+List<SessionGroup> flatSessionGroups(
+  List<SessionOrderingInput> sessions, {
+  SessionPins pins = SessionPins.none,
+}) {
+  if (sessions.isEmpty) return const [];
+  var newest = 0;
+  for (final session in sessions) {
+    if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+  }
+  return [
+    SessionGroup(
+      repoRoot: null,
+      sessionIds: orderSessionsByActivity(sessions, pins: pins),
+      lastActivityMs: newest,
+    ),
+  ];
+}
+
 /// Drops one trailing `/`, except from the filesystem root itself.
 ///
 /// The rail derives a group key, a group header label, and a session title from
