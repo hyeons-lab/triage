@@ -6,10 +6,12 @@ import 'package:flutter/material.dart';
 /// horizontally so it fits narrow phones.
 ///
 /// Purely presentational: each key reports its byte sequence through [onSend],
-/// except the sticky Ctrl toggle, which reports through [onToggleCtrl], and
-/// the paste key, which reports through [onPaste]. The caller owns the armed
-/// state and passes it back as [ctrlArmed] to light the key. Keeping the two
-/// panes' bars as one widget means they can never drift.
+/// except the sticky Ctrl toggle, which reports through [onToggleCtrl], the
+/// paste key, which reports through [onPaste], and the keyboard toggle, which
+/// reports through [onToggleKeyboard]. The caller owns the armed and keyboard
+/// states and passes them back as [ctrlArmed] and [keyboardEnabled] to light
+/// the keys. Keeping the two panes' bars as one widget means they can never
+/// drift.
 class TerminalAccessoryBar extends StatelessWidget {
   const TerminalAccessoryBar({
     super.key,
@@ -17,6 +19,8 @@ class TerminalAccessoryBar extends StatelessWidget {
     required this.onToggleCtrl,
     required this.onPaste,
     required this.ctrlArmed,
+    this.onToggleKeyboard,
+    this.keyboardEnabled = true,
   });
 
   /// Called with the raw byte sequence a key emits (e.g. `'\x1b'` for esc).
@@ -34,6 +38,15 @@ class TerminalAccessoryBar extends StatelessWidget {
   /// Whether sticky Ctrl is currently armed, to highlight the key.
   final bool ctrlArmed;
 
+  /// Called when the soft-keyboard toggle key is tapped; the caller flips
+  /// [keyboardEnabled]. Null hides the key (callers that do not offer the
+  /// toggle).
+  final VoidCallback? onToggleKeyboard;
+
+  /// Whether the soft keyboard may raise. The key lights while suppressed
+  /// (the non-default latched state, like [ctrlArmed]).
+  final bool keyboardEnabled;
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -43,6 +56,8 @@ class TerminalAccessoryBar extends StatelessWidget {
         scrollDirection: Axis.horizontal,
         child: Row(
           children: [
+            if (onToggleKeyboard != null)
+              _key('kbd', onToggleKeyboard!, active: !keyboardEnabled),
             _key('esc', () => onSend('\x1b')),
             _key('ctrl', onToggleCtrl, active: ctrlArmed),
             _key('tab', () => onSend('\t')),

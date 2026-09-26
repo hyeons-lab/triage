@@ -116,4 +116,79 @@ void main() {
     expect(bar.sent, isEmpty);
     expect(bar.ctrlToggles(), 0);
   });
+
+  Future<int Function()> pumpKbdBar(
+    WidgetTester tester, {
+    bool keyboardEnabled = true,
+    bool withHandler = true,
+  }) async {
+    var toggles = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: TerminalAccessoryBar(
+              onSend: (_) {},
+              onToggleCtrl: () {},
+              onPaste: () {},
+              ctrlArmed: false,
+              onToggleKeyboard: withHandler ? () => toggles++ : null,
+              keyboardEnabled: keyboardEnabled,
+            ),
+          ),
+        ),
+      ),
+    );
+    return () => toggles;
+  }
+
+  Color kbdKeyColor(WidgetTester tester) {
+    final container = tester.widget<Container>(
+      find
+          .ancestor(of: find.text('kbd'), matching: find.byType(Container))
+          .first,
+    );
+    return (container.decoration as BoxDecoration).color!;
+  }
+
+  testWidgets('kbd reports through onToggleKeyboard, not onSend', (
+    tester,
+  ) async {
+    final sent = <String>[];
+    var toggles = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TerminalAccessoryBar(
+            onSend: sent.add,
+            onToggleCtrl: () {},
+            onPaste: () {},
+            ctrlArmed: false,
+            onToggleKeyboard: () => toggles++,
+          ),
+        ),
+      ),
+    );
+    await tapKey(tester, 'kbd');
+    expect(toggles, 1);
+    expect(sent, isEmpty);
+  });
+
+  testWidgets('kbd hides without a handler', (tester) async {
+    await pumpKbdBar(tester, withHandler: false);
+    expect(find.text('kbd'), findsNothing);
+    // The input keys are unaffected.
+    expect(find.text('esc'), findsOneWidget);
+  });
+
+  testWidgets('the kbd key is highlighted only while suppressed', (
+    tester,
+  ) async {
+    await pumpKbdBar(tester, keyboardEnabled: true);
+    expect(kbdKeyColor(tester), const Color(0xff232c2f));
+
+    await pumpKbdBar(tester, keyboardEnabled: false);
+    expect(kbdKeyColor(tester), const Color(0xff2b6a63));
+  });
 }

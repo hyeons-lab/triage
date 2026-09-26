@@ -12,6 +12,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:triage_client/daemon_disk_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -940,6 +941,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // as that attempt settles. See `_connectWebSocket`.
   bool _reconnectRequested = false;
   Timer? _credentialStorageTimer;
+  // Refreshes [_daemonStats] while connected; disk pressure builds over the
+  // course of a session, so a connect-time reading alone goes stale.
+  Timer? _daemonStatsTimer;
+  // The active daemon's disk stats, seeded from the hello handshake and kept
+  // current by [_daemonStatsTimer]. Null while unknown (no connection, or a
+  // daemon predating stats), which hides the free-space line.
+  DaemonStatsRecord? _daemonStats;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
   bool _storageBackedClientId = false;
@@ -957,6 +965,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   DateTime? _pairingExpiresAt;
   String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
+  // Mobile soft-keyboard kill switch, persisted globally. While false the
+  // terminal panes neither take focus nor open their IME path, so the
+  // keyboard stays down. Desktop ignores it.
+  bool _softKeyboardEnabled = true;
   // The daemons this device knows about, and which one we are connected to.
   // Empty until a saved/entered server resolves (then the connection screen is
   // shown).
@@ -1001,6 +1013,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Groups and sessions the user placed by hand, which hold their slot instead
   // of flowing with activity. Loaded per server alongside the session list.
   SessionPins _pins = SessionPins.none;
+  // How the rail orders its rows. Per server like the pins; defaults to the
+  // repository grouping.
+  SessionRailSortMode _railSortMode = SessionRailSortMode.byRepo;
   // User-assigned custom labels for sessions, keyed by session id. Loaded per server.
   Map<String, String> _customLabels = {};
   // Reaches the rail list's state so a re-group can cancel a drag in progress
@@ -1105,6 +1120,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   DateTime _lastWatchdogTick = DateTime.now();
   static const Duration _wakeWatchdogInterval = Duration(seconds: 4);
   static const Duration _wakeWatchdogGap = Duration(seconds: 30);
+  // Daemon disk-stats refresh cadence. Disk pressure builds over minutes, so a
+  // minute keeps the free-space line honest without chattering the socket.
+  static const Duration _daemonStatsPollInterval = Duration(seconds: 60);
 
   @override
   void initState() {
@@ -1118,6 +1136,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // reads the cache synchronously rather than awaiting prefs.
     unawaited(_restorePins());
     unawaited(_restoreCustomLabels());
+    unawaited(_restoreSoftKeyboard());
     _lastWatchdogTick = DateTime.now();
     _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
       final now = DateTime.now();
@@ -1375,6 +1394,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // and ids that mean nothing on that machine.
     _pins = SessionPins.none;
     _customLabels = {};
+    _railSortMode = SessionRailSortMode.byRepo;
+    _stopDaemonStatsPolling();
+    _daemonStats = null;
   }
 
   /// Renames a daemon or re-points it at a new address.
@@ -1696,6 +1718,35 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       _selectedSession.focusCursorOnNextDisplay();
     });
+  }
+
+  /// Restores the soft-keyboard kill switch. Global, so no server guards.
+  Future<void> _restoreSoftKeyboard() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_disposed) return;
+      final enabled = prefs.getBool(softKeyboardEnabledPrefKey) ?? true;
+      if (enabled != _softKeyboardEnabled && mounted) {
+        setState(() => _softKeyboardEnabled = enabled);
+      }
+    } catch (_) {
+      // Best-effort; a failed read leaves the keyboard enabled.
+    }
+  }
+
+  /// Flips the soft-keyboard kill switch from the accessory bar's `kbd` key.
+  void _toggleSoftKeyboard() {
+    setState(() => _softKeyboardEnabled = !_softKeyboardEnabled);
+    unawaited(_persistSoftKeyboard(_softKeyboardEnabled));
+  }
+
+  Future<void> _persistSoftKeyboard(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(softKeyboardEnabledPrefKey, enabled);
+    } catch (_) {
+      // Best-effort; ignore persistence failures.
+    }
   }
 
   String _loadOrCreateClientId() {
@@ -2033,6 +2084,38 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
   }
 
+  /// Polls daemon disk stats for the free-space line while this connection
+  /// lives. Guarded by generation and server id like the connect itself, so a
+  /// tick that lands after a switch or reconnect never writes the new
+  /// connection's reading with the old daemon's.
+  void _startDaemonStatsPolling(int generation, String serverId) {
+    _daemonStatsTimer?.cancel();
+    _daemonStatsTimer = Timer.periodic(_daemonStatsPollInterval, (_) async {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId ||
+          !_clientInitialized ||
+          !_client.isConnected) {
+        return;
+      }
+      final stats = await _client.getDaemonStats();
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId ||
+          stats == null) {
+        return;
+      }
+      // A null read is a failed poll (or a daemon predating stats): keep the
+      // last reading rather than flickering the line in and out.
+      setState(() => _daemonStats = stats);
+    });
+  }
+
+  void _stopDaemonStatsPolling() {
+    _daemonStatsTimer?.cancel();
+    _daemonStatsTimer = null;
+  }
+
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
     if (_disposed) return;
     // Nothing to dial. Without this, a connect raised while the connection
@@ -2053,6 +2136,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _isConnecting = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _stopDaemonStatsPolling();
     final generation = ++_connectGeneration;
     if (_clientInitialized) {
       final subscription = _websocketSubscription;
@@ -2099,6 +2183,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       _connectionStatus = 'Connecting...';
       _connectionStatusColor = const Color(0xffffc857);
+      // The hello handshake re-seeds this; until then the previous daemon's
+      // reading (if any) must not linger under the new status.
+      _daemonStats = null;
     });
 
     try {
@@ -2147,7 +2234,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _pairingChallengeError = null;
         _connectionStatus = 'Connected to Daemon';
         _connectionStatusColor = const Color(0xff7fd1c7);
+        _daemonStats = daemonStatsFromResponse(helloRes);
       });
+      _startDaemonStatsPolling(generation, serverId);
 
       await _loadDaemonSessions();
       _reconnectAttempt = 0;
@@ -2714,7 +2803,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Primes [_pins] from this server's stored pins, in the background.
+  /// Primes [_pins] and [_railSortMode] from this server's stored rail state,
+  /// in the background.
   ///
   /// Runs off the load path deliberately, which then reads [_pins] synchronously.
   /// `SharedPreferences.getInstance()` completes only once its platform channel
@@ -2735,6 +2825,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionIds:
             prefs.getStringList(pinnedSessionsPrefKeyFor(serverId)) ?? [],
       );
+      // The sort mode restores on the same read. Assigned before the pins
+      // branch so a re-group it triggers already orders by the stored mode.
+      final restoredMode =
+          prefs.getString(railSortModePrefKeyFor(serverId)) == 'byActivity'
+          ? SessionRailSortMode.byActivity
+          : SessionRailSortMode.byRepo;
+      final modeChanged = restoredMode != _railSortMode;
+      _railSortMode = restoredMode;
       // A load that finished while this read was in flight grouped the rail with
       // no pins, so assigning the field alone would leave [_pins] describing a
       // layout [_sessionGroups] does not have. `pinPrefixTo` reads the displayed
@@ -2745,6 +2843,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _applyPins(restored, persist: false, syncToDaemon: false);
       } else if (_pins.isEmpty) {
         _pins = restored;
+        if (modeChanged && _sessionsServerId == serverId) {
+          _applyPins(_pins, persist: false, syncToDaemon: false);
+        }
       }
     } catch (_) {
       // Pinning is a best-effort convenience; ignore load failures.
@@ -2772,12 +2873,31 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _persistRailSortMode() async {
+    final serverId = _activeServerId;
+    // Same guard as [_persistPins]: never write the outgoing daemon's tiles'
+    // mode under the incoming daemon's key.
+    if (_sessionsServerId != serverId) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        railSortModePrefKeyFor(serverId),
+        _railSortMode == SessionRailSortMode.byActivity
+            ? 'byActivity'
+            : 'byRepo',
+      );
+    } catch (_) {
+      // Best-effort like the pins; ignore persistence failures.
+    }
+  }
+
   Future<void> _clearPinsFor(String serverId) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(pinnedGroupsPrefKeyFor(serverId));
       await prefs.remove(pinnedSessionsPrefKeyFor(serverId));
       await prefs.remove(sessionCustomLabelsPrefKeyFor(serverId));
+      await prefs.remove(railSortModePrefKeyFor(serverId));
     } catch (_) {
       // Best-effort; ignore removal failures.
     }
@@ -2981,7 +3101,39 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// with a visibly grouped rail whose gestures silently did nothing, which is
   /// the opposite of what the guard is for.
   bool get _railGroupingIsCollapsed =>
-      _railGroupingDegraded && _sessionGroups.length <= 1;
+      _railSortMode == SessionRailSortMode.byRepo &&
+      _railGroupingDegraded &&
+      _sessionGroups.length <= 1;
+
+  /// Groups the rail's sessions for the current [_railSortMode].
+  List<SessionGroup> _groupRailSessions(SessionPins pins) =>
+      _groupOrderingInputs(_orderingInputs(), pins);
+
+  /// Groups [inputs] for the current [_railSortMode].
+  ///
+  /// Activity mode yields one group holding every session in flat
+  /// activity order: `buildRailItems` suppresses the header for a single
+  /// group, and a drag there pins session ids across the whole list, which
+  /// stays meaningful when the mode flips back.
+  List<SessionGroup> _groupOrderingInputs(
+    List<SessionOrderingInput> inputs,
+    SessionPins pins,
+  ) {
+    if (_railSortMode == SessionRailSortMode.byRepo) {
+      return groupSessionsByRepo(inputs, pins: pins);
+    }
+    var newest = 0;
+    for (final input in inputs) {
+      if (input.lastActivityMs > newest) newest = input.lastActivityMs;
+    }
+    return [
+      SessionGroup(
+        repoRoot: null,
+        sessionIds: orderSessionsByActivity(inputs, pins: pins),
+        lastActivityMs: newest,
+      ),
+    ];
+  }
 
   /// Re-applies [pins], reordering the rail and keeping the selection on the
   /// same session rather than the same index.
@@ -2993,7 +3145,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     bool persist = true,
     bool syncToDaemon = true,
   }) {
-    final groups = groupSessionsByRepo(_orderingInputs(), pins: pins);
+    final groups = _groupRailSessions(pins);
     final order = flattenGroups(groups);
     final byId = <String, SessionVm>{
       for (final session in _sessions)
@@ -3064,6 +3216,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// Drops every pin, returning the whole rail to activity ordering.
   void _resetRailOrder() => _applyPins(SessionPins.none);
 
+  /// Flips the rail between repository grouping and flat activity order.
+  ///
+  /// Pins are kept: session pins hoist in both modes, and group pins simply
+  /// have nothing to hold onto while flat, then apply again on the way back.
+  void _toggleRailSortMode() {
+    setState(() {
+      _railSortMode = _railSortMode == SessionRailSortMode.byRepo
+          ? SessionRailSortMode.byActivity
+          : SessionRailSortMode.byRepo;
+    });
+    _regroupRail();
+    unawaited(_persistRailSortMode());
+  }
+
   /// Releases one group back to activity ordering, leaving other pins alone.
   void _unpinGroup(String groupKey) =>
       _applyPins(unpin(_pins, groupKey: groupKey));
@@ -3082,14 +3248,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, SessionContextRecord> contexts,
     SessionPins pins,
   ) {
-    return groupSessionsByRepo([
+    return _groupOrderingInputs([
       for (final sessionId in sessionIds)
         SessionOrderingInput(
           sessionId: sessionId,
           repoRoot: contexts[sessionId]?.repositoryRoot,
           lastActivityMs: contexts[sessionId]?.lastActivityMs ?? 0,
         ),
-    ], pins: pins);
+    ], pins);
   }
 
   // Placeholder rail row for a daemon session. [loading] true means it is being
@@ -4093,9 +4259,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _onWebSocketError(dynamic error, int generation) {
     if (_disposed || generation != _connectGeneration) return;
+    _stopDaemonStatsPolling();
     setState(() {
       _connectionStatus = 'Error';
       _connectionStatusColor = const Color(0xffff6b6b);
+      _daemonStats = null;
       _markAttachedSessionsDisconnected();
     });
     _scheduleReconnect();
@@ -4103,9 +4271,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
+    _stopDaemonStatsPolling();
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
+      _daemonStats = null;
       if (_needsPairing) {
         _pairingChallengeLoading = false;
         _pairingChallengeError =
@@ -4121,6 +4291,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _wakeWatchdogTimer?.cancel();
+    _stopDaemonStatsPolling();
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
@@ -5240,6 +5411,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionGroups: _sessionGroups,
         pins: _pins,
         onResetOrder: _resetRailOrder,
+        sortMode: _railSortMode,
+        onToggleSortMode: _toggleRailSortMode,
         onUnpinGroup: _unpinGroup,
         onUnpinSession: _unpinSession,
         onSessionContextMenu: _showSessionContextMenu,
@@ -5268,6 +5441,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         connectionStatus: _connectionStatus,
         connectionStatusColor: _connectionStatusColor,
         serverLabel: _activeServer?.label,
+        diskStatus: _daemonStats == null
+            ? null
+            : formatDiskFree(
+                _daemonStats!.diskFreeBytes,
+                _daemonStats!.diskTotalBytes,
+              ),
         onOpenSettings: _openConnectionSettings,
         onToggleJudgePolicy: _toggleSessionJudgePolicy,
         isCollapsed: isMobile ? false : _sidebarCollapsed,
@@ -5314,6 +5493,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
+              softKeyboardEnabled: _softKeyboardEnabled,
+              onToggleSoftKeyboard: _toggleSoftKeyboard,
             );
 
       if (isMobile) {
@@ -5401,6 +5582,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 /// keeps the row's own background: the rail paints its tiles itself, and an
 /// opaque `Material` underneath them would flash the theme's surface colour for
 /// the duration of the drag.
+/// How the session rail orders its rows.
+enum SessionRailSortMode {
+  /// Repository groups, each ordered by activity (the default).
+  byRepo,
+
+  /// A single flat list ordered by last interaction, ignoring repositories.
+  byActivity,
+}
+
 Widget _railDragProxyDecorator(
   Widget child,
   int index,
@@ -5423,6 +5613,8 @@ class SessionRail extends StatefulWidget {
     required this.sessionGroups,
     required this.pins,
     required this.onResetOrder,
+    required this.sortMode,
+    required this.onToggleSortMode,
     required this.onUnpinGroup,
     required this.onUnpinSession,
     required this.selectedIndex,
@@ -5438,6 +5630,7 @@ class SessionRail extends StatefulWidget {
     required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
+    this.diskStatus,
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
@@ -5459,6 +5652,10 @@ class SessionRail extends StatefulWidget {
   final SessionPins pins;
   // Drops every pin, returning the rail to activity ordering.
   final VoidCallback onResetOrder;
+  // How the rail orders its rows, and the toggle that flips it. The button
+  // shows the mode a tap switches *to*.
+  final SessionRailSortMode sortMode;
+  final VoidCallback onToggleSortMode;
   // Release a single group or row, leaving the rest of the layout intact. Bound
   // to the pin indicator itself rather than a context menu: on touch, the rail's
   // long-press is already the drag trigger, so a menu would compete with it.
@@ -5502,6 +5699,9 @@ class SessionRail extends StatefulWidget {
   final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
+  // Preformatted free-space line ("12,340 MB free (23%)"), or null while
+  // unknown, which hides the line. Rendered below [connectionStatus].
+  final String? diskStatus;
   // Name of the daemon these sessions belong to. Null when none is configured
   // (the injected-client test path).
   final String? serverLabel;
@@ -5828,6 +6028,7 @@ class _SessionRailState extends State<SessionRail> {
               status: widget.connectionStatus,
               color: widget.connectionStatusColor,
               serverLabel: widget.serverLabel,
+              diskStatus: widget.diskStatus,
             ),
           ),
         ),
@@ -5846,6 +6047,24 @@ class _SessionRailState extends State<SessionRail> {
                     letterSpacing: 0,
                   ),
                 ),
+              ),
+              // Flips between repository grouping and a flat activity-ordered
+              // list. The icon names the mode a tap switches to.
+              IconButton(
+                onPressed: widget.onToggleSortMode,
+                icon: Icon(
+                  widget.sortMode == SessionRailSortMode.byRepo
+                      ? Icons.format_list_bulleted
+                      : Icons.account_tree,
+                  size: 16,
+                ),
+                color: const Color(0xff7f8b8d),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                tooltip: widget.sortMode == SessionRailSortMode.byRepo
+                    ? 'Show sessions by recent activity'
+                    : 'Group sessions by repository',
               ),
               // Only offered once something is actually pinned, so it doubles as
               // the signal that the rail is holding a manual order at all.
@@ -6249,15 +6468,18 @@ class _ConnectionStatus extends StatelessWidget {
     required this.status,
     required this.color,
     this.serverLabel,
+    this.diskStatus,
   });
 
   final String status;
   final Color color;
   final String? serverLabel;
+  final String? diskStatus;
 
   @override
   Widget build(BuildContext context) {
     final label = serverLabel;
+    final disk = diskStatus;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -6287,6 +6509,15 @@ class _ConnectionStatus extends StatelessWidget {
                       ? const TextStyle(fontWeight: FontWeight.w600)
                       : const TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
                 ),
+                if (disk != null)
+                  Text(
+                    disk,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xff7f8b8d),
+                      fontSize: 12,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -9769,6 +10000,8 @@ class SessionWorkspace extends StatelessWidget {
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
+    this.softKeyboardEnabled = true,
+    this.onToggleSoftKeyboard,
   });
 
   final SessionVm session;
@@ -9779,6 +10012,9 @@ class SessionWorkspace extends StatelessWidget {
   // Re-asserts this device's terminal size on the shared PTY.
   final VoidCallback? onRefit;
   final VoidCallback? onToggleJudge;
+  // Mobile soft-keyboard kill switch, passed through to the terminal pane.
+  final bool softKeyboardEnabled;
+  final VoidCallback? onToggleSoftKeyboard;
 
   @override
   Widget build(BuildContext context) {
@@ -9809,6 +10045,8 @@ class SessionWorkspace extends StatelessWidget {
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
             isLoading: session.status == 'loading' || !session.loaded,
+            softKeyboardEnabled: softKeyboardEnabled,
+            onToggleSoftKeyboard: onToggleSoftKeyboard,
           ),
         ),
       ],

@@ -249,6 +249,8 @@ table RemoveJudgeDenySubstringRequest {
 
 table GetRailLayoutRequest {}
 
+table GetDaemonStatsRequest {}
+
 table SetRailPinsRequest {
     group_keys: [string];
     session_ids: [string];
@@ -291,7 +293,8 @@ union ClientRequestPayload {
     RemoveJudgeDenySubstringRequest,
     GetRailLayoutRequest,
     SetRailPinsRequest,
-    SetSessionCustomLabelRequest
+    SetSessionCustomLabelRequest,
+    GetDaemonStatsRequest
 }
 
 table ClientMessage {
@@ -313,6 +316,12 @@ table HelloResult {
     server_version: string;
     update_available: bool;
     latest_version: string;
+    // Daemon-host disk space for the volume holding the daemon's state, so a
+    // remote client can show remaining space without another round-trip.
+    // Appended for forward/backward compatibility like the self-update fields;
+    // 0/0 means unknown (a platform without statvfs, or a probe failure).
+    disk_free_bytes: uint64;
+    disk_total_bytes: uint64;
 }
 
 table PairedResult {
@@ -433,6 +442,14 @@ table RailLayoutResult {
     custom_labels: [CustomLabelEntry];
 }
 
+// Polled by clients that show daemon-host disk space; the same figures also
+// ride every HelloResult so a fresh connection has them without a second
+// round-trip. 0/0 means unknown.
+table DaemonStatsResult {
+    disk_free_bytes: uint64;
+    disk_total_bytes: uint64;
+}
+
 union ServerResultPayload {
     UnitResult,
     HelloResult,
@@ -453,7 +470,8 @@ union ServerResultPayload {
     JudgeHookStatusResult,
     JudgeHistoryResult,
     JudgeRulesResult,
-    RailLayoutResult
+    RailLayoutResult,
+    DaemonStatsResult
 }
 
 table ResponsePayload {

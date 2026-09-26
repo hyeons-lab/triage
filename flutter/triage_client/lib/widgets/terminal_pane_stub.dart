@@ -45,6 +45,8 @@ class TerminalPane extends StatefulWidget {
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
+    this.softKeyboardEnabled = true,
+    this.onToggleSoftKeyboard,
   });
 
   final String terminalId;
@@ -65,6 +67,15 @@ class TerminalPane extends StatefulWidget {
   final int focusCursorRevision;
   final bool isExited;
   final bool isLoading;
+
+  /// Mobile soft-keyboard kill switch. While false the pane neither takes
+  /// focus nor opens the IME path, so the keyboard stays down and its
+  /// viewport insets stop churning the terminal layout. Desktop ignores it.
+  final bool softKeyboardEnabled;
+
+  /// Flips [softKeyboardEnabled]; wired to the accessory bar's `kbd` key.
+  /// Null hides the key.
+  final VoidCallback? onToggleSoftKeyboard;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -417,6 +428,17 @@ class _TerminalPaneState extends State<TerminalPane> {
           pos.maxScrollExtent <= 0 ||
           pos.pixels >= pos.maxScrollExtent - 0.5;
       _scrollToCursor(requestFocus: true, forceBottom: isAtBottom);
+    }
+    if (oldWidget.softKeyboardEnabled != widget.softKeyboardEnabled &&
+        _isMobile) {
+      // The user flipped the kill switch: drop the keyboard at once when
+      // suppressing (it may be up right now), and offer it back when
+      // re-enabling (the tap says they want to type).
+      if (widget.softKeyboardEnabled) {
+        _focusNode.requestFocus();
+      } else {
+        _focusNode.unfocus();
+      }
     }
   }
 
@@ -881,7 +903,18 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _focusTerminal() {
     widget.controller.notifyInteraction();
-    _focusNode.requestFocus();
+    _requestTerminalFocus();
+  }
+
+  /// Whether this pane may take keyboard focus right now. On mobile with the
+  /// soft keyboard suppressed, focusing would raise the keyboard (or, with the
+  /// IME path closed, focus a terminal the user cannot type into), so every
+  /// focus request funnels through here. Desktop always passes: focusing
+  /// never raises a keyboard there.
+  bool get _mayTakeFocus => !_isMobile || widget.softKeyboardEnabled;
+
+  void _requestTerminalFocus() {
+    if (_mayTakeFocus) _focusNode.requestFocus();
   }
 
   // The TerminalView auto-fits and calls this when the grid size changes. We
@@ -1261,7 +1294,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         final position = _scrollController.position;
         if (!position.hasContentDimensions || position.maxScrollExtent <= 0) {
           if (requestFocus) {
-            _focusNode.requestFocus();
+            _requestTerminalFocus();
           }
           return;
         }
@@ -1336,7 +1369,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         }
       }
       if (requestFocus) {
-        _focusNode.requestFocus();
+        _requestTerminalFocus();
       }
     }
 
@@ -1625,7 +1658,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     } finally {
       _isPasteDialogShowing = false;
       if (mounted && !widget.isExited) {
-        _focusNode.requestFocus();
+        _requestTerminalFocus();
       }
     }
   }
@@ -1665,6 +1698,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       onToggleCtrl: _toggleCtrl,
       onPaste: () => unawaited(_pasteFromClipboard()),
       ctrlArmed: _ctrlArmed,
+      onToggleKeyboard: widget.onToggleSoftKeyboard,
+      keyboardEnabled: widget.softKeyboardEnabled,
     );
   }
 
@@ -1676,7 +1711,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (isTest) {
       return Focus(
         focusNode: _focusNode,
-        autofocus: true,
+        autofocus: _mayTakeFocus,
         onKeyEvent: _handleTerminalKeyEvent,
         child: Container(
           color: const Color(0xff0d1113),
@@ -1708,16 +1743,19 @@ class _TerminalPaneState extends State<TerminalPane> {
                                   children: [
                                     for (final span in row.spans)
                                       TextSpan(
-                                        text: span.text.isEmpty ? ' ' : span.text,
+                                        text: span.text.isEmpty
+                                            ? ' '
+                                            : span.text,
                                         style: TextStyle(
                                           fontFamily: 'JetBrains Mono',
                                           fontSize: 15,
                                           height: 1.35,
                                           color:
-                                              span.style.foreground?.toColor() ??
+                                              span.style.foreground
+                                                  ?.toColor() ??
                                               const Color(0xffd9e5e3),
-                                          backgroundColor:
-                                              span.style.background?.toColor(),
+                                          backgroundColor: span.style.background
+                                              ?.toColor(),
                                           fontWeight: span.style.bold
                                               ? FontWeight.bold
                                               : FontWeight.normal,
@@ -1807,7 +1845,8 @@ class _TerminalPaneState extends State<TerminalPane> {
                             child: NotificationListener<ScrollEndNotification>(
                               onNotification: (notification) {
                                 scheduleMicrotask(() {
-                                  if (!mounted || !_scrollController.hasClients) {
+                                  if (!mounted ||
+                                      !_scrollController.hasClients) {
                                     return;
                                   }
                                   if (_scrollAnchor.hasAnchor) {
@@ -1834,7 +1873,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                                   controller: _xtermController,
                                   theme: _theme,
                                   focusNode: _focusNode,
-                                  autofocus: true,
+                                  autofocus: _mayTakeFocus,
                                   scrollController: _scrollController,
                                   onKeyEvent: _handleTerminalKeyEvent,
                                   textStyle: _textStyle,
@@ -1844,8 +1883,9 @@ class _TerminalPaneState extends State<TerminalPane> {
                                   // ("physical key already pressed") and swallows
                                   // keystrokes. Mobile must use the IME path, though: it
                                   // is what raises the soft keyboard, so disabling it
-                                  // leaves a phone unable to type.
-                                  hardwareKeyboardOnly: !_isMobile,
+                                  // leaves a phone unable to type — which is exactly
+                                  // what the soft-keyboard kill switch asks for.
+                                  hardwareKeyboardOnly: !_mayTakeFocus,
                                 ),
                               ),
                             ),

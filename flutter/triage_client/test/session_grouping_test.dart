@@ -241,4 +241,60 @@ void main() {
       );
     });
   });
+
+  group('orderSessionsByActivity', () {
+    test('orders across repositories by activity, newest first', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 100),
+          session('session-2', repo: '/b', activity: 300),
+          session('session-3', repo: '/a', activity: 200),
+        ]),
+        ['session-2', 'session-3', 'session-1'],
+      );
+    });
+
+    test('activity ties keep input order', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 100),
+          session('session-2', repo: '/b', activity: 100),
+          session('session-3'),
+        ]),
+        ['session-1', 'session-2', 'session-3'],
+      );
+    });
+
+    test('unknown activity sorts last, in input order', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1'),
+          session('session-2', repo: '/a', activity: 50),
+          session('session-3'),
+        ]),
+        ['session-2', 'session-1', 'session-3'],
+      );
+    });
+
+    test('pinned sessions hoist to the front in pinned order', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 300),
+          session('session-2', repo: '/b', activity: 200),
+          session('session-3', repo: '/a', activity: 100),
+        ], pins: const SessionPins(sessionIds: ['session-3', 'session-2'])),
+        ['session-3', 'session-2', 'session-1'],
+      );
+    });
+
+    test('group pins have no effect without groups', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 100),
+          session('session-2', repo: '/b', activity: 200),
+        ], pins: const SessionPins(groupKeys: ['/a'])),
+        ['session-2', 'session-1'],
+      );
+    });
+  });
 }
