@@ -29,5 +29,9 @@ String? retrieveLegacyToken() => impl.retrieveLegacyToken();
 void clearLegacyToken() => impl.clearLegacyToken();
 
 void persistClientId(String clientId) => impl.persistClientId(clientId);
-String? retrieveClientId() => impl.retrieveClientId();
+
+/// The stored device id, trimmed: storage may carry padding whitespace, and
+/// every consumer compares against the in-memory id. Trimmed here so no
+/// reader can compare an untrimmed value again.
+String? retrieveClientId() => impl.retrieveClientId()?.trim();
 void clearClientId() => impl.clearClientId();

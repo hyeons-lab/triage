@@ -16,6 +16,9 @@ sealed class TerminalIntent {
 ///
 /// [outputSeq] is the host's per-chunk counter; used to drop chunks already
 /// covered by a preceding [HistoryBytes] tail (no gap, no overlap).
+/// Null means unsequenced and always applies; a negative is corrupt (the
+/// schema is uint64) and sanitizes to null. Never default a missing counter
+/// to 0, which names the epoch start.
 final class LiveBytes extends TerminalIntent {
   const LiveBytes(this.bytes, {this.outputSeq});
 
@@ -32,6 +35,8 @@ final class LiveBytes extends TerminalIntent {
 /// with `outputSeq <= throughOutputSeq` are dropped as duplicates.
 /// [rawOutputStart] is the byte offset of the first byte within the host's
 /// full session output log, used for non-destructive delta-merging.
+/// Null counters mean unknown (unanchored pathways replay or apply
+/// defensively); negatives are corrupt and sanitize to null.
 final class HistoryBytes extends TerminalIntent {
   const HistoryBytes(
     this.bytes, {

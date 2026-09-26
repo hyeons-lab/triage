@@ -1000,6 +1000,7 @@ void main() {
 
     // No new clear or write operations performed
     expect(sink.ops.length, opCount);
+    expect(sink.historyReplayedCount, 1);
   });
 
   test(
@@ -1047,6 +1048,7 @@ void main() {
       expect(sink.ops.length, opCountBeforeSnapshot);
       expect(store.appliedLogBytes, 80);
       expect(store.appliedLiveSeq, 8);
+      expect(sink.historyReplayedCount, 1);
     },
   );
 
@@ -1095,6 +1097,7 @@ void main() {
       expect(sink.ops.last, 'write:$deltaText');
       expect(store.appliedLogBytes, 100);
       expect(store.state.historyHighWaterSeq, 10);
+      expect(sink.historyReplayedCount, 1);
     },
   );
 
@@ -1138,6 +1141,7 @@ void main() {
       expect(store.state.historyHighWaterSeq, 6);
       expect(store.appliedLiveSeq, 8);
       expect(store.state.phase, AttachPhase.live);
+      expect(sink.historyReplayedCount, 1);
     },
   );
 
@@ -1181,6 +1185,7 @@ void main() {
       expect(store.state.historyHighWaterSeq, 5);
       expect(store.appliedLiveSeq, 8);
       expect(store.state.phase, AttachPhase.live);
+      expect(sink.historyReplayedCount, 1);
     },
   );
 
@@ -1261,6 +1266,7 @@ void main() {
 
       expect(sink.ops.where((op) => op == 'clear').length, 1);
       expect(sink.ops.length, opCount);
+      expect(sink.historyReplayedCount, 1);
     },
   );
 
@@ -1598,14 +1604,14 @@ void main() {
     },
   );
 
-  // A daemon handover restarts a session's `output_seq` counter: the successor
-  // renumbers from a low value while the byte log carries on unchanged (two
-  // entries for one adopted session report identical `bytes_logged` under very
-  // different `output_seq`). A client still holding the pre-handover high-water
-  // would score every renumbered chunk as a duplicate and go permanently deaf —
-  // history stays on screen, the cursor still blinks, and typing reaches the PTY
-  // while nothing it produces is ever drawn.
-  test('live seq restarting below the high-water still renders (handover)', () {
+  // A daemon restart (cold restore or session revive) resets a session's
+  // `output_seq` counter to 0 while the byte log carries on unchanged (a
+  // handover, by contrast, preserves both counters). A client still holding
+  // the pre-restart high-water would score every renumbered chunk as a
+  // duplicate and go permanently deaf: history stays on screen, the cursor
+  // still blinks, and typing reaches the PTY while nothing it produces is
+  // ever drawn.
+  test('live seq restarting below the high-water still renders (restart)', () {
     store.dispatch(const Attach());
     store.dispatch(
       HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 90000),
@@ -1613,7 +1619,7 @@ void main() {
     store.dispatch(LiveBytes(b('pre'), outputSeq: 90001));
     expect(sink.ops, ['resize:80,24', 'clear', 'write:OLD', 'write:pre']);
 
-    // Successor daemon adopts the session and renumbers from scratch.
+    // Restarted daemon renumbers from scratch.
     sink.ops.clear();
     store.dispatch(LiveBytes(b('after'), outputSeq: 1));
     store.dispatch(LiveBytes(b('more'), outputSeq: 2));
@@ -1623,8 +1629,8 @@ void main() {
   // The epoch-reset window (1024) never trips for a fresh session: a baseline
   // of 500 renumbered to 0/1 scores `0 < 500 - 1024` as false, so without the
   // low-baseline clause every renumbered chunk looks like a duplicate and the
-  // terminal goes permanently deaf.
-  test('live seq reset to 0/1 on a fresh session still renders (handover)', () {
+  // terminal goes permanently deaf after a restart.
+  test('live seq reset to 0/1 on a fresh session still renders (restart)', () {
     store.dispatch(const Attach());
     store.dispatch(
       HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 495),
@@ -1632,7 +1638,7 @@ void main() {
     store.dispatch(LiveBytes(b('pre'), outputSeq: 500));
     expect(sink.ops, ['resize:80,24', 'clear', 'write:OLD', 'write:pre']);
 
-    // Successor daemon adopts the session and renumbers from scratch.
+    // Restarted daemon renumbers from scratch.
     sink.ops.clear();
     store.dispatch(LiveBytes(b('after'), outputSeq: 1));
     store.dispatch(LiveBytes(b('more'), outputSeq: 2));
@@ -1691,6 +1697,7 @@ void main() {
       expect(deltaSink.ops.where((op) => op == 'clear').length, 1);
       expect(deltaSink.ops.length, bufferedOpCount + 1);
       expect(deltaSink.ops.last, 'write:$frameStart$delta');
+      expect(deltaSink.historyReplayedCount, 1);
 
       // The block is still open: mid-frame live bytes buffer instead of writing.
       deltaStore.dispatch(LiveBytes(b('more\n'), outputSeq: 8));
@@ -1701,6 +1708,620 @@ void main() {
       expect(deltaSink.ops.last, 'write:more\n\x1b[?2026l');
     },
   );
+
+  test('empty snapshot without coordinates on a live store is a pure no-op',
+      () {
+    final emptySink = FakeTerminalSink();
+    final emptyStore = TerminalStore(emptySink);
+    addTearDown(emptyStore.dispose);
+    emptyStore.dispatch(const Resize(80, 24));
+    emptyStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    emptyStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
+    expect(emptyStore.appliedLogBytes, 80);
+    final opCount = emptySink.ops.length;
+
+    emptyStore.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+
+    expect(emptySink.ops.where((op) => op == 'clear').length, 1);
+    expect(emptySink.ops.length, opCount);
+    expect(emptyStore.appliedLogBytes, 80);
+    expect(emptyStore.appliedLiveSeq, 8);
+    expect(emptyStore.state.historyHighWaterSeq, 5);
+    expect(emptySink.historyReplayedCount, 1);
+  });
+
+  test('empty ahead-seq snapshot neither clears nor drops late live', () {
+    final aheadSink = FakeTerminalSink();
+    final aheadStore = TerminalStore(aheadSink);
+    addTearDown(aheadStore.dispose);
+    aheadStore.dispatch(const Resize(80, 24));
+    aheadStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    aheadStore.dispatch(LiveBytes(b('live'), outputSeq: 8));
+
+    // Old-daemon resync shape: no raw_output_start, advancing seq, no bytes.
+    aheadStore.dispatch(
+      const HistoryBytes([], cols: 80, rows: 24, throughOutputSeq: 10),
+    );
+    aheadStore.dispatch(LiveBytes(b('late'), outputSeq: 9));
+
+    expect(aheadSink.ops.where((op) => op == 'clear').length, 1);
+    expect(aheadSink.ops.last, 'write:late');
+  });
+
+  test('empty snapshot on an exited store still replays and clears exited', () {
+    final exitedSink = FakeTerminalSink();
+    final exitedStore = TerminalStore(exitedSink);
+    addTearDown(exitedStore.dispose);
+    exitedStore.dispatch(const Resize(80, 24));
+    exitedStore.dispatch(
+      HistoryBytes(
+        b('old'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    exitedStore.dispatch(const Exited());
+    expect(exitedStore.state.exited, isTrue);
+    exitedStore.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+    expect(exitedStore.state.exited, isFalse);
+    expect(exitedSink.ops.where((op) => op == 'clear').length, 2);
+    expect(exitedSink.historyReplayedCount, 2);
+  });
+
+  test('empty snapshot at the applied byte offset is a no-op', () {
+    final atSink = FakeTerminalSink();
+    final atStore = TerminalStore(atSink);
+    addTearDown(atStore.dispose);
+    atStore.dispatch(const Resize(80, 24));
+    atStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    expect(atStore.appliedLogBytes, 50);
+    final opCount = atSink.ops.length;
+
+    atStore.dispatch(
+      const HistoryBytes([], cols: 80, rows: 24, throughOutputSeq: 5,
+          rawOutputStart: 50),
+    );
+
+    expect(atSink.ops.where((op) => op == 'clear').length, 1);
+    expect(atSink.ops.length, opCount);
+    expect(atStore.appliedLogBytes, 50);
+    // The empty-snapshot guard must not advance the live baseline: without
+    // it, this input falls into the delta no-op path, which sets it to 5.
+    expect(atStore.appliedLiveSeq, isNull);
+  });
+
+  test('live without output_seq applies over sequenced history', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('H'), cols: 80, rows: 24, throughOutputSeq: 5),
+    );
+    sink.ops.clear();
+
+    store.dispatch(LiveBytes(b('x')));
+
+    expect(sink.ops, ['write:x']);
+  });
+
+  test('negative history counters neither throw nor poison watermarks', () {
+    final negSink = FakeTerminalSink();
+    final negStore = TerminalStore(negSink);
+    addTearDown(negStore.dispose);
+    negStore.dispatch(const Resize(80, 24));
+    negStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+
+    // Corrupt frame (schema is uint64): treated as unanchored, so the store
+    // falls back to a full replay with sane, non-negative baselines.
+    negStore.dispatch(
+      HistoryBytes(
+        b('junk'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 6,
+        rawOutputStart: -5,
+      ),
+    );
+
+    expect(negSink.ops.where((op) => op == 'clear').length, 2);
+    expect(negStore.appliedLogBytes, 4);
+    expect(negStore.state.historyHighWaterSeq, 6);
+  });
+
+  test('negative history throughOutputSeq replays without poisoning', () {
+    final negSeqSink = FakeTerminalSink();
+    final negSeqStore = TerminalStore(negSeqSink);
+    addTearDown(negSeqStore.dispose);
+    negSeqStore.dispatch(const Resize(80, 24));
+    negSeqStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+
+    // Mirror of the negative-rawOutputStart case: the corrupt seq sanitizes
+    // to null and must not poison the high-water mark.
+    negSeqStore.dispatch(
+      HistoryBytes(
+        b('junk'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: -7,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(negSeqSink.ops.where((op) => op == 'clear').length, 2);
+    expect(negSeqStore.state.historyHighWaterSeq, 5);
+    expect(negSeqStore.appliedLogBytes, 4);
+  });
+
+  test('negative live seq applies as unsequenced without baselines', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 8),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 10));
+    sink.ops.clear();
+
+    // Corrupt counter, not corrupt bytes: treated as unsequenced, so the
+    // content applies exactly like a seq-less chunk while both watermarks
+    // stay put.
+    store.dispatch(LiveBytes(b('stale'), outputSeq: -3));
+
+    expect(sink.ops, ['write:stale']);
+    expect(store.state.historyHighWaterSeq, 8);
+    expect(store.appliedLiveSeq, 10);
+  });
+
+  test('negative live seq at a large baseline neither resets nor poisons',
+      () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 1999),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 2000));
+    sink.ops.clear();
+
+    // Without the sanitize, -3 reads as an epoch reset at this baseline,
+    // wiping both watermarks and parking the live baseline on -3.
+    store.dispatch(LiveBytes(b('stale'), outputSeq: -3));
+
+    expect(sink.ops, ['write:stale']);
+    expect(store.state.historyHighWaterSeq, 1999);
+    expect(store.appliedLiveSeq, 2000);
+  });
+
+  test('negative live seq on null baselines applies without recording', () {
+    final nullSink = FakeTerminalSink();
+    final nullStore = TerminalStore(nullSink);
+    addTearDown(nullStore.dispose);
+    nullStore.dispatch(const Resize(80, 24));
+    nullStore.dispatch(
+      HistoryBytes(b('H'), cols: 80, rows: 24, rawOutputStart: 0),
+    );
+    expect(nullStore.state.historyHighWaterSeq, isNull);
+    expect(nullStore.appliedLiveSeq, isNull);
+    nullSink.ops.clear();
+
+    nullStore.dispatch(LiveBytes(b('x'), outputSeq: -3));
+
+    expect(nullSink.ops, ['write:x']);
+    expect(nullStore.appliedLiveSeq, isNull);
+  });
+
+  test('trimmed log tail replays once, re-anchors, then delta-merges', () {
+    final trimSink = FakeTerminalSink();
+    final trimStore = TerminalStore(trimSink);
+    addTearDown(trimStore.dispose);
+    trimStore.dispatch(const Resize(80, 24));
+    trimStore.dispatch(
+      HistoryBytes(
+        b('a' * 100),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    trimStore.dispatch(LiveBytes(b('b' * 20), outputSeq: 8));
+    expect(trimStore.appliedLogBytes, 120);
+
+    // Daemon trimmed the log and rebased its offsets while the seq advanced:
+    // nonzero start, advanced seq, byte end behind the applied head.
+    trimStore.dispatch(
+      HistoryBytes(
+        b('c' * 10),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 9,
+        rawOutputStart: 90,
+      ),
+    );
+
+    expect(trimSink.ops.where((op) => op == 'clear').length, 2);
+    expect(trimSink.ops.last, 'write:${'c' * 10}');
+    expect(trimStore.appliedLogBytes, 100);
+    expect(trimStore.state.historyHighWaterSeq, 9);
+
+    // A follow-up snapshot merges instead of replaying or no-op looping.
+    trimStore.dispatch(
+      HistoryBytes(
+        b('${'c' * 10}ddddd'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 90,
+      ),
+    );
+
+    expect(trimSink.ops.where((op) => op == 'clear').length, 2);
+    expect(trimSink.ops.last, 'write:ddddd');
+    expect(trimStore.appliedLogBytes, 105);
+  });
+
+  test('shorter snapshot at exactly the live head still replays', () {
+    final eqSink = FakeTerminalSink();
+    final eqStore = TerminalStore(eqSink);
+    addTearDown(eqStore.dispose);
+    eqStore.dispatch(const Resize(80, 24));
+    eqStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    eqStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
+    expect(eqStore.appliedLogBytes, 80);
+
+    // Same epoch position as the live baseline but fewer bytes: the extra
+    // applied bytes no longer exist (trim landed mid-epoch), so the equality
+    // arms of the freshness check must still count this as fresh.
+    final fresh = 'c' * 30;
+    eqStore.dispatch(
+      HistoryBytes(
+        b(fresh),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 8,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(eqSink.ops.where((op) => op == 'clear').length, 2);
+    expect(eqSink.ops.last, 'write:$fresh');
+    expect(eqStore.appliedLogBytes, 30);
+    expect(eqStore.state.historyHighWaterSeq, 8);
+  });
+
+  test('resize-broadcast empty snapshot is a no-op on a live store', () {
+    final bcSink = FakeTerminalSink();
+    final bcStore = TerminalStore(bcSink);
+    addTearDown(bcStore.dispose);
+    bcStore.dispatch(const Resize(80, 24));
+    bcStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    bcStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
+    final opCount = bcSink.ops.length;
+
+    // The exact daemon resize-broadcast shape: anchored coordinates, the
+    // current seq, no bytes.
+    bcStore.dispatch(
+      const HistoryBytes(
+        [],
+        cols: 100,
+        rows: 30,
+        throughOutputSeq: 8,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(bcSink.ops.where((op) => op == 'clear').length, 1);
+    expect(bcSink.ops.length, opCount + 1);
+    expect(bcSink.ops.last, 'resize:100,30');
+    expect(bcStore.appliedLogBytes, 80);
+    expect(bcStore.appliedLiveSeq, 8);
+  });
+
+  test('empty snapshot past the head then its tail replays without a gap',
+      () {
+    final gapSink = FakeTerminalSink();
+    final gapStore = TerminalStore(gapSink);
+    addTearDown(gapStore.dispose);
+    gapStore.dispatch(const Resize(80, 24));
+    gapStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    gapStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
+    expect(gapStore.appliedLogBytes, 80);
+
+    // An empty snapshot stranded past the applied head carries no bytes to
+    // anchor a replay, so the guard swallows it; the tail that follows
+    // still carries the gap evidence and replays.
+    gapStore.dispatch(
+      const HistoryBytes(
+        [],
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 8,
+        rawOutputStart: 120,
+      ),
+    );
+    expect(gapSink.ops.where((op) => op == 'clear').length, 1);
+
+    gapStore.dispatch(
+      HistoryBytes(
+        b('t' * 10),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 9,
+        rawOutputStart: 120,
+      ),
+    );
+
+    expect(gapSink.ops.where((op) => op == 'clear').length, 2);
+    expect(gapSink.ops.last, 'write:${'t' * 10}');
+    expect(gapStore.appliedLogBytes, 130);
+  });
+
+  test('shorter snapshot with advanced seq replays instead of no-op', () {
+    final truncSink = FakeTerminalSink();
+    final truncStore = TerminalStore(truncSink);
+    addTearDown(truncStore.dispose);
+    truncStore.dispatch(const Resize(80, 24));
+    truncStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    truncStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
+    expect(truncStore.appliedLogBytes, 80);
+
+    // Authoritative and newer (seq 10 past the live baseline 8) but shorter:
+    // the extra 50 applied bytes no longer exist and must not be kept.
+    final fresh = 'c' * 30;
+    truncStore.dispatch(
+      HistoryBytes(
+        b(fresh),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(truncSink.ops.where((op) => op == 'clear').length, 2);
+    expect(truncSink.ops.last, 'write:$fresh');
+    expect(truncStore.appliedLogBytes, 30);
+    expect(truncStore.state.historyHighWaterSeq, 10);
+  });
+
+  test('restart snapshot at seq 1 without rawOutputStart replays', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 0),
+    );
+    store.dispatch(LiveBytes(b('a'), outputSeq: 2));
+    sink.ops.clear();
+
+    // Post-restart snapshot carrying seq 1 once output flowed: same new epoch
+    // the live path's 0/1 rule matches, so history must replay, not no-op.
+    store.dispatch(
+      HistoryBytes(b('NEW'), cols: 80, rows: 24, throughOutputSeq: 1),
+    );
+
+    expect(sink.ops, ['clear', 'write:NEW']);
+  });
+
+  test('history-first restart snapshot rebases live dedup (no deafness)', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 495),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 500));
+    sink.ops.clear();
+
+    // The restart snapshot arrives before any new-epoch live chunk: replay
+    // clears the stale live baseline, so the new epoch applies immediately.
+    store.dispatch(
+      HistoryBytes(
+        b('NEW'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 1,
+        rawOutputStart: 0,
+      ),
+    );
+    store.dispatch(LiveBytes(b('after'), outputSeq: 2));
+
+    expect(sink.ops, ['clear', 'write:NEW', 'write:after']);
+  });
+
+  test('baseline 11 with seq 1 resets to the new epoch', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 9),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 11));
+    sink.ops.clear();
+
+    store.dispatch(LiveBytes(b('after'), outputSeq: 1));
+    store.dispatch(LiveBytes(b('more'), outputSeq: 2));
+
+    expect(sink.ops, ['write:after', 'write:more']);
+  });
+
+  test('baseline 11 with seq 2 stays a duplicate', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 9),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 11));
+    sink.ops.clear();
+
+    store.dispatch(LiveBytes(b('stale'), outputSeq: 2));
+
+    expect(sink.ops, isEmpty);
+  });
+
+  test('epoch window edge: baseline-1024 is a duplicate, below resets', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 1999),
+    );
+    store.dispatch(LiveBytes(b('pre'), outputSeq: 2000));
+    sink.ops.clear();
+
+    store.dispatch(LiveBytes(b('old'), outputSeq: 976));
+    expect(sink.ops, isEmpty);
+
+    store.dispatch(LiveBytes(b('new'), outputSeq: 975));
+    expect(sink.ops, ['write:new']);
+  });
+
+  test('delta merge over a plain List<int> appends only the delta', () {
+    final listSink = FakeTerminalSink();
+    final listStore = TerminalStore(listSink);
+    addTearDown(listStore.dispose);
+    listStore.dispatch(const Resize(80, 24));
+    listStore.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    listStore.dispatch(LiveBytes(b('b' * 20), outputSeq: 7));
+    expect(listStore.appliedLogBytes, 70);
+
+    // A spread list is a plain growable List, not a Uint8List, so this
+    // exercises the copying sublist branch rather than sublistView.
+    final fullSnapshot = [...b('${'a' * 50}${'b' * 20}${'c' * 30}')];
+    listStore.dispatch(
+      HistoryBytes(
+        fullSnapshot,
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(listSink.ops.where((op) => op == 'clear').length, 1);
+    expect(listSink.ops.last, 'write:${'c' * 30}');
+    expect(listStore.appliedLogBytes, 100);
+    expect(listStore.state.historyHighWaterSeq, 10);
+  });
+
+  test('history after re-Attach full-replays even with overlapping seq', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+    store.dispatch(const Attach());
+
+    store.dispatch(
+      HistoryBytes(
+        b('a' * 50),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 0,
+      ),
+    );
+
+    expect(sink.ops.where((op) => op == 'clear').length, 2);
+    expect(store.state.phase, AttachPhase.live);
+    expect(store.state.scrollbackReady, isTrue);
+  });
+
+  test('disposing inside a history write does not throw on notify', () {
+    final reentrantSink = ReentrantSink();
+    final reentrantStore = TerminalStore(reentrantSink);
+    reentrantStore.dispatch(const Resize(80, 24));
+    reentrantStore.dispatch(const Attach());
+    reentrantSink.onWrite = reentrantStore.dispose;
+
+    expect(
+      () => reentrantStore.dispatch(
+        HistoryBytes(
+          b('hi'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        ),
+      ),
+      returnsNormally,
+    );
+    // Proves the write actually fired and the dispose ran reentrantly: a
+    // store that never wrote would pass the assertion above vacuously.
+    expect(reentrantSink.ops, contains('dispose'));
+  });
 
   test('large payload newline translation completes quickly without stalling', () {
     store.dispatch(const Attach());

@@ -100,6 +100,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> helloClientIds = [];
   final List<String?> helloTokens = [];
   final List<String> snapshotSessionCalls = [];
+  final List<String> subscribeSessionCalls = [];
+
+  /// Sessions the daemon answers without a subscription id: the response
+  /// shape `_checkedSubscribeSessionEvents` fails closed on. Distinct from
+  /// an outright throw, like [emptyIdStartSessionCommands].
+  final Set<String> emptyIdSubscribeSessions = {};
   final Map<String, List<String>> snapshotVisibleRows = {};
   final Map<String, List<String>> resizedVisibleRows = {};
   final Map<String, Completer<Map<String, dynamic>>> snapshotCompleters = {};
@@ -367,6 +373,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required String sessionId,
     int? afterEventSeq,
   }) async {
+    subscribeSessionCalls.add(sessionId);
+    if (emptyIdSubscribeSessions.contains(sessionId)) {
+      return '';
+    }
     return 'sub-$sessionId';
   }
 
@@ -1172,6 +1182,141 @@ void main() {
     expect(client.restoreSessionSizes['main'], '84x38');
   });
 
+  // Pumps the app, loads 'main', strands it unsubscribed via one failed
+  // revive, then parks the retry's refresh attach with the empty subscribe
+  // id disarmed so the unit resubscribe succeeds. Shared by the two revive
+  // tests below so their preconditions cannot drift apart unnoticed.
+  Future<
+    ({
+      FakeTriageWebSocketClient client,
+      Completer<Map<String, dynamic>> parkedAttach,
+      Finder Function() mainTile,
+    })
+  >
+  stageParkedReviveRetry(WidgetTester tester) async {
+    Finder mainTile() => find.byWidgetPredicate(
+      (w) => w is SessionListTile && w.title.contains('main'),
+    );
+
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Load 'main', then strand it unsubscribed: an exited report during a
+    // metadata refresh revives it, and the revive's resubscribe fails.
+    await tester.tap(mainTile());
+    await tester.pumpAndSettle();
+    expect(client.subscribeSessionCalls, contains('main'));
+
+    client.exitedSessionIds.add('main');
+    client.emptyIdSubscribeSessions.add('main');
+    await tester.tap(mainTile());
+    await tester.pumpAndSettle();
+
+    // The unit resubscribe must succeed for the refresh to reach the
+    // revive, so disarm the empty id and park the refresh attach instead.
+    // The caller fails it (or the revive's fresh attach) from here.
+    client.emptyIdSubscribeSessions.remove('main');
+    final parkedAttach = Completer<Map<String, dynamic>>();
+    client.attachCompleters['main'] = parkedAttach;
+    final subscribesBefore = client.subscribeSessionCalls.length;
+    final attachesBefore = client.attachSessionCalls.length;
+    await tester.tap(mainTile());
+    await tester.pumpAndSettle();
+    // The resubscribe unit ran (proving the first tap left the session
+    // unsubscribed) and its refresh attach is now parked on our completer.
+    expect(
+      client.subscribeSessionCalls.length,
+      greaterThan(subscribesBefore),
+    );
+    expect(client.attachSessionCalls.length, greaterThan(attachesBefore));
+
+    return (client: client, parkedAttach: parkedAttach, mainTile: mainTile);
+  }
+
+  testWidgets(
+    'a revive that cannot resubscribe fails the load instead of attaching',
+    (WidgetTester tester) async {
+      final staged = await stageParkedReviveRetry(tester);
+      final client = staged.client;
+      final parkedAttach = staged.parkedAttach;
+
+      // Re-arm once the attach is parked: the revive's resubscribe must
+      // fail for this leg.
+      client.emptyIdSubscribeSessions.add('main');
+      parkedAttach.complete({
+        'response': {
+          'snapshot': {
+            'context': {'branch': 'main'},
+            'size': {'rows': 24, 'cols': 80},
+            'exited': true,
+          },
+        },
+      });
+      await tester.pumpAndSettle();
+
+      // The revive's resubscribe failed: the tile must read load failed so
+      // the next select retries, not attached over a dead subscription.
+      expect(find.text('load failed'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'a revive that fails to attach logs and retries instead of failing the load',
+    (WidgetTester tester) async {
+      final staged = await stageParkedReviveRetry(tester);
+      final client = staged.client;
+      final parkedAttach = staged.parkedAttach;
+      final mainTile = staged.mainTile;
+
+      parkedAttach.complete({
+        'response': {
+          'snapshot': {
+            'context': {'branch': 'main'},
+            'size': {'rows': 24, 'cols': 80},
+            'exited': true,
+          },
+        },
+      });
+      // Swap before the revive runs: the refresh attach already holds
+      // parkedAttach; the revive's fresh attach reads this entry. A
+      // completion schedules microtasks, so this synchronous swap lands
+      // strictly before the resumed refresh reaches the revive.
+      final failingFreshAttach = Completer<Map<String, dynamic>>();
+      client.attachCompleters['main'] = failingFreshAttach;
+      // Fail it only once the revive is awaiting: completing with error
+      // before any listener attaches reports the error unhandled to the
+      // test framework, even though the revive would catch it.
+      final freshAttachIssued = client.attachSessionCalls.length + 1;
+      for (
+        var i = 0;
+        i < 100 && client.attachSessionCalls.length < freshAttachIssued;
+        i++
+      ) {
+        await tester.pump(const Duration(milliseconds: 10));
+      }
+      expect(client.attachSessionCalls.length, freshAttachIssued);
+      failingFreshAttach.completeError(StateError('revive attach failed'));
+      await tester.pumpAndSettle();
+
+      // Attach-step failure logs and renders the pre-revive snapshot, with
+      // no load-failed paint and no dropped subscription.
+      expect(find.text('load failed'), findsNothing);
+
+      // The fake's restore clears the exited mark, so re-mark it, and lift
+      // the failing completer so the retry's own attach is a normal one: the
+      // next refresh must retry the revive (restore again) rather than sit
+      // attached, and still paint nothing.
+      client.exitedSessionIds.add('main');
+      client.attachCompleters.remove('main');
+      final restoresBefore = client.restoreSessionCalls.length;
+      await tester.tap(mainTile());
+      await tester.pumpAndSettle();
+      expect(client.restoreSessionCalls.length, greaterThan(restoresBefore));
+      expect(find.text('load failed'), findsNothing);
+    },
+  );
+
   testWidgets(
     'restores historical sessions using estimated viewport size when saved size is absent',
     (WidgetTester tester) async {
@@ -1716,6 +1861,24 @@ void main() {
       expect(client.startSessionCommands, ['cmd.exe', 'bash']);
       expect(find.text('triage / scratch-1'), findsWidgets);
       expect(find.text('Creating session...'), findsNothing);
+    });
+  });
+
+  testWidgets('a created session whose subscribe returns no id rolls back to an error', (
+    WidgetTester tester,
+  ) async {
+    await withPlatform(TargetPlatform.android, () async {
+      final client = FakeTriageWebSocketClient();
+      client.emptyIdSubscribeSessions.add('scratch-1');
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+
+      expect(client.subscribeSessionCalls, contains('scratch-1'));
+      expect(find.text('Error creating session'), findsOneWidget);
+      expect(find.text('triage / scratch-1'), findsNothing);
     });
   });
 
@@ -3087,6 +3250,52 @@ void main() {
     },
   );
 
+  testWidgets(
+    'session tile popover refreshes when tile data changes while shown',
+    (WidgetTester tester) async {
+      Widget tile({String? snippetDetail}) => MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.topLeft,
+            child: SizedBox(
+              width: 320,
+              child: SessionListTile(
+                title: 'feat/side-rail-glance',
+                subtitle: 'attached',
+                statusColor: const Color(0xff7fd1c7),
+                icon: Icons.terminal,
+                repoName: 'triage',
+                branch: 'feat/side-rail-glance',
+                worktreeName: 'side-rail-glance',
+                snippet: 'running cargo test',
+                snippetDetail:
+                    snippetDetail ?? 'Running the daemon test suite.',
+                onTap: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpWidget(tile());
+      await tester.pumpAndSettle();
+
+      final gesture = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await gesture.addPointer(location: Offset.zero);
+      addTearDown(gesture.removePointer);
+      await gesture.moveTo(tester.getCenter(find.byType(SessionListTile)));
+      await tester.pumpAndSettle();
+      expect(find.text('Running the daemon test suite.'), findsOneWidget);
+
+      // Same tree, new detail: the mounted card must rebuild with it.
+      // snippetDetail renders only in the card, so this pins the refresh
+      // instead of the tile body.
+      await tester.pumpWidget(tile(snippetDetail: 'Rebuilt with new detail.'));
+      await tester.pumpAndSettle();
+      expect(find.text('Rebuilt with new detail.'), findsOneWidget);
+      expect(find.text('Running the daemon test suite.'), findsNothing);
+    },
+  );
+
   group('parseDaemonAddress', () {
     test('bare host or IPv4 -> ws://host:7777/ws', () {
       expect(
@@ -3385,6 +3594,130 @@ void main() {
       client.hangConnect!.complete();
       await tester.pumpAndSettle();
       expect(client.helloTokens.last, 'home-token');
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+    });
+
+    testWidgets('a load straddling a switch issues no daemon writes', (
+      WidgetTester tester,
+    ) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      persistTokenFor(homeMac.id, 'home-token');
+      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      // Park 'main' mid-load on the work laptop: the pre-attach snapshot
+      // fetch sits pending while the test switches daemons under it.
+      final hungSnapshot = Completer<Map<String, dynamic>>();
+      client.snapshotCompleters['main'] = hungSnapshot;
+      await tester.tap(find.text('triage / main').first);
+      await tester.pumpAndSettle();
+      expect(client.snapshotSessionCalls, contains('main'));
+
+      // Switch to the home mac while the work laptop's load is still parked.
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Home mac'));
+      await tester.pumpAndSettle();
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+
+      final restores = client.restoreSessionCalls.length;
+      final resizes = client.resizeSessionCalls.length;
+      final subscribes = client.subscribeSessionCalls.length;
+      final attaches = client.attachSessionCalls.length;
+
+      // The stale load now resumes, and its snapshot says the session needs
+      // a restore: every daemon write below must bail on staleness instead
+      // of landing on the home mac under the colliding id.
+      hungSnapshot.complete({
+        'snapshot': {
+          'context': {'branch': 'main'},
+          'size': {'rows': 24, 'cols': 80},
+          'exited': true,
+        },
+      });
+      await tester.pumpAndSettle();
+
+      expect(client.restoreSessionCalls.length, restores);
+      expect(client.resizeSessionCalls.length, resizes);
+      expect(client.subscribeSessionCalls.length, subscribes);
+      expect(client.attachSessionCalls.length, attaches);
+      // Silent, not painted: the failure belongs to the daemon we left, and
+      // the home mac's same-named session is healthy.
+      expect(find.text('load failed'), findsNothing);
+    });
+
+    /// Starts a creation on the work laptop and parks its attach, then
+    /// switches to the home mac. Returns the client and the parked attach
+    /// completer; the caller resolves the attach and asserts the stale
+    /// creation plants nothing on the new daemon.
+    Future<
+      ({
+        FakeTriageWebSocketClient client,
+        Completer<Map<String, dynamic>> hungAttach,
+      })
+    >
+    stageParkedCreationAcrossSwitch(WidgetTester tester) async {
+      persistTokenFor(workLaptop.id, 'work-token');
+      persistTokenFor(homeMac.id, 'home-token');
+      final client = await pumpWithServers(tester, selectedId: workLaptop.id);
+
+      // The first created session is deterministically 'scratch-1'.
+      final hungAttach = Completer<Map<String, dynamic>>();
+      client.attachCompleters['scratch-1'] = hungAttach;
+      await tester.tap(find.byTooltip('New session'));
+      await tester.pumpAndSettle();
+      // Multi-shell platforms open a shell menu; any shell will do (the
+      // fake accepts every command), so take the first item when present.
+      final menuItems = find.byType(CheckedPopupMenuItem<NewSessionShell>);
+      if (menuItems.evaluate().isNotEmpty) {
+        await tester.tap(menuItems.first);
+        await tester.pumpAndSettle();
+      }
+      expect(client.startSessionCalls, contains('scratch-1'));
+      expect(client.attachSessionCalls, contains('scratch-1'));
+
+      await tester.tap(find.byTooltip('Daemons'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Home mac'));
+      await tester.pumpAndSettle();
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+
+      return (client: client, hungAttach: hungAttach);
+    }
+
+    testWidgets('a creation straddling a switch plants no tile on the new daemon', (
+      WidgetTester tester,
+    ) async {
+      final staged = await stageParkedCreationAcrossSwitch(tester);
+
+      // The stale creation resumes with a good snapshot: the post-attach
+      // guard must drop it before the rail insert.
+      staged.hungAttach.complete({
+        'response': {
+          'snapshot': {
+            'context': {'branch': 'scratch-1'},
+            'size': {'rows': 24, 'cols': 80},
+            'exited': false,
+          },
+        },
+      });
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / scratch-1'), findsNothing);
+      expect(find.text('Connected to Daemon'), findsOneWidget);
+    });
+
+    testWidgets('a creation failing across a switch paints no error on the new daemon', (
+      WidgetTester tester,
+    ) async {
+      final staged = await stageParkedCreationAcrossSwitch(tester);
+
+      // The attach is already awaited (parked across the switch), so
+      // completing with error is handled, not an unhandled async error.
+      staged.hungAttach.completeError(StateError('creation attach failed'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / scratch-1'), findsNothing);
+      expect(find.text('Error creating session'), findsNothing);
       expect(find.text('Connected to Daemon'), findsOneWidget);
     });
 
