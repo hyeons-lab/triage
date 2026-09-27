@@ -64,6 +64,7 @@ typedef SessionContextRecord = ({
   String? worktreeRoot,
   String? branch,
   int lastActivityMs,
+  int lastInputMs,
 });
 
 /// One session's tool-call auto-approval judge policy.
@@ -536,6 +537,7 @@ class TriageWebSocketClient {
           // Absent from a daemon predating activity tracking; 0 reads as
           // "unknown", which the rail orders last rather than as epoch-old.
           lastActivityMs: (map['last_activity_ms'] as num?)?.toInt() ?? 0,
+          lastInputMs: (map['last_input_ms'] as num?)?.toInt() ?? 0,
         );
       }
     }
@@ -1161,6 +1163,7 @@ class TriageWebSocketClient {
         'worktree_root': started.worktreeRoot,
         'branch': started.branch,
         'last_activity_ms': started.lastActivityMs,
+        'last_input_ms': started.lastInputMs,
       };
     } else if (payloadType ==
         fbs.ServerMessagePayloadTypeId.SessionTerminatedPayload) {
@@ -1300,6 +1303,7 @@ class TriageWebSocketClient {
                   // session's activity to "unknown" and drop the rail back to
                   // id order, on the transport that is now the default.
                   'last_activity_ms': entry.lastActivityMs,
+                  'last_input_ms': entry.lastInputMs,
                 },
               )
               .toList(),

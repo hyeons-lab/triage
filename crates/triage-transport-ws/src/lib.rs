@@ -413,6 +413,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                             worktree_root,
                             branch,
                             last_activity_ms: row.last_activity_ms,
+                            last_input_ms: row.last_input_ms,
                         }
                     })
                     .collect();
@@ -669,6 +670,11 @@ pub struct SessionContextEntry {
     /// session that has produced no output, or a daemon predating this field.
     #[serde(default)]
     pub last_activity_ms: u64,
+    /// Milliseconds since the Unix epoch of the most recent input written to
+    /// the session by any client. The rail's activity sort orders by this.
+    /// 0 means unknown: no input yet, or a daemon predating this field.
+    #[serde(default)]
+    pub last_input_ms: u64,
 }
 
 /// One session's current auto-approval judge policy, as carried in
@@ -763,6 +769,8 @@ pub enum ServerMessage {
         branch: Option<String>,
         #[serde(default)]
         last_activity_ms: u64,
+        #[serde(default)]
+        last_input_ms: u64,
     },
     /// Connection-wide push: an existing session was shut down or deleted.
     SessionTerminated {
@@ -1027,6 +1035,7 @@ mod tests {
                         worktree_root: Some("/repo/worktree".to_string()),
                         branch: Some("main".to_string()),
                         last_activity_ms: 1_700_000_000_000,
+                        last_input_ms: 1_700_000_005_000,
                     }],
                 },
             }
@@ -1233,6 +1242,7 @@ mod tests {
                         branch: Some("main".to_string()),
                     }),
                     last_activity_ms: 1_700_000_000_000,
+                    last_input_ms: 1_700_000_005_000,
                 })
                 .collect())
         }
@@ -1826,6 +1836,7 @@ mod tests {
                     worktree_root: Some("/repo/wt".to_string()),
                     branch: Some("main".to_string()),
                     last_activity_ms: 1_700_000_000_000,
+                    last_input_ms: 1_700_000_005_000,
                 }],
             },
         };
@@ -2084,6 +2095,7 @@ mod tests {
             worktree_root: Some("/path/to/worktree".to_string()),
             branch: Some("feat/sync".to_string()),
             last_activity_ms: 1720000000000,
+            last_input_ms: 1720000000001,
         };
         let bytes = flatbuffers_proto::serialize_server_message(&msg);
         assert_eq!(
@@ -2095,6 +2107,7 @@ mod tests {
                 worktree_root: Some("/path/to/worktree"),
                 branch: Some("feat/sync"),
                 last_activity_ms: 1720000000000,
+                last_input_ms: 1720000000001,
             }
         );
     }
@@ -2122,6 +2135,7 @@ mod tests {
             worktree_root: None,
             branch: Some("main".to_string()),
             last_activity_ms: 123456789,
+            last_input_ms: 987654321,
         };
         let started_json = serde_json::to_string(&started).unwrap();
         let started_deserialized: ServerMessage = serde_json::from_str(&started_json).unwrap();

@@ -126,6 +126,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         let original = session.clone();
@@ -162,6 +163,7 @@ mod tests {
                 pid: 10_000 + index as u32,
                 process_identity: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
                 judge_override: None,
             })
             .collect();
@@ -236,6 +238,7 @@ mod tests {
             pid: 20_001,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         let state = crate::handover::HandoverState {
@@ -320,6 +323,7 @@ mod tests {
                 pid: 10_000,
                 process_identity: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
                 judge_override: None,
             }],
             has_tcp_listener: false,
@@ -689,6 +693,7 @@ mod tests {
             pid: 1,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         let state = crate::handover::HandoverState {
@@ -780,6 +785,7 @@ mod tests {
                     started_at: [u64::from(pid), 0],
                 }),
                 last_activity_ms: 0,
+                last_input_ms: 0,
                 judge_override: None,
             })
         };
@@ -908,6 +914,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         crate::handover::remember_recovered_handover_for_test(
@@ -962,6 +969,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         crate::handover::remember_recovered_handover_for_test(
@@ -1022,6 +1030,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
@@ -1091,6 +1100,7 @@ mod tests {
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
+            last_input_ms: 0,
             judge_override: None,
         };
         let snapshot = |owner_token, fd| {

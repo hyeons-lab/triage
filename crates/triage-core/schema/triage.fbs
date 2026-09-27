@@ -386,6 +386,12 @@ table SessionContextEntry {
     // session that has produced no output, or a daemon predating this field.
     // Appended last to stay wire-compatible with clients built before it.
     last_activity_ms: ulong;
+    // Milliseconds since the Unix epoch of the most recent input written to
+    // the session by any client. The rail's activity sort orders by this:
+    // output recency lets a noisy background job outrank sessions the user
+    // actually types in. 0 means unknown (no input yet, or predating daemon).
+    // Appended last, same wire-compat rule as above.
+    last_input_ms: ulong;
 }
 
 table SessionContextsResult {
@@ -594,6 +600,7 @@ table SessionStartedPayload {
     worktree_root: string;
     branch: string;
     last_activity_ms: ulong;
+    last_input_ms: ulong;
 }
 
 // Connection-wide push (not tied to a session subscription): a session was shut

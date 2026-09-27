@@ -5303,10 +5303,11 @@ class SessionContextEntry {
   String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
   String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
   int get lastActivityMs => fbjs.readUint64(_bc, _bcOffset, 14, 0);
+  int get lastInputMs => fbjs.readUint64(_bc, _bcOffset, 16, 0);
 
   @override
   String toString() {
-    return 'SessionContextEntry{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}, lastActivityMs: ${lastActivityMs}}';
+    return 'SessionContextEntry{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}, lastActivityMs: ${lastActivityMs}, lastInputMs: ${lastInputMs}}';
   }
 }
 
@@ -5324,7 +5325,7 @@ class SessionContextEntryBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(6);
+    fbBuilder.startTable(7);
   }
 
   int addSessionIdOffset(int? offset) {
@@ -5351,6 +5352,10 @@ class SessionContextEntryBuilder {
     fbjs.addUint64(fbBuilder, 5, lastActivityMs);
     return fbBuilder.offset;
   }
+  int addLastInputMs(int? lastInputMs) {
+    fbjs.addUint64(fbBuilder, 6, lastInputMs);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -5364,6 +5369,7 @@ class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
   final String? _worktreeRoot;
   final String? _branch;
   final int? _lastActivityMs;
+  final int? _lastInputMs;
 
   SessionContextEntryObjectBuilder({
     String? sessionId,
@@ -5372,13 +5378,15 @@ class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
     String? worktreeRoot,
     String? branch,
     int? lastActivityMs,
+    int? lastInputMs,
   })
       : _sessionId = sessionId,
         _currentWorkingDirectory = currentWorkingDirectory,
         _repositoryRoot = repositoryRoot,
         _worktreeRoot = worktreeRoot,
         _branch = branch,
-        _lastActivityMs = lastActivityMs;
+        _lastActivityMs = lastActivityMs,
+        _lastInputMs = lastInputMs;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -5393,13 +5401,14 @@ class SessionContextEntryObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_worktreeRoot!);
     final int? branchOffset = _branch == null ? null
         : fbBuilder.writeString(_branch!);
-    fbBuilder.startTable(6);
+    fbBuilder.startTable(7);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, currentWorkingDirectoryOffset);
     fbBuilder.addOffset(2, repositoryRootOffset);
     fbBuilder.addOffset(3, worktreeRootOffset);
     fbBuilder.addOffset(4, branchOffset);
     fbjs.addUint64(fbBuilder, 5, _lastActivityMs);
+    fbjs.addUint64(fbBuilder, 6, _lastInputMs);
     return fbBuilder.endTable();
   }
 
@@ -7763,10 +7772,11 @@ class SessionStartedPayload {
   String? get worktreeRoot => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 10);
   String? get branch => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
   int get lastActivityMs => fbjs.readUint64(_bc, _bcOffset, 14, 0);
+  int get lastInputMs => fbjs.readUint64(_bc, _bcOffset, 16, 0);
 
   @override
   String toString() {
-    return 'SessionStartedPayload{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}, lastActivityMs: ${lastActivityMs}}';
+    return 'SessionStartedPayload{sessionId: ${sessionId}, currentWorkingDirectory: ${currentWorkingDirectory}, repositoryRoot: ${repositoryRoot}, worktreeRoot: ${worktreeRoot}, branch: ${branch}, lastActivityMs: ${lastActivityMs}, lastInputMs: ${lastInputMs}}';
   }
 }
 
@@ -7784,7 +7794,7 @@ class SessionStartedPayloadBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(6);
+    fbBuilder.startTable(7);
   }
 
   int addSessionIdOffset(int? offset) {
@@ -7811,6 +7821,10 @@ class SessionStartedPayloadBuilder {
     fbjs.addUint64(fbBuilder, 5, lastActivityMs);
     return fbBuilder.offset;
   }
+  int addLastInputMs(int? lastInputMs) {
+    fbjs.addUint64(fbBuilder, 6, lastInputMs);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -7824,6 +7838,7 @@ class SessionStartedPayloadObjectBuilder extends fb.ObjectBuilder {
   final String? _worktreeRoot;
   final String? _branch;
   final int? _lastActivityMs;
+  final int? _lastInputMs;
 
   SessionStartedPayloadObjectBuilder({
     String? sessionId,
@@ -7832,13 +7847,15 @@ class SessionStartedPayloadObjectBuilder extends fb.ObjectBuilder {
     String? worktreeRoot,
     String? branch,
     int? lastActivityMs,
+    int? lastInputMs,
   })
       : _sessionId = sessionId,
         _currentWorkingDirectory = currentWorkingDirectory,
         _repositoryRoot = repositoryRoot,
         _worktreeRoot = worktreeRoot,
         _branch = branch,
-        _lastActivityMs = lastActivityMs;
+        _lastActivityMs = lastActivityMs,
+        _lastInputMs = lastInputMs;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -7853,13 +7870,14 @@ class SessionStartedPayloadObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_worktreeRoot!);
     final int? branchOffset = _branch == null ? null
         : fbBuilder.writeString(_branch!);
-    fbBuilder.startTable(6);
+    fbBuilder.startTable(7);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, currentWorkingDirectoryOffset);
     fbBuilder.addOffset(2, repositoryRootOffset);
     fbBuilder.addOffset(3, worktreeRootOffset);
     fbBuilder.addOffset(4, branchOffset);
     fbjs.addUint64(fbBuilder, 5, _lastActivityMs);
+    fbjs.addUint64(fbBuilder, 6, _lastInputMs);
     return fbBuilder.endTable();
   }
 

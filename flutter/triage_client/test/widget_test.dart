@@ -684,7 +684,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String? worktreeRoot,
     String? branch,
     String? cwd,
-    int? lastActivityMs,
+    int? lastInteractionMs,
   }) {
     _testEventController.add({
       'type': 'session_started',
@@ -693,7 +693,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       if (worktreeRoot != null) 'worktree_root': worktreeRoot,
       if (branch != null) 'branch': branch,
       if (cwd != null) 'current_working_directory': cwd,
-      if (lastActivityMs != null) 'last_activity_ms': lastActivityMs,
+      if (lastInteractionMs != null) 'last_activity_ms': lastInteractionMs,
     });
   }
 
@@ -2435,18 +2435,21 @@ void main() {
           worktreeRoot: '/work/alpha',
           branch: 'experiment/flutter-spike',
           lastActivityMs: 1000,
+          lastInputMs: 1000,
         ),
         'main': (
           repositoryRoot: '/work/alpha',
           worktreeRoot: '/work/alpha',
           branch: 'main',
           lastActivityMs: 2000,
+          lastInputMs: 2000,
         ),
         'websocket-session-api': (
           repositoryRoot: '/work/beta',
           worktreeRoot: '/work/beta',
           branch: 'feat/ws',
           lastActivityMs: 3000,
+          lastInputMs: 3000,
         ),
       });
       return client;
@@ -2505,6 +2508,7 @@ void main() {
         worktreeRoot: '/work/alpha',
         branch: 'main',
         lastActivityMs: 2000,
+        lastInputMs: 2000,
       );
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
@@ -2535,6 +2539,7 @@ void main() {
         worktreeRoot: '/',
         branch: 'main',
         lastActivityMs: 2000,
+        lastInputMs: 2000,
       );
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
@@ -2798,7 +2803,7 @@ void main() {
         tester.getTopLeft(header('/work/alpha')).dy,
         lessThan(tester.getTopLeft(row('main')).dy),
       );
-      // Still ahead of its less recent sibling: a dropped `lastActivityMs`
+      // Still ahead of its less recent sibling: a dropped `lastInteractionMs`
       // reads as "never active" and would sink it below flutter-spike, and
       // with it the whole repository, since a group takes its members' max.
       expect(
@@ -3260,6 +3265,82 @@ void main() {
         tester.getTopLeft(row('flutter-spike')).dy,
         lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
         reason: 'the just-touched session outranks idle ones',
+      );
+    });
+
+    testWidgets('activity regroup waits for an open context menu', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      // Select first (arms the resort), then right-click elsewhere: the menu
+      // opens over a rail about to move.
+      await tester.tap(row('flutter-spike'));
+      await tester.pump();
+      await tester.tap(
+        row('websocket-session-api'),
+        buttons: kSecondaryMouseButton,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Assign custom label...'), findsOneWidget);
+
+      // Past the debounce the rail has NOT moved: re-sorting now would
+      // slide the row out from under the open menu.
+      await tester.pump(const Duration(seconds: 2));
+      expect(find.text('Assign custom label...'), findsOneWidget);
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      // Dismiss the menu; the regroup lands on the next tick.
+      await tester.tapAt(const Offset(700, 300));
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(find.text('Assign custom label...'), findsNothing);
+      expect(
+        tester.getTopLeft(row('flutter-spike')).dy,
+        lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
+      );
+    });
+
+    testWidgets('activity mode orders by input recency, not output', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = FakeTriageWebSocketClient();
+      client.initialSessions = ['noisy-build', 'main'];
+      client.sessionContexts.addAll({
+        // Fresh output, never touched: output recency would rank this first.
+        'noisy-build': (
+          repositoryRoot: '/work/alpha',
+          worktreeRoot: '/work/alpha',
+          branch: 'main',
+          lastActivityMs: 9000,
+          lastInputMs: 0,
+        ),
+        // Quiet session the user typed in most recently.
+        'main': (
+          repositoryRoot: '/work/beta',
+          worktreeRoot: '/work/beta',
+          branch: 'main',
+          lastActivityMs: 1000,
+          lastInputMs: 5000,
+        ),
+      });
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(row('main')).dy,
+        lessThan(tester.getTopLeft(row('noisy-build')).dy),
+        reason: 'the touched session outranks the noisy one',
       );
     });
   });
@@ -4074,6 +4155,7 @@ void main() {
           worktreeRoot: '/work/alpha',
           branch: 'experiment/flutter-spike',
           lastActivityMs: 1000,
+          lastInputMs: 1000,
         ),
       });
       await tester.pumpWidget(

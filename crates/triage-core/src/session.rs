@@ -268,6 +268,10 @@ pub struct SessionContextRow {
     /// predates activity tracking. Consumers order unknown last rather than
     /// treating it as the epoch, which would rank it as infinitely stale.
     pub last_activity_ms: u64,
+    /// Milliseconds since the Unix epoch of the most recent input written to
+    /// the session by any client. The rail's activity sort orders by this.
+    /// 0 means unknown: no input yet, or a daemon predating input tracking.
+    pub last_input_ms: u64,
 }
 
 /// User-defined pinning configuration for the session rail.

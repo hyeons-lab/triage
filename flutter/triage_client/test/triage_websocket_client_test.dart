@@ -675,6 +675,7 @@ void main() {
                   worktreeRoot: '/repo/worktrees/feat',
                   branch: 'feat/x',
                   lastActivityMs: 1782616328232,
+                  lastInputMs: 1782616330000,
                 ),
                 // A session outside any repository, and one that has produced no
                 // output: both must decode as absent/zero rather than throwing
@@ -701,6 +702,8 @@ void main() {
         // would report.
         expect(result['session-1']!.lastActivityMs, equals(1782616328232));
         expect(result['session-2']!.lastActivityMs, equals(0));
+        expect(result['session-1']!.lastInputMs, equals(1782616330000));
+        expect(result['session-2']!.lastInputMs, equals(0));
       },
     );
 
@@ -1108,6 +1111,7 @@ void main() {
               repositoryRoot: '/home/user/project',
               branch: 'main',
               lastActivityMs: 1720000000000,
+              lastInputMs: 1720000000001,
             ),
           ).toBytes(),
         );
@@ -1132,6 +1136,7 @@ void main() {
           'worktree_root': null,
           'branch': 'main',
           'last_activity_ms': 1720000000000,
+          'last_input_ms': 1720000000001,
         });
         expect(events[1], {
           'type': 'session_terminated',

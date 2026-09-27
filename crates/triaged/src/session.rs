@@ -158,6 +158,11 @@ pub struct SessionActor {
     /// would be slowest. `Relaxed` throughout: the value is a display-ordering
     /// hint that races with output by nature, and it guards no other memory.
     last_activity_ms: Arc<AtomicU64>,
+    /// Wall-clock of the most recent input written to this session by any
+    /// client, same atomic-sharing rationale as [`Self::last_activity_ms`].
+    /// The rail's activity sort orders by this: output recency alone lets a
+    /// noisy background job outrank sessions the user actually types in.
+    last_input_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,6 +574,11 @@ struct PersistedSession {
     /// output, which would rewrite the manifest continuously under a build.
     #[serde(default)]
     last_activity_ms: u64,
+    /// Wall-clock of the most recent input written to the session, same
+    /// refresh rule as [`Self::last_activity_ms`]. 0 means unknown: a session
+    /// with no input yet, or a manifest written before this field existed.
+    #[serde(default)]
+    last_input_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -604,8 +614,9 @@ impl PersistedSessionLaunch {
             exited,
             last_known_cwd: None,
             // Filled in by `ManagedSession::persisted` for live sessions, which
-            // is the only caller with access to the actor's activity stamp.
+            // is the only caller with access to the actor's stamps.
             last_activity_ms: 0,
+            last_input_ms: 0,
         }
     }
 }
@@ -1634,7 +1645,7 @@ impl SessionManager {
     fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
         // Phase 1 (brief lock): grab the actor command channel + launch of a
         // `Live` session, without doing the actor round-trip under the lock.
-        let (cmd_tx, launch, last_known_cwd, last_activity_ms) = {
+        let (cmd_tx, launch, last_known_cwd, last_activity_ms, last_input_ms) = {
             let sessions = self.sessions()?;
             let Some(ManagedSession::Live {
                 actor,
@@ -1650,6 +1661,7 @@ impl SessionManager {
                 launch.clone(),
                 last_known_cwd.clone(),
                 actor.last_activity_ms(),
+                actor.last_input_ms(),
             )
         };
 
@@ -1674,6 +1686,7 @@ impl SessionManager {
         // unknown" and sort to the bottom of the rail despite having been busy
         // moments earlier.
         persisted.last_activity_ms = last_activity_ms;
+        persisted.last_input_ms = last_input_ms;
         if !is_restorable_shell_launch(&persisted) {
             return Ok(());
         }
@@ -1834,7 +1847,13 @@ impl SessionManager {
         // unbounded wait for a parked actor made the daemon un-handoverable in exactly
         // the situation that most needs a handover. It is also what the shutdown
         // rescue runs on, through the successor it starts.
-        let pending: Vec<(SessionId, Sender<ActorCommand>, PersistedSessionLaunch, u64)> = self
+        let pending: Vec<(
+            SessionId,
+            Sender<ActorCommand>,
+            PersistedSessionLaunch,
+            u64,
+            u64,
+        )> = self
             .sessions()?
             .iter()
             .filter_map(|(id, managed)| match managed {
@@ -1851,6 +1870,7 @@ impl SessionManager {
                     actor.tx.clone(),
                     launch.clone(),
                     actor.last_activity_ms(),
+                    actor.last_input_ms(),
                 )),
                 _ => None,
             })
@@ -1870,10 +1890,10 @@ impl SessionManager {
         // all.
         let inflight: Vec<_> = pending
             .into_iter()
-            .filter_map(|(id, cmd_tx, launch, last_activity_ms)| {
+            .filter_map(|(id, cmd_tx, launch, last_activity_ms, last_input_ms)| {
                 let (tx, rx) = mpsc::channel();
                 match cmd_tx.send(ActorCommand::ExtractHandoverState { response: tx }) {
-                    Ok(()) => Some((id, rx, launch, last_activity_ms)),
+                    Ok(()) => Some((id, rx, launch, last_activity_ms, last_input_ms)),
                     Err(err) => {
                         tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
                         None
@@ -1886,7 +1906,7 @@ impl SessionManager {
         // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
         let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
 
-        for (id, rx, launch, last_activity_ms) in inflight {
+        for (id, rx, launch, last_activity_ms, last_input_ms) in inflight {
             // Bounded, unlike every other actor round-trip in this file. An actor that
             // cannot answer a descriptor dup and three counters before the budget runs
             // out is parked (a `write_all` to a session whose child stopped reading),
@@ -1944,6 +1964,7 @@ impl SessionManager {
                 pid: ext.pid,
                 process_identity: ext.process_identity,
                 last_activity_ms,
+                last_input_ms,
                 judge_override,
             });
         }
@@ -2357,6 +2378,10 @@ impl SessionManager {
         };
         let last_activity_ms = Arc::new(AtomicU64::new(adopted_activity_ms));
         let actor_last_activity_ms = Arc::clone(&last_activity_ms);
+        // Carried as-is, including 0: unlike activity, interaction-unknown is
+        // a real state (never typed in), not a collapse to repair.
+        let last_input_ms = Arc::new(AtomicU64::new(h_sess.last_input_ms));
+        let actor_last_input_ms = Arc::clone(&last_input_ms);
 
         let (reader_start_tx, reader_start_rx) = mpsc::channel();
         let reader = thread::Builder::new()
@@ -2391,6 +2416,7 @@ impl SessionManager {
                     event_session_id,
                     dirty_tx,
                     last_activity_ms: actor_last_activity_ms,
+                    last_input_ms: actor_last_input_ms,
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
@@ -2418,6 +2444,7 @@ impl SessionManager {
             reader: Some(reader),
             writer: Some(writer_handle),
             last_activity_ms,
+            last_input_ms,
         };
 
         sessions.insert(
@@ -2765,6 +2792,7 @@ impl ManagedSession {
                 // in `run_activity_persistence_loop` a plain re-persist rather
                 // than a separate write path.
                 persisted.last_activity_ms = actor.last_activity_ms();
+                persisted.last_input_ms = actor.last_input_ms();
                 persisted
             }
             Self::Historical { session, .. } => session.persisted.clone(),
@@ -2893,6 +2921,7 @@ impl SessionApi for SessionManager {
         )?;
         let actor_tx = actor.tx.clone();
         let last_activity_ms = actor.last_activity_ms();
+        let last_input_ms = actor.last_input_ms();
         let initial_cwd = last_known_cwd.clone();
 
         let mut sessions = self.sessions()?;
@@ -2961,6 +2990,7 @@ impl SessionApi for SessionManager {
             worktree_root,
             branch,
             last_activity_ms,
+            last_input_ms,
         });
         Ok(session_id)
     }
@@ -3220,10 +3250,12 @@ impl SessionApi for SessionManager {
         // the manifest predates the field, so the spawn-time default stands.
         let restored_activity_ms =
             (persisted.last_activity_ms != 0).then_some(persisted.last_activity_ms);
+        let restored_input_ms = (persisted.last_input_ms != 0).then_some(persisted.last_input_ms);
         let actor = match SessionActor::spawn_restored(
             config,
             request.session_id.clone(),
             restored_activity_ms,
+            restored_input_ms,
             self.dirty_tx(),
             self.cwd_update_tx(),
             Some(self.global_senders()),
@@ -3360,6 +3392,7 @@ impl SessionApi for SessionManager {
                 launch: PersistedSessionLaunch,
                 last_known_cwd: Option<PathBuf>,
                 last_activity_ms: u64,
+                last_input_ms: u64,
                 prepared_manifest: PathBuf,
             },
             Historical {
@@ -3384,6 +3417,7 @@ impl SessionApi for SessionManager {
                     launch: launch.clone(),
                     last_known_cwd: last_known_cwd.clone(),
                     last_activity_ms: actor.last_activity_ms(),
+                    last_input_ms: actor.last_input_ms(),
                     // Validate that the removal manifest can be encoded and
                     // written before doing anything irreversible to the child.
                     // It is rewritten from the current map after termination,
@@ -3421,6 +3455,7 @@ impl SessionApi for SessionManager {
                 launch,
                 last_known_cwd,
                 last_activity_ms,
+                last_input_ms,
                 prepared_manifest,
             } => {
                 let completed = match request_actor_shutdown(&tx) {
@@ -3434,6 +3469,7 @@ impl SessionApi for SessionManager {
                 let mut persisted = launch.clone().into_persisted(session_id.clone(), true);
                 persisted.last_known_cwd = last_known_cwd;
                 persisted.last_activity_ms = last_activity_ms;
+                persisted.last_input_ms = last_input_ms;
                 let historical_fallback = HistoricalSession::restore(persisted).map(Box::new);
 
                 let (mut actor, commit_result) = {
@@ -3537,23 +3573,25 @@ impl SessionApi for SessionManager {
             Ready(Option<SessionContext>),
             Live(Sender<ActorCommand>),
         }
-        let mut sources: Vec<(SessionId, ContextSource, u64)> = {
+        let mut sources: Vec<(SessionId, ContextSource, u64, u64)> = {
             let sessions = self.sessions()?;
             sessions
                 .iter()
                 .map(|(session_id, managed)| {
-                    let (source, last_activity_ms) = match managed {
+                    let (source, last_activity_ms, last_input_ms) = match managed {
                         ManagedSession::Live { actor, .. } => (
                             ContextSource::Live(actor.tx.clone()),
                             actor.last_activity_ms(),
+                            actor.last_input_ms(),
                         ),
                         ManagedSession::Historical { session, .. }
                         | ManagedSession::Restoring { session, .. } => (
                             ContextSource::Ready(session.context.clone()),
                             session.persisted.last_activity_ms,
+                            session.persisted.last_input_ms,
                         ),
                     };
-                    (session_id.clone(), source, last_activity_ms)
+                    (session_id.clone(), source, last_activity_ms, last_input_ms)
                 })
                 .collect()
         };
@@ -3562,7 +3600,7 @@ impl SessionApi for SessionManager {
         sources.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
         Ok(sources
             .into_iter()
-            .map(|(session_id, source, last_activity_ms)| {
+            .map(|(session_id, source, last_activity_ms, last_input_ms)| {
                 let context = match source {
                     ContextSource::Ready(context) => context,
                     // A live actor mid-shutdown simply yields no context rather
@@ -3573,6 +3611,7 @@ impl SessionApi for SessionManager {
                     session_id,
                     context,
                     last_activity_ms,
+                    last_input_ms,
                 }
             })
             .collect())
@@ -4009,13 +4048,13 @@ const ACTIVITY_PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 /// last tick is deliberately not a reason to write, because the paths that
 /// remove a session (shutdown, demotion) persist the manifest themselves. Firing
 /// here as well would make every shutdown cost two writes.
-fn activity_advanced(
-    persisted: &HashMap<SessionId, u64>,
-    current: &HashMap<SessionId, u64>,
+fn activity_advanced<V: PartialEq>(
+    persisted: &HashMap<SessionId, V>,
+    current: &HashMap<SessionId, V>,
 ) -> bool {
     current
         .iter()
-        .any(|(session_id, millis)| persisted.get(session_id) != Some(millis))
+        .any(|(session_id, stamp)| persisted.get(session_id) != Some(stamp))
 }
 
 /// Periodically re-persists the manifest when a live session's activity stamp has
@@ -4035,7 +4074,7 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
     // from the manifest means the first tick after startup always writes once:
     // every live session reads as newly advanced. That is a fair price for not
     // parsing the manifest again here.
-    let mut persisted: HashMap<SessionId, u64> = HashMap::new();
+    let mut persisted: HashMap<SessionId, (u64, u64)> = HashMap::new();
     loop {
         thread::sleep(ACTIVITY_PERSIST_INTERVAL);
         let Some(manager) = manager.upgrade() else {
@@ -4044,12 +4083,13 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
         let Ok(sessions) = manager.sessions() else {
             return; // lock poisoned; the manager is unusable
         };
-        let current: HashMap<SessionId, u64> = sessions
+        let current: HashMap<SessionId, (u64, u64)> = sessions
             .iter()
             .filter_map(|(session_id, managed)| match managed {
-                ManagedSession::Live { actor, .. } => {
-                    Some((session_id.clone(), actor.last_activity_ms()))
-                }
+                ManagedSession::Live { actor, .. } => Some((
+                    session_id.clone(),
+                    (actor.last_activity_ms(), actor.last_input_ms()),
+                )),
                 // Historical and restoring sessions produce no output, so their
                 // stamps are already whatever the manifest holds.
                 _ => None,
@@ -4914,6 +4954,7 @@ impl SessionActor {
             None,
             None,
             None,
+            None,
             LogInitialization::Truncate,
         )
     }
@@ -4930,6 +4971,7 @@ impl SessionActor {
             config,
             Some(session_id),
             None,
+            None,
             dirty_tx,
             cwd_update_tx,
             global_senders,
@@ -4944,10 +4986,12 @@ impl SessionActor {
     /// shell prints its prompt within milliseconds, and a seed applied after the
     /// fact loses that race and re-stamps the session to "now", which is the
     /// collapse the seed exists to prevent.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_restored(
         config: SessionConfig,
         session_id: SessionId,
         initial_activity_ms: Option<u64>,
+        initial_input_ms: Option<u64>,
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
@@ -4957,6 +5001,7 @@ impl SessionActor {
             config,
             Some(session_id),
             initial_activity_ms,
+            initial_input_ms,
             dirty_tx,
             cwd_update_tx,
             global_senders,
@@ -4970,6 +5015,7 @@ impl SessionActor {
         config: SessionConfig,
         event_session_id: Option<SessionId>,
         initial_activity_ms: Option<u64>,
+        initial_input_ms: Option<u64>,
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
@@ -5005,6 +5051,11 @@ impl SessionActor {
             initial_activity_ms.unwrap_or_else(now_unix_millis),
         ));
         let actor_last_activity_ms = Arc::clone(&last_activity_ms);
+        // No spawn-time seed, unlike activity: a session that has never
+        // received input sorts as interaction-unknown (last), which is the
+        // truth, not a bucket to avoid.
+        let last_input_ms = Arc::new(AtomicU64::new(initial_input_ms.unwrap_or(0)));
+        let actor_last_input_ms = Arc::clone(&last_input_ms);
         let reader = thread::Builder::new()
             .name("session-actor-reader".into())
             .spawn(move || read_pty_output(reader, output_tx))
@@ -5028,6 +5079,7 @@ impl SessionActor {
                     event_session_id,
                     dirty_tx,
                     last_activity_ms: actor_last_activity_ms,
+                    last_input_ms: actor_last_input_ms,
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
@@ -5049,12 +5101,19 @@ impl SessionActor {
             reader: Some(reader),
             writer: Some(writer_handle),
             last_activity_ms,
+            last_input_ms,
         })
     }
 
     /// Milliseconds since the Unix epoch of this session's most recent output.
     fn last_activity_ms(&self) -> u64 {
         self.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    /// Milliseconds since the Unix epoch of the most recent input written to
+    /// this session by any client.
+    fn last_input_ms(&self) -> u64 {
+        self.last_input_ms.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -5193,6 +5252,9 @@ struct ActorState {
     /// ingest. Distinct from [`Self::dirty_tx`], which is `None` whenever the
     /// summarizer is disabled; activity ordering must not depend on that.
     last_activity_ms: Arc<AtomicU64>,
+    /// Shared with [`SessionActor::last_input_ms`]; stamped on every input
+    /// write from any client.
+    last_input_ms: Arc<AtomicU64>,
     /// When set (managed sessions), the actor reports working-directory changes
     /// here so the manager records the live cwd into the on-disk manifest,
     /// letting a daemon kill restore the session where it left off. `None` for
@@ -5772,6 +5834,11 @@ impl ActorState {
         if self.exited {
             return;
         }
+        // Stamped before the send, like the output stamp in `handle_output`:
+        // this is the interaction recency the rail orders by, and a dropped
+        // write still means the user was here.
+        self.last_input_ms
+            .store(now_unix_millis(), Ordering::Relaxed);
         if let Err(err) = self.writer_tx.try_send(bytes) {
             match err {
                 TrySendError::Full(_) => {
@@ -8412,6 +8479,7 @@ mod tests {
             output_seq: 42,
             bytes_logged: 16,
             last_activity_ms: 0,
+            last_input_ms: 0,
             pid: std::process::id(),
             process_identity: None,
             judge_override: None,
@@ -8558,6 +8626,7 @@ mod tests {
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
+                        last_input_ms: 0,
                         judge_override: None,
                     }],
                     has_tcp_listener: false,
@@ -9599,6 +9668,7 @@ mod tests {
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
+                        last_input_ms: 0,
                         judge_override: None,
                     }],
                     has_tcp_listener: false,
@@ -10650,6 +10720,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             }],
             ..Default::default()
         };
@@ -10741,6 +10812,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -10972,6 +11044,20 @@ mod tests {
         };
         assert!(at_exit > 0);
 
+        // The input stamp needs no settle loop: nothing writes input after the
+        // `exit` above, so whatever the actor holds is final.
+        let input_at_exit = {
+            let sessions = manager.sessions().expect("sessions lock");
+            match sessions.get(&session_id).expect("dead live session") {
+                ManagedSession::Live { actor, .. } => actor.last_input_ms(),
+                _ => panic!("expected a live session"),
+            }
+        };
+        assert!(
+            input_at_exit > 0,
+            "the `exit` write must have stamped input"
+        );
+
         // Demoted directly rather than through `restore_session`, which is the
         // only production caller. Restore demotes and then immediately revives
         // the session, and the revived shell prints a prompt and persists the
@@ -10992,6 +11078,62 @@ mod tests {
             persisted.last_activity_ms, at_exit,
             "the demotion must carry the live stamp, not zero it",
         );
+        assert_eq!(
+            persisted.last_input_ms, input_at_exit,
+            "the demotion must carry the live input stamp too",
+        );
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn write_input_stamps_last_input_ms() {
+        // Interaction recency starts unknown and lands on the first write, so
+        // the rail's activity sort can rank touched sessions above noisy ones.
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let client_id = ClientId::new("input-stamp-client").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach controller");
+
+        let read_input = || {
+            let sessions = manager.sessions().expect("sessions lock");
+            match sessions.get(&session_id).expect("live session") {
+                ManagedSession::Live { actor, .. } => actor.last_input_ms(),
+                _ => panic!("expected a live session"),
+            }
+        };
+        assert_eq!(read_input(), 0, "a fresh session has no input stamp");
+
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: b"echo triage-input-marker\n".to_vec(),
+            })
+            .expect("write input");
+        // The stamp lands when the actor drains the write command, so poll
+        // rather than reading straight away.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stamped = loop {
+            let current = read_input();
+            if current > 0 {
+                break current;
+            }
+            assert!(Instant::now() < deadline, "input stamp never landed");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(stamped <= now_unix_millis());
 
         let _ = manager.shutdown_session(session_id);
         let _ = std::fs::remove_dir_all(&log_dir);
@@ -11025,6 +11167,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
 
@@ -11243,6 +11386,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11317,6 +11461,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11378,6 +11523,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11460,6 +11606,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: persisted_activity_ms,
+                last_input_ms: 0,
             },
         );
 
@@ -11626,6 +11773,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: Some(live_cwd.clone()),
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11675,6 +11823,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: Some(gone_cwd),
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11728,6 +11877,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11776,6 +11926,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -12601,6 +12752,7 @@ mod tests {
                     reader: None,
                     writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
+                    last_input_ms: Arc::new(AtomicU64::new(0)),
                 },
                 lease,
                 launch: PersistedSessionLaunch {
@@ -12722,6 +12874,7 @@ mod tests {
                         reader: None,
                         writer: None,
                         last_activity_ms: Arc::new(AtomicU64::new(0)),
+                        last_input_ms: Arc::new(AtomicU64::new(0)),
                     },
                     lease: InputLeaseState::default(),
                     launch: PersistedSessionLaunch {
@@ -12827,6 +12980,7 @@ mod tests {
                     reader: None,
                     writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
+                    last_input_ms: Arc::new(AtomicU64::new(0)),
                 },
                 lease: InputLeaseState::default(),
                 launch: PersistedSessionLaunch {
@@ -13183,6 +13337,7 @@ mod tests {
                 exited: true,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
 
@@ -13551,6 +13706,7 @@ mod tests {
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
+                        last_input_ms: 0,
                         judge_override: Some(false),
                     }],
                     has_tcp_listener: false,

@@ -29,8 +29,8 @@ void main() {
       ]);
 
       expect(groups.map((g) => g.repoRoot), ['/a', '/b']);
-      expect(groups.first.lastActivityMs, 500);
-      expect(groups.last.lastActivityMs, 400);
+      expect(groups.first.lastInteractionMs, 500);
+      expect(groups.last.lastInteractionMs, 400);
     });
 
     test('orders sessions within a group by activity, newest first', () {
@@ -312,7 +312,7 @@ void main() {
       expect(groups, hasLength(1));
       expect(groups.single.repoRoot, isNull);
       expect(groups.single.sessionIds, ['session-2', 'session-3', 'session-1']);
-      expect(groups.single.lastActivityMs, 300);
+      expect(groups.single.lastInteractionMs, 300);
     });
 
     test('session pins hoist within the single group', () {

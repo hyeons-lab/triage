@@ -15,7 +15,7 @@ class SessionOrderingInput {
   const SessionOrderingInput({
     required this.sessionId,
     required this.repoRoot,
-    required this.lastActivityMs,
+    required this.lastInteractionMs,
   });
 
   /// Daemon-local session id. Identity only: ties are broken on the session's
@@ -31,7 +31,7 @@ class SessionOrderingInput {
 
   /// Milliseconds since the Unix epoch of the session's most recent output.
   /// 0 means unknown: no output yet, or a daemon predating activity tracking.
-  final int lastActivityMs;
+  final int lastInteractionMs;
 }
 
 /// One repository's sessions, in display order.
@@ -39,7 +39,7 @@ class SessionGroup {
   const SessionGroup({
     required this.repoRoot,
     required this.sessionIds,
-    required this.lastActivityMs,
+    required this.lastInteractionMs,
   });
 
   /// Null for the catch-all group holding sessions outside any repository.
@@ -50,7 +50,7 @@ class SessionGroup {
 
   /// The most recent activity among [sessionIds]: what the group is ordered by.
   /// 0 when no member has known activity.
-  final int lastActivityMs;
+  final int lastInteractionMs;
 
   /// Stable key for this group in persisted pin lists. Repository roots are
   /// absolute paths, so the sentinel used for the repo-less group cannot collide
@@ -193,9 +193,9 @@ List<SessionGroup> groupSessionsByRepo(
         // activity alone: pinning changes where a group sits, never how recent
         // it is, so unpinning restores its true activity position rather than
         // leaving it stranded wherever it was pinned.
-        lastActivityMs: members.fold<int>(
+        lastInteractionMs: members.fold<int>(
           0,
-          (best, s) => s.lastActivityMs > best ? s.lastActivityMs : best,
+          (best, s) => s.lastInteractionMs > best ? s.lastInteractionMs : best,
         ),
       ),
     );
@@ -212,8 +212,8 @@ List<SessionGroup> groupSessionsByRepo(
   };
 
   groups.sort((a, b) {
-    if (a.lastActivityMs != b.lastActivityMs) {
-      return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
+    if (a.lastInteractionMs != b.lastInteractionMs) {
+      return b.lastInteractionMs.compareTo(a.lastInteractionMs); // newest first
     }
     // Tie-break on the group's earliest-listed session, so group order is total
     // and stable, the common case being a fresh daemon where every stamp is 0.
@@ -266,8 +266,8 @@ int compareByActivityThenInput(
   SessionOrderingInput b,
   Map<String, int> inputIndex,
 ) {
-  if (a.lastActivityMs != b.lastActivityMs) {
-    return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
+  if (a.lastInteractionMs != b.lastInteractionMs) {
+    return b.lastInteractionMs.compareTo(a.lastInteractionMs); // newest first
   }
   return (inputIndex[a.sessionId] ?? 0).compareTo(inputIndex[b.sessionId] ?? 0);
 }
@@ -306,13 +306,13 @@ List<SessionGroup> flatSessionGroups(
   if (sessions.isEmpty) return const [];
   var newest = 0;
   for (final session in sessions) {
-    if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+    if (session.lastInteractionMs > newest) newest = session.lastInteractionMs;
   }
   return [
     SessionGroup(
       repoRoot: null,
       sessionIds: orderSessionsByActivity(sessions, pins: pins),
-      lastActivityMs: newest,
+      lastInteractionMs: newest,
     ),
   ];
 }

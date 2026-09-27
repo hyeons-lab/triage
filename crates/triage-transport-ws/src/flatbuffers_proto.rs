@@ -1288,6 +1288,7 @@ pub fn build_server_message<'a>(
                                 worktree_root: wt,
                                 branch,
                                 last_activity_ms: entry.last_activity_ms,
+                                last_input_ms: entry.last_input_ms,
                             },
                         ));
                     }
@@ -1789,6 +1790,7 @@ pub fn build_server_message<'a>(
             worktree_root,
             branch,
             last_activity_ms,
+            last_input_ms,
         } => {
             let sid = builder.create_string(session_id.as_str());
             let cwd = current_working_directory
@@ -1806,6 +1808,7 @@ pub fn build_server_message<'a>(
                     worktree_root: worktree,
                     branch,
                     last_activity_ms: *last_activity_ms,
+                    last_input_ms: *last_input_ms,
                 },
             );
             (
@@ -1978,6 +1981,7 @@ pub enum ServerMessageBorrowed<'a> {
         worktree_root: Option<&'a str>,
         branch: Option<&'a str>,
         last_activity_ms: u64,
+        last_input_ms: u64,
     },
     SessionTerminated {
         session_id: &'a str,
@@ -2354,6 +2358,7 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 worktree_root: payload.worktree_root(),
                 branch: payload.branch(),
                 last_activity_ms: payload.last_activity_ms(),
+                last_input_ms: payload.last_input_ms(),
             })
         }
         fb::ServerMessagePayload::SessionTerminatedPayload => {

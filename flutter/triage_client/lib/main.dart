@@ -414,7 +414,7 @@ class SessionVm {
   // so that rows do not slide out from under the pointer while a background
   // build is producing output. The cost is that this is a snapshot of recency
   // rather than a live ranking.
-  int lastActivityMs = 0;
+  int lastInteractionMs = 0;
   // The last distinct linked worktree this session was seen driving, kept so the
   // rail can lead a root/`main` row with it (see [railTitleAt]). A `git -C
   // worktrees/x …` run from the primary checkout chdirs git into the worktree,
@@ -2599,7 +2599,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               // The bulk response carries no cwd; live cwd arrives via push.
               updateCwd: false,
             );
-            session.lastActivityMs = entry.lastActivityMs;
+            // Input recency, not output: a noisy background job must not
+            // outrank sessions the user actually types in. 0 (unknown)
+            // orders last.
+            session.lastInteractionMs = entry.lastInputMs;
           }
           _sessions.add(session);
         }
@@ -3011,7 +3014,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         SessionOrderingInput(
           sessionId: session.remoteSessionId!,
           repoRoot: session.repoRoot,
-          lastActivityMs: session.lastActivityMs,
+          lastInteractionMs: session.lastInteractionMs,
         ),
   ];
 
@@ -3023,7 +3026,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   int _nextLocalActivityStamp() {
     var newest = 0;
     for (final session in _sessions) {
-      if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+      if (session.lastInteractionMs > newest) newest = session.lastInteractionMs;
     }
     return newest + 1;
   }
@@ -3034,18 +3037,27 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // every keystroke.
   static const Duration _activityResortDelay = Duration(seconds: 1);
   Timer? _activityResortTimer;
+  // A session context menu is showing. The debounced regroup waits for it:
+  // re-sorting now would move the row out from under the open menu.
+  bool _contextMenuOpen = false;
 
   /// Records a local interaction with [session]: it outranks every session
   /// for recency-ordered views, and the rail re-sorts once the burst
   /// settles. Stays local: the next daemon context fetch re-asserts the
   /// daemon's stamps.
   void _noteLocalInteraction(SessionVm session) {
-    session.lastActivityMs = _nextLocalActivityStamp();
+    session.lastInteractionMs = _nextLocalActivityStamp();
     _activityResortTimer?.cancel();
-    _activityResortTimer = Timer(_activityResortDelay, () {
-      _activityResortTimer = null;
-      _regroupRail();
-    });
+    _activityResortTimer = Timer(_activityResortDelay, _fireActivityResort);
+  }
+
+  void _fireActivityResort() {
+    _activityResortTimer = null;
+    if (_contextMenuOpen) {
+      _activityResortTimer = Timer(_activityResortDelay, _fireActivityResort);
+      return;
+    }
+    _regroupRail();
   }
 
   /// Re-derives the rail's grouping from the sessions as they stand now,
@@ -3264,7 +3276,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         SessionOrderingInput(
           sessionId: sessionId,
           repoRoot: contexts[sessionId]?.repositoryRoot,
-          lastActivityMs: contexts[sessionId]?.lastActivityMs ?? 0,
+          lastInteractionMs: contexts[sessionId]?.lastInputMs ?? 0,
         ),
     ], pins);
   }
@@ -3369,7 +3381,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // sinks the session, and with it its whole repository (a group is as
         // recent as its most recent member), to the bottom of a rail that is
         // supposed to surface exactly what is being used.
-        session.lastActivityMs = oldSession.lastActivityMs;
+        session.lastInteractionMs = oldSession.lastInteractionMs;
         // Same reasoning for the repository, which is what decides the session's
         // *group*: the replacement takes its context from the attach snapshot,
         // and a snapshot that omits one (an older daemon, or a session outside
@@ -3939,11 +3951,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         cwd: message['current_working_directory']?.toString(),
         updateCwd: message['current_working_directory'] != null,
       );
-      final lastActivity = message['last_activity_ms'];
-      if (lastActivity is int) {
-        session.lastActivityMs = lastActivity;
-      } else if (lastActivity is num) {
-        session.lastActivityMs = lastActivity.toInt();
+      final lastInput = message['last_input_ms'];
+      if (lastInput is int) {
+        session.lastInteractionMs = lastInput;
+      } else if (lastInput is num) {
+        session.lastInteractionMs = lastInput.toInt();
       }
       _setupSessionInputListener(session);
 
@@ -4939,7 +4951,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // running behind the daemon would bury the new session, the exact
           // outcome this is here to prevent. The real stamp arrives with the
           // next context fetch and takes over.
-          session.lastActivityMs = _nextLocalActivityStamp();
+          session.lastInteractionMs = _nextLocalActivityStamp();
 
           setState(() {
             _sessions.insert(0, session);
@@ -5163,7 +5175,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     );
 
     final hasLabel = session.trimmedCustomLabel != null;
-    final result = await showMenu<String>(
+    _contextMenuOpen = true;
+    final String? result;
+    try {
+      result = await showMenu<String>(
       context: context,
       position: rect,
       color: const Color(0xff1b2327),
@@ -5223,7 +5238,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             ),
           ),
       ],
-    );
+      );
+    } finally {
+      _contextMenuOpen = false;
+    }
 
     if (!mounted || result == null) return;
 

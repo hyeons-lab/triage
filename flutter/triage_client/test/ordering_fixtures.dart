@@ -10,5 +10,5 @@ SessionOrderingInput session(String id, {String? repo, int activity = 0}) =>
     SessionOrderingInput(
       sessionId: id,
       repoRoot: repo,
-      lastActivityMs: activity,
+      lastInteractionMs: activity,
     );

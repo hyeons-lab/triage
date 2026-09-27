@@ -64,6 +64,14 @@ Three Flutter client requests in one branch:
   never the local clock) and re-sorts after a 1s debounce, so the rail
   tracks what the user touched instead of freezing at load-time daemon
   stamps. Stamps stay local; the next daemon context fetch re-asserts.
+- Activity sort orders by daemon input recency, not output: the daemon
+  stamps `last_input_ms` on every input write (persisted, handed over,
+  restored like the output stamp) and the rail sorts by it, so a noisy
+  background job no longer outranks typed-in sessions. No output fallback:
+  never-touched sessions sort as unknown (last), which is the truth. The
+  client stamp renamed `lastActivityMs` to `lastInteractionMs` to match.
+- The debounced regroup waits out an open session context menu instead of
+  sliding the row out from under it.
 
 ## Issues
 
@@ -80,7 +88,8 @@ Three Flutter client requests in one branch:
 - 1601005 — feat(client): disk space line, rail sort toggle, keyboard kill switch
 - 456b5ca — fix(client): address PR review on disk stats, sort restore, keyboard routing
 - 4c83c33 — feat(core): probe disk space on Windows via GetDiskFreeSpaceExW
-- HEAD — feat(client): header keyboard toggle; interaction re-ranks activity sort
+- 449ae5a — feat(client): header keyboard toggle; interaction re-ranks activity sort
+- HEAD — feat: sort rail by daemon input recency; regroup waits for menus
 
 ## Progress
 
@@ -119,6 +128,18 @@ Three Flutter client requests in one branch:
   removal, and tap-to-re-rank with debounce (each revert-verified). Gates:
   `flutter analyze`, `flutter test` (609 passed). Release APK installed on
   the Pixel over wireless adb for on-device check.
+- 2026-09-26T20:46-0700: user reported activity order wrong on web (rarely
+  used sessions on top) plus menu/row desync on right-click. Root causes:
+  daemon activity is output recency (documented in schema), and the
+  debounced regroup could fire under an open menu. Fixed with daemon-side
+  `last_input_ms` (schema, JSON, FlatBuffers, persist, handover, restore;
+  per user choice of daemon source over device-local history), client
+  input-first ordering with the stamp renamed to `lastInteractionMs`, and
+  regroup deferral while a context menu is open. Tests: input stamping +
+  demotion carry (Rust), FB/JSON round-trips, input-vs-output ordering and
+  menu deferral (widget), each revert-verified. Gates: fmt, clippy
+  `-D warnings`, cargo suites (minus pre-existing ambient hook failure),
+  bindings check, `flutter analyze`, `flutter test` (611 passed).
 
 ## Research & Discoveries
 

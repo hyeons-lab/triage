@@ -762,17 +762,17 @@ void main() {
         SessionGroup(
           repoRoot: '/src/triage',
           sessionIds: ['s0'],
-          lastActivityMs: 100,
+          lastInteractionMs: 100,
         ),
         SessionGroup(
           repoRoot: '/src/frontend',
           sessionIds: ['s1'],
-          lastActivityMs: 200,
+          lastInteractionMs: 200,
         ),
         const SessionGroup(
           repoRoot: null,
           sessionIds: ['s2'],
-          lastActivityMs: 50,
+          lastInteractionMs: 50,
         ),
       ];
 
@@ -1047,12 +1047,12 @@ void main() {
         SessionGroup(
           repoRoot: '/Users/me/dev/frontend',
           sessionIds: ['session-1'],
-          lastActivityMs: 100,
+          lastInteractionMs: 100,
         ),
         SessionGroup(
           repoRoot: '/Users/me/dev/backend',
           sessionIds: ['session-2'],
-          lastActivityMs: 50,
+          lastInteractionMs: 50,
         ),
       ];
 
