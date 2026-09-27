@@ -3227,6 +3227,41 @@ void main() {
         lessThan(tester.getTopLeft(row('flutter-spike')).dy),
       );
     });
+
+    testWidgets('selecting a session re-ranks it first in activity mode', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      // Baseline is daemon activity: beta (3000) leads, `flutter-spike`
+      // (1000) trails.
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      await tester.tap(row('flutter-spike'));
+      // The bump is debounced: mid-pause the rail has not moved yet.
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      // Past the pause the rail re-sorts. Pumped explicitly: settle stops
+      // while only a quiet timer is pending, never advancing to it.
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(
+        tester.getTopLeft(row('flutter-spike')).dy,
+        lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
+        reason: 'the just-touched session outranks idle ones',
+      );
+    });
   });
 
   testWidgets(
@@ -5025,5 +5060,61 @@ void main() {
         expect(session.store.state.exited, isFalse);
       },
     );
+  });
+
+  group('WorkspaceHeader soft-keyboard toggle', () {
+    SessionVm headerSession() => SessionVm(
+      title: 'triage / main',
+      status: 'attached',
+      statusColor: const Color(0xff7fd1c7),
+      icon: Icons.terminal,
+      rows: [],
+    );
+
+    Future<void> pumpHeader(
+      WidgetTester tester, {
+      required bool enabled,
+      VoidCallback? onToggle,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkspaceHeader(
+              session: headerSession(),
+              softKeyboardEnabled: enabled,
+              onToggleSoftKeyboard: onToggle,
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('enabled key reports taps', (tester) async {
+      var toggles = 0;
+      await pumpHeader(
+        tester,
+        enabled: true,
+        onToggle: () => toggles++,
+      );
+      await tester.tap(find.byTooltip('Soft keyboard: ON (tap to suppress)'));
+      expect(toggles, 1);
+    });
+
+    testWidgets('suppressed key swaps icon and tooltip', (tester) async {
+      await pumpHeader(tester, enabled: false, onToggle: () {});
+      expect(find.byIcon(Icons.keyboard_hide), findsOneWidget);
+      expect(
+        find.byTooltip('Soft keyboard: suppressed (tap to enable)'),
+        findsOneWidget,
+      );
+      expect(find.byIcon(Icons.keyboard), findsNothing);
+    });
+
+    testWidgets('hides without a handler', (tester) async {
+      // Desktop passes no handler: no soft keyboard can raise there.
+      await pumpHeader(tester, enabled: true);
+      expect(find.byIcon(Icons.keyboard), findsNothing);
+      expect(find.byIcon(Icons.keyboard_hide), findsNothing);
+    });
   });
 }

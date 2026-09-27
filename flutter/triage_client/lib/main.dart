@@ -1897,6 +1897,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
     session.terminalController.addInteractionListener(() {
       unawaited(_ensureSessionInputLease(session));
+      _noteLocalInteraction(session);
     });
 
     session.terminalController.addResizeOutListener((cols, rows) {
@@ -3025,6 +3026,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (session.lastActivityMs > newest) newest = session.lastActivityMs;
     }
     return newest + 1;
+  }
+
+  // Re-sort pause after a burst of local interaction. The stamp bump is
+  // immediate (every view ranks the touched session first from then on) but
+  // the regroup waits, so typing re-ranks without reshuffling the rail on
+  // every keystroke.
+  static const Duration _activityResortDelay = Duration(seconds: 1);
+  Timer? _activityResortTimer;
+
+  /// Records a local interaction with [session]: it outranks every session
+  /// for recency-ordered views, and the rail re-sorts once the burst
+  /// settles. Stays local: the next daemon context fetch re-asserts the
+  /// daemon's stamps.
+  void _noteLocalInteraction(SessionVm session) {
+    session.lastActivityMs = _nextLocalActivityStamp();
+    _activityResortTimer?.cancel();
+    _activityResortTimer = Timer(_activityResortDelay, () {
+      _activityResortTimer = null;
+      _regroupRail();
+    });
   }
 
   /// Re-derives the rail's grouping from the sessions as they stand now,
@@ -4285,6 +4306,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
+    _activityResortTimer?.cancel();
     if (_clientInitialized) {
       _client.disconnect();
       _websocketSubscription?.cancel();
@@ -4349,6 +4371,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.focusCursorOnNextDisplay();
       _selectedIndex = index;
     });
+    // Selecting is interacting: the rail's recency views re-rank it first.
+    // (This is the rail tap path only; programmatic selection goes through
+    // the load and reselect paths, which must not disturb daemon order.)
+    _noteLocalInteraction(session);
     if (!canRefresh) return;
     // Lazy-load: an unopened session has no live subscription yet (the connect
     // path only attached the initially-selected one), so attach it now instead
@@ -5484,7 +5510,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
               softKeyboardEnabled: _softKeyboardEnabled,
-              onToggleSoftKeyboard: _toggleSoftKeyboard,
+              // The header toggle only exists where a soft keyboard can
+              // raise and shift the layout (native mobile + mobile web).
+              onToggleSoftKeyboard: isMobilePlatform()
+                  ? _toggleSoftKeyboard
+                  : null,
             );
 
       if (isMobile) {
@@ -10004,7 +10034,8 @@ class SessionWorkspace extends StatelessWidget {
   // Re-asserts this device's terminal size on the shared PTY.
   final VoidCallback? onRefit;
   final VoidCallback? onToggleJudge;
-  // Mobile soft-keyboard kill switch, passed through to the terminal pane.
+  // Mobile soft-keyboard kill switch: the state drives the terminal pane,
+  // the toggle lives in the workspace header.
   final bool softKeyboardEnabled;
   final VoidCallback? onToggleSoftKeyboard;
 
@@ -10018,6 +10049,8 @@ class SessionWorkspace extends StatelessWidget {
           onOpenRail: onOpenRail,
           onRefit: onRefit,
           onToggleJudge: onToggleJudge,
+          softKeyboardEnabled: softKeyboardEnabled,
+          onToggleSoftKeyboard: onToggleSoftKeyboard,
         ),
         Expanded(
           child: TerminalPane(
@@ -10038,7 +10071,6 @@ class SessionWorkspace extends StatelessWidget {
             isExited: session.status == 'exited',
             isLoading: session.status == 'loading' || !session.loaded,
             softKeyboardEnabled: softKeyboardEnabled,
-            onToggleSoftKeyboard: onToggleSoftKeyboard,
           ),
         ),
       ],
@@ -10054,6 +10086,8 @@ class WorkspaceHeader extends StatelessWidget {
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
+    this.softKeyboardEnabled = true,
+    this.onToggleSoftKeyboard,
   });
 
   final SessionVm session;
@@ -10065,6 +10099,10 @@ class WorkspaceHeader extends StatelessWidget {
   // to this device reclaims the size from whichever device resized it last.
   final VoidCallback? onRefit;
   final VoidCallback? onToggleJudge;
+  // Soft-keyboard kill switch. Null hides the header key (desktop, where no
+  // soft keyboard can raise).
+  final bool softKeyboardEnabled;
+  final VoidCallback? onToggleSoftKeyboard;
 
   @override
   Widget build(BuildContext context) {
@@ -10208,6 +10246,29 @@ class WorkspaceHeader extends StatelessWidget {
                       ? const BoxConstraints(minWidth: 32, minHeight: 32)
                       : null,
                   onPressed: onRefit,
+                ),
+                SizedBox(width: isNarrow ? 4 : 8),
+              ],
+              if (onToggleSoftKeyboard != null) ...[
+                IconButton(
+                  icon: Icon(
+                    softKeyboardEnabled
+                        ? Icons.keyboard
+                        : Icons.keyboard_hide,
+                    size: isNarrow ? 18 : 24,
+                    color: softKeyboardEnabled
+                        ? const Color(0xffcdd7d6)
+                        : const Color(0xffffc857),
+                  ),
+                  tooltip: softKeyboardEnabled
+                      ? 'Soft keyboard: ON (tap to suppress)'
+                      : 'Soft keyboard: suppressed (tap to enable)',
+                  visualDensity: isNarrow ? VisualDensity.compact : null,
+                  padding: isNarrow ? const EdgeInsets.all(4) : null,
+                  constraints: isNarrow
+                      ? const BoxConstraints(minWidth: 32, minHeight: 32)
+                      : null,
+                  onPressed: onToggleSoftKeyboard,
                 ),
                 SizedBox(width: isNarrow ? 4 : 8),
               ],

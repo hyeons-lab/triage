@@ -55,6 +55,15 @@ Three Flutter client requests in one branch:
 - Keyboard toggle lives on the shared accessory bar (`kbd` key), so native
   mobile and mobile web get it from one widget; state is device-global,
   persisted in prefs.
+  Amended per user feedback: the toggle moved to the workspace header (next
+  to judge/refit) and the accessory `kbd` key was removed, so the bottom
+  bar keeps input keys only. The header key shows only where a soft keyboard
+  can raise (native mobile + mobile web), via a null handler elsewhere.
+- Activity sort re-ranks on local interaction: selecting, typing, or tapping
+  a session bumps its stamp above every other (via `_nextLocalActivityStamp`,
+  never the local clock) and re-sorts after a 1s debounce, so the rail
+  tracks what the user touched instead of freezing at load-time daemon
+  stamps. Stamps stay local; the next daemon context fetch re-asserts.
 
 ## Issues
 
@@ -70,7 +79,8 @@ Three Flutter client requests in one branch:
 
 - 1601005 — feat(client): disk space line, rail sort toggle, keyboard kill switch
 - 456b5ca — fix(client): address PR review on disk stats, sort restore, keyboard routing
-- HEAD — feat(core): probe disk space on Windows via GetDiskFreeSpaceExW
+- 4c83c33 — feat(core): probe disk space on Windows via GetDiskFreeSpaceExW
+- HEAD — feat(client): header keyboard toggle; interaction re-ranks activity sort
 
 ## Progress
 
@@ -101,6 +111,14 @@ Three Flutter client requests in one branch:
   x86_64-pc-windows-msvc`, which caught a real bug (`PCWSTR` is a type
   alias in windows-sys 0.61, not a constructor); execution coverage comes
   from the CI windows leg.
+- 2026-09-26T18:22-0700: moved the keyboard toggle to the workspace header
+  per user feedback (accessory `kbd` key removed; header key gated on
+  `isMobilePlatform` via null handler) and fixed activity sort going stale
+  (selection and terminal interaction now bump the stamp and re-sort after
+  a 1s debounce). Widget tests for the header key states, the `kbd`
+  removal, and tap-to-re-rank with debounce (each revert-verified). Gates:
+  `flutter analyze`, `flutter test` (609 passed). Release APK installed on
+  the Pixel over wireless adb for on-device check.
 
 ## Research & Discoveries
 

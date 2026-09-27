@@ -47,7 +47,6 @@ class TerminalPane extends StatefulWidget {
     this.isExited = false,
     this.isLoading = false,
     this.softKeyboardEnabled = true,
-    this.onToggleSoftKeyboard,
   });
 
   final String terminalId;
@@ -73,10 +72,6 @@ class TerminalPane extends StatefulWidget {
   /// focus nor opens the IME path, so the keyboard stays down and its
   /// viewport insets stop churning the terminal layout. Desktop ignores it.
   final bool softKeyboardEnabled;
-
-  /// Flips [softKeyboardEnabled]; wired to the accessory bar's `kbd` key.
-  /// Null hides the key.
-  final VoidCallback? onToggleSoftKeyboard;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -1699,8 +1694,6 @@ class _TerminalPaneState extends State<TerminalPane> {
       onToggleCtrl: _toggleCtrl,
       onPaste: () => unawaited(_pasteFromClipboard()),
       ctrlArmed: _ctrlArmed,
-      onToggleKeyboard: widget.onToggleSoftKeyboard,
-      keyboardEnabled: widget.softKeyboardEnabled,
     );
   }
 
