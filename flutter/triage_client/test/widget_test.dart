@@ -95,6 +95,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> pairCodes = [];
   final List<String> writeInputCalls = [];
   final List<String> attachSessionCalls = [];
+  // Parallel to [attachSessionCalls]: the attach mode per call.
+  final List<String> attachSessionModes = [];
+  // Lease holder the fake reports for Observer attaches, per session. Absent
+  // means nobody holds it. Interactive attaches always grant to the caller,
+  // mirroring the daemon's steal-on-attach.
+  final Map<String, String?> attachLeaseHolders = {};
   final List<String> restoreSessionCalls = [];
   final Map<String, String> restoreSessionSizes = {};
   final List<String> helloClientIds = [];
@@ -219,6 +225,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String mode = 'InteractiveController',
   }) async {
     attachSessionCalls.add(sessionId);
+    attachSessionModes.add(mode);
     final attachCompleter = attachCompleters[sessionId];
     if (attachCompleter != null) {
       return attachCompleter.future;
@@ -227,7 +234,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (completer != null) {
       final snapRes = await completer.future;
       return {
-        'response': {'snapshot': snapRes['snapshot']},
+        'response': {
+          'snapshot': snapRes['snapshot'],
+          'lease': _attachLeaseFor(sessionId, clientId, mode),
+        },
       };
     }
     final visibleRows = snapshotVisibleRows[sessionId];
@@ -260,11 +270,13 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
                 .toList(),
             'cursor': {'row': visibleRows.length - 1, 'col': 0},
           },
+          'lease': _attachLeaseFor(sessionId, clientId, mode),
         },
       };
     }
     return {
       'response': {
+        'lease': _attachLeaseFor(sessionId, clientId, mode),
         'snapshot': {
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
@@ -312,6 +324,20 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           ],
         },
       },
+    };
+  }
+
+  Map<String, dynamic> _attachLeaseFor(
+    String sessionId,
+    String clientId,
+    String mode,
+  ) {
+    final holder = mode == 'Observer'
+        ? attachLeaseHolders[sessionId]
+        : clientId;
+    return {
+      'holder': holder == null ? null : {'client_id': holder},
+      'generation': 0,
     };
   }
 
@@ -1162,6 +1188,88 @@ void main() {
     expect(client.writeInputCalls.contains('flutter-spike'), isTrue);
   });
 
+  testWidgets('selecting a session observes without claiming its input lease', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Found by key: once loaded, a tile leads with its workstream label.
+    await tester.tap(find.byKey(const ValueKey<String>('main')));
+    await tester.pumpAndSettle();
+
+    final modes = [
+      for (var i = 0; i < client.attachSessionCalls.length; i++)
+        if (client.attachSessionCalls[i] == 'main')
+          client.attachSessionModes[i],
+    ];
+    expect(modes, isNotEmpty);
+    // Looking at a session must not steal the lease from another client (or
+    // agent) typing there; only a keystroke claims it.
+    expect(modes, everyElement('Observer'));
+  });
+
+  testWidgets(
+    'first keystroke after an observing load acquires the lease and delivers',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('main')));
+      await tester.pumpAndSettle();
+      expect(client.writeInputCalls, isEmpty);
+      final attachesBefore = client.attachSessionCalls
+          .where((sid) => sid == 'main')
+          .length;
+
+      final terminalPane = tester.widget<TerminalPane>(
+        find.byType(TerminalPane),
+      );
+      terminalPane.controller.sendInput('pwd');
+      await tester.pumpAndSettle();
+
+      // Buffered while the lease was acquired, then flushed: nothing lost.
+      expect(client.writeInputCalls, contains('main'));
+      final newModes = [
+        for (var i = 0; i < client.attachSessionCalls.length; i++)
+          if (client.attachSessionCalls[i] == 'main')
+            client.attachSessionModes[i],
+      ].sublist(attachesBefore);
+      expect(newModes, ['InteractiveController']);
+    },
+  );
+
+  testWidgets(
+    'input-lease error re-acquires the named session, not the selected one',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('flutter-spike')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey<String>('main')));
+      await tester.pumpAndSettle();
+
+      int attachesFor(String sid) =>
+          client.attachSessionCalls.where((s) => s == sid).length;
+      final mainBefore = attachesFor('main');
+      final spikeBefore = attachesFor('flutter-spike');
+
+      // The rejection names flutter-spike while main is selected.
+      client.emitErrorMessage(
+        'client test-client does not hold input lease '
+        'for session flutter-spike',
+      );
+      await tester.pumpAndSettle();
+
+      expect(attachesFor('flutter-spike'), spikeBefore + 1);
+      expect(attachesFor('main'), mainBefore);
+    },
+  );
+
   testWidgets('opening a historical session fits it to the current viewport', (
     WidgetTester tester,
   ) async {
@@ -1944,6 +2052,29 @@ void main() {
 
     expect(find.text('feat/remote-sync'), findsWidgets);
   });
+
+  testWidgets(
+    'creating a session merges a session_started placeholder instead of duplicating',
+    (WidgetTester tester) async {
+      await withPlatform(TargetPlatform.macOS, () async {
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        // The daemon broadcasts session_started at spawn, so the push can land
+        // before the create call's own tile insert; the push plants a
+        // placeholder first.
+        client.emitSessionStarted('scratch-1');
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byTooltip('New session'));
+        await tester.pumpAndSettle();
+
+        expect(client.startSessionCommands, ['/bin/sh']);
+        expect(find.byKey(const ValueKey<String>('scratch-1')), findsOneWidget);
+      });
+    },
+  );
 
   testWidgets(
     'dynamically removes session from rail on session_terminated event',

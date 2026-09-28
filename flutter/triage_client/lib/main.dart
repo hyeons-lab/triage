@@ -2003,6 +2003,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  /// Whether an attach response reports this client as the session's input
+  /// lease holder. Observing attaches never claim the lease (only a keystroke
+  /// does), so the flag follows the daemon's current holder instead of
+  /// assuming the attach just granted it: assuming otherwise writes under a
+  /// lease held elsewhere, and the daemon drops those bytes.
+  bool _attachGrantsInputLease(Map<String, dynamic>? attachRes) {
+    final response = attachRes?['response'] as Map<String, dynamic>?;
+    final lease = response?['lease'] as Map<String, dynamic>?;
+    final holder = lease?['holder'] as Map<String, dynamic>?;
+    return holder?['client_id']?.toString().trim() == _clientId;
+  }
+
+  /// Session id named by a daemon input-lease rejection — "client X does not
+  /// hold input lease for session Y" or "session Y has no input lease
+  /// holder". Null when the message names none.
+  String? _leaseErrorSessionId(String message) {
+    return RegExp(r'session (\S+)').firstMatch(message)?.group(1);
+  }
+
   void _sendRemoteSessionInput(
     SessionVm session,
     String sessionId,
@@ -2153,7 +2172,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _subscriptionIds.clear();
     // Leases are daemon-side: a reconnected daemon may have dropped them, and
     // a stale `true` bypasses the buffer-and-acquire path and drops input.
-    // Re-acquired on the next select, keystroke, or refresh.
+    // Re-acquired on the next keystroke; select and refresh only resync the
+    // flag from the daemon's current holder.
     for (final s in _sessions) {
       s.hasInputLease = false;
     }
@@ -3583,10 +3603,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (_isStale(owningGeneration)) throw const _StaleLoad();
       _subscriptionIds[subId] = sid;
 
+      // Observer: loading a session to look at it must not steal the input
+      // lease from another client (or agent) typing there. The first
+      // keystroke acquires it through the buffer-and-flush path instead.
       final attachRes = await _client.attachSession(
         sessionId: sid,
         clientId: _clientId,
-        mode: 'InteractiveController',
+        mode: 'Observer',
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
@@ -3628,7 +3651,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         isRemote: true,
         isExited: exited,
       );
-      session.hasInputLease = true;
+      session.hasInputLease = _attachGrantsInputLease(attachRes);
       // Snapshot carries the current snippet for the attached session (the list
       // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
@@ -3776,16 +3799,32 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final error = message['error'] as Map<String, dynamic>?;
       final msg = error?['message']?.toString() ?? '';
       if (msg.contains('input lease')) {
-        if (_sessions.isEmpty ||
-            _selectedIndex < 0 ||
-            _selectedIndex >= _sessions.length) {
-          return;
+        // The daemon names the rejected session in the message; clear and
+        // re-acquire THAT one. Clearing the selected session instead flaps an
+        // innocent session's lease (stealing it from whoever holds it) while
+        // the rejected one stays marked held and keeps dropping writes.
+        final namedSid = _leaseErrorSessionId(msg);
+        SessionVm? target;
+        if (namedSid != null) {
+          for (final s in _sessions) {
+            if ((_sessionIdFor(s) ?? s.remoteSessionId) == namedSid) {
+              target = s;
+              break;
+            }
+          }
         }
-        final current = _selectedSession;
-        final sid = _sessionIdFor(current) ?? current.remoteSessionId;
-        if (sid != null && !current.isExited) {
-          current.hasInputLease = false;
-          unawaited(_acquireInputLeaseAndFlush(current, sid));
+        target ??=
+            (_sessions.isEmpty ||
+                _selectedIndex < 0 ||
+                _selectedIndex >= _sessions.length)
+            ? null
+            : _selectedSession;
+        final sid = target == null
+            ? null
+            : (_sessionIdFor(target) ?? target.remoteSessionId);
+        if (target != null && sid != null && !target.isExited) {
+          target.hasInputLease = false;
+          unawaited(_acquireInputLeaseAndFlush(target, sid));
         }
       }
       return;
@@ -4461,16 +4500,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // A success arriving after a purge must not resurrect the lease the
       // disconnect just reset; the catch below already fails safe to false.
       final leaseGeneration = _connectGeneration;
+      // Observer: selecting resyncs the flag from whoever holds the lease
+      // without stealing it; typing claims it on demand.
       unawaited(
         _client
             .attachSession(
               sessionId: sid,
               clientId: _clientId,
-              mode: 'InteractiveController',
+              mode: 'Observer',
             )
-            .then((_) {
+            .then((attachRes) {
               if (_isStale(leaseGeneration)) return;
-              session.hasInputLease = true;
+              session.hasInputLease = _attachGrantsInputLease(attachRes);
             })
             .catchError((Object e) {
               if (e is TriageAuthException) {
@@ -4479,7 +4520,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 return;
               }
               if (_isStale(leaseGeneration)) return;
-              debugPrint('Interactive lease attach failed for $sid: $e');
+              debugPrint('Select lease attach failed for $sid: $e');
               session.hasInputLease = false;
             }),
       );
@@ -4558,16 +4599,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
     try {
+      // Observer: a refresh must not steal the lease from whoever is typing.
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
-        mode: 'InteractiveController',
+        mode: 'Observer',
       );
       // The purge or reconnect may have landed during the attach: returning
       // before the restore/resize branches keeps those writes off the new
       // daemon, and skips a lease mark the disconnect just reset.
       if (_isStale(owningGeneration)) return;
-      session.hasInputLease = true;
+      session.hasInputLease = _attachGrantsInputLease(attachRes);
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot != null && !_disposed) {
@@ -4613,13 +4655,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
             // The resubscribe above bails silently when stale; without this
             // recheck the fresh attach would fire at the new daemon under a
-            // colliding id and claim a lease there.
+            // colliding id.
             if (_isStale(owningGeneration)) return;
             reviveStep = _ResubStep.attach;
             final freshAttachRes = await _client.attachSession(
               sessionId: sessionId,
               clientId: _clientId,
-              mode: 'InteractiveController',
+              mode: 'Observer',
             );
             final freshResponseObj =
                 freshAttachRes['response'] as Map<String, dynamic>?;
@@ -4954,8 +4996,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.lastInteractionMs = _nextLocalActivityStamp();
 
           setState(() {
-            _sessions.insert(0, session);
-            _selectedIndex = 0;
+            // The daemon broadcasts session_started at spawn, so the push can
+            // land while this create was still awaiting subscribe/attach,
+            // planting a placeholder the push handler could not yet match to
+            // a tile. Replace it in place instead of inserting a second tile
+            // for one session: duplicates share one rail key and one input
+            // lease, rendering stuck twins that fight over keystrokes.
+            final existingIndex = _sessions.indexWhere(
+              (s) => s.remoteSessionId == sessionId,
+            );
+            if (existingIndex != -1) {
+              _sessions[existingIndex].dispose();
+              _sessions[existingIndex] = session;
+              _selectedIndex = existingIndex;
+              // Same controller swap as the load path: a pane mounted for the
+              // placeholder keeps listening to its controller otherwise.
+              TerminalPane.rebindSessionController(
+                session.title,
+                session.terminalController,
+              );
+            } else {
+              _sessions.insert(0, session);
+              _selectedIndex = 0;
+            }
             _connectionStatus = 'Connected to Daemon';
             _connectionStatusColor = const Color(0xff7fd1c7);
           });

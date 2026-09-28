@@ -89,7 +89,8 @@ Three Flutter client requests in one branch:
 - 456b5ca — fix(client): address PR review on disk stats, sort restore, keyboard routing
 - 4c83c33 — feat(core): probe disk space on Windows via GetDiskFreeSpaceExW
 - 449ae5a — feat(client): header keyboard toggle; interaction re-ranks activity sort
-- HEAD — feat: sort rail by daemon input recency; regroup waits for menus
+- 7d6d21e — feat: sort rail by daemon input recency; regroup waits for menus
+- HEAD — fix(client): merge create/push duplicate tiles; observe without stealing input leases
 
 ## Progress
 
@@ -140,6 +141,41 @@ Three Flutter client requests in one branch:
   menu deferral (widget), each revert-verified. Gates: fmt, clippy
   `-D warnings`, cargo suites (minus pre-existing ambient hook failure),
   bindings check, `flutter analyze`, `flutter test` (611 passed).
+- 2026-09-28T12:20-0700: user reported single-tap new session spawning
+  multiple stuck tiles showing the same session, plus mid-typing dropped
+  letters on mobile. Root cause: the daemon broadcasts `session_started` at
+  spawn, so the push can land while create still awaits subscribe/attach; the
+  push handler plants a placeholder and the create path then inserts a second
+  tile for the same id. Twins share one rail key (element miswiring leaves
+  the visible pane on the stuck placeholder) and fight over the input lease,
+  which is the drops. Fix: create replaces an existing same-id tile in place
+  (mirroring the load path, incl. controller rebind) instead of inserting.
+  Regression widget test plants the push before tapping create: red (3 keyed
+  widgets for one id), green after. Gates: `flutter analyze`, `flutter test`
+  (612 passed). Rust untouched.
+- 2026-09-28T12:20-0700: user confirmed drops happen mid-typing in ALL
+  sessions on both mobile and web, so the twin-tile fix can't be the whole
+  story. Investigated down the stack and exonerated each layer with evidence:
+  daemon input/output paths never drop (zero drop lines in the log; the two
+  grep hits were my own commands in judge records), output fan-out replays
+  rather than drops, the WS send is ordered fire-and-forget, the mobile IME
+  path is phone-only but web drops too, and there is no lease TTL. Remaining
+  lossy step: daemon lease rejections of writes ("does not hold input
+  lease"), whose bytes are lost with no retry. Root cause of the flapping:
+  every client attach (select, load, refresh, resubscribe) used
+  InteractiveController, so merely LOOKING at a session stole its lease from
+  the other client/agent typing there; plus the lease-error handler cleared
+  the selected session instead of the rejected one, flapping innocents.
+  Fix (client-only): Observer on select/load/refresh/revive with the flag
+  resynced from the attach response's lease holder (both transports already
+  carry it; create keeps Interactive since a fresh lease has no victim),
+  typing still acquires on demand via buffer-and-flush, and the error
+  handler targets the session named in the message with selected-session
+  fallback. Three widget tests (Observer-on-select, first-keystroke
+  acquire+deliver, named-session error retarget), each red before / green
+  after. Gates: `flutter analyze`, `flutter test` (615 passed), no fallout.
+  Left uncommitted (no explicit commit ask); still needs push + web/APK
+  rebuild + reinstall + daemon reload for on-device verification.
 
 ## Research & Discoveries
 
