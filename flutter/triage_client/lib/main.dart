@@ -415,6 +415,10 @@ class SessionVm {
   // build is producing output. The cost is that this is a snapshot of recency
   // rather than a live ranking.
   int lastInteractionMs = 0;
+  // The session's most recent output stamp, backing the input-unknown ordering
+  // tier (see [compareRecencyStamps]). Set and carried alongside
+  // [lastInteractionMs]; 0 means unknown.
+  int lastOutputMs = 0;
   // The last distinct linked worktree this session was seen driving, kept so the
   // rail can lead a root/`main` row with it (see [railTitleAt]). A `git -C
   // worktrees/x …` run from the primary checkout chdirs git into the worktree,
@@ -2621,8 +2625,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
             // Input recency, not output: a noisy background job must not
             // outrank sessions the user actually types in. 0 (unknown)
-            // orders last.
+            // orders last — except the input-unknown tier still orders by
+            // output (see [compareRecencyStamps]), so sessions adopted from
+            // a daemon predating input tracking keep a plausible position
+            // instead of collapsing to creation order.
             session.lastInteractionMs = entry.lastInputMs;
+            session.lastOutputMs = entry.lastActivityMs;
           }
           _sessions.add(session);
         }
@@ -3035,6 +3043,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId: session.remoteSessionId!,
           repoRoot: session.repoRoot,
           lastInteractionMs: session.lastInteractionMs,
+          lastOutputMs: session.lastOutputMs,
         ),
   ];
 
@@ -3297,6 +3306,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId: sessionId,
           repoRoot: contexts[sessionId]?.repositoryRoot,
           lastInteractionMs: contexts[sessionId]?.lastInputMs ?? 0,
+          lastOutputMs: contexts[sessionId]?.lastActivityMs ?? 0,
         ),
     ], pins);
   }
@@ -3402,6 +3412,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // recent as its most recent member), to the bottom of a rail that is
         // supposed to surface exactly what is being used.
         session.lastInteractionMs = oldSession.lastInteractionMs;
+        session.lastOutputMs = oldSession.lastOutputMs;
         // Same reasoning for the repository, which is what decides the session's
         // *group*: the replacement takes its context from the attach snapshot,
         // and a snapshot that omits one (an older daemon, or a session outside

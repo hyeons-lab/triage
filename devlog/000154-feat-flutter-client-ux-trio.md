@@ -90,10 +90,28 @@ Three Flutter client requests in one branch:
 - 4c83c33 — feat(core): probe disk space on Windows via GetDiskFreeSpaceExW
 - 449ae5a — feat(client): header keyboard toggle; interaction re-ranks activity sort
 - 7d6d21e — feat: sort rail by daemon input recency; regroup waits for menus
-- HEAD — fix(client): merge create/push duplicate tiles; observe without stealing input leases
+- 7cc7f9e — fix(client): merge create/push duplicate tiles; observe without stealing input leases
+- HEAD — fix(client): order input-unknown rail tier by output activity
 
 ## Progress
 
+- 2026-09-28T21:55-0700: fixed sort collapse after handover from a daemon
+  predating input tracking. Reloading the PR #181 daemon over a main-based
+  one adopted all sessions with `last_input_ms: 0` (handover
+  `#[serde(default)]`); the rail sorts on input only, so every stamp tied at
+  0 and the rail fell back to creation order. Fix: two-tier
+  `compareRecencyStamps` in `session_grouping.dart` — known input outranks
+  unknown input by input, and the unknown tier orders by output instead of
+  creation order. First attempt (single blended stamp) was rejected by the
+  existing "orders by input recency, not output" widget test: folding
+  output into the same scale lets a noisy unknown-input job outrank a
+  typed-in session, so the tiers must not share a scale. Threaded
+  `lastOutputMs` through `SessionOrderingInput`/`SessionGroup`/`SessionVm`
+  (bulk load, both ordering-input builders, open-session carry-forward);
+  `session_started` push untouched (new sessions have no history). 5 new
+  unit tests, full `flutter test` 620/620, `flutter analyze` clean. Daemon
+  change not needed (it truthfully reports 0); needs an APK reinstall to
+  reach the phone.
 - 2026-09-25T18:03-0700: worktree + branch created, plan written.
 - 2026-09-25T19:00-0700: all three features implemented and validated —
   `cargo fmt --check`, clippy `-D warnings`, workspace tests (minus the

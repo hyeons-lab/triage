@@ -323,4 +323,60 @@ void main() {
       expect(groups.single.sessionIds, ['session-2', 'session-1']);
     });
   });
+
+  group('input-unknown tier', () {
+    test('known input outranks unknown input whatever the output says', () {
+      // The noisy job is producing output *now*, but its input is unknown
+      // while the quiet session was typed in. Separate tiers, not one
+      // scale: output must not promote the unknown tier above the known.
+      final groups = groupSessionsByRepo([
+        session('noisy', repo: '/a', output: 9000),
+        session('touched', repo: '/a', activity: 100, output: 1000),
+      ]);
+
+      expect(groups.single.sessionIds, ['touched', 'noisy']);
+    });
+
+    test('input-unknown sessions order by output, not creation order', () {
+      // The post-handover rail: every input stamp is 0 (the old daemon
+      // predates input tracking), so output is all the order there is.
+      final groups = groupSessionsByRepo([
+        session('older', repo: '/a', output: 1000),
+        session('newer', repo: '/a', output: 2000),
+      ]);
+
+      expect(groups.single.sessionIds, ['newer', 'older']);
+    });
+
+    test('known-input groups outrank unknown-input groups by input', () {
+      final groups = groupSessionsByRepo([
+        session('noisy', repo: '/noisy', output: 9000),
+        session('touched', repo: '/touched', activity: 100, output: 1000),
+      ]);
+
+      expect(groups.map((g) => g.repoRoot), ['/touched', '/noisy']);
+    });
+
+    test('unknown-input groups order by their max output', () {
+      final groups = groupSessionsByRepo([
+        session('old-1', repo: '/old', output: 1000),
+        session('old-2', repo: '/old', output: 1500),
+        session('new-1', repo: '/new', output: 2000),
+      ]);
+
+      expect(groups.map((g) => g.repoRoot), ['/new', '/old']);
+      expect(groups.first.lastOutputMs, 2000);
+      expect(groups.last.lastOutputMs, 1500);
+    });
+
+    test('output does not break ties between known inputs', () {
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 100, output: 1000),
+        session('session-2', repo: '/a', activity: 100, output: 9000),
+      ]);
+
+      // Same input stamp: creation order, as before.
+      expect(groups.single.sessionIds, ['session-1', 'session-2']);
+    });
+  });
 }

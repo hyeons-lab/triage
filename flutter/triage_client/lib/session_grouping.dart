@@ -8,7 +8,7 @@ library;
 
 /// The one input the ordering needs from a session.
 ///
-/// Deliberately not `SessionVm`: ordering depends on exactly these three fields,
+/// Deliberately not `SessionVm`: ordering depends on exactly these fields,
 /// and depending on the full view-model would drag the widget layer into every
 /// test.
 class SessionOrderingInput {
@@ -16,6 +16,7 @@ class SessionOrderingInput {
     required this.sessionId,
     required this.repoRoot,
     required this.lastInteractionMs,
+    required this.lastOutputMs,
   });
 
   /// Daemon-local session id. Identity only: ties are broken on the session's
@@ -29,9 +30,15 @@ class SessionOrderingInput {
   /// its worktrees group together without special-casing.
   final String? repoRoot;
 
-  /// Milliseconds since the Unix epoch of the session's most recent output.
-  /// 0 means unknown: no output yet, or a daemon predating activity tracking.
+  /// Milliseconds since the Unix epoch of the session's most recent input.
+  /// 0 means unknown: the session never received input, or its daemon predates
+  /// input tracking (e.g. adopted across a handover from an older binary).
   final int lastInteractionMs;
+
+  /// Milliseconds since the Unix epoch of the session's most recent output.
+  /// Orders sessions whose input is unknown (see [compareRecencyStamps]);
+  /// 0 means unknown.
+  final int lastOutputMs;
 }
 
 /// One repository's sessions, in display order.
@@ -40,6 +47,7 @@ class SessionGroup {
     required this.repoRoot,
     required this.sessionIds,
     required this.lastInteractionMs,
+    required this.lastOutputMs,
   });
 
   /// Null for the catch-all group holding sessions outside any repository.
@@ -48,9 +56,13 @@ class SessionGroup {
   /// This group's sessions, most recently active first.
   final List<String> sessionIds;
 
-  /// The most recent activity among [sessionIds]: what the group is ordered by.
-  /// 0 when no member has known activity.
+  /// The most recent input among [sessionIds]: what the group is ordered by.
+  /// 0 when no member has known input.
   final int lastInteractionMs;
+
+  /// The most recent output among [sessionIds]. Orders groups whose input is
+  /// unknown (see [compareRecencyStamps]); 0 when no member has known output.
+  final int lastOutputMs;
 
   /// Stable key for this group in persisted pin lists. Repository roots are
   /// absolute paths, so the sentinel used for the repo-less group cannot collide
@@ -147,7 +159,8 @@ List<String> pinPrefixTo(
 /// Groups [sessions] by repository and orders both the groups and the sessions
 /// within each by most recent activity.
 ///
-/// Ordering is a *total* order: ties on activity, including the all-zero case
+/// Ordering is a *total* order: known input ranks above unknown input, the
+/// unknown tier ranks by output, and full ties, including the all-zero case
 /// where no session has a known stamp, fall back to the session id's creation
 /// sequence. Without that, equal timestamps would leave the order down to the
 /// input sequence, which is precisely the arbitrary ordering this replaces.
@@ -197,6 +210,10 @@ List<SessionGroup> groupSessionsByRepo(
           0,
           (best, s) => s.lastInteractionMs > best ? s.lastInteractionMs : best,
         ),
+        lastOutputMs: members.fold<int>(
+          0,
+          (best, s) => s.lastOutputMs > best ? s.lastOutputMs : best,
+        ),
       ),
     );
   }
@@ -212,9 +229,13 @@ List<SessionGroup> groupSessionsByRepo(
   };
 
   groups.sort((a, b) {
-    if (a.lastInteractionMs != b.lastInteractionMs) {
-      return b.lastInteractionMs.compareTo(a.lastInteractionMs); // newest first
-    }
+    final order = compareRecencyStamps(
+      aInputMs: a.lastInteractionMs,
+      aOutputMs: a.lastOutputMs,
+      bInputMs: b.lastInteractionMs,
+      bOutputMs: b.lastOutputMs,
+    );
+    if (order != 0) return order;
     // Tie-break on the group's earliest-listed session, so group order is total
     // and stable, the common case being a fresh daemon where every stamp is 0.
     return earliestInput[a.pinKey]!.compareTo(earliestInput[b.pinKey]!);
@@ -256,6 +277,31 @@ List<String> flattenGroups(List<SessionGroup> groups) => [
   for (final group in groups) ...group.sessionIds,
 ];
 
+/// Two-tier recency order, newest first: sessions (or groups) with known input
+/// rank above those without, by input; the input-unknown tier ranks by output.
+///
+/// The tiers must not share one scale. Input 0 means *unknown* — never
+/// touched, or adopted from a daemon predating input tracking — so folding
+/// output into the same stamp would let a noisy job with unknown input
+/// outrank a session the user actually typed in. Comparing output only within
+/// the unknown tier keeps that policy while still ordering the all-unknown
+/// case (a post-handover rail) by output instead of creation order.
+///
+/// Returns 0 on a full tie; callers apply their own tie-break.
+int compareRecencyStamps({
+  required int aInputMs,
+  required int aOutputMs,
+  required int bInputMs,
+  required int bOutputMs,
+}) {
+  final aKnown = aInputMs != 0;
+  final bKnown = bInputMs != 0;
+  if (aKnown != bKnown) return aKnown ? -1 : 1;
+  final aStamp = aKnown ? aInputMs : aOutputMs;
+  final bStamp = bKnown ? bInputMs : bOutputMs;
+  return bStamp.compareTo(aStamp);
+}
+
 /// Orders sessions by activity, newest first, with ties keeping input order.
 ///
 /// Shared by [groupSessionsByRepo] (within each group) and
@@ -266,9 +312,13 @@ int compareByActivityThenInput(
   SessionOrderingInput b,
   Map<String, int> inputIndex,
 ) {
-  if (a.lastInteractionMs != b.lastInteractionMs) {
-    return b.lastInteractionMs.compareTo(a.lastInteractionMs); // newest first
-  }
+  final order = compareRecencyStamps(
+    aInputMs: a.lastInteractionMs,
+    aOutputMs: a.lastOutputMs,
+    bInputMs: b.lastInteractionMs,
+    bOutputMs: b.lastOutputMs,
+  );
+  if (order != 0) return order;
   return (inputIndex[a.sessionId] ?? 0).compareTo(inputIndex[b.sessionId] ?? 0);
 }
 
@@ -304,15 +354,20 @@ List<SessionGroup> flatSessionGroups(
   SessionPins pins = SessionPins.none,
 }) {
   if (sessions.isEmpty) return const [];
-  var newest = 0;
+  var newestInput = 0;
+  var newestOutput = 0;
   for (final session in sessions) {
-    if (session.lastInteractionMs > newest) newest = session.lastInteractionMs;
+    if (session.lastInteractionMs > newestInput) {
+      newestInput = session.lastInteractionMs;
+    }
+    if (session.lastOutputMs > newestOutput) newestOutput = session.lastOutputMs;
   }
   return [
     SessionGroup(
       repoRoot: null,
       sessionIds: orderSessionsByActivity(sessions, pins: pins),
-      lastInteractionMs: newest,
+      lastInteractionMs: newestInput,
+      lastOutputMs: newestOutput,
     ),
   ];
 }
