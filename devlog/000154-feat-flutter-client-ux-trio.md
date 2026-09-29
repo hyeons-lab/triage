@@ -91,10 +91,22 @@ Three Flutter client requests in one branch:
 - 449ae5a — feat(client): header keyboard toggle; interaction re-ranks activity sort
 - 7d6d21e — feat: sort rail by daemon input recency; regroup waits for menus
 - 7cc7f9e — fix(client): merge create/push duplicate tiles; observe without stealing input leases
-- HEAD — fix(client): order input-unknown rail tier by output activity
+- 235c4e8 — fix(client): order input-unknown rail tier by output activity
+- HEAD — feat(mcp): session-to-session messaging via side inboxes
 
 ## Progress
 
+- 2026-09-28T21:55-0700: folded session-to-session messaging into this PR
+  (one large PR, split before merge). Contract (`SessionMessage` + 3
+  `SessionApi` methods with default deny impls) and daemon side inboxes
+  (peek + idempotent ack, full-inbox rejection) came over from the
+  `feat/session-messaging` branch; IPC wire variants + `IpcClient` +
+  server dispatch and the three MCP tools
+  (`send/receive/ack_session_messages`) were finished here. Gates: fmt,
+  clippy `-D warnings`, Rust suites green except the pre-existing
+  env-dependent `triage-hook` signature test (detects the running agent;
+  untouched crate), `flutter test` untouched by this half. Also cleared
+  28GB of >24h-old `/tmp` scratch after the disk filled mid-test-run.
 - 2026-09-28T21:55-0700: fixed sort collapse after handover from a daemon
   predating input tracking. Reloading the PR #181 daemon over a main-based
   one adopted all sessions with `last_input_ms: 0` (handover

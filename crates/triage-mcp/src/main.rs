@@ -193,6 +193,11 @@ impl<A: SessionApi> McpServer<A> {
             "list_sessions" => tool_result(list_sessions(&self.api)?),
             "snapshot_session" => tool_result(snapshot_session(&self.api, arguments)?),
             "styled_rows" => tool_result(styled_rows(&self.api, arguments)?),
+            "send_session_message" => tool_result(send_session_message(&self.api, arguments)?),
+            "receive_session_messages" => {
+                tool_result(receive_session_messages(&self.api, arguments)?)
+            }
+            "ack_session_messages" => tool_result(ack_session_messages(&self.api, arguments)?),
             other => {
                 Err(JsonRpcError::invalid_params(format!("unknown Triage tool {other}")).into())
             }
@@ -300,6 +305,85 @@ fn tool_definitions() -> Value {
                 "idempotentHint": true,
                 "openWorldHint": false
             }
+        },
+        {
+            "name": "send_session_message",
+            "title": "Send Session Message",
+            "description": "Queue a direct coordination message in another session's inbox. Mail is poll-based: the target reads it with receive_session_messages, which keeps returning it until ack_session_messages confirms it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_session_id": {
+                        "type": "string",
+                        "description": "Sender session id (caller-asserted)."
+                    },
+                    "to_session_id": {
+                        "type": "string",
+                        "description": "Target session id."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Message body (non-empty)."
+                    }
+                },
+                "required": ["from_session_id", "to_session_id", "body"]
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "receive_session_messages",
+            "title": "Read Session Messages",
+            "description": "Peek a session's unacked inbox mail, oldest first. Poll this to check for mail; unacked mail is returned again on the next call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Triage session id."
+                    }
+                },
+                "required": ["session_id"]
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "ack_session_messages",
+            "title": "Acknowledge Session Messages",
+            "description": "Confirm receipt of inbox mail, removing it so it stops redelivering. Unknown ids are ignored.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Triage session id."
+                    },
+                    "message_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "description": "Inbox message ids to confirm."
+                    }
+                },
+                "required": ["session_id", "message_ids"]
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
         }
     ])
 }
@@ -367,6 +451,59 @@ fn styled_rows(
     }))
 }
 
+fn send_session_message(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    let arguments = arguments_object(&arguments)?;
+    let from = named_session_id_arg(arguments, "from_session_id")?;
+    let to = named_session_id_arg(arguments, "to_session_id")?;
+    let body = required_argument_string(arguments, "body")?.to_string();
+
+    let id = api
+        .send_session_message(from.clone(), to.clone(), body)
+        .with_context(|| format!("sending message from session {from} to session {to}"))?;
+
+    Ok(json!({ "message_id": id }))
+}
+
+fn receive_session_messages(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    let arguments = arguments_object(&arguments)?;
+    let session_id = session_id_arg(arguments)?;
+    let messages = api
+        .receive_session_messages(session_id.clone())
+        .with_context(|| format!("reading messages for session {session_id}"))?;
+
+    Ok(json!({
+        "session_id": session_id,
+        "messages": messages
+            .iter()
+            .map(|message| json!({
+                "id": message.id,
+                "from_session_id": message.from,
+                "body": message.body,
+                "sent_at_ms": message.sent_at_ms,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn ack_session_messages(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    let arguments = arguments_object(&arguments)?;
+    let session_id = session_id_arg(arguments)?;
+    let message_ids = required_u64_list(arguments, "message_ids")?;
+    api.ack_session_messages(session_id, message_ids)
+        .context("acknowledging session messages")?;
+
+    Ok(json!({ "ok": true }))
+}
+
 fn tool_result(structured_content: Value) -> std::result::Result<Value, ToolCallError> {
     let text = serde_json::to_string_pretty(&structured_content)
         .context("serializing tool result")
@@ -406,8 +543,15 @@ fn arguments_object(
 fn session_id_arg(
     arguments: &serde_json::Map<String, Value>,
 ) -> std::result::Result<SessionId, ToolCallError> {
-    SessionId::new(required_argument_string(arguments, "session_id")?)
-        .context("validating session_id")
+    named_session_id_arg(arguments, "session_id")
+}
+
+fn named_session_id_arg(
+    arguments: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<SessionId, ToolCallError> {
+    SessionId::new(required_argument_string(arguments, field)?)
+        .with_context(|| format!("validating {field}"))
         .map_err(ToolCallError::Tool)
 }
 
@@ -436,6 +580,23 @@ fn required_string<'a>(
             JsonRpcError::invalid_params(format!("{field} must be a non-empty string"))
         })?;
     Ok(value)
+}
+
+fn required_u64_list(
+    values: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Vec<u64>, ToolCallError> {
+    let items = values.get(field).and_then(Value::as_array).ok_or_else(|| {
+        JsonRpcError::invalid_params(format!("{field} must be an array of integers"))
+    })?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_u64().ok_or_else(|| {
+                JsonRpcError::invalid_params(format!("{field} must be an array of integers")).into()
+            })
+        })
+        .collect()
 }
 
 fn required_usize(
@@ -562,10 +723,11 @@ impl JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use triage_core::session::{
         AttachSessionRequest, AttachSessionResponse, CompletedSession, InputLeaseRequest,
-        LeaseChange, ResizeSessionRequest, SessionEventReceiver, SessionSize, SessionSnapshot,
-        TerminalCursor,
+        LeaseChange, ResizeSessionRequest, SessionEventReceiver, SessionMessage, SessionSize,
+        SessionSnapshot, TerminalCursor,
     };
 
     #[derive(Clone)]
@@ -573,6 +735,7 @@ mod tests {
         sessions: Vec<SessionId>,
         snapshot: SessionSnapshot,
         snapshot_error: Option<&'static str>,
+        inbox: RefCell<Vec<SessionMessage>>,
     }
 
     impl RecordingApi {
@@ -601,6 +764,7 @@ mod tests {
                     snippet_detail: None,
                 },
                 snapshot_error: None,
+                inbox: RefCell::new(Vec::new()),
             }
         }
 
@@ -668,6 +832,37 @@ mod tests {
             })
         }
 
+        fn send_session_message(
+            &self,
+            from: SessionId,
+            _to: SessionId,
+            body: String,
+        ) -> Result<u64> {
+            let id = self.inbox.borrow().len() as u64 + 1;
+            self.inbox.borrow_mut().push(SessionMessage {
+                id,
+                from,
+                body,
+                sent_at_ms: 1_700_000_000_000,
+            });
+            Ok(id)
+        }
+
+        fn receive_session_messages(&self, _session_id: SessionId) -> Result<Vec<SessionMessage>> {
+            Ok(self.inbox.borrow().clone())
+        }
+
+        fn ack_session_messages(
+            &self,
+            _session_id: SessionId,
+            message_ids: Vec<u64>,
+        ) -> Result<()> {
+            self.inbox
+                .borrow_mut()
+                .retain(|message| !message_ids.contains(&message.id));
+            Ok(())
+        }
+
         fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
             unimplemented!()
         }
@@ -689,8 +884,23 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 6);
         assert_eq!(tools[0]["name"], "list_sessions");
+        let names = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "list_sessions",
+                "snapshot_session",
+                "styled_rows",
+                "send_session_message",
+                "receive_session_messages",
+                "ack_session_messages",
+            ]
+        );
     }
 
     #[test]
@@ -735,6 +945,149 @@ mod tests {
             })
             .expect("response");
 
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("session_id"));
+    }
+
+    fn call_tool(server: &McpServer<RecordingApi>, name: &str, arguments: Value) -> Value {
+        server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(name)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": name,
+                    "arguments": arguments
+                })),
+            })
+            .expect("response")
+            .result
+            .expect("result")
+    }
+
+    #[test]
+    fn session_messaging_tools_round_trip_through_dispatch() {
+        let server = McpServer::new(RecordingApi::new());
+
+        let sent = call_tool(
+            &server,
+            "send_session_message",
+            json!({
+                "from_session_id": "session-1",
+                "to_session_id": "session-2",
+                "body": "handoff: build is green"
+            }),
+        );
+        assert_eq!(sent["isError"], false);
+        assert_eq!(sent["structuredContent"]["message_id"], 1);
+
+        // Peek: unacked mail redelivers.
+        for _ in 0..2 {
+            let received = call_tool(
+                &server,
+                "receive_session_messages",
+                json!({ "session_id": "session-2" }),
+            );
+            let messages = received["structuredContent"]["messages"]
+                .as_array()
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["id"], 1);
+            assert_eq!(messages[0]["from_session_id"], "session-1");
+            assert_eq!(messages[0]["body"], "handoff: build is green");
+            assert_eq!(messages[0]["sent_at_ms"], 1_700_000_000_000u64);
+        }
+
+        let acked = call_tool(
+            &server,
+            "ack_session_messages",
+            json!({ "session_id": "session-2", "message_ids": [1] }),
+        );
+        assert_eq!(acked["structuredContent"]["ok"], true);
+
+        let received = call_tool(
+            &server,
+            "receive_session_messages",
+            json!({ "session_id": "session-2" }),
+        );
+        assert_eq!(
+            received["structuredContent"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn session_messaging_tools_validate_arguments() {
+        let server = McpServer::new(RecordingApi::new());
+
+        // Missing body.
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(1)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "send_session_message",
+                    "arguments": {
+                        "from_session_id": "session-1",
+                        "to_session_id": "session-2"
+                    }
+                })),
+            })
+            .expect("response");
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("body"));
+
+        // Non-array message_ids.
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(2)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "ack_session_messages",
+                    "arguments": {
+                        "session_id": "session-2",
+                        "message_ids": "1"
+                    }
+                })),
+            })
+            .expect("response");
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("message_ids"));
+
+        // Non-integer message id.
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(3)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "ack_session_messages",
+                    "arguments": {
+                        "session_id": "session-2",
+                        "message_ids": [1, "two"]
+                    }
+                })),
+            })
+            .expect("response");
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("message_ids"));
+
+        // Missing session_id on receive.
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(4)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "receive_session_messages",
+                    "arguments": {}
+                })),
+            })
+            .expect("response");
         let error = response.error.expect("error");
         assert_eq!(error.code, -32602);
         assert!(error.message.contains("session_id"));

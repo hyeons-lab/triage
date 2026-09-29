@@ -31,10 +31,11 @@ use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest,
     SessionApi, SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope,
-    SessionEventReceiver, SessionId, SessionPins, SessionSize, SessionSnapshot,
+    SessionEventReceiver, SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot,
     StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
     SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
 };
+use triage_core::session::{SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN};
 use triage_transport_ws::ServerMessage;
 use unicode_width::UnicodeWidthStr;
 
@@ -303,6 +304,11 @@ struct JudgeState {
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
+    /// Side inboxes for session-to-session coordination mail (agents via
+    /// MCP). In-memory only: not persisted, not carried across handover.
+    inboxes: Mutex<HashMap<SessionId, VecDeque<SessionMessage>>>,
+    /// Daemon-monotonic message id counter (starts at 1; 0 is never valid).
+    next_message_id: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
     pins: Mutex<SessionPins>,
     custom_labels: Mutex<HashMap<String, String>>,
@@ -644,6 +650,8 @@ impl SessionManager {
         Self {
             config,
             next_session: AtomicU64::new(next_session),
+            inboxes: Mutex::new(HashMap::new()),
+            next_message_id: AtomicU64::new(1),
             sessions: Mutex::new(sessions),
             pins: Mutex::new(pins),
             custom_labels: Mutex::new(custom_labels),
@@ -1543,6 +1551,23 @@ impl SessionManager {
         self.sessions
             .lock()
             .map_err(|_| anyhow!("session manager lock poisoned"))
+    }
+
+    fn inboxes(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<SessionId, VecDeque<SessionMessage>>>> {
+        self.inboxes
+            .lock()
+            .map_err(|_| anyhow!("session inbox lock poisoned"))
+    }
+
+    fn require_known_session(&self, session_id: &SessionId) -> Result<()> {
+        let sessions = self.sessions()?;
+        ensure!(
+            sessions.contains_key(session_id),
+            "session {session_id} not found"
+        );
+        Ok(())
     }
 
     fn pins(&self) -> Result<std::sync::MutexGuard<'_, SessionPins>> {
@@ -3355,6 +3380,54 @@ impl SessionApi for SessionManager {
             Resolved::Live(tx) => request_snapshot(&tx)?,
         };
         Ok(self.overlay_snippet(snapshot, &session_id))
+    }
+
+    fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
+        ensure!(
+            !body.trim().is_empty(),
+            "session message body must not be empty"
+        );
+        ensure!(
+            body.len() <= SESSION_MESSAGE_MAX_BODY_LEN,
+            "session message body exceeds {SESSION_MESSAGE_MAX_BODY_LEN} bytes"
+        );
+        self.require_known_session(&from)?;
+        self.require_known_session(&to)?;
+        let mut inboxes = self.inboxes()?;
+        let inbox = inboxes.entry(to).or_default();
+        ensure!(
+            inbox.len() < SESSION_INBOX_CAPACITY,
+            "session inbox is full ({SESSION_INBOX_CAPACITY} unacked messages); retry later"
+        );
+        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
+        inbox.push_back(SessionMessage {
+            id,
+            from,
+            body,
+            sent_at_ms: now_unix_millis(),
+        });
+        Ok(id)
+    }
+
+    fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        self.require_known_session(&session_id)?;
+        let inboxes = self.inboxes()?;
+        Ok(inboxes
+            .get(&session_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
+        self.require_known_session(&session_id)?;
+        let mut inboxes = self.inboxes()?;
+        if let Some(inbox) = inboxes.get_mut(&session_id) {
+            inbox.retain(|message| !message_ids.contains(&message.id));
+            if inbox.is_empty() {
+                inboxes.remove(&session_id);
+            }
+        }
+        Ok(())
     }
 
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
@@ -8338,6 +8411,129 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(res.is_none());
         assert!(elapsed < Duration::from_millis(1000));
+    }
+
+    fn two_live_sessions(manager: &SessionManager) -> (SessionId, SessionId) {
+        let first = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start first session");
+        let second = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start second session");
+        (first, second)
+    }
+
+    #[test]
+    fn session_messaging_round_trip_peeks_until_acked() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+
+        let id = manager
+            .send_session_message(
+                from.clone(),
+                to.clone(),
+                "handoff: build is green".to_string(),
+            )
+            .expect("send message");
+        assert!(id > 0);
+
+        // Peek twice: unacked mail redelivers.
+        for _ in 0..2 {
+            let mail = manager
+                .receive_session_messages(to.clone())
+                .expect("receive messages");
+            assert_eq!(mail.len(), 1);
+            assert_eq!(mail[0].id, id);
+            assert_eq!(mail[0].from, from);
+            assert_eq!(mail[0].body, "handoff: build is green");
+            assert!(mail[0].sent_at_ms > 0);
+        }
+
+        manager
+            .ack_session_messages(to.clone(), vec![id])
+            .expect("ack message");
+        let mail = manager
+            .receive_session_messages(to.clone())
+            .expect("receive after ack");
+        assert!(mail.is_empty());
+
+        // Acking again (or an unknown id) is a no-op, not an error.
+        manager
+            .ack_session_messages(to.clone(), vec![id, 999_999])
+            .expect("re-ack is idempotent");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_rejects_unknown_sessions_and_bad_bodies() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+        let ghost = SessionId::new("no-such-session").unwrap();
+
+        for (sender, target) in [(&ghost, &to), (&from, &ghost)] {
+            let error = manager
+                .send_session_message(sender.clone(), target.clone(), "hi".to_string())
+                .expect_err("unknown session must be rejected");
+            assert!(
+                error.to_string().contains("not found"),
+                "unexpected error: {error}"
+            );
+        }
+        let error = manager
+            .receive_session_messages(ghost.clone())
+            .expect_err("receive on unknown session must fail");
+        assert!(error.to_string().contains("not found"));
+        let error = manager
+            .ack_session_messages(ghost, vec![1])
+            .expect_err("ack on unknown session must fail");
+        assert!(error.to_string().contains("not found"));
+
+        let error = manager
+            .send_session_message(from.clone(), to.clone(), "   ".to_string())
+            .expect_err("blank body must be rejected");
+        assert!(error.to_string().contains("must not be empty"));
+
+        let oversize = "x".repeat(SESSION_MESSAGE_MAX_BODY_LEN + 1);
+        let error = manager
+            .send_session_message(from.clone(), to.clone(), oversize)
+            .expect_err("oversize body must be rejected");
+        assert!(error.to_string().contains("exceeds"));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_rejects_send_when_inbox_full() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+
+        for i in 0..SESSION_INBOX_CAPACITY {
+            manager
+                .send_session_message(from.clone(), to.clone(), format!("mail {i}"))
+                .expect("fill inbox");
+        }
+        let error = manager
+            .send_session_message(from.clone(), to.clone(), "one too many".to_string())
+            .expect_err("full inbox must reject");
+        assert!(error.to_string().contains("inbox is full"));
+
+        // Accepted mail is intact (nothing dropped): ack one, then one more fits.
+        let mail = manager
+            .receive_session_messages(to.clone())
+            .expect("receive full inbox");
+        assert_eq!(mail.len(), SESSION_INBOX_CAPACITY);
+        manager
+            .ack_session_messages(to.clone(), vec![mail[0].id])
+            .expect("ack one");
+        manager
+            .send_session_message(from.clone(), to.clone(), "fits now".to_string())
+            .expect("send after ack");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     #[cfg(unix)]

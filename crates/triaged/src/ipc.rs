@@ -25,8 +25,9 @@ use triage_core::judge::{JudgeRequest, JudgeVerdict, SessionJudgePolicy};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     LeaseChange, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi,
-    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSnapshot, StartSessionRequest,
-    StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionSnapshot,
+    StartSessionRequest, StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest,
+    WriteInputRequest,
 };
 
 use crate::session::SessionManager;
@@ -584,6 +585,30 @@ impl SessionApi for IpcClient {
         }
     }
 
+    fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
+        match self.round_trip(WireRequest::SendSessionMessage { from, to, body })? {
+            WireSuccess::SessionMessageId(id) => Ok(id),
+            other => bail!("unexpected send_session_message response: {other:?}"),
+        }
+    }
+
+    fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        match self.round_trip(WireRequest::ReceiveSessionMessages { session_id })? {
+            WireSuccess::SessionMessages(messages) => Ok(messages),
+            other => bail!("unexpected receive_session_messages response: {other:?}"),
+        }
+    }
+
+    fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
+        match self.round_trip(WireRequest::AckSessionMessages {
+            session_id,
+            message_ids,
+        })? {
+            WireSuccess::Unit => Ok(()),
+            other => bail!("unexpected ack_session_messages response: {other:?}"),
+        }
+    }
+
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         match self.round_trip(WireRequest::ShutdownSession { session_id })? {
             WireSuccess::CompletedSession(completed) => Ok(completed),
@@ -649,6 +674,18 @@ enum WireRequest {
         session_id: SessionId,
     },
     StyledRows(StyledRowsRequest),
+    SendSessionMessage {
+        from: SessionId,
+        to: SessionId,
+        body: String,
+    },
+    ReceiveSessionMessages {
+        session_id: SessionId,
+    },
+    AckSessionMessages {
+        session_id: SessionId,
+        message_ids: Vec<u64>,
+    },
     ShutdownSession {
         session_id: SessionId,
     },
@@ -718,6 +755,8 @@ enum WireSuccess {
     LeaseChange(LeaseChange),
     SessionSnapshot(SessionSnapshot),
     StyledRows(StyledRowsResponse),
+    SessionMessageId(u64),
+    SessionMessages(Vec<SessionMessage>),
     CompletedSession(CompletedSession),
     Subscribed,
     SessionEvent(SessionEventEnvelope),
@@ -1794,6 +1833,18 @@ fn handle_request(
         WireRequest::StyledRows(request) => {
             manager.styled_rows(request).map(WireSuccess::StyledRows)
         }
+        WireRequest::SendSessionMessage { from, to, body } => manager
+            .send_session_message(from, to, body)
+            .map(WireSuccess::SessionMessageId),
+        WireRequest::ReceiveSessionMessages { session_id } => manager
+            .receive_session_messages(session_id)
+            .map(WireSuccess::SessionMessages),
+        WireRequest::AckSessionMessages {
+            session_id,
+            message_ids,
+        } => manager
+            .ack_session_messages(session_id, message_ids)
+            .map(|()| WireSuccess::Unit),
         WireRequest::ShutdownSession { session_id } => manager
             .shutdown_session(session_id)
             .map(WireSuccess::CompletedSession),
@@ -2182,6 +2233,65 @@ mod tests {
         client
             .shutdown_session(session_id)
             .expect("shutdown session");
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY behavior needs a dedicated Windows lifecycle test"
+    )]
+    fn client_exchanges_session_messages_over_unix_socket() {
+        let socket_path = unique_socket_path("sm");
+        let log_dir = unique_dir("sm-logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
+        let server = IpcServer::new(
+            Arc::clone(&manager),
+            cache,
+            IpcConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+
+        let client = IpcClient::new(socket_path.clone());
+        let from = client
+            .start_session(StartSessionRequest::new("/bin/sh"))
+            .expect("start sender");
+        let to = client
+            .start_session(StartSessionRequest::new("/bin/sh"))
+            .expect("start target");
+
+        let id = client
+            .send_session_message(
+                from.clone(),
+                to.clone(),
+                "handoff: build is green".to_string(),
+            )
+            .expect("send message");
+        assert!(id > 0);
+
+        // Peek: unacked mail redelivers over the wire too.
+        for _ in 0..2 {
+            let mail = client
+                .receive_session_messages(to.clone())
+                .expect("receive messages");
+            assert_eq!(mail.len(), 1);
+            assert_eq!(mail[0].id, id);
+            assert_eq!(mail[0].from, from);
+            assert_eq!(mail[0].body, "handoff: build is green");
+        }
+
+        client
+            .ack_session_messages(to.clone(), vec![id])
+            .expect("ack message");
+        let mail = client
+            .receive_session_messages(to.clone())
+            .expect("receive after ack");
+        assert!(mail.is_empty());
+
         let _ = fs::remove_file(socket_path);
         let _ = fs::remove_dir_all(log_dir);
     }

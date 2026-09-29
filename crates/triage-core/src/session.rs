@@ -647,6 +647,27 @@ pub struct ServerUpdateInfo {
     pub latest_version: Option<String>,
 }
 
+/// Maximum bytes in one session message body.
+pub const SESSION_MESSAGE_MAX_BODY_LEN: usize = 64 * 1024;
+/// Maximum queued messages per session inbox; past this the send is rejected.
+pub const SESSION_INBOX_CAPACITY: usize = 256;
+
+/// One direct message between sessions, queued in the target's side inbox.
+/// Agents coordinate through these over MCP; delivery is poll-based
+/// (`receive_session_messages` peeks unacked mail, `ack_session_messages`
+/// confirms it, unacked mail redelivers).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessage {
+    /// Daemon-monotonic id, unique across all inboxes.
+    pub id: u64,
+    /// Sender session, caller-asserted: MCP has no caller session identity,
+    /// and the daemon already trusts MCP clients with full read access.
+    pub from: SessionId,
+    pub body: String,
+    /// Unix millis when the daemon queued the message.
+    pub sent_at_ms: u64,
+}
+
 pub trait SessionApi {
     fn list_sessions(&self) -> Result<Vec<SessionId>>;
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
@@ -674,6 +695,24 @@ pub trait SessionApi {
     }
     fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot>;
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse>;
+    /// Queue a direct message in another session's side inbox, returning its
+    /// id. Both ids must be known sessions; the body must be non-empty and
+    /// within [`SESSION_MESSAGE_MAX_BODY_LEN`]; a full inbox rejects the
+    /// send. Default: unsupported.
+    fn send_session_message(&self, _from: SessionId, _to: SessionId, _body: String) -> Result<u64> {
+        anyhow::bail!("session messaging is not supported by this session API")
+    }
+    /// Peek a session's unacked inbox mail (oldest first) without clearing
+    /// it. Unknown sessions error; no unacked mail returns an empty vec.
+    /// Default: unsupported.
+    fn receive_session_messages(&self, _session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        anyhow::bail!("session messaging is not supported by this session API")
+    }
+    /// Confirm receipt, removing the ids from the session's inbox. Unknown
+    /// ids are ignored (idempotent). Default: unsupported.
+    fn ack_session_messages(&self, _session_id: SessionId, _message_ids: Vec<u64>) -> Result<()> {
+        anyhow::bail!("session messaging is not supported by this session API")
+    }
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession>;
     /// Current snippet for every session (id, one-liner, detail). Sessions
     /// without a snippet yet carry `None`. Default: no snippets (summarization
@@ -847,6 +886,15 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     }
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
         (**self).styled_rows(request)
+    }
+    fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
+        (**self).send_session_message(from, to, body)
+    }
+    fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        (**self).receive_session_messages(session_id)
+    }
+    fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
+        (**self).ack_session_messages(session_id, message_ids)
     }
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
         (**self).shutdown_session(session_id)
@@ -1287,5 +1335,20 @@ mod tests {
         let deserialized = compressed_bytes::deserialize(RawBytesDeserializer(raw))
             .expect("deserialize raw bytes");
         assert_eq!(deserialized, raw);
+    }
+
+    #[test]
+    fn session_message_serde_round_trip() {
+        let message = SessionMessage {
+            id: 7,
+            from: SessionId::new("agent-a").unwrap(),
+            body: "handoff: build is green".to_string(),
+            sent_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionMessage>(&json).unwrap(),
+            message
+        );
     }
 }
