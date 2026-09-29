@@ -161,7 +161,29 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     final isAuthenticated = accepted == null
         ? authenticated
         : token != null && accepted.contains(token);
-    return {'protocol_version': '2026-05-20', 'authenticated': isAuthenticated};
+    return {
+      'protocol_version': '2026-05-20',
+      'authenticated': isAuthenticated,
+      'tailscale_pairing_available': tailscalePairingAvailable,
+    };
+  }
+
+  /// Hello advertisement for Tailscale-identity pairing.
+  bool tailscalePairingAvailable = false;
+
+  /// Client ids `pairViaTailscale` was called with, in order.
+  final List<String> pairViaTailscaleClientIds = [];
+
+  /// When set, `pairViaTailscale` throws this instead of minting.
+  String? pairViaTailscaleError;
+
+  @override
+  Future<String> pairViaTailscale({required String clientId}) async {
+    pairViaTailscaleClientIds.add(clientId);
+    final error = pairViaTailscaleError;
+    if (error != null) throw Exception(error);
+    authenticated = true;
+    return 'tailscale-token';
   }
 
   @override
@@ -2339,6 +2361,45 @@ void main() {
     expect(client.pairCodes, ['WXYZ9876']);
     expect(client.helloClientIds.length, 2);
     expect(find.text('Pair Remote Device'), findsNothing);
+  });
+
+  testWidgets('tailscale-advertising daemon pairs automatically', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(authenticated: false)
+      ..tailscalePairingAvailable = true;
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // No code requested, no PIN entered: one tailscale exchange, then the
+    // reconnect authenticates and sessions load.
+    expect(client.pairViaTailscaleClientIds.length, 1);
+    expect(client.pairingChallengeClientIds, isEmpty);
+    expect(client.pairCodes, isEmpty);
+    expect(find.text('Pair with Tailscale'), findsNothing);
+    expect(find.text('triage / websocket-session-api'), findsWidgets);
+  });
+
+  testWidgets('tailscale pairing failure shows retry and retries', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(authenticated: false)
+      ..tailscalePairingAvailable = true
+      ..pairViaTailscaleError = 'tailnet identity is not authorized';
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pair with Tailscale'), findsOneWidget);
+    expect(find.text('Pair Remote Device'), findsNothing);
+    expect(
+      find.textContaining('tailnet identity is not authorized'),
+      findsOneWidget,
+    );
+    expect(client.pairViaTailscaleClientIds.length, 1);
+
+    await tester.tap(find.text('Try Again'));
+    await tester.pumpAndSettle();
+    expect(client.pairViaTailscaleClientIds.length, 2);
   });
 
   testWidgets('shows the CLI pairing command when remote', (

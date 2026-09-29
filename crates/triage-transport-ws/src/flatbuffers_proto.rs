@@ -52,6 +52,20 @@ pub fn parse_client_message(
                 .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             ClientRequest::PairingChallenge { client_id }
         }
+        fb::ClientRequestPayload::PairViaTailscaleRequest => {
+            let req = msg.payload_as_pair_via_tailscale_request().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "PairViaTailscaleRequest payload is missing",
+                )
+            })?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
+            ClientRequest::PairViaTailscale { client_id }
+        }
         fb::ClientRequestPayload::ListSessionsRequest => ClientRequest::ListSessions,
         fb::ClientRequestPayload::StartSessionRequestTable => {
             let req = msg
@@ -613,6 +627,19 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::PairViaTailscale { client_id } => {
+            let client_id_str = builder.create_string(client_id.as_str());
+            let req = fb::PairViaTailscaleRequest::create(
+                builder,
+                &fb::PairViaTailscaleRequestArgs {
+                    client_id: Some(client_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::PairViaTailscaleRequest,
+                req.as_union_value(),
+            )
+        }
         ClientRequest::ListSessions => {
             let req = fb::ListSessionsRequest::create(builder, &fb::ListSessionsRequestArgs {});
             (
@@ -1083,6 +1110,7 @@ pub fn build_server_message<'a>(
                     latest_version,
                     disk_free_bytes,
                     disk_total_bytes,
+                    tailscale_pairing_available,
                 } => {
                     let pv = builder.create_string(protocol_version);
                     let sv = builder.create_string(server_version);
@@ -1097,6 +1125,7 @@ pub fn build_server_message<'a>(
                             latest_version: lv,
                             disk_free_bytes: *disk_free_bytes,
                             disk_total_bytes: *disk_total_bytes,
+                            tailscale_pairing_available: *tailscale_pairing_available,
                         },
                     );
                     (fb::ServerResultPayload::HelloResult, r.as_union_value())
@@ -1859,6 +1888,7 @@ pub enum ServerResultBorrowed<'a> {
         latest_version: Option<&'a str>,
         disk_free_bytes: u64,
         disk_total_bytes: u64,
+        tailscale_pairing_available: bool,
     },
     Paired {
         token: &'a str,
@@ -2013,6 +2043,7 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         latest_version: hello.latest_version(),
                         disk_free_bytes: hello.disk_free_bytes(),
                         disk_total_bytes: hello.disk_total_bytes(),
+                        tailscale_pairing_available: hello.tailscale_pairing_available(),
                     }
                 }
                 fb::ServerResultPayload::PairingChallengeResult => {
@@ -2147,6 +2178,14 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 }
                 fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {
                     ServerResultBorrowed::Unit
+                }
+                fb::ServerResultPayload::PairedResult => {
+                    let paired = resp.result_as_paired_result().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing paired result")
+                    })?;
+                    ServerResultBorrowed::Paired {
+                        token: paired.token().unwrap_or(""),
+                    }
                 }
                 _ => {
                     return Err(crate::ProtocolError::new(

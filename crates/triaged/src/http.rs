@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -351,6 +352,11 @@ where
         headers.insert("sec-websocket-protocol", proto);
     }
 
+    // The accept loop stashes the peer address in the request extensions (see
+    // `ws.rs`); read it before the upgrade consumes the request. Absent in
+    // unit tests, which never upgrade — the connection then fails closed on
+    // Tailscale-identity pairing for lack of a peer to whois.
+    let peer_addr = req.extensions().get::<SocketAddr>().copied();
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
@@ -362,7 +368,8 @@ where
                 )
                 .await;
                 if let Err(error) =
-                    crate::ws::handle_upgraded_ws(manager, ws_stream, selected_format).await
+                    crate::ws::handle_upgraded_ws(manager, ws_stream, selected_format, peer_addr)
+                        .await
                 {
                     tracing::warn!(error = ?error, "Upgraded WebSocket connection failed");
                 }

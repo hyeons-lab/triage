@@ -44,16 +44,21 @@ pub fn start_websocket_server(
                     tokio::spawn(async move {
                         tracing::debug!(client_addr = %addr, "Spawning HTTP/WebSocket handler");
                         let io = TokioIo::new(stream);
-                        let service = hyper::service::service_fn(move |req| {
-                            let cache = Arc::clone(&cache);
-                            let manager = Arc::clone(&manager);
-                            tracing::debug!(
-                                method = %req.method(),
-                                path = %req.uri().path(),
-                                "Received HTTP request"
-                            );
-                            async move { crate::http::serve_http(req, cache, manager).await }
-                        });
+                        let service = hyper::service::service_fn(
+                            move |mut req: hyper::Request<hyper::body::Incoming>| {
+                                let cache = Arc::clone(&cache);
+                                let manager = Arc::clone(&manager);
+                                tracing::debug!(
+                                    method = %req.method(),
+                                    path = %req.uri().path(),
+                                    "Received HTTP request"
+                                );
+                                // Stash the peer address for the upgrade path: the WS
+                                // connection needs it to whois Tailscale-pairing callers.
+                                req.extensions_mut().insert(addr);
+                                async move { crate::http::serve_http(req, cache, manager).await }
+                            },
+                        );
 
                         if let Err(error) = http1::Builder::new()
                             .serve_connection(io, service)
@@ -81,6 +86,7 @@ pub async fn handle_upgraded_ws<S>(
     manager: Arc<SessionManager>,
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     format: triage_transport_ws::ProtocolFormat,
+    peer_addr: Option<std::net::SocketAddr>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -93,6 +99,9 @@ where
         WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager))
             .with_format(format)
             .with_global_receiver(global_rx);
+    if let Some(peer_addr) = peer_addr {
+        conn = conn.with_peer_addr(peer_addr);
+    }
 
     let mut next_msg = ws_receiver.next();
 

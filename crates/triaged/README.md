@@ -151,6 +151,7 @@ in `~/.config/triage/config.toml`:
 [remote]
 bind = "127.0.0.1:7777"   # loopback only; or a specific tailnet IP
 require_pairing = true
+# tailscale_pair_users = ["you@example.com"]  # SSO pairing (see below)
 ```
 
 Then point a client at `http://<daemon-host>:7777` (web UI) or
@@ -162,7 +163,9 @@ running shells.
 
 > **Pairing requires local CLI approval.** Pairing PINs are never exposed over
 > unauthenticated HTTP. To pair a new client, approve its device code securely
-> via the CLI on the daemon host (see [Pairing](#pairing)).
+> via the CLI on the daemon host (see [Pairing](#pairing)) — or configure
+> [Tailscale-identity pairing](#tailscale-identity-pairing) to skip codes
+> entirely on a tailnet.
 
 ### Prebuilt desktop clients
 
@@ -282,6 +285,31 @@ a pairing request.
 Pairing can be disabled for trusted, isolated setups by setting
 `require_pairing = false` under `[remote]`, in which case clients attach without
 the PIN exchange.
+
+### Tailscale-identity pairing
+
+For daemons reached over a tailnet, pairing can skip the code/PIN exchange
+entirely. List the allowed tailnet users under `[remote]`:
+
+```toml
+[remote]
+tailscale_pair_users = ["you@example.com"]
+```
+
+With a non-empty allowlist the device-code flow is disabled, and the client
+pairs with one automatic exchange: it sends `pair_via_tailscale`, the daemon
+resolves the caller's tailnet user with the local `tailscale whois`, and
+mints the standard pairing token only on an allowlist hit. Identity comes
+from tailscaled's answer about the peer — never from the source IP alone —
+and every resolution failure denies. `tagged-devices` (the pseudo-login
+shared by all tag-owned nodes) can never authorize, and is rejected in
+config validation.
+
+Threat notes: tailnet membership is necessary but not sufficient — only
+listed users pair. Anyone who can run commands as the daemon user can edit
+the allowlist, and a compromised allowlisted node pairs as its owner, so
+treat node hygiene as part of the trust boundary. The `tailscale` CLI must
+be on the daemon host's `PATH`; without it pairing fails closed.
 
 ---
 

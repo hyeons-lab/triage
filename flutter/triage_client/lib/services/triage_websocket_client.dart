@@ -463,6 +463,15 @@ class TriageWebSocketClient {
     return _send('pairing_challenge', {'client_id': clientId});
   }
 
+  /// Pairs by Tailscale identity: the daemon whoises this connection's peer
+  /// and mints a token only for allowlisted tailnet users. No code, no PIN.
+  Future<String> pairViaTailscale({required String clientId}) async {
+    final response = await _send('pair_via_tailscale', {
+      'client_id': clientId,
+    });
+    return response['token']?.toString() ?? '';
+  }
+
   Future<String> startSession({
     required String command,
     List<String> args = const [],
@@ -1220,6 +1229,7 @@ class TriageWebSocketClient {
             'latest_version': hello.latestVersion,
           'disk_free_bytes': hello.diskFreeBytes,
           'disk_total_bytes': hello.diskTotalBytes,
+          'tailscale_pairing_available': hello.tailscalePairingAvailable,
         };
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
@@ -1616,6 +1626,13 @@ class TriageWebSocketClient {
       case 'pairing_challenge':
         payloadType = fbs.ClientRequestPayloadTypeId.PairingChallengeRequest;
         payload = fbs.PairingChallengeRequestObjectBuilder(
+          clientId: extra?['client_id'] as String?,
+        );
+        break;
+
+      case 'pair_via_tailscale':
+        payloadType = fbs.ClientRequestPayloadTypeId.PairViaTailscaleRequest;
+        payload = fbs.PairViaTailscaleRequestObjectBuilder(
           clientId: extra?['client_id'] as String?,
         );
         break;

@@ -141,6 +141,10 @@ table PairingChallengeRequest {
     client_id: string;
 }
 
+table PairViaTailscaleRequest {
+    client_id: string;
+}
+
 table ListSessionsRequest {}
 
 table StartSessionRequestTable {
@@ -294,7 +298,8 @@ union ClientRequestPayload {
     GetRailLayoutRequest,
     SetRailPinsRequest,
     SetSessionCustomLabelRequest,
-    GetDaemonStatsRequest
+    GetDaemonStatsRequest,
+    PairViaTailscaleRequest
 }
 
 table ClientMessage {
@@ -322,6 +327,9 @@ table HelloResult {
     // 0/0 means unknown (a platform without statvfs, or a probe failure).
     disk_free_bytes: uint64;
     disk_total_bytes: uint64;
+    // Appended for forward/backward compatibility: whether the daemon offers
+    // Tailscale-identity pairing. Absent (false) on older daemons.
+    tailscale_pairing_available: bool;
 }
 
 table PairedResult {

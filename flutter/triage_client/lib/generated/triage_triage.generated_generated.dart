@@ -149,7 +149,8 @@ enum ClientRequestPayloadTypeId {
   GetRailLayoutRequest(29),
   SetRailPinsRequest(30),
   SetSessionCustomLabelRequest(31),
-  GetDaemonStatsRequest(32);
+  GetDaemonStatsRequest(32),
+  PairViaTailscaleRequest(33);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -189,6 +190,7 @@ enum ClientRequestPayloadTypeId {
       case 30: return ClientRequestPayloadTypeId.SetRailPinsRequest;
       case 31: return ClientRequestPayloadTypeId.SetSessionCustomLabelRequest;
       case 32: return ClientRequestPayloadTypeId.GetDaemonStatsRequest;
+      case 33: return ClientRequestPayloadTypeId.PairViaTailscaleRequest;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -197,7 +199,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 32;
+  static const int maxValue = 33;
   static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
@@ -1942,6 +1944,79 @@ class PairingChallengeRequestObjectBuilder extends fb.ObjectBuilder {
   final String? _clientId;
 
   PairingChallengeRequestObjectBuilder({
+    String? clientId,
+  })
+      : _clientId = clientId;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? clientIdOffset = _clientId == null ? null
+        : fbBuilder.writeString(_clientId!);
+    fbBuilder.startTable(1);
+    fbBuilder.addOffset(0, clientIdOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class PairViaTailscaleRequest {
+  PairViaTailscaleRequest._(this._bc, this._bcOffset);
+  factory PairViaTailscaleRequest(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<PairViaTailscaleRequest> reader = _PairViaTailscaleRequestReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+
+  @override
+  String toString() {
+    return 'PairViaTailscaleRequest{clientId: ${clientId}}';
+  }
+}
+
+class _PairViaTailscaleRequestReader extends fb.TableReader<PairViaTailscaleRequest> {
+  const _PairViaTailscaleRequestReader();
+
+  @override
+  PairViaTailscaleRequest createObject(fb.BufferContext bc, int offset) => 
+    PairViaTailscaleRequest._(bc, offset);
+}
+
+class PairViaTailscaleRequestBuilder {
+  PairViaTailscaleRequestBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(1);
+  }
+
+  int addClientIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class PairViaTailscaleRequestObjectBuilder extends fb.ObjectBuilder {
+  final String? _clientId;
+
+  PairViaTailscaleRequestObjectBuilder({
     String? clientId,
   })
       : _clientId = clientId;
@@ -4126,6 +4201,7 @@ class ClientMessage {
       case 30: return SetRailPinsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 31: return SetSessionCustomLabelRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 32: return GetDaemonStatsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 33: return PairViaTailscaleRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -4271,10 +4347,11 @@ class HelloResult {
   String? get latestVersion => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
   int get diskFreeBytes => fbjs.readUint64(_bc, _bcOffset, 14, 0);
   int get diskTotalBytes => fbjs.readUint64(_bc, _bcOffset, 16, 0);
+  bool get tailscalePairingAvailable => const fb.BoolReader().vTableGet(_bc, _bcOffset, 18, false);
 
   @override
   String toString() {
-    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}, diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}}';
+    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}, diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}, tailscalePairingAvailable: ${tailscalePairingAvailable}}';
   }
 }
 
@@ -4292,7 +4369,7 @@ class HelloResultBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(7);
+    fbBuilder.startTable(8);
   }
 
   int addProtocolVersionOffset(int? offset) {
@@ -4323,6 +4400,10 @@ class HelloResultBuilder {
     fbjs.addUint64(fbBuilder, 6, diskTotalBytes);
     return fbBuilder.offset;
   }
+  int addTailscalePairingAvailable(bool? tailscalePairingAvailable) {
+    fbBuilder.addBool(7, tailscalePairingAvailable);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -4337,6 +4418,7 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
   final String? _latestVersion;
   final int? _diskFreeBytes;
   final int? _diskTotalBytes;
+  final bool? _tailscalePairingAvailable;
 
   HelloResultObjectBuilder({
     String? protocolVersion,
@@ -4346,6 +4428,7 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
     String? latestVersion,
     int? diskFreeBytes,
     int? diskTotalBytes,
+    bool? tailscalePairingAvailable,
   })
       : _protocolVersion = protocolVersion,
         _authenticated = authenticated,
@@ -4353,7 +4436,8 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
         _updateAvailable = updateAvailable,
         _latestVersion = latestVersion,
         _diskFreeBytes = diskFreeBytes,
-        _diskTotalBytes = diskTotalBytes;
+        _diskTotalBytes = diskTotalBytes,
+        _tailscalePairingAvailable = tailscalePairingAvailable;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -4364,7 +4448,7 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_serverVersion!);
     final int? latestVersionOffset = _latestVersion == null ? null
         : fbBuilder.writeString(_latestVersion!);
-    fbBuilder.startTable(7);
+    fbBuilder.startTable(8);
     fbBuilder.addOffset(0, protocolVersionOffset);
     fbBuilder.addBool(1, _authenticated);
     fbBuilder.addOffset(2, serverVersionOffset);
@@ -4372,6 +4456,7 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.addOffset(4, latestVersionOffset);
     fbjs.addUint64(fbBuilder, 5, _diskFreeBytes);
     fbjs.addUint64(fbBuilder, 6, _diskTotalBytes);
+    fbBuilder.addBool(7, _tailscalePairingAvailable);
     return fbBuilder.endTable();
   }
 

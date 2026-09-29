@@ -649,6 +649,12 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
              pairing approval via HTTP /pair has been removed. Approve client pairing requests using `triage pair <device-code>` on the daemon host."
         );
     }
+    if !config.remote.tailscale_pair_users.is_empty() {
+        tracing::info!(
+            users = ?config.remote.tailscale_pair_users,
+            "Tailscale-identity pairing is enabled; device-code pairing is disabled"
+        );
+    }
     if let Err(error) = std::thread::Builder::new()
         .name("triage-websocket-server".to_string())
         .spawn(move || {

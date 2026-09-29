@@ -956,6 +956,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   String? _bearerToken;
   bool _storageBackedClientId = false;
   bool _needsPairing = false;
+  // Last hello's advertisement: the active daemon offers Tailscale-identity
+  // pairing (and refuses device codes). Reset on server switch/config change
+  // so a stale true can't route a new daemon down the tailscale path.
+  bool _tailscalePairingAvailable = false;
   // The connect generation a displayed pairing challenge belongs to. A
   // stale-401 probe's hello can resolve before the connect hello and pair
   // first; the connect path skips refiring for that generation, since a
@@ -1341,6 +1345,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _selectedServerId = serverId;
       _needsConnectionConfig = false;
       _needsPairing = false;
+      _tailscalePairingAvailable = false;
       _reconnectAttempt = 0;
     });
 
@@ -1436,6 +1441,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // now dialing a different address. Drop it rather than leave a dead PIN
         // prompt in front of the reconnect.
         _needsPairing = false;
+        _tailscalePairingAvailable = false;
       });
       _purgeDaemonLocalState();
       // Same reason as _selectServer: the purge cleared the in-memory pins and
@@ -1485,6 +1491,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       _selectedServerId = null;
       _needsPairing = false;
+      _tailscalePairingAvailable = false;
       _needsConnectionConfig = true;
       _connectionStatus = 'Not connected';
       _connectionStatusColor = const Color(0xff7f8b8d);
@@ -2245,6 +2252,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         token: _bearerToken,
       );
       final authenticated = helloRes['authenticated'] as bool? ?? false;
+      _tailscalePairingAvailable =
+          helloRes['tailscale_pairing_available'] == true;
 
       if (_disposed ||
           generation != _connectGeneration ||
@@ -2345,7 +2354,67 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _connectionStatusColor = const Color(0xffffc857);
     });
 
+    if (_tailscalePairingAvailable) {
+      await _pairViaTailscale(generation, serverId);
+      return;
+    }
     await _requestPairingChallenge(generation: generation);
+  }
+
+  /// Pairs by Tailscale identity: the daemon whoises this connection's peer
+  /// and mints a token for allowlisted tailnet users — no code, no PIN.
+  /// Attempted automatically on the pairing screen when the daemon
+  /// advertises it; failures surface with a retry affordance. There is no
+  /// code fallback: a daemon that advertises this refuses device codes.
+  Future<void> _pairViaTailscale(int generation, String serverId) async {
+    if (_disposed ||
+        generation != _connectGeneration ||
+        serverId != _activeServerId) {
+      return;
+    }
+    if (!_client.isConnected) {
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError =
+            'Connection closed before Tailscale pairing could complete.';
+      });
+      _scheduleReconnect();
+      return;
+    }
+
+    setState(() {
+      _pairingChallengeLoading = true;
+      _pairingChallengeError = null;
+    });
+
+    final String token;
+    try {
+      token = (await _client.pairViaTailscale(clientId: _clientId)).trim();
+      if (token.isEmpty) {
+        throw Exception('Server $serverId returned empty pairing token');
+      }
+    } catch (e) {
+      if (_disposed || generation != _connectGeneration) return;
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError = e.toString().replaceFirst('Exception: ', '');
+      });
+      return;
+    }
+    // Same store-before-guard ordering as the PIN flow: the token belongs to
+    // the captured daemon even if the user switched away mid-attempt.
+    persistClientId(_clientId);
+    persistTokenFor(serverId, token);
+    if (_disposed || serverId != _activeServerId) return;
+
+    setState(() {
+      _bearerToken = token;
+      _storageBackedClientId = retrieveClientId() == _clientId;
+      _pairingChallengeError = null;
+    });
+    _reconnectAttempt = 0;
+    _isConnecting = false;
+    await _connectWebSocket();
   }
 
   /// Re-checks the current token after a stale-context 401, pairing only when
@@ -5478,7 +5547,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 expiresAt: _pairingExpiresAt,
                 isChallengeLoading: _pairingChallengeLoading,
                 challengeError: _pairingChallengeError,
+                tailscaleAvailable: _tailscalePairingAvailable,
                 onRefreshChallenge: () => _requestPairingChallenge(),
+                onTailscaleRetry: () =>
+                    _pairViaTailscale(_connectGeneration, _activeServerId),
                 onPair: _onPairRequested,
                 onCancel: () async {
                   try {
@@ -10414,7 +10486,9 @@ class _PairingView extends StatefulWidget {
     required this.expiresAt,
     required this.isChallengeLoading,
     required this.challengeError,
+    required this.tailscaleAvailable,
     required this.onRefreshChallenge,
+    required this.onTailscaleRetry,
     required this.onPair,
     required this.onCancel,
   });
@@ -10423,7 +10497,9 @@ class _PairingView extends StatefulWidget {
   final DateTime? expiresAt;
   final bool isChallengeLoading;
   final String? challengeError;
+  final bool tailscaleAvailable;
   final Future<void> Function() onRefreshChallenge;
+  final Future<void> Function() onTailscaleRetry;
   final Future<void> Function(String pin) onPair;
   final VoidCallback onCancel;
 
@@ -10501,8 +10577,90 @@ class _PairingViewState extends State<_PairingView> {
     );
   }
 
+  /// Tailscale-identity pairing: attempted automatically, so this is a status
+  /// view — a spinner while the daemon verifies this device's tailnet user,
+  /// an error with a retry button when it refuses. No code or PIN exists on
+  /// this path: the daemon disables device codes when configured for it.
+  Widget _buildTailscale(BuildContext context) {
+    final error = widget.challengeError;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Row(
+          children: [
+            Icon(Icons.security, color: Color(0xff7fd1c7), size: 28),
+            SizedBox(width: 12),
+            Text(
+              'Pair with Tailscale',
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'This daemon pairs by tailnet identity. Verifying this device with the daemon — no code needed.',
+          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
+        ),
+        const SizedBox(height: 12),
+        if (widget.isChallengeLoading)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: CircularProgressIndicator(
+                strokeWidth: 2.5,
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xff7fd1c7)),
+              ),
+            ),
+          )
+        else if (error != null) ...[
+          Text(
+            error,
+            style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 12,
+            runSpacing: 8,
+            children: [
+              TextButton(
+                onPressed: widget.onCancel,
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xff7f8b8d),
+                ),
+                child: const Text('Cancel (Offline Mode)'),
+              ),
+              ElevatedButton(
+                onPressed: () => widget.onTailscaleRetry(),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xff2b6f6f),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: const Text('Try Again'),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (widget.tailscaleAvailable) return _buildTailscale(context);
+
     final deviceCode = widget.deviceCode;
     final expiryLabel = _expiryLabel(widget.expiresAt);
     final cliCommand = _cliCommand(deviceCode);

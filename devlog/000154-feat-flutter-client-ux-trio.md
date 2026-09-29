@@ -94,7 +94,8 @@ Three Flutter client requests in one branch:
 - 235c4e8 — fix(client): order input-unknown rail tier by output activity
 - b954662 — feat(mcp): session-to-session messaging via side inboxes
 - ba9fdc7 — feat(skills): installable coordination skill + label-aware MCP list
-- HEAD — fix(review): harden probe pins, installer symlink checks, tier tests
+- 56b3cd7 — fix(review): harden probe pins, installer symlink checks, tier tests
+- HEAD — feat(security): Tailscale-identity SSO pairing
 
 ## Progress
 

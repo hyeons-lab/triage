@@ -11,6 +11,7 @@ pub mod session;
 pub mod shutdown;
 pub mod storage;
 pub mod summarizer;
+pub mod tailscale;
 pub mod update;
 pub mod ws;
 

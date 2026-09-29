@@ -315,6 +315,12 @@ pub struct SessionManager {
     pairing_challenges: Mutex<HashMap<String, PendingPairingChallenge>>,
     paired_devices: Mutex<HashMap<ClientId, String>>,
     require_pairing: bool,
+    /// Tailnet users allowed to pair via Tailscale identity (from
+    /// `remote.tailscale_pair_users`). Non-empty replaces the device-code
+    /// flow: code challenges are refused and only allowlisted peers mint.
+    tailscale_pair_users: Vec<String>,
+    /// Cached `tailscale whois` resolver for SSO pairing.
+    tailnet_pairing: crate::tailscale::TailnetPairing,
     /// Latest generated snippet per session (in-memory only; not persisted).
     snippets: Mutex<HashMap<SessionId, SessionSnippet>>,
     /// The local-LLM summarizer worker. Disabled until `start_summarizer` runs.
@@ -644,17 +650,18 @@ impl SessionManager {
         });
         let next_session = next_session_sequence(sessions.keys());
         let paired_devices = load_paired_devices(&config.log_dir);
-        let require_pairing = if let Ok(path) = triage_core::config::Config::default_path() {
-            if path.exists() {
-                triage_core::config::Config::load_from_path(&path)
-                    .map(|c| c.remote.require_pairing)
-                    .unwrap_or(true)
+        let (require_pairing, tailscale_pair_users) =
+            if let Ok(path) = triage_core::config::Config::default_path() {
+                if path.exists() {
+                    triage_core::config::Config::load_from_path(&path)
+                        .map(|c| (c.remote.require_pairing, c.remote.tailscale_pair_users))
+                        .unwrap_or((true, Vec::new()))
+                } else {
+                    (true, Vec::new())
+                }
             } else {
-                true
-            }
-        } else {
-            true
-        };
+                (true, Vec::new())
+            };
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
@@ -667,6 +674,8 @@ impl SessionManager {
             pairing_challenges: Mutex::new(HashMap::new()),
             paired_devices: Mutex::new(paired_devices),
             require_pairing,
+            tailscale_pair_users,
+            tailnet_pairing: crate::tailscale::TailnetPairing::new(),
             snippets: Mutex::new(HashMap::new()),
             summarizer: Mutex::new(Summarizer::disabled()),
             judge: Mutex::new(None),
@@ -1784,6 +1793,10 @@ impl SessionManager {
 
     pub fn request_pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallengeInfo> {
         ensure!(
+            self.tailscale_pair_users.is_empty(),
+            "device-code pairing is disabled on this daemon; pair via Tailscale identity instead"
+        );
+        ensure!(
             client_id.as_str().len() <= MAX_PAIRING_CLIENT_ID_LENGTH,
             "pairing client id is too long"
         );
@@ -1874,6 +1887,59 @@ impl SessionManager {
             expires_at: pin_expires_at_unix,
             client_id: challenge.client_id.clone(),
         })
+    }
+
+    /// Pair by Tailscale identity: resolve the peer's tailnet login and mint
+    /// the standard pairing token only for allowlisted users. Every failure
+    /// (unconfigured daemon, unresolvable peer, no match) denies with a
+    /// message that does not distinguish the cause.
+    pub fn pair_via_tailscale(
+        &self,
+        client_id: &ClientId,
+        peer: std::net::SocketAddr,
+    ) -> Result<String> {
+        if self.tailscale_pair_users.is_empty() {
+            bail!(
+                "Tailscale pairing is not configured on this daemon; pair with a device code instead"
+            );
+        }
+        let allowed = self
+            .tailnet_pairing
+            .resolve_login(peer)
+            .is_some_and(|login| {
+                crate::tailscale::tailnet_login_is_allowed(&login, &self.tailscale_pair_users)
+            });
+        if !allowed {
+            bail!("tailnet identity is not authorized to pair with this daemon");
+        }
+        self.mint_paired_token(client_id)
+    }
+
+    /// Mint a pairing token for a client that already proved itself (PIN or
+    /// tailnet identity), persist the hash, and clear any stale CLI code.
+    fn mint_paired_token(&self, client_id: &ClientId) -> Result<String> {
+        use rand::Rng;
+        use sha2::{Digest, Sha256};
+
+        let mut token_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut token_bytes);
+        let token = hex::encode(token_bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let mut devices = self.paired_devices()?;
+        devices.insert(client_id.clone(), hash);
+
+        save_paired_devices(&self.config.log_dir, &devices)?;
+
+        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
+        if pairing_code_path.exists() {
+            let _ = fs::remove_file(pairing_code_path);
+        }
+
+        Ok(token)
     }
 
     #[cfg(unix)]
@@ -7986,7 +8052,10 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
     Some(common_dir)
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: std::time::Duration) -> Option<Vec<u8>> {
+pub(crate) fn run_command_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::null());
@@ -8360,9 +8429,25 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
         })
     }
 
+    fn tailscale_pairing_available(&self) -> bool {
+        !self.tailscale_pair_users.is_empty()
+    }
+
+    fn pair_via_tailscale(
+        &self,
+        client_id: &ClientId,
+        peer: std::net::SocketAddr,
+    ) -> Result<String> {
+        // Fully qualified: the inherent method shares this name, and an
+        // unqualified call would recurse into this trait method instead.
+        SessionManager::pair_via_tailscale(self, client_id, peer)
+    }
+
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
-        use rand::Rng;
-        use sha2::{Digest, Sha256};
+        ensure!(
+            self.tailscale_pair_users.is_empty(),
+            "device-code pairing is disabled on this daemon; pair via Tailscale identity instead"
+        );
 
         let normalized = normalize_pairing_code(code);
         {
@@ -8401,25 +8486,7 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
             challenges.remove(&device_code);
         }
 
-        let mut token_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut token_bytes);
-        let token = hex::encode(token_bytes);
-
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        let hash = hex::encode(hasher.finalize());
-
-        let mut devices = self.paired_devices()?;
-        devices.insert(client_id.clone(), hash);
-
-        save_paired_devices(&self.config.log_dir, &devices)?;
-
-        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
-        if pairing_code_path.exists() {
-            let _ = fs::remove_file(pairing_code_path);
-        }
-
-        Ok(token)
+        self.mint_paired_token(client_id)
     }
 }
 
@@ -13380,6 +13447,109 @@ mod tests {
                 &token,
             )
             .expect("reject second client")
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    fn stub_tailnet_whois(_peer: std::net::SocketAddr) -> Option<Vec<u8>> {
+        Some(br#"{"UserProfile":{"LoginName":"David@Hyeons-Lab.com"}}"#.to_vec())
+    }
+
+    fn tailscale_manager(log_dir: &std::path::Path) -> SessionManager {
+        let mut manager = SessionManager::new(SessionManagerConfig::new(log_dir.to_path_buf()));
+        manager.tailscale_pair_users = vec!["david@hyeons-lab.com".to_string()];
+        manager.tailnet_pairing = crate::tailscale::TailnetPairing::with_runner(stub_tailnet_whois);
+        manager
+    }
+
+    #[test]
+    fn tailscale_pairing_mints_token_for_allowlisted_login() {
+        let log_dir = unique_log_dir();
+        let manager = tailscale_manager(&log_dir);
+        let client = ClientId::new("phone").expect("client id");
+        let peer: std::net::SocketAddr = "100.65.193.69:1".parse().unwrap();
+
+        let token = manager
+            .pair_via_tailscale(&client, peer)
+            .expect("allowlisted peer pairs");
+        assert!(
+            triage_transport_ws::WebSocketAuthenticator::authenticate(&manager, &client, &token)
+                .expect("authenticate paired client")
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn tailscale_pairing_denies_non_allowlisted_login() {
+        let log_dir = unique_log_dir();
+        let mut manager = tailscale_manager(&log_dir);
+        manager.tailscale_pair_users = vec!["someone-else@example.com".to_string()];
+        let client = ClientId::new("phone").expect("client id");
+        let peer: std::net::SocketAddr = "100.65.193.69:1".parse().unwrap();
+
+        let error = manager
+            .pair_via_tailscale(&client, peer)
+            .expect_err("non-allowlisted peer must be denied");
+        assert!(
+            error.to_string().contains("not authorized to pair"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn tailscale_pairing_denies_when_unconfigured() {
+        let log_dir = unique_log_dir();
+        let mut manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        // Hermetic: the constructor reads the operator's real config file.
+        manager.tailscale_pair_users = Vec::new();
+        let client = ClientId::new("phone").expect("client id");
+        let peer: std::net::SocketAddr = "100.65.193.69:1".parse().unwrap();
+
+        let error = manager
+            .pair_via_tailscale(&client, peer)
+            .expect_err("unconfigured daemon must deny");
+        assert!(
+            error.to_string().contains("not configured"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn device_code_challenge_refused_when_tailscale_configured() {
+        let log_dir = unique_log_dir();
+        let manager = tailscale_manager(&log_dir);
+        let client = ClientId::new("phone").expect("client id");
+
+        let error = manager
+            .request_pairing_challenge(&client)
+            .expect_err("code flow must be disabled");
+        assert!(
+            error.to_string().contains("disabled on this daemon"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn pin_pair_refused_when_tailscale_configured() {
+        let log_dir = unique_log_dir();
+        let manager = tailscale_manager(&log_dir);
+        let client = ClientId::new("phone").expect("client id");
+
+        // The gate fires before PIN validation: any code gets the directing
+        // error rather than "invalid pairing PIN".
+        let error = triage_transport_ws::WebSocketAuthenticator::pair(&manager, "000000", &client)
+            .expect_err("code flow must be disabled");
+        assert!(
+            error.to_string().contains("disabled on this daemon"),
+            "unexpected error: {error}"
         );
 
         let _ = std::fs::remove_dir_all(&log_dir);

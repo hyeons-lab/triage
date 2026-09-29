@@ -440,6 +440,24 @@ void main() {
       expect(challengeReq.clientId, equals('client-123'));
     });
 
+    test('pairViaTailscale request translates to binary FlatBuffers', () async {
+      final f = client.pairViaTailscale(clientId: 'client-123');
+      f.catchError((_) => '');
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.PairViaTailscaleRequest),
+      );
+
+      final pairReq = msg.payload as fbs.PairViaTailscaleRequest;
+      expect(pairReq.clientId, equals('client-123'));
+    });
+
     test('writeInput request translates to binary FlatBuffers', () async {
       await client.writeInput(
         sessionId: 'session-456',
@@ -914,6 +932,7 @@ void main() {
                 serverVersion: '0.9.0',
                 updateAvailable: true,
                 latestVersion: '1.0.0',
+                tailscalePairingAvailable: true,
               ),
             ),
           ).toBytes(),
@@ -925,6 +944,7 @@ void main() {
         expect(result['server_version'], equals('0.9.0'));
         expect(result['update_available'], isTrue);
         expect(result['latest_version'], equals('1.0.0'));
+        expect(result['tailscale_pairing_available'], isTrue);
       },
     );
 
