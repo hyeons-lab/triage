@@ -93,7 +93,8 @@ Three Flutter client requests in one branch:
 - 7cc7f9e — fix(client): merge create/push duplicate tiles; observe without stealing input leases
 - 235c4e8 — fix(client): order input-unknown rail tier by output activity
 - b954662 — feat(mcp): session-to-session messaging via side inboxes
-- HEAD — feat(skills): installable coordination skill + label-aware MCP list
+- ba9fdc7 — feat(skills): installable coordination skill + label-aware MCP list
+- HEAD — fix(review): harden probe pins, installer symlink checks, tier tests
 
 ## Progress
 
@@ -225,6 +226,21 @@ Three Flutter client requests in one branch:
 ## Research & Discoveries
 
 ## Lessons Learned
+
+- 2026-09-29T08:52-0700: restoring a file with `mv backup target` preserves
+  the backup's old mtime, so cargo sees the target as unchanged and re-runs
+  a stale test binary. After a mutant probe restored this way, both disk
+  probe pins kept failing on already-restored source until `touch` forced a
+  rebuild. Prefer `cp` (fresh mtime) for mutant restores, or `touch` after
+  `mv`. The scare was pure staleness: the pins genuinely fail under the
+  hardcoded-zeros mutant and pass on real code.
+- 2026-09-29T08:52-0700: a regression test for a symlink-ancestor walk
+  initially passed under the leaf-only mutant because the planted link sat
+  at a level that was itself another file's leaf parent, so the old check
+  fired first. A distinguishing test must plant the fault where the old
+  logic is blind: the link went to a middle level no file's parent, with
+  the nested fixture one level deeper. Always run the new test against the
+  old code before trusting it.
 
 ## Next Steps
 

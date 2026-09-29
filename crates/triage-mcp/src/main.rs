@@ -323,7 +323,7 @@ fn tool_definitions() -> Value {
                     },
                     "body": {
                         "type": "string",
-                        "description": "Message body (non-empty)."
+                        "description": "Message body (required, non-blank after trimming, at most 65536 bytes; blank or oversize bodies are rejected)."
                     }
                 },
                 "required": ["from_session_id", "to_session_id", "body"]
@@ -390,7 +390,10 @@ fn tool_definitions() -> Value {
 
 fn list_sessions(api: &impl SessionApi) -> Result<Value> {
     let session_ids = api.list_sessions().context("listing sessions")?;
-    let layout = api.get_rail_layout().context("reading rail layout")?;
+    // Labels are enrichment, not the feature: a layout failure (or a daemon
+    // predating the rail-layout call) degrades to unlabeled sessions rather
+    // than failing the whole read.
+    let layout = api.get_rail_layout().unwrap_or_default();
     let sessions = session_ids
         .into_iter()
         .map(|session_id| {
@@ -741,6 +744,7 @@ mod tests {
         snapshot_error: Option<&'static str>,
         inbox: RefCell<Vec<SessionMessage>>,
         labels: HashMap<String, String>,
+        layout_error: bool,
     }
 
     impl RecordingApi {
@@ -771,7 +775,13 @@ mod tests {
                 snapshot_error: None,
                 inbox: RefCell::new(Vec::new()),
                 labels: HashMap::new(),
+                layout_error: false,
             }
+        }
+
+        fn with_layout_error(mut self) -> Self {
+            self.layout_error = true;
+            self
         }
 
         fn with_label(mut self, session_id: &str, label: &str) -> Self {
@@ -876,6 +886,9 @@ mod tests {
         }
 
         fn get_rail_layout(&self) -> Result<RailLayout> {
+            if self.layout_error {
+                bail!("rail layout unavailable");
+            }
             Ok(RailLayout {
                 group_keys: Vec::new(),
                 session_ids: Vec::new(),
@@ -974,6 +987,35 @@ mod tests {
         assert_eq!(
             result["structuredContent"]["sessions"][0]["custom_label"],
             "Dev Server"
+        );
+    }
+
+    #[test]
+    fn list_sessions_survives_layout_failure() {
+        let server = McpServer::new(RecordingApi::new().with_layout_error());
+
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!("call-layout-fail")),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "list_sessions",
+                    "arguments": {}
+                })),
+            })
+            .expect("response");
+
+        // Labels are enrichment: the read degrades to unlabeled sessions
+        // rather than failing the whole tool.
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        assert_eq!(
+            result["structuredContent"]["sessions"][0]["id"],
+            "session-1"
+        );
+        assert_eq!(
+            result["structuredContent"]["sessions"][0]["custom_label"],
+            Value::Null
         );
     }
 

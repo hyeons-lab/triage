@@ -45,6 +45,16 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final bool shouldFailConnection;
   int failConnectAttempts;
   Completer<void>? hangConnect;
+  // When set, `getDaemonStats` hangs on this future so a test can resolve
+  // a poll after the connection closes.
+  Completer<DaemonStatsRecord?>? hangDaemonStats;
+
+  @override
+  Future<DaemonStatsRecord?> getDaemonStats() {
+    final hang = hangDaemonStats;
+    if (hang != null) return hang.future;
+    return super.getDaemonStats();
+  }
   bool listSessionsUnauthorized = false;
   bool authenticated;
   // When set, `hello` authenticates only these tokens — which is how a test
@@ -711,6 +721,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String? branch,
     String? cwd,
     int? lastInteractionMs,
+    int? lastOutputMs,
   }) {
     _testEventController.add({
       'type': 'session_started',
@@ -719,7 +730,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       if (worktreeRoot != null) 'worktree_root': worktreeRoot,
       if (branch != null) 'branch': branch,
       if (cwd != null) 'current_working_directory': cwd,
-      if (lastInteractionMs != null) 'last_activity_ms': lastInteractionMs,
+      if (lastInteractionMs != null) 'last_input_ms': lastInteractionMs,
+      if (lastOutputMs != null) 'last_activity_ms': lastOutputMs,
     });
   }
 
@@ -1267,6 +1279,78 @@ void main() {
 
       expect(attachesFor('flutter-spike'), spikeBefore + 1);
       expect(attachesFor('main'), mainBefore);
+
+      // Second daemon shape, same re-acquire behavior.
+      client.emitErrorMessage('session flutter-spike has no input lease holder');
+      await tester.pumpAndSettle();
+
+      expect(attachesFor('flutter-spike'), spikeBefore + 2);
+      expect(attachesFor('main'), mainBefore);
+    },
+  );
+
+  testWidgets(
+    'input-lease error naming an absent session steals no lease',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('main')));
+      await tester.pumpAndSettle();
+
+      int attachesFor(String sid) =>
+          client.attachSessionCalls.where((s) => s == sid).length;
+      final mainBefore = attachesFor('main');
+
+      // The rejection names a session absent from the rail; the selected
+      // session must not pay for it with its lease.
+      client.emitErrorMessage(
+        'client test-client does not hold input lease '
+        'for session ghost-session',
+      );
+      await tester.pumpAndSettle();
+
+      expect(attachesFor('main'), mainBefore);
+    },
+  );
+
+  testWidgets(
+    'daemon stats poll resolving after close repaints nothing',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Positive control: a poll resolving while connected paints the line,
+      // so the absence below proves the guard dropped the stale poll rather
+      // than the line never painting at all.
+      final firstPoll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = firstPoll;
+      await tester.pump(const Duration(seconds: 61));
+      firstPoll.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+      ));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('free ('), findsOneWidget);
+
+      // A second poll starts and hangs mid-flight.
+      client.hangDaemonStats = Completer<DaemonStatsRecord?>();
+      await tester.pump(const Duration(seconds: 61));
+
+      await client.emitSocketClosed();
+      await tester.pump();
+
+      // The hung poll resolves after the close; the post-await guard must
+      // drop it instead of repainting a stale reading.
+      client.hangDaemonStats!.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsNothing);
     },
   );
 
@@ -3472,6 +3556,61 @@ void main() {
         tester.getTopLeft(row('main')).dy,
         lessThan(tester.getTopLeft(row('noisy-build')).dy),
         reason: 'the touched session outranks the noisy one',
+      );
+    });
+
+    testWidgets('started pushes order the input-unknown tier by output', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Neither push carries input, so both land in the input-unknown tier;
+      // their relative order comes from the pushed output alone.
+      client.emitSessionStarted('older-push', lastOutputMs: 1000);
+      client.emitSessionStarted('newer-push', lastOutputMs: 2000);
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(row('newer-push')).dy,
+        lessThan(tester.getTopLeft(row('older-push')).dy),
+        reason: 'the fresher push leads the input-unknown tier',
+      );
+    });
+
+    testWidgets('started pushes order the input-known tier by input', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Conflicting stamps: input says newer leads, output says older
+      // leads. Both land in the input-known tier, so input alone decides;
+      // if the push-path input read broke, output would order older first.
+      client.emitSessionStarted(
+        'older-push',
+        lastInteractionMs: 1000,
+        lastOutputMs: 2000,
+      );
+      client.emitSessionStarted(
+        'newer-push',
+        lastInteractionMs: 2000,
+        lastOutputMs: 1000,
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(row('newer-push')).dy,
+        lessThan(tester.getTopLeft(row('older-push')).dy),
+        reason: 'the fresher push leads the input-known tier',
       );
     });
   });

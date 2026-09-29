@@ -110,6 +110,16 @@ impl WebSocketAuthenticator for NoopAuthenticator {
     }
 }
 
+/// Live disk probe as `(free_bytes, total_bytes)`, defaulting to `(0, 0)`
+/// when the platform cannot probe. One helper for every response carrying
+/// disk stats so the defaulting rule cannot drift between handlers.
+fn current_disk_bytes() -> (u64, u64) {
+    match triage_core::disk::daemon_disk_stats() {
+        Some(stats) => (stats.free_bytes, stats.total_bytes),
+        None => (0, 0),
+    }
+}
+
 #[derive(Debug)]
 pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     api: A,
@@ -300,15 +310,15 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 };
 
                 let update = self.api.server_update_info();
-                let disk = triage_core::disk::daemon_disk_stats();
+                let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
                     server_version: update.server_version,
                     update_available: update.update_available,
                     latest_version: update.latest_version,
-                    disk_free_bytes: disk.map(|d| d.free_bytes).unwrap_or(0),
-                    disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
+                    disk_free_bytes,
+                    disk_total_bytes,
                 })
             }
             ClientRequest::PairingChallenge { client_id } => {
@@ -488,10 +498,10 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 })
             }
             ClientRequest::GetDaemonStats => {
-                let disk = triage_core::disk::daemon_disk_stats();
+                let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
                 Ok(ServerResult::DaemonStats {
-                    disk_free_bytes: disk.map(|d| d.free_bytes).unwrap_or(0),
-                    disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
+                    disk_free_bytes,
+                    disk_total_bytes,
                 })
             }
             ClientRequest::SetRailPins {
@@ -1956,6 +1966,70 @@ mod tests {
             } => {
                 assert_eq!(id, json!("stats-1"));
                 assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // The invariant above accepts 0/0 (platforms that cannot probe), so a
+    // handler hardcoding unknown would pass it. This pins the probe wiring
+    // on platforms where the probe always answers.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn daemon_stats_probe_is_wired_on_supported_platforms() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+        let response =
+            connection.handle_text_message(r#"{"id":"stats-2","type":"get_daemon_stats"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Response {
+                result:
+                    ServerResult::DaemonStats {
+                        disk_free_bytes,
+                        disk_total_bytes,
+                    },
+                ..
+            } => {
+                assert!(
+                    disk_total_bytes > 0,
+                    "probe must report a total, got {disk_total_bytes}"
+                );
+                assert!(
+                    disk_free_bytes <= disk_total_bytes,
+                    "free {disk_free_bytes} exceeds total {disk_total_bytes}"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // Mirror of the stats pin above for the sibling read: hello accepts 0/0 by
+    // design on unknown platforms, so on supported platforms pin that its call
+    // site is wired to the probe rather than hardcoded unknown.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn hello_probe_is_wired_on_supported_platforms() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+        let response = connection.handle_text_message(r#"{"id":"hello-disk","type":"hello"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Response {
+                result:
+                    ServerResult::Hello {
+                        disk_free_bytes,
+                        disk_total_bytes,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(
+                    disk_total_bytes > 0,
+                    "probe must report a total, got {disk_total_bytes}"
+                );
+                assert!(
+                    disk_free_bytes <= disk_total_bytes,
+                    "free {disk_free_bytes} exceeds total {disk_total_bytes}"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }

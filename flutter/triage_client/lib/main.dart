@@ -404,7 +404,7 @@ class SessionVm {
   // Absolute git repository root and worktree root for this session.
   String? repoRoot;
   String? worktreeRoot;
-  // Milliseconds since the Unix epoch of this session's most recent output, as
+  // Milliseconds since the Unix epoch of this session's most recent input, as
   // last reported by the daemon; 0 when unknown. Held here so the rail can
   // re-group after a drag without another round-trip: the grouping needs
   // per-session activity, and a `SessionGroup` only carries the group's max.
@@ -2123,10 +2123,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         return;
       }
       final stats = await _client.getDaemonStats();
+      // No `_clientInitialized` term: the flag flips false only inside
+      // teardown, after the generation bump, so the generation check above
+      // already subsumes it. `isConnected` is the load-bearing term here.
       if (_disposed ||
           !mounted ||
           generation != _connectGeneration ||
           serverId != _activeServerId ||
+          !_client.isConnected ||
           stats == null) {
         return;
       }
@@ -3824,6 +3828,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             }
           }
         }
+        // A named session absent from the rail (terminated, foreign, or
+        // stale) gets nothing: falling back to the selected session would
+        // steal its lease while the rejected one keeps dropping writes.
+        // Unparseable messages keep the legacy fallback below.
+        if (namedSid != null && target == null) return;
         target ??=
             (_sessions.isEmpty ||
                 _selectedIndex < 0 ||
@@ -4006,6 +4015,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.lastInteractionMs = lastInput;
       } else if (lastInput is num) {
         session.lastInteractionMs = lastInput.toInt();
+      }
+      final lastOutput = message['last_activity_ms'];
+      if (lastOutput is int) {
+        session.lastOutputMs = lastOutput;
+      } else if (lastOutput is num) {
+        session.lastOutputMs = lastOutput.toInt();
       }
       _setupSessionInputListener(session);
 

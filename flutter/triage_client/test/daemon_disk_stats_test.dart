@@ -19,11 +19,11 @@ void main() {
     expect(formatDiskFree(999 * _mb, 1000 * _mb), '999 MB free (100%)');
   });
 
-  test('huge volumes keep an exact percentage', () {
-    // The production formula divides before scaling so the intermediate
-    // `freeBytes * 100` cannot lose precision on the web number type past
-    // ~90TB free; this pins the formula shape (the VM integers used here
-    // would stay exact either way).
+  test('formats huge volumes with separators and percentage', () {
+    // A formatting golden for the top end of the range: thousands separators
+    // in the megabyte count plus the whole percent. (It cannot pin the
+    // divide-before-scale formula shape: 95TB times 100 is exactly
+    // representable in float64, so a multiply-first refactor stays green.)
     const tb = 1024 * 1024 * _mb;
     expect(formatDiskFree(95 * tb, 100 * tb), '99,614,720 MB free (95%)');
   });

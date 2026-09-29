@@ -139,7 +139,7 @@ install_file() {
 
 install_skill_copy() {
   # install_skill_copy <skill> <dest_dir> [label]
-  local skill="$1" dest="$2" file src files label="${3:-copy}"
+  local skill="$1" dest="$2" file src files parent check label="${3:-copy}"
   src="${SCRIPT_DIR}/skills/${skill}"
   if [ "${label}" != "upgrade" ]; then
     log "==> Skill (${label}): ${skill} ${dest}"
@@ -152,15 +152,34 @@ install_skill_copy() {
     log "  replace symlink with directory: ${dest}"
     rm "${dest}" || return 1
   fi
-  if [ ! -d "${dest}/agents" ]; then
-    if [ "${DRY_RUN}" -eq 1 ]; then
-      printf '[dry-run] mkdir -p %s/agents\n' "${dest}"
-    elif ! mkdir -p "${dest}/agents"; then
-      printf '  FAILED to create directory: %s\n' "${dest}"
-      return 1
-    fi
-  fi
   files="$(skill_files "${skill}")" || return 1
+  # Parent dirs come from the file list itself, so a new bundled subdir needs
+  # no installer change. Every ancestor of every parent (not just the leaf)
+  # is validated before any file lands, so a refusal never leaves a
+  # half-installed skill behind and a symlink at any depth cannot redirect
+  # the install outside the destination.
+  # shellcheck disable=SC2086
+  for file in ${files}; do
+    parent="${dest}/$(dirname "${file}")"
+    check="${parent}"
+    # Quoted "${dest}" in the case pattern matches literally, so glob
+    # characters in the install path cannot silently disable the walk.
+    while case "${check}" in "${dest}"/?*) true ;; *) false ;; esac; do
+      if [ -L "${check}" ]; then
+        err "ERROR: refusing to install through symlink: ${check}"
+        return 1
+      fi
+      check="$(dirname "${check}")"
+    done
+    if [ ! -d "${parent}" ]; then
+      if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[dry-run] mkdir -p %s\n' "${parent}"
+      elif ! mkdir -p "${parent}"; then
+        printf '  FAILED to create directory: %s\n' "${parent}"
+        return 1
+      fi
+    fi
+  done
   # shellcheck disable=SC2086
   for file in ${files}; do
     install_file "${src}/${file}" "${dest}/${file}" || return 1

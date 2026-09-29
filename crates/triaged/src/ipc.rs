@@ -2283,6 +2283,12 @@ mod tests {
             .expect("send message");
         assert!(id > 0);
 
+        // Direct, not broadcast: the sender's own inbox stays empty.
+        let sender_mail = client
+            .receive_session_messages(from.clone())
+            .expect("receive sender messages");
+        assert!(sender_mail.is_empty());
+
         // Peek: unacked mail redelivers over the wire too.
         for _ in 0..2 {
             let mail = client

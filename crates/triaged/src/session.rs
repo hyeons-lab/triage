@@ -445,6 +445,15 @@ struct SessionSnippet {
     generated_at_output_seq: u64,
 }
 
+/// A session's activity stamps as one named bundle. Both fields are same-type
+/// wall-clock millis of similar magnitude, so a positional `(u64, u64)` pair
+/// would let a swapped construction compile and silently exchange them.
+#[derive(Debug, Clone, Copy)]
+struct SessionStamps {
+    activity_ms: u64,
+    input_ms: u64,
+}
+
 /// Bounded capacity for each connection's global-push channel. If a client
 /// can't keep up, snippet updates are dropped (the next regeneration resends).
 const GLOBAL_PUSH_CHANNEL_CAPACITY: usize = 256;
@@ -1086,6 +1095,15 @@ impl SessionManager {
     fn forget_snippet(&self, session_id: &SessionId) {
         if let Ok(mut snippets) = self.snippets.lock() {
             snippets.remove(session_id);
+        }
+    }
+
+    /// Drops a session's coordination inbox (on shutdown/removal). Unacked
+    /// mail for a removed session is unreachable, since receive and ack gate
+    /// on session membership, so without this it leaks for the daemon lifetime.
+    fn forget_inbox(&self, session_id: &SessionId) {
+        if let Ok(mut inboxes) = self.inboxes.lock() {
+            inboxes.remove(session_id);
         }
     }
 
@@ -1876,8 +1894,7 @@ impl SessionManager {
             SessionId,
             Sender<ActorCommand>,
             PersistedSessionLaunch,
-            u64,
-            u64,
+            SessionStamps,
         )> = self
             .sessions()?
             .iter()
@@ -1894,8 +1911,10 @@ impl SessionManager {
                     id.clone(),
                     actor.tx.clone(),
                     launch.clone(),
-                    actor.last_activity_ms(),
-                    actor.last_input_ms(),
+                    SessionStamps {
+                        activity_ms: actor.last_activity_ms(),
+                        input_ms: actor.last_input_ms(),
+                    },
                 )),
                 _ => None,
             })
@@ -1915,10 +1934,10 @@ impl SessionManager {
         // all.
         let inflight: Vec<_> = pending
             .into_iter()
-            .filter_map(|(id, cmd_tx, launch, last_activity_ms, last_input_ms)| {
+            .filter_map(|(id, cmd_tx, launch, stamps)| {
                 let (tx, rx) = mpsc::channel();
                 match cmd_tx.send(ActorCommand::ExtractHandoverState { response: tx }) {
-                    Ok(()) => Some((id, rx, launch, last_activity_ms, last_input_ms)),
+                    Ok(()) => Some((id, rx, launch, stamps)),
                     Err(err) => {
                         tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
                         None
@@ -1931,7 +1950,7 @@ impl SessionManager {
         // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
         let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
 
-        for (id, rx, launch, last_activity_ms, last_input_ms) in inflight {
+        for (id, rx, launch, stamps) in inflight {
             // Bounded, unlike every other actor round-trip in this file. An actor that
             // cannot answer a descriptor dup and three counters before the budget runs
             // out is parked (a `write_all` to a session whose child stopped reading),
@@ -1988,8 +2007,8 @@ impl SessionManager {
                 bytes_logged: ext.bytes_logged,
                 pid: ext.pid,
                 process_identity: ext.process_identity,
-                last_activity_ms,
-                last_input_ms,
+                last_activity_ms: stamps.activity_ms,
+                last_input_ms: stamps.input_ms,
                 judge_override,
             });
         }
@@ -2982,6 +3001,9 @@ impl SessionApi for SessionManager {
         if let Err(error) = self.persist_manifest(&sessions) {
             let inserted = sessions.remove(&session_id);
             drop(sessions);
+            // A send racing the failed start could have queued mail for a
+            // session that now never exists; drop it with the session.
+            self.forget_inbox(&session_id);
             if let Some(ManagedSession::Live { actor, .. }) = inserted
                 && let Err(shutdown_error) = actor.shutdown()
             {
@@ -3597,6 +3619,7 @@ impl SessionApi for SessionManager {
 
         self.forget_snippet(&session_id);
         self.forget_judge_override(&session_id);
+        self.forget_inbox(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -3646,25 +3669,29 @@ impl SessionApi for SessionManager {
             Ready(Option<SessionContext>),
             Live(Sender<ActorCommand>),
         }
-        let mut sources: Vec<(SessionId, ContextSource, u64, u64)> = {
+        let mut sources: Vec<(SessionId, ContextSource, SessionStamps)> = {
             let sessions = self.sessions()?;
             sessions
                 .iter()
                 .map(|(session_id, managed)| {
-                    let (source, last_activity_ms, last_input_ms) = match managed {
+                    let (source, stamps) = match managed {
                         ManagedSession::Live { actor, .. } => (
                             ContextSource::Live(actor.tx.clone()),
-                            actor.last_activity_ms(),
-                            actor.last_input_ms(),
+                            SessionStamps {
+                                activity_ms: actor.last_activity_ms(),
+                                input_ms: actor.last_input_ms(),
+                            },
                         ),
                         ManagedSession::Historical { session, .. }
                         | ManagedSession::Restoring { session, .. } => (
                             ContextSource::Ready(session.context.clone()),
-                            session.persisted.last_activity_ms,
-                            session.persisted.last_input_ms,
+                            SessionStamps {
+                                activity_ms: session.persisted.last_activity_ms,
+                                input_ms: session.persisted.last_input_ms,
+                            },
                         ),
                     };
-                    (session_id.clone(), source, last_activity_ms, last_input_ms)
+                    (session_id.clone(), source, stamps)
                 })
                 .collect()
         };
@@ -3673,7 +3700,7 @@ impl SessionApi for SessionManager {
         sources.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
         Ok(sources
             .into_iter()
-            .map(|(session_id, source, last_activity_ms, last_input_ms)| {
+            .map(|(session_id, source, stamps)| {
                 let context = match source {
                     ContextSource::Ready(context) => context,
                     // A live actor mid-shutdown simply yields no context rather
@@ -3683,8 +3710,8 @@ impl SessionApi for SessionManager {
                 SessionContextRow {
                     session_id,
                     context,
-                    last_activity_ms,
-                    last_input_ms,
+                    last_activity_ms: stamps.activity_ms,
+                    last_input_ms: stamps.input_ms,
                 }
             })
             .collect())
@@ -8438,6 +8465,12 @@ mod tests {
             .expect("send message");
         assert!(id > 0);
 
+        // Direct, not broadcast: the sender's own inbox stays empty.
+        let sender_mail = manager
+            .receive_session_messages(from.clone())
+            .expect("receive sender messages");
+        assert!(sender_mail.is_empty());
+
         // Peek twice: unacked mail redelivers.
         for _ in 0..2 {
             let mail = manager
@@ -8462,6 +8495,27 @@ mod tests {
         manager
             .ack_session_messages(to.clone(), vec![id, 999_999])
             .expect("re-ack is idempotent");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_shutdown_purges_target_inbox() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+
+        manager
+            .send_session_message(from, to.clone(), "orphan".to_string())
+            .expect("send message");
+        manager
+            .shutdown_session(to.clone())
+            .expect("shutdown target");
+
+        // Unacked mail for a removed session is unreachable (receive gates
+        // on membership), so the inbox must go with the session.
+        let inboxes = manager.inboxes.lock().expect("inbox lock");
+        assert!(!inboxes.contains_key(&to));
 
         let _ = std::fs::remove_dir_all(&log_dir);
     }
