@@ -2,7 +2,7 @@
 
 Model Context Protocol (MCP) server for **Triage**, exposing terminal session context to local AI agents (such as Claude Code, Claude Desktop, or Cursor).
 
-It lets an agent *read* what is happening in your terminals — which sessions exist, what is on screen, and how it is styled — so it can reason about a build, a test run, or a stuck prompt without you pasting output by hand.
+It lets an agent *read* what is happening in your terminals — which sessions exist, what is on screen, and how it is styled — so it can reason about a build, a test run, or a stuck prompt without you pasting output by hand. It also lets agents in different sessions coordinate through direct poll-based messaging.
 
 ## Installation
 
@@ -50,12 +50,16 @@ on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ## Available Tools
 
-The server is **read-only**: every tool observes session state, and none of them
-spawn sessions, write input, or otherwise mutate the daemon. An agent can watch
-your terminals; it cannot drive them.
+The observation tools are **read-only**: they never spawn sessions, write
+input, or otherwise mutate the daemon. The messaging tools are the exception:
+they queue and acknowledge coordination mail between sessions, but still
+cannot drive a terminal.
 
 | Tool | Arguments | Returns |
 | ---- | --------- | ------- |
-| `list_sessions` | — | Every daemon-owned session, each with its current snapshot. |
+| `list_sessions` | — | Every daemon-owned session, each with its custom label (if set) and current snapshot. |
 | `snapshot_session` | `session_id` | The current daemon snapshot for one session. |
 | `styled_rows` | `session_id`, `start`, `end` | Styled cells for a visible row range (`start` inclusive, `end` exclusive). |
+| `send_session_message` | `from_session_id`, `to_session_id`, `body` | The queued message's id. |
+| `receive_session_messages` | `session_id` | Unacked inbox mail, oldest first. Unacked mail is returned again on the next call. |
+| `ack_session_messages` | `session_id`, `message_ids` | `{ok: true}`. Unknown ids are ignored. |

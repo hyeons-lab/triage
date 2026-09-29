@@ -24,10 +24,10 @@ use serde::{Deserialize, Serialize};
 use triage_core::judge::{JudgeRequest, JudgeVerdict, SessionJudgePolicy};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    LeaseChange, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo, SessionApi,
-    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionSnapshot,
-    StartSessionRequest, StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest,
-    WriteInputRequest,
+    LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo,
+    SessionApi, SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage,
+    SessionSnapshot, StartSessionRequest, StyledRowsRequest, StyledRowsResponse,
+    SubscribeSessionEventsRequest, WriteInputRequest,
 };
 
 use crate::session::SessionManager;
@@ -637,6 +637,13 @@ impl SessionApi for IpcClient {
         }
     }
 
+    fn get_rail_layout(&self) -> Result<RailLayout> {
+        match self.round_trip(WireRequest::GetRailLayout)? {
+            WireSuccess::RailLayout(layout) => Ok(layout),
+            other => bail!("unexpected get_rail_layout response: {other:?}"),
+        }
+    }
+
     /// Ask the daemon for its update status (Phase 4, the TUI banner). This is a
     /// best-effort, read-only query: any IPC failure (daemon mid-restart,
     /// unexpected reply) falls back to "this build, nothing newer" so the banner
@@ -717,6 +724,7 @@ enum WireRequest {
         session_id: SessionId,
         enabled: Option<bool>,
     },
+    GetRailLayout,
     ApprovePairingDeviceCode {
         device_code: String,
     },
@@ -765,6 +773,7 @@ enum WireSuccess {
     ServerUpdateInfo(ServerUpdateInfo),
     JudgeVerdict(JudgeVerdict),
     SessionJudgePolicy(SessionJudgePolicy),
+    RailLayout(RailLayout),
     PairingPin(PairingPinInfo),
 }
 
@@ -1894,6 +1903,7 @@ fn handle_request(
         } => manager
             .set_session_judge_policy(session_id, enabled)
             .map(WireSuccess::SessionJudgePolicy),
+        WireRequest::GetRailLayout => manager.get_rail_layout().map(WireSuccess::RailLayout),
         WireRequest::ApprovePairingDeviceCode { device_code } => manager
             .approve_pairing_device_code(&device_code)
             .map(WireSuccess::PairingPin),
@@ -2291,6 +2301,46 @@ mod tests {
             .receive_session_messages(to.clone())
             .expect("receive after ack");
         assert!(mail.is_empty());
+
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY behavior needs a dedicated Windows lifecycle test"
+    )]
+    fn client_reads_rail_layout_over_unix_socket() {
+        let socket_path = unique_socket_path("rl");
+        let log_dir = unique_dir("rl-logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
+        let server = IpcServer::new(
+            Arc::clone(&manager),
+            cache,
+            IpcConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+
+        let client = IpcClient::new(socket_path.clone());
+        let session_id = client
+            .start_session(StartSessionRequest::new("/bin/sh"))
+            .expect("start session");
+        manager
+            .set_session_custom_label(session_id.clone(), Some("Dev Server".to_string()))
+            .expect("set label");
+
+        let layout = client.get_rail_layout().expect("get rail layout");
+        assert_eq!(
+            layout
+                .custom_labels
+                .get(session_id.as_str())
+                .map(String::as_str),
+            Some("Dev Server")
+        );
 
         let _ = fs::remove_file(socket_path);
         let _ = fs::remove_dir_all(log_dir);

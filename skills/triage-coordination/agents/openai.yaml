@@ -1,0 +1,4 @@
+interface:
+  display_name: "Triage Session Coordination"
+  short_description: "Message and coordinate with agents in other Triage sessions"
+  default_prompt: "Use $triage-coordination to coordinate with the agent in the other Triage session."

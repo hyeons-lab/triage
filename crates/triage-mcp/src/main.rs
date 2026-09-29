@@ -390,14 +390,17 @@ fn tool_definitions() -> Value {
 
 fn list_sessions(api: &impl SessionApi) -> Result<Value> {
     let session_ids = api.list_sessions().context("listing sessions")?;
+    let layout = api.get_rail_layout().context("reading rail layout")?;
     let sessions = session_ids
         .into_iter()
         .map(|session_id| {
             let snapshot = api
                 .snapshot_session(session_id.clone())
                 .with_context(|| format!("reading snapshot for session {session_id}"))?;
+            let custom_label: Option<&String> = layout.custom_labels.get(session_id.as_str());
             Ok(json!({
                 "id": session_id,
+                "custom_label": custom_label,
                 "snapshot": snapshot
             }))
         })
@@ -724,10 +727,11 @@ impl JsonRpcError {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use triage_core::session::{
         AttachSessionRequest, AttachSessionResponse, CompletedSession, InputLeaseRequest,
-        LeaseChange, ResizeSessionRequest, SessionEventReceiver, SessionMessage, SessionSize,
-        SessionSnapshot, TerminalCursor,
+        LeaseChange, RailLayout, ResizeSessionRequest, SessionEventReceiver, SessionMessage,
+        SessionSize, SessionSnapshot, TerminalCursor,
     };
 
     #[derive(Clone)]
@@ -736,6 +740,7 @@ mod tests {
         snapshot: SessionSnapshot,
         snapshot_error: Option<&'static str>,
         inbox: RefCell<Vec<SessionMessage>>,
+        labels: HashMap<String, String>,
     }
 
     impl RecordingApi {
@@ -765,7 +770,14 @@ mod tests {
                 },
                 snapshot_error: None,
                 inbox: RefCell::new(Vec::new()),
+                labels: HashMap::new(),
             }
+        }
+
+        fn with_label(mut self, session_id: &str, label: &str) -> Self {
+            self.labels
+                .insert(session_id.to_string(), label.to_string());
+            self
         }
 
         fn with_snapshot_error(mut self, message: &'static str) -> Self {
@@ -863,6 +875,14 @@ mod tests {
             Ok(())
         }
 
+        fn get_rail_layout(&self) -> Result<RailLayout> {
+            Ok(RailLayout {
+                group_keys: Vec::new(),
+                session_ids: Vec::new(),
+                custom_labels: self.labels.clone(),
+            })
+        }
+
         fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
             unimplemented!()
         }
@@ -927,6 +947,33 @@ mod tests {
         assert_eq!(
             result["structuredContent"]["sessions"][0]["snapshot"]["visible_rows"][0],
             "ready"
+        );
+        // No label set: null, not missing.
+        assert_eq!(
+            result["structuredContent"]["sessions"][0]["custom_label"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn list_sessions_includes_custom_labels() {
+        let server = McpServer::new(RecordingApi::new().with_label("session-1", "Dev Server"));
+
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!("call-label")),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "list_sessions",
+                    "arguments": {}
+                })),
+            })
+            .expect("response");
+
+        let result = response.result.unwrap();
+        assert_eq!(
+            result["structuredContent"]["sessions"][0]["custom_label"],
+            "Dev Server"
         );
     }
 

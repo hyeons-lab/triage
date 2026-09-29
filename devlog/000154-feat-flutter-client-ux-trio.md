@@ -92,10 +92,25 @@ Three Flutter client requests in one branch:
 - 7d6d21e — feat: sort rail by daemon input recency; regroup waits for menus
 - 7cc7f9e — fix(client): merge create/push duplicate tiles; observe without stealing input leases
 - 235c4e8 — fix(client): order input-unknown rail tier by output activity
-- HEAD — feat(mcp): session-to-session messaging via side inboxes
+- b954662 — feat(mcp): session-to-session messaging via side inboxes
+- HEAD — feat(skills): installable coordination skill + label-aware MCP list
 
 ## Progress
 
+- 2026-09-28T22:15-0700: added installable `triage-coordination` skill
+  (plan 000154-02) so agents know how to use the MCP messaging tools.
+  Custom labels were invisible over MCP — the only distinguisher the user
+  has — so `list_sessions` items now carry `custom_label`, backed by a new
+  `GetRailLayout` IPC variant pair (`IpcClient` + dispatch). Read-only on
+  purpose: agents route by labels the user assigns in the UI. Skill
+  documents the discover-by-label loop (with repo/branch/worktree/cwd/
+  snippet fallback), `$TRIAGE_SESSION_ID` self-identification, and
+  send/poll/ack etiquette plus the known limits. `install.sh` mirrors
+  agent-review-loop (5 targets, link/upgrade/dry-run, no refinements);
+  `tests/verify-install.sh` covers install/idempotence/link/upgrade/
+  dry-run against a fake HOME (15/15). Also fixed the MCP READMEs' stale
+  read-only claim and tools table. Gates: fmt, clippy `-D warnings`,
+  triaged 322 + mcp 11, shellcheck clean.
 - 2026-09-28T21:55-0700: folded session-to-session messaging into this PR
   (one large PR, split before merge). Contract (`SessionMessage` + 3
   `SessionApi` methods with default deny impls) and daemon side inboxes
