@@ -343,7 +343,7 @@ class SessionVm {
     required this.status,
     required this.statusColor,
     required this.icon,
-    required this.rows,
+    required List<StyledRow> rows,
     this.sessionId,
     this.customLabel,
     this.branch,
@@ -352,7 +352,11 @@ class SessionVm {
     this.cwd,
     this.isRemote = false,
     this.isExited = false,
-  }) : terminalController = TerminalController() {
+  })  : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
+        // so the field must stay mutable no matter what a caller passes —
+        // a lazy placeholder seeds an immutable empty list.
+        rows = List<StyledRow>.of(rows),
+        terminalController = TerminalController() {
     terminal = xt.Terminal(
       maxLines: 50000,
       // Re-wrap the whole buffer on resize, like a real terminal — otherwise

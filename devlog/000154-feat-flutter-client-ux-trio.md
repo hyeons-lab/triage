@@ -41,6 +41,11 @@ Three Flutter client requests in one branch:
   1 MiB -> 256 KiB; Rust `snapshot_history_matches_the_served_tail_cap`
   pins the production cap, Dart `history_trim_test.dart` + store tests pin
   the trim behavior.
+- Crash fix: `SessionVm` copies `rows` in its initializer so the field
+  stays mutable — lazy rail placeholders seeded `const []` and the snapshot
+  refresh's `..clear()..addAll()` threw `Cannot clear a constant list`,
+  aborting the load. Regression test `rows stay mutable for the refresh
+  clear-and-seed` failed before, passes after.
 
 ## Decisions
 
@@ -106,7 +111,8 @@ Three Flutter client requests in one branch:
 - ba9fdc7 — feat(skills): installable coordination skill + label-aware MCP list
 - 56b3cd7 — fix(review): harden probe pins, installer symlink checks, tier tests
 - 3ad3e11 — feat(security): Tailscale-identity SSO pairing
-- HEAD — fix(client): viewport-first history replay; 256 KiB daemon tail cap
+- 2a09d98 — fix(client): viewport-first history replay; 256 KiB daemon tail cap
+- HEAD — fix(client): SessionVm rows defensive copy; lazy sessions crashed refresh
 
 ## Progress
 

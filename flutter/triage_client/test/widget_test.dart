@@ -20,6 +20,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:triage_client/main.dart';
 import 'package:triage_client/models/daemon_server.dart';
+import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/session_grouping.dart' show otherGroupPinKey;
 import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
@@ -5473,6 +5474,29 @@ void main() {
         expect(session.store.state.exited, isFalse);
       },
     );
+  });
+
+  group('SessionVm rows', () {
+    test('rows stay mutable for the refresh clear-and-seed', () {
+      // Lazy rail placeholders seed `rows` with an immutable empty list;
+      // the snapshot refresh mutates it in place (`..clear()..addAll()`),
+      // which threw `Cannot clear a constant list` and aborted the load.
+      final session = SessionVm(
+        title: 'lazy-session',
+        status: 'idle',
+        statusColor: const Color(0xff7f8b8d),
+        icon: Icons.terminal,
+        rows: const [],
+      );
+      session.rows
+        ..clear()
+        ..addAll([
+          StyledRow(
+            spans: [StyledSpan(text: 'seeded', style: const TerminalStyle())],
+          ),
+        ]);
+      expect(session.rows, hasLength(1));
+    });
   });
 
   group('WorkspaceHeader soft-keyboard toggle', () {
