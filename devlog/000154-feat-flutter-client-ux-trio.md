@@ -35,6 +35,12 @@ Three Flutter client requests in one branch:
 - Tests: Rust disk unit tests, `daemon_stats_reports_live_disk_probe`,
   flatbuffers hello + daemon-stats round-trips; Dart `daemon_disk_stats`
   format tests, `orderSessionsByActivity` tests, accessory-bar `kbd` tests.
+- Viewport-first replay: `trimHistoryTail` in `terminal_store.dart`
+  (newest 1000 lines / 256 KiB, SGR-reset prologue, original end-offset
+  baseline preserved for delta merges); daemon `RAW_OUTPUT_TAIL_CAP` cut
+  1 MiB -> 256 KiB; Rust `snapshot_history_matches_the_served_tail_cap`
+  pins the production cap, Dart `history_trim_test.dart` + store tests pin
+  the trim behavior.
 
 ## Decisions
 
@@ -82,6 +88,10 @@ Three Flutter client requests in one branch:
   ~69GB of agent probe/repro scratch in `/private/tmp` plus a 16GB bazel
   cache; user cleared some space themselves, then approved deleting /tmp
   entries older than 24h (kept bazel). Freed ~35GB (37GB available).
+- 8 pairing tests (device-code flows in `http_tests`/`ipc`/`session`)
+  fail on this branch because the merged tailscale-pairing work disables
+  device-code pairing by default; verified byte-identical failure set with
+  the replay changes stashed, so pre-existing relative to this commit.
 
 ## Commits
 
@@ -95,7 +105,8 @@ Three Flutter client requests in one branch:
 - b954662 — feat(mcp): session-to-session messaging via side inboxes
 - ba9fdc7 — feat(skills): installable coordination skill + label-aware MCP list
 - 56b3cd7 — fix(review): harden probe pins, installer symlink checks, tier tests
-- HEAD — feat(security): Tailscale-identity SSO pairing
+- 3ad3e11 — feat(security): Tailscale-identity SSO pairing
+- HEAD — fix(client): viewport-first history replay; 256 KiB daemon tail cap
 
 ## Progress
 
