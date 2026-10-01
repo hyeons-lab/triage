@@ -86,6 +86,10 @@ const int _defaultDaemonPort = 7777;
 Uri? parseDaemonAddress(String input) {
   final raw = input.trim();
   if (raw.isEmpty) return null;
+  // A stray inner space (autocorrect, fat-finger) percent-encodes into an
+  // unresolvable host and the retry loop spins silently instead of
+  // connecting. No valid host, literal, or URL carries whitespace.
+  if (raw.contains(RegExp(r'\s'))) return null;
 
   final hasScheme = RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://').hasMatch(raw);
   if (hasScheme) {

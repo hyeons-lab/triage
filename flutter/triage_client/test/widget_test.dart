@@ -3842,6 +3842,14 @@ void main() {
       expect(parseDaemonAddress('host:99999'), isNull);
       expect(parseDaemonAddress('ftp://host'), isNull);
     });
+
+    test('inner whitespace -> null', () {
+      // A stray space percent-encodes into an unresolvable host and the
+      // retry loop spins silently instead of connecting.
+      expect(parseDaemonAddress('100 104.160.90:7777'), isNull);
+      expect(parseDaemonAddress('ws://100 104.160.90:7777/ws'), isNull);
+      expect(parseDaemonAddress('my host:7777'), isNull);
+    });
   });
 
   testWidgets('first run shows the connection screen when no address is set', (

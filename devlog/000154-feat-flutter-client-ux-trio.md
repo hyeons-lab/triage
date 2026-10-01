@@ -112,7 +112,8 @@ Three Flutter client requests in one branch:
 - 56b3cd7 — fix(review): harden probe pins, installer symlink checks, tier tests
 - 3ad3e11 — feat(security): Tailscale-identity SSO pairing
 - 2a09d98 — fix(client): viewport-first history replay; 256 KiB daemon tail cap
-- HEAD — fix(client): SessionVm rows defensive copy; lazy sessions crashed refresh
+- e06be2f — fix(client): SessionVm rows defensive copy; lazy sessions crashed refresh
+- HEAD — fix(client): reject daemon addresses with inner whitespace
 
 ## Progress
 
