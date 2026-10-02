@@ -2029,6 +2029,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _handleUserGestureEnded() {
     if (_isUserGestureActive) return;
+    _snapshotGestureEndScrollPosition();
     if (_pendingScrollToBottomOnRelease) {
       _pendingScrollToBottomOnRelease = false;
       _restoreScrollPosition(requestFocus: false);
@@ -2043,6 +2044,28 @@ class _TerminalPaneState extends State<TerminalPane> {
         );
       }
     }
+  }
+
+  /// Records the viewport position where a user gesture ended. onScroll
+  /// events during the gesture may have been swallowed by a suppress window
+  /// (replay, fit, restore), leaving a stale entry that the next restore
+  /// would yank the viewport to — typically the very top.
+  void _snapshotGestureEndScrollPosition() {
+    try {
+      final term = _sessionTerms[_sanitizedId];
+      final container = _sessionContainers[_sanitizedId];
+      if (term == null || container == null) return;
+      final buffer = js_util.getProperty(term, 'buffer');
+      final active = js_util.getProperty(buffer, 'active');
+      final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+      final viewportY =
+          (js_util.getProperty(active, 'viewportY') as num).toInt();
+      if (_viewportIsAtBottom(container, viewportY, baseY)) {
+        _sessionSavedViewportY.remove(_sanitizedId);
+      } else if (viewportY >= 0) {
+        _sessionSavedViewportY[_sanitizedId] = viewportY;
+      }
+    } catch (_) {}
   }
 
   /// Releases the listeners [_bindContainerEvents] attached, and is safe to call
