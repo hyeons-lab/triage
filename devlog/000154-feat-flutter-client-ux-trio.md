@@ -115,7 +115,8 @@ Three Flutter client requests in one branch:
 - e06be2f — fix(client): SessionVm rows defensive copy; lazy sessions crashed refresh
 - 67f48aa — fix(client): reject daemon addresses with inner whitespace
 - 5beaf48 — fix(web): execCommand clipboard fallback for non-secure contexts
-- HEAD — fix(pairing): resolve tailscale CLI by absolute path under minimal PATH
+- 825df84 — fix(pairing): resolve tailscale CLI by absolute path under minimal PATH
+- HEAD — fix(pairing): try whois binaries until one parses; GUI app fails headless
 
 ## Progress
 

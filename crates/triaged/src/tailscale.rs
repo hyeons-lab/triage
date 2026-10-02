@@ -98,32 +98,26 @@ fn unmapped_ip(ip: IpAddr) -> IpAddr {
     mapped_ipv4(ip).map_or(ip, IpAddr::V4)
 }
 
-/// Well-known install locations for the `tailscale` CLI, checked before the
-/// bare `PATH` lookup. The daemon usually runs under launchd/systemd with a
-/// minimal `PATH` that lacks Homebrew and the app bundle, so a bare lookup
-/// fails closed and pairing denies everyone.
-const TAILSCALE_CANDIDATE_PATHS: &[&str] = &[
-    "/Applications/Tailscale.app/Contents/MacOS/tailscale",
+/// Candidate `tailscale` binaries, tried in order until one yields a
+/// parseable answer. The daemon usually runs under launchd/systemd with a
+/// minimal `PATH`, so absolute locations come before the bare `PATH` lookup.
+/// Notably absent: the macOS GUI app bundle binary, which requires a GUI
+/// context and fails headless — resolvable but unrunnable here.
+const TAILSCALE_CANDIDATE_BINARIES: &[&str] = &[
     "/opt/homebrew/bin/tailscale",
-    "/usr/local/bin/tailscale",
     "/usr/bin/tailscale",
+    "/usr/local/bin/tailscale",
+    "tailscale",
 ];
 
-/// Resolve the `tailscale` binary: the first existing candidate above, else
-/// the bare name for `PATH` lookup. Never fails — a bad resolution still
-/// fails closed at spawn time.
-fn tailscale_binary() -> &'static str {
-    TAILSCALE_CANDIDATE_PATHS
-        .iter()
-        .find(|path| std::path::Path::new(path).exists())
-        .copied()
-        .unwrap_or("tailscale")
-}
-
 fn run_tailscale_whois(peer: SocketAddr) -> Option<Vec<u8>> {
-    let mut command = std::process::Command::new(tailscale_binary());
-    command.arg("whois").arg("--json").arg(whois_addr_arg(peer));
-    run_command_with_timeout(command, TAILSCALE_WHOIS_TIMEOUT)
+    let arg = whois_addr_arg(peer);
+    TAILSCALE_CANDIDATE_BINARIES.iter().find_map(|binary| {
+        let mut command = std::process::Command::new(binary);
+        command.arg("whois").arg("--json").arg(&arg);
+        run_command_with_timeout(command, TAILSCALE_WHOIS_TIMEOUT)
+            .filter(|output| parse_tailscale_whois_login(output).is_some())
+    })
 }
 
 struct CachedLogin {
@@ -272,13 +266,15 @@ mod tests {
     }
 
     #[test]
-    fn tailscale_binary_resolves_to_existing_path_or_path_fallback() {
-        let resolved = tailscale_binary();
-        if TAILSCALE_CANDIDATE_PATHS.contains(&resolved) {
-            assert!(std::path::Path::new(resolved).exists());
-        } else {
-            assert_eq!(resolved, "tailscale");
-        }
+    fn whois_candidates_skip_gui_binary_and_end_with_path_fallback() {
+        // The GUI bundle binary fails headless; listing it would shadow a
+        // working later candidate with unparseable output.
+        assert!(
+            !TAILSCALE_CANDIDATE_BINARIES
+                .iter()
+                .any(|binary| binary.contains("Tailscale.app"))
+        );
+        assert_eq!(TAILSCALE_CANDIDATE_BINARIES.last(), Some(&"tailscale"));
     }
 
     #[test]
