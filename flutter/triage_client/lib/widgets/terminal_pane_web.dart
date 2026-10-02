@@ -371,6 +371,40 @@ class _TerminalPaneState extends State<TerminalPane> {
     return _cachedTextarea;
   }
 
+  /// Copies [text] to the clipboard, falling back to the legacy
+  /// `execCommand` path when the async Clipboard API is unavailable or
+  /// rejects. `navigator.clipboard` is null outside secure contexts (plain
+  /// `http://` over a tailnet IP), where the primary path would silently
+  /// copy nothing after the key handler already swallowed the native copy.
+  void _copyTextToClipboard(String text) {
+    final clipboard = html.window.navigator.clipboard;
+    if (clipboard == null) {
+      _legacyCopyToClipboard(text);
+      return;
+    }
+    clipboard.writeText(text).then((_) {}, onError: (_) {
+      _legacyCopyToClipboard(text);
+    });
+  }
+
+  void _legacyCopyToClipboard(String text) {
+    var copied = false;
+    try {
+      final textArea = html.TextAreaElement()
+        ..value = text
+        ..style.position = 'fixed'
+        ..style.opacity = '0';
+      html.document.body?.append(textArea);
+      textArea.focus();
+      textArea.select();
+      copied = html.document.execCommand('copy');
+      textArea.remove();
+    } catch (_) {}
+    if (!copied) {
+      debugPrint('Terminal copy failed: clipboard unavailable');
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -540,11 +574,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              html.window.navigator.clipboard?.writeText(selection).catchError((
-                Object error,
-              ) {
-                debugPrint('Terminal copy failed: $error');
-              });
+              _copyTextToClipboard(selection);
               return;
             }
             // If no text is selected on macOS with Cmd+C, do not send SIGINT.
