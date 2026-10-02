@@ -98,8 +98,30 @@ fn unmapped_ip(ip: IpAddr) -> IpAddr {
     mapped_ipv4(ip).map_or(ip, IpAddr::V4)
 }
 
+/// Well-known install locations for the `tailscale` CLI, checked before the
+/// bare `PATH` lookup. The daemon usually runs under launchd/systemd with a
+/// minimal `PATH` that lacks Homebrew and the app bundle, so a bare lookup
+/// fails closed and pairing denies everyone.
+const TAILSCALE_CANDIDATE_PATHS: &[&str] = &[
+    "/Applications/Tailscale.app/Contents/MacOS/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/usr/local/bin/tailscale",
+    "/usr/bin/tailscale",
+];
+
+/// Resolve the `tailscale` binary: the first existing candidate above, else
+/// the bare name for `PATH` lookup. Never fails — a bad resolution still
+/// fails closed at spawn time.
+fn tailscale_binary() -> &'static str {
+    TAILSCALE_CANDIDATE_PATHS
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .copied()
+        .unwrap_or("tailscale")
+}
+
 fn run_tailscale_whois(peer: SocketAddr) -> Option<Vec<u8>> {
-    let mut command = std::process::Command::new("tailscale");
+    let mut command = std::process::Command::new(tailscale_binary());
     command.arg("whois").arg("--json").arg(whois_addr_arg(peer));
     run_command_with_timeout(command, TAILSCALE_WHOIS_TIMEOUT)
 }
@@ -247,6 +269,16 @@ mod tests {
         assert_eq!(whois_addr_arg(v4), "100.65.193.69:1234");
         let v6: SocketAddr = "[fd7a:115c:a1e0::1]:1234".parse().unwrap();
         assert_eq!(whois_addr_arg(v6), "[fd7a:115c:a1e0::1]:1234");
+    }
+
+    #[test]
+    fn tailscale_binary_resolves_to_existing_path_or_path_fallback() {
+        let resolved = tailscale_binary();
+        if TAILSCALE_CANDIDATE_PATHS.contains(&resolved) {
+            assert!(std::path::Path::new(resolved).exists());
+        } else {
+            assert_eq!(resolved, "tailscale");
+        }
     }
 
     #[test]

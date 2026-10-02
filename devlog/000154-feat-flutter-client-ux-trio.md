@@ -114,7 +114,8 @@ Three Flutter client requests in one branch:
 - 2a09d98 — fix(client): viewport-first history replay; 256 KiB daemon tail cap
 - e06be2f — fix(client): SessionVm rows defensive copy; lazy sessions crashed refresh
 - 67f48aa — fix(client): reject daemon addresses with inner whitespace
-- HEAD — fix(web): execCommand clipboard fallback for non-secure contexts
+- 5beaf48 — fix(web): execCommand clipboard fallback for non-secure contexts
+- HEAD — fix(pairing): resolve tailscale CLI by absolute path under minimal PATH
 
 ## Progress
 
