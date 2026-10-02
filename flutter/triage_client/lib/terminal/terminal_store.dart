@@ -31,6 +31,13 @@ const int kPendingLiveByteCap = 1024 * 1024;
 const int kHistoryReplayMaxLines = 1000;
 const int kHistoryReplayMaxBytes = 256 * 1024;
 
+/// Web replay budget: xterm.js parses `write` payloads incrementally without
+/// blocking paint, so the web client replays the full 1 MiB tail the daemon
+/// serves (~16k-24k lines). Native targets keep the smaller budget above
+/// because package:xterm parses synchronously on the UI thread.
+const int kHistoryReplayWebMaxLines = 50000;
+const int kHistoryReplayWebMaxBytes = 1024 * 1024;
+
 /// Trims a full-replay history payload to its newest complete lines.
 ///
 /// xterm is append-only, so a replay must still arrive oldest-first; this keeps
@@ -545,10 +552,12 @@ class TerminalStore extends ChangeNotifier {
     // Viewport-first: replay only the newest lines so a megabyte tail doesn't
     // stall first paint; the baseline below still uses the original end offset
     // (trimming drops a prefix) so delta merges stay anchored.
+    // `kIsWeb` selects the xterm.js sink exactly: every other target parses
+    // through package:xterm on the UI thread.
     final replayBytes = trimHistoryTail(
       bytes,
-      maxLines: kHistoryReplayMaxLines,
-      maxBytes: kHistoryReplayMaxBytes,
+      maxLines: kIsWeb ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines,
+      maxBytes: kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes,
     );
     if (!identical(replayBytes, bytes)) {
       tdbg(

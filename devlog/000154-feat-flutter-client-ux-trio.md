@@ -117,10 +117,21 @@ Three Flutter client requests in one branch:
 - 5beaf48 — fix(web): execCommand clipboard fallback for non-secure contexts
 - 825df84 — fix(pairing): resolve tailscale CLI by absolute path under minimal PATH
 - a72226f — fix(pairing): try whois binaries until one parses; GUI app fails headless
-- HEAD — fix(web): snapshot scroll position at gesture end
+- 17e3eb0 — fix(web): snapshot scroll position at gesture end
+- HEAD — fix(history): serve 1 MiB tail; web replays full scrollback
 
 ## Progress
 
+- 2026-10-02T12:51-0700: user reported limited scrollback in all sessions
+  (1000 lines). `RAW_OUTPUT_TAIL_CAP` 256 KiB -> 1 MiB; web replays the
+  full served tail (`kHistoryReplayWebMax{Lines,Bytes}` = 50k/1 MiB,
+  selected by `kIsWeb`, which matches the xterm.js sink exactly) while
+  native keeps the 1000-line/256 KiB budget (package:xterm parses
+  synchronously on the UI thread). Session logs average 36 MiB (max 414),
+  so full-history replay is infeasible; true infinite scrollback still
+  wants the scroll-up paging pass. Verified live: attach serves exactly
+  1048576 decoded bytes in 11-44 ms (~8x gzip). Gates: fmt, clippy,
+  served-tail + raw-tail tests, flutter analyze, 401 flutter tests.
 - 2026-09-28T22:15-0700: added installable `triage-coordination` skill
   (plan 000154-02) so agents know how to use the MCP messaging tools.
   Custom labels were invisible over MCP — the only distinguisher the user

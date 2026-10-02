@@ -7140,13 +7140,13 @@ const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Maximum bytes of raw output history carried in a snapshot for client-side
-/// re-emulation. 256 KiB matches ~4,000 to 6,000 lines of scrollback — the
-/// client replays newest-first within a smaller line budget anyway — while
-/// remaining safely within WebSocket frame and memory limits during snapshot
-/// serialization. A larger tail stalls first paint over high-latency links:
-/// the transfer plus full re-emulation exceeds client request timeouts and the
-/// retry storm re-requests the same megabytes.
-const RAW_OUTPUT_TAIL_CAP: u64 = 256 * 1024;
+/// re-emulation. 1 MiB matches ~16,000 to 24,000 lines of scrollback. It is
+/// served compressed (see `SessionSnapshot` serialization), so the wire cost
+/// is a fraction of this, and the web client replays it through xterm.js,
+/// which parses incrementally without stalling first paint. Native clients
+/// trim to a smaller budget after decode because package:xterm parses
+/// synchronously on the UI thread.
+const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
 
 /// Maximum bytes of a session log replayed through the terminal emulator when a
 /// session is adopted, restored, or reflowed after a resize.
