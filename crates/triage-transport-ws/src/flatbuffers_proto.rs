@@ -52,6 +52,20 @@ pub fn parse_client_message(
                 .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
             ClientRequest::PairingChallenge { client_id }
         }
+        fb::ClientRequestPayload::PairViaTailscaleRequest => {
+            let req = msg.payload_as_pair_via_tailscale_request().ok_or_else(|| {
+                crate::ProtocolError::new(
+                    "invalid_flatbuffer",
+                    "PairViaTailscaleRequest payload is missing",
+                )
+            })?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
+            ClientRequest::PairViaTailscale { client_id }
+        }
         fb::ClientRequestPayload::ListSessionsRequest => ClientRequest::ListSessions,
         fb::ClientRequestPayload::StartSessionRequestTable => {
             let req = msg
@@ -492,6 +506,7 @@ pub fn parse_client_message(
             ClientRequest::RemoveJudgeDenySubstring { substring }
         }
         fb::ClientRequestPayload::GetRailLayoutRequest => ClientRequest::GetRailLayout,
+        fb::ClientRequestPayload::GetDaemonStatsRequest => ClientRequest::GetDaemonStats,
         fb::ClientRequestPayload::SetRailPinsRequest => {
             let req = msg.payload_as_set_rail_pins_request().ok_or_else(|| {
                 crate::ProtocolError::new(
@@ -609,6 +624,19 @@ pub fn build_client_message<'a>(
             );
             (
                 fb::ClientRequestPayload::PairingChallengeRequest,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::PairViaTailscale { client_id } => {
+            let client_id_str = builder.create_string(client_id.as_str());
+            let req = fb::PairViaTailscaleRequest::create(
+                builder,
+                &fb::PairViaTailscaleRequestArgs {
+                    client_id: Some(client_id_str),
+                },
+            );
+            (
+                fb::ClientRequestPayload::PairViaTailscaleRequest,
                 req.as_union_value(),
             )
         }
@@ -989,6 +1017,13 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::GetDaemonStats => {
+            let req = fb::GetDaemonStatsRequest::create(builder, &fb::GetDaemonStatsRequestArgs {});
+            (
+                fb::ClientRequestPayload::GetDaemonStatsRequest,
+                req.as_union_value(),
+            )
+        }
         ClientRequest::SetRailPins {
             group_keys,
             session_ids,
@@ -1073,6 +1108,9 @@ pub fn build_server_message<'a>(
                     server_version,
                     update_available,
                     latest_version,
+                    disk_free_bytes,
+                    disk_total_bytes,
+                    tailscale_pairing_available,
                 } => {
                     let pv = builder.create_string(protocol_version);
                     let sv = builder.create_string(server_version);
@@ -1085,6 +1123,9 @@ pub fn build_server_message<'a>(
                             server_version: Some(sv),
                             update_available: *update_available,
                             latest_version: lv,
+                            disk_free_bytes: *disk_free_bytes,
+                            disk_total_bytes: *disk_total_bytes,
+                            tailscale_pairing_available: *tailscale_pairing_available,
                         },
                     );
                     (fb::ServerResultPayload::HelloResult, r.as_union_value())
@@ -1276,6 +1317,7 @@ pub fn build_server_message<'a>(
                                 worktree_root: wt,
                                 branch,
                                 last_activity_ms: entry.last_activity_ms,
+                                last_input_ms: entry.last_input_ms,
                             },
                         ));
                     }
@@ -1462,6 +1504,22 @@ pub fn build_server_message<'a>(
                     );
                     (
                         fb::ServerResultPayload::RailLayoutResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::DaemonStats {
+                    disk_free_bytes,
+                    disk_total_bytes,
+                } => {
+                    let r = fb::DaemonStatsResult::create(
+                        builder,
+                        &fb::DaemonStatsResultArgs {
+                            disk_free_bytes: *disk_free_bytes,
+                            disk_total_bytes: *disk_total_bytes,
+                        },
+                    );
+                    (
+                        fb::ServerResultPayload::DaemonStatsResult,
                         r.as_union_value(),
                     )
                 }
@@ -1761,6 +1819,7 @@ pub fn build_server_message<'a>(
             worktree_root,
             branch,
             last_activity_ms,
+            last_input_ms,
         } => {
             let sid = builder.create_string(session_id.as_str());
             let cwd = current_working_directory
@@ -1778,6 +1837,7 @@ pub fn build_server_message<'a>(
                     worktree_root: worktree,
                     branch,
                     last_activity_ms: *last_activity_ms,
+                    last_input_ms: *last_input_ms,
                 },
             );
             (
@@ -1826,6 +1886,9 @@ pub enum ServerResultBorrowed<'a> {
         // `None` until the first successful poll; the FlatBuffers field is
         // omitted, not an empty string, so preserve that distinction.
         latest_version: Option<&'a str>,
+        disk_free_bytes: u64,
+        disk_total_bytes: u64,
+        tailscale_pairing_available: bool,
     },
     Paired {
         token: &'a str,
@@ -1863,6 +1926,10 @@ pub enum ServerResultBorrowed<'a> {
         group_keys: Vec<&'a str>,
         session_ids: Vec<&'a str>,
         custom_labels: Vec<(&'a str, &'a str)>,
+    },
+    DaemonStats {
+        disk_free_bytes: u64,
+        disk_total_bytes: u64,
     },
 }
 
@@ -1944,6 +2011,7 @@ pub enum ServerMessageBorrowed<'a> {
         worktree_root: Option<&'a str>,
         branch: Option<&'a str>,
         last_activity_ms: u64,
+        last_input_ms: u64,
     },
     SessionTerminated {
         session_id: &'a str,
@@ -1973,6 +2041,9 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         server_version: hello.server_version().unwrap_or(""),
                         update_available: hello.update_available(),
                         latest_version: hello.latest_version(),
+                        disk_free_bytes: hello.disk_free_bytes(),
+                        disk_total_bytes: hello.disk_total_bytes(),
+                        tailscale_pairing_available: hello.tailscale_pairing_available(),
                     }
                 }
                 fb::ServerResultPayload::PairingChallengeResult => {
@@ -2093,8 +2164,28 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         custom_labels,
                     }
                 }
+                fb::ServerResultPayload::DaemonStatsResult => {
+                    let stats = resp.result_as_daemon_stats_result().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing daemon stats result",
+                        )
+                    })?;
+                    ServerResultBorrowed::DaemonStats {
+                        disk_free_bytes: stats.disk_free_bytes(),
+                        disk_total_bytes: stats.disk_total_bytes(),
+                    }
+                }
                 fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {
                     ServerResultBorrowed::Unit
+                }
+                fb::ServerResultPayload::PairedResult => {
+                    let paired = resp.result_as_paired_result().ok_or_else(|| {
+                        crate::ProtocolError::new("invalid_flatbuffer", "missing paired result")
+                    })?;
+                    ServerResultBorrowed::Paired {
+                        token: paired.token().unwrap_or(""),
+                    }
                 }
                 _ => {
                     return Err(crate::ProtocolError::new(
@@ -2306,6 +2397,7 @@ pub fn parse_fb_server_message_borrowed<'a>(
                 worktree_root: payload.worktree_root(),
                 branch: payload.branch(),
                 last_activity_ms: payload.last_activity_ms(),
+                last_input_ms: payload.last_input_ms(),
             })
         }
         fb::ServerMessagePayload::SessionTerminatedPayload => {

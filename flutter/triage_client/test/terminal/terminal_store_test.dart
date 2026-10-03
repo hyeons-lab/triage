@@ -159,6 +159,23 @@ void main() {
     expect(sink.ops, isEmpty);
   });
 
+  test('full replay trims to the newest lines with a reset prologue', () {
+    final lines = List.generate(1500, (i) => 'L${i.toString().padLeft(4, '0')}');
+    final payload = '${lines.join('\n')}\n';
+    store.dispatch(const Attach());
+    store.dispatch(HistoryBytes(b(payload), cols: 80, rows: 24));
+    final expectedTail = '${lines.sublist(500).join('\r\n')}\r\n';
+    expect(sink.written.toString(), '\x1b[0m$expectedTail');
+    expect(store.state.phase, AttachPhase.live);
+    expect(store.state.scrollbackReady, isTrue);
+  });
+
+  test('small replay passes through with no reset prologue', () {
+    store.dispatch(const Attach());
+    store.dispatch(HistoryBytes(b('a\nb\n'), cols: 80, rows: 24));
+    expect(sink.written.toString(), 'a\r\nb\r\n');
+  });
+
   test('split UTF-8 across live chunks decodes correctly', () {
     store.dispatch(const Attach());
     store.dispatch(const HistoryBytes([], cols: 80, rows: 24));

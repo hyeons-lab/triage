@@ -33,6 +33,7 @@ class TerminalPane extends StatefulWidget {
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
+    this.softKeyboardEnabled = true,
   });
 
   final String terminalId;
@@ -54,6 +55,11 @@ class TerminalPane extends StatefulWidget {
   final int focusCursorRevision;
   final bool isExited;
   final bool isLoading;
+
+  /// Mobile soft-keyboard kill switch. While false the pane never focuses
+  /// xterm's hidden textarea, so the keyboard stays down and its insets stop
+  /// churning the terminal layout. Desktop ignores it.
+  final bool softKeyboardEnabled;
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
@@ -365,6 +371,48 @@ class _TerminalPaneState extends State<TerminalPane> {
     return _cachedTextarea;
   }
 
+  /// Copies [text] to the clipboard, falling back to the legacy
+  /// `execCommand` path when the async Clipboard API is unavailable or
+  /// rejects. `navigator.clipboard` is null outside secure contexts (plain
+  /// `http://` over a tailnet IP), where the primary path would silently
+  /// copy nothing after the key handler already swallowed the native copy.
+  void _copyTextToClipboard(String text) {
+    final clipboard = html.window.navigator.clipboard;
+    if (clipboard == null) {
+      _legacyCopyToClipboard(text);
+      return;
+    }
+    clipboard.writeText(text).then((_) {}, onError: (_) {
+      _legacyCopyToClipboard(text);
+    });
+  }
+
+  void _legacyCopyToClipboard(String text) {
+    var copied = false;
+    // Removing the temporary textarea resets focus to <body>, dropping the
+    // terminal's hidden textarea: restore whoever held focus first.
+    final previousActive = html.document.activeElement;
+    try {
+      final textArea = html.TextAreaElement()
+        ..value = text
+        ..style.position = 'fixed'
+        ..style.opacity = '0';
+      html.document.body?.append(textArea);
+      textArea.focus();
+      textArea.select();
+      copied = html.document.execCommand('copy');
+      textArea.remove();
+    } catch (_) {}
+    if (previousActive is html.HtmlElement) {
+      try {
+        previousActive.focus();
+      } catch (_) {}
+    }
+    if (!copied) {
+      debugPrint('Terminal copy failed: clipboard unavailable');
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -534,11 +582,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             if (selection.isNotEmpty) {
               event.preventDefault();
               event.stopPropagation();
-              html.window.navigator.clipboard?.writeText(selection).catchError((
-                Object error,
-              ) {
-                debugPrint('Terminal copy failed: $error');
-              });
+              _copyTextToClipboard(selection);
               return;
             }
             // If no text is selected on macOS with Cmd+C, do not send SIGINT.
@@ -756,6 +800,11 @@ class _TerminalPaneState extends State<TerminalPane> {
     return false;
   }
 
+  /// Whether this pane may take keyboard focus right now. On mobile with the
+  /// soft keyboard suppressed, focusing xterm's textarea would raise the
+  /// keyboard, so [_activateTerminal] skips that step. Desktop always passes.
+  bool get _mayTakeFocus => !_isMobile || widget.softKeyboardEnabled;
+
   static html.Element? _deepActiveElement() {
     try {
       var active = html.document.activeElement;
@@ -847,6 +896,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _scheduleFocusRetries({bool force = false}) {
     _clearFocusRetryTimers();
+    // Suppressed on mobile: retries exist to land textarea focus, which the
+    // kill switch forbids — scheduling them would fire three pointless timer
+    // wakes per call. Gated here rather than at each call site so every
+    // present and future caller is covered.
+    if (!_mayTakeFocus) return;
     for (final delayMs in const [50, 150, 300]) {
       late final Timer timer;
       timer = Timer(Duration(milliseconds: delayMs), () {
@@ -891,18 +945,23 @@ class _TerminalPaneState extends State<TerminalPane> {
       return;
     }
 
-    try {
-      final textarea = _activeTextarea;
-      if (textarea != null) {
-        if (_isMobile && _textareaBeforeInputListener == null) {
-          _bindTextareaEvents();
+    // Suppressed on mobile: focusing the textarea (directly or via
+    // `term.focus()`, which focuses it internally) raises the soft keyboard.
+    // The write flush below still runs.
+    if (_mayTakeFocus) {
+      try {
+        final textarea = _activeTextarea;
+        if (textarea != null) {
+          if (_isMobile && _textareaBeforeInputListener == null) {
+            _bindTextareaEvents();
+          }
+          final opts = js_util.newObject();
+          js_util.setProperty(opts, 'preventScroll', true);
+          js_util.callMethod(textarea, 'focus', [opts]);
         }
-        final opts = js_util.newObject();
-        js_util.setProperty(opts, 'preventScroll', true);
-        js_util.callMethod(textarea, 'focus', [opts]);
-      }
-      js_util.callMethod(_term, 'focus', []);
-    } catch (_) {}
+        js_util.callMethod(_term, 'focus', []);
+      } catch (_) {}
+    }
 
     if (_pendingLiveWriteBuffer.isNotEmpty) {
       _flushPendingLiveWrites();
@@ -1978,6 +2037,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _handleUserGestureEnded() {
     if (_isUserGestureActive) return;
+    _snapshotGestureEndScrollPosition();
     if (_pendingScrollToBottomOnRelease) {
       _pendingScrollToBottomOnRelease = false;
       _restoreScrollPosition(requestFocus: false);
@@ -1992,6 +2052,28 @@ class _TerminalPaneState extends State<TerminalPane> {
         );
       }
     }
+  }
+
+  /// Records the viewport position where a user gesture ended. onScroll
+  /// events during the gesture may have been swallowed by a suppress window
+  /// (replay, fit, restore), leaving a stale entry that the next restore
+  /// would yank the viewport to — typically the very top.
+  void _snapshotGestureEndScrollPosition() {
+    try {
+      final term = _sessionTerms[_sanitizedId];
+      final container = _sessionContainers[_sanitizedId];
+      if (term == null || container == null) return;
+      final buffer = js_util.getProperty(term, 'buffer');
+      final active = js_util.getProperty(buffer, 'active');
+      final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+      final viewportY =
+          (js_util.getProperty(active, 'viewportY') as num).toInt();
+      if (_viewportIsAtBottom(container, viewportY, baseY)) {
+        _sessionSavedViewportY.remove(_sanitizedId);
+      } else if (viewportY >= 0) {
+        _sessionSavedViewportY[_sanitizedId] = viewportY;
+      }
+    } catch (_) {}
   }
 
   /// Releases the listeners [_bindContainerEvents] attached, and is safe to call
@@ -2626,6 +2708,25 @@ class _TerminalPaneState extends State<TerminalPane> {
       _focusCursorNowAndAfterReplay();
       _scheduleFocusRetries(force: true);
     }
+    if (oldWidget.softKeyboardEnabled != widget.softKeyboardEnabled &&
+        _isMobile) {
+      // The user flipped the kill switch: blur the hidden textarea at once
+      // when suppressing (the keyboard may be up right now), and focus it
+      // back when re-enabling (the tap says they want to type).
+      if (widget.softKeyboardEnabled) {
+        _activateTerminal(force: true);
+        _scheduleFocusRetries(force: true);
+      } else {
+        _clearFocusRetryTimers();
+        try {
+          final textarea = _activeTextarea;
+          if (textarea != null) {
+            js_util.callMethod(textarea, 'blur', []);
+          }
+        } catch (_) {}
+        _focusNode.unfocus();
+      }
+    }
     if (oldWidget.isLoading != widget.isLoading) {
       _syncPointerEvents();
       if (!widget.isLoading) {
@@ -2720,7 +2821,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     return Focus(
       focusNode: _focusNode,
-      autofocus: true,
+      autofocus: _mayTakeFocus,
       onFocusChange: (hasFocus) {
         if (hasFocus && _initialized) {
           widget.controller.notifyInteraction();
@@ -2772,7 +2873,8 @@ class _TerminalPaneState extends State<TerminalPane> {
                       behavior: HitTestBehavior.opaque,
                       onTapDown: (_) {
                         widget.controller.notifyInteraction();
-                        if (mounted &&
+                        if (_mayTakeFocus &&
+                            mounted &&
                             _focusNode.canRequestFocus &&
                             !_focusNode.hasFocus) {
                           _focusNode.requestFocus();

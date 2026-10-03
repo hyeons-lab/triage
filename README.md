@@ -63,7 +63,7 @@ are Unix-only; Windows falls back to Session Restore. See
 | [`triage`](crates/triage/README.md) | Ratatui TUI: sidebar, session switching, attach, and per-session auto-approval controls. |
 | [`triage-hook`](crates/triage-hook/README.md) | Agent lifecycle-hook shim: auto-approves safe commands for Antigravity, Claude Code, and other agent CLIs. |
 | [`triage_client`](flutter/triage_client/README.md) | Flutter app: web, iOS, Android, macOS, Windows, Linux. Pairs over WebSocket; remembers and switches between multiple daemons; includes approval dashboard. |
-| [`triage-mcp`](crates/triage-mcp/README.md) | MCP server: lets a local AI agent *read* your session state (read-only). |
+| [`triage-mcp`](crates/triage-mcp/README.md) | MCP server: lets local AI agents read session state and coordinate via session messaging. |
 
 Remote clients attach over WebSocket and are gated by a device-code + PIN pairing
 flow that issues a per-device token. Triage terminates no TLS itself — front it
@@ -96,7 +96,7 @@ Usable, and used daily by its author — but pre-1.0, and the attention-routing
 half of the product is still being built.
 
 **Working today:** the daemon and its session core; local IPC; the TUI (sidebar,
-navigation, attach, judge controls); the MCP server (read-only tools); remote access with PIN
+navigation, attach, judge controls); the MCP server (session reads + session messaging); remote access with PIN
 pairing; the web client; Flutter desktop and Android builds; session persistence
 across restarts; zero-downtime handover and SIGTERM rescue on Unix; and the local-model
 [tool-call approval judge](docs/approval-judge.md), which lets an agent CLI

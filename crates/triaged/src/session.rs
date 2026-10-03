@@ -31,10 +31,11 @@ use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
     InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest,
     SessionApi, SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope,
-    SessionEventReceiver, SessionId, SessionPins, SessionSize, SessionSnapshot,
+    SessionEventReceiver, SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot,
     StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
     SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
 };
+use triage_core::session::{SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN};
 use triage_transport_ws::ServerMessage;
 use unicode_width::UnicodeWidthStr;
 
@@ -158,6 +159,11 @@ pub struct SessionActor {
     /// would be slowest. `Relaxed` throughout: the value is a display-ordering
     /// hint that races with output by nature, and it guards no other memory.
     last_activity_ms: Arc<AtomicU64>,
+    /// Wall-clock of the most recent input written to this session by any
+    /// client, same atomic-sharing rationale as [`Self::last_activity_ms`].
+    /// The rail's activity sort orders by this: output recency alone lets a
+    /// noisy background job outrank sessions the user actually types in.
+    last_input_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,12 +304,23 @@ struct JudgeState {
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
+    /// Side inboxes for session-to-session coordination mail (agents via
+    /// MCP). In-memory only: not persisted, not carried across handover.
+    inboxes: Mutex<HashMap<SessionId, VecDeque<SessionMessage>>>,
+    /// Daemon-monotonic message id counter (starts at 1; 0 is never valid).
+    next_message_id: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
     pins: Mutex<SessionPins>,
     custom_labels: Mutex<HashMap<String, String>>,
     pairing_challenges: Mutex<HashMap<String, PendingPairingChallenge>>,
     paired_devices: Mutex<HashMap<ClientId, String>>,
     require_pairing: bool,
+    /// Tailnet users allowed to pair via Tailscale identity (from
+    /// `remote.tailscale_pair_users`). Non-empty replaces the device-code
+    /// flow: code challenges are refused and only allowlisted peers mint.
+    tailscale_pair_users: Vec<String>,
+    /// Cached `tailscale whois` resolver for SSO pairing.
+    tailnet_pairing: crate::tailscale::TailnetPairing,
     /// Latest generated snippet per session (in-memory only; not persisted).
     snippets: Mutex<HashMap<SessionId, SessionSnippet>>,
     /// The local-LLM summarizer worker. Disabled until `start_summarizer` runs.
@@ -432,6 +449,15 @@ struct SessionSnippet {
     /// detail pass produces something usable.
     detail: Option<String>,
     generated_at_output_seq: u64,
+}
+
+/// A session's activity stamps as one named bundle. Both fields are same-type
+/// wall-clock millis of similar magnitude, so a positional `(u64, u64)` pair
+/// would let a swapped construction compile and silently exchange them.
+#[derive(Debug, Clone, Copy)]
+struct SessionStamps {
+    activity_ms: u64,
+    input_ms: u64,
 }
 
 /// Bounded capacity for each connection's global-push channel. If a client
@@ -569,6 +595,11 @@ struct PersistedSession {
     /// output, which would rewrite the manifest continuously under a build.
     #[serde(default)]
     last_activity_ms: u64,
+    /// Wall-clock of the most recent input written to the session, same
+    /// refresh rule as [`Self::last_activity_ms`]. 0 means unknown: a session
+    /// with no input yet, or a manifest written before this field existed.
+    #[serde(default)]
+    last_input_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -604,8 +635,9 @@ impl PersistedSessionLaunch {
             exited,
             last_known_cwd: None,
             // Filled in by `ManagedSession::persisted` for live sessions, which
-            // is the only caller with access to the actor's activity stamp.
+            // is the only caller with access to the actor's stamps.
             last_activity_ms: 0,
+            last_input_ms: 0,
         }
     }
 }
@@ -618,27 +650,32 @@ impl SessionManager {
         });
         let next_session = next_session_sequence(sessions.keys());
         let paired_devices = load_paired_devices(&config.log_dir);
-        let require_pairing = if let Ok(path) = triage_core::config::Config::default_path() {
-            if path.exists() {
-                triage_core::config::Config::load_from_path(&path)
-                    .map(|c| c.remote.require_pairing)
-                    .unwrap_or(true)
+        let (require_pairing, tailscale_pair_users) =
+            if let Ok(path) = triage_core::config::Config::default_path() {
+                if path.exists() {
+                    triage_core::config::Config::load_from_path(&path)
+                        .map(|c| (c.remote.require_pairing, c.remote.tailscale_pair_users))
+                        .unwrap_or((true, Vec::new()))
+                } else {
+                    (true, Vec::new())
+                }
             } else {
-                true
-            }
-        } else {
-            true
-        };
+                (true, Vec::new())
+            };
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
             next_session: AtomicU64::new(next_session),
+            inboxes: Mutex::new(HashMap::new()),
+            next_message_id: AtomicU64::new(1),
             sessions: Mutex::new(sessions),
             pins: Mutex::new(pins),
             custom_labels: Mutex::new(custom_labels),
             pairing_challenges: Mutex::new(HashMap::new()),
             paired_devices: Mutex::new(paired_devices),
             require_pairing,
+            tailscale_pair_users,
+            tailnet_pairing: crate::tailscale::TailnetPairing::new(),
             snippets: Mutex::new(HashMap::new()),
             summarizer: Mutex::new(Summarizer::disabled()),
             judge: Mutex::new(None),
@@ -1067,6 +1104,15 @@ impl SessionManager {
     fn forget_snippet(&self, session_id: &SessionId) {
         if let Ok(mut snippets) = self.snippets.lock() {
             snippets.remove(session_id);
+        }
+    }
+
+    /// Drops a session's coordination inbox (on shutdown/removal). Unacked
+    /// mail for a removed session is unreachable, since receive and ack gate
+    /// on session membership, so without this it leaks for the daemon lifetime.
+    fn forget_inbox(&self, session_id: &SessionId) {
+        if let Ok(mut inboxes) = self.inboxes.lock() {
+            inboxes.remove(session_id);
         }
     }
 
@@ -1534,6 +1580,23 @@ impl SessionManager {
             .map_err(|_| anyhow!("session manager lock poisoned"))
     }
 
+    fn inboxes(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<SessionId, VecDeque<SessionMessage>>>> {
+        self.inboxes
+            .lock()
+            .map_err(|_| anyhow!("session inbox lock poisoned"))
+    }
+
+    fn require_known_session(&self, session_id: &SessionId) -> Result<()> {
+        let sessions = self.sessions()?;
+        ensure!(
+            sessions.contains_key(session_id),
+            "session {session_id} not found"
+        );
+        Ok(())
+    }
+
     fn pins(&self) -> Result<std::sync::MutexGuard<'_, SessionPins>> {
         self.pins
             .lock()
@@ -1634,7 +1697,7 @@ impl SessionManager {
     fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
         // Phase 1 (brief lock): grab the actor command channel + launch of a
         // `Live` session, without doing the actor round-trip under the lock.
-        let (cmd_tx, launch, last_known_cwd, last_activity_ms) = {
+        let (cmd_tx, launch, last_known_cwd, last_activity_ms, last_input_ms) = {
             let sessions = self.sessions()?;
             let Some(ManagedSession::Live {
                 actor,
@@ -1650,6 +1713,7 @@ impl SessionManager {
                 launch.clone(),
                 last_known_cwd.clone(),
                 actor.last_activity_ms(),
+                actor.last_input_ms(),
             )
         };
 
@@ -1674,6 +1738,7 @@ impl SessionManager {
         // unknown" and sort to the bottom of the rail despite having been busy
         // moments earlier.
         persisted.last_activity_ms = last_activity_ms;
+        persisted.last_input_ms = last_input_ms;
         if !is_restorable_shell_launch(&persisted) {
             return Ok(());
         }
@@ -1727,6 +1792,10 @@ impl SessionManager {
     }
 
     pub fn request_pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallengeInfo> {
+        ensure!(
+            self.tailscale_pair_users.is_empty(),
+            "device-code pairing is disabled on this daemon; pair via Tailscale identity instead"
+        );
         ensure!(
             client_id.as_str().len() <= MAX_PAIRING_CLIENT_ID_LENGTH,
             "pairing client id is too long"
@@ -1820,6 +1889,59 @@ impl SessionManager {
         })
     }
 
+    /// Pair by Tailscale identity: resolve the peer's tailnet login and mint
+    /// the standard pairing token only for allowlisted users. Every failure
+    /// (unconfigured daemon, unresolvable peer, no match) denies with a
+    /// message that does not distinguish the cause.
+    pub fn pair_via_tailscale(
+        &self,
+        client_id: &ClientId,
+        peer: std::net::SocketAddr,
+    ) -> Result<String> {
+        if self.tailscale_pair_users.is_empty() {
+            bail!(
+                "Tailscale pairing is not configured on this daemon; pair with a device code instead"
+            );
+        }
+        let allowed = self
+            .tailnet_pairing
+            .resolve_login(peer)
+            .is_some_and(|login| {
+                crate::tailscale::tailnet_login_is_allowed(&login, &self.tailscale_pair_users)
+            });
+        if !allowed {
+            bail!("tailnet identity is not authorized to pair with this daemon");
+        }
+        self.mint_paired_token(client_id)
+    }
+
+    /// Mint a pairing token for a client that already proved itself (PIN or
+    /// tailnet identity), persist the hash, and clear any stale CLI code.
+    fn mint_paired_token(&self, client_id: &ClientId) -> Result<String> {
+        use rand::Rng;
+        use sha2::{Digest, Sha256};
+
+        let mut token_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut token_bytes);
+        let token = hex::encode(token_bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let mut devices = self.paired_devices()?;
+        devices.insert(client_id.clone(), hash);
+
+        save_paired_devices(&self.config.log_dir, &devices)?;
+
+        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
+        if pairing_code_path.exists() {
+            let _ = fs::remove_file(pairing_code_path);
+        }
+
+        Ok(token)
+    }
+
     #[cfg(unix)]
     pub fn serialize_active_sessions(
         &self,
@@ -1834,7 +1956,12 @@ impl SessionManager {
         // unbounded wait for a parked actor made the daemon un-handoverable in exactly
         // the situation that most needs a handover. It is also what the shutdown
         // rescue runs on, through the successor it starts.
-        let pending: Vec<(SessionId, Sender<ActorCommand>, PersistedSessionLaunch, u64)> = self
+        let pending: Vec<(
+            SessionId,
+            Sender<ActorCommand>,
+            PersistedSessionLaunch,
+            SessionStamps,
+        )> = self
             .sessions()?
             .iter()
             .filter_map(|(id, managed)| match managed {
@@ -1850,7 +1977,10 @@ impl SessionManager {
                     id.clone(),
                     actor.tx.clone(),
                     launch.clone(),
-                    actor.last_activity_ms(),
+                    SessionStamps {
+                        activity_ms: actor.last_activity_ms(),
+                        input_ms: actor.last_input_ms(),
+                    },
                 )),
                 _ => None,
             })
@@ -1870,10 +2000,10 @@ impl SessionManager {
         // all.
         let inflight: Vec<_> = pending
             .into_iter()
-            .filter_map(|(id, cmd_tx, launch, last_activity_ms)| {
+            .filter_map(|(id, cmd_tx, launch, stamps)| {
                 let (tx, rx) = mpsc::channel();
                 match cmd_tx.send(ActorCommand::ExtractHandoverState { response: tx }) {
-                    Ok(()) => Some((id, rx, launch, last_activity_ms)),
+                    Ok(()) => Some((id, rx, launch, stamps)),
                     Err(err) => {
                         tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
                         None
@@ -1886,7 +2016,7 @@ impl SessionManager {
         // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
         let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
 
-        for (id, rx, launch, last_activity_ms) in inflight {
+        for (id, rx, launch, stamps) in inflight {
             // Bounded, unlike every other actor round-trip in this file. An actor that
             // cannot answer a descriptor dup and three counters before the budget runs
             // out is parked (a `write_all` to a session whose child stopped reading),
@@ -1943,7 +2073,8 @@ impl SessionManager {
                 bytes_logged: ext.bytes_logged,
                 pid: ext.pid,
                 process_identity: ext.process_identity,
-                last_activity_ms,
+                last_activity_ms: stamps.activity_ms,
+                last_input_ms: stamps.input_ms,
                 judge_override,
             });
         }
@@ -2357,6 +2488,10 @@ impl SessionManager {
         };
         let last_activity_ms = Arc::new(AtomicU64::new(adopted_activity_ms));
         let actor_last_activity_ms = Arc::clone(&last_activity_ms);
+        // Carried as-is, including 0: unlike activity, interaction-unknown is
+        // a real state (never typed in), not a collapse to repair.
+        let last_input_ms = Arc::new(AtomicU64::new(h_sess.last_input_ms));
+        let actor_last_input_ms = Arc::clone(&last_input_ms);
 
         let (reader_start_tx, reader_start_rx) = mpsc::channel();
         let reader = thread::Builder::new()
@@ -2391,6 +2526,7 @@ impl SessionManager {
                     event_session_id,
                     dirty_tx,
                     last_activity_ms: actor_last_activity_ms,
+                    last_input_ms: actor_last_input_ms,
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
@@ -2418,6 +2554,7 @@ impl SessionManager {
             reader: Some(reader),
             writer: Some(writer_handle),
             last_activity_ms,
+            last_input_ms,
         };
 
         sessions.insert(
@@ -2765,6 +2902,7 @@ impl ManagedSession {
                 // in `run_activity_persistence_loop` a plain re-persist rather
                 // than a separate write path.
                 persisted.last_activity_ms = actor.last_activity_ms();
+                persisted.last_input_ms = actor.last_input_ms();
                 persisted
             }
             Self::Historical { session, .. } => session.persisted.clone(),
@@ -2893,6 +3031,7 @@ impl SessionApi for SessionManager {
         )?;
         let actor_tx = actor.tx.clone();
         let last_activity_ms = actor.last_activity_ms();
+        let last_input_ms = actor.last_input_ms();
         let initial_cwd = last_known_cwd.clone();
 
         let mut sessions = self.sessions()?;
@@ -2928,6 +3067,9 @@ impl SessionApi for SessionManager {
         if let Err(error) = self.persist_manifest(&sessions) {
             let inserted = sessions.remove(&session_id);
             drop(sessions);
+            // A send racing the failed start could have queued mail for a
+            // session that now never exists; drop it with the session.
+            self.forget_inbox(&session_id);
             if let Some(ManagedSession::Live { actor, .. }) = inserted
                 && let Err(shutdown_error) = actor.shutdown()
             {
@@ -2961,6 +3103,7 @@ impl SessionApi for SessionManager {
             worktree_root,
             branch,
             last_activity_ms,
+            last_input_ms,
         });
         Ok(session_id)
     }
@@ -3220,10 +3363,12 @@ impl SessionApi for SessionManager {
         // the manifest predates the field, so the spawn-time default stands.
         let restored_activity_ms =
             (persisted.last_activity_ms != 0).then_some(persisted.last_activity_ms);
+        let restored_input_ms = (persisted.last_input_ms != 0).then_some(persisted.last_input_ms);
         let actor = match SessionActor::spawn_restored(
             config,
             request.session_id.clone(),
             restored_activity_ms,
+            restored_input_ms,
             self.dirty_tx(),
             self.cwd_update_tx(),
             Some(self.global_senders()),
@@ -3325,6 +3470,54 @@ impl SessionApi for SessionManager {
         Ok(self.overlay_snippet(snapshot, &session_id))
     }
 
+    fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
+        ensure!(
+            !body.trim().is_empty(),
+            "session message body must not be empty"
+        );
+        ensure!(
+            body.len() <= SESSION_MESSAGE_MAX_BODY_LEN,
+            "session message body exceeds {SESSION_MESSAGE_MAX_BODY_LEN} bytes"
+        );
+        self.require_known_session(&from)?;
+        self.require_known_session(&to)?;
+        let mut inboxes = self.inboxes()?;
+        let inbox = inboxes.entry(to).or_default();
+        ensure!(
+            inbox.len() < SESSION_INBOX_CAPACITY,
+            "session inbox is full ({SESSION_INBOX_CAPACITY} unacked messages); retry later"
+        );
+        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
+        inbox.push_back(SessionMessage {
+            id,
+            from,
+            body,
+            sent_at_ms: now_unix_millis(),
+        });
+        Ok(id)
+    }
+
+    fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        self.require_known_session(&session_id)?;
+        let inboxes = self.inboxes()?;
+        Ok(inboxes
+            .get(&session_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
+        self.require_known_session(&session_id)?;
+        let mut inboxes = self.inboxes()?;
+        if let Some(inbox) = inboxes.get_mut(&session_id) {
+            inbox.retain(|message| !message_ids.contains(&message.id));
+            if inbox.is_empty() {
+                inboxes.remove(&session_id);
+            }
+        }
+        Ok(())
+    }
+
     fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
         let resolved = {
             let sessions = self.sessions()?;
@@ -3360,6 +3553,7 @@ impl SessionApi for SessionManager {
                 launch: PersistedSessionLaunch,
                 last_known_cwd: Option<PathBuf>,
                 last_activity_ms: u64,
+                last_input_ms: u64,
                 prepared_manifest: PathBuf,
             },
             Historical {
@@ -3384,6 +3578,7 @@ impl SessionApi for SessionManager {
                     launch: launch.clone(),
                     last_known_cwd: last_known_cwd.clone(),
                     last_activity_ms: actor.last_activity_ms(),
+                    last_input_ms: actor.last_input_ms(),
                     // Validate that the removal manifest can be encoded and
                     // written before doing anything irreversible to the child.
                     // It is rewritten from the current map after termination,
@@ -3421,6 +3616,7 @@ impl SessionApi for SessionManager {
                 launch,
                 last_known_cwd,
                 last_activity_ms,
+                last_input_ms,
                 prepared_manifest,
             } => {
                 let completed = match request_actor_shutdown(&tx) {
@@ -3434,6 +3630,7 @@ impl SessionApi for SessionManager {
                 let mut persisted = launch.clone().into_persisted(session_id.clone(), true);
                 persisted.last_known_cwd = last_known_cwd;
                 persisted.last_activity_ms = last_activity_ms;
+                persisted.last_input_ms = last_input_ms;
                 let historical_fallback = HistoricalSession::restore(persisted).map(Box::new);
 
                 let (mut actor, commit_result) = {
@@ -3488,6 +3685,7 @@ impl SessionApi for SessionManager {
 
         self.forget_snippet(&session_id);
         self.forget_judge_override(&session_id);
+        self.forget_inbox(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -3537,23 +3735,29 @@ impl SessionApi for SessionManager {
             Ready(Option<SessionContext>),
             Live(Sender<ActorCommand>),
         }
-        let mut sources: Vec<(SessionId, ContextSource, u64)> = {
+        let mut sources: Vec<(SessionId, ContextSource, SessionStamps)> = {
             let sessions = self.sessions()?;
             sessions
                 .iter()
                 .map(|(session_id, managed)| {
-                    let (source, last_activity_ms) = match managed {
+                    let (source, stamps) = match managed {
                         ManagedSession::Live { actor, .. } => (
                             ContextSource::Live(actor.tx.clone()),
-                            actor.last_activity_ms(),
+                            SessionStamps {
+                                activity_ms: actor.last_activity_ms(),
+                                input_ms: actor.last_input_ms(),
+                            },
                         ),
                         ManagedSession::Historical { session, .. }
                         | ManagedSession::Restoring { session, .. } => (
                             ContextSource::Ready(session.context.clone()),
-                            session.persisted.last_activity_ms,
+                            SessionStamps {
+                                activity_ms: session.persisted.last_activity_ms,
+                                input_ms: session.persisted.last_input_ms,
+                            },
                         ),
                     };
-                    (session_id.clone(), source, last_activity_ms)
+                    (session_id.clone(), source, stamps)
                 })
                 .collect()
         };
@@ -3562,7 +3766,7 @@ impl SessionApi for SessionManager {
         sources.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
         Ok(sources
             .into_iter()
-            .map(|(session_id, source, last_activity_ms)| {
+            .map(|(session_id, source, stamps)| {
                 let context = match source {
                     ContextSource::Ready(context) => context,
                     // A live actor mid-shutdown simply yields no context rather
@@ -3572,7 +3776,8 @@ impl SessionApi for SessionManager {
                 SessionContextRow {
                     session_id,
                     context,
-                    last_activity_ms,
+                    last_activity_ms: stamps.activity_ms,
+                    last_input_ms: stamps.input_ms,
                 }
             })
             .collect())
@@ -4009,13 +4214,13 @@ const ACTIVITY_PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 /// last tick is deliberately not a reason to write, because the paths that
 /// remove a session (shutdown, demotion) persist the manifest themselves. Firing
 /// here as well would make every shutdown cost two writes.
-fn activity_advanced(
-    persisted: &HashMap<SessionId, u64>,
-    current: &HashMap<SessionId, u64>,
+fn activity_advanced<V: PartialEq>(
+    persisted: &HashMap<SessionId, V>,
+    current: &HashMap<SessionId, V>,
 ) -> bool {
     current
         .iter()
-        .any(|(session_id, millis)| persisted.get(session_id) != Some(millis))
+        .any(|(session_id, stamp)| persisted.get(session_id) != Some(stamp))
 }
 
 /// Periodically re-persists the manifest when a live session's activity stamp has
@@ -4035,7 +4240,7 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
     // from the manifest means the first tick after startup always writes once:
     // every live session reads as newly advanced. That is a fair price for not
     // parsing the manifest again here.
-    let mut persisted: HashMap<SessionId, u64> = HashMap::new();
+    let mut persisted: HashMap<SessionId, (u64, u64)> = HashMap::new();
     loop {
         thread::sleep(ACTIVITY_PERSIST_INTERVAL);
         let Some(manager) = manager.upgrade() else {
@@ -4044,12 +4249,13 @@ fn run_activity_persistence_loop(manager: std::sync::Weak<SessionManager>) {
         let Ok(sessions) = manager.sessions() else {
             return; // lock poisoned; the manager is unusable
         };
-        let current: HashMap<SessionId, u64> = sessions
+        let current: HashMap<SessionId, (u64, u64)> = sessions
             .iter()
             .filter_map(|(session_id, managed)| match managed {
-                ManagedSession::Live { actor, .. } => {
-                    Some((session_id.clone(), actor.last_activity_ms()))
-                }
+                ManagedSession::Live { actor, .. } => Some((
+                    session_id.clone(),
+                    (actor.last_activity_ms(), actor.last_input_ms()),
+                )),
                 // Historical and restoring sessions produce no output, so their
                 // stamps are already whatever the manifest holds.
                 _ => None,
@@ -4914,6 +5120,7 @@ impl SessionActor {
             None,
             None,
             None,
+            None,
             LogInitialization::Truncate,
         )
     }
@@ -4930,6 +5137,7 @@ impl SessionActor {
             config,
             Some(session_id),
             None,
+            None,
             dirty_tx,
             cwd_update_tx,
             global_senders,
@@ -4944,10 +5152,12 @@ impl SessionActor {
     /// shell prints its prompt within milliseconds, and a seed applied after the
     /// fact loses that race and re-stamps the session to "now", which is the
     /// collapse the seed exists to prevent.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_restored(
         config: SessionConfig,
         session_id: SessionId,
         initial_activity_ms: Option<u64>,
+        initial_input_ms: Option<u64>,
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
@@ -4957,6 +5167,7 @@ impl SessionActor {
             config,
             Some(session_id),
             initial_activity_ms,
+            initial_input_ms,
             dirty_tx,
             cwd_update_tx,
             global_senders,
@@ -4970,6 +5181,7 @@ impl SessionActor {
         config: SessionConfig,
         event_session_id: Option<SessionId>,
         initial_activity_ms: Option<u64>,
+        initial_input_ms: Option<u64>,
         dirty_tx: Option<DirtySender>,
         cwd_update_tx: Option<CwdUpdateSender>,
         global_senders: Option<GlobalSenders>,
@@ -5005,6 +5217,11 @@ impl SessionActor {
             initial_activity_ms.unwrap_or_else(now_unix_millis),
         ));
         let actor_last_activity_ms = Arc::clone(&last_activity_ms);
+        // No spawn-time seed, unlike activity: a session that has never
+        // received input sorts as interaction-unknown (last), which is the
+        // truth, not a bucket to avoid.
+        let last_input_ms = Arc::new(AtomicU64::new(initial_input_ms.unwrap_or(0)));
+        let actor_last_input_ms = Arc::clone(&last_input_ms);
         let reader = thread::Builder::new()
             .name("session-actor-reader".into())
             .spawn(move || read_pty_output(reader, output_tx))
@@ -5028,6 +5245,7 @@ impl SessionActor {
                     event_session_id,
                     dirty_tx,
                     last_activity_ms: actor_last_activity_ms,
+                    last_input_ms: actor_last_input_ms,
                     cwd_update_tx,
                     global_senders,
                     context_resend_pending: false,
@@ -5049,12 +5267,19 @@ impl SessionActor {
             reader: Some(reader),
             writer: Some(writer_handle),
             last_activity_ms,
+            last_input_ms,
         })
     }
 
     /// Milliseconds since the Unix epoch of this session's most recent output.
     fn last_activity_ms(&self) -> u64 {
         self.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    /// Milliseconds since the Unix epoch of the most recent input written to
+    /// this session by any client.
+    fn last_input_ms(&self) -> u64 {
+        self.last_input_ms.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -5193,6 +5418,9 @@ struct ActorState {
     /// ingest. Distinct from [`Self::dirty_tx`], which is `None` whenever the
     /// summarizer is disabled; activity ordering must not depend on that.
     last_activity_ms: Arc<AtomicU64>,
+    /// Shared with [`SessionActor::last_input_ms`]; stamped on every input
+    /// write from any client.
+    last_input_ms: Arc<AtomicU64>,
     /// When set (managed sessions), the actor reports working-directory changes
     /// here so the manager records the live cwd into the on-disk manifest,
     /// letting a daemon kill restore the session where it left off. `None` for
@@ -5772,6 +6000,11 @@ impl ActorState {
         if self.exited {
             return;
         }
+        // Stamped before the send, like the output stamp in `handle_output`:
+        // this is the interaction recency the rail orders by, and a dropped
+        // write still means the user was here.
+        self.last_input_ms
+            .store(now_unix_millis(), Ordering::Relaxed);
         if let Err(err) = self.writer_tx.try_send(bytes) {
             match err {
                 TrySendError::Full(_) => {
@@ -6907,9 +7140,12 @@ const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const SESSION_LOG_RETAIN_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Maximum bytes of raw output history carried in a snapshot for client-side
-/// re-emulation. 1 MiB matches ~15,000 to 25,000 lines of scrollback while
-/// remaining safely within WebSocket frame and memory limits during snapshot
-/// serialization.
+/// re-emulation. 1 MiB matches ~16,000 to 24,000 lines of scrollback. It is
+/// served compressed (see `SessionSnapshot` serialization), so the wire cost
+/// is a fraction of this, and the web client replays it through xterm.js,
+/// which parses incrementally without stalling first paint. Native clients
+/// trim to a smaller budget after decode because package:xterm parses
+/// synchronously on the UI thread.
 const RAW_OUTPUT_TAIL_CAP: u64 = 1024 * 1024;
 
 /// Maximum bytes of a session log replayed through the terminal emulator when a
@@ -7819,7 +8055,10 @@ fn git_repository_root(cwd: &Path) -> Option<PathBuf> {
     Some(common_dir)
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: std::time::Duration) -> Option<Vec<u8>> {
+pub(crate) fn run_command_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::null());
@@ -8193,9 +8432,25 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
         })
     }
 
+    fn tailscale_pairing_available(&self) -> bool {
+        !self.tailscale_pair_users.is_empty()
+    }
+
+    fn pair_via_tailscale(
+        &self,
+        client_id: &ClientId,
+        peer: std::net::SocketAddr,
+    ) -> Result<String> {
+        // Fully qualified: the inherent method shares this name, and an
+        // unqualified call would recurse into this trait method instead.
+        SessionManager::pair_via_tailscale(self, client_id, peer)
+    }
+
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
-        use rand::Rng;
-        use sha2::{Digest, Sha256};
+        ensure!(
+            self.tailscale_pair_users.is_empty(),
+            "device-code pairing is disabled on this daemon; pair via Tailscale identity instead"
+        );
 
         let normalized = normalize_pairing_code(code);
         {
@@ -8234,25 +8489,7 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
             challenges.remove(&device_code);
         }
 
-        let mut token_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut token_bytes);
-        let token = hex::encode(token_bytes);
-
-        let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
-        let hash = hex::encode(hasher.finalize());
-
-        let mut devices = self.paired_devices()?;
-        devices.insert(client_id.clone(), hash);
-
-        save_paired_devices(&self.config.log_dir, &devices)?;
-
-        let pairing_code_path = self.config.log_dir.join("pairing_code.json");
-        if pairing_code_path.exists() {
-            let _ = fs::remove_file(pairing_code_path);
-        }
-
-        Ok(token)
+        self.mint_paired_token(client_id)
     }
 }
 
@@ -8271,6 +8508,156 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(res.is_none());
         assert!(elapsed < Duration::from_millis(1000));
+    }
+
+    fn two_live_sessions(manager: &SessionManager) -> (SessionId, SessionId) {
+        let first = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start first session");
+        let second = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start second session");
+        (first, second)
+    }
+
+    #[test]
+    fn session_messaging_round_trip_peeks_until_acked() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+
+        let id = manager
+            .send_session_message(
+                from.clone(),
+                to.clone(),
+                "handoff: build is green".to_string(),
+            )
+            .expect("send message");
+        assert!(id > 0);
+
+        // Direct, not broadcast: the sender's own inbox stays empty.
+        let sender_mail = manager
+            .receive_session_messages(from.clone())
+            .expect("receive sender messages");
+        assert!(sender_mail.is_empty());
+
+        // Peek twice: unacked mail redelivers.
+        for _ in 0..2 {
+            let mail = manager
+                .receive_session_messages(to.clone())
+                .expect("receive messages");
+            assert_eq!(mail.len(), 1);
+            assert_eq!(mail[0].id, id);
+            assert_eq!(mail[0].from, from);
+            assert_eq!(mail[0].body, "handoff: build is green");
+            assert!(mail[0].sent_at_ms > 0);
+        }
+
+        manager
+            .ack_session_messages(to.clone(), vec![id])
+            .expect("ack message");
+        let mail = manager
+            .receive_session_messages(to.clone())
+            .expect("receive after ack");
+        assert!(mail.is_empty());
+
+        // Acking again (or an unknown id) is a no-op, not an error.
+        manager
+            .ack_session_messages(to.clone(), vec![id, 999_999])
+            .expect("re-ack is idempotent");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_shutdown_purges_target_inbox() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+
+        manager
+            .send_session_message(from, to.clone(), "orphan".to_string())
+            .expect("send message");
+        manager
+            .shutdown_session(to.clone())
+            .expect("shutdown target");
+
+        // Unacked mail for a removed session is unreachable (receive gates
+        // on membership), so the inbox must go with the session.
+        let inboxes = manager.inboxes.lock().expect("inbox lock");
+        assert!(!inboxes.contains_key(&to));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_rejects_unknown_sessions_and_bad_bodies() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+        let ghost = SessionId::new("no-such-session").unwrap();
+
+        for (sender, target) in [(&ghost, &to), (&from, &ghost)] {
+            let error = manager
+                .send_session_message(sender.clone(), target.clone(), "hi".to_string())
+                .expect_err("unknown session must be rejected");
+            assert!(
+                error.to_string().contains("not found"),
+                "unexpected error: {error}"
+            );
+        }
+        let error = manager
+            .receive_session_messages(ghost.clone())
+            .expect_err("receive on unknown session must fail");
+        assert!(error.to_string().contains("not found"));
+        let error = manager
+            .ack_session_messages(ghost, vec![1])
+            .expect_err("ack on unknown session must fail");
+        assert!(error.to_string().contains("not found"));
+
+        let error = manager
+            .send_session_message(from.clone(), to.clone(), "   ".to_string())
+            .expect_err("blank body must be rejected");
+        assert!(error.to_string().contains("must not be empty"));
+
+        let oversize = "x".repeat(SESSION_MESSAGE_MAX_BODY_LEN + 1);
+        let error = manager
+            .send_session_message(from.clone(), to.clone(), oversize)
+            .expect_err("oversize body must be rejected");
+        assert!(error.to_string().contains("exceeds"));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_rejects_send_when_inbox_full() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let (from, to) = two_live_sessions(&manager);
+
+        for i in 0..SESSION_INBOX_CAPACITY {
+            manager
+                .send_session_message(from.clone(), to.clone(), format!("mail {i}"))
+                .expect("fill inbox");
+        }
+        let error = manager
+            .send_session_message(from.clone(), to.clone(), "one too many".to_string())
+            .expect_err("full inbox must reject");
+        assert!(error.to_string().contains("inbox is full"));
+
+        // Accepted mail is intact (nothing dropped): ack one, then one more fits.
+        let mail = manager
+            .receive_session_messages(to.clone())
+            .expect("receive full inbox");
+        assert_eq!(mail.len(), SESSION_INBOX_CAPACITY);
+        manager
+            .ack_session_messages(to.clone(), vec![mail[0].id])
+            .expect("ack one");
+        manager
+            .send_session_message(from.clone(), to.clone(), "fits now".to_string())
+            .expect("send after ack");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     #[cfg(unix)]
@@ -8412,6 +8799,7 @@ mod tests {
             output_seq: 42,
             bytes_logged: 16,
             last_activity_ms: 0,
+            last_input_ms: 0,
             pid: std::process::id(),
             process_identity: None,
             judge_override: None,
@@ -8558,6 +8946,7 @@ mod tests {
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
+                        last_input_ms: 0,
                         judge_override: None,
                     }],
                     has_tcp_listener: false,
@@ -9599,6 +9988,7 @@ mod tests {
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
+                        last_input_ms: 0,
                         judge_override: None,
                     }],
                     has_tcp_listener: false,
@@ -10650,6 +11040,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             }],
             ..Default::default()
         };
@@ -10741,6 +11132,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -10972,6 +11364,20 @@ mod tests {
         };
         assert!(at_exit > 0);
 
+        // The input stamp needs no settle loop: nothing writes input after the
+        // `exit` above, so whatever the actor holds is final.
+        let input_at_exit = {
+            let sessions = manager.sessions().expect("sessions lock");
+            match sessions.get(&session_id).expect("dead live session") {
+                ManagedSession::Live { actor, .. } => actor.last_input_ms(),
+                _ => panic!("expected a live session"),
+            }
+        };
+        assert!(
+            input_at_exit > 0,
+            "the `exit` write must have stamped input"
+        );
+
         // Demoted directly rather than through `restore_session`, which is the
         // only production caller. Restore demotes and then immediately revives
         // the session, and the revived shell prints a prompt and persists the
@@ -10992,6 +11398,62 @@ mod tests {
             persisted.last_activity_ms, at_exit,
             "the demotion must carry the live stamp, not zero it",
         );
+        assert_eq!(
+            persisted.last_input_ms, input_at_exit,
+            "the demotion must carry the live input stamp too",
+        );
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn write_input_stamps_last_input_ms() {
+        // Interaction recency starts unknown and lands on the first write, so
+        // the rail's activity sort can rank touched sessions above noisy ones.
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let client_id = ClientId::new("input-stamp-client").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("attach controller");
+
+        let read_input = || {
+            let sessions = manager.sessions().expect("sessions lock");
+            match sessions.get(&session_id).expect("live session") {
+                ManagedSession::Live { actor, .. } => actor.last_input_ms(),
+                _ => panic!("expected a live session"),
+            }
+        };
+        assert_eq!(read_input(), 0, "a fresh session has no input stamp");
+
+        manager
+            .write_input(WriteInputRequest {
+                session_id: session_id.clone(),
+                client_id,
+                bytes: b"echo triage-input-marker\n".to_vec(),
+            })
+            .expect("write input");
+        // The stamp lands when the actor drains the write command, so poll
+        // rather than reading straight away.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stamped = loop {
+            let current = read_input();
+            if current > 0 {
+                break current;
+            }
+            assert!(Instant::now() < deadline, "input stamp never landed");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(stamped <= now_unix_millis());
 
         let _ = manager.shutdown_session(session_id);
         let _ = std::fs::remove_dir_all(&log_dir);
@@ -11025,6 +11487,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
 
@@ -11243,6 +11706,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11317,6 +11781,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11378,6 +11843,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11460,6 +11926,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: persisted_activity_ms,
+                last_input_ms: 0,
             },
         );
 
@@ -11626,6 +12093,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: Some(live_cwd.clone()),
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11675,6 +12143,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: Some(gone_cwd),
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11728,6 +12197,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -11776,6 +12246,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -12274,6 +12745,28 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
+    /// The attach/resync path serves history through [`RAW_OUTPUT_TAIL_CAP`]:
+    /// pin the production byte cap itself, not just the trimming mechanics.
+    #[test]
+    fn snapshot_history_matches_the_served_tail_cap() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output
+            .ingest(&vec![b'x'; RAW_OUTPUT_TAIL_CAP as usize + 1024])
+            .expect("ingest over-cap payload");
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+        );
+        assert_eq!(snapshot.raw_output.len(), RAW_OUTPUT_TAIL_CAP as usize);
+        assert_eq!(
+            snapshot.raw_output_start,
+            output.bytes_logged - RAW_OUTPUT_TAIL_CAP
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Trimming must drop the *front* of the log and keep the newest bytes: the
     /// tail is what rebuilds the screen, and it is what clients are served.
     #[test]
@@ -12601,6 +13094,7 @@ mod tests {
                     reader: None,
                     writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
+                    last_input_ms: Arc::new(AtomicU64::new(0)),
                 },
                 lease,
                 launch: PersistedSessionLaunch {
@@ -12722,6 +13216,7 @@ mod tests {
                         reader: None,
                         writer: None,
                         last_activity_ms: Arc::new(AtomicU64::new(0)),
+                        last_input_ms: Arc::new(AtomicU64::new(0)),
                     },
                     lease: InputLeaseState::default(),
                     launch: PersistedSessionLaunch {
@@ -12827,6 +13322,7 @@ mod tests {
                     reader: None,
                     writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
+                    last_input_ms: Arc::new(AtomicU64::new(0)),
                 },
                 lease: InputLeaseState::default(),
                 launch: PersistedSessionLaunch {
@@ -12976,6 +13472,109 @@ mod tests {
                 &token,
             )
             .expect("reject second client")
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    fn stub_tailnet_whois(_peer: std::net::SocketAddr) -> Option<Vec<u8>> {
+        Some(br#"{"UserProfile":{"LoginName":"David@Hyeons-Lab.com"}}"#.to_vec())
+    }
+
+    fn tailscale_manager(log_dir: &std::path::Path) -> SessionManager {
+        let mut manager = SessionManager::new(SessionManagerConfig::new(log_dir.to_path_buf()));
+        manager.tailscale_pair_users = vec!["david@hyeons-lab.com".to_string()];
+        manager.tailnet_pairing = crate::tailscale::TailnetPairing::with_runner(stub_tailnet_whois);
+        manager
+    }
+
+    #[test]
+    fn tailscale_pairing_mints_token_for_allowlisted_login() {
+        let log_dir = unique_log_dir();
+        let manager = tailscale_manager(&log_dir);
+        let client = ClientId::new("phone").expect("client id");
+        let peer: std::net::SocketAddr = "100.65.193.69:1".parse().unwrap();
+
+        let token = manager
+            .pair_via_tailscale(&client, peer)
+            .expect("allowlisted peer pairs");
+        assert!(
+            triage_transport_ws::WebSocketAuthenticator::authenticate(&manager, &client, &token)
+                .expect("authenticate paired client")
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn tailscale_pairing_denies_non_allowlisted_login() {
+        let log_dir = unique_log_dir();
+        let mut manager = tailscale_manager(&log_dir);
+        manager.tailscale_pair_users = vec!["someone-else@example.com".to_string()];
+        let client = ClientId::new("phone").expect("client id");
+        let peer: std::net::SocketAddr = "100.65.193.69:1".parse().unwrap();
+
+        let error = manager
+            .pair_via_tailscale(&client, peer)
+            .expect_err("non-allowlisted peer must be denied");
+        assert!(
+            error.to_string().contains("not authorized to pair"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn tailscale_pairing_denies_when_unconfigured() {
+        let log_dir = unique_log_dir();
+        let mut manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        // Hermetic: the constructor reads the operator's real config file.
+        manager.tailscale_pair_users = Vec::new();
+        let client = ClientId::new("phone").expect("client id");
+        let peer: std::net::SocketAddr = "100.65.193.69:1".parse().unwrap();
+
+        let error = manager
+            .pair_via_tailscale(&client, peer)
+            .expect_err("unconfigured daemon must deny");
+        assert!(
+            error.to_string().contains("not configured"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn device_code_challenge_refused_when_tailscale_configured() {
+        let log_dir = unique_log_dir();
+        let manager = tailscale_manager(&log_dir);
+        let client = ClientId::new("phone").expect("client id");
+
+        let error = manager
+            .request_pairing_challenge(&client)
+            .expect_err("code flow must be disabled");
+        assert!(
+            error.to_string().contains("disabled on this daemon"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn pin_pair_refused_when_tailscale_configured() {
+        let log_dir = unique_log_dir();
+        let manager = tailscale_manager(&log_dir);
+        let client = ClientId::new("phone").expect("client id");
+
+        // The gate fires before PIN validation: any code gets the directing
+        // error rather than "invalid pairing PIN".
+        let error = triage_transport_ws::WebSocketAuthenticator::pair(&manager, "000000", &client)
+            .expect_err("code flow must be disabled");
+        assert!(
+            error.to_string().contains("disabled on this daemon"),
+            "unexpected error: {error}"
         );
 
         let _ = std::fs::remove_dir_all(&log_dir);
@@ -13183,6 +13782,7 @@ mod tests {
                 exited: true,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
             },
         );
 
@@ -13551,6 +14151,7 @@ mod tests {
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
+                        last_input_ms: 0,
                         judge_override: Some(false),
                     }],
                     has_tcp_listener: false,

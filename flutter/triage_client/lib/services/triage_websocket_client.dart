@@ -64,6 +64,7 @@ typedef SessionContextRecord = ({
   String? worktreeRoot,
   String? branch,
   int lastActivityMs,
+  int lastInputMs,
 });
 
 /// One session's tool-call auto-approval judge policy.
@@ -102,6 +103,27 @@ typedef RailLayoutRecord = ({
   List<String> sessionIds,
   Map<String, String> customLabels,
 });
+
+/// Daemon-host disk space for the volume holding the daemon's state.
+/// 0/0 means the daemon could not probe it (or predates stats entirely).
+typedef DaemonStatsRecord = ({int diskFreeBytes, int diskTotalBytes});
+
+/// Whether a poll result is worth rendering over the current reading. A
+/// zero-total record is a transient probe failure, not an empty disk: the
+/// poller keeps the last good reading instead of flickering the line out.
+bool isUsableDaemonStats(DaemonStatsRecord? stats) {
+  return stats != null && stats.diskTotalBytes > 0;
+}
+
+/// Reads daemon stats out of a `hello` or `get_daemon_stats` response map.
+/// Both carry the same `disk_*` keys; absent keys read as unknown (0/0), so
+/// a hello from a daemon predating stats degrades to a hidden line.
+DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
+  return (
+    diskFreeBytes: (response['disk_free_bytes'] as num?)?.toInt() ?? 0,
+    diskTotalBytes: (response['disk_total_bytes'] as num?)?.toInt() ?? 0,
+  );
+}
 
 /// Extracts and decompresses the raw output-history tail from a parsed snapshot map.
 ///
@@ -448,6 +470,15 @@ class TriageWebSocketClient {
     return _send('pairing_challenge', {'client_id': clientId});
   }
 
+  /// Pairs by Tailscale identity: the daemon whoises this connection's peer
+  /// and mints a token only for allowlisted tailnet users. No code, no PIN.
+  Future<String> pairViaTailscale({required String clientId}) async {
+    final response = await _send('pair_via_tailscale', {
+      'client_id': clientId,
+    });
+    return response['token']?.toString() ?? '';
+  }
+
   Future<String> startSession({
     required String command,
     List<String> args = const [],
@@ -522,6 +553,7 @@ class TriageWebSocketClient {
           // Absent from a daemon predating activity tracking; 0 reads as
           // "unknown", which the rail orders last rather than as epoch-old.
           lastActivityMs: (map['last_activity_ms'] as num?)?.toInt() ?? 0,
+          lastInputMs: (map['last_input_ms'] as num?)?.toInt() ?? 0,
         );
       }
     }
@@ -845,6 +877,17 @@ class TriageWebSocketClient {
     }
   }
 
+  /// Fetches the daemon host's current disk stats. Polled while connected so
+  /// the daemon selector's free-space line tracks long sessions.
+  Future<DaemonStatsRecord?> getDaemonStats() async {
+    try {
+      final response = await _send('get_daemon_stats');
+      return daemonStatsFromResponse(response);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Updates the pinned group and session ordering on the daemon.
   Future<void> setRailPins({
     required List<String> groupKeys,
@@ -1136,6 +1179,7 @@ class TriageWebSocketClient {
         'worktree_root': started.worktreeRoot,
         'branch': started.branch,
         'last_activity_ms': started.lastActivityMs,
+        'last_input_ms': started.lastInputMs,
       };
     } else if (payloadType ==
         fbs.ServerMessagePayloadTypeId.SessionTerminatedPayload) {
@@ -1190,6 +1234,9 @@ class TriageWebSocketClient {
           // `skip_serializing_if` on the JSON side.
           if (hello.latestVersion != null)
             'latest_version': hello.latestVersion,
+          'disk_free_bytes': hello.diskFreeBytes,
+          'disk_total_bytes': hello.diskTotalBytes,
+          'tailscale_pairing_available': hello.tailscalePairingAvailable,
         };
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
@@ -1273,6 +1320,7 @@ class TriageWebSocketClient {
                   // session's activity to "unknown" and drop the rail back to
                   // id order, on the transport that is now the default.
                   'last_activity_ms': entry.lastActivityMs,
+                  'last_input_ms': entry.lastInputMs,
                 },
               )
               .toList(),
@@ -1350,6 +1398,13 @@ class TriageWebSocketClient {
               if (entry.sessionId != null && entry.label != null)
                 entry.sessionId!: entry.label!,
           },
+        };
+      case 21: // DaemonStatsResult
+        final stats = result as fbs.DaemonStatsResult;
+        return {
+          'result': 'daemon_stats',
+          'disk_free_bytes': stats.diskFreeBytes,
+          'disk_total_bytes': stats.diskTotalBytes,
         };
       default:
         return _unhandled('server result', type.value);
@@ -1582,6 +1637,13 @@ class TriageWebSocketClient {
         );
         break;
 
+      case 'pair_via_tailscale':
+        payloadType = fbs.ClientRequestPayloadTypeId.PairViaTailscaleRequest;
+        payload = fbs.PairViaTailscaleRequestObjectBuilder(
+          clientId: extra?['client_id'] as String?,
+        );
+        break;
+
       case 'list_sessions':
         payloadType = fbs.ClientRequestPayloadTypeId.ListSessionsRequest;
         payload = fbs.ListSessionsRequestObjectBuilder();
@@ -1803,6 +1865,11 @@ class TriageWebSocketClient {
       case 'get_rail_layout':
         payloadType = fbs.ClientRequestPayloadTypeId.GetRailLayoutRequest;
         payload = fbs.GetRailLayoutRequestObjectBuilder();
+        break;
+
+      case 'get_daemon_stats':
+        payloadType = fbs.ClientRequestPayloadTypeId.GetDaemonStatsRequest;
+        payload = fbs.GetDaemonStatsRequestObjectBuilder();
         break;
 
       case 'set_rail_pins':

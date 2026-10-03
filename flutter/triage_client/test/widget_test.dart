@@ -20,6 +20,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:triage_client/main.dart';
 import 'package:triage_client/models/daemon_server.dart';
+import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/session_grouping.dart' show otherGroupPinKey;
 import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
@@ -45,6 +46,16 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final bool shouldFailConnection;
   int failConnectAttempts;
   Completer<void>? hangConnect;
+  // When set, `getDaemonStats` hangs on this future so a test can resolve
+  // a poll after the connection closes.
+  Completer<DaemonStatsRecord?>? hangDaemonStats;
+
+  @override
+  Future<DaemonStatsRecord?> getDaemonStats() {
+    final hang = hangDaemonStats;
+    if (hang != null) return hang.future;
+    return super.getDaemonStats();
+  }
   bool listSessionsUnauthorized = false;
   bool authenticated;
   // When set, `hello` authenticates only these tokens — which is how a test
@@ -95,6 +106,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> pairCodes = [];
   final List<String> writeInputCalls = [];
   final List<String> attachSessionCalls = [];
+  // Parallel to [attachSessionCalls]: the attach mode per call.
+  final List<String> attachSessionModes = [];
+  // Lease holder the fake reports for Observer attaches, per session. Absent
+  // means nobody holds it. Interactive attaches always grant to the caller,
+  // mirroring the daemon's steal-on-attach.
+  final Map<String, String?> attachLeaseHolders = {};
   final List<String> restoreSessionCalls = [];
   final Map<String, String> restoreSessionSizes = {};
   final List<String> helloClientIds = [];
@@ -145,7 +162,29 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     final isAuthenticated = accepted == null
         ? authenticated
         : token != null && accepted.contains(token);
-    return {'protocol_version': '2026-05-20', 'authenticated': isAuthenticated};
+    return {
+      'protocol_version': '2026-05-20',
+      'authenticated': isAuthenticated,
+      'tailscale_pairing_available': tailscalePairingAvailable,
+    };
+  }
+
+  /// Hello advertisement for Tailscale-identity pairing.
+  bool tailscalePairingAvailable = false;
+
+  /// Client ids `pairViaTailscale` was called with, in order.
+  final List<String> pairViaTailscaleClientIds = [];
+
+  /// When set, `pairViaTailscale` throws this instead of minting.
+  String? pairViaTailscaleError;
+
+  @override
+  Future<String> pairViaTailscale({required String clientId}) async {
+    pairViaTailscaleClientIds.add(clientId);
+    final error = pairViaTailscaleError;
+    if (error != null) throw Exception(error);
+    authenticated = true;
+    return 'tailscale-token';
   }
 
   @override
@@ -206,6 +245,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     return sessionContexts;
   }
 
+  /// Rail layout the daemon reports, or null for a daemon predating layouts.
+  RailLayoutRecord? railLayout;
+
+  @override
+  Future<RailLayoutRecord?> getRailLayout() async => railLayout;
+
   @override
   Future<Map<String, dynamic>> attachSession({
     required String sessionId,
@@ -213,6 +258,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String mode = 'InteractiveController',
   }) async {
     attachSessionCalls.add(sessionId);
+    attachSessionModes.add(mode);
     final attachCompleter = attachCompleters[sessionId];
     if (attachCompleter != null) {
       return attachCompleter.future;
@@ -221,7 +267,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     if (completer != null) {
       final snapRes = await completer.future;
       return {
-        'response': {'snapshot': snapRes['snapshot']},
+        'response': {
+          'snapshot': snapRes['snapshot'],
+          'lease': _attachLeaseFor(sessionId, clientId, mode),
+        },
       };
     }
     final visibleRows = snapshotVisibleRows[sessionId];
@@ -254,11 +303,13 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
                 .toList(),
             'cursor': {'row': visibleRows.length - 1, 'col': 0},
           },
+          'lease': _attachLeaseFor(sessionId, clientId, mode),
         },
       };
     }
     return {
       'response': {
+        'lease': _attachLeaseFor(sessionId, clientId, mode),
         'snapshot': {
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
@@ -306,6 +357,20 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           ],
         },
       },
+    };
+  }
+
+  Map<String, dynamic> _attachLeaseFor(
+    String sessionId,
+    String clientId,
+    String mode,
+  ) {
+    final holder = mode == 'Observer'
+        ? attachLeaseHolders[sessionId]
+        : clientId;
+    return {
+      'holder': holder == null ? null : {'client_id': holder},
+      'generation': 0,
     };
   }
 
@@ -678,7 +743,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     String? worktreeRoot,
     String? branch,
     String? cwd,
-    int? lastActivityMs,
+    int? lastInteractionMs,
+    int? lastOutputMs,
   }) {
     _testEventController.add({
       'type': 'session_started',
@@ -687,7 +753,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       if (worktreeRoot != null) 'worktree_root': worktreeRoot,
       if (branch != null) 'branch': branch,
       if (cwd != null) 'current_working_directory': cwd,
-      if (lastActivityMs != null) 'last_activity_ms': lastActivityMs,
+      if (lastInteractionMs != null) 'last_input_ms': lastInteractionMs,
+      if (lastOutputMs != null) 'last_activity_ms': lastOutputMs,
     });
   }
 
@@ -1155,6 +1222,160 @@ void main() {
 
     expect(client.writeInputCalls.contains('flutter-spike'), isTrue);
   });
+
+  testWidgets('selecting a session observes without claiming its input lease', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Found by key: once loaded, a tile leads with its workstream label.
+    await tester.tap(find.byKey(const ValueKey<String>('main')));
+    await tester.pumpAndSettle();
+
+    final modes = [
+      for (var i = 0; i < client.attachSessionCalls.length; i++)
+        if (client.attachSessionCalls[i] == 'main')
+          client.attachSessionModes[i],
+    ];
+    expect(modes, isNotEmpty);
+    // Looking at a session must not steal the lease from another client (or
+    // agent) typing there; only a keystroke claims it.
+    expect(modes, everyElement('Observer'));
+  });
+
+  testWidgets(
+    'first keystroke after an observing load acquires the lease and delivers',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('main')));
+      await tester.pumpAndSettle();
+      expect(client.writeInputCalls, isEmpty);
+      final attachesBefore = client.attachSessionCalls
+          .where((sid) => sid == 'main')
+          .length;
+
+      final terminalPane = tester.widget<TerminalPane>(
+        find.byType(TerminalPane),
+      );
+      terminalPane.controller.sendInput('pwd');
+      await tester.pumpAndSettle();
+
+      // Buffered while the lease was acquired, then flushed: nothing lost.
+      expect(client.writeInputCalls, contains('main'));
+      final newModes = [
+        for (var i = 0; i < client.attachSessionCalls.length; i++)
+          if (client.attachSessionCalls[i] == 'main')
+            client.attachSessionModes[i],
+      ].sublist(attachesBefore);
+      expect(newModes, ['InteractiveController']);
+    },
+  );
+
+  testWidgets(
+    'input-lease error re-acquires the named session, not the selected one',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('flutter-spike')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey<String>('main')));
+      await tester.pumpAndSettle();
+
+      int attachesFor(String sid) =>
+          client.attachSessionCalls.where((s) => s == sid).length;
+      final mainBefore = attachesFor('main');
+      final spikeBefore = attachesFor('flutter-spike');
+
+      // The rejection names flutter-spike while main is selected.
+      client.emitErrorMessage(
+        'client test-client does not hold input lease '
+        'for session flutter-spike',
+      );
+      await tester.pumpAndSettle();
+
+      expect(attachesFor('flutter-spike'), spikeBefore + 1);
+      expect(attachesFor('main'), mainBefore);
+
+      // Second daemon shape, same re-acquire behavior.
+      client.emitErrorMessage('session flutter-spike has no input lease holder');
+      await tester.pumpAndSettle();
+
+      expect(attachesFor('flutter-spike'), spikeBefore + 2);
+      expect(attachesFor('main'), mainBefore);
+    },
+  );
+
+  testWidgets(
+    'input-lease error naming an absent session steals no lease',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('main')));
+      await tester.pumpAndSettle();
+
+      int attachesFor(String sid) =>
+          client.attachSessionCalls.where((s) => s == sid).length;
+      final mainBefore = attachesFor('main');
+
+      // The rejection names a session absent from the rail; the selected
+      // session must not pay for it with its lease.
+      client.emitErrorMessage(
+        'client test-client does not hold input lease '
+        'for session ghost-session',
+      );
+      await tester.pumpAndSettle();
+
+      expect(attachesFor('main'), mainBefore);
+    },
+  );
+
+  testWidgets(
+    'daemon stats poll resolving after close repaints nothing',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Positive control: a poll resolving while connected paints the line,
+      // so the absence below proves the guard dropped the stale poll rather
+      // than the line never painting at all.
+      final firstPoll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = firstPoll;
+      await tester.pump(const Duration(seconds: 61));
+      firstPoll.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+      ));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('free ('), findsOneWidget);
+
+      // A second poll starts and hangs mid-flight.
+      client.hangDaemonStats = Completer<DaemonStatsRecord?>();
+      await tester.pump(const Duration(seconds: 61));
+
+      await client.emitSocketClosed();
+      await tester.pump();
+
+      // The hung poll resolves after the close; the post-await guard must
+      // drop it instead of repainting a stale reading.
+      client.hangDaemonStats!.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsNothing);
+    },
+  );
 
   testWidgets('opening a historical session fits it to the current viewport', (
     WidgetTester tester,
@@ -1940,6 +2161,29 @@ void main() {
   });
 
   testWidgets(
+    'creating a session merges a session_started placeholder instead of duplicating',
+    (WidgetTester tester) async {
+      await withPlatform(TargetPlatform.macOS, () async {
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        // The daemon broadcasts session_started at spawn, so the push can land
+        // before the create call's own tile insert; the push plants a
+        // placeholder first.
+        client.emitSessionStarted('scratch-1');
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byTooltip('New session'));
+        await tester.pumpAndSettle();
+
+        expect(client.startSessionCommands, ['/bin/sh']);
+        expect(find.byKey(const ValueKey<String>('scratch-1')), findsOneWidget);
+      });
+    },
+  );
+
+  testWidgets(
     'dynamically removes session from rail on session_terminated event',
     (WidgetTester tester) async {
       final client = FakeTriageWebSocketClient();
@@ -2118,6 +2362,45 @@ void main() {
     expect(client.pairCodes, ['WXYZ9876']);
     expect(client.helloClientIds.length, 2);
     expect(find.text('Pair Remote Device'), findsNothing);
+  });
+
+  testWidgets('tailscale-advertising daemon pairs automatically', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(authenticated: false)
+      ..tailscalePairingAvailable = true;
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // No code requested, no PIN entered: one tailscale exchange, then the
+    // reconnect authenticates and sessions load.
+    expect(client.pairViaTailscaleClientIds.length, 1);
+    expect(client.pairingChallengeClientIds, isEmpty);
+    expect(client.pairCodes, isEmpty);
+    expect(find.text('Pair with Tailscale'), findsNothing);
+    expect(find.text('triage / websocket-session-api'), findsWidgets);
+  });
+
+  testWidgets('tailscale pairing failure shows retry and retries', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(authenticated: false)
+      ..tailscalePairingAvailable = true
+      ..pairViaTailscaleError = 'tailnet identity is not authorized';
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pair with Tailscale'), findsOneWidget);
+    expect(find.text('Pair Remote Device'), findsNothing);
+    expect(
+      find.textContaining('tailnet identity is not authorized'),
+      findsOneWidget,
+    );
+    expect(client.pairViaTailscaleClientIds.length, 1);
+
+    await tester.tap(find.text('Try Again'));
+    await tester.pumpAndSettle();
+    expect(client.pairViaTailscaleClientIds.length, 2);
   });
 
   testWidgets('shows the CLI pairing command when remote', (
@@ -2429,18 +2712,21 @@ void main() {
           worktreeRoot: '/work/alpha',
           branch: 'experiment/flutter-spike',
           lastActivityMs: 1000,
+          lastInputMs: 1000,
         ),
         'main': (
           repositoryRoot: '/work/alpha',
           worktreeRoot: '/work/alpha',
           branch: 'main',
           lastActivityMs: 2000,
+          lastInputMs: 2000,
         ),
         'websocket-session-api': (
           repositoryRoot: '/work/beta',
           worktreeRoot: '/work/beta',
           branch: 'feat/ws',
           lastActivityMs: 3000,
+          lastInputMs: 3000,
         ),
       });
       return client;
@@ -2499,6 +2785,7 @@ void main() {
         worktreeRoot: '/work/alpha',
         branch: 'main',
         lastActivityMs: 2000,
+        lastInputMs: 2000,
       );
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
@@ -2529,6 +2816,7 @@ void main() {
         worktreeRoot: '/',
         branch: 'main',
         lastActivityMs: 2000,
+        lastInputMs: 2000,
       );
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
@@ -2792,7 +3080,7 @@ void main() {
         tester.getTopLeft(header('/work/alpha')).dy,
         lessThan(tester.getTopLeft(row('main')).dy),
       );
-      // Still ahead of its less recent sibling: a dropped `lastActivityMs`
+      // Still ahead of its less recent sibling: a dropped `lastInteractionMs`
       // reads as "never active" and would sink it below flutter-spike, and
       // with it the whole repository, since a group takes its members' max.
       expect(
@@ -3187,6 +3475,206 @@ void main() {
         findsOneWidget,
       );
     });
+
+    testWidgets('a stored activity sort flattens the rail under daemon pins', (
+      WidgetTester tester,
+    ) async {
+      // Pins sync down from the daemon on load; the sort mode is a purely
+      // local preference. Restoring byActivity must flatten the rail even when
+      // the daemon's pins are the active ones and local pins are absent: the
+      // mode must not wait for a pin change to take effect.
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = clientWithRepos()
+        ..railLayout = (
+          groupKeys: <String>[],
+          sessionIds: <String>['main'],
+          customLabels: <String, String>{},
+        );
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Flat: no group headers at all.
+      expect(header('/work/alpha'), findsNothing);
+      expect(header('/work/beta'), findsNothing);
+      // The daemon's session pin still hoists within the flat list: `main`
+      // leads despite `websocket-session-api` being more recently active.
+      expect(
+        tester.getTopLeft(row('main')).dy,
+        lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
+      );
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+    });
+
+    testWidgets('selecting a session re-ranks it first in activity mode', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      // Baseline is daemon activity: beta (3000) leads, `flutter-spike`
+      // (1000) trails.
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      await tester.tap(row('flutter-spike'));
+      // The bump is debounced: mid-pause the rail has not moved yet.
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      // Past the pause the rail re-sorts. Pumped explicitly: settle stops
+      // while only a quiet timer is pending, never advancing to it.
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(
+        tester.getTopLeft(row('flutter-spike')).dy,
+        lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
+        reason: 'the just-touched session outranks idle ones',
+      );
+    });
+
+    testWidgets('activity regroup waits for an open context menu', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      await tester.pumpWidget(TriageClientApp(client: clientWithRepos()));
+      await tester.pumpAndSettle();
+
+      // Select first (arms the resort), then right-click elsewhere: the menu
+      // opens over a rail about to move.
+      await tester.tap(row('flutter-spike'));
+      await tester.pump();
+      await tester.tap(
+        row('websocket-session-api'),
+        buttons: kSecondaryMouseButton,
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Assign custom label...'), findsOneWidget);
+
+      // Past the debounce the rail has NOT moved: re-sorting now would
+      // slide the row out from under the open menu.
+      await tester.pump(const Duration(seconds: 2));
+      expect(find.text('Assign custom label...'), findsOneWidget);
+      expect(
+        tester.getTopLeft(row('websocket-session-api')).dy,
+        lessThan(tester.getTopLeft(row('flutter-spike')).dy),
+      );
+
+      // Dismiss the menu; the regroup lands on the next tick.
+      await tester.tapAt(const Offset(700, 300));
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(find.text('Assign custom label...'), findsNothing);
+      expect(
+        tester.getTopLeft(row('flutter-spike')).dy,
+        lessThan(tester.getTopLeft(row('websocket-session-api')).dy),
+      );
+    });
+
+    testWidgets('activity mode orders by input recency, not output', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = FakeTriageWebSocketClient();
+      client.initialSessions = ['noisy-build', 'main'];
+      client.sessionContexts.addAll({
+        // Fresh output, never touched: output recency would rank this first.
+        'noisy-build': (
+          repositoryRoot: '/work/alpha',
+          worktreeRoot: '/work/alpha',
+          branch: 'main',
+          lastActivityMs: 9000,
+          lastInputMs: 0,
+        ),
+        // Quiet session the user typed in most recently.
+        'main': (
+          repositoryRoot: '/work/beta',
+          worktreeRoot: '/work/beta',
+          branch: 'main',
+          lastActivityMs: 1000,
+          lastInputMs: 5000,
+        ),
+      });
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(row('main')).dy,
+        lessThan(tester.getTopLeft(row('noisy-build')).dy),
+        reason: 'the touched session outranks the noisy one',
+      );
+    });
+
+    testWidgets('started pushes order the input-unknown tier by output', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Neither push carries input, so both land in the input-unknown tier;
+      // their relative order comes from the pushed output alone.
+      client.emitSessionStarted('older-push', lastOutputMs: 1000);
+      client.emitSessionStarted('newer-push', lastOutputMs: 2000);
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(row('newer-push')).dy,
+        lessThan(tester.getTopLeft(row('older-push')).dy),
+        reason: 'the fresher push leads the input-unknown tier',
+      );
+    });
+
+    testWidgets('started pushes order the input-known tier by input', (
+      WidgetTester tester,
+    ) async {
+      SharedPreferences.setMockInitialValues({
+        railSortModePrefKeyFor(unconfiguredServerId): 'byActivity',
+      });
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      // Conflicting stamps: input says newer leads, output says older
+      // leads. Both land in the input-known tier, so input alone decides;
+      // if the push-path input read broke, output would order older first.
+      client.emitSessionStarted(
+        'older-push',
+        lastInteractionMs: 1000,
+        lastOutputMs: 2000,
+      );
+      client.emitSessionStarted(
+        'newer-push',
+        lastInteractionMs: 2000,
+        lastOutputMs: 1000,
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.getTopLeft(row('newer-push')).dy,
+        lessThan(tester.getTopLeft(row('older-push')).dy),
+        reason: 'the fresher push leads the input-known tier',
+      );
+    });
   });
 
   testWidgets(
@@ -3353,6 +3841,14 @@ void main() {
       expect(parseDaemonAddress('host:notaport'), isNull);
       expect(parseDaemonAddress('host:99999'), isNull);
       expect(parseDaemonAddress('ftp://host'), isNull);
+    });
+
+    test('inner whitespace -> null', () {
+      // A stray space percent-encodes into an unresolvable host and the
+      // retry loop spins silently instead of connecting.
+      expect(parseDaemonAddress('100 104.160.90:7777'), isNull);
+      expect(parseDaemonAddress('ws://100 104.160.90:7777/ws'), isNull);
+      expect(parseDaemonAddress('my host:7777'), isNull);
     });
   });
 
@@ -3999,6 +4495,7 @@ void main() {
           worktreeRoot: '/work/alpha',
           branch: 'experiment/flutter-spike',
           lastActivityMs: 1000,
+          lastInputMs: 1000,
         ),
       });
       await tester.pumpWidget(
@@ -4985,5 +5482,84 @@ void main() {
         expect(session.store.state.exited, isFalse);
       },
     );
+  });
+
+  group('SessionVm rows', () {
+    test('rows stay mutable for the refresh clear-and-seed', () {
+      // Lazy rail placeholders seed `rows` with an immutable empty list;
+      // the snapshot refresh mutates it in place (`..clear()..addAll()`),
+      // which threw `Cannot clear a constant list` and aborted the load.
+      final session = SessionVm(
+        title: 'lazy-session',
+        status: 'idle',
+        statusColor: const Color(0xff7f8b8d),
+        icon: Icons.terminal,
+        rows: const [],
+      );
+      session.rows
+        ..clear()
+        ..addAll([
+          StyledRow(
+            spans: [StyledSpan(text: 'seeded', style: const TerminalStyle())],
+          ),
+        ]);
+      expect(session.rows, hasLength(1));
+    });
+  });
+
+  group('WorkspaceHeader soft-keyboard toggle', () {
+    SessionVm headerSession() => SessionVm(
+      title: 'triage / main',
+      status: 'attached',
+      statusColor: const Color(0xff7fd1c7),
+      icon: Icons.terminal,
+      rows: [],
+    );
+
+    Future<void> pumpHeader(
+      WidgetTester tester, {
+      required bool enabled,
+      VoidCallback? onToggle,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkspaceHeader(
+              session: headerSession(),
+              softKeyboardEnabled: enabled,
+              onToggleSoftKeyboard: onToggle,
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('enabled key reports taps', (tester) async {
+      var toggles = 0;
+      await pumpHeader(
+        tester,
+        enabled: true,
+        onToggle: () => toggles++,
+      );
+      await tester.tap(find.byTooltip('Soft keyboard: ON (tap to suppress)'));
+      expect(toggles, 1);
+    });
+
+    testWidgets('suppressed key swaps icon and tooltip', (tester) async {
+      await pumpHeader(tester, enabled: false, onToggle: () {});
+      expect(find.byIcon(Icons.keyboard_hide), findsOneWidget);
+      expect(
+        find.byTooltip('Soft keyboard: suppressed (tap to enable)'),
+        findsOneWidget,
+      );
+      expect(find.byIcon(Icons.keyboard), findsNothing);
+    });
+
+    testWidgets('hides without a handler', (tester) async {
+      // Desktop passes no handler: no soft keyboard can raise there.
+      await pumpHeader(tester, enabled: true);
+      expect(find.byIcon(Icons.keyboard), findsNothing);
+      expect(find.byIcon(Icons.keyboard_hide), findsNothing);
+    });
   });
 }

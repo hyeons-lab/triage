@@ -34,6 +34,11 @@ pub struct HandoverSession {
     /// blob written before this field existed.
     #[serde(default)]
     pub last_activity_ms: u64,
+    /// Wall-clock of the most recent input written to the session by any
+    /// client. Carried across the swap like the activity stamp; 0 means the
+    /// session never received input (or the state predates this field).
+    #[serde(default)]
+    pub last_input_ms: u64,
     #[serde(default)]
     pub judge_override: Option<bool>,
 }

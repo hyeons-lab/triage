@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -50,6 +51,16 @@ pub trait WebSocketAuthenticator {
     fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool>;
     fn pairing_challenge(&self, client_id: &ClientId) -> Result<PairingChallenge>;
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String>;
+    /// Whether this daemon offers Tailscale-identity pairing (allowlist
+    /// configured). Default denies.
+    fn tailscale_pairing_available(&self) -> bool {
+        false
+    }
+    /// Mint a pairing token for the peer at `peer` after verifying its
+    /// tailnet identity. Default denies (fail closed).
+    fn pair_via_tailscale(&self, _client_id: &ClientId, _peer: SocketAddr) -> Result<String> {
+        bail!("Tailscale pairing is not configured on this daemon")
+    }
 }
 
 impl<T: WebSocketAuthenticator + ?Sized> WebSocketAuthenticator for std::sync::Arc<T> {
@@ -64,6 +75,12 @@ impl<T: WebSocketAuthenticator + ?Sized> WebSocketAuthenticator for std::sync::A
     }
     fn pair(&self, code: &str, client_id: &ClientId) -> Result<String> {
         (**self).pair(code, client_id)
+    }
+    fn tailscale_pairing_available(&self) -> bool {
+        (**self).tailscale_pairing_available()
+    }
+    fn pair_via_tailscale(&self, client_id: &ClientId, peer: SocketAddr) -> Result<String> {
+        (**self).pair_via_tailscale(client_id, peer)
     }
 }
 
@@ -110,6 +127,16 @@ impl WebSocketAuthenticator for NoopAuthenticator {
     }
 }
 
+/// Live disk probe as `(free_bytes, total_bytes)`, defaulting to `(0, 0)`
+/// when the platform cannot probe. One helper for every response carrying
+/// disk stats so the defaulting rule cannot drift between handlers.
+fn current_disk_bytes() -> (u64, u64) {
+    match triage_core::disk::daemon_disk_stats() {
+        Some(stats) => (stats.free_bytes, stats.total_bytes),
+        None => (0, 0),
+    }
+}
+
 #[derive(Debug)]
 pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     api: A,
@@ -122,6 +149,10 @@ pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     /// client learns about sessions it never attached to.
     global_rx: Option<Receiver<ServerMessage>>,
     pub format: ProtocolFormat,
+    /// Remote peer of this connection, set by the accept loop. Required for
+    /// Tailscale-identity pairing (the daemon whoises the caller); absent in
+    /// contexts without a real peer (unit tests), which fail closed.
+    peer_addr: Option<SocketAddr>,
 }
 
 impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
@@ -134,6 +165,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             subscriptions: HashMap::new(),
             global_rx: None,
             format: ProtocolFormat::Flatbuffers,
+            peer_addr: None,
         }
     }
 }
@@ -148,7 +180,14 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             subscriptions: HashMap::new(),
             global_rx: None,
             format: ProtocolFormat::Flatbuffers,
+            peer_addr: None,
         }
+    }
+
+    /// Records the connection's remote peer for Tailscale-identity pairing.
+    pub fn with_peer_addr(mut self, peer_addr: SocketAddr) -> Self {
+        self.peer_addr = Some(peer_addr);
+        self
     }
 
     pub fn with_format(mut self, format: ProtocolFormat) -> Self {
@@ -278,7 +317,8 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             match &request {
                 ClientRequest::Hello { .. }
                 | ClientRequest::PairingChallenge { .. }
-                | ClientRequest::Pair { .. } => {}
+                | ClientRequest::Pair { .. }
+                | ClientRequest::PairViaTailscale { .. } => {}
                 _ => bail!(TransportError::Unauthorized),
             }
         }
@@ -300,12 +340,16 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 };
 
                 let update = self.api.server_update_info();
+                let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
                     server_version: update.server_version,
                     update_available: update.update_available,
                     latest_version: update.latest_version,
+                    disk_free_bytes,
+                    disk_total_bytes,
+                    tailscale_pairing_available: self.authenticator.tailscale_pairing_available(),
                 })
             }
             ClientRequest::PairingChallenge { client_id } => {
@@ -317,6 +361,14 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             }
             ClientRequest::Pair { code, client_id } => {
                 let token = self.authenticator.pair(&code, &client_id)?;
+                self.authenticated = true;
+                Ok(ServerResult::Paired { token })
+            }
+            ClientRequest::PairViaTailscale { client_id } => {
+                let Some(peer) = self.peer_addr else {
+                    bail!("Tailscale pairing requires a peer address");
+                };
+                let token = self.authenticator.pair_via_tailscale(&client_id, peer)?;
                 self.authenticated = true;
                 Ok(ServerResult::Paired { token })
             }
@@ -410,6 +462,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                             worktree_root,
                             branch,
                             last_activity_ms: row.last_activity_ms,
+                            last_input_ms: row.last_input_ms,
                         }
                     })
                     .collect();
@@ -483,6 +536,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     custom_labels: layout.custom_labels,
                 })
             }
+            ClientRequest::GetDaemonStats => {
+                let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
+                Ok(ServerResult::DaemonStats {
+                    disk_free_bytes,
+                    disk_total_bytes,
+                })
+            }
             ClientRequest::SetRailPins {
                 group_keys,
                 session_ids,
@@ -541,6 +601,9 @@ pub enum ClientRequest {
         client_id: ClientId,
     },
     PairingChallenge {
+        client_id: ClientId,
+    },
+    PairViaTailscale {
         client_id: ClientId,
     },
     ListSessions,
@@ -613,6 +676,7 @@ pub enum ClientRequest {
         substring: String,
     },
     GetRailLayout,
+    GetDaemonStats,
     SetRailPins {
         group_keys: Vec<String>,
         session_ids: Vec<String>,
@@ -658,6 +722,11 @@ pub struct SessionContextEntry {
     /// session that has produced no output, or a daemon predating this field.
     #[serde(default)]
     pub last_activity_ms: u64,
+    /// Milliseconds since the Unix epoch of the most recent input written to
+    /// the session by any client. The rail's activity sort orders by this.
+    /// 0 means unknown: no input yet, or a daemon predating this field.
+    #[serde(default)]
+    pub last_input_ms: u64,
 }
 
 /// One session's current auto-approval judge policy, as carried in
@@ -752,6 +821,8 @@ pub enum ServerMessage {
         branch: Option<String>,
         #[serde(default)]
         last_activity_ms: u64,
+        #[serde(default)]
+        last_input_ms: u64,
     },
     /// Connection-wide push: an existing session was shut down or deleted.
     SessionTerminated {
@@ -773,6 +844,17 @@ pub enum ServerResult {
         /// The newest release tag seen, normalized without a leading `v`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         latest_version: Option<String>,
+        /// Free/total bytes on the volume holding the daemon's state. 0/0
+        /// means unknown. Defaulted so a hello from a daemon predating
+        /// these fields still parses.
+        #[serde(default)]
+        disk_free_bytes: u64,
+        #[serde(default)]
+        disk_total_bytes: u64,
+        /// Whether the daemon offers Tailscale-identity pairing (allowlist
+        /// configured). Defaults false so hellos from older daemons parse.
+        #[serde(default)]
+        tailscale_pairing_available: bool,
     },
     Paired {
         token: String,
@@ -832,6 +914,10 @@ pub enum ServerResult {
         session_ids: Vec<String>,
         custom_labels: HashMap<String, String>,
     },
+    DaemonStats {
+        disk_free_bytes: u64,
+        disk_total_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -879,6 +965,52 @@ mod tests {
 
     use super::*;
 
+    /// Disk stats in a response are a live probe: exact bytes can shift
+    /// between the handler's probe and any re-probe (other processes, temp
+    /// files), so assert the invariant rather than exact equality. Unknown
+    /// (0/0) is accepted: some platforms cannot probe at all.
+    fn assert_disk_invariant(free_bytes: u64, total_bytes: u64) {
+        if free_bytes == 0 && total_bytes == 0 {
+            return;
+        }
+        assert!(
+            total_bytes > 0,
+            "disk total must be positive, got {total_bytes}"
+        );
+        assert!(
+            free_bytes <= total_bytes,
+            "disk free {free_bytes} exceeds total {total_bytes}"
+        );
+    }
+
+    /// Asserts a hello result's stable fields exactly; disk stats go through
+    /// [`assert_disk_invariant`].
+    fn assert_hello_result(result: ServerResult, authenticated: bool) {
+        match result {
+            ServerResult::Hello {
+                protocol_version,
+                authenticated: actual,
+                server_version,
+                update_available,
+                latest_version,
+                disk_free_bytes,
+                disk_total_bytes,
+                tailscale_pairing_available,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(actual, authenticated);
+                assert!(!tailscale_pairing_available);
+                // FakeSessionApi uses the default `server_update_info`: its
+                // own crate version and no newer release known.
+                assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
+                assert!(!update_available);
+                assert_eq!(latest_version, None);
+                assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     #[test]
     fn hello_reports_protocol_version() {
         let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
@@ -891,21 +1023,26 @@ mod tests {
             },
         });
 
-        assert_eq!(
-            response,
-            ServerMessage::Response {
-                id: Some(json!(1)),
-                result: ServerResult::Hello {
-                    protocol_version: PROTOCOL_VERSION.to_string(),
-                    authenticated: true,
-                    // FakeSessionApi uses the default `server_update_info`: its
-                    // own crate version and no newer release known.
-                    server_version: env!("CARGO_PKG_VERSION").to_string(),
-                    update_available: false,
-                    latest_version: None,
-                },
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!(1)));
+                assert_hello_result(result, true);
             }
-        );
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_invariant_accepts_unknown_and_valid_volumes() {
+        assert_disk_invariant(0, 0);
+        assert_disk_invariant(25, 100);
+        assert_disk_invariant(100, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds total")]
+    fn disk_invariant_rejects_free_above_total() {
+        assert_disk_invariant(101, 100);
     }
 
     #[test]
@@ -956,6 +1093,7 @@ mod tests {
                         worktree_root: Some("/repo/worktree".to_string()),
                         branch: Some("main".to_string()),
                         last_activity_ms: 1_700_000_000_000,
+                        last_input_ms: 1_700_000_005_000,
                     }],
                 },
             }
@@ -1162,6 +1300,7 @@ mod tests {
                         branch: Some("main".to_string()),
                     }),
                     last_activity_ms: 1_700_000_000_000,
+                    last_input_ms: 1_700_000_005_000,
                 })
                 .collect())
         }
@@ -1379,6 +1518,49 @@ mod tests {
         }
     }
 
+    struct TailscaleAuthenticator {
+        paired_token: String,
+        client_id: ClientId,
+        allowed_peer: std::net::SocketAddr,
+    }
+
+    impl WebSocketAuthenticator for TailscaleAuthenticator {
+        fn require_pairing(&self) -> bool {
+            true
+        }
+        fn authenticate(&self, client_id: &ClientId, token: &str) -> Result<bool> {
+            Ok(client_id == &self.client_id && token == self.paired_token)
+        }
+        fn pairing_challenge(&self, _client_id: &ClientId) -> Result<PairingChallenge> {
+            anyhow::bail!("device-code pairing is disabled on this daemon")
+        }
+        fn pair(&self, _code: &str, _client_id: &ClientId) -> Result<String> {
+            anyhow::bail!("device-code pairing is disabled on this daemon")
+        }
+        fn tailscale_pairing_available(&self) -> bool {
+            true
+        }
+        fn pair_via_tailscale(
+            &self,
+            client_id: &ClientId,
+            peer: std::net::SocketAddr,
+        ) -> Result<String> {
+            if client_id == &self.client_id && peer == self.allowed_peer {
+                Ok(self.paired_token.clone())
+            } else {
+                anyhow::bail!("tailnet identity is not authorized to pair with this daemon")
+            }
+        }
+    }
+
+    fn tailscale_test_auth() -> TailscaleAuthenticator {
+        TailscaleAuthenticator {
+            paired_token: "tailnet-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+            allowed_peer: "100.65.193.69:1".parse().unwrap(),
+        }
+    }
+
     #[test]
     fn unauthenticated_connection_blocks_session_requests() {
         let auth = FakeAuthenticator {
@@ -1539,16 +1721,7 @@ mod tests {
         match response {
             ServerMessage::Response { id, result } => {
                 assert_eq!(id, Some(json!("hello-req")));
-                assert_eq!(
-                    result,
-                    ServerResult::Hello {
-                        protocol_version: PROTOCOL_VERSION.to_string(),
-                        authenticated: true,
-                        server_version: env!("CARGO_PKG_VERSION").to_string(),
-                        update_available: false,
-                        latest_version: None,
-                    }
-                );
+                assert_hello_result(result, true);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1584,16 +1757,7 @@ mod tests {
         match response {
             ServerMessage::Response { id, result } => {
                 assert_eq!(id, Some(json!("hello-req")));
-                assert_eq!(
-                    result,
-                    ServerResult::Hello {
-                        protocol_version: PROTOCOL_VERSION.to_string(),
-                        authenticated: false,
-                        server_version: env!("CARGO_PKG_VERSION").to_string(),
-                        update_available: false,
-                        latest_version: None,
-                    }
-                );
+                assert_hello_result(result, false);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1643,6 +1807,32 @@ mod tests {
         assert_eq!(hello.server_version().unwrap(), env!("CARGO_PKG_VERSION"));
         assert!(!hello.update_available());
         assert!(hello.latest_version().is_none());
+        // Disk fields ride the handshake too, as a live probe: assert the
+        // invariant, not exact bytes.
+        assert_disk_invariant(hello.disk_free_bytes(), hello.disk_total_bytes());
+        assert!(!hello.tailscale_pairing_available());
+    }
+
+    #[test]
+    fn flatbuffers_daemon_stats_roundtrip() {
+        let msg = ServerMessage::Response {
+            id: Some(json!("stats-fb")),
+            result: ServerResult::DaemonStats {
+                disk_free_bytes: 12_345,
+                disk_total_bytes: 67_890,
+            },
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("stats-fb"),
+                result: flatbuffers_proto::ServerResultBorrowed::DaemonStats {
+                    disk_free_bytes: 12_345,
+                    disk_total_bytes: 67_890,
+                },
+            }
+        );
     }
 
     #[test]
@@ -1657,6 +1847,151 @@ mod tests {
             flatbuffers_proto::ServerMessageBorrowed::UpdateAvailable {
                 current_version: "0.1.6",
                 latest_version: "0.1.7",
+            }
+        );
+    }
+
+    #[test]
+    fn hello_advertises_tailscale_pairing_when_available() {
+        let mut connection = WebSocketSessionConnection::with_authenticator(
+            FakeSessionApi::default(),
+            tailscale_test_auth(),
+        );
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("hello-ts")),
+            request: ClientRequest::Hello {
+                client_id: None,
+                token: None,
+            },
+        });
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!("hello-ts")));
+                match result {
+                    ServerResult::Hello {
+                        protocol_version,
+                        authenticated,
+                        server_version,
+                        update_available,
+                        latest_version,
+                        disk_free_bytes,
+                        disk_total_bytes,
+                        tailscale_pairing_available,
+                    } => {
+                        assert_eq!(protocol_version, PROTOCOL_VERSION);
+                        assert!(!authenticated);
+                        assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
+                        assert!(!update_available);
+                        assert_eq!(latest_version, None);
+                        assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+                        assert!(tailscale_pairing_available);
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_via_tailscale_allowed_preauth_and_mints() {
+        let mut connection = WebSocketSessionConnection::with_authenticator(
+            FakeSessionApi::default(),
+            tailscale_test_auth(),
+        )
+        .with_peer_addr("100.65.193.69:1".parse().unwrap());
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("pair-ts")),
+            request: ClientRequest::PairViaTailscale {
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        });
+        match response {
+            ServerMessage::Response { id, result } => {
+                assert_eq!(id, Some(json!("pair-ts")));
+                assert_eq!(
+                    result,
+                    ServerResult::Paired {
+                        token: "tailnet-token".to_string(),
+                    }
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        // Minting authenticates the connection: session requests now pass.
+        let sessions = connection.handle_message(ClientMessage {
+            id: Some(json!("list-after")),
+            request: ClientRequest::ListSessions,
+        });
+        assert!(matches!(sessions, ServerMessage::Response { .. }));
+    }
+
+    #[test]
+    fn pair_via_tailscale_denied_without_peer_addr() {
+        let mut connection = WebSocketSessionConnection::with_authenticator(
+            FakeSessionApi::default(),
+            tailscale_test_auth(),
+        );
+        let response = connection.handle_message(ClientMessage {
+            id: Some(json!("pair-ts")),
+            request: ClientRequest::PairViaTailscale {
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        });
+        match response {
+            ServerMessage::Error { error, .. } => {
+                assert!(
+                    error.message.contains("peer address"),
+                    "unexpected error: {}",
+                    error.message
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatbuffers_pair_via_tailscale_roundtrip_when_unauthenticated() {
+        let mut connection = WebSocketSessionConnection::with_authenticator(
+            FakeSessionApi::default(),
+            tailscale_test_auth(),
+        )
+        .with_peer_addr("100.65.193.69:1".parse().unwrap());
+        let request = ClientMessage {
+            id: Some(json!("pair-ts-fb")),
+            request: ClientRequest::PairViaTailscale {
+                client_id: ClientId::new("phone").unwrap(),
+            },
+        };
+
+        let client_bytes = flatbuffers_proto::serialize_client_message(&request);
+        let parsed = flatbuffers::root::<fb::ClientMessage>(&client_bytes)
+            .ok()
+            .and_then(|msg| msg.payload_as_pair_via_tailscale_request())
+            .expect("tailscale pair request payload");
+        assert_eq!(parsed.client_id().unwrap(), "phone");
+
+        let response_bytes = connection.handle_binary_message(&client_bytes);
+        let root = flatbuffers::root::<fb::ServerMessage>(&response_bytes).unwrap();
+        assert_eq!(
+            root.payload_type(),
+            fb::ServerMessagePayload::ResponsePayload
+        );
+        let resp = root.payload_as_response_payload().unwrap();
+        assert_eq!(resp.id().unwrap(), "pair-ts-fb");
+        assert_eq!(resp.result_type(), fb::ServerResultPayload::PairedResult);
+        let paired = resp.result_as_paired_result().unwrap();
+        assert_eq!(paired.token().unwrap(), "tailnet-token");
+
+        let borrowed = flatbuffers_proto::parse_fb_server_message_borrowed(&response_bytes)
+            .expect("borrowed paired response");
+        assert_eq!(
+            borrowed,
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("pair-ts-fb"),
+                result: flatbuffers_proto::ServerResultBorrowed::Paired {
+                    token: "tailnet-token",
+                },
             }
         );
     }
@@ -1748,6 +2083,7 @@ mod tests {
                     worktree_root: Some("/repo/wt".to_string()),
                     branch: Some("main".to_string()),
                     last_activity_ms: 1_700_000_000_000,
+                    last_input_ms: 1_700_000_005_000,
                 }],
             },
         };
@@ -1845,6 +2181,92 @@ mod tests {
                 assert_eq!(group_keys, vec!["/repo/a"]);
                 assert_eq!(session_ids, vec!["s1", "s2"]);
                 assert_eq!(custom_labels.get("s1"), Some(&"Agent One".to_string()));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_stats_reports_live_disk_probe() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+        let response =
+            connection.handle_text_message(r#"{"id":"stats-1","type":"get_daemon_stats"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Response {
+                id: Some(id),
+                result:
+                    ServerResult::DaemonStats {
+                        disk_free_bytes,
+                        disk_total_bytes,
+                    },
+            } => {
+                assert_eq!(id, json!("stats-1"));
+                assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // The invariant above accepts 0/0 (platforms that cannot probe), so a
+    // handler hardcoding unknown would pass it. This pins the probe wiring
+    // on platforms where the probe always answers.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn daemon_stats_probe_is_wired_on_supported_platforms() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+        let response =
+            connection.handle_text_message(r#"{"id":"stats-2","type":"get_daemon_stats"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Response {
+                result:
+                    ServerResult::DaemonStats {
+                        disk_free_bytes,
+                        disk_total_bytes,
+                    },
+                ..
+            } => {
+                assert!(
+                    disk_total_bytes > 0,
+                    "probe must report a total, got {disk_total_bytes}"
+                );
+                assert!(
+                    disk_free_bytes <= disk_total_bytes,
+                    "free {disk_free_bytes} exceeds total {disk_total_bytes}"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // Mirror of the stats pin above for the sibling read: hello accepts 0/0 by
+    // design on unknown platforms, so on supported platforms pin that its call
+    // site is wired to the probe rather than hardcoded unknown.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn hello_probe_is_wired_on_supported_platforms() {
+        let mut connection = WebSocketSessionConnection::new(FakeSessionApi::default());
+        let response = connection.handle_text_message(r#"{"id":"hello-disk","type":"hello"}"#);
+        let decoded: ServerMessage = serde_json::from_str(&response).unwrap();
+        match decoded {
+            ServerMessage::Response {
+                result:
+                    ServerResult::Hello {
+                        disk_free_bytes,
+                        disk_total_bytes,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(
+                    disk_total_bytes > 0,
+                    "probe must report a total, got {disk_total_bytes}"
+                );
+                assert!(
+                    disk_free_bytes <= disk_total_bytes,
+                    "free {disk_free_bytes} exceeds total {disk_total_bytes}"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1984,6 +2406,7 @@ mod tests {
             worktree_root: Some("/path/to/worktree".to_string()),
             branch: Some("feat/sync".to_string()),
             last_activity_ms: 1720000000000,
+            last_input_ms: 1720000000001,
         };
         let bytes = flatbuffers_proto::serialize_server_message(&msg);
         assert_eq!(
@@ -1995,6 +2418,7 @@ mod tests {
                 worktree_root: Some("/path/to/worktree"),
                 branch: Some("feat/sync"),
                 last_activity_ms: 1720000000000,
+                last_input_ms: 1720000000001,
             }
         );
     }
@@ -2022,6 +2446,7 @@ mod tests {
             worktree_root: None,
             branch: Some("main".to_string()),
             last_activity_ms: 123456789,
+            last_input_ms: 987654321,
         };
         let started_json = serde_json::to_string(&started).unwrap();
         let started_deserialized: ServerMessage = serde_json::from_str(&started_json).unwrap();

@@ -21,6 +21,89 @@ const int kMinTerminalRows = 1;
 /// new snapshot supersedes.
 const int kPendingLiveByteCap = 1024 * 1024;
 
+/// Viewport-first replay budget: a full history replay keeps the newest
+/// [kHistoryReplayMaxLines] complete lines and at most [kHistoryReplayMaxBytes]
+/// bytes. Re-emulating a megabyte tail stalls first paint for seconds (worse
+/// over a high-latency link, where the transfer itself lags); the newest lines
+/// are the viewport plus scrollback the user actually sees, and live output
+/// keeps accumulating past them. Older scrollback stays in the daemon log for
+/// a future scroll-up paging pass to fetch on demand.
+const int kHistoryReplayMaxLines = 1000;
+const int kHistoryReplayMaxBytes = 256 * 1024;
+
+/// Web replay budget: xterm.js parses `write` payloads incrementally without
+/// blocking paint, so the web client replays the full 1 MiB tail the daemon
+/// serves (~16k-24k lines). Native targets keep the smaller budget above
+/// because package:xterm parses synchronously on the UI thread.
+const int kHistoryReplayWebMaxLines = 50000;
+const int kHistoryReplayWebMaxBytes = 1024 * 1024;
+
+/// Trims a full-replay history payload to its newest complete lines.
+///
+/// xterm is append-only, so a replay must still arrive oldest-first; this keeps
+/// the last [maxLines] lines (a trailing newline terminates the last line
+/// rather than starting an empty one) and at most [maxBytes] bytes, so first
+/// paint waits on the viewport instead of the whole tail. A trimmed payload is
+/// prefixed with an SGR reset so rendition state set before the cut cannot
+/// bleed into it; an untrimmed payload — including empty, which the caller
+/// treats as a no-op — is returned untouched.
+///
+/// Baselines are the caller's job: trimming drops a prefix, so the log end
+/// offset stays `rawStart + original.length`, never the trimmed length.
+List<int> trimHistoryTail(
+  List<int> bytes, {
+  required int maxLines,
+  required int maxBytes,
+}) {
+  if (bytes.isEmpty || maxLines <= 0 || maxBytes <= 0) {
+    return bytes.isEmpty ? bytes : const <int>[];
+  }
+  var end = bytes.length;
+  if (bytes[end - 1] == 0x0a) end--;
+  var start = 0;
+  var newlines = 0;
+  for (var i = end - 1; i >= 0; i--) {
+    if (bytes[i] == 0x0a) {
+      newlines++;
+      if (newlines >= maxLines) {
+        start = i + 1;
+        break;
+      }
+    }
+  }
+  final byteFloor = bytes.length - maxBytes;
+  if (byteFloor > start) {
+    // The byte cap binds. byteFloor > start >= 0, so byteFloor - 1 below
+    // is a valid index.
+    if (bytes[byteFloor - 1] == 0x0a) {
+      start = byteFloor;
+    } else {
+      // Mid-line cut: advance to the next complete line boundary instead of
+      // slicing an older row (and possibly a rune) in two. When no newline
+      // follows (one line exceeds maxBytes), at least skip UTF-8
+      // continuation bytes so decoding starts on a rune boundary.
+      var lineStart = -1;
+      for (var i = byteFloor; i < end; i++) {
+        if (bytes[i] == 0x0a) {
+          lineStart = i + 1;
+          break;
+        }
+      }
+      if (lineStart != -1) {
+        start = lineStart;
+      } else {
+        start = byteFloor;
+        while (start < bytes.length && (bytes[start] & 0xC0) == 0x80) {
+          start++;
+        }
+      }
+    }
+  }
+  if (start <= 0) return bytes;
+  const reset = <int>[0x1b, 0x5b, 0x30, 0x6d]; // ESC [ 0 m
+  return [...reset, ...bytes.sublist(start)];
+}
+
 /// How far below the dedup baseline an `output_seq` may fall and still be a
 /// re-delivery rather than a fresh numbering epoch.
 ///
@@ -492,7 +575,23 @@ class TerminalStore extends ChangeNotifier {
     // emulator, which auto-answers them; suppress those answers so they are not
     // echoed to the host as user input.
     _beginHostInputSuppression();
-    _writeDecoded(bytes);
+    // Viewport-first: replay only the newest lines so a megabyte tail doesn't
+    // stall first paint; the baseline below still uses the original end offset
+    // (trimming drops a prefix) so delta merges stay anchored.
+    // `kIsWeb` selects the xterm.js sink exactly: every other target parses
+    // through package:xterm on the UI thread.
+    final replayBytes = trimHistoryTail(
+      bytes,
+      maxLines: kIsWeb ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines,
+      maxBytes: kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes,
+    );
+    if (!identical(replayBytes, bytes)) {
+      tdbg(
+        'store.history',
+        'TRIMMED replay ${bytes.length}B -> ${replayBytes.length}B',
+      );
+    }
+    _writeDecoded(replayBytes);
 
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;

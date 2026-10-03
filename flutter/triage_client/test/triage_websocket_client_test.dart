@@ -440,6 +440,24 @@ void main() {
       expect(challengeReq.clientId, equals('client-123'));
     });
 
+    test('pairViaTailscale request translates to binary FlatBuffers', () async {
+      final f = client.pairViaTailscale(clientId: 'client-123');
+      f.catchError((_) => '');
+
+      expect(sink.sent, hasLength(1));
+      final bytes = sink.sent.first as List<int>;
+
+      final msg = fbs.ClientMessage(bytes);
+      expect(msg.id, equals('req-0'));
+      expect(
+        msg.payloadType,
+        equals(fbs.ClientRequestPayloadTypeId.PairViaTailscaleRequest),
+      );
+
+      final pairReq = msg.payload as fbs.PairViaTailscaleRequest;
+      expect(pairReq.clientId, equals('client-123'));
+    });
+
     test('writeInput request translates to binary FlatBuffers', () async {
       await client.writeInput(
         sessionId: 'session-456',
@@ -675,6 +693,7 @@ void main() {
                   worktreeRoot: '/repo/worktrees/feat',
                   branch: 'feat/x',
                   lastActivityMs: 1782616328232,
+                  lastInputMs: 1782616330000,
                 ),
                 // A session outside any repository, and one that has produced no
                 // output: both must decode as absent/zero rather than throwing
@@ -701,6 +720,8 @@ void main() {
         // would report.
         expect(result['session-1']!.lastActivityMs, equals(1782616328232));
         expect(result['session-2']!.lastActivityMs, equals(0));
+        expect(result['session-1']!.lastInputMs, equals(1782616330000));
+        expect(result['session-2']!.lastInputMs, equals(0));
       },
     );
 
@@ -911,6 +932,7 @@ void main() {
                 serverVersion: '0.9.0',
                 updateAvailable: true,
                 latestVersion: '1.0.0',
+                tailscalePairingAvailable: true,
               ),
             ),
           ).toBytes(),
@@ -922,6 +944,7 @@ void main() {
         expect(result['server_version'], equals('0.9.0'));
         expect(result['update_available'], isTrue);
         expect(result['latest_version'], equals('1.0.0'));
+        expect(result['tailscale_pairing_available'], isTrue);
       },
     );
 
@@ -1108,6 +1131,7 @@ void main() {
               repositoryRoot: '/home/user/project',
               branch: 'main',
               lastActivityMs: 1720000000000,
+              lastInputMs: 1720000000001,
             ),
           ).toBytes(),
         );
@@ -1132,6 +1156,7 @@ void main() {
           'worktree_root': null,
           'branch': 'main',
           'last_activity_ms': 1720000000000,
+          'last_input_ms': 1720000000001,
         });
         expect(events[1], {
           'type': 'session_terminated',
@@ -1321,5 +1346,26 @@ void main() {
         expect(result, isEmpty);
       },
     );
+  });
+
+  group('isUsableDaemonStats', () {
+    test('rejects null and zero-total probe failures', () {
+      expect(isUsableDaemonStats(null), isFalse);
+      expect(
+        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 0)),
+        isFalse,
+      );
+    });
+
+    test('accepts positive totals including a full disk', () {
+      expect(
+        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 100)),
+        isTrue,
+      );
+      expect(
+        isUsableDaemonStats((diskFreeBytes: 50, diskTotalBytes: 100)),
+        isTrue,
+      );
+    });
   });
 }

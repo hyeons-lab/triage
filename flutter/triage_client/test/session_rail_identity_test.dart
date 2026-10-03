@@ -762,17 +762,20 @@ void main() {
         SessionGroup(
           repoRoot: '/src/triage',
           sessionIds: ['s0'],
-          lastActivityMs: 100,
+          lastInteractionMs: 100,
+          lastOutputMs: 0,
         ),
         SessionGroup(
           repoRoot: '/src/frontend',
           sessionIds: ['s1'],
-          lastActivityMs: 200,
+          lastInteractionMs: 200,
+          lastOutputMs: 0,
         ),
         const SessionGroup(
           repoRoot: null,
           sessionIds: ['s2'],
-          lastActivityMs: 50,
+          lastInteractionMs: 50,
+          lastOutputMs: 0,
         ),
       ];
 
@@ -785,6 +788,8 @@ void main() {
             sessionGroups: groups,
             pins: SessionPins.none,
             onResetOrder: () {},
+            sortMode: SessionRailSortMode.byRepo,
+            onToggleSortMode: () {},
             onUnpinGroup: (_) {},
             onUnpinSession: (_) {},
             selectedIndex: 0,
@@ -914,6 +919,8 @@ void main() {
             sessionGroups: groups,
             pins: SessionPins.none,
             onResetOrder: () {},
+            sortMode: SessionRailSortMode.byRepo,
+            onToggleSortMode: () {},
             onUnpinGroup: (_) {},
             onUnpinSession: (_) {},
             selectedIndex: 0,
@@ -945,6 +952,8 @@ void main() {
             sessionGroups: groups,
             pins: SessionPins.none,
             onResetOrder: () {},
+            sortMode: SessionRailSortMode.byRepo,
+            onToggleSortMode: () {},
             onUnpinGroup: (_) {},
             onUnpinSession: (_) {},
             selectedIndex: 0,
@@ -1041,12 +1050,14 @@ void main() {
         SessionGroup(
           repoRoot: '/Users/me/dev/frontend',
           sessionIds: ['session-1'],
-          lastActivityMs: 100,
+          lastInteractionMs: 100,
+          lastOutputMs: 0,
         ),
         SessionGroup(
           repoRoot: '/Users/me/dev/backend',
           sessionIds: ['session-2'],
-          lastActivityMs: 50,
+          lastInteractionMs: 50,
+          lastOutputMs: 0,
         ),
       ];
 
@@ -1058,6 +1069,8 @@ void main() {
               sessionGroups: groups,
               pins: SessionPins.none,
               onResetOrder: () {},
+              sortMode: SessionRailSortMode.byRepo,
+              onToggleSortMode: () {},
               onUnpinGroup: (_) {},
               onUnpinSession: (_) {},
               selectedIndex: 0,

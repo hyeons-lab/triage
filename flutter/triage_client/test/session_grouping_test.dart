@@ -29,8 +29,8 @@ void main() {
       ]);
 
       expect(groups.map((g) => g.repoRoot), ['/a', '/b']);
-      expect(groups.first.lastActivityMs, 500);
-      expect(groups.last.lastActivityMs, 400);
+      expect(groups.first.lastInteractionMs, 500);
+      expect(groups.last.lastInteractionMs, 400);
     });
 
     test('orders sessions within a group by activity, newest first', () {
@@ -239,6 +239,168 @@ void main() {
         pinPrefixTo(const ['/gone', '/a'], const ['/a', '/b'], '/b', 0),
         equals(['/gone', '/b', '/a']),
       );
+    });
+  });
+
+  group('orderSessionsByActivity', () {
+    test('orders across repositories by activity, newest first', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 100),
+          session('session-2', repo: '/b', activity: 300),
+          session('session-3', repo: '/a', activity: 200),
+        ]),
+        ['session-2', 'session-3', 'session-1'],
+      );
+    });
+
+    test('activity ties keep input order', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 100),
+          session('session-2', repo: '/b', activity: 100),
+          session('session-3'),
+        ]),
+        ['session-1', 'session-2', 'session-3'],
+      );
+    });
+
+    test('unknown activity sorts last, in input order', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1'),
+          session('session-2', repo: '/a', activity: 50),
+          session('session-3'),
+        ]),
+        ['session-2', 'session-1', 'session-3'],
+      );
+    });
+
+    test('pinned sessions hoist to the front in pinned order', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 300),
+          session('session-2', repo: '/b', activity: 200),
+          session('session-3', repo: '/a', activity: 100),
+        ], pins: const SessionPins(sessionIds: ['session-3', 'session-2'])),
+        ['session-3', 'session-2', 'session-1'],
+      );
+    });
+
+    test('group pins have no effect without groups', () {
+      expect(
+        orderSessionsByActivity([
+          session('session-1', repo: '/a', activity: 100),
+          session('session-2', repo: '/b', activity: 200),
+        ], pins: const SessionPins(groupKeys: ['/a'])),
+        ['session-2', 'session-1'],
+      );
+    });
+  });
+
+  group('flatSessionGroups', () {
+    test('no sessions yields no groups, matching repo grouping', () {
+      expect(flatSessionGroups([]), isEmpty);
+    });
+
+    test('one group holds every session in activity order', () {
+      final groups = flatSessionGroups([
+        session('session-1', repo: '/a', activity: 100),
+        session('session-2', repo: '/b', activity: 300),
+        session('session-3', repo: '/a', activity: 200),
+      ]);
+      expect(groups, hasLength(1));
+      expect(groups.single.repoRoot, isNull);
+      expect(groups.single.sessionIds, ['session-2', 'session-3', 'session-1']);
+      expect(groups.single.lastInteractionMs, 300);
+    });
+
+    test('session pins hoist within the single group', () {
+      final groups = flatSessionGroups([
+        session('session-1', repo: '/a', activity: 300),
+        session('session-2', repo: '/b', activity: 200),
+      ], pins: const SessionPins(sessionIds: ['session-2']));
+      expect(groups.single.sessionIds, ['session-2', 'session-1']);
+    });
+  });
+
+  group('input-unknown tier', () {
+    test('known input outranks unknown input whatever the output says', () {
+      // The noisy job is producing output *now*, but its input is unknown
+      // while the quiet session was typed in. Separate tiers, not one
+      // scale: output must not promote the unknown tier above the known.
+      final groups = groupSessionsByRepo([
+        session('noisy', repo: '/a', output: 9000),
+        session('touched', repo: '/a', activity: 100, output: 1000),
+      ]);
+
+      expect(groups.single.sessionIds, ['touched', 'noisy']);
+    });
+
+    test('input-unknown sessions order by output, not creation order', () {
+      // The post-handover rail: every input stamp is 0 (the old daemon
+      // predates input tracking), so output is all the order there is.
+      final groups = groupSessionsByRepo([
+        session('older', repo: '/a', output: 1000),
+        session('newer', repo: '/a', output: 2000),
+      ]);
+
+      expect(groups.single.sessionIds, ['newer', 'older']);
+    });
+
+    test('known-input groups outrank unknown-input groups by input', () {
+      final groups = groupSessionsByRepo([
+        session('noisy', repo: '/noisy', output: 9000),
+        session('touched', repo: '/touched', activity: 100, output: 1000),
+      ]);
+
+      expect(groups.map((g) => g.repoRoot), ['/touched', '/noisy']);
+    });
+
+    test('unknown-input groups order by their max output', () {
+      final groups = groupSessionsByRepo([
+        session('old-1', repo: '/old', output: 1000),
+        session('old-2', repo: '/old', output: 1500),
+        session('new-1', repo: '/new', output: 2000),
+      ]);
+
+      expect(groups.map((g) => g.repoRoot), ['/new', '/old']);
+      expect(groups.first.lastOutputMs, 2000);
+      expect(groups.last.lastOutputMs, 1500);
+    });
+
+    test('output does not break ties between known inputs', () {
+      final groups = groupSessionsByRepo([
+        session('session-1', repo: '/a', activity: 100, output: 1000),
+        session('session-2', repo: '/a', activity: 100, output: 9000),
+      ]);
+
+      // Same input stamp: creation order, as before.
+      expect(groups.single.sessionIds, ['session-1', 'session-2']);
+    });
+  });
+
+  group('windows paths', () {
+    test('leafOf takes the last backslash segment', () {
+      expect(leafOf(r'C:\Users\dev\repo'), 'repo');
+      expect(leafOf(r'C:\Users\dev\repo\'), 'repo');
+    });
+
+    test('trimTrailingSlash strips one trailing backslash', () {
+      expect(trimTrailingSlash(r'C:\Users\dev\repo\'), r'C:\Users\dev\repo');
+      expect(trimTrailingSlash(r'C:\Users\dev\repo'), r'C:\Users\dev\repo');
+    });
+
+    test('mixed separators split on the later one', () {
+      expect(leafOf('C:/Users\\dev/repo'), 'repo');
+      expect(leafOf(r'C:\Users/dev\repo'), 'repo');
+    });
+
+    test('forward-slash behavior is unchanged', () {
+      expect(leafOf('/a/bb/ccc'), 'ccc');
+      expect(leafOf('/a/bb/ccc/'), 'ccc');
+      expect(trimTrailingSlash('/'), '/');
+      expect(leafOf('/'), isNull);
     });
   });
 }

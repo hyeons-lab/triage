@@ -116,4 +116,14 @@ void main() {
     expect(bar.sent, isEmpty);
     expect(bar.ctrlToggles(), 0);
   });
+
+  testWidgets('no keyboard toggle lives in the accessory row', (
+    tester,
+  ) async {
+    // The soft-keyboard switch moved to the workspace header; the bottom
+    // bar keeps input keys only.
+    await pumpBar(tester);
+    expect(find.text('kbd'), findsNothing);
+    expect(find.text('esc'), findsOneWidget);
+  });
 }

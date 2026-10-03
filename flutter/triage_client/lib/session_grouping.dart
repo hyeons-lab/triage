@@ -8,14 +8,15 @@ library;
 
 /// The one input the ordering needs from a session.
 ///
-/// Deliberately not `SessionVm`: ordering depends on exactly these three fields,
+/// Deliberately not `SessionVm`: ordering depends on exactly these fields,
 /// and depending on the full view-model would drag the widget layer into every
 /// test.
 class SessionOrderingInput {
   const SessionOrderingInput({
     required this.sessionId,
     required this.repoRoot,
-    required this.lastActivityMs,
+    required this.lastInteractionMs,
+    required this.lastOutputMs,
   });
 
   /// Daemon-local session id. Identity only: ties are broken on the session's
@@ -29,9 +30,15 @@ class SessionOrderingInput {
   /// its worktrees group together without special-casing.
   final String? repoRoot;
 
+  /// Milliseconds since the Unix epoch of the session's most recent input.
+  /// 0 means unknown: the session never received input, or its daemon predates
+  /// input tracking (e.g. adopted across a handover from an older binary).
+  final int lastInteractionMs;
+
   /// Milliseconds since the Unix epoch of the session's most recent output.
-  /// 0 means unknown: no output yet, or a daemon predating activity tracking.
-  final int lastActivityMs;
+  /// Orders sessions whose input is unknown (see [compareRecencyStamps]);
+  /// 0 means unknown.
+  final int lastOutputMs;
 }
 
 /// One repository's sessions, in display order.
@@ -39,7 +46,8 @@ class SessionGroup {
   const SessionGroup({
     required this.repoRoot,
     required this.sessionIds,
-    required this.lastActivityMs,
+    required this.lastInteractionMs,
+    required this.lastOutputMs,
   });
 
   /// Null for the catch-all group holding sessions outside any repository.
@@ -48,9 +56,13 @@ class SessionGroup {
   /// This group's sessions, most recently active first.
   final List<String> sessionIds;
 
-  /// The most recent activity among [sessionIds]: what the group is ordered by.
-  /// 0 when no member has known activity.
-  final int lastActivityMs;
+  /// The most recent input among [sessionIds]: what the group is ordered by.
+  /// 0 when no member has known input.
+  final int lastInteractionMs;
+
+  /// The most recent output among [sessionIds]. Orders groups whose input is
+  /// unknown (see [compareRecencyStamps]); 0 when no member has known output.
+  final int lastOutputMs;
 
   /// Stable key for this group in persisted pin lists. Repository roots are
   /// absolute paths, so the sentinel used for the repo-less group cannot collide
@@ -147,7 +159,8 @@ List<String> pinPrefixTo(
 /// Groups [sessions] by repository and orders both the groups and the sessions
 /// within each by most recent activity.
 ///
-/// Ordering is a *total* order: ties on activity, including the all-zero case
+/// Ordering is a *total* order: known input ranks above unknown input, the
+/// unknown tier ranks by output, and full ties, including the all-zero case
 /// where no session has a known stamp, fall back to the session id's creation
 /// sequence. Without that, equal timestamps would leave the order down to the
 /// input sequence, which is precisely the arbitrary ordering this replaces.
@@ -174,14 +187,8 @@ List<SessionGroup> groupSessionsByRepo(
   final inputIndex = <String, int>{
     for (var i = 0; i < sessions.length; i++) sessions[i].sessionId: i,
   };
-  int byActivityThenInput(SessionOrderingInput a, SessionOrderingInput b) {
-    if (a.lastActivityMs != b.lastActivityMs) {
-      return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
-    }
-    return (inputIndex[a.sessionId] ?? 0).compareTo(
-      inputIndex[b.sessionId] ?? 0,
-    );
-  }
+  int byActivityThenInput(SessionOrderingInput a, SessionOrderingInput b) =>
+      compareByActivityThenInput(a, b, inputIndex);
 
   final groups = <SessionGroup>[];
   for (final entry in byRepo.entries) {
@@ -199,9 +206,13 @@ List<SessionGroup> groupSessionsByRepo(
         // activity alone: pinning changes where a group sits, never how recent
         // it is, so unpinning restores its true activity position rather than
         // leaving it stranded wherever it was pinned.
-        lastActivityMs: members.fold<int>(
+        lastInteractionMs: members.fold<int>(
           0,
-          (best, s) => s.lastActivityMs > best ? s.lastActivityMs : best,
+          (best, s) => s.lastInteractionMs > best ? s.lastInteractionMs : best,
+        ),
+        lastOutputMs: members.fold<int>(
+          0,
+          (best, s) => s.lastOutputMs > best ? s.lastOutputMs : best,
         ),
       ),
     );
@@ -218,9 +229,13 @@ List<SessionGroup> groupSessionsByRepo(
   };
 
   groups.sort((a, b) {
-    if (a.lastActivityMs != b.lastActivityMs) {
-      return b.lastActivityMs.compareTo(a.lastActivityMs); // newest first
-    }
+    final order = compareRecencyStamps(
+      aInputMs: a.lastInteractionMs,
+      aOutputMs: a.lastOutputMs,
+      bInputMs: b.lastInteractionMs,
+      bOutputMs: b.lastOutputMs,
+    );
+    if (order != 0) return order;
     // Tie-break on the group's earliest-listed session, so group order is total
     // and stable, the common case being a fresh daemon where every stamp is 0.
     return earliestInput[a.pinKey]!.compareTo(earliestInput[b.pinKey]!);
@@ -262,7 +277,105 @@ List<String> flattenGroups(List<SessionGroup> groups) => [
   for (final group in groups) ...group.sessionIds,
 ];
 
-/// Drops one trailing `/`, except from the filesystem root itself.
+/// Two-tier recency order, newest first: sessions (or groups) with known input
+/// rank above those without, by input; the input-unknown tier ranks by output.
+///
+/// The tiers must not share one scale. Input 0 means *unknown* — never
+/// touched, or adopted from a daemon predating input tracking — so folding
+/// output into the same stamp would let a noisy job with unknown input
+/// outrank a session the user actually typed in. Comparing output only within
+/// the unknown tier keeps that policy while still ordering the all-unknown
+/// case (a post-handover rail) by output instead of creation order.
+///
+/// Returns 0 on a full tie; callers apply their own tie-break.
+int compareRecencyStamps({
+  required int aInputMs,
+  required int aOutputMs,
+  required int bInputMs,
+  required int bOutputMs,
+}) {
+  final aKnown = aInputMs != 0;
+  final bKnown = bInputMs != 0;
+  if (aKnown != bKnown) return aKnown ? -1 : 1;
+  final aStamp = aKnown ? aInputMs : aOutputMs;
+  final bStamp = bKnown ? bInputMs : bOutputMs;
+  return bStamp.compareTo(aStamp);
+}
+
+/// Orders sessions by activity, newest first, with ties keeping input order.
+///
+/// Shared by [groupSessionsByRepo] (within each group) and
+/// [orderSessionsByActivity] (across all of them): one rule in one place, so
+/// the two modes can never disagree about what "most recent" means.
+int compareByActivityThenInput(
+  SessionOrderingInput a,
+  SessionOrderingInput b,
+  Map<String, int> inputIndex,
+) {
+  final order = compareRecencyStamps(
+    aInputMs: a.lastInteractionMs,
+    aOutputMs: a.lastOutputMs,
+    bInputMs: b.lastInteractionMs,
+    bOutputMs: b.lastOutputMs,
+  );
+  if (order != 0) return order;
+  return (inputIndex[a.sessionId] ?? 0).compareTo(inputIndex[b.sessionId] ?? 0);
+}
+
+/// Orders [sessions] by most recent activity as one flat list, ignoring
+/// repositories.
+///
+/// The rail's "sort by activity" mode. Pinned sessions hoist to the front in
+/// pinned order (group pins have no meaning without groups); everything else
+/// flows by activity exactly as it would within a group.
+List<String> orderSessionsByActivity(
+  List<SessionOrderingInput> sessions, {
+  SessionPins pins = SessionPins.none,
+}) {
+  final inputIndex = <String, int>{
+    for (var i = 0; i < sessions.length; i++) sessions[i].sessionId: i,
+  };
+  final ordered = [...sessions]
+    ..sort((a, b) => compareByActivityThenInput(a, b, inputIndex));
+  return _hoistPinned(
+    ordered.map((s) => s.sessionId).toList(),
+    pins.sessionIds,
+    (id) => id,
+  );
+}
+
+/// Builds the rail's flat activity view: no groups for no sessions (matching
+/// [groupSessionsByRepo]), otherwise one group holding every session in
+/// activity order. A single group renders headerless via `buildRailItems`,
+/// and a drag there pins session ids across the whole list, which stays
+/// meaningful when the mode flips back.
+List<SessionGroup> flatSessionGroups(
+  List<SessionOrderingInput> sessions, {
+  SessionPins pins = SessionPins.none,
+}) {
+  if (sessions.isEmpty) return const [];
+  var newestInput = 0;
+  var newestOutput = 0;
+  for (final session in sessions) {
+    if (session.lastInteractionMs > newestInput) {
+      newestInput = session.lastInteractionMs;
+    }
+    if (session.lastOutputMs > newestOutput) newestOutput = session.lastOutputMs;
+  }
+  return [
+    SessionGroup(
+      repoRoot: null,
+      sessionIds: orderSessionsByActivity(sessions, pins: pins),
+      lastInteractionMs: newestInput,
+      lastOutputMs: newestOutput,
+    ),
+  ];
+}
+
+/// Drops one trailing `/` (or `\`), except from the filesystem root itself.
+///
+/// Paths arrive from daemons on any OS, so a Windows daemon reports
+/// backslash roots the rail must group and label like any other path.
 ///
 /// The rail derives a group key, a group header label, and a session title from
 /// the same paths. Three private copies of this rule had already drifted apart
@@ -270,17 +383,20 @@ List<String> flattenGroups(List<SessionGroup> groups) => [
 /// others.
 String? trimTrailingSlash(String? path) {
   if (path == null || path.isEmpty) return null;
-  if (path.length > 1 && path.endsWith('/')) {
+  if (path.length > 1 && (path.endsWith('/') || path.endsWith('\\'))) {
     return path.substring(0, path.length - 1);
   }
   return path;
 }
 
-/// The last path segment of [path], or null when it has none.
+/// The last path segment of [path], or null when it has none. Both `/` and
+/// `\` separate segments: see [trimTrailingSlash].
 String? leafOf(String? path) {
   final trimmed = trimTrailingSlash(path);
   if (trimmed == null) return null;
-  final slash = trimmed.lastIndexOf('/');
+  final slashPos = trimmed.lastIndexOf('/');
+  final backslashPos = trimmed.lastIndexOf('\\');
+  final slash = slashPos > backslashPos ? slashPos : backslashPos;
   final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
   return leaf.isEmpty ? null : leaf;
 }

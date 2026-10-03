@@ -67,7 +67,7 @@ void main() {
       ], pins: const SessionPins(groupKeys: ['/a']));
 
       expect(groups.first.repoRoot, '/a');
-      expect(groups.first.lastActivityMs, 5);
+      expect(groups.first.lastInteractionMs, 5);
     });
 
     test('a pin naming an absent group is ignored, not fatal', () {

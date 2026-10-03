@@ -231,6 +231,12 @@ impl AgentPatternPack {
     }
 }
 
+/// Tailscale reports tag-owned (non-user) nodes with this synthetic login. It
+/// is shared by *every* tagged node on a tailnet, so it must never be treated
+/// as an identity: rejected in config validation and never matched by the
+/// pairing gate (defense in depth).
+pub const TAGGED_DEVICES_LOGIN: &str = "tagged-devices";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteConfig {
@@ -243,6 +249,12 @@ pub struct RemoteConfig {
     /// Pairing approval is handled exclusively via `triage pair` now. Kept for
     /// config-file compatibility; the value is ignored (never validated).
     pub pair_approval_tailnet_users: Vec<String>,
+    /// Tailnet users allowed to pair via Tailscale identity, matched against
+    /// `UserProfile.LoginName` from `tailscale whois`. Empty (default) keeps
+    /// the device-code + `triage pair` flow; non-empty replaces it: code
+    /// challenges are refused and pairing mints a token only for allowlisted
+    /// peers. Entries must be non-empty.
+    pub tailscale_pair_users: Vec<String>,
     /// Deprecated: legacy toggle for the removed web `/pair` approval route.
     /// Kept for config-file compatibility; the value is ignored (never validated).
     pub pair_approval_trust_local_peers: bool,
@@ -257,6 +269,14 @@ impl RemoteConfig {
         self.bind_addr()?;
         if let Some(ref path) = self.web_assets_path {
             ensure_non_empty("remote.web_assets_path", path)?;
+        }
+        ensure_non_empty_items("remote.tailscale_pair_users", &self.tailscale_pair_users)?;
+        for (index, user) in self.tailscale_pair_users.iter().enumerate() {
+            ensure!(
+                user.trim().to_lowercase() != TAGGED_DEVICES_LOGIN,
+                "remote.tailscale_pair_users[{index}] must not be the shared \
+                 tagged-devices pseudo-login"
+            );
         }
         // `pair_approval_*` keys are deprecated no-ops (the web `/pair` route no
         // longer exists), so they are parsed for compatibility but never
@@ -286,6 +306,7 @@ impl Default for RemoteConfig {
             web_assets_path: None,
             // Deprecated no-op; kept at the default for config compatibility.
             pair_approval_tailnet_users: Vec::new(),
+            tailscale_pair_users: Vec::new(),
             // Deprecated no-op; kept at the default for config compatibility.
             pair_approval_trust_local_peers: true,
         }
@@ -611,6 +632,7 @@ tls_cert = "~/.config/triage/certs/dev.crt"
 tls_key = "~/.config/triage/certs/dev.key"
 pair_approval_tailnet_users = ["alice@example.com", "bob@example.com"]
 pair_approval_trust_local_peers = false
+tailscale_pair_users = ["david@hyeons-lab.com"]
 
 [mcp]
 tcp_bind = "127.0.0.1:8889"
@@ -657,6 +679,7 @@ pause_all = "ctrl+p"
         assert!(config.remote.require_pairing);
         assert!(config.remote.pair_approval_tailnet_users.is_empty());
         assert!(config.remote.pair_approval_trust_local_peers);
+        assert!(config.remote.tailscale_pair_users.is_empty());
         assert_eq!(config.mcp.tcp_bind, "127.0.0.1:7778");
         assert!(!config.grpc.enabled);
         assert_eq!(config.keybindings.next_attention, "g w");
@@ -703,6 +726,7 @@ notify_sound = false
             ["alice@example.com", "bob@example.com"]
         );
         assert!(!config.remote.pair_approval_trust_local_peers);
+        assert_eq!(config.remote.tailscale_pair_users, ["david@hyeons-lab.com"]);
         assert_eq!(config.mcp.tcp_bind_addr().unwrap().port(), 8889);
         assert_eq!(config.grpc.bind_addr().unwrap().unwrap().port(), 50051);
         assert_eq!(config.approval.patterns, ["^rm -rf"]);
@@ -728,6 +752,40 @@ group_by = "workspace"
         .expect_err("invalid group_by should fail");
 
         assert!(error.to_string().contains("parsing config TOML"));
+    }
+
+    #[test]
+    fn blank_tailscale_pair_user_fails() {
+        let error = Config::from_toml_str(
+            r#"
+[remote]
+tailscale_pair_users = ["david@hyeons-lab.com", " "]
+"#,
+        )
+        .expect_err("blank allowlist entry should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote.tailscale_pair_users[1] must not be empty")
+        );
+    }
+
+    #[test]
+    fn tagged_devices_pair_user_fails() {
+        let error = Config::from_toml_str(
+            r#"
+[remote]
+tailscale_pair_users = [" Tagged-Devices "]
+"#,
+        )
+        .expect_err("tagged-devices pseudo-login should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must not be the shared tagged-devices pseudo-login")
+        );
     }
 
     #[test]

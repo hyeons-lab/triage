@@ -10,6 +10,10 @@ const String serversPrefKey = 'daemon_servers_v1';
 /// shared_preferences key holding the id of the daemon to connect to on launch.
 const String selectedServerPrefKey = 'daemon_selected_server_v1';
 
+/// shared_preferences key holding the mobile soft-keyboard kill switch.
+/// Global (a device UX preference, not per daemon); absent reads as enabled.
+const String softKeyboardEnabledPrefKey = 'soft_keyboard_enabled_v1';
+
 /// The single daemon address written before multi-server support. Read once to
 /// migrate it into the server list, then deleted.
 const String legacyDaemonAddressPrefKey = 'daemon_address_v1';
@@ -38,6 +42,10 @@ String pinnedGroupsPrefKeyFor(String serverId) => 'pinned_groups_v1_$serverId';
 /// order. Flat across groups; each group reads out only its own members.
 String pinnedSessionsPrefKeyFor(String serverId) =>
     'pinned_sessions_v1_$serverId';
+
+/// shared_preferences key holding one server's rail sort mode (`byRepo` or
+/// `byActivity`). Absent reads as the default grouping.
+String railSortModePrefKeyFor(String serverId) => 'rail_sort_mode_v1_$serverId';
 
 /// shared_preferences key holding one server's custom session labels, as a JSON-encoded
 /// map of session identity key (remote session id, local session id, or title) to custom label.
@@ -265,6 +273,12 @@ Future<void> migrateRailPins(String fromId, String toId) async {
     if (customLabels != null) {
       await prefs.setString(sessionCustomLabelsPrefKeyFor(toId), customLabels);
       await prefs.remove(sessionCustomLabelsPrefKeyFor(fromId));
+    }
+
+    final sortMode = prefs.getString(railSortModePrefKeyFor(fromId));
+    if (sortMode != null) {
+      await prefs.setString(railSortModePrefKeyFor(toId), sortMode);
+      await prefs.remove(railSortModePrefKeyFor(fromId));
     }
   } catch (_) {}
 }

@@ -12,6 +12,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:triage_client/daemon_disk_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -85,6 +86,10 @@ const int _defaultDaemonPort = 7777;
 Uri? parseDaemonAddress(String input) {
   final raw = input.trim();
   if (raw.isEmpty) return null;
+  // A stray inner space (autocorrect, fat-finger) percent-encodes into an
+  // unresolvable host and the retry loop spins silently instead of
+  // connecting. No valid host, literal, or URL carries whitespace.
+  if (raw.contains(RegExp(r'\s'))) return null;
 
   final hasScheme = RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://').hasMatch(raw);
   if (hasScheme) {
@@ -342,7 +347,7 @@ class SessionVm {
     required this.status,
     required this.statusColor,
     required this.icon,
-    required this.rows,
+    required List<StyledRow> rows,
     this.sessionId,
     this.customLabel,
     this.branch,
@@ -351,7 +356,11 @@ class SessionVm {
     this.cwd,
     this.isRemote = false,
     this.isExited = false,
-  }) : terminalController = TerminalController() {
+  })  : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
+        // so the field must stay mutable no matter what a caller passes —
+        // a lazy placeholder seeds an immutable empty list.
+        rows = List<StyledRow>.of(rows),
+        terminalController = TerminalController() {
     terminal = xt.Terminal(
       maxLines: 50000,
       // Re-wrap the whole buffer on resize, like a real terminal — otherwise
@@ -403,7 +412,7 @@ class SessionVm {
   // Absolute git repository root and worktree root for this session.
   String? repoRoot;
   String? worktreeRoot;
-  // Milliseconds since the Unix epoch of this session's most recent output, as
+  // Milliseconds since the Unix epoch of this session's most recent input, as
   // last reported by the daemon; 0 when unknown. Held here so the rail can
   // re-group after a drag without another round-trip: the grouping needs
   // per-session activity, and a `SessionGroup` only carries the group's max.
@@ -413,7 +422,11 @@ class SessionVm {
   // so that rows do not slide out from under the pointer while a background
   // build is producing output. The cost is that this is a snapshot of recency
   // rather than a live ranking.
-  int lastActivityMs = 0;
+  int lastInteractionMs = 0;
+  // The session's most recent output stamp, backing the input-unknown ordering
+  // tier (see [compareRecencyStamps]). Set and carried alongside
+  // [lastInteractionMs]; 0 means unknown.
+  int lastOutputMs = 0;
   // The last distinct linked worktree this session was seen driving, kept so the
   // rail can lead a root/`main` row with it (see [railTitleAt]). A `git -C
   // worktrees/x …` run from the primary checkout chdirs git into the worktree,
@@ -940,10 +953,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // as that attempt settles. See `_connectWebSocket`.
   bool _reconnectRequested = false;
   Timer? _credentialStorageTimer;
+  // Refreshes [_daemonStats] while connected; disk pressure builds over the
+  // course of a session, so a connect-time reading alone goes stale.
+  Timer? _daemonStatsTimer;
+  // The active daemon's disk stats, seeded from the hello handshake and kept
+  // current by [_daemonStatsTimer]. Null while unknown (no connection, or a
+  // daemon predating stats), which hides the free-space line.
+  DaemonStatsRecord? _daemonStats;
   StreamSubscription<Map<String, dynamic>>? _websocketSubscription;
   String? _bearerToken;
   bool _storageBackedClientId = false;
   bool _needsPairing = false;
+  // Last hello's advertisement: the active daemon offers Tailscale-identity
+  // pairing (and refuses device codes). Reset on server switch/config change
+  // so a stale true can't route a new daemon down the tailscale path.
+  bool _tailscalePairingAvailable = false;
   // The connect generation a displayed pairing challenge belongs to. A
   // stale-401 probe's hello can resolve before the connect hello and pair
   // first; the connect path skips refiring for that generation, since a
@@ -957,6 +981,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   DateTime? _pairingExpiresAt;
   String? _pairingChallengeError;
   bool _sidebarCollapsed = false;
+  // Mobile soft-keyboard kill switch, persisted globally. While false the
+  // terminal panes neither take focus nor open their IME path, so the
+  // keyboard stays down. Desktop ignores it.
+  bool _softKeyboardEnabled = true;
   // The daemons this device knows about, and which one we are connected to.
   // Empty until a saved/entered server resolves (then the connection screen is
   // shown).
@@ -1001,6 +1029,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Groups and sessions the user placed by hand, which hold their slot instead
   // of flowing with activity. Loaded per server alongside the session list.
   SessionPins _pins = SessionPins.none;
+  // How the rail orders its rows. Per server like the pins; defaults to the
+  // repository grouping.
+  SessionRailSortMode _railSortMode = SessionRailSortMode.byRepo;
   // User-assigned custom labels for sessions, keyed by session id. Loaded per server.
   Map<String, String> _customLabels = {};
   // Reaches the rail list's state so a re-group can cancel a drag in progress
@@ -1105,6 +1136,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   DateTime _lastWatchdogTick = DateTime.now();
   static const Duration _wakeWatchdogInterval = Duration(seconds: 4);
   static const Duration _wakeWatchdogGap = Duration(seconds: 30);
+  // Daemon disk-stats refresh cadence. Disk pressure builds over minutes, so a
+  // minute keeps the free-space line honest without chattering the socket.
+  static const Duration _daemonStatsPollInterval = Duration(seconds: 60);
 
   @override
   void initState() {
@@ -1118,6 +1152,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // reads the cache synchronously rather than awaiting prefs.
     unawaited(_restorePins());
     unawaited(_restoreCustomLabels());
+    unawaited(_restoreSoftKeyboard());
     _lastWatchdogTick = DateTime.now();
     _wakeWatchdogTimer = Timer.periodic(_wakeWatchdogInterval, (_) {
       final now = DateTime.now();
@@ -1318,6 +1353,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _selectedServerId = serverId;
       _needsConnectionConfig = false;
       _needsPairing = false;
+      _tailscalePairingAvailable = false;
       _reconnectAttempt = 0;
     });
 
@@ -1375,6 +1411,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // and ids that mean nothing on that machine.
     _pins = SessionPins.none;
     _customLabels = {};
+    _railSortMode = SessionRailSortMode.byRepo;
+    _stopDaemonStatsPolling();
+    _daemonStats = null;
   }
 
   /// Renames a daemon or re-points it at a new address.
@@ -1410,6 +1449,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // now dialing a different address. Drop it rather than leave a dead PIN
         // prompt in front of the reconnect.
         _needsPairing = false;
+        _tailscalePairingAvailable = false;
       });
       _purgeDaemonLocalState();
       // Same reason as _selectServer: the purge cleared the in-memory pins and
@@ -1459,6 +1499,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       _selectedServerId = null;
       _needsPairing = false;
+      _tailscalePairingAvailable = false;
       _needsConnectionConfig = true;
       _connectionStatus = 'Not connected';
       _connectionStatusColor = const Color(0xff7f8b8d);
@@ -1698,6 +1739,35 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
   }
 
+  /// Restores the soft-keyboard kill switch. Global, so no server guards.
+  Future<void> _restoreSoftKeyboard() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_disposed) return;
+      final enabled = prefs.getBool(softKeyboardEnabledPrefKey) ?? true;
+      if (enabled != _softKeyboardEnabled && mounted) {
+        setState(() => _softKeyboardEnabled = enabled);
+      }
+    } catch (_) {
+      // Best-effort; a failed read leaves the keyboard enabled.
+    }
+  }
+
+  /// Flips the soft-keyboard kill switch from the accessory bar's `kbd` key.
+  void _toggleSoftKeyboard() {
+    setState(() => _softKeyboardEnabled = !_softKeyboardEnabled);
+    unawaited(_persistSoftKeyboard(_softKeyboardEnabled));
+  }
+
+  Future<void> _persistSoftKeyboard(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(softKeyboardEnabledPrefKey, enabled);
+    } catch (_) {
+      // Best-effort; ignore persistence failures.
+    }
+  }
+
   String _loadOrCreateClientId() {
     // The watcher compares trimmed values; retrieveClientId trims at the
     // storage boundary, so this is already the trimmed id.
@@ -1846,6 +1916,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
     session.terminalController.addInteractionListener(() {
       unawaited(_ensureSessionInputLease(session));
+      _noteLocalInteraction(session);
     });
 
     session.terminalController.addResizeOutListener((cols, rows) {
@@ -1951,6 +2022,25 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  /// Whether an attach response reports this client as the session's input
+  /// lease holder. Observing attaches never claim the lease (only a keystroke
+  /// does), so the flag follows the daemon's current holder instead of
+  /// assuming the attach just granted it: assuming otherwise writes under a
+  /// lease held elsewhere, and the daemon drops those bytes.
+  bool _attachGrantsInputLease(Map<String, dynamic>? attachRes) {
+    final response = attachRes?['response'] as Map<String, dynamic>?;
+    final lease = response?['lease'] as Map<String, dynamic>?;
+    final holder = lease?['holder'] as Map<String, dynamic>?;
+    return holder?['client_id']?.toString().trim() == _clientId;
+  }
+
+  /// Session id named by a daemon input-lease rejection — "client X does not
+  /// hold input lease for session Y" or "session Y has no input lease
+  /// holder". Null when the message names none.
+  String? _leaseErrorSessionId(String message) {
+    return RegExp(r'session ([a-zA-Z0-9_-]+)').firstMatch(message)?.group(1);
+  }
+
   void _sendRemoteSessionInput(
     SessionVm session,
     String sessionId,
@@ -2033,6 +2123,44 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     });
   }
 
+  /// Polls daemon disk stats for the free-space line while this connection
+  /// lives. Guarded by generation and server id like the connect itself, so a
+  /// tick that lands after a switch or reconnect never writes the new
+  /// connection's reading with the old daemon's.
+  void _startDaemonStatsPolling(int generation, String serverId) {
+    _daemonStatsTimer?.cancel();
+    _daemonStatsTimer = Timer.periodic(_daemonStatsPollInterval, (_) async {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId ||
+          !_clientInitialized ||
+          !_client.isConnected) {
+        return;
+      }
+      final stats = await _client.getDaemonStats();
+      // No `_clientInitialized` term: the flag flips false only inside
+      // teardown, after the generation bump, so the generation check above
+      // already subsumes it. `isConnected` is the load-bearing term here.
+      if (_disposed ||
+          !mounted ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId ||
+          !_client.isConnected ||
+          !isUsableDaemonStats(stats)) {
+        return;
+      }
+      // A null or zero-total read is a failed poll (or a daemon predating
+      // stats): keep the last reading rather than flickering the line in
+      // and out.
+      setState(() => _daemonStats = stats);
+    });
+  }
+
+  void _stopDaemonStatsPolling() {
+    _daemonStatsTimer?.cancel();
+    _daemonStatsTimer = null;
+  }
+
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
     if (_disposed) return;
     // Nothing to dial. Without this, a connect raised while the connection
@@ -2053,6 +2181,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _isConnecting = true;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _stopDaemonStatsPolling();
     final generation = ++_connectGeneration;
     if (_clientInitialized) {
       final subscription = _websocketSubscription;
@@ -2067,7 +2196,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _subscriptionIds.clear();
     // Leases are daemon-side: a reconnected daemon may have dropped them, and
     // a stale `true` bypasses the buffer-and-acquire path and drops input.
-    // Re-acquired on the next select, keystroke, or refresh.
+    // Re-acquired on the next keystroke; select and refresh only resync the
+    // flag from the daemon's current holder.
     for (final s in _sessions) {
       s.hasInputLease = false;
     }
@@ -2099,6 +2229,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       _connectionStatus = 'Connecting...';
       _connectionStatusColor = const Color(0xffffc857);
+      // The hello handshake re-seeds this; until then the previous daemon's
+      // reading (if any) must not linger under the new status.
+      _daemonStats = null;
     });
 
     try {
@@ -2128,6 +2261,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         token: _bearerToken,
       );
       final authenticated = helloRes['authenticated'] as bool? ?? false;
+      _tailscalePairingAvailable =
+          helloRes['tailscale_pairing_available'] == true;
 
       if (_disposed ||
           generation != _connectGeneration ||
@@ -2147,7 +2282,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _pairingChallengeError = null;
         _connectionStatus = 'Connected to Daemon';
         _connectionStatusColor = const Color(0xff7fd1c7);
+        _daemonStats = daemonStatsFromResponse(helloRes);
       });
+      _startDaemonStatsPolling(generation, serverId);
 
       await _loadDaemonSessions();
       _reconnectAttempt = 0;
@@ -2226,7 +2363,67 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       _connectionStatusColor = const Color(0xffffc857);
     });
 
+    if (_tailscalePairingAvailable) {
+      await _pairViaTailscale(generation, serverId);
+      return;
+    }
     await _requestPairingChallenge(generation: generation);
+  }
+
+  /// Pairs by Tailscale identity: the daemon whoises this connection's peer
+  /// and mints a token for allowlisted tailnet users — no code, no PIN.
+  /// Attempted automatically on the pairing screen when the daemon
+  /// advertises it; failures surface with a retry affordance. There is no
+  /// code fallback: a daemon that advertises this refuses device codes.
+  Future<void> _pairViaTailscale(int generation, String serverId) async {
+    if (_disposed ||
+        generation != _connectGeneration ||
+        serverId != _activeServerId) {
+      return;
+    }
+    if (!_client.isConnected) {
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError =
+            'Connection closed before Tailscale pairing could complete.';
+      });
+      _scheduleReconnect();
+      return;
+    }
+
+    setState(() {
+      _pairingChallengeLoading = true;
+      _pairingChallengeError = null;
+    });
+
+    final String token;
+    try {
+      token = (await _client.pairViaTailscale(clientId: _clientId)).trim();
+      if (token.isEmpty) {
+        throw Exception('Server $serverId returned empty pairing token');
+      }
+    } catch (e) {
+      if (_disposed || generation != _connectGeneration) return;
+      setState(() {
+        _pairingChallengeLoading = false;
+        _pairingChallengeError = e.toString().replaceFirst('Exception: ', '');
+      });
+      return;
+    }
+    // Same store-before-guard ordering as the PIN flow: the token belongs to
+    // the captured daemon even if the user switched away mid-attempt.
+    persistClientId(_clientId);
+    persistTokenFor(serverId, token);
+    if (_disposed || serverId != _activeServerId) return;
+
+    setState(() {
+      _bearerToken = token;
+      _storageBackedClientId = retrieveClientId() == _clientId;
+      _pairingChallengeError = null;
+    });
+    _reconnectAttempt = 0;
+    _isConnecting = false;
+    await _connectWebSocket();
   }
 
   /// Re-checks the current token after a stale-context 401, pairing only when
@@ -2508,7 +2705,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               // The bulk response carries no cwd; live cwd arrives via push.
               updateCwd: false,
             );
-            session.lastActivityMs = entry.lastActivityMs;
+            // Input recency, not output: a noisy background job must not
+            // outrank sessions the user actually types in. 0 (unknown)
+            // orders last — except the input-unknown tier still orders by
+            // output (see [compareRecencyStamps]), so sessions adopted from
+            // a daemon predating input tracking keep a plausible position
+            // instead of collapsing to creation order.
+            session.lastInteractionMs = entry.lastInputMs;
+            session.lastOutputMs = entry.lastActivityMs;
           }
           _sessions.add(session);
         }
@@ -2714,7 +2918,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Primes [_pins] from this server's stored pins, in the background.
+  /// Primes [_pins] and [_railSortMode] from this server's stored rail state,
+  /// in the background.
   ///
   /// Runs off the load path deliberately, which then reads [_pins] synchronously.
   /// `SharedPreferences.getInstance()` completes only once its platform channel
@@ -2735,14 +2940,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionIds:
             prefs.getStringList(pinnedSessionsPrefKeyFor(serverId)) ?? [],
       );
+      // The sort mode restores on the same read. Assigned before the pins
+      // branch so a re-group it triggers already orders by the stored mode.
+      final restoredMode =
+          prefs.getString(railSortModePrefKeyFor(serverId)) == 'byActivity'
+          ? SessionRailSortMode.byActivity
+          : SessionRailSortMode.byRepo;
+      final modeChanged = restoredMode != _railSortMode;
+      _railSortMode = restoredMode;
       // A load that finished while this read was in flight grouped the rail with
       // no pins, so assigning the field alone would leave [_pins] describing a
       // layout [_sessionGroups] does not have. `pinPrefixTo` reads the displayed
       // order and assumes the pinned block already leads it, so the next drag
       // would compute its prefix against the wrong list and drop pins. Re-group
       // instead, without persisting, since this is what storage already says.
-      if (!restored.isEmpty && _sessionsServerId == serverId) {
-        _applyPins(restored, persist: false, syncToDaemon: false);
+      // A restored sort mode re-groups on its own too: local pins may be
+      // absent while daemon-supplied pins are active (or none are), and the
+      // mode must not wait for a pin change to take effect.
+      if (_sessionsServerId == serverId) {
+        if (!restored.isEmpty) {
+          _applyPins(restored, persist: false, syncToDaemon: false);
+        } else if (modeChanged) {
+          _applyPins(_pins, persist: false, syncToDaemon: false);
+        }
       } else if (_pins.isEmpty) {
         _pins = restored;
       }
@@ -2772,12 +2992,31 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _persistRailSortMode() async {
+    final serverId = _activeServerId;
+    // Same guard as [_persistPins]: never write the outgoing daemon's tiles'
+    // mode under the incoming daemon's key.
+    if (_sessionsServerId != serverId) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        railSortModePrefKeyFor(serverId),
+        _railSortMode == SessionRailSortMode.byActivity
+            ? 'byActivity'
+            : 'byRepo',
+      );
+    } catch (_) {
+      // Best-effort like the pins; ignore persistence failures.
+    }
+  }
+
   Future<void> _clearPinsFor(String serverId) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(pinnedGroupsPrefKeyFor(serverId));
       await prefs.remove(pinnedSessionsPrefKeyFor(serverId));
       await prefs.remove(sessionCustomLabelsPrefKeyFor(serverId));
+      await prefs.remove(railSortModePrefKeyFor(serverId));
     } catch (_) {
       // Best-effort; ignore removal failures.
     }
@@ -2885,7 +3124,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         SessionOrderingInput(
           sessionId: session.remoteSessionId!,
           repoRoot: session.repoRoot,
-          lastActivityMs: session.lastActivityMs,
+          lastInteractionMs: session.lastInteractionMs,
+          lastOutputMs: session.lastOutputMs,
         ),
   ];
 
@@ -2897,9 +3137,38 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   int _nextLocalActivityStamp() {
     var newest = 0;
     for (final session in _sessions) {
-      if (session.lastActivityMs > newest) newest = session.lastActivityMs;
+      if (session.lastInteractionMs > newest) newest = session.lastInteractionMs;
     }
     return newest + 1;
+  }
+
+  // Re-sort pause after a burst of local interaction. The stamp bump is
+  // immediate (every view ranks the touched session first from then on) but
+  // the regroup waits, so typing re-ranks without reshuffling the rail on
+  // every keystroke.
+  static const Duration _activityResortDelay = Duration(seconds: 1);
+  Timer? _activityResortTimer;
+  // A session context menu is showing. The debounced regroup waits for it:
+  // re-sorting now would move the row out from under the open menu.
+  bool _contextMenuOpen = false;
+
+  /// Records a local interaction with [session]: it outranks every session
+  /// for recency-ordered views, and the rail re-sorts once the burst
+  /// settles. Stays local: the next daemon context fetch re-asserts the
+  /// daemon's stamps.
+  void _noteLocalInteraction(SessionVm session) {
+    session.lastInteractionMs = _nextLocalActivityStamp();
+    _activityResortTimer?.cancel();
+    _activityResortTimer = Timer(_activityResortDelay, _fireActivityResort);
+  }
+
+  void _fireActivityResort() {
+    _activityResortTimer = null;
+    if (_contextMenuOpen) {
+      _activityResortTimer = Timer(_activityResortDelay, _fireActivityResort);
+      return;
+    }
+    _regroupRail();
   }
 
   /// Re-derives the rail's grouping from the sessions as they stand now,
@@ -2981,7 +3250,24 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// with a visibly grouped rail whose gestures silently did nothing, which is
   /// the opposite of what the guard is for.
   bool get _railGroupingIsCollapsed =>
-      _railGroupingDegraded && _sessionGroups.length <= 1;
+      _railSortMode == SessionRailSortMode.byRepo &&
+      _railGroupingDegraded &&
+      _sessionGroups.length <= 1;
+
+  /// Groups the rail's sessions for the current [_railSortMode].
+  List<SessionGroup> _groupRailSessions(SessionPins pins) =>
+      _groupOrderingInputs(_orderingInputs(), pins);
+
+  /// Groups [inputs] for the current [_railSortMode].
+  List<SessionGroup> _groupOrderingInputs(
+    List<SessionOrderingInput> inputs,
+    SessionPins pins,
+  ) {
+    if (_railSortMode == SessionRailSortMode.byRepo) {
+      return groupSessionsByRepo(inputs, pins: pins);
+    }
+    return flatSessionGroups(inputs, pins: pins);
+  }
 
   /// Re-applies [pins], reordering the rail and keeping the selection on the
   /// same session rather than the same index.
@@ -2993,7 +3279,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     bool persist = true,
     bool syncToDaemon = true,
   }) {
-    final groups = groupSessionsByRepo(_orderingInputs(), pins: pins);
+    final groups = _groupRailSessions(pins);
     final order = flattenGroups(groups);
     final byId = <String, SessionVm>{
       for (final session in _sessions)
@@ -3064,6 +3350,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// Drops every pin, returning the whole rail to activity ordering.
   void _resetRailOrder() => _applyPins(SessionPins.none);
 
+  /// Flips the rail between repository grouping and flat activity order.
+  ///
+  /// Pins are kept: session pins hoist in both modes, and group pins simply
+  /// have nothing to hold onto while flat, then apply again on the way back.
+  void _toggleRailSortMode() {
+    setState(() {
+      _railSortMode = _railSortMode == SessionRailSortMode.byRepo
+          ? SessionRailSortMode.byActivity
+          : SessionRailSortMode.byRepo;
+    });
+    _regroupRail();
+    unawaited(_persistRailSortMode());
+  }
+
   /// Releases one group back to activity ordering, leaving other pins alone.
   void _unpinGroup(String groupKey) =>
       _applyPins(unpin(_pins, groupKey: groupKey));
@@ -3082,14 +3382,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, SessionContextRecord> contexts,
     SessionPins pins,
   ) {
-    return groupSessionsByRepo([
+    return _groupOrderingInputs([
       for (final sessionId in sessionIds)
         SessionOrderingInput(
           sessionId: sessionId,
           repoRoot: contexts[sessionId]?.repositoryRoot,
-          lastActivityMs: contexts[sessionId]?.lastActivityMs ?? 0,
+          lastInteractionMs: contexts[sessionId]?.lastInputMs ?? 0,
+          lastOutputMs: contexts[sessionId]?.lastActivityMs ?? 0,
         ),
-    ], pins: pins);
+    ], pins);
   }
 
   // Placeholder rail row for a daemon session. [loading] true means it is being
@@ -3192,7 +3493,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // sinks the session, and with it its whole repository (a group is as
         // recent as its most recent member), to the bottom of a rail that is
         // supposed to surface exactly what is being used.
-        session.lastActivityMs = oldSession.lastActivityMs;
+        session.lastInteractionMs = oldSession.lastInteractionMs;
+        session.lastOutputMs = oldSession.lastOutputMs;
         // Same reasoning for the repository, which is what decides the session's
         // *group*: the replacement takes its context from the attach snapshot,
         // and a snapshot that omits one (an older daemon, or a session outside
@@ -3394,10 +3696,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (_isStale(owningGeneration)) throw const _StaleLoad();
       _subscriptionIds[subId] = sid;
 
+      // Observer: loading a session to look at it must not steal the input
+      // lease from another client (or agent) typing there. The first
+      // keystroke acquires it through the buffer-and-flush path instead.
       final attachRes = await _client.attachSession(
         sessionId: sid,
         clientId: _clientId,
-        mode: 'InteractiveController',
+        mode: 'Observer',
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
@@ -3439,7 +3744,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         isRemote: true,
         isExited: exited,
       );
-      session.hasInputLease = true;
+      session.hasInputLease = _attachGrantsInputLease(attachRes);
       // Snapshot carries the current snippet for the attached session (the list
       // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
@@ -3587,16 +3892,37 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final error = message['error'] as Map<String, dynamic>?;
       final msg = error?['message']?.toString() ?? '';
       if (msg.contains('input lease')) {
-        if (_sessions.isEmpty ||
-            _selectedIndex < 0 ||
-            _selectedIndex >= _sessions.length) {
-          return;
+        // The daemon names the rejected session in the message; clear and
+        // re-acquire THAT one. Clearing the selected session instead flaps an
+        // innocent session's lease (stealing it from whoever holds it) while
+        // the rejected one stays marked held and keeps dropping writes.
+        final namedSid = _leaseErrorSessionId(msg);
+        SessionVm? target;
+        if (namedSid != null) {
+          for (final s in _sessions) {
+            if ((_sessionIdFor(s) ?? s.remoteSessionId) == namedSid) {
+              target = s;
+              break;
+            }
+          }
         }
-        final current = _selectedSession;
-        final sid = _sessionIdFor(current) ?? current.remoteSessionId;
-        if (sid != null && !current.isExited) {
-          current.hasInputLease = false;
-          unawaited(_acquireInputLeaseAndFlush(current, sid));
+        // A named session absent from the rail (terminated, foreign, or
+        // stale) gets nothing: falling back to the selected session would
+        // steal its lease while the rejected one keeps dropping writes.
+        // Unparseable messages keep the legacy fallback below.
+        if (namedSid != null && target == null) return;
+        target ??=
+            (_sessions.isEmpty ||
+                _selectedIndex < 0 ||
+                _selectedIndex >= _sessions.length)
+            ? null
+            : _selectedSession;
+        final sid = target == null
+            ? null
+            : (_sessionIdFor(target) ?? target.remoteSessionId);
+        if (target != null && sid != null && !target.isExited) {
+          target.hasInputLease = false;
+          unawaited(_acquireInputLeaseAndFlush(target, sid));
         }
       }
       return;
@@ -3762,11 +4088,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         cwd: message['current_working_directory']?.toString(),
         updateCwd: message['current_working_directory'] != null,
       );
-      final lastActivity = message['last_activity_ms'];
-      if (lastActivity is int) {
-        session.lastActivityMs = lastActivity;
-      } else if (lastActivity is num) {
-        session.lastActivityMs = lastActivity.toInt();
+      final lastInput = message['last_input_ms'];
+      if (lastInput is int) {
+        session.lastInteractionMs = lastInput;
+      } else if (lastInput is num) {
+        session.lastInteractionMs = lastInput.toInt();
+      }
+      final lastOutput = message['last_activity_ms'];
+      if (lastOutput is int) {
+        session.lastOutputMs = lastOutput;
+      } else if (lastOutput is num) {
+        session.lastOutputMs = lastOutput.toInt();
       }
       _setupSessionInputListener(session);
 
@@ -4093,9 +4425,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _onWebSocketError(dynamic error, int generation) {
     if (_disposed || generation != _connectGeneration) return;
+    _stopDaemonStatsPolling();
     setState(() {
       _connectionStatus = 'Error';
       _connectionStatusColor = const Color(0xffff6b6b);
+      _daemonStats = null;
       _markAttachedSessionsDisconnected();
     });
     _scheduleReconnect();
@@ -4103,9 +4437,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
+    _stopDaemonStatsPolling();
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
+      _daemonStats = null;
       if (_needsPairing) {
         _pairingChallengeLoading = false;
         _pairingChallengeError =
@@ -4121,9 +4457,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _wakeWatchdogTimer?.cancel();
+    _stopDaemonStatsPolling();
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
+    _activityResortTimer?.cancel();
     if (_clientInitialized) {
       _client.disconnect();
       _websocketSubscription?.cancel();
@@ -4188,6 +4526,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.focusCursorOnNextDisplay();
       _selectedIndex = index;
     });
+    // Selecting is interacting: the rail's recency views re-rank it first.
+    // (This is the rail tap path only; programmatic selection goes through
+    // the load and reselect paths, which must not disturb daemon order.)
+    _noteLocalInteraction(session);
     if (!canRefresh) return;
     // Lazy-load: an unopened session has no live subscription yet (the connect
     // path only attached the initially-selected one), so attach it now instead
@@ -4262,16 +4604,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // A success arriving after a purge must not resurrect the lease the
       // disconnect just reset; the catch below already fails safe to false.
       final leaseGeneration = _connectGeneration;
+      // Observer: selecting resyncs the flag from whoever holds the lease
+      // without stealing it; typing claims it on demand.
       unawaited(
         _client
             .attachSession(
               sessionId: sid,
               clientId: _clientId,
-              mode: 'InteractiveController',
+              mode: 'Observer',
             )
-            .then((_) {
+            .then((attachRes) {
               if (_isStale(leaseGeneration)) return;
-              session.hasInputLease = true;
+              session.hasInputLease = _attachGrantsInputLease(attachRes);
             })
             .catchError((Object e) {
               if (e is TriageAuthException) {
@@ -4280,7 +4624,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 return;
               }
               if (_isStale(leaseGeneration)) return;
-              debugPrint('Interactive lease attach failed for $sid: $e');
+              debugPrint('Select lease attach failed for $sid: $e');
               session.hasInputLease = false;
             }),
       );
@@ -4359,16 +4703,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
     try {
+      // Observer: a refresh must not steal the lease from whoever is typing.
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
-        mode: 'InteractiveController',
+        mode: 'Observer',
       );
       // The purge or reconnect may have landed during the attach: returning
       // before the restore/resize branches keeps those writes off the new
       // daemon, and skips a lease mark the disconnect just reset.
       if (_isStale(owningGeneration)) return;
-      session.hasInputLease = true;
+      session.hasInputLease = _attachGrantsInputLease(attachRes);
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot != null && !_disposed) {
@@ -4414,13 +4759,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
             // The resubscribe above bails silently when stale; without this
             // recheck the fresh attach would fire at the new daemon under a
-            // colliding id and claim a lease there.
+            // colliding id.
             if (_isStale(owningGeneration)) return;
             reviveStep = _ResubStep.attach;
             final freshAttachRes = await _client.attachSession(
               sessionId: sessionId,
               clientId: _clientId,
-              mode: 'InteractiveController',
+              mode: 'Observer',
             );
             final freshResponseObj =
                 freshAttachRes['response'] as Map<String, dynamic>?;
@@ -4728,7 +5073,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             isRemote: true,
             isExited: exited,
           );
-          session.hasInputLease = true;
+          session.hasInputLease = _attachGrantsInputLease(attachRes);
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
           final bracketedPaste =
@@ -4752,11 +5097,32 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // running behind the daemon would bury the new session, the exact
           // outcome this is here to prevent. The real stamp arrives with the
           // next context fetch and takes over.
-          session.lastActivityMs = _nextLocalActivityStamp();
+          session.lastInteractionMs = _nextLocalActivityStamp();
 
           setState(() {
-            _sessions.insert(0, session);
-            _selectedIndex = 0;
+            // The daemon broadcasts session_started at spawn, so the push can
+            // land while this create was still awaiting subscribe/attach,
+            // planting a placeholder the push handler could not yet match to
+            // a tile. Replace it in place instead of inserting a second tile
+            // for one session: duplicates share one rail key and one input
+            // lease, rendering stuck twins that fight over keystrokes.
+            final existingIndex = _sessions.indexWhere(
+              (s) => s.remoteSessionId == sessionId,
+            );
+            if (existingIndex != -1) {
+              _sessions[existingIndex].dispose();
+              _sessions[existingIndex] = session;
+              _selectedIndex = existingIndex;
+              // Same controller swap as the load path: a pane mounted for the
+              // placeholder keeps listening to its controller otherwise.
+              TerminalPane.rebindSessionController(
+                session.title,
+                session.terminalController,
+              );
+            } else {
+              _sessions.insert(0, session);
+              _selectedIndex = 0;
+            }
             _connectionStatus = 'Connected to Daemon';
             _connectionStatusColor = const Color(0xff7fd1c7);
           });
@@ -4976,7 +5342,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     );
 
     final hasLabel = session.trimmedCustomLabel != null;
-    final result = await showMenu<String>(
+    _contextMenuOpen = true;
+    final String? result;
+    try {
+      result = await showMenu<String>(
       context: context,
       position: rect,
       color: const Color(0xff1b2327),
@@ -5036,7 +5405,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             ),
           ),
       ],
-    );
+      );
+    } finally {
+      _contextMenuOpen = false;
+    }
 
     if (!mounted || result == null) return;
 
@@ -5184,7 +5556,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 expiresAt: _pairingExpiresAt,
                 isChallengeLoading: _pairingChallengeLoading,
                 challengeError: _pairingChallengeError,
+                tailscaleAvailable: _tailscalePairingAvailable,
                 onRefreshChallenge: () => _requestPairingChallenge(),
+                onTailscaleRetry: () =>
+                    _pairViaTailscale(_connectGeneration, _activeServerId),
                 onPair: _onPairRequested,
                 onCancel: () async {
                   try {
@@ -5240,6 +5615,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionGroups: _sessionGroups,
         pins: _pins,
         onResetOrder: _resetRailOrder,
+        sortMode: _railSortMode,
+        onToggleSortMode: _toggleRailSortMode,
         onUnpinGroup: _unpinGroup,
         onUnpinSession: _unpinSession,
         onSessionContextMenu: _showSessionContextMenu,
@@ -5268,6 +5645,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         connectionStatus: _connectionStatus,
         connectionStatusColor: _connectionStatusColor,
         serverLabel: _activeServer?.label,
+        diskStatus: _daemonStats == null
+            ? null
+            : formatDiskFree(
+                _daemonStats!.diskFreeBytes,
+                _daemonStats!.diskTotalBytes,
+              ),
         onOpenSettings: _openConnectionSettings,
         onToggleJudgePolicy: _toggleSessionJudgePolicy,
         isCollapsed: isMobile ? false : _sidebarCollapsed,
@@ -5314,6 +5697,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
+              softKeyboardEnabled: _softKeyboardEnabled,
+              // The header toggle only exists where a soft keyboard can
+              // raise and shift the layout (native mobile + mobile web).
+              onToggleSoftKeyboard: isMobilePlatform()
+                  ? _toggleSoftKeyboard
+                  : null,
             );
 
       if (isMobile) {
@@ -5401,6 +5790,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 /// keeps the row's own background: the rail paints its tiles itself, and an
 /// opaque `Material` underneath them would flash the theme's surface colour for
 /// the duration of the drag.
+/// How the session rail orders its rows.
+enum SessionRailSortMode {
+  /// Repository groups, each ordered by activity (the default).
+  byRepo,
+
+  /// A single flat list ordered by last interaction, ignoring repositories.
+  byActivity,
+}
+
 Widget _railDragProxyDecorator(
   Widget child,
   int index,
@@ -5423,6 +5821,8 @@ class SessionRail extends StatefulWidget {
     required this.sessionGroups,
     required this.pins,
     required this.onResetOrder,
+    required this.sortMode,
+    required this.onToggleSortMode,
     required this.onUnpinGroup,
     required this.onUnpinSession,
     required this.selectedIndex,
@@ -5438,6 +5838,7 @@ class SessionRail extends StatefulWidget {
     required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
+    this.diskStatus,
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
@@ -5459,6 +5860,10 @@ class SessionRail extends StatefulWidget {
   final SessionPins pins;
   // Drops every pin, returning the rail to activity ordering.
   final VoidCallback onResetOrder;
+  // How the rail orders its rows, and the toggle that flips it. The button
+  // shows the mode a tap switches *to*.
+  final SessionRailSortMode sortMode;
+  final VoidCallback onToggleSortMode;
   // Release a single group or row, leaving the rest of the layout intact. Bound
   // to the pin indicator itself rather than a context menu: on touch, the rail's
   // long-press is already the drag trigger, so a menu would compete with it.
@@ -5502,6 +5907,9 @@ class SessionRail extends StatefulWidget {
   final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
+  // Preformatted free-space line ("12,340 MB free (23%)"), or null while
+  // unknown, which hides the line. Rendered below [connectionStatus].
+  final String? diskStatus;
   // Name of the daemon these sessions belong to. Null when none is configured
   // (the injected-client test path).
   final String? serverLabel;
@@ -5638,9 +6046,11 @@ class _SessionRailState extends State<SessionRail> {
         ),
         const SizedBox(height: 16),
         Tooltip(
-          message: widget.serverLabel == null
-              ? widget.connectionStatus
-              : '${widget.serverLabel} — ${widget.connectionStatus}',
+          message: [
+            if (widget.serverLabel != null) widget.serverLabel!,
+            widget.connectionStatus,
+            if (widget.diskStatus != null) widget.diskStatus!,
+          ].join(' — '),
           child: Container(
             width: 10,
             height: 10,
@@ -5828,6 +6238,7 @@ class _SessionRailState extends State<SessionRail> {
               status: widget.connectionStatus,
               color: widget.connectionStatusColor,
               serverLabel: widget.serverLabel,
+              diskStatus: widget.diskStatus,
             ),
           ),
         ),
@@ -5846,6 +6257,24 @@ class _SessionRailState extends State<SessionRail> {
                     letterSpacing: 0,
                   ),
                 ),
+              ),
+              // Flips between repository grouping and a flat activity-ordered
+              // list. The icon names the mode a tap switches to.
+              IconButton(
+                onPressed: widget.onToggleSortMode,
+                icon: Icon(
+                  widget.sortMode == SessionRailSortMode.byRepo
+                      ? Icons.format_list_bulleted
+                      : Icons.account_tree,
+                  size: 16,
+                ),
+                color: const Color(0xff7f8b8d),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                tooltip: widget.sortMode == SessionRailSortMode.byRepo
+                    ? 'Show sessions by recent activity'
+                    : 'Group sessions by repository',
               ),
               // Only offered once something is actually pinned, so it doubles as
               // the signal that the rail is holding a manual order at all.
@@ -6249,15 +6678,18 @@ class _ConnectionStatus extends StatelessWidget {
     required this.status,
     required this.color,
     this.serverLabel,
+    this.diskStatus,
   });
 
   final String status;
   final Color color;
   final String? serverLabel;
+  final String? diskStatus;
 
   @override
   Widget build(BuildContext context) {
     final label = serverLabel;
+    final disk = diskStatus;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -6287,6 +6719,15 @@ class _ConnectionStatus extends StatelessWidget {
                       ? const TextStyle(fontWeight: FontWeight.w600)
                       : const TextStyle(color: Color(0xff7f8b8d), fontSize: 12),
                 ),
+                if (disk != null)
+                  Text(
+                    disk,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xff7f8b8d),
+                      fontSize: 12,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -9769,6 +10210,8 @@ class SessionWorkspace extends StatelessWidget {
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
+    this.softKeyboardEnabled = true,
+    this.onToggleSoftKeyboard,
   });
 
   final SessionVm session;
@@ -9779,6 +10222,10 @@ class SessionWorkspace extends StatelessWidget {
   // Re-asserts this device's terminal size on the shared PTY.
   final VoidCallback? onRefit;
   final VoidCallback? onToggleJudge;
+  // Mobile soft-keyboard kill switch: the state drives the terminal pane,
+  // the toggle lives in the workspace header.
+  final bool softKeyboardEnabled;
+  final VoidCallback? onToggleSoftKeyboard;
 
   @override
   Widget build(BuildContext context) {
@@ -9790,6 +10237,8 @@ class SessionWorkspace extends StatelessWidget {
           onOpenRail: onOpenRail,
           onRefit: onRefit,
           onToggleJudge: onToggleJudge,
+          softKeyboardEnabled: softKeyboardEnabled,
+          onToggleSoftKeyboard: onToggleSoftKeyboard,
         ),
         Expanded(
           child: TerminalPane(
@@ -9809,6 +10258,7 @@ class SessionWorkspace extends StatelessWidget {
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
             isLoading: session.status == 'loading' || !session.loaded,
+            softKeyboardEnabled: softKeyboardEnabled,
           ),
         ),
       ],
@@ -9824,6 +10274,8 @@ class WorkspaceHeader extends StatelessWidget {
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
+    this.softKeyboardEnabled = true,
+    this.onToggleSoftKeyboard,
   });
 
   final SessionVm session;
@@ -9835,6 +10287,10 @@ class WorkspaceHeader extends StatelessWidget {
   // to this device reclaims the size from whichever device resized it last.
   final VoidCallback? onRefit;
   final VoidCallback? onToggleJudge;
+  // Soft-keyboard kill switch. Null hides the header key (desktop, where no
+  // soft keyboard can raise).
+  final bool softKeyboardEnabled;
+  final VoidCallback? onToggleSoftKeyboard;
 
   @override
   Widget build(BuildContext context) {
@@ -9981,6 +10437,29 @@ class WorkspaceHeader extends StatelessWidget {
                 ),
                 SizedBox(width: isNarrow ? 4 : 8),
               ],
+              if (onToggleSoftKeyboard != null) ...[
+                IconButton(
+                  icon: Icon(
+                    softKeyboardEnabled
+                        ? Icons.keyboard
+                        : Icons.keyboard_hide,
+                    size: isNarrow ? 18 : 24,
+                    color: softKeyboardEnabled
+                        ? const Color(0xffcdd7d6)
+                        : const Color(0xffffc857),
+                  ),
+                  tooltip: softKeyboardEnabled
+                      ? 'Soft keyboard: ON (tap to suppress)'
+                      : 'Soft keyboard: suppressed (tap to enable)',
+                  visualDensity: isNarrow ? VisualDensity.compact : null,
+                  padding: isNarrow ? const EdgeInsets.all(4) : null,
+                  constraints: isNarrow
+                      ? const BoxConstraints(minWidth: 32, minHeight: 32)
+                      : null,
+                  onPressed: onToggleSoftKeyboard,
+                ),
+                SizedBox(width: isNarrow ? 4 : 8),
+              ],
               if (onClose != null)
                 IconButton(
                   icon: Icon(
@@ -10016,7 +10495,9 @@ class _PairingView extends StatefulWidget {
     required this.expiresAt,
     required this.isChallengeLoading,
     required this.challengeError,
+    required this.tailscaleAvailable,
     required this.onRefreshChallenge,
+    required this.onTailscaleRetry,
     required this.onPair,
     required this.onCancel,
   });
@@ -10025,7 +10506,9 @@ class _PairingView extends StatefulWidget {
   final DateTime? expiresAt;
   final bool isChallengeLoading;
   final String? challengeError;
+  final bool tailscaleAvailable;
   final Future<void> Function() onRefreshChallenge;
+  final Future<void> Function() onTailscaleRetry;
   final Future<void> Function(String pin) onPair;
   final VoidCallback onCancel;
 
@@ -10103,8 +10586,90 @@ class _PairingViewState extends State<_PairingView> {
     );
   }
 
+  /// Tailscale-identity pairing: attempted automatically, so this is a status
+  /// view — a spinner while the daemon verifies this device's tailnet user,
+  /// an error with a retry button when it refuses. No code or PIN exists on
+  /// this path: the daemon disables device codes when configured for it.
+  Widget _buildTailscale(BuildContext context) {
+    final error = widget.challengeError;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Row(
+          children: [
+            Icon(Icons.security, color: Color(0xff7fd1c7), size: 28),
+            SizedBox(width: 12),
+            Text(
+              'Pair with Tailscale',
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'This daemon pairs by tailnet identity. Verifying this device with the daemon — no code needed.',
+          style: TextStyle(color: Color(0xffa5b1b4), fontSize: 14, height: 1.4),
+        ),
+        const SizedBox(height: 12),
+        if (widget.isChallengeLoading)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: CircularProgressIndicator(
+                strokeWidth: 2.5,
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xff7fd1c7)),
+              ),
+            ),
+          )
+        else if (error != null) ...[
+          Text(
+            error,
+            style: const TextStyle(color: Color(0xffff6b6b), fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 12,
+            runSpacing: 8,
+            children: [
+              TextButton(
+                onPressed: widget.onCancel,
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xff7f8b8d),
+                ),
+                child: const Text('Cancel (Offline Mode)'),
+              ),
+              ElevatedButton(
+                onPressed: () => widget.onTailscaleRetry(),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xff2b6f6f),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: const Text('Try Again'),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (widget.tailscaleAvailable) return _buildTailscale(context);
+
     final deviceCode = widget.deviceCode;
     final expiryLabel = _expiryLabel(widget.expiresAt);
     final cliCommand = _cliCommand(deviceCode);
