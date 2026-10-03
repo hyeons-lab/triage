@@ -636,6 +636,19 @@ class SessionVm {
     return displayTitle;
   }
 
+  /// What the rail row and workspace header show for this session: the
+  /// sticky [status], except a remote session on a dead socket always reads
+  /// disconnected. The sticky string only moves on observed events, so
+  /// without this a half-dead socket holds a green "attached" while typing
+  /// goes nowhere. Local sessions and exited sessions report as-is: the
+  /// socket is irrelevant to the former and cannot revive the latter.
+  ({String text, Color color}) displayStatus({required bool connected}) {
+    if (!connected && isRemote && !isExited && status != 'exited') {
+      return (text: 'disconnected', color: const Color(0xffff6b6b));
+    }
+    return (text: status, color: statusColor);
+  }
+
   /// The inferred worktree currently leading the row, or null when the live
   /// context names its own workstream — a distinct current worktree or a branch
   /// that isn't the default — so the inference stays out of the way, or when
@@ -939,6 +952,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // letting it veto the load it will never perform.
   final GenerationClaims _loadingClaims = GenerationClaims();
   final Map<String, List<int>> _pendingInputBytes = {};
+
+  /// Cap per session for input buffered while lease-less or offline. Past
+  /// this the session is gone or wedged rather than merely slow, so further
+  /// bytes drop with a log instead of growing the buffer without bound.
+  static const int _maxPendingInputBytes = 4096;
   final GenerationClaims _leaseAcquisitionClaims = GenerationClaims();
   // Marks the selected session's rail tile so reopening the rail can scroll it
   // to the top — the session you're in should be the first thing you see.
@@ -956,6 +974,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Refreshes [_daemonStats] while connected; disk pressure builds over the
   // course of a session, so a connect-time reading alone goes stale.
   Timer? _daemonStatsTimer;
+  // Liveness probe for the socket; a failed beat tears the connection down
+  // through the close path so a half-dead socket cannot hold a green
+  // indicator while typing goes nowhere.
+  Timer? _heartbeatTimer;
   // The active daemon's disk stats, seeded from the hello handshake and kept
   // current by [_daemonStatsTimer]. Null while unknown (no connection, or a
   // daemon predating stats), which hides the free-space line.
@@ -1139,6 +1161,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Daemon disk-stats refresh cadence. Disk pressure builds over minutes, so a
   // minute keeps the free-space line honest without chattering the socket.
   static const Duration _daemonStatsPollInterval = Duration(seconds: 60);
+  // Liveness cadence: comfortably above the 10s request timeout so one slow
+  // beat cannot destroy a healthy connection, and short enough that a dead
+  // socket is noticed while the user is still looking at it.
+  static const Duration _heartbeatInterval = Duration(seconds: 25);
 
   @override
   void initState() {
@@ -1413,6 +1439,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _customLabels = {};
     _railSortMode = SessionRailSortMode.byRepo;
     _stopDaemonStatsPolling();
+    _stopHeartbeat();
     _daemonStats = null;
   }
 
@@ -1889,8 +1916,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       if (_isRemoteSession(session)) {
         if (!_client.isConnected) {
+          // Mark, but do not drop: the bytes buffer in
+          // `_sendRemoteSessionInput` and flush when the reconnect
+          // re-acquires the lease.
           _markRemoteSessionDisconnected(session);
-          return;
         }
 
         if (session.isExited || session.status == 'exited') {
@@ -2046,7 +2075,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     String sessionId,
     List<int> bytes,
   ) {
-    if (session.hasInputLease) {
+    if (!session.hasInputLease || !_client.isConnected) {
+      // Buffer input so keystrokes are never dropped while acquiring the
+      // lease or while the socket is down; both flush on (re-)acquire.
+      final buffer = _pendingInputBytes.putIfAbsent(sessionId, () => <int>[]);
+      if (buffer.length + bytes.length > _maxPendingInputBytes) {
+        debugPrint(
+          'Dropping ${bytes.length} input bytes for $sessionId: '
+          'pending buffer full',
+        );
+        return;
+      }
+      buffer.addAll(bytes);
+      // No-ops while offline (its own guard returns first); the reconnect
+      // path below flushes proactively, and the next keystroke retries.
+      unawaited(_acquireInputLeaseAndFlush(session, sessionId));
+    } else {
       _client
           .writeInput(sessionId: sessionId, clientId: _clientId, bytes: bytes)
           .catchError((error) {
@@ -2054,11 +2098,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               _markRemoteSessionDisconnected(session);
             }
           });
-    } else {
-      // Buffer input so keystrokes are never dropped while acquiring the lease.
-      final buffer = _pendingInputBytes.putIfAbsent(sessionId, () => <int>[]);
-      buffer.addAll(bytes);
-      unawaited(_acquireInputLeaseAndFlush(session, sessionId));
     }
   }
 
@@ -2161,6 +2200,44 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _daemonStatsTimer = null;
   }
 
+  /// Probes socket liveness with a cheap `hello` while this connection
+  /// lives. A beat that fails (timeout, not auth: an unauthenticated hello
+  /// still answers) with the channel nominally up means a half-dead socket,
+  /// and it is torn down through the close path so the indicator, the
+  /// session marks, and the reconnect all run. Guarded like the stats
+  /// poller, plus foreground (a throttled background timer must not
+  /// destroy a connection nobody is watching) and pairing (nothing to
+  /// prove before auth).
+  void _startHeartbeat(int generation) {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) async {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          !_clientInitialized ||
+          !_client.isConnected ||
+          _needsPairing ||
+          !_clientForeground) {
+        return;
+      }
+      try {
+        await _client.hello(clientId: _clientId, token: _bearerToken);
+      } catch (e) {
+        if (_disposed || generation != _connectGeneration) return;
+        if (!_client.isConnected) return;
+        debugPrint('Heartbeat failed; tearing down dead socket: $e');
+        try {
+          await _client.disconnect();
+        } catch (_) {}
+        _onWebSocketClosed(generation);
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+  }
+
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
     if (_disposed) return;
     // Nothing to dial. Without this, a connect raised while the connection
@@ -2182,6 +2259,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _stopDaemonStatsPolling();
+    _stopHeartbeat();
     final generation = ++_connectGeneration;
     if (_clientInitialized) {
       final subscription = _websocketSubscription;
@@ -2285,6 +2363,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _daemonStats = daemonStatsFromResponse(helloRes);
       });
       _startDaemonStatsPolling(generation, serverId);
+      _startHeartbeat(generation);
 
       await _loadDaemonSessions();
       _reconnectAttempt = 0;
@@ -2794,6 +2873,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
           }
         }
+      }
+
+      // Input typed while the socket was down buffered instead of dropping;
+      // flush it now that the selected session is re-attached rather than
+      // waiting for the next keystroke. Other sessions flush on select.
+      if (!_isStale(generation) &&
+          sessionIds.isNotEmpty &&
+          !failedSessionIds.contains(sessionIds[targetSelectedIndex]) &&
+          (_pendingInputBytes[sessionIds[targetSelectedIndex]]?.isNotEmpty ??
+              false)) {
+        unawaited(
+          _acquireInputLeaseAndFlush(
+            _sessions[targetSelectedIndex],
+            sessionIds[targetSelectedIndex],
+          ),
+        );
       }
 
       if (!_disposed && generation == _connectGeneration) {
@@ -4128,6 +4223,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final session = _sessions[index];
       session.dispose();
       TerminalPane.destroySession(session.title);
+      _pendingInputBytes.remove(sessionId);
 
       final wasSelected = index == _selectedIndex;
       if (index < _selectedIndex) {
@@ -4426,6 +4522,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onWebSocketError(dynamic error, int generation) {
     if (_disposed || generation != _connectGeneration) return;
     _stopDaemonStatsPolling();
+    _stopHeartbeat();
     setState(() {
       _connectionStatus = 'Error';
       _connectionStatusColor = const Color(0xffff6b6b);
@@ -4438,6 +4535,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
     _stopDaemonStatsPolling();
+    _stopHeartbeat();
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
@@ -4458,6 +4556,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _wakeWatchdogTimer?.cancel();
     _stopDaemonStatsPolling();
+    _stopHeartbeat();
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
@@ -5221,6 +5320,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _sessions.removeAt(index);
         session.dispose();
         TerminalPane.destroySession(session.title);
+        final removedId = _sessionIdFor(session) ?? session.remoteSessionId;
+        if (removedId != null) _pendingInputBytes.remove(removedId);
         if (_selectedIndex >= _sessions.length) {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
         }
@@ -5644,6 +5745,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         ),
         connectionStatus: _connectionStatus,
         connectionStatusColor: _connectionStatusColor,
+        connected: _client.isConnected,
         serverLabel: _activeServer?.label,
         diskStatus: _daemonStats == null
             ? null
@@ -5691,6 +5793,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ? emptyWorkspace
           : SessionWorkspace(
               session: currentSession,
+              connected: _client.isConnected,
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
@@ -5838,6 +5941,7 @@ class SessionRail extends StatefulWidget {
     required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
+    required this.connected,
     this.diskStatus,
     required this.onOpenSettings,
     required this.isCollapsed,
@@ -5907,6 +6011,9 @@ class SessionRail extends StatefulWidget {
   final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
+  // Live socket state: rows read disconnected on a dead socket no matter
+  // what their sticky session string says.
+  final bool connected;
   // Preformatted free-space line ("12,340 MB free (23%)"), or null while
   // unknown, which hides the line. Rendered below [connectionStatus].
   final String? diskStatus;
@@ -6422,6 +6529,9 @@ class _SessionRailState extends State<SessionRail> {
                       final matchIndex = rowIndexFor[index]!;
                       final entry = matchingEntries[matchIndex];
                       final session = entry.session;
+                      final display = session.displayStatus(
+                        connected: widget.connected,
+                      );
                       final originalIndex = entry.originalIndex;
                       final key = ValueKey<String>(_rowKeyFor(session));
                       final tile = SessionListTile(
@@ -6431,8 +6541,8 @@ class _SessionRailState extends State<SessionRail> {
                         selected: originalIndex == widget.selectedIndex,
                         title: session.railTitleAt(now),
                         glanceTitle: session.glanceTitleAt(now),
-                        subtitle: session.status,
-                        statusColor: session.statusColor,
+                        subtitle: display.text,
+                        statusColor: display.color,
                         icon: session.icon,
                         branch: session.branch,
                         repoName: session.repoName,
@@ -10205,6 +10315,7 @@ class SessionWorkspace extends StatelessWidget {
   const SessionWorkspace({
     super.key,
     required this.session,
+    required this.connected,
     this.onCloseSession,
     this.onViewFit,
     this.onOpenRail,
@@ -10215,6 +10326,7 @@ class SessionWorkspace extends StatelessWidget {
   });
 
   final SessionVm session;
+  final bool connected;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
   // Mobile only: opens the session rail overlay from the workspace header.
@@ -10233,6 +10345,7 @@ class SessionWorkspace extends StatelessWidget {
       children: [
         WorkspaceHeader(
           session: session,
+          connected: connected,
           onClose: onCloseSession,
           onOpenRail: onOpenRail,
           onRefit: onRefit,
@@ -10270,6 +10383,7 @@ class WorkspaceHeader extends StatelessWidget {
   const WorkspaceHeader({
     super.key,
     required this.session,
+    required this.connected,
     this.onClose,
     this.onOpenRail,
     this.onRefit,
@@ -10279,6 +10393,9 @@ class WorkspaceHeader extends StatelessWidget {
   });
 
   final SessionVm session;
+  // Live socket state: the status dot reads disconnected on a dead socket
+  // no matter what the sticky session string says.
+  final bool connected;
   final VoidCallback? onClose;
   // Mobile only: opens the session rail overlay. Null on desktop, where the
   // rail is always visible beside the workspace.
@@ -10320,6 +10437,7 @@ class WorkspaceHeader extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isNarrow = constraints.maxWidth < 600;
+        final display = session.displayStatus(connected: connected);
         return Container(
           height: 68,
           padding: EdgeInsets.symmetric(horizontal: isNarrow ? 12 : 22),
@@ -10405,17 +10523,17 @@ class WorkspaceHeader extends StatelessWidget {
                 SizedBox(width: isNarrow ? 2 : 4),
               ],
               Tooltip(
-                message: session.status,
+                message: display.text,
                 child: Icon(
                   Icons.circle,
                   size: isNarrow ? 10 : 12,
-                  color: session.statusColor,
+                  color: display.color,
                 ),
               ),
               if (!isNarrow) ...[
                 const SizedBox(width: 8),
                 Text(
-                  session.status,
+                  display.text,
                   style: const TextStyle(color: Color(0xffcdd7d6)),
                 ),
               ],
