@@ -3,7 +3,10 @@ mod tests {
     use crate::session::{SessionManager, SessionManagerConfig};
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
-    use triage_core::session::{SessionApi, SessionId, SessionSize, StartSessionRequest};
+    use triage_core::session::{
+        AttachMode, AttachSessionRequest, ClientId, InputControllerKind, InputLeaseRequest,
+        InputLeaseState, SessionApi, SessionId, SessionSize, StartSessionRequest,
+    };
 
     struct TempDir {
         path: PathBuf,
@@ -128,6 +131,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         let original = session.clone();
 
@@ -165,6 +169,7 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 judge_override: None,
+                lease: InputLeaseState::default(),
             })
             .collect();
         let state = crate::handover::HandoverState {
@@ -240,6 +245,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session],
@@ -325,6 +331,7 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 judge_override: None,
+                lease: InputLeaseState::default(),
             }],
             has_tcp_listener: false,
             sends_teardown_commit: true,
@@ -557,6 +564,72 @@ mod tests {
         Ok(())
     }
 
+    /// The input lease must survive a handover: if adoption resets it, the
+    /// next write from the client that still believes it holds the lease is
+    /// denied and that keystroke is lost.
+    #[test]
+    fn handover_round_trip_preserves_the_input_lease() -> anyhow::Result<()> {
+        let _handover_lock = handover_state_lock();
+        let temp_dir = TempDir::new()?;
+        let log_dir = temp_dir.path.clone();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let session_id = manager.start_session(StartSessionRequest {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 100".to_string()],
+            cwd: Some(std::env::current_dir()?),
+            size: SessionSize::default(),
+        })?;
+
+        let holder = ClientId::new("lease-holder")?;
+        manager.acquire_input_lease(InputLeaseRequest {
+            session_id: session_id.clone(),
+            client_id: holder,
+            kind: InputControllerKind::Interactive,
+        })?;
+
+        let (state, fds) = manager.serialize_active_sessions()?;
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(
+            state.sessions[0]
+                .lease
+                .holder
+                .as_ref()
+                .map(|holder| holder.client_id.as_str()),
+            Some("lease-holder"),
+            "serialize must carry the lease holder"
+        );
+
+        // Through JSON like the real transfer: the lease must survive serde.
+        let json = serde_json::to_string(&state)?;
+        let state: crate::handover::HandoverState = serde_json::from_str(&json)?;
+
+        let new_manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        new_manager.adopt_sessions(state, fds)?;
+
+        // Observe without disturbing: an observing attach reports the
+        // current holder instead of taking the lease over.
+        let response = new_manager.attach_session(AttachSessionRequest {
+            session_id: session_id.clone(),
+            client_id: ClientId::new("observer")?,
+            mode: AttachMode::Observer,
+        })?;
+        assert_eq!(
+            response
+                .lease
+                .holder
+                .as_ref()
+                .map(|holder| holder.client_id.as_str()),
+            Some("lease-holder"),
+            "adopt must restore the handover lease holder"
+        );
+        assert_eq!(response.lease.generation, 1);
+
+        manager.detach_all_live_sessions();
+        new_manager.shutdown_session(session_id)?;
+        Ok(())
+    }
+
     /// A descriptor handed to the code under test, whose closure can be
     /// observed reliably from inside a parallel test binary.
     ///
@@ -695,6 +768,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],
@@ -787,6 +861,7 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 judge_override: None,
+                lease: InputLeaseState::default(),
             })
         };
 
@@ -916,6 +991,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -971,6 +1047,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1032,6 +1109,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
             socket_identity,
@@ -1102,6 +1180,7 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
         let snapshot = |owner_token, fd| {
             crate::handover::remember_recovered_handover_for_test(
