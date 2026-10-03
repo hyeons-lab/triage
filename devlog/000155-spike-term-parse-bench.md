@@ -66,6 +66,11 @@ do the xterm2 swap and shelve triage-term. Spike branch — no product code.
   package addresses the typing lag (separate, still undiagnosed) or
   reconnect frequency; chunked+yield replay remains good hardening for
   either package given xterm2's thin margin.
+- `flutter drive` uninstalls the app package on completion (drive_service
+  stop method). The gate runs wiped the user's release install from the
+  Pixel; rebuilt and reinstalled `app-release.apk` from
+  feat/flutter-client-ux-trio at ac06f3d after. Future on-device benches
+  must reinstall the release APK as their last step.
 
 ## Lessons Learned
 
