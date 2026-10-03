@@ -99,10 +99,13 @@ fn unmapped_ip(ip: IpAddr) -> IpAddr {
 }
 
 /// Candidate `tailscale` binaries, tried in order until one yields a
-/// parseable answer. The daemon usually runs under launchd/systemd with a
-/// minimal `PATH`, so absolute locations come before the bare `PATH` lookup.
-/// Notably absent: the macOS GUI app bundle binary, which requires a GUI
-/// context and fails headless — resolvable but unrunnable here.
+/// parseable answer. The search also stops at the first working CLI that
+/// answers with valid JSON, since other paths to the same tailscaled cannot
+/// change the answer (see [`judge_whois_output`]). The daemon usually runs under
+/// launchd/systemd with a minimal `PATH`, so absolute locations come before
+/// the bare `PATH` lookup. Notably absent: the macOS GUI app bundle binary,
+/// which requires a GUI context and fails headless — resolvable but
+/// unrunnable here.
 const TAILSCALE_CANDIDATE_BINARIES: &[&str] = &[
     "/opt/homebrew/bin/tailscale",
     "/usr/bin/tailscale",
@@ -110,14 +113,44 @@ const TAILSCALE_CANDIDATE_BINARIES: &[&str] = &[
     "tailscale",
 ];
 
+/// Verdict for one candidate binary's whois attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhoisCandidateVerdict {
+    /// Parseable login: use this output, stop searching.
+    Use,
+    /// No login, but a working CLI answered (tagged device, unknown peer):
+    /// other paths to the same tailscaled cannot change the answer.
+    Stop,
+    /// Binary missing/broken/timed out, or garbage output: try the next one.
+    Next,
+}
+
+fn judge_whois_output(output: Option<&[u8]>) -> WhoisCandidateVerdict {
+    let Some(output) = output else {
+        return WhoisCandidateVerdict::Next;
+    };
+    if parse_tailscale_whois_login(output).is_some() {
+        return WhoisCandidateVerdict::Use;
+    }
+    if serde_json::from_slice::<serde_json::Value>(output).is_ok() {
+        return WhoisCandidateVerdict::Stop;
+    }
+    WhoisCandidateVerdict::Next
+}
+
 fn run_tailscale_whois(peer: SocketAddr) -> Option<Vec<u8>> {
     let arg = whois_addr_arg(peer);
-    TAILSCALE_CANDIDATE_BINARIES.iter().find_map(|binary| {
+    for binary in TAILSCALE_CANDIDATE_BINARIES {
         let mut command = std::process::Command::new(binary);
         command.arg("whois").arg("--json").arg(&arg);
-        run_command_with_timeout(command, TAILSCALE_WHOIS_TIMEOUT)
-            .filter(|output| parse_tailscale_whois_login(output).is_some())
-    })
+        let output = run_command_with_timeout(command, TAILSCALE_WHOIS_TIMEOUT);
+        match judge_whois_output(output.as_deref()) {
+            WhoisCandidateVerdict::Use => return output,
+            WhoisCandidateVerdict::Stop => return None,
+            WhoisCandidateVerdict::Next => continue,
+        }
+    }
+    None
 }
 
 struct CachedLogin {
@@ -280,6 +313,36 @@ mod tests {
     #[test]
     fn negative_cache_ttl_is_shorter_than_success_ttl() {
         assert!(WHOIS_NEGATIVE_CACHE_TTL < WHOIS_CACHE_TTL);
+    }
+
+    #[test]
+    fn judge_stops_at_valid_json_without_login() {
+        // Tagged machine node: tailscaled answered, so other candidate paths
+        // to it cannot change the answer; the search must stop, fail closed.
+        let tagged = &br#"{"Node":{"Name":"server1","Tags":["tag:server"]}}"#[..];
+        assert_eq!(parse_tailscale_whois_login(tagged), None);
+        assert_eq!(
+            judge_whois_output(Some(tagged)),
+            WhoisCandidateVerdict::Stop
+        );
+    }
+
+    #[test]
+    fn judge_uses_login_and_retries_the_rest() {
+        let login = whois_output("david@hyeons-lab.com");
+        assert_eq!(
+            judge_whois_output(Some(&login[..])),
+            WhoisCandidateVerdict::Use
+        );
+        assert_eq!(judge_whois_output(None), WhoisCandidateVerdict::Next);
+        assert_eq!(
+            judge_whois_output(Some(&b"not json at all"[..])),
+            WhoisCandidateVerdict::Next
+        );
+        assert_eq!(
+            judge_whois_output(Some(&b""[..])),
+            WhoisCandidateVerdict::Next
+        );
     }
 
     static RESOLVER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

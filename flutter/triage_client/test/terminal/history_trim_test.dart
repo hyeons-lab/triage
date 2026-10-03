@@ -84,4 +84,34 @@ void main() {
     final trimmed = trimHistoryTail(b('a\nb\n'), maxLines: 1, maxBytes: 1024);
     expect(s(trimmed).startsWith(reset), isTrue);
   });
+
+  test('byte cap mid-line advances to the next complete line', () {
+    // 20-byte window cuts into line8; the partial row is dropped rather than
+    // replayed mid-line.
+    final payload = List.generate(10, (i) => 'line$i-5678\n').join();
+    final out = trimHistoryTail(
+      b(payload),
+      maxLines: 1000,
+      maxBytes: 20,
+    );
+    expect(s(out), '\x1b[0mline9-5678\n');
+  });
+
+  test('byte cap mid-rune skips continuation bytes, no replacement glyph', () {
+    // 'hello \u20ac world\n': the 3-byte euro sign sits at bytes 6..9. A
+    // maxBytes window cutting into it must start on a rune boundary, so the
+    // decoded replay holds no U+FFFD.
+    final input = b('hello \u20ac world\n');
+    for (var cut = 1; cut <= 12; cut++) {
+      final out = trimHistoryTail(input, maxLines: 1000, maxBytes: cut);
+      expect(
+        s(out).contains('\uFFFD'),
+        isFalse,
+        reason: 'maxBytes=$cut produced a replacement glyph',
+      );
+    }
+    // The tightest windows keep only the tail runes after the cut rune.
+    final tight = trimHistoryTail(input, maxLines: 1000, maxBytes: 7);
+    expect(s(tight), '\x1b[0m world\n');
+  });
 }

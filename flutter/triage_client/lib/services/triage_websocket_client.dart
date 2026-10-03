@@ -108,6 +108,13 @@ typedef RailLayoutRecord = ({
 /// 0/0 means the daemon could not probe it (or predates stats entirely).
 typedef DaemonStatsRecord = ({int diskFreeBytes, int diskTotalBytes});
 
+/// Whether a poll result is worth rendering over the current reading. A
+/// zero-total record is a transient probe failure, not an empty disk: the
+/// poller keeps the last good reading instead of flickering the line out.
+bool isUsableDaemonStats(DaemonStatsRecord? stats) {
+  return stats != null && stats.diskTotalBytes > 0;
+}
+
 /// Reads daemon stats out of a `hello` or `get_daemon_stats` response map.
 /// Both carry the same `disk_*` keys; absent keys read as unknown (0/0), so
 /// a hello from a daemon predating stats degrades to a hidden line.

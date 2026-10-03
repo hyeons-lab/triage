@@ -72,7 +72,33 @@ List<int> trimHistoryTail(
     }
   }
   final byteFloor = bytes.length - maxBytes;
-  if (byteFloor > start) start = byteFloor;
+  if (byteFloor > start) {
+    // The byte cap binds. byteFloor > start >= 0, so byteFloor - 1 below
+    // is a valid index.
+    if (bytes[byteFloor - 1] == 0x0a) {
+      start = byteFloor;
+    } else {
+      // Mid-line cut: advance to the next complete line boundary instead of
+      // slicing an older row (and possibly a rune) in two. When no newline
+      // follows (one line exceeds maxBytes), at least skip UTF-8
+      // continuation bytes so decoding starts on a rune boundary.
+      var lineStart = -1;
+      for (var i = byteFloor; i < end; i++) {
+        if (bytes[i] == 0x0a) {
+          lineStart = i + 1;
+          break;
+        }
+      }
+      if (lineStart != -1) {
+        start = lineStart;
+      } else {
+        start = byteFloor;
+        while (start < bytes.length && (bytes[start] & 0xC0) == 0x80) {
+          start++;
+        }
+      }
+    }
+  }
   if (start <= 0) return bytes;
   const reset = <int>[0x1b, 0x5b, 0x30, 0x6d]; // ESC [ 0 m
   return [...reset, ...bytes.sublist(start)];

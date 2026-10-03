@@ -379,4 +379,28 @@ void main() {
       expect(groups.single.sessionIds, ['session-1', 'session-2']);
     });
   });
+
+  group('windows paths', () {
+    test('leafOf takes the last backslash segment', () {
+      expect(leafOf(r'C:\Users\dev\repo'), 'repo');
+      expect(leafOf(r'C:\Users\dev\repo\'), 'repo');
+    });
+
+    test('trimTrailingSlash strips one trailing backslash', () {
+      expect(trimTrailingSlash(r'C:\Users\dev\repo\'), r'C:\Users\dev\repo');
+      expect(trimTrailingSlash(r'C:\Users\dev\repo'), r'C:\Users\dev\repo');
+    });
+
+    test('mixed separators split on the later one', () {
+      expect(leafOf('C:/Users\\dev/repo'), 'repo');
+      expect(leafOf(r'C:\Users/dev\repo'), 'repo');
+    });
+
+    test('forward-slash behavior is unchanged', () {
+      expect(leafOf('/a/bb/ccc'), 'ccc');
+      expect(leafOf('/a/bb/ccc/'), 'ccc');
+      expect(trimTrailingSlash('/'), '/');
+      expect(leafOf('/'), isNull);
+    });
+  });
 }

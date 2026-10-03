@@ -1347,4 +1347,25 @@ void main() {
       },
     );
   });
+
+  group('isUsableDaemonStats', () {
+    test('rejects null and zero-total probe failures', () {
+      expect(isUsableDaemonStats(null), isFalse);
+      expect(
+        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 0)),
+        isFalse,
+      );
+    });
+
+    test('accepts positive totals including a full disk', () {
+      expect(
+        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 100)),
+        isTrue,
+      );
+      expect(
+        isUsableDaemonStats((diskFreeBytes: 50, diskTotalBytes: 100)),
+        isTrue,
+      );
+    });
+  });
 }

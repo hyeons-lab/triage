@@ -2038,7 +2038,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// hold input lease for session Y" or "session Y has no input lease
   /// holder". Null when the message names none.
   String? _leaseErrorSessionId(String message) {
-    return RegExp(r'session (\S+)').firstMatch(message)?.group(1);
+    return RegExp(r'session ([a-zA-Z0-9_-]+)').firstMatch(message)?.group(1);
   }
 
   void _sendRemoteSessionInput(
@@ -2146,11 +2146,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           generation != _connectGeneration ||
           serverId != _activeServerId ||
           !_client.isConnected ||
-          stats == null) {
+          !isUsableDaemonStats(stats)) {
         return;
       }
-      // A null read is a failed poll (or a daemon predating stats): keep the
-      // last reading rather than flickering the line in and out.
+      // A null or zero-total read is a failed poll (or a daemon predating
+      // stats): keep the last reading rather than flickering the line in
+      // and out.
       setState(() => _daemonStats = stats);
     });
   }
@@ -5072,7 +5073,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             isRemote: true,
             isExited: exited,
           );
-          session.hasInputLease = true;
+          session.hasInputLease = _attachGrantsInputLease(attachRes);
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
           final bracketedPaste =

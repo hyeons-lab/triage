@@ -372,7 +372,10 @@ List<SessionGroup> flatSessionGroups(
   ];
 }
 
-/// Drops one trailing `/`, except from the filesystem root itself.
+/// Drops one trailing `/` (or `\`), except from the filesystem root itself.
+///
+/// Paths arrive from daemons on any OS, so a Windows daemon reports
+/// backslash roots the rail must group and label like any other path.
 ///
 /// The rail derives a group key, a group header label, and a session title from
 /// the same paths. Three private copies of this rule had already drifted apart
@@ -380,17 +383,20 @@ List<SessionGroup> flatSessionGroups(
 /// others.
 String? trimTrailingSlash(String? path) {
   if (path == null || path.isEmpty) return null;
-  if (path.length > 1 && path.endsWith('/')) {
+  if (path.length > 1 && (path.endsWith('/') || path.endsWith('\\'))) {
     return path.substring(0, path.length - 1);
   }
   return path;
 }
 
-/// The last path segment of [path], or null when it has none.
+/// The last path segment of [path], or null when it has none. Both `/` and
+/// `\` separate segments: see [trimTrailingSlash].
 String? leafOf(String? path) {
   final trimmed = trimTrailingSlash(path);
   if (trimmed == null) return null;
-  final slash = trimmed.lastIndexOf('/');
+  final slashPos = trimmed.lastIndexOf('/');
+  final backslashPos = trimmed.lastIndexOf('\\');
+  final slash = slashPos > backslashPos ? slashPos : backslashPos;
   final leaf = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
   return leaf.isEmpty ? null : leaf;
 }

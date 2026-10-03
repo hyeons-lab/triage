@@ -22,8 +22,9 @@ void main() {
   test('formats huge volumes with separators and percentage', () {
     // A formatting golden for the top end of the range: thousands separators
     // in the megabyte count plus the whole percent. (It cannot pin the
-    // divide-before-scale formula shape: 95TB times 100 is exactly
-    // representable in float64, so a multiply-first refactor stays green.)
+    // divide-before-scale formula shape: at 95TB the multiply-first rounding
+    // error is far too small to shift the whole-percent result, so a
+    // multiply-first refactor stays green anyway.)
     const tb = 1024 * 1024 * _mb;
     expect(formatDiskFree(95 * tb, 100 * tb), '99,614,720 MB free (95%)');
   });

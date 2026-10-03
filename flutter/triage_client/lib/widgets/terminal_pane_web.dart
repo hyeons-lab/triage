@@ -389,6 +389,9 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _legacyCopyToClipboard(String text) {
     var copied = false;
+    // Removing the temporary textarea resets focus to <body>, dropping the
+    // terminal's hidden textarea: restore whoever held focus first.
+    final previousActive = html.document.activeElement;
     try {
       final textArea = html.TextAreaElement()
         ..value = text
@@ -400,6 +403,11 @@ class _TerminalPaneState extends State<TerminalPane> {
       copied = html.document.execCommand('copy');
       textArea.remove();
     } catch (_) {}
+    if (previousActive is html.HtmlElement) {
+      try {
+        previousActive.focus();
+      } catch (_) {}
+    }
     if (!copied) {
       debugPrint('Terminal copy failed: clipboard unavailable');
     }

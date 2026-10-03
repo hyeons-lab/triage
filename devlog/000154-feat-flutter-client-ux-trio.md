@@ -118,10 +118,22 @@ Three Flutter client requests in one branch:
 - 825df84 — fix(pairing): resolve tailscale CLI by absolute path under minimal PATH
 - a72226f — fix(pairing): try whois binaries until one parses; GUI app fails headless
 - 17e3eb0 — fix(web): snapshot scroll position at gesture end
-- HEAD — fix(history): serve 1 MiB tail; web replays full scrollback
+- ac06f3d — fix(history): serve 1 MiB tail; web replays full scrollback
+- HEAD — fix(review): address Antigravity + Copilot feedback on PR #181
 
 ## Progress
 
+- 2026-10-02T21:24-0700: addressed Antigravity review of the tip (5
+  warnings, 3 suggestions, 4 test asks) plus the new Copilot inline thread
+  (float64 test comment). tailscale whois stops at the first valid-JSON
+  answer instead of replaying the query against every candidate binary;
+  trimHistoryTail aligns byte-cap cuts to line/rune boundaries; stats poll
+  keeps the last good reading on zero-total probes; rail paths handle
+  Windows separators; legacy clipboard restores focus; create path reads
+  the lease grant like the other attach sites; install.sh SC2086
+  silenced; lease-error regex constrained. Tests: whois verdict incl.
+  tagged-node fixture, trim mid-line/mid-rune, Windows grouping,
+  isUsableDaemonStats. W2 tests proven non-vacuous by revert-run.
 - 2026-10-02T12:51-0700: user reported limited scrollback in all sessions
   (1000 lines). `RAW_OUTPUT_TAIL_CAP` 256 KiB -> 1 MiB; web replays the
   full served tail (`kHistoryReplayWebMax{Lines,Bytes}` = 50k/1 MiB,

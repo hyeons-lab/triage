@@ -299,6 +299,7 @@ elif [ "${LINK_MODE}" -eq 1 ] || [ "${UPGRADE_MODE}" -eq 1 ]; then
   TARGETS="agents ${TARGETS}"
 fi
 # Deduplicate while keeping order.
+# shellcheck disable=SC2086
 TARGETS="$(printf '%s\n' ${TARGETS} | awk '!seen[$0]++' | tr '\n' ' ')"
 
 failures=0
