@@ -69,6 +69,11 @@ const _: () = assert!(
 );
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
+/// Bound on one actor's context reply inside the `list_session_contexts`
+/// fan-out. A leg past this is wedged, not slow (~40ms was the per-leg cost
+/// at load 150), so the batch degrades that row to `None` rather than
+/// hanging every client's rail load behind one stuck session.
+const SESSION_CONTEXT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
 /// Maximum number of recent judge decisions retained in memory for the settings
@@ -3960,23 +3965,58 @@ impl SessionApi for SessionManager {
                 (session_id, pending_source, stamps)
             })
             .collect();
-        Ok(pending
-            .into_iter()
-            .map(|(session_id, source, stamps)| {
-                let context = match source {
-                    PendingContext::Ready(context) => context,
-                    PendingContext::Live(rx) => recv_actor_result(rx, "reading session context")
-                        .ok()
-                        .flatten(),
-                };
-                SessionContextRow {
-                    session_id,
-                    context,
-                    last_activity_ms: stamps.activity_ms,
-                    last_input_ms: stamps.input_ms,
+        // Split the already-resolved rows from the legs still awaiting an
+        // actor reply; only the latter need a collection thread. Live legs
+        // start as `None` placeholders so a timed-out reply degrades the row
+        // instead of failing the batch.
+        let mut rows = Vec::with_capacity(pending.len());
+        let mut live = Vec::new();
+        for (session_id, source, stamps) in pending {
+            let row = SessionContextRow {
+                session_id,
+                context: None,
+                last_activity_ms: stamps.activity_ms,
+                last_input_ms: stamps.input_ms,
+            };
+            match source {
+                PendingContext::Ready(context) => {
+                    rows.push(SessionContextRow { context, ..row });
                 }
-            })
-            .collect())
+                PendingContext::Live(rx) => {
+                    live.push((rows.len(), rx));
+                    rows.push(row);
+                }
+            }
+        }
+        // Collect concurrently: sequential `recv` costs the SUM of every
+        // actor's scheduling latency (2.8s for 68 sessions at load 150), one
+        // thread per pending reply costs the MAX. Each leg is also
+        // timeout-bounded, so a wedged actor yields `None` like the
+        // mid-shutdown case instead of hanging the whole batch forever.
+        // Joins land back in `rows` order, never by arrival, so a slow
+        // session cannot file its context under another session's id.
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = live
+                .into_iter()
+                .map(|(index, rx)| {
+                    (
+                        index,
+                        scope.spawn(move || {
+                            rx.recv_timeout(SESSION_CONTEXT_REQUEST_TIMEOUT)
+                                .ok()
+                                .and_then(|result| result.ok())
+                                .flatten()
+                        }),
+                    )
+                })
+                .collect();
+            for (index, handle) in handles {
+                if let Ok(context) = handle.join() {
+                    rows[index].context = context;
+                }
+            }
+        });
+        Ok(rows)
     }
 
     fn session_judge_policy(
@@ -11753,6 +11793,74 @@ mod tests {
             let _ = manager.shutdown_session(id);
             let _ = std::fs::remove_dir_all(&repo);
         }
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// A wedged actor must degrade its row to `None`, not hang the batch: one
+    /// stuck session used to wedge every client's rail load behind an
+    /// unbounded sequential `recv` in `list_session_contexts`.
+    #[test]
+    fn list_session_contexts_survives_a_wedged_actor() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let healthy_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+
+        // A live session whose actor channel nobody drains: the Context send
+        // succeeds, but no reply ever arrives, so this leg must hit the
+        // per-actor timeout instead of hanging the batch.
+        let (tx, _never_drained) = mpsc::channel();
+        let wedged_id = SessionId::new("session-wedged").expect("session id");
+        {
+            let mut sessions = manager.sessions().expect("lock sessions");
+            sessions.insert(
+                wedged_id.clone(),
+                ManagedSession::Live {
+                    actor: SessionActor {
+                        tx,
+                        worker: None,
+                        reader: None,
+                        writer: None,
+                        last_activity_ms: Arc::new(AtomicU64::new(0)),
+                        last_input_ms: Arc::new(AtomicU64::new(0)),
+                    },
+                    lease: InputLeaseState::default(),
+                    launch: PersistedSessionLaunch {
+                        command: "true".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        size: SessionSize::default(),
+                        log_path: log_dir.join("wedged.log"),
+                    },
+                    last_known_cwd: None,
+                },
+            );
+        }
+
+        let start = Instant::now();
+        let rows = manager.list_session_contexts().expect("list contexts");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SESSION_CONTEXT_REQUEST_TIMEOUT + Duration::from_secs(10),
+            "wedged actor hung the batch: {elapsed:?}"
+        );
+        assert_eq!(rows.len(), 2, "one row per session, wedged included");
+        let wedged = rows
+            .iter()
+            .find(|row| row.session_id == wedged_id)
+            .expect("wedged row");
+        assert!(wedged.context.is_none(), "wedged actor degrades to None");
+        let healthy = rows
+            .iter()
+            .find(|row| row.session_id == healthy_id)
+            .expect("healthy row");
+        assert!(
+            healthy.context.is_some(),
+            "healthy session still resolves its context"
+        );
+
+        let _ = manager.shutdown_session(healthy_id);
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
