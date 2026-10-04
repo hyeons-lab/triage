@@ -46,6 +46,10 @@ session loading degrades to the slowest actor instead of stalling.
 - 2026-10-04T08:21-0700: implemented scoped-thread collect + 5s per-leg
   timeout. New test hangs pre-fix (killed at 90s, zero output) and passes in
   ~6s with the fix; existing order test green; fmt + clippy clean.
+- 2026-10-04T08:52-0700: PR 190 open (stack 6/6), CI green. Release-built with
+  Flutter bundle, installed, reloaded: 68 sessions preserved, CTX_MS 67 at
+  load ~150 (was 2839 pre-fix), served bundle md5 matches fresh build, no
+  panics. PR 189 CI also green.
 
 ## Research & Discoveries
 
