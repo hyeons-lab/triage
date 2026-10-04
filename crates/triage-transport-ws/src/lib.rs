@@ -830,6 +830,27 @@ pub enum ServerMessage {
     },
 }
 
+impl ServerMessage {
+    /// Short stable name for logs and metrics. Matches the serde tag so a
+    /// logged kind greps the same on both sides of the wire.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ServerMessage::Response { .. } => "response",
+            ServerMessage::Error { .. } => "error",
+            ServerMessage::Event { .. } => "event",
+            ServerMessage::SubscriptionClosed { .. } => "subscription_closed",
+            ServerMessage::SessionSnippetUpdated { .. } => "session_snippet_updated",
+            ServerMessage::SessionContextUpdated { .. } => "session_context_updated",
+            ServerMessage::UpdateAvailable { .. } => "update_available",
+            ServerMessage::SessionJudgePolicyUpdated { .. } => "session_judge_policy_updated",
+            ServerMessage::RailPinsUpdated { .. } => "rail_pins_updated",
+            ServerMessage::SessionCustomLabelUpdated { .. } => "session_custom_label_updated",
+            ServerMessage::SessionStarted { .. } => "session_started",
+            ServerMessage::SessionTerminated { .. } => "session_terminated",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ServerResult {
