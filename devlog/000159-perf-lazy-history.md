@@ -62,7 +62,8 @@ page and re-emulates from the oldest loaded byte. Stacked on
 
 ## Commits
 
-- HEAD — perf(client,daemon): lazy history paging via windowed attach
+- 77e3ece — perf(client,daemon): lazy history paging via windowed attach
+- HEAD — fix(daemon): omit null history_bytes from attach JSON
 
 ## Progress
 
