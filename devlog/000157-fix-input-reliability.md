@@ -30,6 +30,10 @@ client heartbeat with dead-socket teardown, socket-driven indicator.
 - Tests: handover lease round-trip, 2 denied-flush integrations, 2
   parked-map units, 4 displayStatus units; `connected:` threaded through
   rail/header test constructions.
+- Client (follow-up): heartbeat teardown gated on 75s of inbound
+  silence instead of one failed beat; transport tracks
+  `millisSinceLastInbound` on every frame. The ungated version turned
+  slow loads into teardown loops (see Issues).
 
 ## Decisions
 
@@ -54,6 +58,12 @@ client heartbeat with dead-socket teardown, socket-driven indicator.
 - Heartbeat skips background (throttled timers must not kill idle
   connections) and pairing (nothing to prove before auth); auth can
   never fail a beat because an unauthenticated hello still answers.
+- Liveness is inbound traffic, not the beat: a hello routinely times
+  out behind a huge history replay on the daemon's serial
+  per-connection queue (ws.rs handles requests inline, one at a time),
+  so teardown requires 75s of total silence. Per-request concurrency on
+  the daemon is the principled fix; deferred as a separate change
+  (response reordering needs care).
 
 ## Issues
 
@@ -63,10 +73,18 @@ client heartbeat with dead-socket teardown, socket-driven indicator.
 - Residual: bytes in flight on a socket that dies are best-effort — the
   daemon cannot tell delivered from lost without write sequence numbers.
   Protocol-level ack/seq is the principled fix, deferred as future work.
+- 2026-10-03T19:06-0700 outage: the ungated heartbeat tore the socket
+  down on any single slow beat; on a slow connection the attach replay
+  always exceeds the 10s request timeout, so every connect died
+  mid-load and reconnected into the same wedge (sessions never
+  loading). Ruled out a parked session-245 actor first: observer
+  attaches to 245 and a control session both answered in <400ms, and
+  the daemon sat at ~2% CPU. Fix is the silence gate above.
 
 ## Commits
 
-- HEAD — fix(input): end-to-end input reliability
+- beef314 — fix(input): end-to-end input reliability
+- HEAD — fix(client): gate heartbeat teardown on inbound silence
 
 ## Progress
 
@@ -75,6 +93,15 @@ client heartbeat with dead-socket teardown, socket-driven indicator.
 - 2026-10-02T22:10-0700: D1/D2/C1/C2/C3 implemented. Daemon tests
   red-then-green (handover revert-run, 2x5s-deadline integrations);
   fmt + clippy clean; flutter analyze clean; 53 + 148 client tests pass.
+- 2026-10-03T19:06-0700: silence-gated the heartbeat after the outage
+  above; transport unit test green, analyze clean.
+- 2026-10-03T19:31-0700: deploy took three tries — the first two
+  installs served the pre-fix bundle (binary predated the flutter
+  stamp; likely raced cargo invocations on a load-58 machine). A clean
+  client rebuild (`rm -rf flutter/.../build` + release build) fixed
+  it; curl-verified the served JS contains the new strings. Lessons:
+  `grep` on the binary never works (rust-embed `compression` feature),
+  so always curl-verify the served bundle after a web-client deploy.
 
 ## Research & Discoveries
 

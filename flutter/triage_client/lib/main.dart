@@ -1165,6 +1165,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // beat cannot destroy a healthy connection, and short enough that a dead
   // socket is noticed while the user is still looking at it.
   static const Duration _heartbeatInterval = Duration(seconds: 25);
+  // Inbound silence that must accompany a failed beat before the socket is
+  // torn down: three beats' worth. A beat routinely fails on a
+  // slow-but-alive connection (its hello waits behind a huge history
+  // replay on the daemon's serial per-connection queue), and tearing down
+  // there aborts the very load the user is waiting for, then reconnects
+  // into the same wedge. Only sustained silence means dead.
+  static const Duration _heartbeatSilenceTolerance = Duration(seconds: 75);
 
   @override
   void initState() {
@@ -2201,13 +2208,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Probes socket liveness with a cheap `hello` while this connection
-  /// lives. A beat that fails (timeout, not auth: an unauthenticated hello
-  /// still answers) with the channel nominally up means a half-dead socket,
-  /// and it is torn down through the close path so the indicator, the
-  /// session marks, and the reconnect all run. Guarded like the stats
-  /// poller, plus foreground (a throttled background timer must not
-  /// destroy a connection nobody is watching) and pairing (nothing to
-  /// prove before auth).
+  /// lives. A failed beat alone (timeout, not auth: an unauthenticated
+  /// hello still answers) only tears the socket down through the close
+  /// path when no frame of any kind has arrived for
+  /// [_heartbeatSilenceTolerance]: the beat's job is to solicit traffic
+  /// when idle, and any inbound traffic is the liveness proof, not the
+  /// beat itself. Guarded like the stats poller, plus foreground (a
+  /// throttled background timer must not destroy a connection nobody is
+  /// watching) and pairing (nothing to prove before auth).
   void _startHeartbeat(int generation) {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) async {
@@ -2224,7 +2232,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } catch (e) {
         if (_disposed || generation != _connectGeneration) return;
         if (!_client.isConnected) return;
-        debugPrint('Heartbeat failed; tearing down dead socket: $e');
+        if (_client.millisSinceLastInbound <
+            _heartbeatSilenceTolerance.inMilliseconds) {
+          debugPrint(
+            'Heartbeat failed but the socket carried traffic recently; '
+            'keeping it: $e',
+          );
+          return;
+        }
+        debugPrint(
+          'Heartbeat failed with no inbound traffic for '
+          '${_heartbeatSilenceTolerance.inSeconds}s; tearing down: $e',
+        );
         try {
           await _client.disconnect();
         } catch (_) {}
