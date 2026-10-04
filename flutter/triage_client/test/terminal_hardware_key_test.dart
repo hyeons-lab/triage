@@ -204,5 +204,85 @@ void main() {
       }
     });
   });
+
+  group('TerminalPane Shift+Enter newline', () {
+    Future<List<String>> pumpPane(WidgetTester tester) async {
+      final terminal = Terminal();
+      final controller = TerminalController();
+      final inputs = <String>[];
+      controller.addInputListener((data) {
+        inputs.add(data);
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TerminalPane(
+              terminalId: 'test-session',
+              terminal: terminal,
+              controller: controller,
+              fallbackRows: const [],
+              onTerminalResizeBind: (_) {},
+              focusCursorRevision: 0,
+              bracketedPasteEnabled: false,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      return inputs;
+    }
+
+    testWidgets('Shift+Enter sends LF instead of submitting', (tester) async {
+      final inputs = await pumpPane(tester);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+
+      expect(inputs, ['\n']);
+    });
+
+    testWidgets('Shift+numpadEnter sends LF', (tester) async {
+      final inputs = await pumpPane(tester);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.numpadEnter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+
+      expect(inputs, ['\n']);
+    });
+
+    testWidgets('plain Enter is left to the emulator default', (
+      tester,
+    ) async {
+      final inputs = await pumpPane(tester);
+
+      // Our layer sends nothing: xterm's own handler owns plain Enter (CR)
+      // in production. (The fallback view mounts no TerminalView, so there
+      // is no emulator echo to observe here.)
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+
+      expect(inputs, isEmpty);
+    });
+
+    testWidgets('Ctrl+Shift+Enter is left to the default path', (
+      tester,
+    ) async {
+      final inputs = await pumpPane(tester);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+
+      expect(inputs, isEmpty);
+    });
+  });
 }
 
