@@ -335,6 +335,7 @@ async fn main() -> Result<()> {
         id: Some(serde_json::Value::String("attach-req".to_string())),
         request: ClientRequest::AttachSession {
             request: AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: AttachMode::InteractiveController,

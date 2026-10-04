@@ -256,6 +256,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required String sessionId,
     required String clientId,
     String mode = 'InteractiveController',
+    int? historyBytes,
   }) async {
     attachSessionCalls.add(sessionId);
     attachSessionModes.add(mode);

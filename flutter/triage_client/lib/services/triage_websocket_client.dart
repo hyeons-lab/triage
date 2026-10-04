@@ -133,7 +133,12 @@ DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
 ///   falling back to raw base64 bytes if uncompressed.
 /// - `List<dynamic>`: legacy uncompressed JSON integer byte arrays.
 Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
-  final raw = snapshot['raw_output'];
+  return historyBytesFromField(snapshot['raw_output']);
+}
+
+/// Decodes one compressed-bytes history field (snapshot tail or fetch page)
+/// from either transport encoding into raw PTY bytes.
+Uint8List historyBytesFromField(dynamic raw) {
   if (raw is Uint8List) return raw;
   if (raw is String) {
     if (raw.isEmpty) return Uint8List(0);
@@ -931,9 +936,15 @@ class TriageWebSocketClient {
     required String sessionId,
     required String clientId,
     String mode = 'InteractiveController',
+    int? historyBytes,
   }) async {
     return _send('attach_session', {
-      'request': {'session_id': sessionId, 'client_id': clientId, 'mode': mode},
+      'request': {
+        'session_id': sessionId,
+        'client_id': clientId,
+        'mode': mode,
+        if (historyBytes != null) 'history_bytes': historyBytes,
+      },
     });
   }
 
@@ -1708,6 +1719,7 @@ class TriageWebSocketClient {
           sessionId: request?['session_id'] as String?,
           clientId: request?['client_id'] as String?,
           mode: mode,
+          historyBytes: (request?['history_bytes'] as num?)?.toInt(),
         );
         break;
 

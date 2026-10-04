@@ -1464,6 +1464,7 @@ mod tests {
     fn attach_request_can_use_interactive_controller_mode() {
         let request = ClientRequest::AttachSession {
             request: AttachSessionRequest {
+                history_bytes: None,
                 session_id: SessionId::new("session-1").unwrap(),
                 client_id: ClientId::new("client-1").unwrap(),
                 mode: AttachMode::InteractiveController,

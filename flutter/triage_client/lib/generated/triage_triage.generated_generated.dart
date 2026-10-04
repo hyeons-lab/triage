@@ -2206,10 +2206,11 @@ class AttachSessionRequestTable {
   String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
   String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
   AttachMode get mode => AttachMode.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 8, 0));
+  int get historyBytes => fbjs.readUint64(_bc, _bcOffset, 10, 0);
 
   @override
   String toString() {
-    return 'AttachSessionRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}}';
+    return 'AttachSessionRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}, historyBytes: ${historyBytes}}';
   }
 }
 
@@ -2227,7 +2228,7 @@ class AttachSessionRequestTableBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(3);
+    fbBuilder.startTable(4);
   }
 
   int addSessionIdOffset(int? offset) {
@@ -2242,6 +2243,10 @@ class AttachSessionRequestTableBuilder {
     fbBuilder.addInt8(2, mode?.value);
     return fbBuilder.offset;
   }
+  int addHistoryBytes(int? historyBytes) {
+    fbjs.addUint64(fbBuilder, 3, historyBytes);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -2252,15 +2257,18 @@ class AttachSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
   final String? _sessionId;
   final String? _clientId;
   final AttachMode? _mode;
+  final int? _historyBytes;
 
   AttachSessionRequestTableObjectBuilder({
     String? sessionId,
     String? clientId,
     AttachMode? mode,
+    int? historyBytes,
   })
       : _sessionId = sessionId,
         _clientId = clientId,
-        _mode = mode;
+        _mode = mode,
+        _historyBytes = historyBytes;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -2269,10 +2277,11 @@ class AttachSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_sessionId!);
     final int? clientIdOffset = _clientId == null ? null
         : fbBuilder.writeString(_clientId!);
-    fbBuilder.startTable(3);
+    fbBuilder.startTable(4);
     fbBuilder.addOffset(0, sessionIdOffset);
     fbBuilder.addOffset(1, clientIdOffset);
     fbBuilder.addInt8(2, _mode?.value);
+    fbjs.addUint64(fbBuilder, 3, _historyBytes);
     return fbBuilder.endTable();
   }
 
