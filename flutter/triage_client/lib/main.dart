@@ -741,6 +741,17 @@ class SessionVm {
   // True once this remote session has been subscribed/attached (lazy-loaded).
   // Non-selected sessions stay unloaded until the user opens them.
   bool loaded = false;
+  // History window currently held, in raw bytes requested from the daemon.
+  // Starts at the first-page window and doubles toward the platform replay
+  // budget as the user pages older scrollback (see `_pageHistoryUp`).
+  int historyWindowBytes = kHistoryFirstWindowBytes;
+  // Absolute log offset of the oldest byte held, from the last applied
+  // history. Null until the first history lands; 0 means the log start is
+  // loaded and paging stops.
+  int? historyStart;
+  // A scroll-up page re-attach is in flight; near-top triggers coalesce
+  // behind it instead of stacking replays.
+  bool pagingHistory = false;
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
@@ -822,6 +833,7 @@ class SessionVm {
     int? rawOutputStart,
     bool isExited = false,
   }) {
+    historyStart = rawOutputStart;
     _pendingHistory = _PendingHistory(
       rawOutput,
       throughOutputSeq,
@@ -2024,6 +2036,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'InteractiveController',
+        // Lease-only: the snapshot is discarded, so probe with the minimum
+        // window instead of shipping a megabyte tail to throw away.
+        historyBytes: kHistoryLeaseProbeBytes,
       );
       // A disconnect in between resets leases: a zombie `true` here would
       // bypass the buffer-and-acquire path and drop input.
@@ -3823,10 +3838,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Observer: loading a session to look at it must not steal the input
       // lease from another client (or agent) typing there. The first
       // keystroke acquires it through the buffer-and-flush path instead.
+      // First-page window: first paint waits on the viewport, and
+      // scrolling near the top re-attaches with a doubling window.
       final attachRes = await _client.attachSession(
         sessionId: sid,
         clientId: _clientId,
         mode: 'Observer',
+        historyBytes: kHistoryFirstWindowBytes,
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
@@ -4744,6 +4762,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 sessionId: sid,
                 clientId: _clientId,
                 mode: 'Observer',
+                // Lease-only resync: the snapshot is discarded.
+                historyBytes: kHistoryLeaseProbeBytes,
               )
               .then((attachRes) {
                 if (_isStale(leaseGeneration)) return;
@@ -4812,6 +4832,61 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  /// Page older scrollback after a near-top scroll: re-attach with a
+  /// doubling history window (up to the platform replay budget) and replay
+  /// the wider tail. Stops at the log start (`historyStart == 0`) and
+  /// coalesces triggers behind one in-flight page.
+  Future<void> _pageHistoryUp(SessionVm session) async {
+    if (!_client.isConnected || !session.isRemote || !session.loaded) return;
+    if (session.pagingHistory) return;
+    final start = session.historyStart;
+    if (start == null || start <= 0) return;
+    final maxWindow =
+        kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+    final nextWindow = nextHistoryWindowBytes(
+      current: session.historyWindowBytes,
+      max: maxWindow,
+    );
+    if (nextWindow <= session.historyWindowBytes) return;
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    final generation = _connectGeneration;
+    session.pagingHistory = true;
+    session.terminalController.notifyHistoryPageStarted();
+    try {
+      // Observer: paging must not steal the lease from whoever is typing.
+      final attachRes = await _client.attachSession(
+        sessionId: sessionId,
+        clientId: _clientId,
+        mode: 'Observer',
+        historyBytes: nextWindow,
+      );
+      if (_isStale(generation) || _disposed) return;
+      session.hasInputLease = _attachGrantsInputLease(attachRes);
+      final responseObj = attachRes['response'] as Map<String, dynamic>?;
+      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      if (snapshot == null) return;
+      // Full replay, not a delta merge: the wider window extends backward,
+      // which the store's same-end branch would no-op. Reset the lifecycle
+      // first so the wider tail replays from its older start; live chunks
+      // covered by it drop as duplicates by output_seq.
+      session.store.dispatch(const Attach());
+      session.historyWindowBytes = nextWindow;
+      session.applyHistory(
+        _rawOutputFromSnapshot(snapshot),
+        throughOutputSeq: snapshot['output_seq'] as int?,
+        rawOutputStart: snapshot['raw_output_start'] as int?,
+        isExited: snapshot['exited'] == true,
+      );
+    } on TriageAuthException {
+      _routeStaleAuthFailure(generation);
+    } catch (e) {
+      tdbg('history.page', 'page up failed for $sessionId: $e');
+    } finally {
+      session.pagingHistory = false;
+    }
+  }
+
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
     bool includeHistory = false,
@@ -4837,10 +4912,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
     try {
       // Observer: a refresh must not steal the lease from whoever is typing.
+      // The held window, so a refresh neither regresses paged-up depth nor
+      // ships a megabyte tail the replay trim would drop.
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'Observer',
+        historyBytes: session.historyWindowBytes,
       );
       // The purge or reconnect may have landed during the attach: returning
       // before the restore/resize branches keeps those writes off the new
@@ -4899,6 +4977,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               sessionId: sessionId,
               clientId: _clientId,
               mode: 'Observer',
+              historyBytes: session.historyWindowBytes,
             );
             final freshResponseObj =
                 freshAttachRes['response'] as Map<String, dynamic>?;
@@ -5172,6 +5251,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             sessionId: sessionId,
             clientId: _clientId,
             mode: 'InteractiveController',
+            // Freshly spawned: no history yet, first-page window suffices.
+            historyBytes: kHistoryFirstWindowBytes,
           );
           // The daemon changed under us: this snapshot belongs to the one
           // we left, and the tile below must not land on the new rail.
@@ -5831,6 +5912,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
+              onNearTop: () => _pageHistoryUp(currentSession),
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
@@ -10352,6 +10434,7 @@ class SessionWorkspace extends StatelessWidget {
     required this.connected,
     this.onCloseSession,
     this.onViewFit,
+    this.onNearTop,
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
@@ -10363,6 +10446,9 @@ class SessionWorkspace extends StatelessWidget {
   final bool connected;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
+  // The terminal scrolled near the top of its scrollback: page older
+  // history by re-attaching with a wider window.
+  final VoidCallback? onNearTop;
   // Mobile only: opens the session rail overlay from the workspace header.
   final VoidCallback? onOpenRail;
   // Re-asserts this device's terminal size on the shared PTY.
@@ -10401,6 +10487,7 @@ class SessionWorkspace extends StatelessWidget {
               session.noteViewFit(cols, rows);
               onViewFit?.call(cols, rows);
             },
+            onNearTop: onNearTop,
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',

@@ -545,6 +545,13 @@ pub struct AttachSessionRequest {
     pub session_id: SessionId,
     pub client_id: ClientId,
     pub mode: AttachMode,
+    /// Maximum raw-history bytes to carry in the attach snapshot.
+    /// `None` (and old clients, via the serde default) keeps the legacy
+    /// full-tail cap; `Some(n)` ships at most `n` bytes so first paint
+    /// waits on the viewport instead of the whole tail. Clients page older
+    /// scrollback by re-attaching with a larger window.
+    #[serde(default)]
+    pub history_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

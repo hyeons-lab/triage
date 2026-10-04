@@ -140,8 +140,14 @@ pub fn parse_client_message(
                     ));
                 }
             };
+            let history_bytes = if req.history_bytes() == 0 {
+                None
+            } else {
+                Some(req.history_bytes())
+            };
             ClientRequest::AttachSession {
                 request: AttachSessionRequest {
+                    history_bytes,
                     session_id,
                     client_id,
                     mode,
@@ -693,6 +699,7 @@ pub fn build_client_message<'a>(
                     session_id: Some(sess_id_str),
                     client_id: Some(client_id_str),
                     mode,
+                    history_bytes: request.history_bytes.unwrap_or(0),
                 },
             );
             (

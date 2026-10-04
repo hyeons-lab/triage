@@ -2206,6 +2206,7 @@ mod tests {
             .expect("subscribe events");
         client
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: AttachMode::InteractiveController,

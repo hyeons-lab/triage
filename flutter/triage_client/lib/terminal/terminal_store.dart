@@ -38,6 +38,28 @@ const int kHistoryReplayMaxBytes = 256 * 1024;
 const int kHistoryReplayWebMaxLines = 50000;
 const int kHistoryReplayWebMaxBytes = 1024 * 1024;
 
+/// First history window requested on attach: enough for the viewport plus
+/// instant scrollback, small enough that first paint never waits on a
+/// megabyte tail. Scrolling near the top re-attaches with a doubling
+/// window (see [nextHistoryWindowBytes]) up to the platform replay
+/// budget above.
+const int kHistoryFirstWindowBytes = 64 * 1024;
+
+/// History window requested by attaches that discard the snapshot (input
+/// lease acquisition): just enough to keep the protocol's empty-tail
+/// shape without shipping a megabyte to throw away.
+const int kHistoryLeaseProbeBytes = 1024;
+
+/// Next history window after [current] when paging older scrollback:
+/// doubling keeps the cumulative transfer near 2x the final depth,
+/// capped at [max] (the platform replay budget — the trim drops
+/// anything older anyway).
+int nextHistoryWindowBytes({required int current, required int max}) {
+  if (current <= 0) return max <= 0 ? 0 : kHistoryFirstWindowBytes.clamp(1, max);
+  final doubled = current * 2;
+  return doubled >= max ? max : doubled;
+}
+
 /// Trims a full-replay history payload to its newest complete lines.
 ///
 /// xterm is append-only, so a replay must still arrive oldest-first; this keeps

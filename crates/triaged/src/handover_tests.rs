@@ -610,6 +610,7 @@ mod tests {
         // Observe without disturbing: an observing attach reports the
         // current holder instead of taking the lease over.
         let response = new_manager.attach_session(AttachSessionRequest {
+            history_bytes: None,
             session_id: session_id.clone(),
             client_id: ClientId::new("observer")?,
             mode: AttachMode::Observer,
