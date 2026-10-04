@@ -616,7 +616,15 @@ class _TerminalPaneState extends State<TerminalPane> {
             event.stopPropagation();
             widget.controller.notifyInteraction();
             final altKey = event.altKey;
-            _sendInput(altKey ? '\x1b\r' : '\r');
+            // Shift+Enter inserts a newline (LF) instead of submitting (CR);
+            // Alt+Enter keeps its ESC+CR chord, plain Enter stays CR.
+            final newline = bytesForEnterKey(
+              shift: event.shiftKey,
+              ctrl: event.ctrlKey,
+              alt: altKey,
+              meta: event.metaKey,
+            );
+            _sendInput(newline ?? (altKey ? '\x1b\r' : '\r'));
             _activateTerminal();
             return;
           }
