@@ -206,6 +206,17 @@ class TriageWebSocketClient {
 
   bool get isConnected => _channel != null;
 
+  // Monotonic proof-of-life: any inbound frame — response, event, output —
+  // shows the socket delivers, even when one request is slow behind a big
+  // one on the daemon's serial per-connection queue.
+  final Stopwatch _rxStopwatch = Stopwatch();
+  int _lastRxElapsedMs = 0;
+
+  /// Milliseconds since any frame arrived. Zero before the first connect.
+  int get millisSinceLastInbound => _rxStopwatch.isRunning
+      ? _rxStopwatch.elapsedMilliseconds - _lastRxElapsedMs
+      : 0;
+
   /// Default to FlatBuffers unless the server explicitly negotiated JSON.
   /// This ensures connections through reverse proxies that strip
   /// Sec-WebSocket-Protocol headers still default to binary FlatBuffers.
@@ -286,6 +297,10 @@ class TriageWebSocketClient {
       }
       _channel = pending;
       _subscription = subscription;
+      _rxStopwatch
+        ..reset()
+        ..start();
+      _lastRxElapsedMs = 0;
     } catch (error) {
       // This attempt never took ownership (`_channel` is assigned only on
       // success), so the same rule as the handlers above applies: if another
@@ -305,6 +320,7 @@ class TriageWebSocketClient {
   }
 
   void _handleIncomingMessage(dynamic messageData) {
+    _lastRxElapsedMs = _rxStopwatch.elapsedMilliseconds;
     try {
       final Map<String, dynamic> message;
       final binaryMessage = _asBinaryMessage(messageData);
