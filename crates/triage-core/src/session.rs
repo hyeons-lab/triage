@@ -550,7 +550,7 @@ pub struct AttachSessionRequest {
     /// full-tail cap; `Some(n)` ships at most `n` bytes so first paint
     /// waits on the viewport instead of the whole tail. Clients page older
     /// scrollback by re-attaching with a larger window.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_bytes: Option<u64>,
 }
 
