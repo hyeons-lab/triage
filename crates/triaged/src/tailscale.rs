@@ -23,10 +23,12 @@ use crate::session::run_command_with_timeout;
 
 /// Subprocess budget for one `tailscale whois` call.
 const TAILSCALE_WHOIS_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a *successful* lookup is reused. Short enough that
-/// allowlist/identity changes take effect quickly; a burst of pair attempts
-/// from one peer triggers at most one subprocess per window.
-const WHOIS_CACHE_TTL: Duration = Duration::from_secs(10);
+/// How long a *successful* lookup is reused. Tailnet IP-to-login mappings
+/// change only when nodes or users change (rare), while reconnects are
+/// common — and each cold pair pays ~300ms for the subprocess on the load
+/// path. Five minutes keeps identity changes effective quickly while making
+/// reconnect pairs free.
+const WHOIS_CACHE_TTL: Duration = Duration::from_secs(300);
 /// How long a *failed* lookup is cached. Far shorter than [`WHOIS_CACHE_TTL`]
 /// so a transient failure (timeout, tailscaled reload) denies a legitimate
 /// allowlisted user for at most this long.
