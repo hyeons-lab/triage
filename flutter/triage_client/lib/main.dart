@@ -988,6 +988,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Refreshes [_daemonStats] while connected; disk pressure builds over the
   // course of a session, so a connect-time reading alone goes stale.
   Timer? _daemonStatsTimer;
+  Timer? _railReconcileTimer;
+  static const Duration _railReconcileInterval = Duration(seconds: 60);
   // Liveness probe for the socket; a failed beat tears the connection down
   // through the close path so a half-dead socket cannot hold a green
   // indicator while typing goes nowhere.
@@ -1460,6 +1462,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _customLabels = {};
     _railSortMode = SessionRailSortMode.byRepo;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
     _stopHeartbeat();
     _daemonStats = null;
   }
@@ -2224,6 +2227,114 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _daemonStatsTimer = null;
   }
 
+  /// Anti-entropy for the rail: lifecycle pushes are fire-and-forget with no
+  /// replay, so any miss (a gap the client never noticed, a tab that predates
+  /// a handler) leaves rows stale until the next reconnect. Once a minute,
+  /// diff the rail against the daemon's list and replay the delta through
+  /// the same application paths as the pushes, so a missed push heals
+  /// without a refresh. Guarded by generation and server id like the stats
+  /// poll, so a tick landing after a switch never files one daemon's
+  /// sessions onto another's rail.
+  void _startRailReconcile(int generation, String serverId) {
+    _railReconcileTimer?.cancel();
+    _railReconcileTimer = Timer.periodic(_railReconcileInterval, (_) async {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId ||
+          !_clientInitialized ||
+          !_client.isConnected) {
+        return;
+      }
+      await _reconcileRail(generation, serverId);
+    });
+  }
+
+  void _stopRailReconcile() {
+    _railReconcileTimer?.cancel();
+    _railReconcileTimer = null;
+  }
+
+  Future<void> _reconcileRail(int generation, String serverId) async {
+    bool stale() =>
+        _disposed ||
+        generation != _connectGeneration ||
+        serverId != _activeServerId ||
+        !_client.isConnected;
+    List<String> ids;
+    try {
+      ids = await _client.listSessions();
+    } catch (_) {
+      return;
+    }
+    if (stale()) return;
+    final live = ids.toSet();
+    final known = <String>{};
+    for (final s in _sessions) {
+      final sid = s.remoteSessionId;
+      if (sid != null) known.add(sid);
+    }
+    // Removals first: a replaced row keeps its slot when the add lands.
+    for (final sid in known.difference(live)) {
+      _applySessionTerminated(sid);
+    }
+    final added = live.difference(known);
+    if (added.isNotEmpty) {
+      // One batch fetch for the rows' first paint, shaped like the push the
+      // application path expects. The bulk response carries no cwd; live cwd
+      // arrives via push, as on the connect-time load.
+      Map<String, SessionContextRecord> contexts;
+      try {
+        contexts = await _client.listSessionContexts();
+      } catch (_) {
+        return;
+      }
+      if (stale()) return;
+      for (final sid in added) {
+        final ctx = contexts[sid];
+        _applySessionStarted({
+          'session_id': sid,
+          'repository_root': ctx?.repositoryRoot,
+          'worktree_root': ctx?.worktreeRoot,
+          'branch': ctx?.branch,
+          'last_input_ms': ctx?.lastInputMs,
+          'last_activity_ms': ctx?.lastActivityMs,
+        }, sid);
+      }
+    }
+    // Labels: the daemon wins on every key it has. A locally-known label the
+    // daemon lacks is pushed up — same rule as the connect-time load: a
+    // local-only label is a write the daemon never saw, not a remote clear
+    // to mirror.
+    Map<String, String> daemonLabels;
+    try {
+      final layout = await _client.getRailLayout();
+      if (stale()) return;
+      daemonLabels = layout?.customLabels ?? const {};
+    } catch (_) {
+      return;
+    }
+    for (final entry in daemonLabels.entries) {
+      final have =
+          _customLabels[entry.key] ?? _customLabels['triage / ${entry.key}'];
+      if (have != entry.value) {
+        _applyCustomLabelUpdated(entry.key, entry.value);
+      }
+    }
+    for (final key in _customLabels.keys.toList()) {
+      final sid = key.startsWith('triage / ') ? key.substring(9) : key;
+      if (!daemonLabels.containsKey(sid) && live.contains(sid)) {
+        final label = _customLabels[key];
+        if (label != null && label.trim().isNotEmpty) {
+          unawaited(
+            _client
+                .setSessionCustomLabel(sessionId: sid, customLabel: label)
+                .catchError((_) {}),
+          );
+        }
+      }
+    }
+  }
+
   /// Probes socket liveness with a cheap `hello` while this connection
   /// lives. A failed beat alone (timeout, not auth: an unauthenticated
   /// hello still answers) only tears the socket down through the close
@@ -2295,6 +2406,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
     _stopHeartbeat();
     final generation = ++_connectGeneration;
     if (_clientInitialized) {
@@ -2399,6 +2511,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _daemonStats = daemonStatsFromResponse(helloRes);
       });
       _startDaemonStatsPolling(generation, serverId);
+      _startRailReconcile(generation, serverId);
       _startHeartbeat(generation);
 
       await _loadDaemonSessions();
@@ -4025,6 +4138,127 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  /// Applies a custom-label change from a push or the rail reconcile:
+  /// updates the cached labels and the row, and persists. Null/blank clears.
+  void _applyCustomLabelUpdated(String sessionId, String? rawLabel) {
+    final trimmed = rawLabel?.trim();
+    final key = sessionId;
+    _customLabels.remove('triage / $key');
+    if (trimmed != null && trimmed.isNotEmpty) {
+      _customLabels[key] = trimmed;
+    } else {
+      _customLabels.remove(key);
+    }
+    for (final session in _sessions) {
+      if (session.remoteSessionId == sessionId) {
+        session.customLabel = (trimmed != null && trimmed.isNotEmpty)
+            ? trimmed
+            : null;
+      }
+    }
+    unawaited(_persistCustomLabels());
+    if (mounted) setState(() {});
+  }
+
+  /// Inserts a rail row for a session the daemon reports that this client has
+  /// no row for yet — from a `session_started` push or the rail reconcile.
+  /// Idempotent: an existing row short-circuits, so a push racing the
+  /// reconcile (or a redelivered push) cannot double-insert.
+  void _applySessionStarted(Map<String, dynamic> message, String sessionId) {
+    final existingIndex = _sessions.indexWhere(
+      (s) => s.remoteSessionId == sessionId,
+    );
+    if (existingIndex != -1) return;
+
+    final wasEmpty = _sessions.isEmpty;
+    final session = _loadingDaemonSession(sessionId, loading: wasEmpty);
+    session.applyContext(
+      repoRoot: message['repository_root']?.toString(),
+      worktreeRoot: message['worktree_root']?.toString(),
+      branch: message['branch']?.toString(),
+      cwd: message['current_working_directory']?.toString(),
+      updateCwd: message['current_working_directory'] != null,
+    );
+    final lastInput = message['last_input_ms'];
+    if (lastInput is int) {
+      session.lastInteractionMs = lastInput;
+    } else if (lastInput is num) {
+      session.lastInteractionMs = lastInput.toInt();
+    }
+    final lastOutput = message['last_activity_ms'];
+    if (lastOutput is int) {
+      session.lastOutputMs = lastOutput;
+    } else if (lastOutput is num) {
+      session.lastOutputMs = lastOutput.toInt();
+    }
+    _setupSessionInputListener(session);
+
+    void apply() {
+      _sessions.add(session);
+      _regroupRail();
+    }
+
+    if (mounted) {
+      setState(apply);
+    } else {
+      apply();
+    }
+
+    if (wasEmpty && !_disposed) {
+      _loadSessionWithPairingFallback(sessionId);
+    }
+  }
+
+  /// Drops the rail row for a removed session — from a `session_terminated`
+  /// push or the rail reconcile — disposing its pane, unpinning it, clearing
+  /// its cached label, and attaching the neighbour when it was selected.
+  /// Idempotent: an unknown id short-circuits.
+  void _applySessionTerminated(String sessionId) {
+    final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+    if (index == -1) return;
+
+    final session = _sessions[index];
+    session.dispose();
+    TerminalPane.destroySession(session.title);
+    _pendingInputBytes.remove(sessionId);
+
+    final wasSelected = index == _selectedIndex;
+    if (index < _selectedIndex) {
+      _selectedIndex--;
+    }
+    _sessions.removeAt(index);
+    if (_selectedIndex >= _sessions.length) {
+      _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+    }
+
+    var newPins = _pins;
+    if (_pins.sessionIds.contains(sessionId)) {
+      newPins = unpin(_pins, sessionId: sessionId);
+      unawaited(_persistPins(newPins));
+    }
+    if (_customLabels.containsKey(sessionId) ||
+        _customLabels.containsKey('triage / $sessionId')) {
+      _customLabels.remove(sessionId);
+      _customLabels.remove('triage / $sessionId');
+      unawaited(_persistCustomLabels());
+    }
+
+    _applyPins(newPins, persist: false);
+
+    if (wasSelected &&
+        _sessions.isNotEmpty &&
+        _selectedIndex >= 0 &&
+        _selectedIndex < _sessions.length) {
+      final nextSelected = _sessions[_selectedIndex];
+      if (!nextSelected.loaded) {
+        final sid = _sessionIdFor(nextSelected);
+        if (sid != null) {
+          _loadSessionWithPairingFallback(sid);
+        }
+      }
+    }
+  }
+
   Future<void> _processWebSocketEvent(Map<String, dynamic> message) async {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
@@ -4194,121 +4428,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'session_custom_label_updated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null) return;
-      final rawLabel = message['custom_label']?.toString();
-      final trimmed = rawLabel?.trim();
-      final key = sessionId;
-      _customLabels.remove('triage / $key');
-      if (trimmed != null && trimmed.isNotEmpty) {
-        _customLabels[key] = trimmed;
-      } else {
-        _customLabels.remove(key);
-      }
-      for (final session in _sessions) {
-        if (session.remoteSessionId == sessionId) {
-          session.customLabel = (trimmed != null && trimmed.isNotEmpty)
-              ? trimmed
-              : null;
-        }
-      }
-      unawaited(_persistCustomLabels());
-      if (mounted) setState(() {});
+      _applyCustomLabelUpdated(sessionId, message['custom_label']?.toString());
       return;
     }
 
     if (type == 'session_started') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final existingIndex = _sessions.indexWhere(
-        (s) => s.remoteSessionId == sessionId,
-      );
-      if (existingIndex != -1) return;
-
-      final wasEmpty = _sessions.isEmpty;
-      final session = _loadingDaemonSession(sessionId, loading: wasEmpty);
-      session.applyContext(
-        repoRoot: message['repository_root']?.toString(),
-        worktreeRoot: message['worktree_root']?.toString(),
-        branch: message['branch']?.toString(),
-        cwd: message['current_working_directory']?.toString(),
-        updateCwd: message['current_working_directory'] != null,
-      );
-      final lastInput = message['last_input_ms'];
-      if (lastInput is int) {
-        session.lastInteractionMs = lastInput;
-      } else if (lastInput is num) {
-        session.lastInteractionMs = lastInput.toInt();
-      }
-      final lastOutput = message['last_activity_ms'];
-      if (lastOutput is int) {
-        session.lastOutputMs = lastOutput;
-      } else if (lastOutput is num) {
-        session.lastOutputMs = lastOutput.toInt();
-      }
-      _setupSessionInputListener(session);
-
-      void apply() {
-        _sessions.add(session);
-        _regroupRail();
-      }
-
-      if (mounted) {
-        setState(apply);
-      } else {
-        apply();
-      }
-
-      if (wasEmpty && !_disposed) {
-        _loadSessionWithPairingFallback(sessionId);
-      }
+      _applySessionStarted(message, sessionId);
       return;
     }
 
     if (type == 'session_terminated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
-      if (index == -1) return;
-
-      final session = _sessions[index];
-      session.dispose();
-      TerminalPane.destroySession(session.title);
-      _pendingInputBytes.remove(sessionId);
-
-      final wasSelected = index == _selectedIndex;
-      if (index < _selectedIndex) {
-        _selectedIndex--;
-      }
-      _sessions.removeAt(index);
-      if (_selectedIndex >= _sessions.length) {
-        _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
-      }
-
-      var newPins = _pins;
-      if (_pins.sessionIds.contains(sessionId)) {
-        newPins = unpin(_pins, sessionId: sessionId);
-        unawaited(_persistPins(newPins));
-      }
-      if (_customLabels.containsKey(sessionId) ||
-          _customLabels.containsKey('triage / $sessionId')) {
-        _customLabels.remove(sessionId);
-        _customLabels.remove('triage / $sessionId');
-        unawaited(_persistCustomLabels());
-      }
-
-      _applyPins(newPins, persist: false);
-
-      if (wasSelected &&
-          _sessions.isNotEmpty &&
-          _selectedIndex >= 0 &&
-          _selectedIndex < _sessions.length) {
-        final nextSelected = _sessions[_selectedIndex];
-        if (!nextSelected.loaded) {
-          final sid = _sessionIdFor(nextSelected);
-          if (sid != null) {
-            _loadSessionWithPairingFallback(sid);
-          }
-        }
-      }
+      _applySessionTerminated(sessionId);
       return;
     }
 
@@ -4571,6 +4705,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onWebSocketError(dynamic error, int generation) {
     if (_disposed || generation != _connectGeneration) return;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
     _stopHeartbeat();
     setState(() {
       _connectionStatus = 'Error';
@@ -4584,6 +4719,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
     _stopHeartbeat();
     setState(() {
       _connectionStatus = 'Connection Closed';
@@ -4605,6 +4741,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _wakeWatchdogTimer?.cancel();
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
     _stopHeartbeat();
     _connectGeneration++;
     _reconnectTimer?.cancel();

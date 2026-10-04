@@ -464,6 +464,10 @@ fn broadcast_to_global_senders(senders: &GlobalSenders, message: ServerMessage) 
         // resend (context updates won't otherwise be re-emitted).
         Err(TrySendError::Full(_)) => {
             delivered_to_all = false;
+            tracing::debug!(
+                kind = message.kind(),
+                "global push channel full; dropping push for a slow client"
+            );
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -1145,6 +1149,32 @@ impl SessionManager {
     fn forget_inbox(&self, session_id: &SessionId) {
         if let Ok(mut inboxes) = self.inboxes.lock() {
             inboxes.remove(session_id);
+        }
+    }
+
+    /// Drops a session's custom label (on shutdown/removal), persisting the
+    /// layout without it. The label map is keyed by session id, not by record
+    /// membership, so without this a removed session's label outlives it —
+    /// on disk too, since the shutdown manifest snapshots the live map — and
+    /// a later session reusing the name collides with a ghost row.
+    fn forget_custom_label(&self, session_id: &SessionId) {
+        let (Ok(sessions), Ok(pins), Ok(mut labels)) =
+            (self.sessions(), self.pins(), self.custom_labels())
+        else {
+            return;
+        };
+        if !labels.contains_key(session_id.as_str()) {
+            return;
+        }
+        let mut candidate_labels = labels.clone();
+        candidate_labels.remove(session_id.as_str());
+        // Candidate-then-assign like the setter: a persist failure must not
+        // leave memory disagreeing with the manifest.
+        if self
+            .persist_manifest_with_layout(&sessions, &pins, &candidate_labels)
+            .is_ok()
+        {
+            *labels = candidate_labels;
         }
     }
 
@@ -3860,6 +3890,7 @@ impl SessionApi for SessionManager {
         self.forget_judge_override(&session_id);
         self.forget_inbox(&session_id);
         self.forget_parked_input(&session_id);
+        self.forget_custom_label(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -15371,6 +15402,48 @@ mod tests {
             layout2.custom_labels.get("session-1"),
             Some(&"Worker Node".to_string())
         );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Shutdown must take the session's custom label with it: the label map
+    /// is keyed by id, not by record membership, so without an explicit
+    /// forget a removed session's label outlives it (in memory and on disk)
+    /// and a later session reusing the name collides with a ghost row.
+    #[test]
+    fn shutdown_session_forgets_the_custom_label() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        manager
+            .set_session_custom_label(session_id.clone(), Some("doomed".to_string()))
+            .expect("set label");
+        assert!(
+            manager
+                .get_rail_layout()
+                .expect("layout")
+                .custom_labels
+                .contains_key(session_id.as_str())
+        );
+
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown");
+
+        let layout = manager.get_rail_layout().expect("layout after shutdown");
+        assert!(
+            !layout.custom_labels.contains_key(session_id.as_str()),
+            "label must not outlive its session"
+        );
+
+        // Nor on disk: a cold restart must not resurrect it.
+        let manager2 = SessionManager::new(config);
+        let layout2 = manager2.get_rail_layout().expect("layout after restart");
+        assert!(!layout2.custom_labels.contains_key(session_id.as_str()));
 
         let _ = std::fs::remove_dir_all(&log_dir);
     }
