@@ -50,6 +50,11 @@ pegged or about to die. Builds on the existing 60s `getDaemonStats` poll.
 - 2026-10-05T10:33-0700: implemented + verified. Live probe: CPU 30% at
   load ~4.4, battery 100% Full matching pmset. fmt/clippy clean; core
   108, transport 40, triaged 343 + 8 pre-existing; flutter 676.
+- 2026-10-05T10:41-0700: PR 192 open (stack 8/8). Release-built, installed,
+  reloaded: 64 sessions preserved. Live: hello + 3 polls carry
+  cpu/battery (60→31→26 settling, 100/full steady); served bundle md5
+  matches. Charging/discharging/unknown states covered by parser tests
+  (this Mac sits at full on AC).
 
 ## Research & Discoveries
 
