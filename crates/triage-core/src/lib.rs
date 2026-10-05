@@ -1,5 +1,6 @@
 pub mod config;
 pub mod disk;
+pub mod host;
 pub mod ipc;
 pub mod judge;
 pub mod judge_rules;

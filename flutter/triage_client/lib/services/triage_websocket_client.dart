@@ -106,22 +106,48 @@ typedef RailLayoutRecord = ({
 
 /// Daemon-host disk space for the volume holding the daemon's state.
 /// 0/0 means the daemon could not probe it (or predates stats entirely).
-typedef DaemonStatsRecord = ({int diskFreeBytes, int diskTotalBytes});
+typedef DaemonStatsRecord = ({
+  int diskFreeBytes,
+  int diskTotalBytes,
+  int? cpuPercent,
+  int? batteryPercent,
+  String batteryState,
+});
 
 /// Whether a poll result is worth rendering over the current reading. A
-/// zero-total record is a transient probe failure, not an empty disk: the
-/// poller keeps the last good reading instead of flickering the line out.
+/// record with no usable leg is a transient probe failure, not an empty
+/// machine: the poller keeps the last good reading instead of flickering
+/// the lines out.
 bool isUsableDaemonStats(DaemonStatsRecord? stats) {
-  return stats != null && stats.diskTotalBytes > 0;
+  return stats != null &&
+      (stats.diskTotalBytes > 0 ||
+          stats.cpuPercent != null ||
+          stats.batteryPercent != null);
 }
 
 /// Reads daemon stats out of a `hello` or `get_daemon_stats` response map.
-/// Both carry the same `disk_*` keys; absent keys read as unknown (0/0), so
-/// a hello from a daemon predating stats degrades to a hidden line.
+/// Both carry the same keys; absent disk keys read as unknown (0/0), so a
+/// hello from a daemon predating stats degrades to hidden lines. Host
+/// percents normalize here for both protocols: negative (the FlatBuffers
+/// unknown sentinel) reads as null, above 100 clamps, and an unrecognized
+/// battery state reads as unknown.
 DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
+  int? legiblePercent(String key) {
+    final raw = response[key];
+    if (raw is! num) return null;
+    final value = raw.toInt();
+    if (value < 0) return null;
+    return value > 100 ? 100 : value;
+  }
+
+  final rawState = response['battery_state']?.toString().toLowerCase();
+  const knownStates = {'unknown', 'charging', 'discharging', 'full'};
   return (
     diskFreeBytes: (response['disk_free_bytes'] as num?)?.toInt() ?? 0,
     diskTotalBytes: (response['disk_total_bytes'] as num?)?.toInt() ?? 0,
+    cpuPercent: legiblePercent('cpu_percent'),
+    batteryPercent: legiblePercent('battery_percent'),
+    batteryState: knownStates.contains(rawState) ? rawState! : 'unknown',
   );
 }
 
@@ -1235,6 +1261,18 @@ class TriageWebSocketClient {
     return {'type': 'unknown', 'unhandled': what, 'tag': tag};
   }
 
+  /// Reads a generated `BatteryState` getter as its lowercase wire name. The
+  /// generated `fromValue` throws on values from a newer daemon, so a guard
+  /// here (rather than at the call site) keeps one future enum member from
+  /// failing the whole hello/stats decode.
+  String _batteryStateName(fbs.BatteryState Function() read) {
+    try {
+      return read().name.toLowerCase();
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
   Map<String, dynamic> _parseServerResult(
     fbs.ServerResultPayloadTypeId? type,
     dynamic result,
@@ -1263,6 +1301,9 @@ class TriageWebSocketClient {
           'disk_free_bytes': hello.diskFreeBytes,
           'disk_total_bytes': hello.diskTotalBytes,
           'tailscale_pairing_available': hello.tailscalePairingAvailable,
+          'cpu_percent': hello.cpuPercent,
+          'battery_percent': hello.batteryPercent,
+          'battery_state': _batteryStateName(() => hello.batteryState),
         };
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
@@ -1431,6 +1472,9 @@ class TriageWebSocketClient {
           'result': 'daemon_stats',
           'disk_free_bytes': stats.diskFreeBytes,
           'disk_total_bytes': stats.diskTotalBytes,
+          'cpu_percent': stats.cpuPercent,
+          'battery_percent': stats.batteryPercent,
+          'battery_state': _batteryStateName(() => stats.batteryState),
         };
       default:
         return _unhandled('server result', type.value);

@@ -116,6 +116,44 @@ class _LeaseChangeActionReader extends fb.Reader<LeaseChangeAction> {
       LeaseChangeAction.fromValue(const fb.Int8Reader().read(bc, offset));
 }
 
+enum BatteryState {
+  Unknown(0),
+  Charging(1),
+  Discharging(2),
+  Full(3);
+
+  final int value;
+  const BatteryState(this.value);
+
+  factory BatteryState.fromValue(int value) {
+    switch (value) {
+      case 0: return BatteryState.Unknown;
+      case 1: return BatteryState.Charging;
+      case 2: return BatteryState.Discharging;
+      case 3: return BatteryState.Full;
+      default: throw StateError('Invalid value $value for bit flag enum');
+    }
+  }
+
+  static BatteryState? _createOrNull(int? value) =>
+      value == null ? null : BatteryState.fromValue(value);
+
+  static const int minValue = 0;
+  static const int maxValue = 3;
+  static const fb.Reader<BatteryState> reader = _BatteryStateReader();
+}
+
+class _BatteryStateReader extends fb.Reader<BatteryState> {
+  const _BatteryStateReader();
+
+  @override
+  int get size => 1;
+
+  @override
+  BatteryState read(fb.BufferContext bc, int offset) =>
+      BatteryState.fromValue(const fb.Int8Reader().read(bc, offset));
+}
+
 enum ClientRequestPayloadTypeId {
   NONE(0),
   HelloRequest(1),
@@ -4357,10 +4395,13 @@ class HelloResult {
   int get diskFreeBytes => fbjs.readUint64(_bc, _bcOffset, 14, 0);
   int get diskTotalBytes => fbjs.readUint64(_bc, _bcOffset, 16, 0);
   bool get tailscalePairingAvailable => const fb.BoolReader().vTableGet(_bc, _bcOffset, 18, false);
+  int get cpuPercent => const fb.Int16Reader().vTableGet(_bc, _bcOffset, 20, -1);
+  int get batteryPercent => const fb.Int16Reader().vTableGet(_bc, _bcOffset, 22, -1);
+  BatteryState get batteryState => BatteryState.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 24, 0));
 
   @override
   String toString() {
-    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}, diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}, tailscalePairingAvailable: ${tailscalePairingAvailable}}';
+    return 'HelloResult{protocolVersion: ${protocolVersion}, authenticated: ${authenticated}, serverVersion: ${serverVersion}, updateAvailable: ${updateAvailable}, latestVersion: ${latestVersion}, diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}, tailscalePairingAvailable: ${tailscalePairingAvailable}, cpuPercent: ${cpuPercent}, batteryPercent: ${batteryPercent}, batteryState: ${batteryState}}';
   }
 }
 
@@ -4378,7 +4419,7 @@ class HelloResultBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(8);
+    fbBuilder.startTable(11);
   }
 
   int addProtocolVersionOffset(int? offset) {
@@ -4413,6 +4454,18 @@ class HelloResultBuilder {
     fbBuilder.addBool(7, tailscalePairingAvailable);
     return fbBuilder.offset;
   }
+  int addCpuPercent(int? cpuPercent) {
+    fbBuilder.addInt16(8, cpuPercent);
+    return fbBuilder.offset;
+  }
+  int addBatteryPercent(int? batteryPercent) {
+    fbBuilder.addInt16(9, batteryPercent);
+    return fbBuilder.offset;
+  }
+  int addBatteryState(BatteryState? batteryState) {
+    fbBuilder.addInt8(10, batteryState?.value);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -4428,6 +4481,9 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
   final int? _diskFreeBytes;
   final int? _diskTotalBytes;
   final bool? _tailscalePairingAvailable;
+  final int? _cpuPercent;
+  final int? _batteryPercent;
+  final BatteryState? _batteryState;
 
   HelloResultObjectBuilder({
     String? protocolVersion,
@@ -4438,6 +4494,9 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
     int? diskFreeBytes,
     int? diskTotalBytes,
     bool? tailscalePairingAvailable,
+    int? cpuPercent,
+    int? batteryPercent,
+    BatteryState? batteryState,
   })
       : _protocolVersion = protocolVersion,
         _authenticated = authenticated,
@@ -4446,7 +4505,10 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
         _latestVersion = latestVersion,
         _diskFreeBytes = diskFreeBytes,
         _diskTotalBytes = diskTotalBytes,
-        _tailscalePairingAvailable = tailscalePairingAvailable;
+        _tailscalePairingAvailable = tailscalePairingAvailable,
+        _cpuPercent = cpuPercent,
+        _batteryPercent = batteryPercent,
+        _batteryState = batteryState;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -4457,7 +4519,7 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeString(_serverVersion!);
     final int? latestVersionOffset = _latestVersion == null ? null
         : fbBuilder.writeString(_latestVersion!);
-    fbBuilder.startTable(8);
+    fbBuilder.startTable(11);
     fbBuilder.addOffset(0, protocolVersionOffset);
     fbBuilder.addBool(1, _authenticated);
     fbBuilder.addOffset(2, serverVersionOffset);
@@ -4466,6 +4528,9 @@ class HelloResultObjectBuilder extends fb.ObjectBuilder {
     fbjs.addUint64(fbBuilder, 5, _diskFreeBytes);
     fbjs.addUint64(fbBuilder, 6, _diskTotalBytes);
     fbBuilder.addBool(7, _tailscalePairingAvailable);
+    fbBuilder.addInt16(8, _cpuPercent);
+    fbBuilder.addInt16(9, _batteryPercent);
+    fbBuilder.addInt8(10, _batteryState?.value);
     return fbBuilder.endTable();
   }
 
@@ -6371,10 +6436,13 @@ class DaemonStatsResult {
 
   int get diskFreeBytes => fbjs.readUint64(_bc, _bcOffset, 4, 0);
   int get diskTotalBytes => fbjs.readUint64(_bc, _bcOffset, 6, 0);
+  int get cpuPercent => const fb.Int16Reader().vTableGet(_bc, _bcOffset, 8, -1);
+  int get batteryPercent => const fb.Int16Reader().vTableGet(_bc, _bcOffset, 10, -1);
+  BatteryState get batteryState => BatteryState.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 12, 0));
 
   @override
   String toString() {
-    return 'DaemonStatsResult{diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}}';
+    return 'DaemonStatsResult{diskFreeBytes: ${diskFreeBytes}, diskTotalBytes: ${diskTotalBytes}, cpuPercent: ${cpuPercent}, batteryPercent: ${batteryPercent}, batteryState: ${batteryState}}';
   }
 }
 
@@ -6392,7 +6460,7 @@ class DaemonStatsResultBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(2);
+    fbBuilder.startTable(5);
   }
 
   int addDiskFreeBytes(int? diskFreeBytes) {
@@ -6401,6 +6469,18 @@ class DaemonStatsResultBuilder {
   }
   int addDiskTotalBytes(int? diskTotalBytes) {
     fbjs.addUint64(fbBuilder, 1, diskTotalBytes);
+    return fbBuilder.offset;
+  }
+  int addCpuPercent(int? cpuPercent) {
+    fbBuilder.addInt16(2, cpuPercent);
+    return fbBuilder.offset;
+  }
+  int addBatteryPercent(int? batteryPercent) {
+    fbBuilder.addInt16(3, batteryPercent);
+    return fbBuilder.offset;
+  }
+  int addBatteryState(BatteryState? batteryState) {
+    fbBuilder.addInt8(4, batteryState?.value);
     return fbBuilder.offset;
   }
 
@@ -6412,20 +6492,32 @@ class DaemonStatsResultBuilder {
 class DaemonStatsResultObjectBuilder extends fb.ObjectBuilder {
   final int? _diskFreeBytes;
   final int? _diskTotalBytes;
+  final int? _cpuPercent;
+  final int? _batteryPercent;
+  final BatteryState? _batteryState;
 
   DaemonStatsResultObjectBuilder({
     int? diskFreeBytes,
     int? diskTotalBytes,
+    int? cpuPercent,
+    int? batteryPercent,
+    BatteryState? batteryState,
   })
       : _diskFreeBytes = diskFreeBytes,
-        _diskTotalBytes = diskTotalBytes;
+        _diskTotalBytes = diskTotalBytes,
+        _cpuPercent = cpuPercent,
+        _batteryPercent = batteryPercent,
+        _batteryState = batteryState;
 
   /// Finish building, and store into the [fbBuilder].
   @override
   int finish(fb.Builder fbBuilder) {
-    fbBuilder.startTable(2);
+    fbBuilder.startTable(5);
     fbjs.addUint64(fbBuilder, 0, _diskFreeBytes);
     fbjs.addUint64(fbBuilder, 1, _diskTotalBytes);
+    fbBuilder.addInt16(2, _cpuPercent);
+    fbBuilder.addInt16(3, _batteryPercent);
+    fbBuilder.addInt8(4, _batteryState?.value);
     return fbBuilder.endTable();
   }
 
