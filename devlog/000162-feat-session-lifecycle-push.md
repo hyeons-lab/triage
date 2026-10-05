@@ -57,6 +57,10 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
   disabled, passes enabled. fmt/clippy clean; triaged lib 343 pass + 8
   pre-existing pairing failures (identical set on clean base); transport
   39 pass; flutter 667 pass.
+- 2026-10-04T17:20-0700: PR 191 open (stack 7/7). Release-built, installed,
+  reloaded: 69 sessions preserved. Live-verified label forget (set=true
+  before shutdown, leaked=false after) and served bundle md5. Cleared the
+  session-294 ghost label; only 295 carries cera-gaps now.
 
 ## Research & Discoveries
 
