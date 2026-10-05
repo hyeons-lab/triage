@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:triage_client/daemon_disk_stats.dart';
+import 'package:triage_client/daemon_host_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -6030,6 +6031,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 _daemonStats!.diskFreeBytes,
                 _daemonStats!.diskTotalBytes,
               ),
+        hostStatus: _daemonStats == null
+            ? null
+            : formatHostStats(
+                cpuPercent: _daemonStats!.cpuPercent,
+                batteryPercent: _daemonStats!.batteryPercent,
+                batteryState: _daemonStats!.batteryState,
+              ),
         onOpenSettings: _openConnectionSettings,
         onToggleJudgePolicy: _toggleSessionJudgePolicy,
         isCollapsed: isMobile ? false : _sidebarCollapsed,
@@ -6221,6 +6229,7 @@ class SessionRail extends StatefulWidget {
     required this.connectionStatusColor,
     required this.connected,
     this.diskStatus,
+    this.hostStatus,
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
@@ -6295,6 +6304,9 @@ class SessionRail extends StatefulWidget {
   // Preformatted free-space line ("12,340 MB free (23%)"), or null while
   // unknown, which hides the line. Rendered below [connectionStatus].
   final String? diskStatus;
+  // Preformatted host line ("CPU 12% · Battery 87% (charging)"), or null
+  // while unknown, which hides the line. Rendered below [diskStatus].
+  final String? hostStatus;
   // Name of the daemon these sessions belong to. Null when none is configured
   // (the injected-client test path).
   final String? serverLabel;
@@ -6435,6 +6447,7 @@ class _SessionRailState extends State<SessionRail> {
             if (widget.serverLabel != null) widget.serverLabel!,
             widget.connectionStatus,
             if (widget.diskStatus != null) widget.diskStatus!,
+            if (widget.hostStatus != null) widget.hostStatus!,
           ].join(' — '),
           child: Container(
             width: 10,
@@ -6624,6 +6637,7 @@ class _SessionRailState extends State<SessionRail> {
               color: widget.connectionStatusColor,
               serverLabel: widget.serverLabel,
               diskStatus: widget.diskStatus,
+              hostStatus: widget.hostStatus,
             ),
           ),
         ),
@@ -7067,17 +7081,20 @@ class _ConnectionStatus extends StatelessWidget {
     required this.color,
     this.serverLabel,
     this.diskStatus,
+    this.hostStatus,
   });
 
   final String status;
   final Color color;
   final String? serverLabel;
   final String? diskStatus;
+  final String? hostStatus;
 
   @override
   Widget build(BuildContext context) {
     final label = serverLabel;
     final disk = diskStatus;
+    final host = hostStatus;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -7110,6 +7127,15 @@ class _ConnectionStatus extends StatelessWidget {
                 if (disk != null)
                   Text(
                     disk,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xff7f8b8d),
+                      fontSize: 12,
+                    ),
+                  ),
+                if (host != null)
+                  Text(
+                    host,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       color: Color(0xff7f8b8d),

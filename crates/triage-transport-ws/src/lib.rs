@@ -137,6 +137,10 @@ fn current_disk_bytes() -> (u64, u64) {
     }
 }
 
+fn current_host_stats() -> triage_core::host::HostStats {
+    triage_core::host::daemon_host_stats()
+}
+
 #[derive(Debug)]
 pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     api: A,
@@ -341,6 +345,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
 
                 let update = self.api.server_update_info();
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
+                let host = current_host_stats();
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
@@ -350,6 +355,12 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     disk_free_bytes,
                     disk_total_bytes,
                     tailscale_pairing_available: self.authenticator.tailscale_pairing_available(),
+                    cpu_percent: host.cpu_percent,
+                    battery_percent: host.battery.map(|battery| battery.percent),
+                    battery_state: host
+                        .battery
+                        .map(|battery| battery.state)
+                        .unwrap_or(triage_core::host::BatteryState::Unknown),
                 })
             }
             ClientRequest::PairingChallenge { client_id } => {
@@ -538,9 +549,16 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             }
             ClientRequest::GetDaemonStats => {
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
+                let host = current_host_stats();
                 Ok(ServerResult::DaemonStats {
                     disk_free_bytes,
                     disk_total_bytes,
+                    cpu_percent: host.cpu_percent,
+                    battery_percent: host.battery.map(|battery| battery.percent),
+                    battery_state: host
+                        .battery
+                        .map(|battery| battery.state)
+                        .unwrap_or(triage_core::host::BatteryState::Unknown),
                 })
             }
             ClientRequest::SetRailPins {
@@ -876,6 +894,16 @@ pub enum ServerResult {
         /// configured). Defaults false so hellos from older daemons parse.
         #[serde(default)]
         tailscale_pairing_available: bool,
+        /// Host CPU busy percent and battery level/state for the daemon
+        /// selector. `None`/unknown means the probe failed or the first
+        /// CPU sample is still seeding; defaulted so results from older
+        /// daemons parse, skipped on the wire when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_percent: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_percent: Option<u8>,
+        #[serde(default)]
+        battery_state: triage_core::host::BatteryState,
     },
     Paired {
         token: String,
@@ -938,6 +966,12 @@ pub enum ServerResult {
     DaemonStats {
         disk_free_bytes: u64,
         disk_total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_percent: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_percent: Option<u8>,
+        #[serde(default)]
+        battery_state: triage_core::host::BatteryState,
     },
 }
 
@@ -1017,6 +1051,7 @@ mod tests {
                 disk_free_bytes,
                 disk_total_bytes,
                 tailscale_pairing_available,
+                ..
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(actual, authenticated);
@@ -1842,6 +1877,9 @@ mod tests {
             result: ServerResult::DaemonStats {
                 disk_free_bytes: 12_345,
                 disk_total_bytes: 67_890,
+                cpu_percent: Some(42),
+                battery_percent: Some(87),
+                battery_state: triage_core::host::BatteryState::Charging,
             },
         };
         let bytes = flatbuffers_proto::serialize_server_message(&msg);
@@ -1852,6 +1890,39 @@ mod tests {
                 result: flatbuffers_proto::ServerResultBorrowed::DaemonStats {
                     disk_free_bytes: 12_345,
                     disk_total_bytes: 67_890,
+                    cpu_percent: Some(42),
+                    battery_percent: Some(87),
+                    battery_state: triage_core::host::BatteryState::Charging,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn flatbuffers_daemon_stats_unknown_roundtrip() {
+        // Unknown legs must survive the round trip as unknown (-1), not as
+        // a bogus 0: 0% CPU and 0% battery are both valid readings.
+        let msg = ServerMessage::Response {
+            id: Some(json!("stats-fb-unknown")),
+            result: ServerResult::DaemonStats {
+                disk_free_bytes: 0,
+                disk_total_bytes: 0,
+                cpu_percent: None,
+                battery_percent: None,
+                battery_state: triage_core::host::BatteryState::Unknown,
+            },
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("stats-fb-unknown"),
+                result: flatbuffers_proto::ServerResultBorrowed::DaemonStats {
+                    disk_free_bytes: 0,
+                    disk_total_bytes: 0,
+                    cpu_percent: None,
+                    battery_percent: None,
+                    battery_state: triage_core::host::BatteryState::Unknown,
                 },
             }
         );
@@ -1899,6 +1970,7 @@ mod tests {
                         disk_free_bytes,
                         disk_total_bytes,
                         tailscale_pairing_available,
+                        ..
                     } => {
                         assert_eq!(protocol_version, PROTOCOL_VERSION);
                         assert!(!authenticated);
@@ -2221,10 +2293,20 @@ mod tests {
                     ServerResult::DaemonStats {
                         disk_free_bytes,
                         disk_total_bytes,
+                        cpu_percent,
+                        battery_percent,
+                        ..
                     },
             } => {
                 assert_eq!(id, json!("stats-1"));
                 assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+                // Live host legs are unknown-or-bounded, never bogus.
+                if let Some(cpu) = cpu_percent {
+                    assert!(cpu <= 100, "cpu {cpu} exceeds 100");
+                }
+                if let Some(battery) = battery_percent {
+                    assert!(battery <= 100, "battery {battery} exceeds 100");
+                }
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -2246,6 +2328,7 @@ mod tests {
                     ServerResult::DaemonStats {
                         disk_free_bytes,
                         disk_total_bytes,
+                        ..
                     },
                 ..
             } => {
