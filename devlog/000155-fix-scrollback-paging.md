@@ -91,6 +91,13 @@ fix PR on top of #192.
   `Expected <2> Actual <1>` before the handler logic).
   `flutter analyze` clean; full suite 685 passed + 2 live-skipped;
   live test green against the daemon. No Rust changes.
+- 2026-10-06T08:46-0700: deployed. Daemon rebuilt (bundle 297e62d0,
+  pill string present), installed, handover clean with 65 sessions
+  preserved; served main.dart.js matches the fresh build. Release APK
+  rebuilt (57.1MB) but not installed — Pixel 10 Pro Fold not on adb
+  (only a Samsung S25 Ultra visible); needs Pixel wireless debugging
+  reconnected. Web override dir (~/.local/share/triage/web) absent:
+  nothing shadowing the embedded bundle. PR 193 CI green.
 
 ## Research & Discoveries
 
