@@ -113,6 +113,39 @@ void main() {
     expect(store.state.scrollbackReady, isTrue);
   });
 
+  test('a deeper window replays more lines than the first-page trim', () {
+    // The native first-page budget keeps 1000 lines; serving the same
+    // 2000-line suffix for a doubled window must keep twice the lines,
+    // not replay the identical trimmed suffix (which left paging stuck
+    // showing the same content on every page).
+    final lines = List.generate(2000, (i) => 'line $i\n').join();
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b(lines),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryFirstWindowBytes,
+      ),
+    );
+    final firstReplay = sink.written.toString();
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b(lines),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryFirstWindowBytes * 2,
+      ),
+    );
+    final secondReplay = sink.written.toString().substring(firstReplay.length);
+    // The write path normalizes LF to CRLF; match the replayed form.
+    expect(firstReplay, isNot(contains('line 0\r\n')));
+    expect(firstReplay, contains('line 1999\r\n'));
+    expect(secondReplay, contains('line 0\r\n'));
+    expect(secondReplay, contains('line 1999\r\n'));
+  });
+
   test('outputSeq <= history high-water is dropped as duplicate', () {
     store.dispatch(const Attach());
     store.dispatch(
@@ -160,10 +193,10 @@ void main() {
   });
 
   test('full replay trims to the newest lines with a reset prologue', () {
-    expect(kHistoryReplayMaxLines, 10000);
+    expect(kHistoryReplayMaxLines, 1000);
     final lines = List.generate(
       kHistoryReplayMaxLines + 500,
-      (i) => 'L${i.toString().padLeft(5, '0')}',
+      (i) => 'L${i.toString().padLeft(4, '0')}',
     );
     final payload = '${lines.join('\n')}\n';
     store.dispatch(const Attach());
@@ -176,7 +209,8 @@ void main() {
 
   test('256 KiB paged history of 2500 lines retains the oldest line', () {
     // Regression guard: a 256 KiB native page of ~100-byte lines is ~2,500
-    // lines; a 1,000-line cap silently dropped the older 1,500 lines on write.
+    // lines; scaling the line budget with windowBytes (4,000 lines at 256 KiB)
+    // retains all 2,500 lines instead of trimming to the 1,000-line first page.
     final lines = List.generate(
       2500,
       (i) => 'L${i.toString().padLeft(4, '0')}-${'x' * 90}',
@@ -184,7 +218,14 @@ void main() {
     final payload = '${lines.join('\n')}\n';
     expect(payload.length, lessThanOrEqualTo(256 * 1024));
     store.dispatch(const Attach());
-    store.dispatch(HistoryBytes(b(payload), cols: 80, rows: 24));
+    store.dispatch(
+      HistoryBytes(
+        b(payload),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryReplayMaxBytes,
+      ),
+    );
     expect(sink.written.toString(), startsWith('L0000-'));
     expect(sink.written.toString(), contains('L2499-'));
   });
