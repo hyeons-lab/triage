@@ -113,6 +113,39 @@ void main() {
     expect(store.state.scrollbackReady, isTrue);
   });
 
+  test('a deeper window replays more lines than the first-page trim', () {
+    // The native first-page budget keeps 1000 lines; serving the same
+    // 2000-line suffix for a doubled window must keep twice the lines,
+    // not replay the identical trimmed suffix (which left paging stuck
+    // showing the same content on every page).
+    final lines = List.generate(2000, (i) => 'line $i\n').join();
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b(lines),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryFirstWindowBytes,
+      ),
+    );
+    final firstReplay = sink.written.toString();
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b(lines),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryFirstWindowBytes * 2,
+      ),
+    );
+    final secondReplay = sink.written.toString().substring(firstReplay.length);
+    // The write path normalizes LF to CRLF; match the replayed form.
+    expect(firstReplay, isNot(contains('line 0\r\n')));
+    expect(firstReplay, contains('line 1999\r\n'));
+    expect(secondReplay, contains('line 0\r\n'));
+    expect(secondReplay, contains('line 1999\r\n'));
+  });
+
   test('outputSeq <= history high-water is dropped as duplicate', () {
     store.dispatch(const Attach());
     store.dispatch(

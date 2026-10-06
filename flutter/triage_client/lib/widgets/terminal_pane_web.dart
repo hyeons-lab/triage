@@ -40,7 +40,10 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final dynamic terminal;
-  final VoidCallback? onNearTop;
+  // Paging request, reporting back whether a page launched (see
+  // SessionWorkspace.onNearTop). The trigger ignores the answer; the
+  // history-replayed handler uses it to auto-continue or report.
+  final bool Function()? onNearTop;
   final bool bracketedPasteEnabled;
 
   /// Plain rows; unused by the live web view but kept for parity with native.
@@ -314,6 +317,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
+  bool _showNoOlderScrollback = false;
+  Timer? _noOlderScrollbackTimer;
   Timer? _suppressScrollSaveTimer;
   Timer? _jiggleRestoreTimer;
   int? _pendingJiggleCols;
@@ -1651,6 +1656,24 @@ class _TerminalPaneState extends State<TerminalPane> {
         timer.cancel();
         _pageRestoreTimer = null;
         if (!mounted || !_initialized || len < 0) return;
+        // A page that added no lines while the user is still near the top
+        // is a barren window (a TUI redrawing in place): ask for a deeper
+        // one instead of re-seating on identical content, so one gesture
+        // skips the desert. The viewport is re-read here (not trusted
+        // from the anchor): the parse the poll waited out took long
+        // enough for the user to scroll away.
+        var stillNearTop = false;
+        try {
+          final buffer = js_util.getProperty(_term, 'buffer');
+          final active = js_util.getProperty(buffer, 'active');
+          final viewportY =
+              (js_util.getProperty(active, 'viewportY') as num?)?.toInt();
+          stillNearTop = viewportY != null && viewportY <= 5;
+        } catch (_) {}
+        if (len - anchorLen <= 0 && stillNearTop) {
+          _continuePastBarrenPage();
+          return;
+        }
         final target = anchorY + (len - anchorLen);
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         var baseY = 0;
@@ -1673,6 +1696,40 @@ class _TerminalPaneState extends State<TerminalPane> {
         lastLen = len;
       }
     });
+  }
+
+  /// A page landed with no new buffer lines while the user is still near
+  /// the top: the window was barren (a TUI redrawing in place), so ask for
+  /// a deeper one instead of sitting on identical content. When no deeper
+  /// window is available the scrollback is genuinely exhausted and the
+  /// pill says so, rather than leaving the top silently inert.
+  void _continuePastBarrenPage() {
+    final terminalId = widget.terminalId;
+    // Deferred like the native pane's (this can run inside the landed
+    // page's own single-flight window), and guarded against a session
+    // swap landing between the poll and now.
+    scheduleMicrotask(() {
+      if (!mounted ||
+          !_initialized ||
+          widget.terminalId != terminalId) {
+        return;
+      }
+      if (widget.onNearTop?.call() == false) {
+        _noteHistoryExhausted();
+      }
+    });
+  }
+
+  void _noteHistoryExhausted() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => _showNoOlderScrollback = false);
+      }
+    });
+    if (mounted && !_showNoOlderScrollback) {
+      setState(() => _showNoOlderScrollback = true);
+    }
   }
 
   /// Heals a grid that disagrees with its own pixels.
@@ -2968,6 +3025,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _pageRestoreTimer?.cancel();
+    _noOlderScrollbackTimer?.cancel();
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
@@ -3090,6 +3148,13 @@ class _TerminalPaneState extends State<TerminalPane> {
                       backgroundColor: Colors.transparent,
                       color: Color(0xffffc857),
                     ),
+                  ),
+                if (_showNoOlderScrollback)
+                  const Positioned(
+                    top: 8,
+                    left: 0,
+                    right: 0,
+                    child: Center(child: NoOlderScrollbackPill()),
                   ),
               ],
             ),

@@ -60,6 +60,38 @@ int nextHistoryWindowBytes({required int current, required int max}) {
   return doubled >= max ? max : doubled;
 }
 
+/// Both emulators' scrollback capacity in lines (xterm.dart `maxLines` and
+/// the xterm.js `scrollback` option): the backstop the scaled line budget
+/// below can never exceed.
+const int kEmulatorMaxScrollbackLines = 50000;
+
+/// Replay-trim budgets for a served history window, in
+/// ([maxLines], [maxBytes]) kept newest-first by [trimHistoryTail].
+///
+/// The line budget scales with the window so each deeper page emulates
+/// strictly more than the last: trimming every page to the first-page
+/// budget replays the same suffix of the same log end over and over and
+/// the buffer never grows. The byte budget is the window itself, so a
+/// page never parses more than it asked for. A null window (local seeds
+/// and other replays that were never windowed) keeps the platform
+/// budgets, exactly as before.
+({int maxLines, int maxBytes}) historyTrimBudgetsForWindow(
+  int? windowBytes, {
+  required bool web,
+}) {
+  final platformLines = web ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines;
+  final platformBytes = web ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+  if (windowBytes == null || windowBytes <= 0) {
+    return (maxLines: platformLines, maxBytes: platformBytes);
+  }
+  final scaledLines =
+      platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
+  return (
+    maxLines: min(scaledLines, kEmulatorMaxScrollbackLines),
+    maxBytes: min(windowBytes, platformBytes),
+  );
+}
+
 /// Trims a full-replay history payload to its newest complete lines.
 ///
 /// xterm is append-only, so a replay must still arrive oldest-first; this keeps
@@ -402,6 +434,7 @@ class TerminalStore extends ChangeNotifier {
         :final rows,
         :final throughOutputSeq,
         :final rawOutputStart,
+        :final windowBytes,
       ):
         return _reduceHistory(
           s,
@@ -410,6 +443,7 @@ class TerminalStore extends ChangeNotifier {
           rows,
           throughOutputSeq,
           rawOutputStart: rawOutputStart,
+          windowBytes: windowBytes,
         );
 
       case LiveBytes(:final bytes, :final outputSeq):
@@ -451,6 +485,7 @@ class TerminalStore extends ChangeNotifier {
     int rows,
     int? throughOutputSeq, {
     int? rawOutputStart,
+    int? windowBytes,
   }) {
     _stashedAppliedLiveSeq = null;
     _stashedAppliedLogBytes = null;
@@ -635,13 +670,16 @@ class TerminalStore extends ChangeNotifier {
     _beginHostInputSuppression();
     // Viewport-first: replay only the newest lines so a megabyte tail doesn't
     // stall first paint; the baseline below still uses the original end offset
-    // (trimming drops a prefix) so delta merges stay anchored.
+    // (trimming drops a prefix) so delta merges stay anchored. The budgets
+    // scale with the served window so each deeper page emulates more than
+    // the last instead of replaying the same trimmed suffix.
     // `kIsWeb` selects the xterm.js sink exactly: every other target parses
     // through package:xterm on the UI thread.
+    final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
     final replayBytes = trimHistoryTail(
       bytes,
-      maxLines: kIsWeb ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines,
-      maxBytes: kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes,
+      maxLines: budgets.maxLines,
+      maxBytes: budgets.maxBytes,
     );
     if (!identical(replayBytes, bytes)) {
       tdbg(

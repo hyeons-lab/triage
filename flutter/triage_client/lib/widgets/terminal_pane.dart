@@ -1,7 +1,38 @@
+import 'package:flutter/widgets.dart';
+
 import '../terminal/debug_log.dart';
 import 'terminal_pane_stub.dart'
     if (dart.library.js_util) 'terminal_pane_web.dart'
     as impl;
+
+/// Transient pill shown at the top of the terminal when scrollback paging
+/// exhausts without yielding older lines: a TUI redrawing in place (or the
+/// platform window maxed on barren output) means the loaded scrollback is
+/// genuinely all there is in reach — the view is not stuck, there is
+/// nothing older to load. Shared by both pane implementations so the
+/// wording cannot drift between them.
+class NoOlderScrollbackPill extends StatelessWidget {
+  const NoOlderScrollbackPill({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const IgnorePointer(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Color(0xcc161b1d),
+          borderRadius: BorderRadius.all(Radius.circular(12)),
+        ),
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Text(
+            'No older scrollback in reach',
+            style: TextStyle(color: Color(0xffcdd7d6), fontSize: 12),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 class TerminalController {
   final List<void Function(String)> _writeListeners = [];
