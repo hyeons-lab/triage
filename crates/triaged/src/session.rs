@@ -25,7 +25,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
-use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
+use tattoy_wezterm_term::{
+    Intensity, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize, Underline,
+};
 use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputControllerKind,
@@ -3283,6 +3285,7 @@ fn spawn_adopted_pty_runtime(
         .open(&target_log_path)
         .with_context(|| format!("opening session log {}", target_log_path.display()))?;
 
+    let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
         log_path: target_log_path,
@@ -3307,6 +3310,8 @@ fn spawn_adopted_pty_runtime(
         log_cache: None,
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
+        scrollback: Some(scrollback),
+        scroll_seq_baseline: None,
     };
 
     let (replay_len, replay) = read_replay_tail(&h_sess.log_path)?;
@@ -4639,6 +4644,7 @@ impl PtySession {
         }
 
         self.child.wait().context("waiting for PTY child")?;
+        self.output.flush_pending_translated_bytes();
         self.output.log.flush().context("flushing session log")?;
 
         Ok(CompletedSession {
@@ -6028,6 +6034,13 @@ struct OutputState {
     log_cache: Option<Vec<u8>>,
     pending_carriage_return: bool,
     pending_escape_buffer: Vec<u8>,
+    /// Ingest-time scrollback journal. `None` for read-only historical
+    /// inspection and unit tests that construct `OutputState` directly.
+    scrollback: Option<crate::scrollback::ScrollbackJournal>,
+    /// Stable-row boundary baseline for scroll detection. `None` until
+    /// `init_scroll_baseline` seeds it before the first live advance (and
+    /// reset across reflow).
+    scroll_seq_baseline: Option<StableRowIndex>,
 }
 
 /// Visible rows + output sequence + git context + cwd, returned by the actor's
@@ -6209,6 +6222,7 @@ fn run_actor(
 impl ActorState {
     #[cfg(unix)]
     fn extract_handover_state(&mut self) -> Result<ExtractedHandover> {
+        self.output.flush_pending_translated_bytes();
         let fd = self
             .master
             .as_raw_fd()
@@ -6473,6 +6487,7 @@ impl ActorState {
                 if let Err(error) = result {
                     tracing::warn!(error = ?error, "PTY output reader closed with error");
                 }
+                self.output.flush_pending_translated_bytes();
                 self.output
                     .report_unrecovered_loss("session output ended before log writes recovered");
                 self.output_closed = true;
@@ -7071,7 +7086,7 @@ impl OutputState {
         }
     }
 
-    fn flush_pending_translated_bytes(&mut self) {
+    fn flush_replayed_pending_translated_bytes(&mut self) {
         if self.pending_escape_buffer.is_empty() {
             return;
         }
@@ -7082,6 +7097,15 @@ impl OutputState {
         self.terminal.advance_bytes(&translated);
         self.pending_carriage_return = self.pending_escape_buffer.last() == Some(&b'\r');
         self.pending_escape_buffer.clear();
+    }
+
+    fn flush_pending_translated_bytes(&mut self) {
+        if self.pending_escape_buffer.is_empty() {
+            return;
+        }
+        self.init_scroll_baseline();
+        self.flush_replayed_pending_translated_bytes();
+        self.journal_scrolled_lines();
     }
 
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
@@ -7229,7 +7253,9 @@ impl OutputState {
             self.mark_fully_persisted();
         }
         let current_working_directory = self.extract_current_working_directory(bytes);
+        self.init_scroll_baseline();
         self.advance_translated_bytes(bytes);
+        self.journal_scrolled_lines();
         Ok(current_working_directory)
     }
 
@@ -7343,6 +7369,96 @@ impl OutputState {
             return CacheReseedOutcome::Seeded;
         }
         CacheReseedOutcome::RetryLater
+    }
+
+    /// Anchor the scroll baseline before the first advance.
+    ///
+    /// The baseline must predate the first chunk's scrolls: anchoring
+    /// after the advance would silently skip them. Restore and reflow
+    /// rebuild the terminal through `advance_replayed_bytes`, which
+    /// never calls this, so the first *live* chunk anchors onto the
+    /// rebuilt window instead of re-journaling persisted lines.
+    fn init_scroll_baseline(&mut self) {
+        if self.scroll_seq_baseline.is_some()
+            || self
+                .scrollback
+                .as_ref()
+                .is_none_or(crate::scrollback::ScrollbackJournal::is_disabled)
+            || self.terminal.is_alt_screen_active()
+        {
+            return;
+        }
+        let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
+        self.scroll_seq_baseline = Some(first_visible);
+    }
+
+    /// Journal lines that scrolled into scrollback during this chunk.
+    ///
+    /// The stable index of the first visible row only moves when lines
+    /// scroll: rows between the baseline and the new boundary entered
+    /// scrollback since the last chunk, so they are encoded once and
+    /// appended, stamped with the chunk's end log offset. Scrollback
+    /// rows are immutable (wipes and eviction only remove them), so
+    /// encoding at first sight is final.
+    ///
+    /// Desert chunks (TUI redraws with no scrolling) cost two integer
+    /// reads. Wipes, resizes, and terminal replacement move the window
+    /// discontinuously; every such case re-anchors the baseline without
+    /// journaling, losing at most one chunk's scrolls. Wiped lines keep
+    /// their records: history is a record, not a mirror. Restore and
+    /// reflow replay through `advance_replayed_bytes`, which never calls
+    /// this, so rebuilt terminals cannot double-journal persisted lines.
+    fn journal_scrolled_lines(&mut self) {
+        if self
+            .scrollback
+            .as_ref()
+            .is_none_or(crate::scrollback::ScrollbackJournal::is_disabled)
+            || self.terminal.is_alt_screen_active()
+        {
+            return;
+        }
+        let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
+        let baseline = match self.scroll_seq_baseline {
+            Some(baseline) => baseline,
+            None => {
+                self.scroll_seq_baseline = Some(first_visible);
+                return;
+            }
+        };
+        if baseline >= first_visible {
+            // No new scroll, or a wipe/reflow/replacement moved the
+            // window back: re-anchor without journaling.
+            self.scroll_seq_baseline = Some(first_visible);
+            return;
+        }
+        let screen = self.terminal.screen();
+        let top = screen.phys_to_stable_row_index(0);
+        let start = baseline.max(top);
+        let Some(phys_start) = screen.stable_row_to_phys(start) else {
+            self.scroll_seq_baseline = Some(first_visible);
+            return;
+        };
+        // `phys_row(0)` is the first visible row's phys index, i.e. the
+        // scrollback/viewport boundary. (`scrollback_rows` sounds right
+        // but returns the total row count despite its doc comment.)
+        let phys_end = screen.phys_row(0);
+        if phys_start >= phys_end {
+            self.scroll_seq_baseline = Some(first_visible);
+            return;
+        }
+        let palette = self.terminal.palette();
+        let lines = self
+            .terminal
+            .screen()
+            .lines_in_phys_range(phys_start..phys_end);
+        let offset = self.bytes_logged;
+        if let Some(journal) = self.scrollback.as_mut() {
+            for mut line in lines {
+                let bytes = crate::scrollback::encode_line(&mut line, &palette);
+                journal.append(offset, &bytes);
+            }
+        }
+        self.scroll_seq_baseline = Some(first_visible);
     }
 
     fn is_segmented_log(&self) -> bool {
@@ -7459,6 +7575,13 @@ impl OutputState {
         // `read_raw_output_tail` would then seek past EOF.
         let dropped = self.bytes_logged.saturating_sub(len);
         self.bytes_logged = len;
+        // Journal offsets share the log's coordinate space: drop records
+        // below the new head and shift the survivors onto it. Segmented
+        // logs never reach this path (absolute offsets, immutable
+        // segments), so no rebase is needed there.
+        if let Some(journal) = self.scrollback.as_mut() {
+            journal.rebase(dropped);
+        }
         // The cache mirrors the head of the log, so it no longer corresponds to
         // anything on disk once the front is dropped.
         self.log_cache = None;
@@ -7519,7 +7642,7 @@ impl OutputState {
             }
         }
         let cwd = self.advance_replayed_bytes(bytes);
-        self.flush_pending_translated_bytes();
+        self.flush_replayed_pending_translated_bytes();
         Ok(cwd)
     }
 
@@ -7550,6 +7673,7 @@ impl OutputState {
     fn reflow_from_log(&mut self, size: &SessionSize, writer: SharedPtyWriter) -> Result<()> {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
+        self.scroll_seq_baseline = None;
         self.cwd_sequence_buffer.clear();
 
         if let Some(cache) = self.log_cache.clone() {
@@ -7564,7 +7688,7 @@ impl OutputState {
             let (_, replay) = read_replay_tail(&self.log_path)?;
             self.advance_replayed_bytes(&replay);
         }
-        self.flush_pending_translated_bytes();
+        self.flush_replayed_pending_translated_bytes();
 
         let replay_writes = replay_gate.dropped_write_count();
         let replay_flushes = replay_gate.dropped_flush_count();
@@ -7729,17 +7853,18 @@ fn spawn_pty_runtime(
         LogInitialization::Truncate => {
             let writer = shared_pty_writer(pair.master.take_writer().context("taking PTY writer")?);
             let terminal = terminal_with_writer(&config.size, writer.clone());
-            let session_dir = resolve_segment_session_dir(&config.log_path)
-                .or_else(|| config.log_path.parent().map(|p| p.to_path_buf()));
-            if let Some(dir) = session_dir {
-                if dir.is_dir()
-                    && let Ok(segments) = crate::storage::list_session_segments(&dir)
-                {
-                    for seg in segments {
-                        let _ = fs::remove_file(seg.path);
+            if let Some(dir) = resolve_segment_session_dir(&config.log_path) {
+                if dir.is_dir() {
+                    if let Ok(segments) = crate::storage::list_session_segments(&dir) {
+                        for seg in segments {
+                            let _ = fs::remove_file(seg.path);
+                        }
                     }
+                    crate::scrollback::purge_journal_files(&dir);
                 }
                 let _ = fs::create_dir_all(&dir);
+            } else if let Some(parent) = config.log_path.parent() {
+                let _ = fs::create_dir_all(parent);
             }
             let log = OpenOptions::new()
                 .create(true)
@@ -7754,6 +7879,7 @@ fn spawn_pty_runtime(
                 .and_then(crate::storage::parse_segment_index)
                 .unwrap_or((1, false));
             let active_segment_bytes = fs::metadata(&config.log_path).map(|m| m.len()).unwrap_or(0);
+            let scrollback = crate::scrollback::open_journal_for_log(&config.log_path);
             Ok(PtyRuntime {
                 master: pair.master,
                 child,
@@ -7784,6 +7910,8 @@ fn spawn_pty_runtime(
                     log_cache: Some(Vec::new()),
                     pending_carriage_return: false,
                     pending_escape_buffer: Vec::new(),
+                    scrollback: Some(scrollback),
+                    scroll_seq_baseline: None,
                 },
                 size: config.size,
                 current_working_directory: None,
@@ -7808,6 +7936,7 @@ fn spawn_pty_runtime(
                 .and_then(crate::storage::parse_segment_index)
                 .unwrap_or((1, false));
             let active_segment_bytes = fs::metadata(&config.log_path).map(|m| m.len()).unwrap_or(0);
+            let scrollback = crate::scrollback::open_journal_for_log(&config.log_path);
             let mut output = OutputState {
                 log: log.try_clone().context("cloning restored session log")?,
                 log_path: config.log_path.clone(),
@@ -7832,6 +7961,8 @@ fn spawn_pty_runtime(
                 log_cache: Some(Vec::new()),
                 pending_carriage_return: false,
                 pending_escape_buffer: Vec::new(),
+                scrollback: Some(scrollback),
+                scroll_seq_baseline: None,
             };
             let (replay_len, replay) = read_replay_tail(&config.log_path)?;
             let replayed_working_directory = if replay_len == 0 {
@@ -7952,6 +8083,8 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         log_cache: Some(Vec::new()),
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
+        scrollback: None,
+        scroll_seq_baseline: None,
     })
 }
 
@@ -14342,6 +14475,8 @@ mod tests {
             log_cache: Some(Vec::new()),
             pending_carriage_return: false,
             pending_escape_buffer: Vec::new(),
+            scrollback: None,
+            scroll_seq_baseline: None,
         };
 
         output
@@ -14825,6 +14960,278 @@ mod tests {
         assert_eq!(fs::read(&path).expect("read log"), b"789q");
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// Desert flood: TUI-style in-place redraws scroll nothing, so the
+    /// journal does not grow past its baseline no matter how many bytes
+    /// pass through. This is the case the journal exists for in reverse:
+    /// the raw bytes are unreachable desert, and there are no scrolled
+    /// lines to save.
+    #[test]
+    fn ingest_desert_flood_journals_nothing() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 5,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Scroll one baseline line first so the journal is proven live,
+        // then flood in-place redraws without scrolling.
+        output
+            .ingest(b"seed\r\na1\r\na2\r\na3\r\na4\r\na5")
+            .expect("seed one scroll and fill screen");
+        let baseline_bytes = output
+            .scrollback
+            .as_ref()
+            .expect("journal")
+            .journaled_bytes();
+        assert!(baseline_bytes > 0, "seed scroll must journal a baseline");
+        for _ in 0..50 {
+            output
+                .ingest(b"\x1b[Hredraw-line-1\x1b[K\r\nredraw-2\x1b[K")
+                .expect("redraw in place");
+        }
+
+        let journal = output.scrollback.as_mut().expect("journal");
+        assert_eq!(
+            journal.journaled_bytes(),
+            baseline_bytes,
+            "in-place redraws must journal nothing past the baseline"
+        );
+        assert!(
+            output.scroll_seq_baseline.is_some(),
+            "the baseline must stay anchored across redraws"
+        );
+        assert!(
+            output.bytes_logged > 1000,
+            "the test must actually flood bytes: {}",
+            output.bytes_logged
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Scrolling journals each scrolled line once, stamped with its
+    /// chunk's end offset, so the serve-time seam can split prefix from
+    /// raw tail exactly.
+    #[test]
+    fn ingest_scrolling_journals_lines_with_chunk_offsets() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Three lines fill three rows; the third newline scrolls line1.
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\n")
+            .expect("ingest lines 1-3");
+        assert_eq!(output.bytes_logged, 21);
+        // Each further line scrolls exactly one more.
+        output.ingest(b"line4\r\n").expect("ingest line 4");
+        assert_eq!(output.bytes_logged, 28);
+        output.ingest(b"line5\r\n").expect("ingest line 5");
+        assert_eq!(output.bytes_logged, 35);
+
+        let journal = output.scrollback.as_mut().expect("journal");
+        // line1 @ 21 is older than a raw window starting at 28; the
+        // seam is strict, so line2 @ 28 is not.
+        let prefix = journal.read_prefix_older_than(28, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        assert!(
+            text.contains("line1") && !text.contains("line2"),
+            "seam at 28 must serve exactly line1: {text:?}"
+        );
+        let prefix = journal.read_prefix_older_than(36, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        let (l1, l2, l3) = (text.find("line1"), text.find("line2"), text.find("line3"));
+        assert!(
+            matches!((l1, l2, l3), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "records must append oldest-first: {text:?}"
+        );
+        assert!(
+            !text.contains("line4") && !text.contains("line5"),
+            "viewport lines must never journal: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy trim rebases the journal into the trimmed coordinate
+    /// space: records below the cut drop, survivors shift onto the new
+    /// head, and the seam keeps working.
+    #[test]
+    fn ingest_trim_rebases_journal_offsets() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\n")
+            .expect("ingest lines 1-3");
+        output
+            .ingest(b"line4\r\nline5\r\n")
+            .expect("ingest lines 4-5");
+        assert_eq!(output.bytes_logged, 35);
+
+        // Pad without scrolling to push past the bound: 35 + 16 = 51,
+        // trimmed back to 20, so the cut lands at absolute offset 31.
+        // line1 @ 21 drops; line2, line3 @ 35 shift to 4.
+        output.max_log_bytes = 30;
+        output.retain_log_bytes = 20;
+        output
+            .ingest(b"pad-pad-pad-pad!")
+            .expect("pad past the bound");
+        assert_eq!(output.bytes_logged, 20);
+
+        let journal = output.scrollback.as_mut().expect("journal");
+        let prefix = journal.read_prefix_older_than(20, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        assert!(
+            !text.contains("line1"),
+            "records below the cut must drop: {text:?}"
+        );
+        assert!(
+            text.contains("line2") && text.contains("line3"),
+            "survivors must stay servable past the trim: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reflowing the terminal on resize resets the scroll baseline so the
+    /// next live ingest neither double-journals wrapped replay lines nor
+    /// drops newly scrolled lines after widening.
+    #[test]
+    fn ingest_reflow_resets_scroll_baseline_without_duplicate_or_dropped_lines() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let wide_size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, wide_size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Three 12-col lines fill the 3-row viewport and scroll line1.
+        output
+            .ingest(b"aaaaaaaaaaaa\r\nbbbbbbbbbbbb\r\ncccccccccccc\r\n")
+            .expect("ingest wide lines");
+        let before_reflow = output
+            .scrollback
+            .as_mut()
+            .expect("journal")
+            .read_prefix_older_than(1_000, 1 << 20);
+        let before_text = String::from_utf8_lossy(&before_reflow);
+        assert!(
+            before_text.contains("aaaaaaaaaaaa") && !before_text.contains("bbbbbbbbbbbb"),
+            "only line1 should be journaled before reflow: {before_text:?}"
+        );
+
+        // Narrowing to 6 cols wraps each 12-col replayed line into 2 rows,
+        // increasing the rebuilt terminal's first_visible stable row.
+        let narrow_size = SessionSize {
+            rows: 3,
+            cols: 6,
+            ..SessionSize::default()
+        };
+        output
+            .reflow_from_log(&narrow_size, shared_pty_writer(Box::new(std::io::sink())))
+            .expect("reflow narrow");
+        assert!(
+            output.scroll_seq_baseline.is_none(),
+            "reflow must clear scroll_seq_baseline"
+        );
+
+        // A non-scrolling chunk after narrowing must not re-journal the wrapped replay lines.
+        output.ingest(b"\x1b[Hok").expect("ingest non-scrolling");
+        let after_narrow = output
+            .scrollback
+            .as_mut()
+            .expect("journal")
+            .read_prefix_older_than(1_000, 1 << 20);
+        assert_eq!(
+            after_narrow, before_reflow,
+            "narrow reflow followed by non-scrolling ingest must not duplicate replayed lines"
+        );
+
+        // Widening back to 20 cols and 5 rows lowers first_visible; the next
+        // scrolling chunk must re-anchor and journal its scrolled line.
+        let tall_size = SessionSize {
+            rows: 5,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        output
+            .reflow_from_log(&tall_size, shared_pty_writer(Box::new(std::io::sink())))
+            .expect("reflow tall");
+        output
+            .ingest(b"\x1b[5;1Hd\r\ne\r\nf\r\n")
+            .expect("scroll on tall terminal");
+        let after_tall = output
+            .scrollback
+            .as_mut()
+            .expect("journal")
+            .read_prefix_older_than(1_000, 1 << 20);
+        assert!(
+            after_tall.len() > before_reflow.len(),
+            "post-reflow scrolling chunk must journal new lines"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Flushing a held-back trailing newline + partial escape sequence on
+    /// timeout or stream close must journal the line scrolled by that newline.
+    #[test]
+    fn flush_pending_translated_bytes_journals_scrolled_lines() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 2,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output.ingest(b"top-line\r\nbot").expect("fill two rows");
+        // A newline immediately followed by an incomplete CSI sequence is held
+        // back in pending_escape_buffer until flush_pending_translated_bytes runs.
+        output
+            .ingest(b"\n\x1b[35")
+            .expect("ingest held-back newline");
+        output.flush_pending_translated_bytes();
+
+        let journal = output.scrollback.as_mut().expect("journal");
+        let prefix = journal.read_prefix_older_than(1_000, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        assert!(
+            text.contains("top-line"),
+            "flushing held-back newline must journal the scrolled line: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A failed log write (full disk) must degrade history, not liveness:
@@ -15918,6 +16325,11 @@ mod tests {
             log_cache: Some(Vec::new()),
             pending_carriage_return: false,
             pending_escape_buffer: Vec::new(),
+            // No journal by default: `unique_log_path` tests share the
+            // temp dir, and journals in one directory would interleave.
+            // Journal tests open their own in a `unique_log_dir`.
+            scrollback: None,
+            scroll_seq_baseline: None,
         }
     }
 
