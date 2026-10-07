@@ -27,6 +27,17 @@ history window. Zero client or protocol changes.
 - 2026-10-09T11:35-0700: render terminal_style references in
   scrollback.rs doc comments as code spans instead of intra-doc
   links, resolving rustdoc broken-intra-doc-links CI failure.
+- 2026-10-06T17:33-0700 (PR B): serve path.
+  `overlay_raw_output_history` takes the session journal and
+  prefixes journaled lines older than the raw window (cap split
+  half/half, raw floor 16 KiB, total clamped; `raw_output_start`
+  still addresses the raw tail). Wired into the live and Historical
+  `snapshot_with_history` paths. Reads are `&self` (serve paths
+  hold no exclusive access); `ingest` flushes the journal after
+  every chunk so small journals are serve-visible (the
+  all-buffer-serves-nothing bug caught live on session-303). 2
+  overlay fixture tests; live-verified end to end (304 live +
+  reload, 305 restored) with WS probes.
 
 ## Decisions
 
@@ -44,7 +55,8 @@ history window. Zero client or protocol changes.
 
 - a6592d9: feat(triaged): journal scrolled lines at ingest (PR A)
 - bd57f71: docs(triaged): fix broken intra-doc links in scrollback docs
-- HEAD: fix(scrollback): review findings from scrollback-index audit
+- 199d075: fix(scrollback): review findings from scrollback-index audit
+- HEAD: feat(triaged): serve journaled scrollback prefix (PR B)
 
 ## Progress
 
@@ -55,6 +67,11 @@ history window. Zero client or protocol changes.
   scrollback + 5 ingest tests green; fmt/clippy/workspace clean;
   8 pairing failures verified pre-existing on the clean base).
   Committed, pushed, stacked PR opened on `fix/scrollback-paging`.
+- 2026-10-06T17:33-0700: PR B implemented, gated, and live-verified
+  (synthetic desert sessions over WS: prefix served live, across
+  reload, and on the restored path; byte-identical). Committed,
+  pushed as `feat/scrollback-serve`, stacked PR opened on
+  `feat/scrollback-index`.
 - 2026-10-09T11:35-0700: Fixed broken intra-doc links in scrollback.rs
   doc comments. Format, clippy, doc, and unit tests passing.
 - 2026-10-10T07:24-0700: Rebased onto fix/scrollback-paging (98c6d01).
@@ -86,11 +103,17 @@ history window. Zero client or protocol changes.
   showed 4 lines journaled for 1 scroll).
 - Anchor-then-advance: any baseline-diff hook must sample *before*
   the mutation it measures, or the first batch is silently lost.
-  Here that meant a separate pre-advance init, because the natural
   single-hook placement runs post-advance.
+- Buffered writers + shared-ref readers need a flush contract:
+  tests that flush explicitly pass while production serves nothing.
+  Pin the production path (read via shared ref, no manual flush) or
+  the test proves nothing. Also: the exiting old daemon does not
+  drop `OutputState`, so handover does not flush — durability must
+  come from the steady-state path, not shutdown.
 
 ## Next Steps
 
-- PR B: serve path in `overlay_raw_output_history` (live +
-  Historical), fixture integration, live verify on session-245,
-  then gates + stacked PR.
+- Review order: 193 (paging) → 194 (journal) → serve PR; retarget
+  bases as each merges. Then re-verify mobile web on the fresh
+  bundle (hard refresh past the 192 service worker) and chase the
+  input bug if it persists there.

@@ -184,6 +184,13 @@ const JOURNAL_RETAINED_FILES: usize = 20;
 /// (u32 LE).
 const RECORD_HEADER_LEN: usize = 12;
 
+/// Appends between writer flushes. Reads never flush (the serve paths
+/// hold only a shared reference), so this bounds how many trailing
+/// records a read can miss. The miss is nearly always irrelevant to
+/// serving: unflushed records sit above the raw window's start, where
+/// the strict seam would exclude them anyway.
+const JOURNAL_FLUSH_EVERY: usize = 128;
+
 /// One journaled scrollback line: the SGR-encoded bytes plus the absolute
 /// log offset of the ingest chunk that scrolled it.
 pub struct JournalRecord {
@@ -206,6 +213,8 @@ pub struct ScrollbackJournal {
     active_index: u32,
     active_lines: usize,
     writer: Option<BufWriter<File>>,
+    /// Appends since the last flush (see [`JOURNAL_FLUSH_EVERY`]).
+    since_flush: usize,
     /// Set on the first I/O failure; the journal stays inert afterwards.
     broken: bool,
     warned: bool,
@@ -229,6 +238,7 @@ impl ScrollbackJournal {
             active_index: 0,
             active_lines: 0,
             writer: None,
+            since_flush: 0,
             broken: false,
             warned: false,
         };
@@ -245,6 +255,7 @@ impl ScrollbackJournal {
             active_index: 0,
             active_lines: 0,
             writer: None,
+            since_flush: 0,
             broken: true,
             warned: true,
         }
@@ -268,15 +279,13 @@ impl ScrollbackJournal {
     /// Serve prefix bytes: journaled lines strictly older than
     /// `raw_start`, newest-first up to `max_bytes`, returned oldest-first
     /// for replay. Never fails; unreadable data yields a shorter prefix.
-    pub fn read_prefix_older_than(&mut self, raw_start: u64, max_bytes: usize) -> Vec<u8> {
+    ///
+    /// Takes a shared reference because the serve paths hold no exclusive
+    /// access: it reads only flushed bytes, so up to [`JOURNAL_FLUSH_EVERY`]
+    /// trailing records may be missing (see the const for why that is
+    /// nearly always above the seam anyway).
+    pub fn read_prefix_older_than(&self, raw_start: u64, max_bytes: usize) -> Vec<u8> {
         if self.broken || max_bytes == 0 {
-            return Vec::new();
-        }
-        // The active file must include everything appended so far.
-        if let Some(writer) = self.writer.as_mut()
-            && let Err(err) = writer.flush()
-        {
-            self.note_broken(&err);
             return Vec::new();
         }
         // Collect newest-first, then reverse whole records (never bytes)
@@ -449,10 +458,34 @@ impl ScrollbackJournal {
         writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
         writer.write_all(bytes)?;
         self.active_lines += 1;
+        self.since_flush += 1;
+        if self.since_flush >= JOURNAL_FLUSH_EVERY
+            && let Some(writer) = self.writer.as_mut()
+        {
+            writer.flush()?;
+            self.since_flush = 0;
+        }
         if self.active_lines >= JOURNAL_LINES_PER_FILE {
             self.rotate()?;
         }
         Ok(())
+    }
+
+    /// Flush buffered appends so reads see them. Reads serve only
+    /// flushed bytes (the serve paths hold no exclusive access), so the
+    /// ingest path calls this after every chunk: an empty buffer makes
+    /// it a branch, a dirty one costs a single write.
+    pub(crate) fn flush_buffer(&mut self) {
+        if self.since_flush == 0 {
+            return;
+        }
+        if let Some(writer) = self.writer.as_mut()
+            && let Err(err) = writer.flush()
+        {
+            self.note_broken(&err);
+            return;
+        }
+        self.since_flush = 0;
     }
 
     fn rotate(&mut self) -> anyhow::Result<()> {
@@ -468,6 +501,7 @@ impl ScrollbackJournal {
         }
         self.active_index += 1;
         self.active_lines = 0;
+        self.since_flush = 0;
         Ok(())
     }
 
@@ -714,6 +748,7 @@ mod tests {
         journal.append(100, b"first\r\n");
         journal.append(200, b"second\r\n");
         journal.append(300, b"third\r\n");
+        journal.flush_buffer();
         // raw_start beyond every record: everything is older.
         assert_eq!(
             journal.read_prefix_older_than(1000, 1024),
@@ -729,6 +764,7 @@ mod tests {
         journal.append(100, b"old\r\n");
         journal.append(200, b"boundary\r\n");
         journal.append(300, b"new\r\n");
+        journal.flush_buffer();
         // Records at or above raw_start belong to the raw window, not
         // the prefix: overlap would replay lines twice.
         assert_eq!(journal.read_prefix_older_than(200, 1024), b"old\r\n");
@@ -742,6 +778,7 @@ mod tests {
         journal.append(100, b"aaaa\r\n");
         journal.append(200, b"bbbb\r\n");
         journal.append(300, b"cccc\r\n");
+        journal.flush_buffer();
         // Six bytes each: budget fits the two newest, oldest-first.
         assert_eq!(
             journal.read_prefix_older_than(1000, 12),
@@ -775,6 +812,7 @@ mod tests {
         {
             let mut journal = ScrollbackJournal::open(&dir);
             journal.append(300, b"c\r\n");
+            journal.flush_buffer();
             assert_eq!(
                 journal.read_prefix_older_than(1000, 1024),
                 b"a\r\nb\r\nc\r\n"
@@ -790,7 +828,7 @@ mod tests {
             file.write_all(&[1, 2, 3]).expect("tear tail");
         }
         {
-            let mut journal = ScrollbackJournal::open(&dir);
+            let journal = ScrollbackJournal::open(&dir);
             assert_eq!(
                 journal.read_prefix_older_than(1000, 1024),
                 b"a\r\nb\r\nc\r\n"

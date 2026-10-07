@@ -5414,6 +5414,7 @@ impl HistoricalSession {
             &self.persisted.log_path,
             self.output.bytes_logged,
             history_cap,
+            self.output.scrollback.as_ref(),
         )
     }
 
@@ -6399,6 +6400,7 @@ impl ActorState {
             &self.output.log_path,
             self.output.bytes_logged,
             history_cap,
+            self.output.scrollback.as_ref(),
         )
     }
 
@@ -6878,6 +6880,13 @@ impl OutputState {
         self.init_scroll_baseline();
         self.advance_translated_bytes(bytes);
         self.journal_scrolled_lines();
+        // Reads serve only flushed bytes, so every chunk — scrolling or
+        // desert — makes the journal current through it. Without this a
+        // journal under the periodic-flush threshold is all buffer and
+        // serves nothing.
+        if let Some(journal) = self.scrollback.as_mut() {
+            journal.flush_buffer();
+        }
         Ok(current_working_directory)
     }
 
@@ -7661,14 +7670,41 @@ const _: () = assert!(
 /// Overlays the raw output-history tail onto a snapshot for client-side
 /// re-emulation. Used by the attach/resync/snapshot paths; the resize broadcast
 /// keeps the plain `snapshot()` so it never carries the tail.
+///
+/// When a scrollback journal is passed, the served stream is prefixed with the
+/// journaled lines older than the raw window: desert sessions whose raw tail
+/// replays to a single screen get their real scrolled lines back ahead of it.
+/// The cap splits between prefix and raw so the total stays within
+/// `history_cap`; the raw tail never shrinks below 16 KiB (the viewport
+/// repaint needs it). `raw_output_start` still addresses the raw tail — the
+/// prefix is extra, unaddressed bytes the client replays ahead of it.
 fn overlay_raw_output_history(
     mut snapshot: SessionSnapshot,
     log_path: &Path,
     bytes_logged: u64,
     history_cap: u64,
+    journal: Option<&crate::scrollback::ScrollbackJournal>,
 ) -> SessionSnapshot {
-    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, history_cap);
-    snapshot.raw_output = raw;
+    let prefix_budget = match journal {
+        Some(_) => history_cap / 2,
+        None => 0,
+    };
+    let raw_cap = history_cap
+        .saturating_sub(prefix_budget)
+        .max(history_cap.min(16 * 1024));
+    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, raw_cap);
+    let prefix = match journal {
+        Some(journal) if prefix_budget > 0 => {
+            let room = history_cap.saturating_sub(raw.len() as u64);
+            let budget = prefix_budget.min(room).min(usize::MAX as u64) as usize;
+            journal.read_prefix_older_than(start, budget)
+        }
+        _ => Vec::new(),
+    };
+    let mut combined = Vec::with_capacity(prefix.len() + raw.len());
+    combined.extend_from_slice(&prefix);
+    combined.extend_from_slice(&raw);
+    snapshot.raw_output = combined;
     snapshot.raw_output_start = start;
     snapshot
 }
@@ -13702,6 +13738,7 @@ mod tests {
             &path,
             output.bytes_logged,
             RAW_OUTPUT_TAIL_CAP,
+            None,
         );
         assert_eq!(snapshot.raw_output.len(), RAW_OUTPUT_TAIL_CAP as usize);
         assert_eq!(
@@ -13725,6 +13762,7 @@ mod tests {
             &path,
             output.bytes_logged,
             6,
+            None,
         );
         assert_eq!(snapshot.raw_output, b"abcdef");
         assert_eq!(snapshot.raw_output_start, output.bytes_logged - 6);
@@ -13854,6 +13892,103 @@ mod tests {
             .shutdown_session(session_id)
             .expect("shutdown session");
         let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Desert fixture: scrolled lines journaled early, then buried under a
+    /// flood of in-place redraws. The served stream must lead with the
+    /// journaled prefix (the only reachable copy of the scrolled lines)
+    /// ahead of the raw desert tail, within the cap.
+    #[test]
+    fn overlay_prefixes_journaled_lines_ahead_of_desert_tail() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Three lines scroll (one chunk, stamped @ 35)...
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n")
+            .expect("ingest scrolled lines");
+        // ...then 42 KB of cursor-addressed redraws that scroll nothing.
+        for _ in 0..2500 {
+            output
+                .ingest(b"\x1b[1;1H0123456789\x1b[K")
+                .expect("redraw in place");
+        }
+        assert!(output.bytes_logged > 40_000);
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+
+        let cap = 65536;
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            cap,
+            output.scrollback.as_ref(),
+        );
+
+        // Cap splits half/half: 32 KiB raw desert tail, rest for prefix.
+        let raw_len = 32768;
+        assert_eq!(snapshot.raw_output_start, output.bytes_logged - raw_len);
+        assert!(snapshot.raw_output.len() <= cap as usize);
+        let served = &snapshot.raw_output;
+        let prefix = b"\x1b[0mline1\r\n\x1b[0mline2\r\n\x1b[0mline3\r\n";
+        assert!(
+            served.starts_with(prefix),
+            "served stream must lead with the journaled lines: {:?}",
+            String::from_utf8_lossy(&served[..served.len().min(200)])
+        );
+        let log = fs::read(&path).expect("read log");
+        assert_eq!(
+            &served[prefix.len()..],
+            &log[log.len() - raw_len as usize..],
+            "prefix must be followed by the raw desert tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When the raw window already covers the journaled offsets, the
+    /// prefix must be empty: serving it would replay lines twice.
+    #[test]
+    fn overlay_serves_no_prefix_when_raw_covers_journal() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n")
+            .expect("ingest scrolled lines");
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            65536,
+            output.scrollback.as_ref(),
+        );
+
+        assert_eq!(snapshot.raw_output_start, 0);
+        assert_eq!(
+            snapshot.raw_output,
+            b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Trimming must drop the *front* of the log and keep the newest bytes: the
@@ -14065,7 +14200,9 @@ mod tests {
         output.ingest(b"line5\r\n").expect("ingest line 5");
         assert_eq!(output.bytes_logged, 35);
 
-        let journal = output.scrollback.as_mut().expect("journal");
+        // No explicit flush: ingest must leave the journal serve-visible
+        // on its own (the serve paths hold only a shared reference).
+        let journal = output.scrollback.as_ref().expect("journal");
         // line1 @ 21 is older than a raw window starting at 28; the
         // seam is strict, so line2 @ 28 is not.
         let prefix = journal.read_prefix_older_than(28, 1 << 20);
@@ -14124,6 +14261,7 @@ mod tests {
         assert_eq!(output.bytes_logged, 20);
 
         let journal = output.scrollback.as_mut().expect("journal");
+        journal.flush_buffer();
         let prefix = journal.read_prefix_older_than(20, 1 << 20);
         let text = String::from_utf8_lossy(&prefix);
         assert!(
