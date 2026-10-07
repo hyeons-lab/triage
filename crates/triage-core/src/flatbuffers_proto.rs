@@ -138,6 +138,8 @@ pub fn build_session_snapshot<'a>(
         .as_ref()
         .map(|c| build_session_context(builder, c));
     let raw_output = (!snap.raw_output.is_empty()).then(|| builder.create_vector(&snap.raw_output));
+    let raw_output_prefix = (!snap.raw_output_prefix.is_empty())
+        .then(|| builder.create_vector(&snap.raw_output_prefix));
     let snippet = snap.snippet.as_ref().map(|s| builder.create_string(s));
     let snippet_detail = snap
         .snippet_detail
@@ -160,6 +162,7 @@ pub fn build_session_snapshot<'a>(
             exited: snap.exited,
             raw_output,
             raw_output_start: snap.raw_output_start,
+            raw_output_prefix,
             snippet,
             snippet_detail,
         },
@@ -287,7 +290,11 @@ mod tests {
     use super::*;
     use crate::session::{SessionSize, TerminalCursor};
 
-    fn sample(raw_output: Vec<u8>, raw_output_start: u64) -> SessionSnapshot {
+    fn sample(
+        raw_output: Vec<u8>,
+        raw_output_start: u64,
+        raw_output_prefix: Vec<u8>,
+    ) -> SessionSnapshot {
         SessionSnapshot {
             output_seq: 7,
             bytes_logged: 100,
@@ -306,6 +313,7 @@ mod tests {
             exited: false,
             raw_output,
             raw_output_start,
+            raw_output_prefix,
             snippet: None,
             snippet_detail: None,
         }
@@ -314,21 +322,38 @@ mod tests {
     #[test]
     fn session_snapshot_round_trips_raw_output() {
         let mut builder = FlatBufferBuilder::new();
-        let off = build_session_snapshot(&mut builder, &sample(vec![1, 2, 3, 0xff], 96));
+        let off = build_session_snapshot(
+            &mut builder,
+            &sample(vec![1, 2, 3, 0xff], 96, vec![9, 8, 7]),
+        );
         builder.finish(off, None);
         let snap = flatbuffers::root::<fb::SessionSnapshot>(builder.finished_data()).unwrap();
         assert_eq!(snap.raw_output_start(), 96);
         assert_eq!(snap.raw_output().unwrap().bytes(), &[1, 2, 3, 0xff]);
+        assert_eq!(snap.raw_output_prefix().unwrap().bytes(), &[9, 8, 7]);
     }
 
     #[test]
     fn empty_raw_output_is_omitted_for_old_client_compat() {
         let mut builder = FlatBufferBuilder::new();
-        let off = build_session_snapshot(&mut builder, &sample(Vec::new(), 0));
+        let off = build_session_snapshot(&mut builder, &sample(Vec::new(), 0, Vec::new()));
         builder.finish(off, None);
         let snap = flatbuffers::root::<fb::SessionSnapshot>(builder.finished_data()).unwrap();
         // Append-only field absent when empty: old clients see a missing vector.
         assert!(snap.raw_output().is_none());
+        assert!(snap.raw_output_prefix().is_none());
         assert_eq!(snap.raw_output_start(), 0);
+    }
+
+    #[test]
+    fn snapshot_field_ids_stay_append_only() {
+        // snippet/detail ids predate raw_output_prefix: FlatBuffers ids
+        // follow declaration order, so a mid-table insert silently
+        // renumbers them and corrupts both skew directions (old readers
+        // decode prefix bytes as snippet; new readers decode an old
+        // snippet string as prefix). The prefix must stay last.
+        assert_eq!(fb::SessionSnapshot::VT_SNIPPET, 30);
+        assert_eq!(fb::SessionSnapshot::VT_SNIPPET_DETAIL, 32);
+        assert_eq!(fb::SessionSnapshot::VT_RAW_OUTPUT_PREFIX, 34);
     }
 }

@@ -132,7 +132,8 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
-class _TerminalPaneState extends State<TerminalPane> {
+class _TerminalPaneState extends State<TerminalPane>
+    with NoOlderScrollbackLatch {
   static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
   static final Map<String, dynamic> _sessionTerms = {};
@@ -315,9 +316,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
-  bool _showNoOlderScrollback = false;
-  Timer? _noOlderScrollbackTimer;
-
   void _clearPageAnchor({bool cancelRestoreTimer = true}) {
     if (cancelRestoreTimer) {
       _pageRestoreTimer?.cancel();
@@ -404,9 +402,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       _legacyCopyToClipboard(text);
       return;
     }
-    clipboard.writeText(text).then((_) {}, onError: (_) {
-      _legacyCopyToClipboard(text);
-    });
+    clipboard
+        .writeText(text)
+        .then(
+          (_) {},
+          onError: (_) {
+            _legacyCopyToClipboard(text);
+          },
+        );
   }
 
   void _legacyCopyToClipboard(String text) {
@@ -1495,7 +1498,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (activePane != null) {
         activePane._pageRestoreTimer?.cancel();
         activePane._pageRestoreTimer = null;
-        activePane._dismissNoOlderScrollback();
+        activePane.dismissNoOlderScrollback();
         activePane._pendingScrollToBottomOnRelease = true;
         activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
@@ -1539,7 +1542,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _rebindViewListenersTo(TerminalController controller) {
     if (identical(_boundViewController, controller)) return;
     _clearPageAnchor();
-    _dismissNoOlderScrollback();
+    dismissNoOlderScrollback();
     final previous = _boundViewController;
     if (previous != null) _unbindControllerFrom(previous);
     _boundViewController = controller;
@@ -1595,7 +1598,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       return;
     }
     _clearPageAnchor();
-    _dismissNoOlderScrollback();
+    dismissNoOlderScrollback();
     // Refit before restoring scroll: a fit that ran while the layout was
     // narrow (or whose resize-out died in the debounce) leaves a narrow grid
     // under a wide pane, and replay is the moment that mismatch turns
@@ -1641,10 +1644,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     ) {
       polls++;
       var len = -1;
+      var baseY = 0;
       try {
         final buffer = js_util.getProperty(_term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         len = (js_util.getProperty(active, 'length') as num?)?.toInt() ?? -1;
+        baseY = (js_util.getProperty(active, 'baseY') as num?)?.toInt() ?? 0;
       } catch (_) {}
       if ((len >= 0 && len == lastLen) || polls >= 40) {
         timer.cancel();
@@ -1655,20 +1660,29 @@ class _TerminalPaneState extends State<TerminalPane> {
         // buffer), so reading `viewportY` after the write would see the
         // bottom of the scrollback and treat every barren page with >29
         // lines as if the user had scrolled away. Always restore the
-        // viewport to `target` first so an exhausted page does not leave
+        // viewport to `clamped` first so an exhausted page does not leave
         // the view stranded at `baseY`.
         final addedLines = len - anchorLen;
         final wasNearTop = anchorY <= 5;
         final target = math.max(anchorY + addedLines, 0);
+        final clamped = target.clamp(0, math.max(baseY, 0)).toInt();
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         try {
-          js_util.callMethod(_term, 'scrollToLine', [target]);
+          js_util.callMethod(_term, 'scrollToLine', [clamped]);
         } catch (_) {}
-        _sessionSavedViewportY[_sanitizedId] = target;
-        if (addedLines <= 0 && wasNearTop) {
+        if (clamped >= baseY) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+        } else {
+          _sessionSavedViewportY[_sanitizedId] = clamped;
+        }
+        _pendingScrollToBottomOnRelease = false;
+        if (shouldContinuePastBarrenPage(
+          addedLines: addedLines,
+          nearTop: wasNearTop,
+        )) {
           _continuePastBarrenPage();
         } else if (addedLines > 0) {
-          _dismissNoOlderScrollback();
+          dismissNoOlderScrollback();
         }
       } else {
         lastLen = len;
@@ -1695,31 +1709,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         return;
       }
       if (widget.onNearTop?.call() == false) {
-        _noteHistoryExhausted();
+        noteHistoryExhausted();
       }
     });
-  }
-
-  void _dismissNoOlderScrollback() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = null;
-    if (_showNoOlderScrollback && mounted) {
-      setState(() => _showNoOlderScrollback = false);
-    } else {
-      _showNoOlderScrollback = false;
-    }
-  }
-
-  void _noteHistoryExhausted() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => _showNoOlderScrollback = false);
-      }
-    });
-    if (mounted && !_showNoOlderScrollback) {
-      setState(() => _showNoOlderScrollback = true);
-    }
   }
 
   /// Heals a grid that disagrees with its own pixels.
@@ -2255,8 +2247,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       final buffer = js_util.getProperty(term, 'buffer');
       final active = js_util.getProperty(buffer, 'active');
       final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-      final viewportY =
-          (js_util.getProperty(active, 'viewportY') as num).toInt();
+      final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+          .toInt();
       if (_viewportIsAtBottom(container, viewportY, baseY)) {
         _sessionSavedViewportY.remove(_sanitizedId);
       } else if (viewportY >= 0) {
@@ -2934,7 +2926,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         _restoreScrollPosition(requestFocus: false);
       }
     }
-    if (oldWidget.controller != widget.controller) {
+    if (oldWidget.controller != widget.controller ||
+        oldWidget.terminalId != widget.terminalId) {
       tdbg(
         'pane.didUpdate',
         '$_sanitizedId controller changed '
@@ -2942,7 +2935,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(widget.controller)}',
       );
       _clearPageAnchor();
-      _dismissNoOlderScrollback();
+      dismissNoOlderScrollback();
       _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
@@ -2984,7 +2977,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _pageRestoreTimer?.cancel();
-    _noOlderScrollbackTimer?.cancel();
+    cancelNoOlderScrollbackTimer();
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
@@ -3108,7 +3101,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                       color: Color(0xffffc857),
                     ),
                   ),
-                if (_showNoOlderScrollback)
+                if (showNoOlderScrollback)
                   const Positioned(
                     top: 8,
                     left: 0,
