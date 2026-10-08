@@ -281,7 +281,7 @@ impl ScrollbackJournal {
     /// for replay. Never fails; unreadable data yields a shorter prefix.
     ///
     /// Takes a shared reference because the serve paths hold no exclusive
-    /// access: it reads only flushed bytes, so up to [`JOURNAL_FLUSH_EVERY`]
+    /// access: it reads only flushed bytes, so up to `JOURNAL_FLUSH_EVERY`
     /// trailing records may be missing (see the const for why that is
     /// nearly always above the seam anyway).
     pub fn read_prefix_older_than(&self, raw_start: u64, max_bytes: usize) -> Vec<u8> {
