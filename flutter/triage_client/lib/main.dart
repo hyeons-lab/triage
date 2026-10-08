@@ -834,6 +834,7 @@ class SessionVm {
     int? throughOutputSeq,
     int? rawOutputStart,
     int? windowBytes,
+    List<int> rawOutputPrefix = const [],
     bool isExited = false,
   }) {
     historyStart = rawOutputStart;
@@ -845,10 +846,12 @@ class SessionVm {
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
       windowBytes: windowBytes,
+      rawOutputPrefix: rawOutputPrefix,
     );
     tdbg(
       'vm.applyHistory',
-      '$title ${rawOutput.length}B seq=$throughOutputSeq '
+      '$title ${rawOutput.length}B+${rawOutputPrefix.length}P '
+          'seq=$throughOutputSeq '
           'phase=${store.state.phase} viewReady=$_viewReady',
     );
     if (store.state.phase != AttachPhase.awaitingHistory &&
@@ -889,6 +892,7 @@ class SessionVm {
         throughOutputSeq: pending.throughOutputSeq,
         rawOutputStart: pending.rawOutputStart,
         windowBytes: pending.windowBytes,
+        rawOutputPrefix: pending.rawOutputPrefix,
       ),
     );
     if (isExited) {
@@ -930,12 +934,14 @@ class _PendingHistory {
     this.throughOutputSeq, {
     this.rawOutputStart,
     this.windowBytes,
+    this.rawOutputPrefix = const [],
   });
 
   final List<int> rawOutput;
   final int? throughOutputSeq;
   final int? rawOutputStart;
   final int? windowBytes;
+  final List<int> rawOutputPrefix;
 }
 
 /// Aborts a session load whose daemon changed mid-flight.
@@ -4003,7 +4009,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // replaying its empty history would clear the terminal to a blank screen.
       if (replayTargetSize != null &&
           preparedSnapshot != null &&
-          _rawOutputFromSnapshot(preparedSnapshot).isNotEmpty &&
+          snapshotCarriesHistory(preparedSnapshot) &&
           !_snapshotSizeMatches(snapshot, replayTargetSize)) {
         snapshot = preparedSnapshot;
       }
@@ -4052,6 +4058,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
         windowBytes: kHistoryFirstWindowBytes,
+        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -4568,7 +4575,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
-          await _applySnapshotToSession(session, sessionId, snapshot);
+          // Pushed snapshots are served unwindowed at the full history
+          // cap: replay them at the platform budgets, not the held
+          // window, or the trim over-shrinks them.
+          await _applySnapshotToSession(
+            session,
+            sessionId,
+            snapshot,
+            unwindowed: true,
+          );
         }
       } else if (event.containsKey('LeaseChanged')) {
         final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
@@ -4600,6 +4615,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, dynamic> snapshot, {
     (int, int)? renderSize,
     bool replayHistory = true,
+    // True when the snapshot was served unwindowed at the full history
+    // cap (server-pushed ResyncRequired): the replay must keep the
+    // platform budgets instead of the session's narrower held window,
+    // which would over-trim the payload. A plain null windowBytes
+    // parameter cannot express this (its null would have to mean both
+    // "use held" and "use platform budgets"), so the tri-state rides a
+    // bool.
+    bool unwindowed = false,
   }) async {
     // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
     // _loadDaemonSessions) while the refresh was in flight — applying to a
@@ -4627,6 +4650,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final fittedCols = renderSize?.$2 ?? cols;
     final fittedRows = renderSize?.$1 ?? rowsVal;
     final rawOutput = _rawOutputFromSnapshot(snapshot);
+    final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final snapshotRawOutputStart = snapshot['raw_output_start'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
@@ -4644,7 +4668,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
-        windowBytes: session.historyWindowBytes,
+        windowBytes: unwindowed ? null : session.historyWindowBytes,
+        rawOutputPrefix: rawOutputPrefix,
         isExited: exited,
       );
     } else if (exited != session.isExited) {
@@ -4709,6 +4734,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// the host did not carry history (old host, or a resize broadcast).
   Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) =>
       rawOutputFromSnapshot(snapshot);
+
+  Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
+      rawOutputPrefixFromSnapshot(snapshot);
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.
@@ -5079,6 +5107,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         throughOutputSeq: snapshot['output_seq'] as int?,
         rawOutputStart: snapshot['raw_output_start'] as int?,
         windowBytes: nextWindow,
+        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot),
         isExited: snapshot['exited'] == true,
       );
       success = true;
@@ -5509,6 +5538,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             throughOutputSeq: outputSeq,
             rawOutputStart: rawOutputStart,
             windowBytes: kHistoryFirstWindowBytes,
+            rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
             isExited: exited,
           );
 

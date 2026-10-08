@@ -156,6 +156,9 @@ pub fn resolve_active_segment(session_dir: &Path) -> Result<(PathBuf, u32, u64)>
 ///
 /// Writes to a PID-isolated temporary file first, then atomically renames to the final
 /// compressed path, and finally unlinks the raw file.
+///
+/// Returns `Ok(0)` (no file written, the raw left in place) when the raw
+/// changed under the encode; `Ok` alone does not mean sealed.
 pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<u64> {
     let tmp_name = format!(
         "{}.tmp.{}",
@@ -166,37 +169,80 @@ pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<
         std::process::id()
     );
     let tmp_path = compressed_path.with_file_name(tmp_name);
-    let encode_res = (|| -> Result<()> {
-        let raw_file = File::open(raw_path)
-            .with_context(|| format!("opening raw segment {}", raw_path.display()))?;
-        let raw_len = raw_file.metadata()?.len();
-        let mut reader = BufReader::new(raw_file);
-
-        let tmp_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .with_context(|| format!("creating temp compressed segment {}", tmp_path.display()))?;
-        let writer = BufWriter::new(tmp_file);
-
-        let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;
-        encoder.set_pledged_src_size(Some(raw_len))?;
-        std::io::copy(&mut reader, &mut encoder)?;
-        let mut writer = encoder.finish()?;
-        writer.flush()?;
-        drop(writer);
-        Ok(())
-    })();
-
-    if let Err(err) = encode_res {
+    // Identity before the encode: a journal rebase may delete (or a
+    // handover peer may append to) the raw while we encode, and the
+    // rename below must not resurrect a stale seal over rebased data.
+    // Segments are immutable post-rotation, so this is a no-op for them.
+    let raw_id_before = raw_identity(raw_path);
+    if let Err(err) = encode_phase(raw_path, &tmp_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
     }
+    commit_seal_phase(raw_path, &tmp_path, compressed_path, raw_id_before)
+}
+
+/// Identity of a seal source for detecting mid-encode change: size plus
+/// mtime, or `None` when the file cannot be stated. Coarse on purpose
+/// (a same-size same-mtime rewrite is not a race we can see); deletions
+/// and appends always differ.
+pub(crate) fn raw_identity(raw_path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(raw_path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()))
+}
+
+/// Encode the raw segment to a temp path. Split from the commit so tests
+/// can stage the racing mutation deterministically between snapshot and
+/// decision.
+pub(crate) fn encode_phase(raw_path: &Path, tmp_path: &Path) -> Result<()> {
+    let raw_file = File::open(raw_path)
+        .with_context(|| format!("opening raw segment {}", raw_path.display()))?;
+    let raw_len = raw_file.metadata()?.len();
+    let mut reader = BufReader::new(raw_file);
+
+    let tmp_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp_path)
+        .with_context(|| format!("creating temp compressed segment {}", tmp_path.display()))?;
+    let writer = BufWriter::new(tmp_file);
+
+    let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;
+    encoder.set_pledged_src_size(Some(raw_len))?;
+    std::io::copy(&mut reader, &mut encoder)?;
+    let mut writer = encoder.finish()?;
+    writer.flush()?;
+    drop(writer);
+    Ok(())
+}
+
+/// Re-check the raw identity and rename-or-drop. The encode snapshotted
+/// the identity first; a journal rebase may have deleted (or a handover
+/// peer may have appended to) the raw while we encoded, and the rename
+/// must not resurrect a stale seal over rebased data. Segments are
+/// immutable post-rotation, so the re-check is a no-op for them.
+pub(crate) fn commit_seal_phase(
+    raw_path: &Path,
+    tmp_path: &Path,
+    compressed_path: &Path,
+    raw_id_before: Option<(u64, Option<std::time::SystemTime>)>,
+) -> Result<u64> {
+    if raw_identity(raw_path) != raw_id_before {
+        // The raw changed (or vanished) under the encode: the sealed
+        // bytes would be stale. Drop the job without failing so the
+        // caller does not latch broken over a benign race.
+        let _ = fs::remove_file(tmp_path);
+        tracing::debug!(
+            raw_path = %raw_path.display(),
+            "raw changed during encode; dropping seal"
+        );
+        return Ok(0);
+    }
 
     // Atomic rename
-    if let Err(err) = fs::rename(&tmp_path, compressed_path) {
-        let _ = fs::remove_file(&tmp_path);
+    if let Err(err) = fs::rename(tmp_path, compressed_path) {
+        let _ = fs::remove_file(tmp_path);
         return Err(err).with_context(|| {
             format!(
                 "renaming {} to {}",
@@ -470,6 +516,20 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
 pub struct CompressionJob {
     pub raw_path: PathBuf,
     pub compressed_path: PathBuf,
+    /// True when the source may legitimately vanish before encoding (a
+    /// journal raw deleted by a rebase between queueing and encoding):
+    /// a NotFound then is the protocol working, not a failure. Segment
+    /// raws are immutable post-rotation, so a missing segment raw stays
+    /// anomalous and must warn.
+    pub allow_missing_raw: bool,
+}
+
+/// Whether a compress failure is just a vanished source tree (a journal
+/// raw deleted by a rebase, or a session dir removed with jobs still
+/// queued): dropping the job is correct either way.
+pub(crate) fn compress_source_is_missing(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Message sent across the worker channel.
@@ -514,6 +574,30 @@ impl CompressionWorker {
         self.tx.clone()
     }
 
+    /// One error-reporting shape for both worker loops: a vanished
+    /// source on a job that allows it is a debug (benign race, by
+    /// design); everything else warns.
+    fn log_compress_error(job: &CompressionJob, err: &anyhow::Error, teardown: bool) {
+        if job.allow_missing_raw && compress_source_is_missing(err) {
+            tracing::debug!(
+                raw_path = %job.raw_path.display(),
+                "seal source gone before encoding; dropping job"
+            );
+            return;
+        }
+        tracing::warn!(
+            raw_path = %job.raw_path.display(),
+            compressed_path = %job.compressed_path.display(),
+            ?err,
+            "{}",
+            if teardown {
+                "failed to compress segment file during worker teardown"
+            } else {
+                "failed to compress rotated segment file"
+            }
+        );
+    }
+
     fn run_worker(rx: Receiver<WorkerMessage>) {
         while let Ok(msg) = rx.recv() {
             let job = match msg {
@@ -524,30 +608,24 @@ impl CompressionWorker {
                             &pending_job.raw_path,
                             &pending_job.compressed_path,
                         ) {
-                            tracing::warn!(
-                                raw_path = %pending_job.raw_path.display(),
-                                compressed_path = %pending_job.compressed_path.display(),
-                                ?err,
-                                "failed to compress segment file during worker teardown"
-                            );
+                            Self::log_compress_error(&pending_job, &err, true);
                         }
                     }
                     break;
                 }
             };
-            if let Err(err) = compress_segment_file(&job.raw_path, &job.compressed_path) {
-                tracing::warn!(
-                    raw_path = %job.raw_path.display(),
-                    compressed_path = %job.compressed_path.display(),
-                    ?err,
-                    "failed to compress rotated segment file"
-                );
-            } else {
-                tracing::debug!(
-                    raw_path = %job.raw_path.display(),
-                    compressed_path = %job.compressed_path.display(),
-                    "successfully compressed segment file"
-                );
+            match compress_segment_file(&job.raw_path, &job.compressed_path) {
+                Err(err) => Self::log_compress_error(&job, &err, false),
+                // Identity-mismatch drop, already debug-logged inside
+                // compress_segment_file: not a success, stay quiet.
+                Ok(0) => {}
+                Ok(_) => {
+                    tracing::debug!(
+                        raw_path = %job.raw_path.display(),
+                        compressed_path = %job.compressed_path.display(),
+                        "successfully compressed segment file"
+                    );
+                }
             }
         }
     }

@@ -132,7 +132,8 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
-class _TerminalPaneState extends State<TerminalPane> {
+class _TerminalPaneState extends State<TerminalPane>
+    with NoOlderScrollbackLatch {
   static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
   static final Map<String, dynamic> _sessionTerms = {};
@@ -317,8 +318,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
-  bool _showNoOlderScrollback = false;
-  Timer? _noOlderScrollbackTimer;
   Timer? _suppressScrollSaveTimer;
   Timer? _jiggleRestoreTimer;
   int? _pendingJiggleCols;
@@ -1657,7 +1656,6 @@ class _TerminalPaneState extends State<TerminalPane> {
         _pageRestoreTimer = null;
         if (!mounted || !_initialized || len < 0) return;
         // A page that added no lines while the user was near the top
-        // is a barren window (a TUI redrawing in place): ask for a deeper
         // one instead of sitting on identical content, so one gesture
         // skips the desert. Re-seat the viewport on target first so the
         // view does not sit stranded at the bottom of the log.
@@ -1680,7 +1678,10 @@ class _TerminalPaneState extends State<TerminalPane> {
           _sessionSavedViewportY[_sanitizedId] = clamped;
         }
         _pendingScrollToBottomOnRelease = false;
-        if (len - anchorLen <= 0 && wasNearTop) {
+        if (shouldContinuePastBarrenPage(
+          addedLines: len - anchorLen,
+          nearTop: wasNearTop,
+        )) {
           _continuePastBarrenPage();
           return;
         }
@@ -1707,21 +1708,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         return;
       }
       if (widget.onNearTop?.call() == false) {
-        _noteHistoryExhausted();
+        noteHistoryExhausted();
       }
     });
-  }
-
-  void _noteHistoryExhausted() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => _showNoOlderScrollback = false);
-      }
-    });
-    if (mounted && !_showNoOlderScrollback) {
-      setState(() => _showNoOlderScrollback = true);
-    }
   }
 
   /// Heals a grid that disagrees with its own pixels.
@@ -3021,7 +3010,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _pageRestoreTimer?.cancel();
-    _noOlderScrollbackTimer?.cancel();
+    cancelNoOlderScrollbackTimer();
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
@@ -3145,7 +3134,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                       color: Color(0xffffc857),
                     ),
                   ),
-                if (_showNoOlderScrollback)
+                if (showNoOlderScrollback)
                   const Positioned(
                     top: 8,
                     left: 0,
