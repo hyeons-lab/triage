@@ -23,6 +23,9 @@ writer (child not draining stdin).
 - Regression test `ingest_failure_still_advances_terminal_and_sequence`
   forces EBADF with a read-only log handle; observed red pre-fix, green
   post-fix.
+- 2026-10-09T12:10-0700: add log_path diagnostic attribution to PTY
+  output log write failure warning and expand regression test to assert
+  consecutive failure resilience, on-disk integrity, and write recovery.
 
 ## Decisions
 
@@ -47,7 +50,8 @@ writer (child not draining stdin).
 
 ## Commits
 
-- HEAD — fix(daemon): keep broadcasting PTY output when the log write fails
+- a469c91 — fix(daemon): keep broadcasting PTY output when the log write fails
+- HEAD: fix(triaged): review findings from ingest failure audit
 
 ## Progress
 

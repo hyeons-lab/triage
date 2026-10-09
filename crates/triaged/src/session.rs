@@ -6512,6 +6512,7 @@ impl OutputState {
                 // either; the baseline is the active segment's length for
                 // segmented logs, where `bytes_logged` is cumulative.
                 tracing::warn!(
+                    log_path = %self.log_path.display(),
                     error = ?error,
                     "failed to write PTY output log; continuing live-only"
                 );
@@ -12947,25 +12948,53 @@ mod tests {
         output
             .ingest(b"second\r\n")
             .expect("ingest must survive a log write failure");
+        output
+            .ingest(b"third\r\n")
+            .expect("consecutive failures must also survive");
 
         assert_eq!(
-            output.output_seq, 2,
-            "a failed chunk still advances the output sequence"
+            output.output_seq, 3,
+            "failed chunks still advance the output sequence monotonically"
         );
         assert_eq!(
             output.bytes_logged, 7,
-            "counters must re-sync to the on-disk length"
+            "counters must stay synced to the on-disk length across failures"
         );
         assert!(
             output.log_cache.is_none(),
             "a failed write invalidates the log cache"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\n",
+            "unlogged chunks must not corrupt on-disk content"
         );
         let rows = visible_rows(&output.terminal);
         assert!(
             rows.iter().any(|row| row.contains("second")),
             "the terminal must advance past a failed write: {rows:?}"
         );
+        assert!(
+            rows.iter().any(|row| row.contains("third")),
+            "the terminal must advance past consecutive failed writes: {rows:?}"
+        );
 
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output
+            .ingest(b"fourth\r\n")
+            .expect("resumed write must succeed");
+        assert_eq!(output.output_seq, 4);
+        assert_eq!(output.bytes_logged, 7 + 8);
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\nfourth\r\n",
+            "resumed writes must append cleanly after skipped chunks"
+        );
+
+        drop(output);
         let _ = fs::remove_file(&path);
     }
 
