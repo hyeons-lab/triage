@@ -6485,24 +6485,54 @@ impl OutputState {
     }
 
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
-        self.log
-            .write_all(bytes)
-            .context("writing PTY output log")?;
-        self.bytes_logged += bytes.len() as u64;
-        self.active_segment_bytes += bytes.len() as u64;
-        self.output_seq += 1;
-        if self.is_segmented_log() {
-            self.rotate_segment_if_oversized();
-        } else {
-            self.trim_log_if_oversized();
-        }
-        if let Some(cache) = &mut self.log_cache {
-            if cache.len() + bytes.len() <= 1024 * 1024 {
-                cache.extend_from_slice(bytes);
-            } else {
+        match self.log.write_all(bytes) {
+            Ok(()) => {
+                self.bytes_logged += bytes.len() as u64;
+                self.active_segment_bytes += bytes.len() as u64;
+                if self.is_segmented_log() {
+                    self.rotate_segment_if_oversized();
+                } else {
+                    self.trim_log_if_oversized();
+                }
+                if let Some(cache) = &mut self.log_cache {
+                    if cache.len() + bytes.len() <= 1024 * 1024 {
+                        cache.extend_from_slice(bytes);
+                    } else {
+                        self.log_cache = None;
+                    }
+                }
+            }
+            Err(error) => {
+                // A failed log write (full disk) degrades history, not
+                // liveness: the chunk still advances the terminal and the
+                // output sequence below, so callers broadcast it instead of
+                // freezing every attached client. `write_all` may have
+                // persisted a prefix before failing, so re-sync the counters
+                // to the on-disk length and drop the cache rather than trust
+                // either; the baseline is the active segment's length for
+                // segmented logs, where `bytes_logged` is cumulative.
+                tracing::warn!(
+                    log_path = %self.log_path.display(),
+                    error = ?error,
+                    "failed to write PTY output log; continuing live-only"
+                );
+                let baseline = if self.is_segmented_log() {
+                    self.active_segment_bytes
+                } else {
+                    self.bytes_logged
+                };
+                let on_disk = self
+                    .log
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(baseline);
+                let persisted = on_disk.saturating_sub(baseline).min(bytes.len() as u64);
+                self.bytes_logged += persisted;
+                self.active_segment_bytes += persisted;
                 self.log_cache = None;
             }
         }
+        self.output_seq += 1;
         let current_working_directory = self.extract_current_working_directory(bytes);
         self.advance_translated_bytes(bytes);
         Ok(current_working_directory)
@@ -12900,6 +12930,71 @@ mod tests {
         output.ingest(b"cd").expect("ingest after failed trim");
         assert!(output.bytes_logged > logged, "trimming must stay disabled");
 
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A failed log write (full disk) must degrade history, not liveness:
+    /// the chunk still advances the terminal and the output sequence, so the
+    /// actor's Ok path broadcasts it instead of freezing every attached
+    /// client. The failure is forced portably by swapping in a read-only
+    /// handle, whose writes fail with EBADF on every platform.
+    #[test]
+    fn ingest_failure_still_advances_terminal_and_sequence() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+        output
+            .ingest(b"third\r\n")
+            .expect("consecutive failures must also survive");
+
+        assert_eq!(
+            output.output_seq, 3,
+            "failed chunks still advance the output sequence monotonically"
+        );
+        assert_eq!(
+            output.bytes_logged, 7,
+            "counters must stay synced to the on-disk length across failures"
+        );
+        assert!(
+            output.log_cache.is_none(),
+            "a failed write invalidates the log cache"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\n",
+            "unlogged chunks must not corrupt on-disk content"
+        );
+        let rows = visible_rows(&output.terminal);
+        assert!(
+            rows.iter().any(|row| row.contains("second")),
+            "the terminal must advance past a failed write: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("third")),
+            "the terminal must advance past consecutive failed writes: {rows:?}"
+        );
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output
+            .ingest(b"fourth\r\n")
+            .expect("resumed write must succeed");
+        assert_eq!(output.output_seq, 4);
+        assert_eq!(output.bytes_logged, 7 + 8);
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\nfourth\r\n",
+            "resumed writes must append cleanly after skipped chunks"
+        );
+
+        drop(output);
         let _ = fs::remove_file(&path);
     }
 
