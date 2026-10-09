@@ -3938,21 +3938,22 @@ impl SessionApi for SessionManager {
             Ready(Option<SessionContext>),
             Live(mpsc::Receiver<ActorResult<Option<SessionContext>>>),
         }
-        let mut pending: Vec<(SessionId, PendingContext, SessionStamps)> =
-            Vec::with_capacity(sources.len());
-        for (session_id, source, stamps) in sources {
-            let pending_source = match source {
-                ContextSource::Ready(context) => PendingContext::Ready(context),
-                ContextSource::Live(tx) => {
-                    let (resp_tx, resp_rx) = mpsc::channel();
-                    match tx.send(ActorCommand::Context { response: resp_tx }) {
-                        Ok(()) => PendingContext::Live(resp_rx),
-                        Err(_) => PendingContext::Ready(None),
+        let pending: Vec<(SessionId, PendingContext, SessionStamps)> = sources
+            .into_iter()
+            .map(|(session_id, source, stamps)| {
+                let pending_source = match source {
+                    ContextSource::Ready(context) => PendingContext::Ready(context),
+                    ContextSource::Live(tx) => {
+                        let (resp_tx, resp_rx) = mpsc::channel();
+                        match tx.send(ActorCommand::Context { response: resp_tx }) {
+                            Ok(()) => PendingContext::Live(resp_rx),
+                            Err(_) => PendingContext::Ready(None),
+                        }
                     }
-                }
-            };
-            pending.push((session_id, pending_source, stamps));
-        }
+                };
+                (session_id, pending_source, stamps)
+            })
+            .collect();
         Ok(pending
             .into_iter()
             .map(|(session_id, source, stamps)| {
@@ -11682,29 +11683,49 @@ mod tests {
     }
 
     /// The contexts batch must return one row per session in stable sort-key
-    /// order. Guards the fan-out: responses collected out of order would
-    /// file one session's context under another's id.
+    /// order and correlate each session with its own resolved context.
     #[test]
     fn list_session_contexts_returns_every_session_in_order() {
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
-        let mut ids = Vec::new();
-        for _ in 0..3 {
-            ids.push(
-                manager
-                    .start_session(StartSessionRequest::new(long_running_shell_command()))
-                    .expect("start session"),
+        let mut session_data = Vec::new();
+        for i in 1..=3 {
+            let repo = unique_log_dir();
+            std::fs::create_dir_all(&repo).expect("create repo dir");
+            let branch = format!("feat/test-{}", i);
+            git_test_command(&repo, &["init", &format!("--initial-branch={branch}")]);
+            git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+            git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+            std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+            git_test_command(&repo, &["add", "README.md"]);
+            git_test_command(&repo, &["commit", "-m", "initial"]);
+
+            let mut req = StartSessionRequest::new(long_running_shell_command());
+            req.cwd = Some(repo.clone());
+            let id = manager.start_session(req).expect("start session");
+            session_data.push((id, branch, repo));
+        }
+
+        session_data
+            .sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
+
+        let rows = manager.list_session_contexts().expect("list contexts");
+        assert_eq!(rows.len(), session_data.len());
+        for (row, (expected_id, expected_branch, _)) in rows.iter().zip(&session_data) {
+            assert_eq!(
+                &row.session_id, expected_id,
+                "session id matches sort order"
+            );
+            assert_eq!(
+                row.context.as_ref().and_then(|c| c.branch.as_deref()),
+                Some(expected_branch.as_str()),
+                "context matches session"
             );
         }
 
-        let rows = manager.list_session_contexts().expect("list contexts");
-        let mut expected = ids.clone();
-        expected.sort_by(|left, right| session_sort_key(left).cmp(&session_sort_key(right)));
-        let got: Vec<SessionId> = rows.iter().map(|row| row.session_id.clone()).collect();
-        assert_eq!(got, expected, "one row per session, in sort-key order");
-
-        for id in &ids {
-            let _ = manager.shutdown_session(id.clone());
+        for (id, _, repo) in session_data {
+            let _ = manager.shutdown_session(id);
+            let _ = std::fs::remove_dir_all(&repo);
         }
         let _ = std::fs::remove_dir_all(&log_dir);
     }

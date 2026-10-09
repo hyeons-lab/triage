@@ -1,4 +1,4 @@
-# 000158 — perf/load-quick-wins
+# 000158: perf/load-quick-wins
 
 ## Agent
 
@@ -33,7 +33,7 @@ paging follows as the transfer fix on its own branch.
 - Negative whois TTL stays 1s: only the success path gets cheaper.
 - No WS compression in this branch: tungstenite 0.24 has no
   permessage-deflate API. An upgrade or hand-rolled negotiation is a
-  bigger, riskier change than the transfer problem needs — lazy history
+  bigger, riskier change than the transfer problem needs: lazy history
   (next branch) removes the bytes instead of squeezing them.
 
 ## Issues
@@ -42,7 +42,8 @@ paging follows as the transfer fix on its own branch.
 
 ## Commits
 
-- HEAD — perf(daemon): fan out session contexts, stretch whois TTL
+- cd5d43d: perf(daemon): fan out session contexts, stretch whois TTL
+- HEAD: perf(daemon): review findings from load quick wins audit
 
 ## Progress
 
@@ -52,6 +53,10 @@ paging follows as the transfer fix on its own branch.
   green, fmt + clippy clean, full suite green except the 8 pre-existing
   pairing failures. Baseline `list_contexts` 373ms captured for the
   post-deploy comparison.
+- 2026-10-09T13:20-0700: Completed review loop (8 pillars). Verified
+  session branch context correlation in list_session_contexts test,
+  simplified pending vector mapping, removed em dashes, and validated
+  across all workspace tests.
 
 ## Research & Discoveries
 
