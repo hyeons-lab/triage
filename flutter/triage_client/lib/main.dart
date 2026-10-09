@@ -2763,6 +2763,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           } else {
             s.dispose();
             TerminalPane.destroySession(s.title);
+            if (sid != null) {
+              _pendingInputBytes.remove(sid);
+            }
           }
         }
       } else {
@@ -2770,6 +2773,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           s.dispose();
           TerminalPane.destroySession(s.title);
         }
+        _pendingInputBytes.clear();
       }
       setState(() {
         _sessionsServerId = _activeServerId;
@@ -2899,15 +2903,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // waiting for the next keystroke. Other sessions flush on select.
       if (!_isStale(generation) &&
           sessionIds.isNotEmpty &&
-          !failedSessionIds.contains(sessionIds[targetSelectedIndex]) &&
-          (_pendingInputBytes[sessionIds[targetSelectedIndex]]?.isNotEmpty ??
-              false)) {
-        unawaited(
-          _acquireInputLeaseAndFlush(
-            _sessions[targetSelectedIndex],
-            sessionIds[targetSelectedIndex],
-          ),
-        );
+          targetSelectedIndex >= 0 &&
+          targetSelectedIndex < sessionIds.length) {
+        final targetSid = sessionIds[targetSelectedIndex];
+        final targetVmIndex =
+            _sessions.indexWhere((s) => s.remoteSessionId == targetSid);
+        if (targetVmIndex != -1 &&
+            !failedSessionIds.contains(targetSid) &&
+            (_pendingInputBytes[targetSid]?.isNotEmpty ?? false)) {
+          unawaited(
+            _acquireInputLeaseAndFlush(
+              _sessions[targetVmIndex],
+              targetSid,
+            ),
+          );
+        }
       }
 
       if (!_disposed && generation == _connectGeneration) {
@@ -4718,34 +4728,39 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }());
       }
     }
-    if (sid != null && !session.isExited && subscribed) {
-      // A success arriving after a purge must not resurrect the lease the
-      // disconnect just reset; the catch below already fails safe to false.
-      final leaseGeneration = _connectGeneration;
-      // Observer: selecting resyncs the flag from whoever holds the lease
-      // without stealing it; typing claims it on demand.
-      unawaited(
-        _client
-            .attachSession(
-              sessionId: sid,
-              clientId: _clientId,
-              mode: 'Observer',
-            )
-            .then((attachRes) {
-              if (_isStale(leaseGeneration)) return;
-              session.hasInputLease = _attachGrantsInputLease(attachRes);
-            })
-            .catchError((Object e) {
-              if (e is TriageAuthException) {
+    if (sid != null && !session.isExited) {
+      if (_pendingInputBytes[sid]?.isNotEmpty ?? false) {
+        // Pending input buffered while unselected: flush immediately on select.
+        unawaited(_acquireInputLeaseAndFlush(session, sid));
+      } else if (subscribed) {
+        // A success arriving after a purge must not resurrect the lease the
+        // disconnect just reset; the catch below already fails safe to false.
+        final leaseGeneration = _connectGeneration;
+        // Observer: selecting resyncs the flag from whoever holds the lease
+        // without stealing it; typing claims it on demand.
+        unawaited(
+          _client
+              .attachSession(
+                sessionId: sid,
+                clientId: _clientId,
+                mode: 'Observer',
+              )
+              .then((attachRes) {
+                if (_isStale(leaseGeneration)) return;
+                session.hasInputLease = _attachGrantsInputLease(attachRes);
+              })
+              .catchError((Object e) {
+                if (e is TriageAuthException) {
+                  session.hasInputLease = false;
+                  _routeStaleAuthFailure(leaseGeneration);
+                  return;
+                }
+                if (_isStale(leaseGeneration)) return;
+                debugPrint('Select lease attach failed for $sid: $e');
                 session.hasInputLease = false;
-                _routeStaleAuthFailure(leaseGeneration);
-                return;
-              }
-              if (_isStale(leaseGeneration)) return;
-              debugPrint('Select lease attach failed for $sid: $e');
-              session.hasInputLease = false;
-            }),
-      );
+              }),
+        );
+      }
     }
     if (session.hasFitted && (sid == null || subscribed)) {
       // Already fitted and subscribed: refresh metadata without clearing and replaying history.
