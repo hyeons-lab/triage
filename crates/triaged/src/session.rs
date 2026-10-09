@@ -28,12 +28,13 @@ use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
 use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
-    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest,
-    SessionApi, SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope,
-    SessionEventReceiver, SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot,
-    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
-    SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
+    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputControllerKind,
+    InputLeaseRequest, InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest,
+    RestoreSessionRequest, SessionApi, SessionContext, SessionContextRow, SessionEvent,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionPins,
+    SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
+    StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
+    TerminalStyle, WriteInputRequest,
 };
 use triage_core::session::{SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN};
 use triage_transport_ws::ServerMessage;
@@ -189,6 +190,16 @@ const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_DEVICE_CODE_TTL: Duration = Duration::from_secs(15 * 60);
 const PAIRING_PIN_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PENDING_PAIRING_CHALLENGES: usize = 64;
+/// How long denied input waits for its client to acquire the lease before it
+/// is dropped. Acquire-on-denial is one round trip, so anything older is from
+/// a client that went away.
+const PARKED_INPUT_TTL: Duration = Duration::from_secs(10);
+/// Cap per (session, client) so a client typing into a denied lease for
+/// minutes cannot grow the parked map without bound. Bytes past the cap are
+/// dropped, and the client is already re-acquiring on the first denial.
+const PARKED_INPUT_CAP_BYTES: usize = 4096;
+/// Maximum number of distinct clients that can concurrently park denied input per session.
+const MAX_PARKED_CLIENTS_PER_SESSION: usize = 8;
 const MAX_PAIRING_CLIENT_ID_LENGTH: usize = 128;
 
 /// Normalize a user-typed pairing code per Crockford Base32 rules:
@@ -301,12 +312,27 @@ struct JudgeState {
     rules: crate::judge::JudgeRules,
 }
 
+/// Input bytes one client was denied while lease-less, waiting for that
+/// client to acquire the lease. Denied means never written, so flushing on
+/// acquire is exactly-once by construction.
+struct ParkedInput {
+    client: ClientId,
+    bytes: Vec<u8>,
+    parked_at: Instant,
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     /// Side inboxes for session-to-session coordination mail (agents via
     /// MCP). In-memory only: not persisted, not carried across handover.
     inboxes: Mutex<HashMap<SessionId, VecDeque<SessionMessage>>>,
+    /// Input bytes denied by the lease, parked per session and client until
+    /// the denied client acquires the lease (then flushed to the actor) or
+    /// the TTL lapses. In-memory only: a denied write returns its error
+    /// unchanged so the client still re-acquires; this only saves the bytes
+    /// that error would otherwise destroy.
+    parked_input: Mutex<HashMap<SessionId, Vec<ParkedInput>>>,
     /// Daemon-monotonic message id counter (starts at 1; 0 is never valid).
     next_message_id: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
@@ -667,6 +693,7 @@ impl SessionManager {
             config,
             next_session: AtomicU64::new(next_session),
             inboxes: Mutex::new(HashMap::new()),
+            parked_input: Mutex::new(HashMap::new()),
             next_message_id: AtomicU64::new(1),
             sessions: Mutex::new(sessions),
             pins: Mutex::new(pins),
@@ -1186,6 +1213,126 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         overrides.remove(session_id);
+    }
+
+    /// Parks bytes `write_input` denied, for delivery when `client_id`
+    /// acquires the lease. Expired entries are swept on every park and take,
+    /// so dead sessions leave nothing behind; the stamp stays at the first
+    /// parked byte so a client typing into a denial for minutes still ages
+    /// out instead of refreshing its parking forever.
+    ///
+    /// Lock order: the sessions guard may be held (sessions-then-parked, as
+    /// in `write_input`); this never takes the sessions lock, so the order
+    /// cannot invert.
+    fn park_denied_input(&self, session_id: &SessionId, client_id: &ClientId, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_parked_input(&mut parked);
+        let entries = parked.entry(session_id.clone()).or_default();
+        if let Some(existing) = entries.iter_mut().find(|entry| entry.client == *client_id) {
+            let room = PARKED_INPUT_CAP_BYTES.saturating_sub(existing.bytes.len());
+            if bytes.len() > room {
+                tracing::warn!(
+                    session_id = %session_id,
+                    client_id = %client_id,
+                    dropped_bytes = bytes.len() - room,
+                    "parked input buffer cap reached; dropping excess denied input"
+                );
+            }
+            existing.bytes.extend(bytes.into_iter().take(room));
+        } else if entries.len() < MAX_PARKED_CLIENTS_PER_SESSION {
+            let mut bytes = bytes;
+            if bytes.len() > PARKED_INPUT_CAP_BYTES {
+                tracing::warn!(
+                    session_id = %session_id,
+                    client_id = %client_id,
+                    dropped_bytes = bytes.len() - PARKED_INPUT_CAP_BYTES,
+                    "parked input buffer cap reached; dropping excess denied input"
+                );
+            }
+            bytes.truncate(PARKED_INPUT_CAP_BYTES);
+            entries.push(ParkedInput {
+                client: client_id.clone(),
+                bytes,
+                parked_at: Instant::now(),
+            });
+        } else {
+            tracing::warn!(
+                session_id = %session_id,
+                client_id = %client_id,
+                dropped_bytes = bytes.len(),
+                "maximum parked clients per session reached; dropping denied input"
+            );
+        }
+    }
+
+    /// Takes everything parked for `client_id` on `session_id`, for the
+    /// flush-on-acquire paths. Empty when nothing was denied (the common
+    /// case) or when it all expired.
+    fn take_parked_input(&self, session_id: &SessionId, client_id: &ClientId) -> Vec<u8> {
+        let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_parked_input(&mut parked);
+        let Some(entries) = parked.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let Some(index) = entries.iter().position(|entry| entry.client == *client_id) else {
+            return Vec::new();
+        };
+        let entry = entries.remove(index);
+        if entries.is_empty() {
+            parked.remove(session_id);
+        }
+        entry.bytes
+    }
+
+    /// Drops a session's parked input when the session goes away, so a
+    /// restored session reusing the id cannot inherit bytes parked for an
+    /// earlier incarnation (same hazard as `forget_judge_override`).
+    fn forget_parked_input(&self, session_id: &SessionId) {
+        let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
+        parked.remove(session_id);
+    }
+
+    fn sweep_parked_input(parked: &mut HashMap<SessionId, Vec<ParkedInput>>) {
+        let now = Instant::now();
+        parked.retain(|_, entries| {
+            entries
+                .retain(|entry| now.saturating_duration_since(entry.parked_at) < PARKED_INPUT_TTL);
+            !entries.is_empty()
+        });
+    }
+
+    /// Acquires the input lease for a client, drains any input parked during denial,
+    /// forwards it to the session actor under the sessions lock, and broadcasts the event.
+    fn grant_input_lease_and_flush(
+        &self,
+        session_id: &SessionId,
+        client_id: &ClientId,
+        kind: InputControllerKind,
+        lease: &mut InputLeaseState,
+        actor: &SessionActor,
+    ) -> Result<LeaseChange> {
+        let change = lease.acquire(client_id.clone(), kind);
+        let parked = self.take_parked_input(session_id, client_id);
+        if !parked.is_empty() {
+            let dropped_bytes = parked.len();
+            if let Err(error) = request_write_input(&actor.tx, parked) {
+                tracing::warn!(
+                    %session_id,
+                    %client_id,
+                    dropped_bytes,
+                    ?error,
+                    "failed to flush parked input after lease grant; dropping it"
+                );
+            }
+        }
+        actor.broadcast_event(SessionEvent::LeaseChanged {
+            session_id: session_id.clone(),
+            change: change.clone(),
+        })?;
+        Ok(change)
     }
 
     /// One session's judge policy: its override, and the resolved answer.
@@ -1961,13 +2108,14 @@ impl SessionManager {
             Sender<ActorCommand>,
             PersistedSessionLaunch,
             SessionStamps,
+            InputLeaseState,
         )> = self
             .sessions()?
             .iter()
             .filter_map(|(id, managed)| match managed {
                 ManagedSession::Live {
                     actor,
-                    lease: _,
+                    lease,
                     launch,
                     // The adopted process stays alive across a handover, so the new
                     // daemon reads its live cwd directly (see `adopted_session_cwd`);
@@ -1981,6 +2129,7 @@ impl SessionManager {
                         activity_ms: actor.last_activity_ms(),
                         input_ms: actor.last_input_ms(),
                     },
+                    lease.clone(),
                 )),
                 _ => None,
             })
@@ -2000,10 +2149,10 @@ impl SessionManager {
         // all.
         let inflight: Vec<_> = pending
             .into_iter()
-            .filter_map(|(id, cmd_tx, launch, stamps)| {
+            .filter_map(|(id, cmd_tx, launch, stamps, lease)| {
                 let (tx, rx) = mpsc::channel();
                 match cmd_tx.send(ActorCommand::ExtractHandoverState { response: tx }) {
-                    Ok(()) => Some((id, rx, launch, stamps)),
+                    Ok(()) => Some((id, rx, launch, stamps, lease)),
                     Err(err) => {
                         tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
                         None
@@ -2016,7 +2165,7 @@ impl SessionManager {
         // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
         let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
 
-        for (id, rx, launch, stamps) in inflight {
+        for (id, rx, launch, stamps, lease) in inflight {
             // Bounded, unlike every other actor round-trip in this file. An actor that
             // cannot answer a descriptor dup and three counters before the budget runs
             // out is parked (a `write_all` to a session whose child stopped reading),
@@ -2076,6 +2225,7 @@ impl SessionManager {
                 last_activity_ms: stamps.activity_ms,
                 last_input_ms: stamps.input_ms,
                 judge_override,
+                lease,
             });
         }
 
@@ -2561,7 +2711,7 @@ impl SessionManager {
             h_sess.id.clone(),
             ManagedSession::Live {
                 actor,
-                lease: InputLeaseState::default(),
+                lease: h_sess.lease.clone(),
                 launch,
                 last_known_cwd,
             },
@@ -3116,18 +3266,19 @@ impl SessionApi for SessionManager {
 
         match session {
             ManagedSession::Live { actor, lease, .. } => {
+                // Flush-on-grant: bytes this client was denied while lease-less
+                // are delivered now that the attach grants it the lease.
+                // Observers never grant, so their parked bytes stay parked.
                 if let Some(kind) = request.mode.controller_kind() {
-                    let change = lease.acquire(request.client_id, kind);
-                    actor.broadcast_event(SessionEvent::LeaseChanged {
-                        session_id: request.session_id.clone(),
-                        change,
-                    })?;
+                    self.grant_input_lease_and_flush(
+                        &request.session_id,
+                        &request.client_id,
+                        kind,
+                        lease,
+                        actor,
+                    )?;
                 }
 
-                // The lease mutation and its event stay under the lock (see
-                // `broadcast_event`); the snapshot round-trip must not. Every client
-                // attach lands here, so an actor parked on a stuck PTY would freeze
-                // the whole daemon on the commonest request there is.
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
@@ -3186,26 +3337,28 @@ impl SessionApi for SessionManager {
     }
 
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
-        let mut sessions = self.sessions()?;
-        let session = sessions
-            .get_mut(&request.session_id)
-            .with_context(|| format!("session {} not found", request.session_id))?;
-        match session {
-            ManagedSession::Live { actor, lease, .. } => {
-                let change = lease.acquire(request.client_id, request.kind);
-                actor.broadcast_event(SessionEvent::LeaseChanged {
-                    session_id: request.session_id,
-                    change: change.clone(),
-                })?;
-                Ok(change)
+        let change = {
+            let mut sessions = self.sessions()?;
+            let session = sessions
+                .get_mut(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            match session {
+                ManagedSession::Live { actor, lease, .. } => self.grant_input_lease_and_flush(
+                    &request.session_id,
+                    &request.client_id,
+                    request.kind,
+                    lease,
+                    actor,
+                )?,
+                ManagedSession::Historical { .. } => {
+                    bail!("restored historical sessions cannot acquire input leases")
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
             }
-            ManagedSession::Historical { .. } => {
-                bail!("restored historical sessions cannot acquire input leases")
-            }
-            ManagedSession::Restoring { .. } => {
-                bail!("session {} is being restored", request.session_id)
-            }
-        }
+        };
+        Ok(change)
     }
 
     fn release_input_lease(
@@ -3264,15 +3417,24 @@ impl SessionApi for SessionManager {
                     ManagedSession::Live { .. } => unreachable!(),
                 }
             };
-            let holder = lease.holder.as_ref().with_context(|| {
-                format!("session {} has no input lease holder", request.session_id)
-            })?;
-            ensure!(
-                holder.client_id == request.client_id,
-                "client {} does not hold input lease for session {}",
-                request.client_id,
-                request.session_id
-            );
+            // A denial still bails with the same message (the client parses it
+            // to re-acquire), but the bytes are parked first so the acquire
+            // they trigger can deliver them instead of losing the keystroke.
+            let denied = match lease.holder.as_ref() {
+                None => Some(format!(
+                    "session {} has no input lease holder",
+                    request.session_id
+                )),
+                Some(holder) if holder.client_id != request.client_id => Some(format!(
+                    "client {} does not hold input lease for session {}",
+                    request.client_id, request.session_id
+                )),
+                _ => None,
+            };
+            if let Some(message) = denied {
+                self.park_denied_input(&request.session_id, &request.client_id, request.bytes);
+                bail!(message);
+            }
             actor.tx.clone()
         };
         request_write_input(&cmd_tx, request.bytes)
@@ -3424,7 +3586,7 @@ impl SessionApi for SessionManager {
             request.session_id.clone(),
             ManagedSession::Live {
                 actor,
-                lease: InputLeaseState::default(),
+                lease: lease.clone(),
                 launch,
                 last_known_cwd,
             },
@@ -3686,6 +3848,7 @@ impl SessionApi for SessionManager {
         self.forget_snippet(&session_id);
         self.forget_judge_override(&session_id);
         self.forget_inbox(&session_id);
+        self.forget_parked_input(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -8833,6 +8996,7 @@ mod tests {
             pid: std::process::id(),
             process_identity: None,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
 
         let mut master: libc::c_int = 0;
@@ -8978,6 +9142,7 @@ mod tests {
                         last_activity_ms: 0,
                         last_input_ms: 0,
                         judge_override: None,
+                        lease: InputLeaseState::default(),
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -10020,6 +10185,7 @@ mod tests {
                         last_activity_ms: 0,
                         last_input_ms: 0,
                         judge_override: None,
+                        lease: InputLeaseState::default(),
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -11486,6 +11652,236 @@ mod tests {
         assert!(stamped <= now_unix_millis());
 
         let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Bytes denied by the lease must not be lost: the daemon parks them and
+    /// delivers them when the denied client acquires the lease (here via a
+    /// controller attach, which takes the lease over). Polls the grid for the
+    /// PTY echo rather than sleeping a fixed guess.
+    #[test]
+    fn denied_input_is_delivered_on_attach_acquire() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let holder = ClientId::new("park-first-holder").expect("client id");
+        let waiter = ClientId::new("park-waiter").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: holder,
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("first attach takes the lease");
+
+        let denied = manager.write_input(WriteInputRequest {
+            session_id: session_id.clone(),
+            client_id: waiter.clone(),
+            bytes: b"echo parked-on-attach\r".to_vec(),
+        });
+        assert!(
+            denied.is_err(),
+            "the write must be denied while another client holds the lease"
+        );
+        let error_msg = denied.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not hold input lease for session")
+                && error_msg.contains(session_id.as_str()),
+            "denial message must match client-expected format: {error_msg}"
+        );
+
+        manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: waiter,
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("second attach takes the lease over");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot");
+            let text: String = snapshot
+                .styled_rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
+                .collect();
+            if text.contains("parked-on-attach") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "denied bytes never reached the session after the takeover"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Same as above through the standalone lease RPC rather than attach.
+    #[test]
+    fn denied_input_is_delivered_on_lease_rpc_acquire() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let holder = ClientId::new("rpc-first-holder").expect("client id");
+        let waiter = ClientId::new("rpc-waiter").expect("client id");
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: session_id.clone(),
+                client_id: holder,
+                kind: triage_core::session::InputControllerKind::Interactive,
+            })
+            .expect("first acquire takes the lease");
+
+        let denied = manager.write_input(WriteInputRequest {
+            session_id: session_id.clone(),
+            client_id: waiter.clone(),
+            bytes: b"echo parked-on-rpc\r".to_vec(),
+        });
+        assert!(
+            denied.is_err(),
+            "the write must be denied while another client holds the lease"
+        );
+        let error_msg = denied.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not hold input lease for session")
+                && error_msg.contains(session_id.as_str()),
+            "denial message must match client-expected format: {error_msg}"
+        );
+
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: session_id.clone(),
+                client_id: waiter,
+                kind: triage_core::session::InputControllerKind::Interactive,
+            })
+            .expect("second acquire takes the lease over");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot");
+            let text: String = snapshot
+                .styled_rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
+                .collect();
+            if text.contains("parked-on-rpc") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "denied bytes never reached the session after the takeover"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Parked input is capped per client and take-once: a client typing into
+    /// a denial for minutes cannot grow the map without bound, and a flush
+    /// cannot deliver the same bytes twice.
+    #[test]
+    fn parked_input_is_capped_and_take_once() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-cap").expect("session id");
+        let client = ClientId::new("cap-client").expect("client id");
+        let other = ClientId::new("cap-other").expect("client id");
+
+        manager.park_denied_input(&session_id, &client, vec![b'x'; PARKED_INPUT_CAP_BYTES]);
+        manager.park_denied_input(&session_id, &client, b"overflow".to_vec());
+        manager.park_denied_input(&session_id, &other, b"y".to_vec());
+
+        let taken = manager.take_parked_input(&session_id, &client);
+        assert_eq!(taken.len(), PARKED_INPUT_CAP_BYTES);
+        assert!(
+            manager.take_parked_input(&session_id, &client).is_empty(),
+            "a take must drain, so a second flush cannot redeliver"
+        );
+        assert_eq!(
+            manager.take_parked_input(&session_id, &other),
+            b"y",
+            "one client's take must not touch another's parked bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Expired entries are swept on touch, so clients that went away leave
+    /// nothing behind, while active client entries are preserved.
+    #[test]
+    fn parked_input_sweep_drops_expired_entries() {
+        let session_id = SessionId::new("session-sweep").expect("session id");
+        let client = ClientId::new("sweep-client").expect("client id");
+        let active_client = ClientId::new("active-client").expect("client id");
+        let mut parked = HashMap::new();
+        parked.insert(
+            session_id.clone(),
+            vec![
+                ParkedInput {
+                    client,
+                    bytes: b"old".to_vec(),
+                    parked_at: Instant::now()
+                        .checked_sub(PARKED_INPUT_TTL + Duration::from_secs(1))
+                        .expect("recent past"),
+                },
+                ParkedInput {
+                    client: active_client.clone(),
+                    bytes: b"fresh".to_vec(),
+                    parked_at: Instant::now(),
+                },
+            ],
+        );
+        SessionManager::sweep_parked_input(&mut parked);
+        let remaining = parked
+            .get(&session_id)
+            .expect("session still has active client");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].client, active_client);
+        assert_eq!(remaining[0].bytes, b"fresh");
+    }
+
+    #[test]
+    fn parked_input_is_capped_by_client_count() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-client-cap").expect("session id");
+
+        for i in 0..MAX_PARKED_CLIENTS_PER_SESSION {
+            let client = ClientId::new(format!("client-{}", i)).expect("client id");
+            manager.park_denied_input(&session_id, &client, b"data".to_vec());
+        }
+
+        // The next client should be rejected because the session has reached the max parked clients.
+        let overflow_client = ClientId::new("client-overflow").expect("client id");
+        manager.park_denied_input(&session_id, &overflow_client, b"overflow".to_vec());
+        assert!(
+            manager
+                .take_parked_input(&session_id, &overflow_client)
+                .is_empty()
+        );
+
+        // Existing client can still append up to byte cap.
+        let client_0 = ClientId::new("client-0").expect("client id");
+        manager.park_denied_input(&session_id, &client_0, b"-more".to_vec());
+        assert_eq!(
+            manager.take_parked_input(&session_id, &client_0),
+            b"data-more"
+        );
+
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
@@ -14248,6 +14644,7 @@ mod tests {
                         last_activity_ms: 0,
                         last_input_ms: 0,
                         judge_override: Some(false),
+                        lease: InputLeaseState::default(),
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
