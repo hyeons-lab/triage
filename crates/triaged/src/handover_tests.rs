@@ -630,6 +630,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn handover_json_without_lease_defaults_to_unheld() {
+        let session = crate::handover::HandoverSession {
+            id: SessionId::new("legacy-session").unwrap(),
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: std::path::PathBuf::from("/tmp/legacy.log"),
+            output_seq: 0,
+            bytes_logged: 0,
+            pid: 1234,
+            process_identity: None,
+            last_activity_ms: 0,
+            last_input_ms: 0,
+            judge_override: None,
+            lease: triage_core::session::InputLeaseState::default(),
+        };
+        let mut value = serde_json::to_value(crate::handover::HandoverState {
+            sessions: vec![session],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Strip the `lease` field to simulate a payload from a pre-lease daemon.
+        value["sessions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("lease");
+
+        let state: crate::handover::HandoverState =
+            serde_json::from_value(value).expect("deserialize legacy handover JSON without lease");
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(
+            state.sessions[0].lease,
+            triage_core::session::InputLeaseState::default()
+        );
+        assert!(state.sessions[0].lease.holder.is_none());
+    }
+
     /// A descriptor handed to the code under test, whose closure can be
     /// observed reliably from inside a parallel test binary.
     ///

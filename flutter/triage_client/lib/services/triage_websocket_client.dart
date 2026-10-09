@@ -206,14 +206,14 @@ class TriageWebSocketClient {
 
   bool get isConnected => _channel != null;
 
-  // Monotonic proof-of-life: any inbound frame — response, event, output —
+  // Monotonic proof-of-life: any inbound frame (response, event, output)
   // shows the socket delivers, even when one request is slow behind a big
   // one on the daemon's serial per-connection queue.
   final Stopwatch _rxStopwatch = Stopwatch();
   int _lastRxElapsedMs = 0;
 
-  /// Milliseconds since any frame arrived. Zero before the first connect.
-  int get millisSinceLastInbound => _rxStopwatch.isRunning
+  /// Milliseconds since any frame arrived. Zero when disconnected or before the first connect.
+  int get millisSinceLastInbound => (isConnected && _rxStopwatch.isRunning)
       ? _rxStopwatch.elapsedMilliseconds - _lastRxElapsedMs
       : 0;
 
@@ -1077,9 +1077,13 @@ class TriageWebSocketClient {
     final subscription = _subscription;
     _channel = null;
     _subscription = null;
+    _rxStopwatch
+      ..stop()
+      ..reset();
+    _lastRxElapsedMs = 0;
     // Stop listening first: on a half-open socket the close below never
     // completes, so the stream would never end on its own and the subscription
-    // would keep this channel — and its socket — alive past every reconnect.
+    // would keep this channel (and its socket) alive past every reconnect.
     unawaited(subscription?.cancel().catchError((_) {}));
     if (channel != null) {
       // Closing is a handshake, and a half-open socket never answers it. Bound

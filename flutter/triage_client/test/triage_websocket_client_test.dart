@@ -1397,6 +1397,7 @@ void main() {
       expect(client.millisSinceLastInbound, lessThan(silent));
 
       await client.disconnect();
+      expect(client.millisSinceLastInbound, 0);
     });
   });
 }

@@ -83,8 +83,9 @@ client heartbeat with dead-socket teardown, socket-driven indicator.
 
 ## Commits
 
-- beef314 — fix(input): end-to-end input reliability
-- HEAD — fix(client): gate heartbeat teardown on inbound silence
+- 4be117b: fix(input): end-to-end input reliability
+- fcc472d: fix(client): gate heartbeat teardown on inbound silence
+- HEAD: fix(triaged,client): review findings from input reliability audit
 
 ## Progress
 
@@ -95,13 +96,25 @@ client heartbeat with dead-socket teardown, socket-driven indicator.
   fmt + clippy clean; flutter analyze clean; 53 + 148 client tests pass.
 - 2026-10-03T19:06-0700: silence-gated the heartbeat after the outage
   above; transport unit test green, analyze clean.
-- 2026-10-03T19:31-0700: deploy took three tries — the first two
-  installs served the pre-fix bundle (binary predated the flutter
+- 2026-10-03T19:31-0700: deploy took three tries (the first two
+  installs served the pre-fix bundle; binary predated the flutter
   stamp; likely raced cargo invocations on a load-58 machine). A clean
   client rebuild (`rm -rf flutter/.../build` + release build) fixed
   it; curl-verified the served JS contains the new strings. Lessons:
   `grep` on the binary never works (rust-embed `compression` feature),
   so always curl-verify the served bundle after a web-client deploy.
+- 2026-10-09T12:30-0700: Completed code review loop across daemon and
+  Flutter client. Fixed input inversion race under session lock, bounded
+  parked clients per session (MAX_PARKED_CLIENTS_PER_SESSION = 8), pruned
+  pending input on session disposal, guarded session lookup on reconnect,
+  flushed pending input on session select, verified legacy handover JSON
+  backward compatibility, and enforced websocket silence invariant.
+- 2026-10-09T12:48-0700: Confirmation round passed clean across all 8 pillars;
+  addressed clean-up recommendations: consolidated lease grant and flush into
+  canonical helper `grant_input_lease_and_flush`, unnested select pending input
+  flush from async subscription guard, and asserted post-disconnect elapsed
+  silence reset and error message format in test suites. All 364 workspace tests
+  and 653 Flutter tests pass.
 
 ## Research & Discoveries
 
