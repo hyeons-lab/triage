@@ -31,7 +31,7 @@ use tattoy_wezterm_term::{Intensity, Underline};
 ///
 /// The record starts with a reset so rendition state from any previous
 /// record cannot bleed in, then re-emits style runs (attributes first,
-/// then foreground, then background, mirroring [`terminal_style`] in
+/// then foreground, then background, mirroring `terminal_style` in
 /// `session.rs`) with each run change resetting before applying. Trailing
 /// blank cells in the default style are dropped (wezterm lines are
 /// full-width padded); control characters never survive into the text,
@@ -97,7 +97,7 @@ pub fn encode_line(line: &mut Line, palette: &ColorPalette) -> Vec<u8> {
 }
 
 /// Append SGR parameters for one cell's attributes, mirroring the attr
-/// coverage of [`terminal_style`]: intensity, italic, underline, reverse,
+/// coverage of `terminal_style`: intensity, italic, underline, reverse,
 /// and resolved RGB colors. Anything unmapped degrades to unstyled text.
 fn push_sgr_params(
     attrs: &tattoy_wezterm_term::CellAttributes,

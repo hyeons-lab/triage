@@ -24,6 +24,9 @@ history window. Zero client or protocol changes.
   construction sites; `ingest` anchors the baseline before the
   advance and journals new scrolls after; legacy trim rebases the
   journal. 13 journal/encoder + 3 ingest tests.
+- 2026-10-09T11:35-0700: render terminal_style references in
+  scrollback.rs doc comments as code spans instead of intra-doc
+  links, resolving rustdoc broken-intra-doc-links CI failure.
 
 ## Decisions
 
@@ -39,7 +42,8 @@ history window. Zero client or protocol changes.
 
 ## Commits
 
-- HEAD — feat(triaged): journal scrolled lines at ingest (PR A)
+- 009ea65 — feat(triaged): journal scrolled lines at ingest (PR A)
+- HEAD: docs(triaged): fix broken intra-doc links in scrollback docs
 
 ## Progress
 
@@ -50,6 +54,8 @@ history window. Zero client or protocol changes.
   scrollback + 5 ingest tests green; fmt/clippy/workspace clean;
   8 pairing failures verified pre-existing on the clean base).
   Committed, pushed, stacked PR opened on `fix/scrollback-paging`.
+- 2026-10-09T11:35-0700: Fixed broken intra-doc links in scrollback.rs
+  doc comments. Format, clippy, doc, and unit tests passing.
 
 ## Research & Discoveries
 
