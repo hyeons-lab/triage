@@ -38,6 +38,10 @@ history window. Zero client or protocol changes.
   all-buffer-serves-nothing bug caught live on session-303). 2
   overlay fixture tests; live-verified end to end (304 live +
   reload, 305 restored) with WS probes.
+- 2026-10-09T09:44-0700 (PR B test fix): gate live tmp assertion on unix
+  in journal_open test. On non-unix platforms pid_is_alive returns
+  false, so live tmp debris is swept on open. Gated the assertion to
+  unix and asserted absence on non-unix to pass Windows CI.
 
 ## Decisions
 
@@ -56,7 +60,10 @@ history window. Zero client or protocol changes.
 - a6592d9: feat(triaged): journal scrolled lines at ingest (PR A)
 - bd57f71: docs(triaged): fix broken intra-doc links in scrollback docs
 - 199d075: fix(scrollback): review findings from scrollback-index audit
-- HEAD: feat(triaged): serve journaled scrollback prefix (PR B)
+- 4bbc9d2: feat(triaged): serve journaled scrollback prefix (PR B)
+- 30c57c2: docs(triaged): fix broken intra-doc links in scrollback docs
+- b39ba89: fix(triaged): review findings from scrollback-serve audit loop
+- HEAD: test(triaged): gate live tmp assertion on unix in journal_open test
 
 ## Progress
 
@@ -72,6 +79,9 @@ history window. Zero client or protocol changes.
   reload, and on the restored path; byte-identical). Committed,
   pushed as `feat/scrollback-serve`, stacked PR opened on
   `feat/scrollback-index`.
+- 2026-10-09T09:44-0700: Fixed Windows CI test failure in
+  `journal_open_recovers_debris_and_pairs` by gating unix-only live tmp
+  assertion. All workspace tests passing.
 - 2026-10-09T11:35-0700: Fixed broken intra-doc links in scrollback.rs
   doc comments. Format, clippy, doc, and unit tests passing.
 - 2026-10-10T07:24-0700: Rebased onto fix/scrollback-paging (98c6d01).

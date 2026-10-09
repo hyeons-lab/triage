@@ -2156,7 +2156,10 @@ mod tests {
         let journal = ScrollbackJournal::open(&dir);
         assert!(dir.join("segment-000001.tlog.zst.tmp.0").exists());
         assert!(!dir.join("scrollback-000009.slog.zst.tmp.0").exists());
+        #[cfg(unix)]
         assert!(dir.join(&live).exists());
+        #[cfg(not(unix))]
+        assert!(!dir.join(&live).exists());
         assert!(!dir.join("scrollback-rebase.tmp.0").exists());
         assert!(!dir.join("scrollback-000009.slog").exists());
         assert!(dir.join("scrollback-000009.slog.zst").exists());
