@@ -3264,6 +3264,12 @@ impl SessionApi for SessionManager {
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
 
+        let history_cap = request
+            .history_bytes
+            .filter(|cap| *cap > 0)
+            .map(|cap| cap.min(RAW_OUTPUT_TAIL_CAP))
+            .unwrap_or(RAW_OUTPUT_TAIL_CAP);
+
         match session {
             ManagedSession::Live { actor, lease, .. } => {
                 // Flush-on-grant: bytes this client was denied while lease-less
@@ -3282,14 +3288,14 @@ impl SessionApi for SessionManager {
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
-                let snapshot = request_snapshot_with_history(&cmd_tx)?;
+                let snapshot = request_snapshot_with_history(&cmd_tx, history_cap)?;
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
                     lease,
                 })
             }
             ManagedSession::Historical { session, lease } => {
-                let snapshot = session.snapshot_with_history();
+                let snapshot = session.snapshot_with_history(history_cap);
                 let lease = lease.clone();
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
@@ -5269,11 +5275,12 @@ impl HistoricalSession {
     /// As [`Self::snapshot`], but carrying the raw output-history tail for
     /// client-side re-emulation. Historical sessions are only ever read on the
     /// attach/snapshot paths, so this is always history-bearing.
-    fn snapshot_with_history(&self) -> SessionSnapshot {
+    fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
         overlay_raw_output_history(
             self.snapshot(),
             &self.persisted.log_path,
             self.output.bytes_logged,
+            history_cap,
         )
     }
 
@@ -5697,6 +5704,7 @@ enum ActorCommand {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
     SnapshotWithHistory {
+        history_cap: u64,
         response: Sender<ActorResult<SessionSnapshot>>,
     },
     /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
@@ -6116,8 +6124,11 @@ impl ActorState {
                 let _ = response.send(Ok(self.snapshot()));
                 false
             }
-            ActorCommand::SnapshotWithHistory { response } => {
-                let _ = response.send(Ok(self.snapshot_with_history()));
+            ActorCommand::SnapshotWithHistory {
+                history_cap,
+                response,
+            } => {
+                let _ = response.send(Ok(self.snapshot_with_history(history_cap)));
                 false
             }
             ActorCommand::SummaryRows { response } => {
@@ -6243,11 +6254,12 @@ impl ActorState {
     /// A snapshot carrying the raw output-history tail for client-side
     /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
     /// the plain [`Self::snapshot`] so they never carry history.
-    fn snapshot_with_history(&self) -> SessionSnapshot {
+    fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
         overlay_raw_output_history(
             self.snapshot(),
             &self.output.log_path,
             self.output.bytes_logged,
+            history_cap,
         )
     }
 
@@ -6392,7 +6404,7 @@ impl ActorState {
             event: SessionEvent::ResyncRequired {
                 session_id,
                 latest_event_seq,
-                snapshot: self.snapshot_with_history(),
+                snapshot: self.snapshot_with_history(RAW_OUTPUT_TAIL_CAP),
             },
         }
     }
@@ -7411,8 +7423,9 @@ fn overlay_raw_output_history(
     mut snapshot: SessionSnapshot,
     log_path: &Path,
     bytes_logged: u64,
+    history_cap: u64,
 ) -> SessionSnapshot {
-    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, RAW_OUTPUT_TAIL_CAP);
+    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, history_cap);
     snapshot.raw_output = raw;
     snapshot.raw_output_start = start;
     snapshot
@@ -7810,10 +7823,16 @@ fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     recv_actor_result(resp_rx, "reading session snapshot")
 }
 
-fn request_snapshot_with_history(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+fn request_snapshot_with_history(
+    tx: &Sender<ActorCommand>,
+    history_cap: u64,
+) -> Result<SessionSnapshot> {
     let (resp_tx, resp_rx) = mpsc::channel();
-    tx.send(ActorCommand::SnapshotWithHistory { response: resp_tx })
-        .context("sending session snapshot with history command")?;
+    tx.send(ActorCommand::SnapshotWithHistory {
+        history_cap,
+        response: resp_tx,
+    })
+    .context("sending session snapshot with history command")?;
     recv_actor_result(resp_rx, "reading session snapshot with history")
 }
 
@@ -7839,7 +7858,7 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         ActorCommand::Snapshot { response } => {
             let _ = response.send(Err(error));
         }
-        ActorCommand::SnapshotWithHistory { response } => {
+        ActorCommand::SnapshotWithHistory { response, .. } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::SummaryRows { response } => {
@@ -10922,6 +10941,7 @@ mod tests {
 
         let observed = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: observer.clone(),
                 mode: triage_core::session::AttachMode::Observer,
@@ -10941,6 +10961,7 @@ mod tests {
 
         let controlled = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: local_tui.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11385,6 +11406,7 @@ mod tests {
         let client_id = ClientId::new("restore-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11432,6 +11454,7 @@ mod tests {
         let client_id = ClientId::new("revive-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11481,6 +11504,7 @@ mod tests {
         // It accepts input again through the normal attach + write path.
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11519,6 +11543,7 @@ mod tests {
         let client_id = ClientId::new("demote-activity-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11643,6 +11668,7 @@ mod tests {
         let client_id = ClientId::new("input-stamp-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11745,6 +11771,7 @@ mod tests {
         let waiter = ClientId::new("park-waiter").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: holder,
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11769,6 +11796,7 @@ mod tests {
 
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: waiter,
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12052,6 +12080,7 @@ mod tests {
         let client_id = ClientId::new("demote-cwd-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12161,6 +12190,7 @@ mod tests {
         // session was not demoted and its actor not reaped.
         let response = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: ClientId::new("non-restorable-client").expect("client id"),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12298,6 +12328,7 @@ mod tests {
         assert_eq!(snapshot.current_working_directory, Some(cwd.clone()));
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12360,6 +12391,7 @@ mod tests {
         assert_eq!(snapshot.current_working_directory, Some(launch_cwd.clone()));
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12534,6 +12566,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -13259,6 +13292,7 @@ mod tests {
             snapshot_from_output(&output, &SessionSize::default(), None, None, false),
             &path,
             output.bytes_logged,
+            RAW_OUTPUT_TAIL_CAP,
         );
         assert_eq!(snapshot.raw_output.len(), RAW_OUTPUT_TAIL_CAP as usize);
         assert_eq!(
@@ -13266,6 +13300,151 @@ mod tests {
             output.bytes_logged - RAW_OUTPUT_TAIL_CAP
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A requested attach cap ships only the newest bytes: first paint waits
+    /// on the viewport page, with older pages fetched on demand.
+    #[test]
+    fn attach_history_cap_limits_the_served_tail() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output
+            .ingest(b"0123456789abcdef")
+            .expect("ingest fixed payload");
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            6,
+        );
+        assert_eq!(snapshot.raw_output, b"abcdef");
+        assert_eq!(snapshot.raw_output_start, output.bytes_logged - 6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attach_session_historical_limits_history_tail_to_requested_cap() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-cap-test").expect("session id");
+        let log_path = log_dir
+            .join("sessions")
+            .join("session-cap-test")
+            .join("segment-000001.tlog");
+        std::fs::create_dir_all(log_path.parent().unwrap()).expect("create session log dir");
+        std::fs::write(&log_path, b"0123456789abcdef").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: "echo".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+                log_path: log_path.clone(),
+                exited: true,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+            },
+        );
+
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let attached = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("cap-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: Some(6),
+            })
+            .expect("attach session");
+
+        assert_eq!(attached.snapshot.raw_output, b"abcdef");
+        assert_eq!(attached.snapshot.raw_output_start, 16 - 6);
+
+        // history_bytes: None returns full tail
+        let attached_full = manager
+            .attach_session(AttachSessionRequest {
+                session_id,
+                client_id: ClientId::new("cap-client-2").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("attach session full");
+        assert_eq!(attached_full.snapshot.raw_output, b"0123456789abcdef");
+        assert_eq!(attached_full.snapshot.raw_output_start, 0);
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attach_session_live_limits_history_tail_to_requested_cap() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config);
+
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let snap = manager
+                .attach_session(AttachSessionRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("probe-client").unwrap(),
+                    mode: triage_core::session::AttachMode::Observer,
+                    history_bytes: None,
+                })
+                .expect("probe attach");
+            if snap.snapshot.raw_output.len() >= 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let full = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("full-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("full attach");
+
+        if !full.snapshot.raw_output.is_empty() {
+            let cap = 2.min(full.snapshot.raw_output.len());
+            let capped = manager
+                .attach_session(AttachSessionRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("cap-client").unwrap(),
+                    mode: triage_core::session::AttachMode::Observer,
+                    history_bytes: Some(cap as u64),
+                })
+                .expect("capped attach");
+
+            assert_eq!(capped.snapshot.raw_output.len(), cap);
+            assert_eq!(
+                capped.snapshot.raw_output,
+                &full.snapshot.raw_output[full.snapshot.raw_output.len() - cap..]
+            );
+            assert_eq!(
+                capped.snapshot.raw_output_start,
+                full.snapshot.raw_output_start + (full.snapshot.raw_output.len() - cap) as u64
+            );
+        }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     /// Trimming must drop the *front* of the log and keep the newest bytes: the
@@ -15103,6 +15282,7 @@ mod tests {
 
         let _attached = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: ClientId::new("test-client").unwrap(),
                 mode: triage_core::session::AttachMode::Observer,

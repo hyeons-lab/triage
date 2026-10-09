@@ -43,6 +43,7 @@ class TerminalPane extends StatefulWidget {
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
     this.onViewFit,
+    this.onNearTop,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
@@ -52,6 +53,7 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final xt.Terminal terminal;
+  final VoidCallback? onNearTop;
   final bool bracketedPasteEnabled;
 
   /// Plain rows rendered only by the FLUTTER_TEST fallback view.
@@ -132,6 +134,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
   late final ScrollController _scrollController;
+  double? _pageAnchorPixels;
+  int? _pageAnchorLines;
+  DateTime? _pageAnchorAt;
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
   // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
@@ -324,6 +329,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.addRefitListener(_onRefit);
     widget.controller.addClearListener(_onClear);
     widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
+    widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+    widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
     _xtermController.addListener(_recordSelectionAnchor);
     _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
@@ -403,10 +410,18 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.controller.removeRefitListener(_onRefit);
       oldWidget.controller.removeClearListener(_onClear);
       oldWidget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
+      oldWidget.controller.removeHistoryPageStartedListener(
+        _onHistoryPageStarted,
+      );
+      oldWidget.controller.removeHistoryPageCancelledListener(
+        _onHistoryPageCancelled,
+      );
       widget.controller.addFitListener(_onFit);
       widget.controller.addRefitListener(_onRefit);
       widget.controller.addClearListener(_onClear);
       widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
+      widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+      widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
     }
     if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
       if (_pendingBottomSnapOnPointerUp) {
@@ -447,6 +462,10 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.removeRefitListener(_onRefit);
     widget.controller.removeClearListener(_onClear);
     widget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
+    widget.controller.removeHistoryPageStartedListener(_onHistoryPageStarted);
+    widget.controller.removeHistoryPageCancelledListener(
+      _onHistoryPageCancelled,
+    );
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
@@ -511,6 +530,46 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _onHistoryReplayed() {
     if (!mounted) return;
+    // A scroll-up page replayed a wider window: re-seat the viewport on
+    // the same content (old pixels plus the added rows) instead of the
+    // normal bottom snap. xterm.dart parses synchronously, so the buffer
+    // is settled here, but layout needs a post-frame callback to compute
+    // the updated scroll extent.
+    if (_pageAnchorAt != null &&
+        DateTime.now().difference(_pageAnchorAt!) <
+            const Duration(seconds: 15) &&
+        _pageAnchorPixels != null &&
+        _pageAnchorLines != null &&
+        _scrollController.hasClients) {
+      final addedLines = _terminal.buffer.lines.length - _pageAnchorLines!;
+      final lh = _lineHeight() ?? 2.0;
+      final target = _pageAnchorPixels! + addedLines * lh;
+      _pageAnchorPixels = null;
+      _pageAnchorLines = null;
+      _pageAnchorAt = null;
+      _pendingBottomSnapOnPointerUp = false;
+      _suppressScrollSaveFor(const Duration(milliseconds: 500));
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) return;
+        final position = _scrollController.position;
+        final clamped = target.clamp(
+          0.0,
+          position.hasContentDimensions ? position.maxScrollExtent : 0.0,
+        );
+        position.jumpTo(clamped);
+        _sessionSavedScrollOffsets[widget.terminalId] = clamped;
+        _scrollAnchor.capture(
+          buffer: _terminal.buffer,
+          pixels: clamped,
+          maxScrollExtent: position.maxScrollExtent,
+          lineHeight: lh,
+        );
+      });
+      return;
+    }
+    _pageAnchorPixels = null;
+    _pageAnchorLines = null;
+    _pageAnchorAt = null;
     final isGestureActive =
         _activePointers.isNotEmpty ||
         (_scrollController.hasClients &&
@@ -521,6 +580,24 @@ class _TerminalPaneState extends State<TerminalPane> {
       _pendingBottomSnapOnPointerUp = false;
       _scrollToCursor(requestFocus: false, forceBottom: true);
     }
+  }
+
+  /// Stash the scroll anchor ahead of a scroll-up page re-attach: the
+  /// replay clears the buffer, so the anchor (scroll pixels + line count)
+  /// is what re-seats the viewport on the same content.
+  void _onHistoryPageStarted() {
+    if (!mounted || !_scrollController.hasClients) return;
+    _pendingBottomSnapOnPointerUp = false;
+    _pageAnchorPixels = _scrollController.position.pixels;
+    _pageAnchorLines = _terminal.buffer.lines.length;
+    _pageAnchorAt = DateTime.now();
+  }
+
+  void _onHistoryPageCancelled() {
+    _pageAnchorPixels = null;
+    _pageAnchorLines = null;
+    _pageAnchorAt = null;
+    _pendingBottomSnapOnPointerUp = false;
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -1085,6 +1162,19 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (_suppressAnchorCapture || _suppressScrollSave || _dragSelecting) return;
     _captureScrollAnchor();
+    // Near the top of the loaded scrollback: ask for older history.
+    // Paging coalesces in the session (single-flight + log-start stop),
+    // so repeats while a page is in flight are cheap; our own programmatic
+    // jumps return at the gate above and never retrigger.
+    if (_scrollController.hasClients) {
+      final position = _scrollController.position;
+      if (position.hasContentDimensions && position.maxScrollExtent > 0) {
+        final lh = _lineHeight() ?? 2.0;
+        if (position.pixels <= lh * 5) {
+          widget.onNearTop?.call();
+        }
+      }
+    }
   }
 
   void _saveScrollOffset([String? terminalId, double? lineHeight]) {

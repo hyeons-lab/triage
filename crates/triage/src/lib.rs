@@ -626,6 +626,7 @@ fn attach_existing_session(
 ) -> Result<SessionRuntime> {
     let events = manager.subscribe_session_events(session_id.clone())?;
     let attached = manager.attach_session(AttachSessionRequest {
+        history_bytes: None,
         session_id: session_id.clone(),
         client_id: client_id.clone(),
         mode: AttachMode::Observer,
@@ -685,6 +686,7 @@ fn start_local_session(
         }
     };
     let attached = match manager.attach_session(AttachSessionRequest {
+        history_bytes: None,
         session_id: session_id.clone(),
         client_id: client_id.clone(),
         mode: AttachMode::InteractiveController,

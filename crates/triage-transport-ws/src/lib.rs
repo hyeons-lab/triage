@@ -1464,6 +1464,7 @@ mod tests {
     fn attach_request_can_use_interactive_controller_mode() {
         let request = ClientRequest::AttachSession {
             request: AttachSessionRequest {
+                history_bytes: None,
                 session_id: SessionId::new("session-1").unwrap(),
                 client_id: ClientId::new("client-1").unwrap(),
                 mode: AttachMode::InteractiveController,
@@ -2435,6 +2436,57 @@ mod tests {
                 session_id: "s-old",
             }
         );
+    }
+
+    #[test]
+    fn flatbuffers_attach_session_history_bytes_roundtrip() {
+        let request = ClientMessage {
+            id: Some(json!("attach-fb")),
+            request: ClientRequest::AttachSession {
+                request: AttachSessionRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    client_id: ClientId::new("client-1").unwrap(),
+                    mode: AttachMode::Observer,
+                    history_bytes: Some(65536),
+                },
+            },
+        };
+
+        let bytes = flatbuffers_proto::serialize_client_message(&request);
+        let fb_msg = flatbuffers::root::<fb::ClientMessage>(&bytes).unwrap();
+        let parsed = flatbuffers_proto::parse_client_message(fb_msg).unwrap();
+
+        match parsed.request {
+            ClientRequest::AttachSession { request } => {
+                assert_eq!(request.history_bytes, Some(65536));
+                assert_eq!(request.mode, AttachMode::Observer);
+            }
+            other => panic!("unexpected parsed request: {other:?}"),
+        }
+
+        // None history_bytes serializes as 0 and parses back as None.
+        let request_none = ClientMessage {
+            id: Some(json!("attach-fb-none")),
+            request: ClientRequest::AttachSession {
+                request: AttachSessionRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    client_id: ClientId::new("client-1").unwrap(),
+                    mode: AttachMode::Observer,
+                    history_bytes: None,
+                },
+            },
+        };
+
+        let bytes_none = flatbuffers_proto::serialize_client_message(&request_none);
+        let fb_msg_none = flatbuffers::root::<fb::ClientMessage>(&bytes_none).unwrap();
+        let parsed_none = flatbuffers_proto::parse_client_message(fb_msg_none).unwrap();
+
+        match parsed_none.request {
+            ClientRequest::AttachSession { request } => {
+                assert_eq!(request.history_bytes, None);
+            }
+            other => panic!("unexpected parsed request: {other:?}"),
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ class TerminalPane extends StatefulWidget {
     required this.onTerminalResizeBind,
     required this.focusCursorRevision,
     this.onViewFit,
+    this.onNearTop,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
@@ -39,6 +40,7 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final dynamic terminal;
+  final VoidCallback? onNearTop;
   final bool bracketedPasteEnabled;
 
   /// Plain rows; unused by the live web view but kept for parity with native.
@@ -245,8 +247,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchStartSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchMoveSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchCancelSubscription;
+  num? _touchStartY;
   StreamSubscription<html.Event>? _containerPointerDownSubscription;
   StreamSubscription<html.Event>? _containerPointerUpSubscription;
   StreamSubscription<html.Event>? _containerPointerCancelSubscription;
@@ -306,6 +310,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   // flushes the session's staged history) using the last fitted size.
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
+  Timer? _pageRestoreTimer;
+  int? _pageAnchorY;
+  int? _pageAnchorLen;
+  DateTime? _pageAnchorAt;
   Timer? _suppressScrollSaveTimer;
   Timer? _jiggleRestoreTimer;
   int? _pendingJiggleCols;
@@ -1239,6 +1247,14 @@ class _TerminalPaneState extends State<TerminalPane> {
           } else if (viewportY >= 0) {
             _sessionSavedViewportY[sessionId] = viewportY;
           }
+          // Near the top of the loaded scrollback: ask for older history.
+          // Paging coalesces in the session (single-flight + log-start
+          // stop), so repeat scroll events while a page is in flight are
+          // cheap. Suppressed saves (programmatic restores) return above,
+          // so our own scrollToLine never retriggers.
+          if (baseY > 0 && viewportY <= 5) {
+            activePane.widget.onNearTop?.call();
+          }
         } catch (_) {}
       });
       onScrollSubscription = js_util.callMethod(_term, 'onScroll', [
@@ -1489,6 +1505,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     controller.addFitListener(_onFit);
     controller.addRefitListener(_onRefit);
     controller.addHistoryReplayedListener(_onHistoryReplayed);
+    controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+    controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
     tdbg(
       'pane.rebind',
       '$_sanitizedId view listeners -> '
@@ -1508,22 +1526,44 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.addFitListener(_onFit);
     widget.controller.addRefitListener(_onRefit);
     widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
+    widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+    widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
   }
 
-  void _unbindController() => _unbindControllerFrom(widget.controller);
+  void _unbindController() {
+    final bound = _boundViewController ?? widget.controller;
+    _unbindControllerFrom(bound);
+    _boundViewController = null;
+  }
 
   // Removes pane-specific listeners from an explicit controller. Persistent write
   // and clear listeners remain attached to the session controller so background
   // sessions receive live output.
   void _unbindControllerFrom(TerminalController controller) {
+    _pageRestoreTimer?.cancel();
+    _pageRestoreTimer = null;
     controller.removeResizeListener(_onResize);
     controller.removeFitListener(_onFit);
     controller.removeRefitListener(_onRefit);
     controller.removeHistoryReplayedListener(_onHistoryReplayed);
+    controller.removeHistoryPageStartedListener(_onHistoryPageStarted);
+    controller.removeHistoryPageCancelledListener(_onHistoryPageCancelled);
   }
 
   void _onHistoryReplayed() {
     if (!_initialized) return;
+    // A scroll-up page replayed a wider window: restore the stashed anchor
+    // adjusted by the added rows instead of the normal saved-Y restore,
+    // which would land mid-window on the same numeric line.
+    if (_pageAnchorAt != null &&
+        DateTime.now().difference(_pageAnchorAt!) <
+            const Duration(seconds: 15)) {
+      _restorePagedScrollPosition();
+      return;
+    }
+    _pageAnchorY = null;
+    _pageAnchorLen = null;
+    _pageAnchorAt = null;
     // Refit before restoring scroll: a fit that ran while the layout was
     // narrow (or whose resize-out died in the debounce) leaves a narrow grid
     // under a wide pane, and replay is the moment that mismatch turns
@@ -1531,6 +1571,91 @@ class _TerminalPaneState extends State<TerminalPane> {
     // after it, not before.
     _reconcileGridWithPixels();
     _afterReplayContentWritten(initialReplay: true);
+  }
+
+  /// Stash the scroll anchor ahead of a scroll-up page re-attach: the
+  /// replay clears the buffer, so the anchor (viewport line + buffer
+  /// length) is what re-seats the viewport on the same content.
+  void _onHistoryPageStarted() {
+    if (!_initialized) return;
+    _pendingScrollToBottomOnRelease = false;
+    _pageRestoreTimer?.cancel();
+    _pageRestoreTimer = null;
+    try {
+      final buffer = js_util.getProperty(_term, 'buffer');
+      final active = js_util.getProperty(buffer, 'active');
+      _pageAnchorY =
+          (js_util.getProperty(active, 'viewportY') as num?)?.toInt();
+      _pageAnchorLen =
+          (js_util.getProperty(active, 'length') as num?)?.toInt();
+      _pageAnchorAt = DateTime.now();
+    } catch (_) {
+      _pageAnchorY = null;
+      _pageAnchorLen = null;
+      _pageAnchorAt = null;
+    }
+  }
+
+  void _onHistoryPageCancelled() {
+    _pageAnchorY = null;
+    _pageAnchorLen = null;
+    _pageAnchorAt = null;
+    _pageRestoreTimer?.cancel();
+    _pageRestoreTimer = null;
+    _pendingScrollToBottomOnRelease = false;
+  }
+
+  /// Restore the stashed page anchor once the widened replay has settled.
+  /// xterm.js parses `write` incrementally, so the buffer length right
+  /// after the replay undercounts; poll until it stabilizes (or 2s
+  /// elapse) and scroll to the old line plus the added rows.
+  void _restorePagedScrollPosition() {
+    final anchorY = _pageAnchorY;
+    final anchorLen = _pageAnchorLen;
+    _pageAnchorY = null;
+    _pageAnchorLen = null;
+    _pageAnchorAt = null;
+    if (anchorY == null || anchorLen == null) return;
+    _pendingScrollToBottomOnRelease = false;
+    _pageRestoreTimer?.cancel();
+    var polls = 0;
+    var lastLen = -1;
+    _pageRestoreTimer = Timer.periodic(const Duration(milliseconds: 50), (
+      timer,
+    ) {
+      polls++;
+      var len = -1;
+      try {
+        final buffer = js_util.getProperty(_term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        len = (js_util.getProperty(active, 'length') as num?)?.toInt() ?? -1;
+      } catch (_) {}
+      if ((len >= anchorLen && len == lastLen) || polls >= 40) {
+        timer.cancel();
+        _pageRestoreTimer = null;
+        if (!mounted || !_initialized || len < 0) return;
+        final target = anchorY + (len - anchorLen);
+        _suppressScrollSaveFor(const Duration(milliseconds: 500));
+        var baseY = 0;
+        try {
+          final buffer = js_util.getProperty(_term, 'buffer');
+          final active = js_util.getProperty(buffer, 'active');
+          baseY = (js_util.getProperty(active, 'baseY') as num?)?.toInt() ?? 0;
+        } catch (_) {}
+        final clamped = target.clamp(0, math.max(baseY, 0)).toInt();
+        try {
+          js_util.callMethod(_term, 'scrollToLine', [clamped]);
+        } catch (_) {}
+        if (clamped >= baseY) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+        } else {
+          _sessionSavedViewportY[_sanitizedId] = clamped;
+        }
+        _pendingScrollToBottomOnRelease = false;
+      } else {
+        lastLen = len;
+      }
+    });
   }
 
   /// Heals a grid that disagrees with its own pixels.
@@ -1723,9 +1848,50 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
       _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
+      if (event.touches != null && event.touches!.isNotEmpty) {
+        _touchStartY = event.touches!.first.client.y;
+      }
+    });
+
+    _containerTouchMoveSubscription = _container.onTouchMove.listen((event) {
+      if (_touchStartY != null &&
+          event.touches != null &&
+          event.touches!.isNotEmpty) {
+        final currentY = event.touches!.first.client.y;
+        final deltaY = currentY - _touchStartY!;
+        if (deltaY > 30) {
+          try {
+            final activePane = _containerEventOwners[_sanitizedId];
+            if (activePane != null && activePane.mounted) {
+              final term = _sessionTerms[_sanitizedId];
+              if (term != null) {
+                final buffer = js_util.getProperty(term, 'buffer');
+                final active = js_util.getProperty(buffer, 'active');
+                final viewportY =
+                    (js_util.getProperty(active, 'viewportY') as num?)
+                        ?.toInt() ??
+                    0;
+                if (viewportY <= 0) {
+                  _touchStartY = null;
+                  activePane.widget.onNearTop?.call();
+                } else {
+                  _touchStartY = currentY;
+                }
+              } else {
+                _touchStartY = null;
+              }
+            } else {
+              _touchStartY = null;
+            }
+          } catch (_) {
+            _touchStartY = null;
+          }
+        }
+      }
     });
 
     _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
+      _touchStartY = null;
       _activeTouchCount =
           event.touches?.length ?? math.max(0, _activeTouchCount - 1);
       _handleUserGestureEnded();
@@ -1740,6 +1906,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerTouchCancelSubscription = _container.onTouchCancel.listen((
       event,
     ) {
+      _touchStartY = null;
       _activeTouchCount =
           event.touches?.length ?? math.max(0, _activeTouchCount - 1);
       _handleUserGestureEnded();
@@ -2107,6 +2274,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = null;
     _containerTouchStartSubscription?.cancel();
     _containerTouchStartSubscription = null;
+    _containerTouchMoveSubscription?.cancel();
+    _containerTouchMoveSubscription = null;
+    _touchStartY = null;
     _containerTouchEndSubscription?.cancel();
     _containerTouchEndSubscription = null;
     _containerTouchCancelSubscription?.cancel();
@@ -2780,6 +2950,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
+    _pageRestoreTimer?.cancel();
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);

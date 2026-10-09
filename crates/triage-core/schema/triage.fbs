@@ -158,6 +158,9 @@ table AttachSessionRequestTable {
     session_id: string;
     client_id: string;
     mode: AttachMode;
+    // Maximum raw-history bytes in the attach snapshot. 0 (and old
+    // clients, which omit the field) keeps the legacy full-tail cap.
+    history_bytes: uint64;
 }
 
 table SubscribeSessionEventsRequestTable {

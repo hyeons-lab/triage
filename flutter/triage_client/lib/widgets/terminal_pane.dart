@@ -91,6 +91,33 @@ class TerminalController {
     }
   }
 
+  // Fired before a scroll-up page re-attach so panes can stash their
+  // scroll anchor; the replay that follows carries a bigger window, and
+  // the anchor is restored adjusted by the added rows.
+  final List<void Function()> _historyPageStartedListeners = [];
+  void addHistoryPageStartedListener(void Function() listener) =>
+      _historyPageStartedListeners.add(listener);
+  void removeHistoryPageStartedListener(void Function() listener) =>
+      _historyPageStartedListeners.remove(listener);
+
+  void notifyHistoryPageStarted() {
+    for (final listener in List.from(_historyPageStartedListeners)) {
+      listener();
+    }
+  }
+
+  final List<void Function()> _historyPageCancelledListeners = [];
+  void addHistoryPageCancelledListener(void Function() listener) =>
+      _historyPageCancelledListeners.add(listener);
+  void removeHistoryPageCancelledListener(void Function() listener) =>
+      _historyPageCancelledListeners.remove(listener);
+
+  void notifyHistoryPageCancelled() {
+    for (final listener in List.from(_historyPageCancelledListeners)) {
+      listener();
+    }
+  }
+
   void write(String data) {
     if (_writeListeners.isEmpty) {
       tdbg(
@@ -165,6 +192,8 @@ class TerminalController {
     _resizeOutListeners.clear();
     _interactionListeners.clear();
     _historyReplayedListeners.clear();
+    _historyPageStartedListeners.clear();
+    _historyPageCancelledListeners.clear();
     _writeBuffer.clear();
   }
 }
