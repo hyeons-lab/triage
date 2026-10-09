@@ -106,6 +106,18 @@ class TerminalController {
     }
   }
 
+  final List<void Function()> _historyPageCancelledListeners = [];
+  void addHistoryPageCancelledListener(void Function() listener) =>
+      _historyPageCancelledListeners.add(listener);
+  void removeHistoryPageCancelledListener(void Function() listener) =>
+      _historyPageCancelledListeners.remove(listener);
+
+  void notifyHistoryPageCancelled() {
+    for (final listener in List.from(_historyPageCancelledListeners)) {
+      listener();
+    }
+  }
+
   void write(String data) {
     if (_writeListeners.isEmpty) {
       tdbg(
@@ -181,6 +193,7 @@ class TerminalController {
     _interactionListeners.clear();
     _historyReplayedListeners.clear();
     _historyPageStartedListeners.clear();
+    _historyPageCancelledListeners.clear();
     _writeBuffer.clear();
   }
 }

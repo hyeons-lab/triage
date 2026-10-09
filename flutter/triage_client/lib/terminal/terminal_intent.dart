@@ -73,6 +73,12 @@ final class Attach extends TerminalIntent {
   const Attach();
 }
 
+/// An attach attempt was cancelled or failed; resumes live phase and flushes
+/// any pending live chunks received while awaiting history.
+final class CancelAttach extends TerminalIntent {
+  const CancelAttach();
+}
+
 /// Session detached; live/history writes stop until the next [Attach].
 final class Detach extends TerminalIntent {
   const Detach();

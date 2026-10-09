@@ -27,6 +27,7 @@ import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/size_drift.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
+import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
@@ -844,7 +845,8 @@ class SessionVm {
       '$title ${rawOutput.length}B seq=$throughOutputSeq '
           'phase=${store.state.phase} viewReady=$_viewReady',
     );
-    if (!store.state.scrollbackReady || store.appliedLogBytes == null) {
+    if (store.state.phase != AttachPhase.awaitingHistory &&
+        (!store.state.scrollbackReady || store.appliedLogBytes == null)) {
       store.dispatch(const Attach());
     }
     this.isExited = isExited;
@@ -4852,7 +4854,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (sessionId == null) return;
     final generation = _connectGeneration;
     session.pagingHistory = true;
+    if (mounted) setState(() {});
     session.terminalController.notifyHistoryPageStarted();
+    // Reset lifecycle before attach so live chunks arriving during the
+    // round-trip buffer in pendingLive rather than writing to the sink
+    // and getting erased by full replay.
+    session.store.dispatch(const Attach());
+    var success = false;
     try {
       // Observer: paging must not steal the lease from whoever is typing.
       final attachRes = await _client.attachSession(
@@ -4861,29 +4869,37 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         mode: 'Observer',
         historyBytes: nextWindow,
       );
-      if (_isStale(generation) || _disposed) return;
+      if (_isStale(generation) || _disposed || !_sessions.contains(session)) {
+        return;
+      }
       session.hasInputLease = _attachGrantsInputLease(attachRes);
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot == null) return;
+      final raw = _rawOutputFromSnapshot(snapshot);
+      if (raw.isEmpty) return;
       // Full replay, not a delta merge: the wider window extends backward,
-      // which the store's same-end branch would no-op. Reset the lifecycle
-      // first so the wider tail replays from its older start; live chunks
-      // covered by it drop as duplicates by output_seq.
-      session.store.dispatch(const Attach());
+      // which the store's same-end branch would no-op. The Attach above reset
+      // the lifecycle; live chunks covered by it drop as duplicates by output_seq.
       session.historyWindowBytes = nextWindow;
       session.applyHistory(
-        _rawOutputFromSnapshot(snapshot),
+        raw,
         throughOutputSeq: snapshot['output_seq'] as int?,
         rawOutputStart: snapshot['raw_output_start'] as int?,
         isExited: snapshot['exited'] == true,
       );
+      success = true;
     } on TriageAuthException {
       _routeStaleAuthFailure(generation);
     } catch (e) {
       tdbg('history.page', 'page up failed for $sessionId: $e');
     } finally {
       session.pagingHistory = false;
+      if (!success) {
+        session.store.dispatch(const CancelAttach());
+        session.terminalController.notifyHistoryPageCancelled();
+      }
+      if (mounted) setState(() {});
     }
   }
 
@@ -10474,25 +10490,76 @@ class SessionWorkspace extends StatelessWidget {
           onToggleSoftKeyboard: onToggleSoftKeyboard,
         ),
         Expanded(
-          child: TerminalPane(
-            key: ValueKey(session.title),
-            terminalId: session.title,
-            controller: session.terminalController,
-            terminal: session.terminal,
-            fallbackRows: session.rows,
-            onTerminalResizeBind: (callback) {
-              session.onTerminalResize = callback;
-            },
-            onViewFit: (cols, rows) {
-              session.noteViewFit(cols, rows);
-              onViewFit?.call(cols, rows);
-            },
-            onNearTop: onNearTop,
-            focusCursorRevision: session.focusCursorRevision,
-            bracketedPasteEnabled: session.bracketedPasteEnabled,
-            isExited: session.status == 'exited',
-            isLoading: session.status == 'loading' || !session.loaded,
-            softKeyboardEnabled: softKeyboardEnabled,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: TerminalPane(
+                  key: ValueKey(session.title),
+                  terminalId: session.title,
+                  controller: session.terminalController,
+                  terminal: session.terminal,
+                  fallbackRows: session.rows,
+                  onTerminalResizeBind: (callback) {
+                    session.onTerminalResize = callback;
+                  },
+                  onViewFit: (cols, rows) {
+                    session.noteViewFit(cols, rows);
+                    onViewFit?.call(cols, rows);
+                  },
+                  onNearTop: onNearTop,
+                  focusCursorRevision: session.focusCursorRevision,
+                  bracketedPasteEnabled: session.bracketedPasteEnabled,
+                  isExited: session.status == 'exited',
+                  isLoading: session.status == 'loading' || !session.loaded,
+                  softKeyboardEnabled: softKeyboardEnabled,
+                ),
+              ),
+              if (session.pagingHistory)
+                Positioned(
+                  top: 8,
+                  left: 0,
+                  right: 0,
+                  child: IgnorePointer(
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xCC1E1E1E),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: const Color(0x33FFFFFF),
+                            width: 1,
+                          ),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Color(0xFF90CAF9),
+                              ),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              'Loading history...',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFFE0E0E0),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
       ],

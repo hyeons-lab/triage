@@ -52,7 +52,7 @@ const int kHistoryLeaseProbeBytes = 1024;
 
 /// Next history window after [current] when paging older scrollback:
 /// doubling keeps the cumulative transfer near 2x the final depth,
-/// capped at [max] (the platform replay budget — the trim drops
+/// capped at [max] (the platform replay budget, since the trim drops
 /// anything older anyway).
 int nextHistoryWindowBytes({required int current, required int max}) {
   if (current <= 0) return max <= 0 ? 0 : kHistoryFirstWindowBytes.clamp(1, max);
@@ -262,6 +262,12 @@ class TerminalStore extends ChangeNotifier {
   // subsequent history snapshots without clearing the terminal.
   int? _appliedLogBytes;
 
+  // Baselines stashed on Attach() and restored if attach is cancelled via
+  // CancelAttach(), so a failed re-attach does not leave dedup baselines null.
+  int? _stashedAppliedLiveSeq;
+  int? _stashedAppliedLogBytes;
+  int? _stashedHistoryHighWaterSeq;
+
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
@@ -312,9 +318,13 @@ class TerminalStore extends ChangeNotifier {
   TerminalState _reduce(TerminalState s, TerminalIntent intent) {
     switch (intent) {
       case Attach():
-        // Start of a fresh attach lifecycle: drop any carries and any live
-        // chunks buffered against a prior attach so they cannot leak into this
-        // session once HistoryBytes arrives.
+        // Start of a fresh attach lifecycle: stash baselines in case attach
+        // fails or is cancelled, then drop carries and live chunks buffered
+        // against a prior attach so they cannot leak into this session once
+        // HistoryBytes arrives.
+        _stashedAppliedLiveSeq = _appliedLiveSeq;
+        _stashedAppliedLogBytes = _appliedLogBytes;
+        _stashedHistoryHighWaterSeq = s.historyHighWaterSeq;
         _resetCarries();
         _clearPendingLive();
         _appliedLiveSeq = null;
@@ -328,6 +338,26 @@ class TerminalStore extends ChangeNotifier {
           // The [HistoryBytes] that ends this attach re-establishes it.
           resetHistoryHighWaterSeq: true,
         );
+
+      case CancelAttach():
+        if (s.phase == AttachPhase.awaitingHistory) {
+          _appliedLiveSeq = _stashedAppliedLiveSeq;
+          _appliedLogBytes = _stashedAppliedLogBytes;
+          final restoredHighWaterSeq = _stashedHistoryHighWaterSeq;
+          _stashedAppliedLiveSeq = null;
+          _stashedAppliedLogBytes = null;
+          _stashedHistoryHighWaterSeq = null;
+          if (s.sized) {
+            _flushPendingLive(restoredHighWaterSeq);
+          }
+          return s.copyWith(
+            phase: AttachPhase.live,
+            scrollbackReady: true,
+            historyHighWaterSeq: restoredHighWaterSeq,
+            resetHistoryHighWaterSeq: restoredHighWaterSeq == null,
+          );
+        }
+        return s;
 
       case Detach():
         _closeFrameOnWire();
@@ -350,6 +380,9 @@ class TerminalStore extends ChangeNotifier {
         _clearPendingLive();
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
+        _stashedAppliedLiveSeq = null;
+        _stashedAppliedLogBytes = null;
+        _stashedHistoryHighWaterSeq = null;
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -419,6 +452,9 @@ class TerminalStore extends ChangeNotifier {
     int? throughOutputSeq, {
     int? rawOutputStart,
   }) {
+    _stashedAppliedLiveSeq = null;
+    _stashedAppliedLogBytes = null;
+    _stashedHistoryHighWaterSeq = null;
     // Replay at the client's target grid size ([cols] x [rows], the current
     // emulator/view size chosen by the caller, not the host capture size). A
     // later viewport [Resize] reflows and the live repaint self-heals.

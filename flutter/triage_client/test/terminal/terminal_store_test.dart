@@ -2356,4 +2356,32 @@ void main() {
     expect(sink.written.toString(), contains('line of terminal output\r\n'));
     expect(stopwatch.elapsedMilliseconds, lessThan(2000));
   });
+
+  test('CancelAttach resumes live phase and flushes queued live output', () {
+    final cancelSink = FakeTerminalSink();
+    final cancelStore = TerminalStore(cancelSink);
+    cancelStore.dispatch(const Resize(80, 24));
+    cancelStore.dispatch(const Attach());
+    cancelStore.dispatch(
+      HistoryBytes(b('init'), cols: 80, rows: 24, throughOutputSeq: 1),
+    );
+    cancelSink.ops.clear();
+
+    // Start a re-attach (such as during history paging)
+    cancelStore.dispatch(const Attach());
+    expect(cancelStore.state.phase, AttachPhase.awaitingHistory);
+
+    // Live output arrives while awaiting history
+    cancelStore.dispatch(LiveBytes(b('buffered live'), outputSeq: 2));
+    expect(cancelSink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+    // Attach fails or cancels: CancelAttach restores live phase and flushes
+    cancelStore.dispatch(const CancelAttach());
+    expect(cancelStore.state.phase, AttachPhase.live);
+    expect(cancelStore.state.scrollbackReady, isTrue);
+    expect(cancelSink.ops, ['write:buffered live']);
+    expect(cancelStore.appliedLogBytes, equals(4 + 'buffered live'.length));
+    expect(cancelStore.appliedLiveSeq, equals(2));
+    expect(cancelStore.state.historyHighWaterSeq, equals(1));
+  });
 }

@@ -3264,6 +3264,12 @@ impl SessionApi for SessionManager {
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
 
+        let history_cap = request
+            .history_bytes
+            .filter(|cap| *cap > 0)
+            .map(|cap| cap.min(RAW_OUTPUT_TAIL_CAP))
+            .unwrap_or(RAW_OUTPUT_TAIL_CAP);
+
         match session {
             ManagedSession::Live { actor, lease, .. } => {
                 // Flush-on-grant: bytes this client was denied while lease-less
@@ -3282,11 +3288,6 @@ impl SessionApi for SessionManager {
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
-                let history_cap = request
-                    .history_bytes
-                    .filter(|cap| *cap > 0)
-                    .map(|cap| cap.min(RAW_OUTPUT_TAIL_CAP))
-                    .unwrap_or(RAW_OUTPUT_TAIL_CAP);
                 let snapshot = request_snapshot_with_history(&cmd_tx, history_cap)?;
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
@@ -3294,11 +3295,6 @@ impl SessionApi for SessionManager {
                 })
             }
             ManagedSession::Historical { session, lease } => {
-                let history_cap = request
-                    .history_bytes
-                    .filter(|cap| *cap > 0)
-                    .map(|cap| cap.min(RAW_OUTPUT_TAIL_CAP))
-                    .unwrap_or(RAW_OUTPUT_TAIL_CAP);
                 let snapshot = session.snapshot_with_history(history_cap);
                 let lease = lease.clone();
                 Ok(AttachSessionResponse {
@@ -13324,6 +13320,131 @@ mod tests {
         assert_eq!(snapshot.raw_output, b"abcdef");
         assert_eq!(snapshot.raw_output_start, output.bytes_logged - 6);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attach_session_historical_limits_history_tail_to_requested_cap() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-cap-test").expect("session id");
+        let log_path = log_dir
+            .join("sessions")
+            .join("session-cap-test")
+            .join("segment-000001.tlog");
+        std::fs::create_dir_all(log_path.parent().unwrap()).expect("create session log dir");
+        std::fs::write(&log_path, b"0123456789abcdef").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: "echo".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+                log_path: log_path.clone(),
+                exited: true,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+            },
+        );
+
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let attached = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("cap-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: Some(6),
+            })
+            .expect("attach session");
+
+        assert_eq!(attached.snapshot.raw_output, b"abcdef");
+        assert_eq!(attached.snapshot.raw_output_start, 16 - 6);
+
+        // history_bytes: None returns full tail
+        let attached_full = manager
+            .attach_session(AttachSessionRequest {
+                session_id,
+                client_id: ClientId::new("cap-client-2").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("attach session full");
+        assert_eq!(attached_full.snapshot.raw_output, b"0123456789abcdef");
+        assert_eq!(attached_full.snapshot.raw_output_start, 0);
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attach_session_live_limits_history_tail_to_requested_cap() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config);
+
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let snap = manager
+                .attach_session(AttachSessionRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("probe-client").unwrap(),
+                    mode: triage_core::session::AttachMode::Observer,
+                    history_bytes: None,
+                })
+                .expect("probe attach");
+            if snap.snapshot.raw_output.len() >= 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let full = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("full-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("full attach");
+
+        if !full.snapshot.raw_output.is_empty() {
+            let cap = 2.min(full.snapshot.raw_output.len());
+            let capped = manager
+                .attach_session(AttachSessionRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("cap-client").unwrap(),
+                    mode: triage_core::session::AttachMode::Observer,
+                    history_bytes: Some(cap as u64),
+                })
+                .expect("capped attach");
+
+            assert_eq!(capped.snapshot.raw_output.len(), cap);
+            assert_eq!(
+                capped.snapshot.raw_output,
+                &full.snapshot.raw_output[full.snapshot.raw_output.len() - cap..]
+            );
+            assert_eq!(
+                capped.snapshot.raw_output_start,
+                full.snapshot.raw_output_start + (full.snapshot.raw_output.len() - cap) as u64
+            );
+        }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     /// Trimming must drop the *front* of the log and keep the newest bytes: the

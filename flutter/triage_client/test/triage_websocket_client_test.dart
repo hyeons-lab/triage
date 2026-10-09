@@ -534,6 +534,7 @@ void main() {
         sessionId: 'session-789',
         clientId: 'client-abc',
         mode: 'Observer',
+        historyBytes: 65536,
       );
       f.catchError((_) => <String, dynamic>{});
 
@@ -551,6 +552,7 @@ void main() {
       expect(attachReq.sessionId, equals('session-789'));
       expect(attachReq.clientId, equals('client-abc'));
       expect(attachReq.mode, equals(fbs.AttachMode.Observer));
+      expect(attachReq.historyBytes, equals(65536));
     });
 
     test('attachSession rejects unknown attach modes', () async {

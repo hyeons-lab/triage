@@ -330,6 +330,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.addClearListener(_onClear);
     widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
     widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+    widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
     _xtermController.addListener(_recordSelectionAnchor);
     _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
@@ -412,11 +413,15 @@ class _TerminalPaneState extends State<TerminalPane> {
       oldWidget.controller.removeHistoryPageStartedListener(
         _onHistoryPageStarted,
       );
+      oldWidget.controller.removeHistoryPageCancelledListener(
+        _onHistoryPageCancelled,
+      );
       widget.controller.addFitListener(_onFit);
       widget.controller.addRefitListener(_onRefit);
       widget.controller.addClearListener(_onClear);
       widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
       widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+      widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
     }
     if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
       if (_pendingBottomSnapOnPointerUp) {
@@ -458,6 +463,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     widget.controller.removeClearListener(_onClear);
     widget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
     widget.controller.removeHistoryPageStartedListener(_onHistoryPageStarted);
+    widget.controller.removeHistoryPageCancelledListener(
+      _onHistoryPageCancelled,
+    );
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
@@ -525,7 +533,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     // A scroll-up page replayed a wider window: re-seat the viewport on
     // the same content (old pixels plus the added rows) instead of the
     // normal bottom snap. xterm.dart parses synchronously, so the buffer
-    // is settled here and no stabilization wait is needed.
+    // is settled here, but layout needs a post-frame callback to compute
+    // the updated scroll extent.
     if (_pageAnchorAt != null &&
         DateTime.now().difference(_pageAnchorAt!) <
             const Duration(seconds: 15) &&
@@ -534,16 +543,28 @@ class _TerminalPaneState extends State<TerminalPane> {
         _scrollController.hasClients) {
       final addedLines = _terminal.buffer.lines.length - _pageAnchorLines!;
       final lh = _lineHeight() ?? 2.0;
-      final position = _scrollController.position;
-      final target = (_pageAnchorPixels! + addedLines * lh).clamp(
-        0.0,
-        position.hasContentDimensions ? position.maxScrollExtent : 0.0,
-      );
+      final target = _pageAnchorPixels! + addedLines * lh;
       _pageAnchorPixels = null;
       _pageAnchorLines = null;
       _pageAnchorAt = null;
+      _pendingBottomSnapOnPointerUp = false;
       _suppressScrollSaveFor(const Duration(milliseconds: 500));
-      position.jumpTo(target);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) return;
+        final position = _scrollController.position;
+        final clamped = target.clamp(
+          0.0,
+          position.hasContentDimensions ? position.maxScrollExtent : 0.0,
+        );
+        position.jumpTo(clamped);
+        _sessionSavedScrollOffsets[widget.terminalId] = clamped;
+        _scrollAnchor.capture(
+          buffer: _terminal.buffer,
+          pixels: clamped,
+          maxScrollExtent: position.maxScrollExtent,
+          lineHeight: lh,
+        );
+      });
       return;
     }
     _pageAnchorPixels = null;
@@ -566,9 +587,17 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// is what re-seats the viewport on the same content.
   void _onHistoryPageStarted() {
     if (!mounted || !_scrollController.hasClients) return;
+    _pendingBottomSnapOnPointerUp = false;
     _pageAnchorPixels = _scrollController.position.pixels;
     _pageAnchorLines = _terminal.buffer.lines.length;
     _pageAnchorAt = DateTime.now();
+  }
+
+  void _onHistoryPageCancelled() {
+    _pageAnchorPixels = null;
+    _pageAnchorLines = null;
+    _pageAnchorAt = null;
+    _pendingBottomSnapOnPointerUp = false;
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
