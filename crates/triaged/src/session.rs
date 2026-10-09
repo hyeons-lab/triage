@@ -3927,14 +3927,41 @@ impl SessionApi for SessionManager {
         // Same `HashMap`-iteration hazard as `list_sessions`: sort so a client
         // building its list from this response gets a stable fallback order.
         sources.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
-        Ok(sources
+        // Fan out: send every live actor its Context command before
+        // collecting any reply, so the actors resolve concurrently instead
+        // of one round-trip at a time (~5.6ms each sequential: 373ms for 66
+        // sessions on the load path, ahead of the attach on the daemon's
+        // serial per-connection queue). Replies are collected back in
+        // session order, and a live actor mid-shutdown still yields no
+        // context rather than failing the whole batch.
+        enum PendingContext {
+            Ready(Option<SessionContext>),
+            Live(mpsc::Receiver<ActorResult<Option<SessionContext>>>),
+        }
+        let pending: Vec<(SessionId, PendingContext, SessionStamps)> = sources
+            .into_iter()
+            .map(|(session_id, source, stamps)| {
+                let pending_source = match source {
+                    ContextSource::Ready(context) => PendingContext::Ready(context),
+                    ContextSource::Live(tx) => {
+                        let (resp_tx, resp_rx) = mpsc::channel();
+                        match tx.send(ActorCommand::Context { response: resp_tx }) {
+                            Ok(()) => PendingContext::Live(resp_rx),
+                            Err(_) => PendingContext::Ready(None),
+                        }
+                    }
+                };
+                (session_id, pending_source, stamps)
+            })
+            .collect();
+        Ok(pending
             .into_iter()
             .map(|(session_id, source, stamps)| {
                 let context = match source {
-                    ContextSource::Ready(context) => context,
-                    // A live actor mid-shutdown simply yields no context rather
-                    // than failing the whole batch.
-                    ContextSource::Live(tx) => request_session_context(&tx).ok().flatten(),
+                    PendingContext::Ready(context) => context,
+                    PendingContext::Live(rx) => recv_actor_result(rx, "reading session context")
+                        .ok()
+                        .flatten(),
                 };
                 SessionContextRow {
                     session_id,
@@ -11652,6 +11679,54 @@ mod tests {
         assert!(stamped <= now_unix_millis());
 
         let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// The contexts batch must return one row per session in stable sort-key
+    /// order and correlate each session with its own resolved context.
+    #[test]
+    fn list_session_contexts_returns_every_session_in_order() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut session_data = Vec::new();
+        for i in 1..=3 {
+            let repo = unique_log_dir();
+            std::fs::create_dir_all(&repo).expect("create repo dir");
+            let branch = format!("feat/test-{}", i);
+            git_test_command(&repo, &["init", &format!("--initial-branch={branch}")]);
+            git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+            git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+            std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+            git_test_command(&repo, &["add", "README.md"]);
+            git_test_command(&repo, &["commit", "-m", "initial"]);
+
+            let mut req = StartSessionRequest::new(long_running_shell_command());
+            req.cwd = Some(repo.clone());
+            let id = manager.start_session(req).expect("start session");
+            session_data.push((id, branch, repo));
+        }
+
+        session_data
+            .sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
+
+        let rows = manager.list_session_contexts().expect("list contexts");
+        assert_eq!(rows.len(), session_data.len());
+        for (row, (expected_id, expected_branch, _)) in rows.iter().zip(&session_data) {
+            assert_eq!(
+                &row.session_id, expected_id,
+                "session id matches sort order"
+            );
+            assert_eq!(
+                row.context.as_ref().and_then(|c| c.branch.as_deref()),
+                Some(expected_branch.as_str()),
+                "context matches session"
+            );
+        }
+
+        for (id, _, repo) in session_data {
+            let _ = manager.shutdown_session(id);
+            let _ = std::fs::remove_dir_all(&repo);
+        }
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
