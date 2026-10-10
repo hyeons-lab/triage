@@ -312,10 +312,10 @@ fn probe_battery_status() -> Option<BatteryStatus> {
         }
         let capacity_str = std::fs::read_to_string(entry.path().join("capacity")).ok();
         let status_str = std::fs::read_to_string(entry.path().join("status")).ok();
-        if let (Some(cap), Some(stat)) = (capacity_str, status_str) {
-            if let Ok(capacity) = cap.trim().parse::<u8>() {
-                entries.push((capacity, stat));
-            }
+        if let (Some(cap), Some(stat)) = (capacity_str, status_str)
+            && let Ok(capacity) = cap.trim().parse::<u8>()
+        {
+            entries.push((capacity, stat));
         }
     }
     parse_linux_batteries(&entries)

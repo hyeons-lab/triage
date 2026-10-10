@@ -43,7 +43,8 @@ pegged or about to die. Builds on the existing 60s `getDaemonStats` poll.
 
 - 494e380: feat(stats): host CPU and battery in the daemon selector
 - d171064: docs(devlog): record 192 deploy verification
-- HEAD: fix(stats): review findings from host-stats audit
+- e209e33: fix(stats): review findings from host-stats audit
+- HEAD: fix(stats): collapse nested if in linux battery probe
 
 ## Progress
 
@@ -69,6 +70,9 @@ pegged or about to die. Builds on the existing 60s `getDaemonStats` poll.
   to prevent UI flickering, added serde(other) and wire-omission attributes,
   and added unit/widget regression tests. Round 2 confirmation review
   completed cleanly with zero findings across all 8 pillars.
+- 2026-10-10T07:22-0700: Fixed CI Linux target clippy failure (collapsible-if
+  in probe_battery_status). Verified cross-target clippy passes cleanly for
+  x86_64-unknown-linux-gnu and host target, formatted, tests pass.
 
 ## Research & Discoveries
 
