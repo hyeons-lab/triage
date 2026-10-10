@@ -16,3 +16,22 @@ String? controlByteForChar(String char) {
   }
   return null;
 }
+
+/// Bytes to send for an Enter key press under the given modifiers, or null
+/// to keep the default path (plain Enter, which the emulator sends as CR).
+///
+/// Shift+Enter with no other modifier sends LF so raw-mode apps can tell
+/// "insert a newline" apart from "submit this line". Cooked shells accept
+/// both identically, so the encoding degrades safely where unsupported.
+///
+/// Shared by both terminal panes (native and web) so hardware Shift+Enter
+/// encodes identically on every client.
+String? bytesForEnterKey({
+  required bool shift,
+  required bool ctrl,
+  required bool alt,
+  required bool meta,
+}) {
+  if (shift && !ctrl && !alt && !meta) return '\n';
+  return null;
+}

@@ -30,4 +30,30 @@ void main() {
       expect(controlByteForChar('ab'), isNull);
     });
   });
+
+  group('bytesForEnterKey (Shift+Enter newline)', () {
+    String? enter({
+      bool shift = false,
+      bool ctrl = false,
+      bool alt = false,
+      bool meta = false,
+    }) => bytesForEnterKey(shift: shift, ctrl: ctrl, alt: alt, meta: meta);
+
+    test('shift alone sends LF', () {
+      expect(enter(shift: true), '\n');
+    });
+
+    test('plain enter keeps the default path', () {
+      expect(enter(), isNull);
+    });
+
+    test('any other modifier keeps the default path', () {
+      expect(enter(shift: true, ctrl: true), isNull);
+      expect(enter(shift: true, alt: true), isNull);
+      expect(enter(shift: true, meta: true), isNull);
+      expect(enter(ctrl: true), isNull);
+      expect(enter(alt: true), isNull);
+      expect(enter(meta: true), isNull);
+    });
+  });
 }

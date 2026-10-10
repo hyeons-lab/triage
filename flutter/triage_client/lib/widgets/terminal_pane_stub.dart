@@ -1483,6 +1483,26 @@ class _TerminalPaneState extends State<TerminalPane> {
       }
       return KeyEventResult.handled;
     }
+    if (event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+      // Shift+Enter inserts a newline (LF) instead of submitting (CR);
+      // anything else falls through to xterm's default handling below.
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        final keys = HardwareKeyboard.instance;
+        final bytes = bytesForEnterKey(
+          shift: keys.isShiftPressed,
+          ctrl: keys.isControlPressed,
+          alt: keys.isAltPressed,
+          meta: keys.isMetaPressed,
+        );
+        if (bytes != null) {
+          widget.controller.notifyInteraction();
+          widget.controller.sendInput(bytes);
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    }
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
