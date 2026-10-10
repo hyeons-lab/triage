@@ -15,6 +15,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
+import 'package:triage_client/terminal/touch_scroll_takeover.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 
@@ -255,9 +256,11 @@ class _TerminalPaneState extends State<TerminalPane>
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchCancelSubscription;
   num? _touchStartY;
+  final TouchScrollTakeover _touchScrollTakeover = TouchScrollTakeover();
   StreamSubscription<html.Event>? _containerPointerDownSubscription;
   StreamSubscription<html.Event>? _containerPointerUpSubscription;
   StreamSubscription<html.Event>? _containerPointerCancelSubscription;
+  StreamSubscription<html.Event>? _containerPointerMoveSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   int _activeTouchCount = 0;
   int _activePointerCount = 0;
@@ -1904,6 +1907,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
+      _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
       if (event.touches != null && event.touches!.isNotEmpty) {
         _touchStartY = event.touches!.first.client.y;
@@ -1911,6 +1915,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerTouchMoveSubscription = _container.onTouchMove.listen((event) {
+      _touchScrollTakeover.onTouchMove(DateTime.now().millisecondsSinceEpoch);
       if (_touchStartY != null &&
           event.touches != null &&
           event.touches!.isNotEmpty) {
@@ -1972,6 +1977,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerPointerDownSubscription = _container.on['pointerdown'].listen((
       event,
     ) {
+      _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activePointerCount++;
     });
 
@@ -1988,6 +1994,60 @@ class _TerminalPaneState extends State<TerminalPane>
         _handleUserGestureEnded();
       },
     );
+
+    // Pointer-driven fallback for touch-drag scrolling. xterm.js scrolls
+    // from its own touch handlers, but the browser drops the rest of a touch
+    // stream when live output detaches the touchstart target mid-gesture;
+    // pointermove keeps flowing with fresh hit-testing, so drive from it
+    // while xterm's path is silent (see [TouchScrollTakeover]).
+    _containerPointerMoveSubscription = _container.on['pointermove'].listen((
+      event,
+    ) {
+      if (!_initialized) return;
+      final term = _sessionTerms[_sanitizedId];
+      if (term == null) return;
+      final int buttons;
+      final String pointerType;
+      final double y;
+      try {
+        buttons = (js_util.getProperty(event, 'buttons') as num?)?.toInt() ?? 0;
+        pointerType =
+            js_util.getProperty(event, 'pointerType') as String? ?? '';
+        y = (js_util.getProperty(event, 'clientY') as num).toDouble();
+      } catch (_) {
+        return;
+      }
+      if ((buttons & 1) == 0 || pointerType == 'mouse') return;
+      final canDrive = pointerType == 'pen'
+          ? _activeTouchCount == 0
+          : _activeTouchCount == 1;
+      double rowPx = 0;
+      try {
+        final rows = (js_util.getProperty(term, 'rows') as num).toDouble();
+        final viewportHeight =
+            _container.querySelector('.xterm-viewport')?.clientHeight ?? 0;
+        if (rows > 0) rowPx = viewportHeight / rows;
+      } catch (_) {
+        return;
+      }
+      final rowsToScroll = _touchScrollTakeover.onPointerMove(
+        nowMs: DateTime.now().millisecondsSinceEpoch,
+        y: y,
+        rowPx: rowPx,
+        canDrive: canDrive,
+      );
+      if (rowsToScroll == 0) return;
+      try {
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+            .toInt();
+        final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+        final target = (viewportY + rowsToScroll).clamp(0, baseY);
+        if (target == viewportY) return;
+        js_util.callMethod(term, 'scrollToLine', [target]);
+      } catch (_) {}
+    });
 
     _containerWheelSubscription = _container.onWheel.listen((event) {
       if (_currentRoute?.isCurrent == false) {
@@ -2344,6 +2404,8 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerPointerUpSubscription = null;
     _containerPointerCancelSubscription?.cancel();
     _containerPointerCancelSubscription = null;
+    _containerPointerMoveSubscription?.cancel();
+    _containerPointerMoveSubscription = null;
     _containerWheelSubscription?.cancel();
     _containerWheelSubscription = null;
     _activeTouchCount = 0;
