@@ -63,7 +63,8 @@ history window. Zero client or protocol changes.
 - 4bbc9d2: feat(triaged): serve journaled scrollback prefix (PR B)
 - 30c57c2: docs(triaged): fix broken intra-doc links in scrollback docs
 - b39ba89: fix(triaged): review findings from scrollback-serve audit loop
-- HEAD: test(triaged): gate live tmp assertion on unix in journal_open test
+- 7355d48: test(triaged): gate live tmp assertion on unix in journal_open test
+- HEAD: fix(triaged): address review findings from scrollback-serve audit loop
 
 ## Progress
 
@@ -91,6 +92,13 @@ history window. Zero client or protocol changes.
   record count allocation optimization, overflow guards, and scroll baseline
   invalidation on emulator reflow. Verified clean across all 8 pillars with
   full test suite and cross-target clippy.
+- 2026-10-10T07:54-0700: Completed 8-pillar code review audit for
+  scrollback-serve. Fixed partial-record framing synchronization on torn
+  payloads, sealed read recovery on unreadable files, header-only empty peek
+  handling, staging rename ordering before index unlinks in rebase, and PID
+  overflow guards in pid_is_alive. Synchronized barren page continuation and
+  exhaustion timer cleanup across Flutter terminal panes. Full workspace tests,
+  cross-target clippy, and Flutter test suite passing cleanly.
 
 ## Research & Discoveries
 

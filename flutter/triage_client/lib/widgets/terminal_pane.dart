@@ -70,6 +70,7 @@ mixin NoOlderScrollbackLatch<T extends StatefulWidget> on State<T> {
   void cancelNoOlderScrollbackTimer() {
     _noOlderScrollbackTimer?.cancel();
     _noOlderScrollbackTimer = null;
+    showNoOlderScrollback = false;
   }
 }
 

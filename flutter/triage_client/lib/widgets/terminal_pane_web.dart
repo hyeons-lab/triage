@@ -394,9 +394,14 @@ class _TerminalPaneState extends State<TerminalPane>
       _legacyCopyToClipboard(text);
       return;
     }
-    clipboard.writeText(text).then((_) {}, onError: (_) {
-      _legacyCopyToClipboard(text);
-    });
+    clipboard
+        .writeText(text)
+        .then(
+          (_) {},
+          onError: (_) {
+            _legacyCopyToClipboard(text);
+          },
+        );
   }
 
   void _legacyCopyToClipboard(String text) {
@@ -1605,10 +1610,9 @@ class _TerminalPaneState extends State<TerminalPane>
     try {
       final buffer = js_util.getProperty(_term, 'buffer');
       final active = js_util.getProperty(buffer, 'active');
-      _pageAnchorY =
-          (js_util.getProperty(active, 'viewportY') as num?)?.toInt();
-      _pageAnchorLen =
-          (js_util.getProperty(active, 'length') as num?)?.toInt();
+      _pageAnchorY = (js_util.getProperty(active, 'viewportY') as num?)
+          ?.toInt();
+      _pageAnchorLen = (js_util.getProperty(active, 'length') as num?)?.toInt();
       _pageAnchorAt = DateTime.now();
     } catch (_) {
       _pageAnchorY = null;
@@ -1702,9 +1706,7 @@ class _TerminalPaneState extends State<TerminalPane>
     // page's own single-flight window), and guarded against a session
     // swap landing between the poll and now.
     scheduleMicrotask(() {
-      if (!mounted ||
-          !_initialized ||
-          widget.terminalId != terminalId) {
+      if (!mounted || !_initialized || widget.terminalId != terminalId) {
         return;
       }
       if (widget.onNearTop?.call() == false) {
@@ -2288,8 +2290,8 @@ class _TerminalPaneState extends State<TerminalPane>
       final buffer = js_util.getProperty(term, 'buffer');
       final active = js_util.getProperty(buffer, 'active');
       final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-      final viewportY =
-          (js_util.getProperty(active, 'viewportY') as num).toInt();
+      final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+          .toInt();
       if (_viewportIsAtBottom(container, viewportY, baseY)) {
         _sessionSavedViewportY.remove(_sanitizedId);
       } else if (viewportY >= 0) {
@@ -2960,9 +2962,7 @@ class _TerminalPaneState extends State<TerminalPane>
     }
     if (oldWidget.controller != widget.controller ||
         oldWidget.terminalId != widget.terminalId) {
-      _noOlderScrollbackTimer?.cancel();
-      _noOlderScrollbackTimer = null;
-      _showNoOlderScrollback = false;
+      cancelNoOlderScrollbackTimer();
       tdbg(
         'pane.didUpdate',
         '$_sanitizedId controller changed '

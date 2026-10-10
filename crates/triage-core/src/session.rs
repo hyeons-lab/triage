@@ -1162,7 +1162,7 @@ mod tests {
             exited: false,
             raw_output: original_bytes.clone(),
             raw_output_start: 0,
-            raw_output_prefix: Vec::new(),
+            raw_output_prefix: original_bytes.clone(),
             snippet: None,
             snippet_detail: None,
         };
@@ -1172,12 +1172,14 @@ mod tests {
 
         // Verify it was serialized as a base64 string, not an array of numbers
         assert!(json_val["raw_output"].is_string());
+        assert!(json_val["raw_output_prefix"].is_string());
         let encoded_str = json_val["raw_output"].as_str().unwrap();
         assert!(!encoded_str.is_empty());
 
         let round_trip: SessionSnapshot =
             serde_json::from_str(&json_str).expect("deserialize snapshot");
         assert_eq!(round_trip.raw_output, original_bytes);
+        assert_eq!(round_trip.raw_output_prefix, original_bytes);
     }
 
     #[test]

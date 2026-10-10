@@ -2248,7 +2248,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 ? stats.diskTotalBytes
                 : _daemonStats!.diskTotalBytes,
             cpuPercent: stats.cpuPercent ?? _daemonStats!.cpuPercent,
-            batteryPercent: stats.batteryPercent ?? _daemonStats!.batteryPercent,
+            batteryPercent:
+                stats.batteryPercent ?? _daemonStats!.batteryPercent,
             batteryState: stats.batteryPercent != null
                 ? stats.batteryState
                 : _daemonStats!.batteryState,
@@ -5048,8 +5049,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (session.pagingHistory) return false;
     final start = session.historyStart;
     if (start == null || start <= 0) return false;
-    final maxWindow =
-        kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+    final maxWindow = kIsWeb
+        ? kHistoryReplayWebMaxBytes
+        : kHistoryReplayMaxBytes;
     final nextWindow = nextHistoryWindowBytes(
       current: session.historyWindowBytes,
       max: maxWindow,
@@ -5064,8 +5066,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// coalesces triggers behind one in-flight page.
   Future<void> _pageHistoryUp(SessionVm session) async {
     if (!_canPageHistory(session)) return;
-    final maxWindow =
-        kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+    final maxWindow = kIsWeb
+        ? kHistoryReplayWebMaxBytes
+        : kHistoryReplayMaxBytes;
     final nextWindow = nextHistoryWindowBytes(
       current: session.historyWindowBytes,
       max: maxWindow,
@@ -5095,9 +5098,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.hasInputLease = _attachGrantsInputLease(attachRes);
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-      if (snapshot == null) return;
+      if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
       final raw = _rawOutputFromSnapshot(snapshot);
-      if (raw.isEmpty) return;
       // Full replay, not a delta merge: the wider window extends backward,
       // which the store's same-end branch would no-op. The Attach above reset
       // the lifecycle; live chunks covered by it drop as duplicates by output_seq.

@@ -255,9 +255,6 @@ pub struct ScrollbackJournal {
     writer: Option<BufWriter<File>>,
     /// Appends since the last flush (see [`JOURNAL_FLUSH_EVERY`]).
     since_flush: usize,
-    /// Scratch for assembling one record per `write_all` (see
-    /// [`Self::append_inner`]).
-    record_scratch: Vec<u8>,
     /// Raw/sealed pairs awaiting a seal after rotations (drained by
     /// [`Self::drain_pending_seals`], synchronously or via the worker).
     /// A list because one chunk can rotate more than once.
@@ -296,7 +293,6 @@ impl ScrollbackJournal {
             active_lines: 0,
             writer: None,
             since_flush: 0,
-            record_scratch: Vec::new(),
             pending_seals: Vec::new(),
             broken: false,
             warned: false,
@@ -319,7 +315,6 @@ impl ScrollbackJournal {
             active_lines: 0,
             writer: None,
             since_flush: 0,
-            record_scratch: Vec::new(),
             pending_seals: Vec::new(),
             broken: true,
             warned: true,
@@ -359,12 +354,6 @@ impl ScrollbackJournal {
     /// access: it reads only flushed bytes, so up to `JOURNAL_FLUSH_EVERY`
     /// trailing records may be missing (see the const for why that is
     /// nearly always above the seam anyway).
-    /// Read prefix older than `raw_start` (alias for `read_prefix_at_or_older_than`).
-    #[inline]
-    pub fn read_prefix_older_than(&self, raw_start: u64, max_bytes: usize) -> Vec<u8> {
-        self.read_prefix_at_or_older_than(raw_start, max_bytes)
-    }
-
     pub fn read_prefix_at_or_older_than(&self, raw_start: u64, max_bytes: usize) -> Vec<u8> {
         if self.broken || max_bytes == 0 {
             return Vec::new();
@@ -406,10 +395,10 @@ impl ScrollbackJournal {
                 Err(err) => {
                     tracing::warn!(index, dir = %self.dir.display(), ?err,
                         "skipping unreadable scrollback journal file");
-                    break 'files;
+                    continue;
                 }
             };
-            for record in records.iter().rev() {
+            for record in records.into_iter().rev() {
                 if record.log_offset > raw_start {
                     continue;
                 }
@@ -417,7 +406,7 @@ impl ScrollbackJournal {
                     break 'files;
                 }
                 collected_len += record.bytes.len();
-                collected.push(record.bytes.clone());
+                collected.push(record.bytes);
             }
         }
         collected.reverse();
@@ -431,6 +420,7 @@ impl ScrollbackJournal {
         if self.broken {
             return;
         }
+        self.flush_buffer();
         if let Err(err) = self.rebase_inner(cut) {
             self.note_broken(&err);
         }
@@ -590,8 +580,7 @@ impl ScrollbackJournal {
     fn ensure_writer(&mut self) -> anyhow::Result<&mut BufWriter<File>> {
         if self.writer.is_none() {
             let path = self.active_path(self.active_index);
-            let fresh =
-                !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) == 0;
+            let fresh = !path.exists() || path.metadata().map(|m| m.len()).unwrap_or(0) == 0;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -780,19 +769,23 @@ impl ScrollbackJournal {
     }
 
     fn enforce_retention(&mut self) -> anyhow::Result<()> {
-        let mut sealed: Vec<u32> = Vec::new();
+        let mut files: Vec<u32> = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
-            if let Some((index, true)) =
+            if let Some((index, _)) =
                 Self::parse_journal_index(&entry.file_name().to_string_lossy())
+                && !files.contains(&index)
             {
-                sealed.push(index);
+                files.push(index);
             }
         }
-        sealed.sort_unstable();
-        while sealed.len() > JOURNAL_RETAINED_FILES {
-            let oldest = sealed.remove(0);
+        files.sort_unstable();
+        while files.len() > JOURNAL_RETAINED_FILES {
+            let oldest = files.remove(0);
             let _ = std::fs::remove_file(self.sealed_path(oldest));
+            if oldest != self.active_index {
+                let _ = std::fs::remove_file(self.active_path(oldest));
+            }
         }
         Ok(())
     }
@@ -824,20 +817,32 @@ impl ScrollbackJournal {
 
     fn read_file_records(&self, index: u32) -> anyhow::Result<Vec<JournalRecord>> {
         let sealed = self.sealed_path(index);
-        let bytes = if sealed.exists() {
-            let file = File::open(&sealed)?;
-            let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))?;
-            let mut bytes = Vec::new();
-            decoder.read_to_end(&mut bytes)?;
-            bytes
-        } else {
-            let active = self.active_path(index);
-            if !active.exists() {
-                return Ok(Vec::new());
+        match File::open(&sealed) {
+            Ok(file) => {
+                let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))?;
+                let mut bytes = Vec::new();
+                decoder.read_to_end(&mut bytes)?;
+                Ok(parse_records(&bytes))
             }
-            std::fs::read(active)?
-        };
-        Ok(parse_records(&bytes))
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let active = self.active_path(index);
+                match std::fs::read(&active) {
+                    Ok(bytes) => Ok(parse_records(&bytes)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if let Ok(file) = File::open(&sealed) {
+                            let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))?;
+                            let mut bytes = Vec::new();
+                            decoder.read_to_end(&mut bytes)?;
+                            Ok(parse_records(&bytes))
+                        } else {
+                            Ok(Vec::new())
+                        }
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Cheapest useful fact about a file: its first record's offset.
@@ -845,23 +850,28 @@ impl ScrollbackJournal {
     /// (raw), so files above the seam skip without a full decode.
     fn peek_min_offset(&self, index: u32) -> Peek {
         let sealed = self.sealed_path(index);
-        if sealed.exists() {
-            let file = match File::open(&sealed) {
-                Ok(file) => file,
-                Err(_) => return Peek::Unreadable,
-            };
-            let mut decoder = match zstd::stream::Decoder::new(BufReader::new(file)) {
-                Ok(decoder) => decoder,
-                Err(_) => return Peek::Unreadable,
-            };
-            Self::peek_stream_head(&mut decoder)
-        } else {
-            let path = self.active_path(index);
-            let mut file = match File::open(&path) {
-                Ok(file) => file,
-                Err(_) => return Peek::Empty,
-            };
-            Self::peek_stream_head(&mut file)
+        match File::open(&sealed) {
+            Ok(file) => match zstd::stream::Decoder::new(BufReader::new(file)) {
+                Ok(mut decoder) => Self::peek_stream_head(&mut decoder),
+                Err(_) => Peek::Unreadable,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let path = self.active_path(index);
+                match File::open(&path) {
+                    Ok(mut file) => Self::peek_stream_head(&mut file),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if let Ok(file) = File::open(&sealed)
+                            && let Ok(mut decoder) =
+                                zstd::stream::Decoder::new(BufReader::new(file))
+                        {
+                            return Self::peek_stream_head(&mut decoder);
+                        }
+                        Peek::Empty
+                    }
+                    Err(_) => Peek::Unreadable,
+                }
+            }
+            Err(_) => Peek::Unreadable,
         }
     }
 
@@ -921,8 +931,11 @@ impl ScrollbackJournal {
         // A full head with our magic but a newer version is downgrade
         // skew, not corruption (short heads cannot tell and stay
         // Unreadable, as before).
-        if file_header_len(head).is_none() {
+        let Some(header_len) = file_header_len(head) else {
             return Peek::Future;
+        };
+        if head.len() <= header_len {
+            return Peek::Empty;
         }
         Peek::Unreadable
     }
@@ -1005,7 +1018,15 @@ impl ScrollbackJournal {
                 skipped_any = true;
                 continue;
             }
-            let records = self.read_file_records(*index)?;
+            let records = match self.read_file_records(*index) {
+                Ok(records) => records,
+                Err(err) => {
+                    tracing::warn!(index, dir = %self.dir.display(), ?err,
+                        "rebase dropping unreadable scrollback journal file");
+                    skipped_any = true;
+                    continue;
+                }
+            };
             decoded_any |= !records.is_empty();
             for mut record in records {
                 if record.log_offset < cut {
@@ -1100,11 +1121,11 @@ impl ScrollbackJournal {
             let _ = std::fs::remove_file(&staging);
             anyhow::bail!("scrollback journal grew during rebase; peer handover suspected");
         }
+        std::fs::rename(&staging, self.active_path(fresh))?;
         for index in &indices {
             let _ = std::fs::remove_file(self.sealed_path(*index));
             let _ = std::fs::remove_file(self.active_path(*index));
         }
-        std::fs::rename(&staging, self.active_path(fresh))?;
         // Defense in depth: a worker seal that passed its identity
         // re-check before the deletes above may still land after them,
         // resurrecting a stale sealed twin at a collected index (reads
@@ -1136,8 +1157,6 @@ impl ScrollbackJournal {
             let _ = std::fs::remove_file(self.sealed_path(*index));
         }
     }
-        }
-    }
 }
 
 /// Parse length-prefixed records, stopping at the first truncation or
@@ -1156,6 +1175,7 @@ fn parse_records_with_len(bytes: &[u8]) -> (Vec<JournalRecord>, usize) {
         // so reopen never truncates a newer writer's data.
         None => return (records, bytes.len()),
     };
+    let mut valid_len = cursor;
     while cursor + RECORD_HEADER_LEN <= bytes.len() {
         let offset = u64::from_le_bytes(
             *bytes[cursor..cursor + 8]
@@ -1176,8 +1196,9 @@ fn parse_records_with_len(bytes: &[u8]) -> (Vec<JournalRecord>, usize) {
             bytes: bytes[cursor..cursor + len].to_vec(),
         });
         cursor += len;
+        valid_len = cursor;
     }
-    (records, cursor)
+    (records, valid_len)
 }
 
 /// Length of the file header to skip: 6 past a known magic, 0 for
@@ -1197,8 +1218,12 @@ fn file_header_len(bytes: &[u8]) -> Option<usize> {
 /// but version above ours. Legacy files (no magic) are not future.
 /// Used to fail closed instead of mutating data we cannot parse.
 fn is_future_journal_file(path: &Path) -> bool {
-    match std::fs::read(path) {
-        Ok(bytes) => !bytes.is_empty() && file_header_len(&bytes).is_none(),
+    let mut head = [0u8; JOURNAL_HEADER_LEN];
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    match f.read_exact(&mut head) {
+        Ok(()) => file_header_len(&head).is_none(),
         Err(_) => false,
     }
 }
@@ -1218,12 +1243,15 @@ fn journal_header() -> [u8; JOURNAL_HEADER_LEN] {
 /// check is unavailable and tmps sweep as before.
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
         return false;
     }
     // Signal 0 performs error checking without delivering; EPERM still
     // means a live process owned by someone else.
-    let signaled = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    let signaled = unsafe { libc::kill(pid, 0) == 0 };
     signaled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -1935,6 +1963,7 @@ mod tests {
         journal.rotate().expect("rotate file 0");
         journal.append(300, b"file1_rec1\r\n");
         journal.append(400, b"file1_rec2\r\n");
+        journal.flush_buffer();
 
         assert_eq!(
             journal.sealed_and_active_newest_first(),
@@ -2449,6 +2478,81 @@ mod tests {
         assert!(job.compressed_path.ends_with("scrollback-000000.slog.zst"));
         // The worker owns the seal now: no inline file appears.
         assert!(!dir.join("scrollback-000000.slog.zst").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_reopen_truncates_torn_record_header_and_payload() {
+        let dir = unique_journal_dir("tear-header-payload");
+        {
+            let mut journal = ScrollbackJournal::open(&dir);
+            journal.append(100, b"record_one\r\n");
+            journal.flush_buffer();
+        }
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("scrollback-000000.slog"))
+                .expect("open active");
+            // Write a full 12-byte header with declared length 50, but only 4 payload bytes
+            file.write_all(&200u64.to_le_bytes()).expect("write offset");
+            file.write_all(&50u32.to_le_bytes()).expect("write len");
+            file.write_all(b"four").expect("write partial payload");
+        }
+        {
+            let mut journal = ScrollbackJournal::open(&dir);
+            journal.append(300, b"record_two\r\n");
+            journal.flush_buffer();
+            assert_eq!(
+                journal.read_prefix_at_or_older_than(1000, 1024),
+                b"record_one\r\nrecord_two\r\n",
+                "torn header must be truncated so subsequent appends remain readable"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_header_only_file_peeks_empty() {
+        let dir = unique_journal_dir("header-only");
+        std::fs::write(dir.join("scrollback-000000.slog"), journal_header())
+            .expect("seed header only");
+        let journal = ScrollbackJournal::open(&dir);
+        assert!(
+            matches!(journal.peek_min_offset(0), Peek::Empty),
+            "header-only journal file must peek Empty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_pid_is_alive_guards_overflow() {
+        assert!(
+            !pid_is_alive(u32::MAX),
+            "overflowing u32 PID must evaluate to dead"
+        );
+        assert!(!pid_is_alive(0), "PID 0 must evaluate to dead");
+    }
+
+    #[test]
+    fn journal_read_prefix_continues_past_unreadable_file() {
+        let dir = unique_journal_dir("read-unreadable");
+        let mut file0 = journal_header().to_vec();
+        file0.extend_from_slice(&100u64.to_le_bytes());
+        file0.extend_from_slice(&7u32.to_le_bytes());
+        file0.extend_from_slice(b"file0\r\n");
+        std::fs::write(dir.join("scrollback-000000.slog"), &file0).expect("seed file 0");
+        std::fs::write(dir.join("scrollback-000001.slog.zst"), b"corrupt zstd")
+            .expect("seed corrupt file 1");
+
+        let journal = ScrollbackJournal::open(&dir);
+        assert_eq!(
+            journal.read_prefix_at_or_older_than(1000, 1024),
+            b"file0\r\n",
+            "unreadable file must be skipped and intact older file served"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

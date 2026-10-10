@@ -6880,8 +6880,8 @@ impl OutputState {
         self.init_scroll_baseline();
         self.advance_translated_bytes(bytes);
         self.journal_scrolled_lines();
-        // Reads serve only flushed bytes, so every chunk — scrolling or
-        // desert — makes the journal current through it. Without this a
+        // Reads serve only flushed bytes, so every chunk (scrolling or
+        // desert) makes the journal current through it. Without this a
         // journal under the periodic-flush threshold is all buffer and
         // serves nothing.
         if let Some(journal) = self.scrollback.as_mut() {
@@ -9955,7 +9955,7 @@ mod tests {
 
         let initial_journaled = {
             let journal = output.scrollback.as_mut().expect("journal");
-            journal.read_prefix_older_than(1000, 1024)
+            journal.read_prefix_at_or_older_than(1000, 1024)
         };
         assert!(
             initial_journaled.is_empty(),
@@ -9981,7 +9981,7 @@ mod tests {
 
         let after_journaled = {
             let journal = output.scrollback.as_mut().expect("journal");
-            journal.read_prefix_older_than(1000, 1024)
+            journal.read_prefix_at_or_older_than(1000, 1024)
         };
 
         // If reflow had not reset scroll_seq_baseline to None, the pre-resize baseline (0)

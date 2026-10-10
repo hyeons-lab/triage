@@ -372,9 +372,7 @@ class _TerminalPaneState extends State<TerminalPane>
     }
     if (!identical(oldWidget.terminal, widget.terminal) ||
         oldWidget.terminalId != widget.terminalId) {
-      _noOlderScrollbackTimer?.cancel();
-      _noOlderScrollbackTimer = null;
-      _showNoOlderScrollback = false;
+      cancelNoOlderScrollbackTimer();
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -428,7 +426,9 @@ class _TerminalPaneState extends State<TerminalPane>
       widget.controller.addClearListener(_onClear);
       widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
       widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
-      widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
+      widget.controller.addHistoryPageCancelledListener(
+        _onHistoryPageCancelled,
+      );
     }
     if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
       if (_pendingBottomSnapOnPointerUp) {
@@ -562,7 +562,10 @@ class _TerminalPaneState extends State<TerminalPane>
       _pageAnchorAt = null;
       _pendingBottomSnapOnPointerUp = false;
       _suppressScrollSaveFor(const Duration(milliseconds: 500));
-      if (addedLines <= 0 && wasNearTop) {
+      if (shouldContinuePastBarrenPage(
+        addedLines: addedLines,
+        nearTop: wasNearTop,
+      )) {
         _continuePastBarrenPage();
         return;
       }
@@ -581,12 +584,6 @@ class _TerminalPaneState extends State<TerminalPane>
           maxScrollExtent: position.maxScrollExtent,
           lineHeight: lh,
         );
-        if (shouldContinuePastBarrenPage(
-          addedLines: addedLines,
-          nearTop: wasNearTop,
-        )) {
-          _continuePastBarrenPage();
-        }
       });
       return;
     }
