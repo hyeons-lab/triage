@@ -53,7 +53,10 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final xt.Terminal terminal;
-  final VoidCallback? onNearTop;
+  // Paging request, reporting back whether a page launched (see
+  // SessionWorkspace.onNearTop). The trigger ignores the answer; the
+  // history-replayed handler uses it to auto-continue or report.
+  final bool Function()? onNearTop;
   final bool bracketedPasteEnabled;
 
   /// Plain rows rendered only by the FLUTTER_TEST fallback view.
@@ -137,6 +140,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
   DateTime? _pageAnchorAt;
+  bool _showNoOlderScrollback = false;
+  Timer? _noOlderScrollbackTimer;
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
   // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
@@ -368,6 +373,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (!identical(oldWidget.terminal, widget.terminal) ||
         oldWidget.terminalId != widget.terminalId) {
+      _noOlderScrollbackTimer?.cancel();
+      _noOlderScrollbackTimer = null;
+      _showNoOlderScrollback = false;
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -469,6 +477,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
+    _noOlderScrollbackTimer?.cancel();
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
     _focusNode.dispose();
@@ -543,12 +552,21 @@ class _TerminalPaneState extends State<TerminalPane> {
         _scrollController.hasClients) {
       final addedLines = _terminal.buffer.lines.length - _pageAnchorLines!;
       final lh = _lineHeight() ?? 2.0;
+      final position = _scrollController.position;
+      // Read before the re-seat jump below: a fruitful page moves the
+      // viewport, and the barren check cares where the user was when the
+      // page landed, not where the restore put them.
+      final wasNearTop = position.pixels <= lh * 5;
       final target = _pageAnchorPixels! + addedLines * lh;
       _pageAnchorPixels = null;
       _pageAnchorLines = null;
       _pageAnchorAt = null;
       _pendingBottomSnapOnPointerUp = false;
       _suppressScrollSaveFor(const Duration(milliseconds: 500));
+      if (addedLines <= 0 && wasNearTop) {
+        _continuePastBarrenPage();
+        return;
+      }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || !_scrollController.hasClients) return;
         final position = _scrollController.position;
@@ -598,6 +616,37 @@ class _TerminalPaneState extends State<TerminalPane> {
     _pageAnchorLines = null;
     _pageAnchorAt = null;
     _pendingBottomSnapOnPointerUp = false;
+  }
+
+  /// A page landed with no new buffer lines while the user is still near
+  /// the top: the window was barren (a TUI redrawing in place), so ask for
+  /// a deeper one instead of sitting on identical content. When no deeper
+  /// window is available the scrollback is genuinely exhausted and the
+  /// pill says so, rather than leaving the top silently inert.
+  void _continuePastBarrenPage() {
+    final terminalId = widget.terminalId;
+    // Deferred: this handler runs inside the landed page's own
+    // single-flight window (the replay lands before `_pageHistoryUp`
+    // releases it), so a synchronous re-request would read as already in
+    // flight and wrongly report exhaustion.
+    scheduleMicrotask(() {
+      if (!mounted || widget.terminalId != terminalId) return;
+      if (widget.onNearTop?.call() == false) {
+        _noteHistoryExhausted();
+      }
+    });
+  }
+
+  void _noteHistoryExhausted() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => _showNoOlderScrollback = false);
+      }
+    });
+    if (mounted && !_showNoOlderScrollback) {
+      setState(() => _showNoOlderScrollback = true);
+    }
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -1894,6 +1943,13 @@ class _TerminalPaneState extends State<TerminalPane> {
                     color: const Color(0xffffc857),
                   ),
                 ),
+              if (_showNoOlderScrollback)
+                const Positioned(
+                  top: 8,
+                  left: 0,
+                  right: 0,
+                  child: Center(child: NoOlderScrollbackPill()),
+                ),
             ],
           ),
         ),
@@ -2017,6 +2073,13 @@ class _TerminalPaneState extends State<TerminalPane> {
                         ),
                       ),
                     if (copyButton != null) copyButton,
+                    if (_showNoOlderScrollback)
+                      const Positioned(
+                        top: 8,
+                        left: 0,
+                        right: 0,
+                        child: Center(child: NoOlderScrollbackPill()),
+                      ),
                   ],
                 ),
               ),

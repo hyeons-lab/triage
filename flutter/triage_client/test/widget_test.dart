@@ -27,6 +27,12 @@ import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
+import 'package:xterm/xterm.dart' as xt;
+
+/// One history window a test serves for a session: the raw tail bytes, the
+/// absolute log offset they start at, and the output sequence they run
+/// through. Pages over the same log end share [seq] with an older [start].
+typedef FakeHistoryWindow = ({List<int> bytes, int start, int seq});
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
   FakeTriageWebSocketClient({
@@ -108,6 +114,26 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> attachSessionCalls = [];
   // Parallel to [attachSessionCalls]: the attach mode per call.
   final List<String> attachSessionModes = [];
+  // Parallel to [attachSessionCalls]: the requested history window per call.
+  final List<int?> attachHistoryWindowsRequested = [];
+  // History served per session per requested window. When a session has an
+  // entry, its attach snapshots carry raw_output/raw_output_start for the
+  // requested window (falling back to the first entry when the exact window
+  // is not keyed); sessions without one attach history-less, as before.
+  final Map<String, Map<int, FakeHistoryWindow>> attachHistoryWindows = {};
+
+  Map<String, dynamic> _historyKeysFor(String sessionId, int? window) {
+    final byWindow = attachHistoryWindows[sessionId];
+    if (byWindow == null || byWindow.isEmpty) return const {};
+    final served =
+        byWindow[window] ?? byWindow.entries.first.value;
+    return {
+      'raw_output': served.bytes,
+      'raw_output_start': served.start,
+      'bytes_logged': served.start + served.bytes.length,
+      'output_seq': served.seq,
+    };
+  }
   // Lease holder the fake reports for Observer attaches, per session. Absent
   // means nobody holds it. Interactive attaches always grant to the caller,
   // mirroring the daemon's steal-on-attach.
@@ -260,6 +286,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   }) async {
     attachSessionCalls.add(sessionId);
     attachSessionModes.add(mode);
+    attachHistoryWindowsRequested.add(historyBytes);
     final attachCompleter = attachCompleters[sessionId];
     if (attachCompleter != null) {
       return attachCompleter.future;
@@ -281,6 +308,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           'snapshot': {
             'size': _snapshotSize,
             'exited': exitedSessionIds.contains(sessionId),
+            ..._historyKeysFor(sessionId, historyBytes),
             'visible_rows': visibleRows,
             'styled_rows': visibleRows
                 .map(
@@ -312,6 +340,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       'response': {
         'lease': _attachLeaseFor(sessionId, clientId, mode),
         'snapshot': {
+          ..._historyKeysFor(sessionId, historyBytes),
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
             // Normally absent, matching a daemon that reports only the branch on
@@ -5527,6 +5556,180 @@ void main() {
         expect(controller.position.pixels, scrolledUp);
       },
     );
+  });
+
+  group('history paging', () {
+    List<int> historyLines(int from, int to) {
+      final buf = StringBuffer();
+      for (var i = from; i < to; i++) {
+        buf.writeln('history line $i');
+      }
+      return utf8.encode(buf.toString());
+    }
+
+    List<StyledRow> fallbackRows(int count) => List.generate(
+      count,
+      (i) => StyledRow(
+        spans: [
+          StyledSpan(text: 'Log line $i', style: const TerminalStyle()),
+        ],
+      ),
+    );
+
+    List<int?> windowsFor(FakeTriageWebSocketClient client, String sid) => [
+      for (var i = 0; i < client.attachSessionCalls.length; i++)
+        if (client.attachSessionCalls[i] == sid)
+          client.attachHistoryWindowsRequested[i],
+    ];
+
+    testWidgets('scrolling to the top re-attaches with a doubled window', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      client.snapshotVisibleRows['flutter-spike'] = List.generate(
+        100,
+        (i) => 'Log line $i',
+      );
+      final first = historyLines(0, 100);
+      final second = historyLines(0, 200);
+      client.attachHistoryWindows['flutter-spike'] = {
+        65536: (bytes: first, start: 100000, seq: 7),
+        131072: (
+          bytes: second,
+          start: 100000 - (second.length - first.length),
+          seq: 7,
+        ),
+      };
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(windowsFor(client, 'flutter-spike'), [65536]);
+
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final controller = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      controller.jumpTo(0);
+      await tester.pumpAndSettle();
+
+      expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
+    });
+
+    Future<void> pumpStandalonePane(
+      WidgetTester tester, {
+      required TerminalController controller,
+      required xt.Terminal terminal,
+      required String terminalId,
+      bool Function()? onNearTop,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TerminalPane(
+              terminalId: terminalId,
+              controller: controller,
+              terminal: terminal,
+              fallbackRows: fallbackRows(100),
+              onTerminalResizeBind: (_) {},
+              focusCursorRevision: 0,
+              onNearTop: onNearTop,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a barren page auto-continues, then reports no older scrollback', (
+      WidgetTester tester,
+    ) async {
+      final controller = TerminalController();
+      final terminal = xt.Terminal(maxLines: 50000);
+      var pages = 0;
+      bool onNearTop() {
+        pages++;
+        // The first two launches land (barren); the third is gated.
+        return pages < 3;
+      }
+
+      await pumpStandalonePane(
+        tester,
+        controller: controller,
+        terminal: terminal,
+        terminalId: 'paging-barren-test',
+        onNearTop: onNearTop,
+      );
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final scrollController = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      // The scrolled-up user whose page landed with no new lines.
+      scrollController.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+
+      // First landed page is barren: auto-continue with a deeper window.
+      controller.notifyHistoryPageStarted();
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 2);
+      expect(find.text('No older scrollback in reach'), findsNothing);
+
+      // Second landed page is barren too, and the deeper page is gated:
+      // report the exhausted scrollback instead of going silently inert.
+      controller.notifyHistoryPageStarted();
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 3);
+      expect(find.text('No older scrollback in reach'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 3));
+      expect(find.text('No older scrollback in reach'), findsNothing);
+    });
+
+    testWidgets('a fruitful page neither continues nor reports', (
+      WidgetTester tester,
+    ) async {
+      final controller = TerminalController();
+      final terminal = xt.Terminal(maxLines: 50000);
+      var pages = 0;
+      bool onNearTop() {
+        pages++;
+        return true;
+      }
+
+      await pumpStandalonePane(
+        tester,
+        controller: controller,
+        terminal: terminal,
+        terminalId: 'paging-fruitful-test',
+        onNearTop: onNearTop,
+      );
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final scrollController = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      scrollController.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+
+      // The landed page grew the buffer: nothing more to do.
+      controller.notifyHistoryPageStarted();
+      terminal.write('fresh line\n' * 60);
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+      expect(find.text('No older scrollback in reach'), findsNothing);
+    });
   });
 
   group('SessionVm exited lifecycle', () {
