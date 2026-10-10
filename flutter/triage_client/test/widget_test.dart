@@ -2218,14 +2218,17 @@ void main() {
       client.railLayout = (
         groupKeys: <String>[],
         sessionIds: <String>[],
-        customLabels: {'reconciled-new': 'Fresh Label'},
+        customLabels: {
+          'main': 'Renamed Main',
+          'reconciled-new': 'Fresh Label',
+        },
       );
       await tester.pump(const Duration(seconds: 61));
       await tester.pumpAndSettle();
 
       expect(find.text('triage / flutter-spike'), findsNothing);
       expect(find.text('triage / websocket-session-api'), findsNothing);
-      expect(find.text('triage / main'), findsWidgets);
+      expect(find.text('Renamed Main'), findsWidgets);
       expect(find.text('Fresh Label'), findsWidgets);
     },
   );

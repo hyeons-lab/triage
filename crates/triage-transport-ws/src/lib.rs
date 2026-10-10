@@ -2533,4 +2533,86 @@ mod tests {
             serde_json::from_str(&terminated_json).unwrap();
         assert_eq!(terminated, terminated_deserialized);
     }
+
+    #[test]
+    fn server_message_kind_matches_serde_tag() {
+        let messages = vec![
+            ServerMessage::Response {
+                id: Some(json!("1")),
+                result: ServerResult::Unit,
+            },
+            ServerMessage::Error {
+                id: Some(json!("2")),
+                error: ProtocolError::new("internal", "test error"),
+            },
+            ServerMessage::Event {
+                subscription_id: SubscriptionId::new("sub-1").unwrap(),
+                envelope: SessionEventEnvelope {
+                    event_seq: 1,
+                    event: SessionEvent::Output {
+                        session_id: SessionId::new("s-1").unwrap(),
+                        output_seq: 1,
+                        bytes: vec![1, 2, 3],
+                    },
+                },
+            },
+            ServerMessage::SubscriptionClosed {
+                subscription_id: SubscriptionId::new("sub-1").unwrap(),
+            },
+            ServerMessage::SessionSnippetUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                snippet: "snippet".to_string(),
+                detail: None,
+                output_seq: 1,
+            },
+            ServerMessage::SessionContextUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                current_working_directory: Some("/dir".to_string()),
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            },
+            ServerMessage::UpdateAvailable {
+                current_version: "1.0.0".to_string(),
+                latest_version: "1.1.0".to_string(),
+            },
+            ServerMessage::SessionJudgePolicyUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                policy: SessionJudgePolicy {
+                    explicit: None,
+                    effective: false,
+                },
+            },
+            ServerMessage::RailPinsUpdated {
+                group_keys: vec!["group".to_string()],
+                session_ids: vec!["s-1".to_string()],
+            },
+            ServerMessage::SessionCustomLabelUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                custom_label: Some("label".to_string()),
+            },
+            ServerMessage::SessionStarted {
+                session_id: SessionId::new("s-1").unwrap(),
+                current_working_directory: Some("/dir".to_string()),
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+                last_activity_ms: 100,
+                last_input_ms: 200,
+            },
+            ServerMessage::SessionTerminated {
+                session_id: SessionId::new("s-1").unwrap(),
+            },
+        ];
+
+        for msg in messages {
+            let serialized = serde_json::to_value(&msg).unwrap();
+            let tag = serialized.get("type").and_then(Value::as_str);
+            assert_eq!(
+                Some(msg.kind()),
+                tag,
+                "msg.kind() does not match serde type tag for {msg:?}"
+            );
+        }
+    }
 }

@@ -1152,29 +1152,12 @@ impl SessionManager {
         }
     }
 
-    /// Drops a session's custom label (on shutdown/removal), persisting the
-    /// layout without it. The label map is keyed by session id, not by record
-    /// membership, so without this a removed session's label outlives it —
-    /// on disk too, since the shutdown manifest snapshots the live map — and
-    /// a later session reusing the name collides with a ghost row.
+    /// Drops a session's custom label from memory on shutdown or removal.
+    /// The shutdown manifest already committed the on-disk layout without it,
+    /// so this drops the in-memory entry to prevent ghost rows upon reuse.
     fn forget_custom_label(&self, session_id: &SessionId) {
-        let (Ok(sessions), Ok(pins), Ok(mut labels)) =
-            (self.sessions(), self.pins(), self.custom_labels())
-        else {
-            return;
-        };
-        if !labels.contains_key(session_id.as_str()) {
-            return;
-        }
-        let mut candidate_labels = labels.clone();
-        candidate_labels.remove(session_id.as_str());
-        // Candidate-then-assign like the setter: a persist failure must not
-        // leave memory disagreeing with the manifest.
-        if self
-            .persist_manifest_with_layout(&sessions, &pins, &candidate_labels)
-            .is_ok()
-        {
-            *labels = candidate_labels;
+        if let Ok(mut labels) = self.custom_labels() {
+            labels.remove(session_id.as_str());
         }
     }
 
@@ -1835,7 +1818,8 @@ impl SessionManager {
         session_id: &SessionId,
     ) -> Result<PathBuf> {
         let pins = self.pins()?;
-        let custom_labels = self.custom_labels()?;
+        let mut custom_labels = self.custom_labels()?.clone();
+        custom_labels.remove(session_id.as_str());
         let json = encode_manifest(sessions, Some(session_id), &pins, &custom_labels)?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
@@ -3794,10 +3778,16 @@ impl SessionApi for SessionManager {
                     let Some(removed) = sessions.remove(&session_id) else {
                         bail!("historical session {session_id} disappeared during shutdown");
                     };
-                    if let Err(error) = self.persist_manifest(&sessions) {
+                    let pins = self.pins()?;
+                    let mut candidate_labels = self.custom_labels()?.clone();
+                    candidate_labels.remove(session_id.as_str());
+                    if let Err(error) =
+                        self.persist_manifest_with_layout(&sessions, &pins, &candidate_labels)
+                    {
                         sessions.insert(session_id.clone(), removed);
                         return Err(error);
                     }
+                    self.forget_custom_label(&session_id);
                     ShutdownTarget::Historical {
                         completed,
                         log_path,
@@ -3855,7 +3845,9 @@ impl SessionApi for SessionManager {
                         sessions.insert(session_id.clone(), removed);
                         bail!("session {session_id} changed state during shutdown");
                     };
-                    if let Err(error) = &rewrite_result {
+                    if rewrite_result.is_ok() {
+                        self.forget_custom_label(&session_id);
+                    } else if let Err(error) = &rewrite_result {
                         match historical_fallback {
                             Ok(session) => {
                                 sessions.insert(
@@ -15419,15 +15411,24 @@ mod tests {
         let session_id = manager
             .start_session(StartSessionRequest::new(long_running_shell_command()))
             .expect("start session");
+        let survivor_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start survivor session");
         manager
             .set_session_custom_label(session_id.clone(), Some("doomed".to_string()))
-            .expect("set label");
-        assert!(
-            manager
-                .get_rail_layout()
-                .expect("layout")
+            .expect("set doomed label");
+        manager
+            .set_session_custom_label(survivor_id.clone(), Some("survivor".to_string()))
+            .expect("set survivor label");
+
+        let layout = manager.get_rail_layout().expect("layout");
+        assert!(layout.custom_labels.contains_key(session_id.as_str()));
+        assert_eq!(
+            layout
                 .custom_labels
-                .contains_key(session_id.as_str())
+                .get(survivor_id.as_str())
+                .map(String::as_str),
+            Some("survivor")
         );
 
         manager
@@ -15439,12 +15440,29 @@ mod tests {
             !layout.custom_labels.contains_key(session_id.as_str()),
             "label must not outlive its session"
         );
+        assert_eq!(
+            layout
+                .custom_labels
+                .get(survivor_id.as_str())
+                .map(String::as_str),
+            Some("survivor"),
+            "surviving session label must remain intact"
+        );
 
-        // Nor on disk: a cold restart must not resurrect it.
+        // Nor on disk: a cold restart must not resurrect it, but must keep survivor.
         let manager2 = SessionManager::new(config);
         let layout2 = manager2.get_rail_layout().expect("layout after restart");
         assert!(!layout2.custom_labels.contains_key(session_id.as_str()));
+        assert_eq!(
+            layout2
+                .custom_labels
+                .get(survivor_id.as_str())
+                .map(String::as_str),
+            Some("survivor"),
+            "surviving session label must remain intact on disk"
+        );
 
+        let _ = manager.shutdown_session(survivor_id);
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 

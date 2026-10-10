@@ -357,11 +357,11 @@ class SessionVm {
     this.cwd,
     this.isRemote = false,
     this.isExited = false,
-  })  : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
-        // so the field must stay mutable no matter what a caller passes —
-        // a lazy placeholder seeds an immutable empty list.
-        rows = List<StyledRow>.of(rows),
-        terminalController = TerminalController() {
+  }) : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
+       // so the field must stay mutable no matter what a caller passes:
+       // a lazy placeholder seeds an immutable empty list.
+       rows = List<StyledRow>.of(rows),
+       terminalController = TerminalController() {
     terminal = xt.Terminal(
       maxLines: 50000,
       // Re-wrap the whole buffer on resize, like a real terminal — otherwise
@@ -989,6 +989,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // course of a session, so a connect-time reading alone goes stale.
   Timer? _daemonStatsTimer;
   Timer? _railReconcileTimer;
+  bool _isReconcilingRail = false;
   static const Duration _railReconcileInterval = Duration(seconds: 60);
   // Liveness probe for the socket; a failed beat tears the connection down
   // through the close path so a half-dead socket cannot hold a green
@@ -2239,24 +2240,33 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _railReconcileTimer?.cancel();
     _railReconcileTimer = Timer.periodic(_railReconcileInterval, (_) async {
       if (_disposed ||
+          !mounted ||
+          _isReconcilingRail ||
           generation != _connectGeneration ||
           serverId != _activeServerId ||
           !_clientInitialized ||
           !_client.isConnected) {
         return;
       }
-      await _reconcileRail(generation, serverId);
+      _isReconcilingRail = true;
+      try {
+        await _reconcileRail(generation, serverId);
+      } finally {
+        _isReconcilingRail = false;
+      }
     });
   }
 
   void _stopRailReconcile() {
     _railReconcileTimer?.cancel();
     _railReconcileTimer = null;
+    _isReconcilingRail = false;
   }
 
   Future<void> _reconcileRail(int generation, String serverId) async {
     bool stale() =>
         _disposed ||
+        !mounted ||
         generation != _connectGeneration ||
         serverId != _activeServerId ||
         !_client.isConnected;
@@ -2301,18 +2311,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }, sid);
       }
     }
-    // Labels: the daemon wins on every key it has. A locally-known label the
-    // daemon lacks is pushed up — same rule as the connect-time load: a
-    // local-only label is a write the daemon never saw, not a remote clear
-    // to mirror.
-    Map<String, String> daemonLabels;
+    // Labels: the daemon is authoritative during periodic anti-entropy.
+    // For every key present on the daemon, update the local cache if divergent.
+    // For any local label whose session is live on the daemon but lacks a
+    // daemon label, clear the local label.
+    final RailLayoutRecord? layout;
     try {
-      final layout = await _client.getRailLayout();
-      if (stale()) return;
-      daemonLabels = layout?.customLabels ?? const {};
+      layout = await _client.getRailLayout();
     } catch (_) {
       return;
     }
+    if (layout == null || stale()) return;
+    final daemonLabels = layout.customLabels;
     for (final entry in daemonLabels.entries) {
       final have =
           _customLabels[entry.key] ?? _customLabels['triage / ${entry.key}'];
@@ -2324,12 +2334,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final sid = key.startsWith('triage / ') ? key.substring(9) : key;
       if (!daemonLabels.containsKey(sid) && live.contains(sid)) {
         final label = _customLabels[key];
-        if (label != null && label.trim().isNotEmpty) {
-          unawaited(
-            _client
-                .setSessionCustomLabel(sessionId: sid, customLabel: label)
-                .catchError((_) {}),
-          );
+        if (label != null) {
+          _applyCustomLabelUpdated(sid, null);
         }
       }
     }
@@ -3036,16 +3042,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           targetSelectedIndex >= 0 &&
           targetSelectedIndex < sessionIds.length) {
         final targetSid = sessionIds[targetSelectedIndex];
-        final targetVmIndex =
-            _sessions.indexWhere((s) => s.remoteSessionId == targetSid);
+        final targetVmIndex = _sessions.indexWhere(
+          (s) => s.remoteSessionId == targetSid,
+        );
         if (targetVmIndex != -1 &&
             !failedSessionIds.contains(targetSid) &&
             (_pendingInputBytes[targetSid]?.isNotEmpty ?? false)) {
           unawaited(
-            _acquireInputLeaseAndFlush(
-              _sessions[targetVmIndex],
-              targetSid,
-            ),
+            _acquireInputLeaseAndFlush(_sessions[targetVmIndex], targetSid),
           );
         }
       }
@@ -3391,7 +3395,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   int _nextLocalActivityStamp() {
     var newest = 0;
     for (final session in _sessions) {
-      if (session.lastInteractionMs > newest) newest = session.lastInteractionMs;
+      if (session.lastInteractionMs > newest) {
+        newest = session.lastInteractionMs;
+      }
     }
     return newest + 1;
   }
@@ -4161,7 +4167,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Inserts a rail row for a session the daemon reports that this client has
-  /// no row for yet — from a `session_started` push or the rail reconcile.
+  /// no row for yet: from a `session_started` push or the rail reconcile.
   /// Idempotent: an existing row short-circuits, so a push racing the
   /// reconcile (or a redelivered push) cannot double-insert.
   void _applySessionStarted(Map<String, dynamic> message, String sessionId) {
@@ -4209,8 +4215,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Drops the rail row for a removed session — from a `session_terminated`
-  /// push or the rail reconcile — disposing its pane, unpinning it, clearing
+  /// Drops the rail row for a removed session (from a `session_terminated`
+  /// push or the rail reconcile), disposing its pane, unpinning it, clearing
   /// its cached label, and attaching the neighbour when it was selected.
   /// Idempotent: an unknown id short-circuits.
   void _applySessionTerminated(String sessionId) {
@@ -4980,8 +4986,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (session.pagingHistory) return;
     final start = session.historyStart;
     if (start == null || start <= 0) return;
-    final maxWindow =
-        kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+    final maxWindow = kIsWeb
+        ? kHistoryReplayWebMaxBytes
+        : kHistoryReplayMaxBytes;
     final nextWindow = nextHistoryWindowBytes(
       current: session.historyWindowBytes,
       max: maxWindow,
@@ -5715,65 +5722,67 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final String? result;
     try {
       result = await showMenu<String>(
-      context: context,
-      position: rect,
-      color: const Color(0xff1b2327),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: const BorderSide(color: Color(0xff334044)),
-      ),
-      items: [
-        PopupMenuItem<String>(
-          value: 'edit_label',
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 14),
-          child: Row(
-            children: [
-              Icon(
-                hasLabel ? Icons.edit_outlined : Icons.label_outline,
-                size: 16,
-                color: const Color(0xff7fd1c7),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  hasLabel ? 'Edit custom label...' : 'Assign custom label...',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Color(0xffcdd7d6),
-                    fontSize: 13,
-                  ),
-                ),
-              ),
-            ],
-          ),
+        context: context,
+        position: rect,
+        color: const Color(0xff1b2327),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: const BorderSide(color: Color(0xff334044)),
         ),
-        if (hasLabel)
+        items: [
           PopupMenuItem<String>(
-            value: 'clear_label',
+            value: 'edit_label',
             height: 38,
             padding: const EdgeInsets.symmetric(horizontal: 14),
-            child: const Row(
+            child: Row(
               children: [
                 Icon(
-                  Icons.label_off_outlined,
+                  hasLabel ? Icons.edit_outlined : Icons.label_outline,
                   size: 16,
-                  color: Color(0xffe06c75),
+                  color: const Color(0xff7fd1c7),
                 ),
-                SizedBox(width: 10),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    'Clear custom label',
+                    hasLabel
+                        ? 'Edit custom label...'
+                        : 'Assign custom label...',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: Color(0xffcdd7d6), fontSize: 13),
+                    style: const TextStyle(
+                      color: Color(0xffcdd7d6),
+                      fontSize: 13,
+                    ),
                   ),
                 ),
               ],
             ),
           ),
-      ],
+          if (hasLabel)
+            PopupMenuItem<String>(
+              value: 'clear_label',
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              child: const Row(
+                children: [
+                  Icon(
+                    Icons.label_off_outlined,
+                    size: 16,
+                    color: Color(0xffe06c75),
+                  ),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Clear custom label',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: Color(0xffcdd7d6), fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
       );
     } finally {
       _contextMenuOpen = false;
@@ -10883,9 +10892,7 @@ class WorkspaceHeader extends StatelessWidget {
               if (onToggleSoftKeyboard != null) ...[
                 IconButton(
                   icon: Icon(
-                    softKeyboardEnabled
-                        ? Icons.keyboard
-                        : Icons.keyboard_hide,
+                    softKeyboardEnabled ? Icons.keyboard : Icons.keyboard_hide,
                     size: isNarrow ? 18 : 24,
                     color: softKeyboardEnabled
                         ? const Color(0xffcdd7d6)
