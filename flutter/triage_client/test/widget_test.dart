@@ -2201,6 +2201,39 @@ void main() {
   );
 
   testWidgets(
+    'rail reconcile converges rows and labels with no push delivered',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / main'), findsWidgets);
+
+      // The daemon's membership changes with no push delivered (a miss the
+      // client never noticed): the reconcile must add, remove, and relabel
+      // through the same paths as the pushes. The stats poll is parked so
+      // its timer cannot error into this test's async zone.
+      client.hangDaemonStats = Completer<DaemonStatsRecord?>();
+      client.initialSessions = ['main', 'reconciled-new'];
+      client.railLayout = (
+        groupKeys: <String>[],
+        sessionIds: <String>[],
+        customLabels: {
+          'main': 'Renamed Main',
+          'reconciled-new': 'Fresh Label',
+        },
+      );
+      await tester.pump(const Duration(seconds: 61));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / flutter-spike'), findsNothing);
+      expect(find.text('triage / websocket-session-api'), findsNothing);
+      expect(find.text('Renamed Main'), findsWidgets);
+      expect(find.text('Fresh Label'), findsWidgets);
+    },
+  );
+
+  testWidgets(
     'dynamically auto-loads session when session_started arrives on empty session list',
     (WidgetTester tester) async {
       final client = FakeTriageWebSocketClient();
