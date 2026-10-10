@@ -18,6 +18,15 @@ enum LeaseChangeAction : byte {
     TakenOver = 2
 }
 
+// Host battery charge state for the daemon selector. Unknown doubles as
+// "no battery" (desktops) and "probe failed".
+enum BatteryState : byte {
+    Unknown = 0,
+    Charging = 1,
+    Discharging = 2,
+    Full = 3
+}
+
 struct SessionSize {
     rows: uint32;
     cols: uint32;
@@ -333,6 +342,14 @@ table HelloResult {
     // Appended for forward/backward compatibility: whether the daemon offers
     // Tailscale-identity pairing. Absent (false) on older daemons.
     tailscale_pairing_available: bool;
+    // Appended for forward/backward compatibility: host CPU busy percent
+    // and battery level/state for the daemon selector. -1 means unknown
+    // (0 is a valid reading, so the disk 0/0 convention cannot apply);
+    // the explicit defaults keep a new client reading an old daemon on
+    // unknown instead of a bogus 0.
+    cpu_percent: int16 = -1;
+    battery_percent: int16 = -1;
+    battery_state: BatteryState = Unknown;
 }
 
 table PairedResult {
@@ -465,6 +482,12 @@ table RailLayoutResult {
 table DaemonStatsResult {
     disk_free_bytes: uint64;
     disk_total_bytes: uint64;
+    // Appended for forward/backward compatibility: host CPU busy percent
+    // and battery level/state, same -1-means-unknown convention as the
+    // HelloResult copies.
+    cpu_percent: int16 = -1;
+    battery_percent: int16 = -1;
+    battery_state: BatteryState = Unknown;
 }
 
 union ServerResultPayload {

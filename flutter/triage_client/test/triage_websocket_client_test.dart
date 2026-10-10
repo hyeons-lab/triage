@@ -1354,20 +1354,101 @@ void main() {
     test('rejects null and zero-total probe failures', () {
       expect(isUsableDaemonStats(null), isFalse);
       expect(
-        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 0)),
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: null,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        )),
         isFalse,
       );
     });
 
     test('accepts positive totals including a full disk', () {
       expect(
-        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 100)),
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 100,
+          cpuPercent: null,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        )),
         isTrue,
       );
       expect(
-        isUsableDaemonStats((diskFreeBytes: 50, diskTotalBytes: 100)),
+        isUsableDaemonStats((
+          diskFreeBytes: 50,
+          diskTotalBytes: 100,
+          cpuPercent: 12,
+          batteryPercent: 87,
+          batteryState: 'charging',
+        )),
         isTrue,
       );
+    });
+
+    test('accepts host-only readings when disk is unknown', () {
+      expect(
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: 12,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        )),
+        isTrue,
+      );
+      expect(
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: null,
+          batteryPercent: 87,
+          batteryState: 'discharging',
+        )),
+        isTrue,
+      );
+    });
+  });
+
+  group('daemonStatsFromResponse', () {
+    test('reads host legs alongside disk', () {
+      final stats = daemonStatsFromResponse({
+        'disk_free_bytes': 50,
+        'disk_total_bytes': 100,
+        'cpu_percent': 12,
+        'battery_percent': 87,
+        'battery_state': 'charging',
+      });
+      expect(stats.diskFreeBytes, 50);
+      expect(stats.diskTotalBytes, 100);
+      expect(stats.cpuPercent, 12);
+      expect(stats.batteryPercent, 87);
+      expect(stats.batteryState, 'charging');
+    });
+
+    test('missing keys degrade to hidden legs (old daemons)', () {
+      final stats = daemonStatsFromResponse({
+        'disk_free_bytes': 50,
+        'disk_total_bytes': 100,
+      });
+      expect(stats.cpuPercent, isNull);
+      expect(stats.batteryPercent, isNull);
+      expect(stats.batteryState, 'unknown');
+    });
+
+    test('normalizes sentinel, clamp, and bad state', () {
+      final stats = daemonStatsFromResponse({
+        'disk_free_bytes': 50,
+        'disk_total_bytes': 100,
+        'cpu_percent': -1,
+        'battery_percent': 101,
+        'battery_state': 'calibrating',
+      });
+      expect(stats.cpuPercent, isNull);
+      expect(stats.batteryPercent, 100);
+      expect(stats.batteryState, 'unknown');
     });
   });
 

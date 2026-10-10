@@ -7,6 +7,43 @@ use triage_core::session::{
     StyledRowsRequest, WriteInputRequest,
 };
 
+/// Host percent to the wire: unknown encodes as -1 (0 is a valid reading).
+pub(crate) fn percent_to_wire(percent: Option<u8>) -> i16 {
+    percent.map_or(-1, |percent| percent as i16)
+}
+
+/// Wire percent back to a reading. Negative is unknown; above 100 clamps
+/// rather than failing the whole result on one corrupt field.
+pub(crate) fn percent_from_wire(raw: i16) -> Option<u8> {
+    if raw < 0 {
+        None
+    } else {
+        Some(raw.min(100) as u8)
+    }
+}
+
+fn battery_state_to_fb(state: triage_core::host::BatteryState) -> fb::BatteryState {
+    match state {
+        triage_core::host::BatteryState::Unknown => fb::BatteryState::Unknown,
+        triage_core::host::BatteryState::Charging => fb::BatteryState::Charging,
+        triage_core::host::BatteryState::Discharging => fb::BatteryState::Discharging,
+        triage_core::host::BatteryState::Full => fb::BatteryState::Full,
+    }
+}
+
+/// Wire battery state back to a reading. A value from a newer daemon maps
+/// to Unknown rather than failing the handshake: a stats enum must never
+/// break older clients.
+fn battery_state_from_fb(state: fb::BatteryState) -> triage_core::host::BatteryState {
+    match state {
+        fb::BatteryState::Unknown => triage_core::host::BatteryState::Unknown,
+        fb::BatteryState::Charging => triage_core::host::BatteryState::Charging,
+        fb::BatteryState::Discharging => triage_core::host::BatteryState::Discharging,
+        fb::BatteryState::Full => triage_core::host::BatteryState::Full,
+        _ => triage_core::host::BatteryState::Unknown,
+    }
+}
+
 pub fn parse_client_message(
     msg: fb::ClientMessage<'_>,
 ) -> Result<ClientMessage, crate::ProtocolError> {
@@ -1118,6 +1155,9 @@ pub fn build_server_message<'a>(
                     disk_free_bytes,
                     disk_total_bytes,
                     tailscale_pairing_available,
+                    cpu_percent,
+                    battery_percent,
+                    battery_state,
                 } => {
                     let pv = builder.create_string(protocol_version);
                     let sv = builder.create_string(server_version);
@@ -1133,6 +1173,9 @@ pub fn build_server_message<'a>(
                             disk_free_bytes: *disk_free_bytes,
                             disk_total_bytes: *disk_total_bytes,
                             tailscale_pairing_available: *tailscale_pairing_available,
+                            cpu_percent: percent_to_wire(*cpu_percent),
+                            battery_percent: percent_to_wire(*battery_percent),
+                            battery_state: battery_state_to_fb(*battery_state),
                         },
                     );
                     (fb::ServerResultPayload::HelloResult, r.as_union_value())
@@ -1517,12 +1560,18 @@ pub fn build_server_message<'a>(
                 ServerResult::DaemonStats {
                     disk_free_bytes,
                     disk_total_bytes,
+                    cpu_percent,
+                    battery_percent,
+                    battery_state,
                 } => {
                     let r = fb::DaemonStatsResult::create(
                         builder,
                         &fb::DaemonStatsResultArgs {
                             disk_free_bytes: *disk_free_bytes,
                             disk_total_bytes: *disk_total_bytes,
+                            cpu_percent: percent_to_wire(*cpu_percent),
+                            battery_percent: percent_to_wire(*battery_percent),
+                            battery_state: battery_state_to_fb(*battery_state),
                         },
                     );
                     (
@@ -1896,6 +1945,9 @@ pub enum ServerResultBorrowed<'a> {
         disk_free_bytes: u64,
         disk_total_bytes: u64,
         tailscale_pairing_available: bool,
+        cpu_percent: Option<u8>,
+        battery_percent: Option<u8>,
+        battery_state: triage_core::host::BatteryState,
     },
     Paired {
         token: &'a str,
@@ -1937,6 +1989,9 @@ pub enum ServerResultBorrowed<'a> {
     DaemonStats {
         disk_free_bytes: u64,
         disk_total_bytes: u64,
+        cpu_percent: Option<u8>,
+        battery_percent: Option<u8>,
+        battery_state: triage_core::host::BatteryState,
     },
 }
 
@@ -2051,6 +2106,9 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         disk_free_bytes: hello.disk_free_bytes(),
                         disk_total_bytes: hello.disk_total_bytes(),
                         tailscale_pairing_available: hello.tailscale_pairing_available(),
+                        cpu_percent: percent_from_wire(hello.cpu_percent()),
+                        battery_percent: percent_from_wire(hello.battery_percent()),
+                        battery_state: battery_state_from_fb(hello.battery_state()),
                     }
                 }
                 fb::ServerResultPayload::PairingChallengeResult => {
@@ -2181,6 +2239,9 @@ pub fn parse_fb_server_message_borrowed<'a>(
                     ServerResultBorrowed::DaemonStats {
                         disk_free_bytes: stats.disk_free_bytes(),
                         disk_total_bytes: stats.disk_total_bytes(),
+                        cpu_percent: percent_from_wire(stats.cpu_percent()),
+                        battery_percent: percent_from_wire(stats.battery_percent()),
+                        battery_state: battery_state_from_fb(stats.battery_state()),
                     }
                 }
                 fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {

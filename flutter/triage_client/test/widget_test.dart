@@ -1340,6 +1340,93 @@ void main() {
   );
 
   testWidgets(
+    'daemon stats poll paints host line under disk line',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final poll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll;
+      await tester.pump(const Duration(seconds: 61));
+      poll.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: 12,
+        batteryPercent: 87,
+        batteryState: 'charging',
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsOneWidget);
+      expect(
+        find.text('CPU 12% · Battery 87% (charging)'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'daemon stats poll with unknown host stats hides host status line',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final poll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll;
+      await tester.pump(const Duration(seconds: 61));
+      poll.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsOneWidget);
+      expect(find.textContaining('CPU'), findsNothing);
+      expect(find.textContaining('Battery'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'daemon stats poll preserves previous non-null stats on partial poll miss',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final poll1 = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll1;
+      await tester.pump(const Duration(seconds: 61));
+      poll1.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: 25,
+        batteryPercent: 80,
+        batteryState: 'charging',
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('CPU 25% · Battery 80% (charging)'), findsOneWidget);
+
+      final poll2 = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll2;
+      await tester.pump(const Duration(seconds: 61));
+      poll2.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: 79,
+        batteryState: 'charging',
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('CPU 25% · Battery 79% (charging)'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
     'daemon stats poll resolving after close repaints nothing',
     (WidgetTester tester) async {
       final client = FakeTriageWebSocketClient();
@@ -1355,6 +1442,9 @@ void main() {
       firstPoll.complete((
         diskFreeBytes: 50 * 1024 * 1024,
         diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
       ));
       await tester.pumpAndSettle();
       expect(find.textContaining('free ('), findsOneWidget);
@@ -1371,6 +1461,9 @@ void main() {
       client.hangDaemonStats!.complete((
         diskFreeBytes: 50 * 1024 * 1024,
         diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
       ));
       await tester.pumpAndSettle();
 
