@@ -837,6 +837,9 @@ class SessionVm {
     bool isExited = false,
   }) {
     historyStart = rawOutputStart;
+    if (windowBytes != null) {
+      historyWindowBytes = windowBytes;
+    }
     _pendingHistory = _PendingHistory(
       rawOutput,
       throughOutputSeq,

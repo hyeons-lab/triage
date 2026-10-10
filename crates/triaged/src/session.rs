@@ -685,18 +685,16 @@ impl SessionManager {
         });
         let next_session = next_session_sequence(sessions.keys());
         let paired_devices = load_paired_devices(&config.log_dir);
-        let (require_pairing, tailscale_pair_users) =
-            if let Ok(path) = triage_core::config::Config::default_path() {
-                if path.exists() {
-                    triage_core::config::Config::load_from_path(&path)
-                        .map(|c| (c.remote.require_pairing, c.remote.tailscale_pair_users))
-                        .unwrap_or((true, Vec::new()))
-                } else {
-                    (true, Vec::new())
-                }
-            } else {
-                (true, Vec::new())
-            };
+        let (require_pairing, tailscale_pair_users) = if cfg!(test) {
+            (true, Vec::new())
+        } else {
+            triage_core::config::Config::default_path()
+                .ok()
+                .filter(|p| p.exists())
+                .and_then(|p| triage_core::config::Config::load_from_path(p).ok())
+                .map(|c| (c.remote.require_pairing, c.remote.tailscale_pair_users))
+                .unwrap_or_else(|| (true, Vec::new()))
+        };
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,

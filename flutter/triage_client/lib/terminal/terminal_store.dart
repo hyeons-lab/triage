@@ -87,7 +87,7 @@ const int kEmulatorMaxScrollbackLines = 50000;
   final scaledLines =
       platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
   return (
-    maxLines: min(scaledLines, kEmulatorMaxScrollbackLines),
+    maxLines: min(max(1, scaledLines), kEmulatorMaxScrollbackLines),
     maxBytes: min(windowBytes, platformBytes),
   );
 }
@@ -656,7 +656,7 @@ class TerminalStore extends ChangeNotifier {
     tdbg(
       'store.history',
       'FULL REPLAY ${bytes.length}B at ${cols}x$rows '
-          'throughSeq=$throughSeq rawStart=$rawStart',
+          'throughSeq=$throughSeq rawStart=$rawStart windowBytes=$windowBytes',
     );
     _sink.clear();
     // Reset carries so history starts a fresh decode stream; history then

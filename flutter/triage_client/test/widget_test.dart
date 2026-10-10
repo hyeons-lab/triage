@@ -5688,6 +5688,9 @@ void main() {
       await tester.pumpAndSettle();
       expect(pages, 3);
       expect(find.text('No older scrollback in reach'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 3));
+      expect(find.text('No older scrollback in reach'), findsNothing);
     });
 
     testWidgets('a fruitful page neither continues nor reports', (

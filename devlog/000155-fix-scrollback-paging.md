@@ -2,7 +2,7 @@
 
 ## Agent
 
-Muse Code (muse-spark) — 2026-10-06T06:30-0700.
+2026-10-06T06:30-0700.
 
 ## Intent
 
@@ -30,6 +30,11 @@ fix PR on top of #192.
   auto-continue + pill, fruitful quiet), trim-budget units, store
   scaled-replay, Vm buffer-growth regression, and an env-guarded
   live-daemon round-trip test (`TRIAGE_LIVE_WS`, skipped in CI).
+- Review audit: re-seated web viewport to clamped target before checking
+  barren auto-continuation; reset transient exhaustion pill on session
+  swap; enforced 1-line floor in `historyTrimBudgetsForWindow`; synced
+  `historyWindowBytes` in `applyHistory`; isolated `SessionManager::new`
+  under `cfg!(test)` to prevent ambient host config pollution.
 
 ## Decisions
 
@@ -49,8 +54,14 @@ fix PR on top of #192.
   replay result, which covers region-eaten output that a newline
   count would miss.
 - Out of scope: reaching scrollback buried under gigabytes of TUI
-  redraws needs scrollback extraction or a raw-log viewer — a
+  redraws needs scrollback extraction or a raw-log viewer: a
   product decision for a follow-up, not this fix.
+- Re-seat viewport before evaluating barren near-top status: xterm.js
+  buffer writes scroll to baseY; evaluating near-top against live
+  viewport before restore checks the tail instead of the anchor.
+- Hermetic test isolation: isolate `SessionManager::new` under
+  `cfg!(test)` to prevent developer host configuration from altering
+  pairing defaults during unit tests.
 
 ## Issues
 
@@ -67,7 +78,7 @@ fix PR on top of #192.
   scrollback at all. The TUI updates a scroll region in place (~1976
   save/set-region/reset cycles per MiB); region scrolls never enter
   the scrollback buffer. Headless xterm.js replays the 1 MiB tail to
-  24 lines (6 non-empty). Correct emulation — paging cannot help
+  24 lines (6 non-empty). Correct emulation: paging cannot help
   because older windows are the same redraws. The 2.24 GB log floods
   at ~4.5 KiB/s, so the desert exceeds any sane window.
 - The user is actively typing in session-245 (last_input 11 s before
@@ -76,7 +87,10 @@ fix PR on top of #192.
 
 ## Commits
 
-- HEAD — fix(client): unstick scrollback paging on barren and dense histories
+- be7e36e: fix(client): unstick scrollback paging on barren and dense histories
+- b6dbdc0: docs(devlog): record 193 deploy verification
+- 179fb41: docs(devlog): record Pixel install
+- HEAD: fix(scrollback): review findings from scrollback-paging audit
 
 ## Progress
 
@@ -99,6 +113,16 @@ fix PR on top of #192.
   old pairing had lapsed. Web override dir
   (~/.local/share/triage/web) absent: nothing shadowing the embedded
   bundle. PR 193 CI green.
+- 2026-10-10T00:03-0700: Completed 8-pillar code review loop. Round 1
+  synthesized 10 findings across error handling, xterm.js viewport
+  drift, timer cleanup, and test isolation. Applied fixes across
+  `terminal_pane_web.dart`, `terminal_pane_stub.dart`,
+  `terminal_store.dart`, `main.dart`, `session.rs`, and test suites.
+  Round 2 confirmation review completed with zero findings across all
+  8 pillars. All 692 client tests and 356 workspace tests pass cleanly.
+- 2026-10-10T07:23-0700: Rebased onto feat/host-stats (65667a3). Verified
+  cross-target clippy passes cleanly for x86_64-unknown-linux-gnu and host,
+  all tests pass.
 
 ## Research & Discoveries
 
@@ -110,4 +134,5 @@ fix PR on top of #192.
 
 ## Next Steps
 
-- Run the live FBS paging probe; fix what it finds.
+- Commit and push fix/scrollback-paging to PR #193 with user approval.
+- Cascade rebase to PR #194 (feat/scrollback-index).

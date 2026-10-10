@@ -43,6 +43,17 @@ void main() {
       session.applyHistory([0x61], throughOutputSeq: 1, rawOutputStart: 0);
       expect(session.historyStart, 0);
     });
+
+    test('applyHistory synchronizes historyWindowBytes', () {
+      final session = _session();
+      session.applyHistory(
+        [0x61],
+        throughOutputSeq: 1,
+        rawOutputStart: 4096,
+        windowBytes: 131072,
+      );
+      expect(session.historyWindowBytes, 131072);
+    });
   });
 
   group('history trim budgets', () {
@@ -75,14 +86,23 @@ void main() {
       );
     });
 
-    test('null window keeps the platform budgets', () {
+    test('null and non-positive windows keep platform budgets', () {
+      for (final w in [null, 0, -1]) {
+        expect(
+          historyTrimBudgetsForWindow(w, web: false),
+          (maxLines: 1000, maxBytes: 262144),
+        );
+        expect(
+          historyTrimBudgetsForWindow(w, web: true),
+          (maxLines: 50000, maxBytes: 1048576),
+        );
+      }
+    });
+
+    test('small positive window maintains at least one line', () {
       expect(
-        historyTrimBudgetsForWindow(null, web: false),
-        (maxLines: 1000, maxBytes: 262144),
-      );
-      expect(
-        historyTrimBudgetsForWindow(null, web: true),
-        (maxLines: 50000, maxBytes: 1048576),
+        historyTrimBudgetsForWindow(50, web: false),
+        (maxLines: 1, maxBytes: 50),
       );
     });
   });

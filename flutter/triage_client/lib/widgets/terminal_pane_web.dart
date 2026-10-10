@@ -1656,24 +1656,12 @@ class _TerminalPaneState extends State<TerminalPane> {
         timer.cancel();
         _pageRestoreTimer = null;
         if (!mounted || !_initialized || len < 0) return;
-        // A page that added no lines while the user is still near the top
+        // A page that added no lines while the user was near the top
         // is a barren window (a TUI redrawing in place): ask for a deeper
-        // one instead of re-seating on identical content, so one gesture
-        // skips the desert. The viewport is re-read here (not trusted
-        // from the anchor): the parse the poll waited out took long
-        // enough for the user to scroll away.
-        var stillNearTop = false;
-        try {
-          final buffer = js_util.getProperty(_term, 'buffer');
-          final active = js_util.getProperty(buffer, 'active');
-          final viewportY =
-              (js_util.getProperty(active, 'viewportY') as num?)?.toInt();
-          stillNearTop = viewportY != null && viewportY <= 5;
-        } catch (_) {}
-        if (len - anchorLen <= 0 && stillNearTop) {
-          _continuePastBarrenPage();
-          return;
-        }
+        // one instead of sitting on identical content, so one gesture
+        // skips the desert. Re-seat the viewport on target first so the
+        // view does not sit stranded at the bottom of the log.
+        final wasNearTop = anchorY <= 5;
         final target = anchorY + (len - anchorLen);
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         var baseY = 0;
@@ -1692,6 +1680,10 @@ class _TerminalPaneState extends State<TerminalPane> {
           _sessionSavedViewportY[_sanitizedId] = clamped;
         }
         _pendingScrollToBottomOnRelease = false;
+        if (len - anchorLen <= 0 && wasNearTop) {
+          _continuePastBarrenPage();
+          return;
+        }
       } else {
         lastLen = len;
       }
@@ -2977,7 +2969,11 @@ class _TerminalPaneState extends State<TerminalPane> {
         _restoreScrollPosition(requestFocus: false);
       }
     }
-    if (oldWidget.controller != widget.controller) {
+    if (oldWidget.controller != widget.controller ||
+        oldWidget.terminalId != widget.terminalId) {
+      _noOlderScrollbackTimer?.cancel();
+      _noOlderScrollbackTimer = null;
+      _showNoOlderScrollback = false;
       tdbg(
         'pane.didUpdate',
         '$_sanitizedId controller changed '

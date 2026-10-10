@@ -373,6 +373,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (!identical(oldWidget.terminal, widget.terminal) ||
         oldWidget.terminalId != widget.terminalId) {
+      _noOlderScrollbackTimer?.cancel();
+      _noOlderScrollbackTimer = null;
+      _showNoOlderScrollback = false;
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -560,6 +563,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       _pageAnchorAt = null;
       _pendingBottomSnapOnPointerUp = false;
       _suppressScrollSaveFor(const Duration(milliseconds: 500));
+      if (addedLines <= 0 && wasNearTop) {
+        _continuePastBarrenPage();
+        return;
+      }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || !_scrollController.hasClients) return;
         final position = _scrollController.position;
@@ -575,9 +582,6 @@ class _TerminalPaneState extends State<TerminalPane> {
           maxScrollExtent: position.maxScrollExtent,
           lineHeight: lh,
         );
-        if (addedLines <= 0 && wasNearTop) {
-          _continuePastBarrenPage();
-        }
       });
       return;
     }

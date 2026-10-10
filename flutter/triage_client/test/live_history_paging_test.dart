@@ -23,13 +23,20 @@ String? get _liveWs {
   return Platform.environment['TRIAGE_LIVE_WS'];
 }
 
+String get _liveSessionId {
+  const sid = String.fromEnvironment('TRIAGE_LIVE_SESSION');
+  if (sid.isNotEmpty) return sid;
+  return Platform.environment['TRIAGE_LIVE_SESSION'] ?? 'session-255';
+}
+
 Future<Map<String, dynamic>> _window(
   TriageWebSocketClient client,
   String clientId,
-  int bytes,
-) async {
+  int bytes, {
+  String? sessionId,
+}) async {
   final res = await client.attachSession(
-    sessionId: 'session-255',
+    sessionId: sessionId ?? _liveSessionId,
     clientId: clientId,
     mode: 'Observer',
     historyBytes: bytes,
@@ -77,9 +84,10 @@ void main() {
         final w64 = await _window(client, 'live-probe2', 65536);
         final w128 = await _window(client, 'live-probe2', 131072);
 
+        final targetSessionId = _liveSessionId;
         final session = SessionVm(
-          title: 'triage / session-255',
-          sessionId: 'session-255',
+          title: 'triage / $targetSessionId',
+          sessionId: targetSessionId,
           status: 'attached',
           statusColor: const Color(0xff7fd1c7),
           icon: Icons.terminal,
