@@ -6890,7 +6890,7 @@ impl OutputState {
     /// rebuilt window instead of re-journaling persisted lines.
     fn init_scroll_baseline(&mut self) {
         if self.scroll_seq_baseline.is_some()
-            || self.scrollback.is_none()
+            || self.scrollback.as_ref().is_none_or(|j| !j.is_enabled())
             || self.terminal.is_alt_screen_active()
         {
             return;
@@ -6916,7 +6916,9 @@ impl OutputState {
     /// reflow replay through `advance_replayed_bytes`, which never calls
     /// this, so rebuilt terminals cannot double-journal persisted lines.
     fn journal_scrolled_lines(&mut self) {
-        if self.scrollback.is_none() || self.terminal.is_alt_screen_active() {
+        if self.scrollback.as_ref().is_none_or(|j| !j.is_enabled())
+            || self.terminal.is_alt_screen_active()
+        {
             return;
         }
         let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
@@ -7161,6 +7163,7 @@ impl OutputState {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
         self.cwd_sequence_buffer.clear();
+        self.scroll_seq_baseline = None;
 
         if let Some(cache) = self.log_cache.clone() {
             self.advance_replayed_bytes(&cache);
@@ -9866,6 +9869,73 @@ mod tests {
             "historical reflow should not write terminal replies to the live PTY"
         );
         let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_reflow_does_not_journal_replayed_history() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let log_path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 10,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&log_path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Ingest 10 lines: fits within 10 rows, no scrolls into scrollback yet.
+        output
+            .ingest(
+                b"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8\r\nline9",
+            )
+            .expect("ingest initial lines");
+
+        let initial_journaled = {
+            let journal = output.scrollback.as_mut().expect("journal");
+            journal.read_prefix_older_than(1000, 1024)
+        };
+        assert!(
+            initial_journaled.is_empty(),
+            "no lines scrolled yet on 10-row terminal"
+        );
+
+        // Reflow/resize terminal to 3 rows: replays log into 3 rows.
+        // During replay, lines 0..6 scroll into the terminal's internal scrollback.
+        let new_size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let writer = shared_pty_writer(Box::new(std::io::sink()));
+        output
+            .reflow_from_log(&new_size, writer)
+            .expect("reflow log");
+
+        // Ingest a new single live line
+        output
+            .ingest(b"\r\nlive_after_resize\r\n")
+            .expect("ingest live after resize");
+
+        let after_journaled = {
+            let journal = output.scrollback.as_mut().expect("journal");
+            journal.read_prefix_older_than(1000, 1024)
+        };
+
+        // If reflow had not reset scroll_seq_baseline to None, the pre-resize baseline (0)
+        // would cause all replayed lines (line0..line6) to be journaled on this live chunk.
+        // With scroll_seq_baseline reset, only the newly scrolled lines from the live chunk are journaled.
+        let text = String::from_utf8_lossy(&after_journaled);
+        assert!(
+            !text.contains("line0"),
+            "replayed history lines must not be journaled after reflow: {text:?}"
+        );
+        assert!(
+            !text.contains("line1"),
+            "replayed history lines must not be journaled after reflow: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13924,7 +13994,7 @@ mod tests {
 
     /// Desert flood: TUI-style in-place redraws scroll nothing, so the
     /// journal stays empty no matter how many bytes pass through. This
-    /// is the case the journal exists for in reverse — the raw bytes
+    /// is the case the journal exists for in reverse: the raw bytes
     /// are unreachable desert, and there are no scrolled lines to save.
     #[test]
     fn ingest_desert_flood_journals_nothing() {

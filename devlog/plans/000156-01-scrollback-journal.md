@@ -4,7 +4,7 @@
 
 Problem: TUI-saturated sessions (session-245: 2.24 GB log, ~1976
 scroll-region cycles/MiB, flooding 4.5 KiB/s) hold no scrollback in
-any reachable byte window — the 1 MiB tail replays to 24 lines
+any reachable byte window: the 1 MiB tail replays to 24 lines
 (proven in 000155 with headless xterm.js). Byte windows cannot reach
 the real scrolled content buried under the redraw desert. PR 193 made
 paging correct within reach and honest at exhaustion; this plan
@@ -19,7 +19,7 @@ Key findings from the ingest path (all verified this run):
 - The emulator retains 3500 scrollback rows by default
   (`TerminalConfiguration::scrollback_size`, config.rs:146) and
   `TriageTerminalConfig` keeps the default. Region scrolls never enter
-  it (wezterm-correct), so it holds exactly the scrolled lines —
+  it (wezterm-correct), so it holds exactly the scrolled lines,
   including session-245's pre-TUI output. The data is already in RAM.
 - Production cell→styled-span conversion exists
   (`styled_visible_rows_for_range`, used by `snapshot_from_output`).
@@ -27,7 +27,7 @@ Key findings from the ingest path (all verified this run):
 - History serving funnels through one function,
   `overlay_raw_output_history` (session.rs:7471): one injection point.
 - TUI redraw cycles are absolute-anchor rich (8302 `n;nH` positions
-  per MiB in session-245), so a mid-stream replay self-corrects —
+  per MiB in session-245), so a mid-stream replay self-corrects,
   the property today's window cuts already rely on.
 
 Options considered:
@@ -74,7 +74,7 @@ unchanged. Budget split: prefix up to half the window cap, raw tail
 the rest (min 16 KiB raw so the viewport always repaints).
 
 Deliberate semantic: wiped (3J) scrollback stays servable from the
-journal — triage history is a record, not a mirror of terminal
+journal: triage history is a record, not a mirror of terminal
 scrollback. Alt-screen content is never journaled (ephemeral by
 terminal design, consistent everywhere). Journal rows keep their
 ingest width (rewrap differences on resize are cosmetic).
@@ -140,7 +140,7 @@ ends (no autowrap dependence).
    path; unit test). Segmented sessions never rebase (absolute
    offsets).
 5. Serve path: extend `overlay_raw_output_history` (or a wrapper at
-   its two call sites — live actor path session.rs:3284 and
+   its two call sites: live actor path session.rs:3284 and
    Historical path session.rs:3296) to prepend seam-queried journal
    bytes within the budget split. `raw_output_start` unchanged.
 6. Desert-fixture integration test: feed region-update cycles plus
@@ -187,7 +187,7 @@ ends (no autowrap dependence).
 - Non-goals: client changes, protocol changes, alt-screen history,
   backfilling scrollback for logs written before this ships (journal
   starts at deploy; old deserts stay deserts until new scrolls
-  arrive — acceptable, documented).
+  arrive; acceptable and documented).
 
 ## Build Notes (appended during implementation)
 

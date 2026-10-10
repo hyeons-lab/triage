@@ -250,6 +250,11 @@ impl ScrollbackJournal {
         }
     }
 
+    /// Returns true if the journal is operational (not broken or disabled).
+    pub fn is_enabled(&self) -> bool {
+        !self.broken
+    }
+
     /// Append one scrolled line. Soft-fails into disabled mode.
     pub fn append(&mut self, log_offset: u64, bytes: &[u8]) {
         if self.broken {
@@ -281,7 +286,10 @@ impl ScrollbackJournal {
         'files: for index in self.sealed_and_active_newest_first() {
             let records = match self.read_file_records(index) {
                 Ok(records) => records,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::warn!(?err, index, dir = %self.dir.display(), "skipping unreadable scrollback file");
+                    break 'files;
+                }
             };
             for record in records.iter().rev() {
                 if record.log_offset >= raw_start {
@@ -370,7 +378,7 @@ impl ScrollbackJournal {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.contains(".tmp.") {
+            if name.starts_with("scrollback-") && name.contains(".tmp.") {
                 let _ = std::fs::remove_file(entry.path());
                 continue;
             }
@@ -392,18 +400,26 @@ impl ScrollbackJournal {
         // Resume appending the active tail, or start a fresh index after
         // the sealed head (never reuse a sealed index).
         let resume = match (highest_active, highest_sealed) {
-            (Some(active), _) => active,
-            (None, Some(sealed)) => sealed + 1,
+            (Some(active), Some(sealed)) if active > sealed => active,
+            (_, Some(sealed)) => sealed + 1,
+            (Some(active), None) => active,
             (None, None) => 0,
         };
         self.active_index = resume;
         self.active_lines = Self::count_records(&self.active_path(resume));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.active_path(resume))?;
-        self.writer = Some(BufWriter::new(file));
+        self.writer = None;
         Ok(())
+    }
+
+    fn ensure_writer(&mut self) -> anyhow::Result<&mut BufWriter<File>> {
+        if self.writer.is_none() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.active_path(self.active_index))?;
+            self.writer = Some(BufWriter::new(file));
+        }
+        Ok(self.writer.as_mut().expect("writer initialized above"))
     }
 
     fn count_records(path: &Path) -> usize {
@@ -411,13 +427,24 @@ impl ScrollbackJournal {
             Ok(bytes) => bytes,
             Err(_) => return 0,
         };
-        parse_records(&bytes).len()
+        let mut count = 0;
+        let mut cursor = 0;
+        while cursor + RECORD_HEADER_LEN <= bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap_or([0; 4]))
+                    as usize;
+            cursor += RECORD_HEADER_LEN;
+            if len > bytes.len().saturating_sub(cursor) {
+                break;
+            }
+            count += 1;
+            cursor += len;
+        }
+        count
     }
 
     fn append_inner(&mut self, log_offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
-        let Some(writer) = self.writer.as_mut() else {
-            anyhow::bail!("journal writer missing");
-        };
+        let writer = self.ensure_writer()?;
         writer.write_all(&log_offset.to_le_bytes())?;
         writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
         writer.write_all(bytes)?;
@@ -434,16 +461,13 @@ impl ScrollbackJournal {
         }
         self.writer = None;
         let raw_path = self.active_path(self.active_index);
-        let sealed_path = self.sealed_path(self.active_index);
-        crate::storage::compress_segment_file(&raw_path, &sealed_path)?;
-        self.enforce_retention()?;
+        if raw_path.exists() {
+            let sealed_path = self.sealed_path(self.active_index);
+            crate::storage::compress_segment_file(&raw_path, &sealed_path)?;
+            self.enforce_retention()?;
+        }
         self.active_index += 1;
         self.active_lines = 0;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.active_path(self.active_index))?;
-        self.writer = Some(BufWriter::new(file));
         Ok(())
     }
 
@@ -473,21 +497,17 @@ impl ScrollbackJournal {
             return indices;
         };
         for entry in entries.flatten() {
-            if let Some((index, sealed)) =
+            if let Some((index, _sealed)) =
                 Self::parse_journal_index(&entry.file_name().to_string_lossy())
+                && !indices.contains(&index)
             {
-                // Skip the active stem here; it is pushed last-as-newest
-                // below (its sealed twin, if any, sorts by index).
-                if !sealed && index == self.active_index {
-                    continue;
-                }
-                if !indices.contains(&index) {
-                    indices.push(index);
-                }
+                indices.push(index);
             }
         }
+        if !indices.contains(&self.active_index) {
+            indices.push(self.active_index);
+        }
         indices.sort_unstable_by(|a, b| b.cmp(a));
-        indices.push(self.active_index);
         indices
     }
 
@@ -500,23 +520,26 @@ impl ScrollbackJournal {
             decoder.read_to_end(&mut bytes)?;
             bytes
         } else {
-            std::fs::read(self.active_path(index))?
+            let active = self.active_path(index);
+            if !active.exists() {
+                return Ok(Vec::new());
+            }
+            std::fs::read(active)?
         };
         Ok(parse_records(&bytes))
     }
 
     fn rebase_inner(&mut self, cut: u64) -> anyhow::Result<()> {
         if let Some(writer) = self.writer.as_mut() {
-            writer.flush()?;
+            let _ = writer.flush();
         }
+        self.writer = None;
         // Collect oldest-first across every file, then rewrite compacted.
         let mut indices = self.sealed_and_active_newest_first();
         indices.reverse();
         let mut survivors: Vec<JournalRecord> = Vec::new();
         for index in &indices {
-            let Ok(records) = self.read_file_records(*index) else {
-                continue;
-            };
+            let records = self.read_file_records(*index)?;
             for mut record in records {
                 if record.log_offset < cut {
                     continue;
@@ -529,14 +552,8 @@ impl ScrollbackJournal {
             let _ = std::fs::remove_file(self.sealed_path(*index));
             let _ = std::fs::remove_file(self.active_path(*index));
         }
-        self.writer = None;
         self.active_index = 0;
         self.active_lines = 0;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.active_path(0))?;
-        self.writer = Some(BufWriter::new(file));
         for record in survivors {
             self.append_inner(record.log_offset, &record.bytes)?;
         }
@@ -557,7 +574,7 @@ fn parse_records(bytes: &[u8]) -> Vec<JournalRecord> {
         let len = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap_or([0; 4]))
             as usize;
         cursor += RECORD_HEADER_LEN;
-        if cursor + len > bytes.len() {
+        if len > bytes.len().saturating_sub(cursor) {
             break;
         }
         records.push(JournalRecord {
@@ -779,6 +796,85 @@ mod tests {
                 b"a\r\nb\r\nc\r\n"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_rotation_and_sealed_read() {
+        let dir = unique_journal_dir("rotation");
+        let mut journal = ScrollbackJournal::open(&dir);
+        journal.append(100, b"file0_rec1\r\n");
+        journal.append(200, b"file0_rec2\r\n");
+        journal.rotate().expect("rotate file 0");
+        journal.append(300, b"file1_rec1\r\n");
+        journal.append(400, b"file1_rec2\r\n");
+
+        assert_eq!(
+            journal.sealed_and_active_newest_first(),
+            vec![1, 0],
+            "active index 1 should precede sealed index 0 in newest-first order"
+        );
+
+        // Read prefix spanning sealed and active files in oldest-first chronological order
+        assert_eq!(
+            journal.read_prefix_older_than(1000, 1024),
+            b"file0_rec1\r\nfile0_rec2\r\nfile1_rec1\r\nfile1_rec2\r\n"
+        );
+
+        // Budget caps should pull the newest records across the seam
+        assert_eq!(
+            journal.read_prefix_older_than(1000, 24),
+            b"file1_rec1\r\nfile1_rec2\r\n"
+        );
+
+        // Rebase should compact across sealed and active files
+        journal.rebase(250);
+        assert_eq!(
+            journal.read_prefix_older_than(1000, 1024),
+            b"file1_rec1\r\nfile1_rec2\r\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_lazy_file_creation() {
+        let dir = unique_journal_dir("lazy");
+        let mut journal = ScrollbackJournal::open(&dir);
+        assert!(journal.is_enabled());
+
+        // Opening should not eagerly create a 0-byte active file
+        let active_path = journal.active_path(0);
+        assert!(
+            !active_path.exists(),
+            "active file should not exist before first append"
+        );
+
+        // First append creates the file
+        journal.append(100, b"lazy_content\r\n");
+        assert!(
+            active_path.exists(),
+            "active file must exist after first append"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_sweeps_only_scrollback_tmp_files() {
+        let dir = unique_journal_dir("tmp_sweep");
+        let scrollback_tmp = dir.join("scrollback-000000.slog.zst.tmp.12345");
+        let segment_tmp = dir.join("segment-000001.tlog.zst.tmp.12345");
+        std::fs::write(&scrollback_tmp, b"debris").expect("write scrollback tmp");
+        std::fs::write(&segment_tmp, b"in-flight segment").expect("write segment tmp");
+
+        let _journal = ScrollbackJournal::open(&dir);
+        assert!(
+            !scrollback_tmp.exists(),
+            "scrollback tmp file should be swept"
+        );
+        assert!(
+            segment_tmp.exists(),
+            "segment tmp file must be preserved for storage worker"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
