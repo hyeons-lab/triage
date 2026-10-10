@@ -244,6 +244,19 @@ void main() {
       expect(inputs, ['\n']);
     });
 
+    testWidgets('Shift+Enter key repeat sends multiple LFs', (tester) async {
+      final inputs = await pumpPane(tester);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+
+      expect(inputs, ['\n', '\n']);
+    });
+
     testWidgets('Shift+numpadEnter sends LF', (tester) async {
       final inputs = await pumpPane(tester);
 

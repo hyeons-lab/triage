@@ -17,8 +17,11 @@ the web and native panes. Stacked on `perf/lazy-history`.
 - Native pane intercepts Enter/numpadEnter in
   `_handleTerminalKeyEvent`; web capture listener uses the helper in
   its Enter branch (Alt+Enter ESC+CR preserved).
-- Tests: helper unit tests (all modifier combos) + native widget tests
-  (Shift+Enter LF, plain/Ctrl+Shift fall-through).
+- Review findings fix: wire `bytesForEnterKey` into web
+  `attachCustomKeyEventHandler` on xterm.js directly so events
+  bypassing the window capture listener also send LF on Shift+Enter.
+- Tests: helper unit tests (all modifier combos), native widget tests
+  (Shift+Enter LF, key repeat, plain/Ctrl+Shift fall-through).
 
 ## Decisions
 
@@ -36,7 +39,8 @@ the web and native panes. Stacked on `perf/lazy-history`.
 
 ## Commits
 
-- HEAD: fix(client): shift+enter inserts a newline instead of submitting
+- da1ad59: fix(client): shift+enter inserts a newline instead of submitting
+- HEAD: fix(client): review findings from shift-enter-newline audit
 
 ## Progress
 
@@ -44,6 +48,12 @@ the web and native panes. Stacked on `perf/lazy-history`.
 - Discovery: web already intercepts all Enter in a window-capture
   listener; native falls through to xterm's handler.
 - Implemented + gates green (analyze clean, 666 flutter tests).
+- 2026-10-09T16:44-0700: Completed review fix loop at high effort.
+  Round 1 surfaced missing `bytesForEnterKey` wiring in web
+  `attachCustomKeyEventHandler` (Pillars 1 & 5) and missing key repeat
+  test (Pillar 8). Applied fixes; Round 2 full confirmation round
+  passed clean with zero findings across all 8 pillars. All 669 tests
+  passing and analyze clean.
 
 ## Research & Discoveries
 
@@ -55,5 +65,4 @@ the web and native panes. Stacked on `perf/lazy-history`.
 
 ## Next Steps
 
-- Shared helper + unit tests, both pane wirings, widget test, gates,
-  commit, stacked PR.
+- Push branch to origin, cascade to PR 190 (fix/context-list-fanout).

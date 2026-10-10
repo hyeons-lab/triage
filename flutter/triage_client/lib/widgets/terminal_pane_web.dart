@@ -1292,7 +1292,16 @@ class _TerminalPaneState extends State<TerminalPane> {
             js_util.callMethod(event, 'stopPropagation', []);
             final altKey =
                 js_util.getProperty(event, 'altKey') as bool? ?? false;
-            _sessionInputRouter.sendInput(sessionId, altKey ? '\x1b\r' : '\r');
+            final newline = bytesForEnterKey(
+              shift: js_util.getProperty(event, 'shiftKey') as bool? ?? false,
+              ctrl: js_util.getProperty(event, 'ctrlKey') as bool? ?? false,
+              alt: altKey,
+              meta: js_util.getProperty(event, 'metaKey') as bool? ?? false,
+            );
+            _sessionInputRouter.sendInput(
+              sessionId,
+              newline ?? (altKey ? '\x1b\r' : '\r'),
+            );
             return false;
           }
           if (key == 'Escape' ||
