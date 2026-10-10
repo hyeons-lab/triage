@@ -159,7 +159,30 @@ DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
 ///   falling back to raw base64 bytes if uncompressed.
 /// - `List<dynamic>`: legacy uncompressed JSON integer byte arrays.
 Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
-  final raw = snapshot['raw_output'];
+  return historyBytesFromField(snapshot['raw_output']);
+}
+
+/// Extracts the journaled scrollback prefix (lines at or older than the
+/// raw window seam) from a parsed snapshot map. Empty from old hosts; same
+/// encodings as the raw tail.
+Uint8List rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) {
+  return historyBytesFromField(snapshot['raw_output_prefix']);
+}
+
+/// Whether a parsed snapshot carries replayable history: either the raw
+/// tail or the journaled prefix counts. A prefix-only snapshot is
+/// reachable when the raw tail is empty but offset-0 journal survivors
+/// remain (a failed tail read re-queries the journal at seam 0, so only
+/// records stamped exactly 0 ride along); the restore fallback must not
+/// discard it as history-less.
+bool snapshotCarriesHistory(Map<String, dynamic> snapshot) {
+  return rawOutputFromSnapshot(snapshot).isNotEmpty ||
+      rawOutputPrefixFromSnapshot(snapshot).isNotEmpty;
+}
+
+/// Decodes one compressed-bytes history field (snapshot tail or fetch page)
+/// from either transport encoding into raw PTY bytes.
+Uint8List historyBytesFromField(dynamic raw) {
   if (raw is Uint8List) return raw;
   if (raw is String) {
     if (raw.isEmpty) return Uint8List(0);
@@ -1515,6 +1538,13 @@ class TriageWebSocketClient {
                 ? snap.rawOutput as Uint8List
                 : Uint8List.fromList(snap.rawOutput!)),
       'raw_output_start': snap.rawOutputStart,
+      // Journaled scrollback lines at or older than the raw window seam,
+      // replayed ahead of it on full replays and ignored by delta merges.
+      'raw_output_prefix': snap.rawOutputPrefix == null
+          ? null
+          : (snap.rawOutputPrefix is Uint8List
+                ? snap.rawOutputPrefix as Uint8List
+                : Uint8List.fromList(snap.rawOutputPrefix!)),
       // Local-LLM one-line description of the session, if generated.
       'snippet': snap.snippet,
       // Local-LLM longer-form summary for the hover popover / search.

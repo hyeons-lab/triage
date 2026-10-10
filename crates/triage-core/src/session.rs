@@ -125,6 +125,16 @@ pub struct SessionSnapshot {
     /// session's full output log (`bytes_logged` is the end offset).
     #[serde(default)]
     pub raw_output_start: u64,
+    /// Journaled scrollback lines at or older than the raw window seam
+    /// (SGR-encoded, reset-prefixed, oldest-first). A record stamped
+    /// exactly [`Self::raw_output_start`] is included: its chunk bytes
+    /// lie entirely below the window. Unaddressed: not part of the output
+    /// log and not covered by [`Self::raw_output_start`]. Full replays
+    /// prepend these bytes ahead of [`Self::raw_output`], while delta
+    /// merges ignore them and run byte accounting on [`Self::raw_output`]
+    /// alone. Empty when the journal has nothing at or below the seam.
+    #[serde(default, with = "compressed_bytes")]
+    pub raw_output_prefix: Vec<u8>,
     /// Local-LLM one-line description of what the session is doing, if one has
     /// been generated. `None` when summarization is disabled or not yet produced.
     #[serde(default)]
@@ -1152,6 +1162,7 @@ mod tests {
             exited: false,
             raw_output: original_bytes.clone(),
             raw_output_start: 0,
+            raw_output_prefix: original_bytes.clone(),
             snippet: None,
             snippet_detail: None,
         };
@@ -1161,12 +1172,14 @@ mod tests {
 
         // Verify it was serialized as a base64 string, not an array of numbers
         assert!(json_val["raw_output"].is_string());
+        assert!(json_val["raw_output_prefix"].is_string());
         let encoded_str = json_val["raw_output"].as_str().unwrap();
         assert!(!encoded_str.is_empty());
 
         let round_trip: SessionSnapshot =
             serde_json::from_str(&json_str).expect("deserialize snapshot");
         assert_eq!(round_trip.raw_output, original_bytes);
+        assert_eq!(round_trip.raw_output_prefix, original_bytes);
     }
 
     #[test]
@@ -1189,6 +1202,7 @@ mod tests {
             exited: false,
             raw_output: Vec::new(),
             raw_output_start: 0,
+            raw_output_prefix: Vec::new(),
             snippet: None,
             snippet_detail: None,
         };

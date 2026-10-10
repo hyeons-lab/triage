@@ -1019,6 +1019,119 @@ void main() {
     },
   );
 
+  test(
+    'full replay prepends the journaled prefix but anchors bytes on the raw tail',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      final prefixText = 'journaled old line\r\n';
+      final rawText = 'raw tail\r\n';
+      store.dispatch(
+        HistoryBytes(
+          b(rawText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 100,
+          rawOutputPrefix: b(prefixText),
+        ),
+      );
+
+      final painted = sink.written.toString();
+      expect(
+        painted,
+        contains(prefixText),
+        reason: 'prefix must paint at all: $painted',
+      );
+      expect(
+        painted.indexOf(prefixText),
+        lessThan(painted.indexOf(rawText)),
+        reason: 'prefix must replay ahead of the raw tail: $painted',
+      );
+      // Byte coordinates stay in raw-log space: the prefix is extra.
+      expect(store.appliedLogBytes, 100 + rawText.length);
+    },
+  );
+
+  test('prefix-only history still paints after scrollback is ready', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    final initialText = 'hello world\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b(initialText),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+    expect(store.appliedLogBytes, initialText.length);
+
+    // Empty raw tail with a nonempty prefix: the early-return guard must
+    // not swallow it (a prefix-only snapshot still paints).
+    final prefixText = 'journaled old line\r\n';
+    store.dispatch(
+      HistoryBytes(
+        const [],
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 15,
+        rawOutputPrefix: b(prefixText),
+      ),
+    );
+
+    final painted = sink.written.toString();
+    expect(
+      painted,
+      contains(prefixText),
+      reason: 'prefix-only payload must paint: $painted',
+    );
+  });
+
+  test('delta merge ignores the journaled prefix', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    final initialText = 'hello world\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b(initialText),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+        rawOutputPrefix: b('old prefix\r\n'),
+      ),
+    );
+    expect(store.appliedLogBytes, initialText.length);
+
+    // A resync whose prefix changed but whose raw tail only grew: the
+    // delta merge must apply the raw delta and never paint the prefix.
+    final addedText = 'second line\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b('$initialText$addedText'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 15,
+        rawOutputStart: 0,
+        rawOutputPrefix: b('new prefix that must not paint\r\n'),
+      ),
+    );
+
+    expect(sink.ops.where((op) => op == 'clear').length, 1);
+    expect(sink.ops.last, 'write:$addedText');
+    expect(sink.written.toString(), isNot(contains('must not paint')));
+    expect(store.appliedLogBytes, initialText.length + addedText.length);
+    expect(store.state.historyHighWaterSeq, 15);
+  });
+
   test('delta merge: subsequent snapshot already fully covered is a no-op', () {
     final sink = FakeTerminalSink();
     final store = TerminalStore(sink);

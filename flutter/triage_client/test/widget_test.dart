@@ -140,6 +140,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final Map<String, String?> attachLeaseHolders = {};
   final List<String> restoreSessionCalls = [];
   final Map<String, String> restoreSessionSizes = {};
+  // Prefix-only history the restore echo carries, per session. The daemon's
+  // restore snapshot replays journaled scrollback when the raw tail is gone;
+  // keyed sessions get `raw_output_prefix` with no `raw_output`, which is
+  // what the restore fallback gate must adopt rather than discard.
+  final Map<String, List<int>> restoreHistoryPrefix = {};
   final List<String> helloClientIds = [];
   final List<String?> helloTokens = [];
   final List<String> snapshotSessionCalls = [];
@@ -455,10 +460,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     restoreSessionCalls.add(sessionId);
     restoreSessionSizes[sessionId] = '${cols}x$rows';
     exitedSessionIds.remove(sessionId);
+    final prefix = restoreHistoryPrefix[sessionId];
     return {
       'snapshot': {
         'size': {'rows': rows, 'cols': cols},
         'exited': false,
+        if (prefix != null) 'raw_output_prefix': prefix,
       },
     };
   }
@@ -909,6 +916,36 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       },
     });
   }
+
+  /// Emits a server-pushed resync carrying a full-history snapshot. The
+  /// daemon serves these unwindowed at the history cap; the client must
+  /// replay them at the platform budgets, not the held window.
+  void emitResyncRequired(
+    String sessionId,
+    List<int> rawOutput, {
+    int start = 1000000,
+    int seq = 50,
+  }) {
+    _testEventController.add({
+      'type': 'event',
+      'envelope': {
+        'event': {
+          'ResyncRequired': {
+            'session_id': sessionId,
+            'snapshot': {
+              'size': {'rows': 24, 'cols': 80},
+              'exited': false,
+              'raw_output': rawOutput,
+              'raw_output_start': start,
+              'bytes_logged': start + rawOutput.length,
+              'output_seq': seq,
+            },
+          },
+        },
+      },
+    });
+  }
+
 }
 
 Future<void> withPlatform(
@@ -1731,6 +1768,84 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('ft-standard-WSL2 x86_64)'), findsNothing);
+  });
+
+  testWidgets('resync-required snapshot replays unwindowed, not at held window', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // 500 lines x 300 B = 150 KiB: the platform budgets (256 KiB) keep
+    // all of it, while the 64 KiB held window trims to ~218 lines. The
+    // ResyncRequired call site must replay unwindowed; read the buffer
+    // through the pane widget, since the fallback rendered rows never
+    // fit enough to discriminate. Fit the view first: history stays
+    // staged until a real grid size lands, which never happens under
+    // FLUTTER_TEST.
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+    final buf = StringBuffer();
+    for (var i = 0; i < 500; i++) {
+      buf.writeln('history line $i'.padRight(299));
+    }
+    client.emitResyncRequired('flutter-spike', utf8.encode(buf.toString()));
+    await tester.pumpAndSettle();
+
+    final terminal = tester
+        .widget<TerminalPane>(find.byType(TerminalPane))
+        .terminal;
+    // Each 300-char line wraps to ~4 rows at the fitted width, so the
+    // trimmed mutant (~218 logical lines) still shows ~870 buffer rows:
+    // pin the oldest line's survival, not just a row count.
+    final seen = StringBuffer();
+    for (var i = 0; i < terminal.buffer.lines.length; i++) {
+      seen.writeln(terminal.buffer.lines[i].toString());
+    }
+    expect(seen.toString(), contains('history line 0'));
+    expect(terminal.buffer.lines.length, greaterThanOrEqualTo(1500));
+  });
+
+  testWidgets('exited-session restore adopts a prefix-only prepared snapshot', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(
+      exitedSessionIds: {'flutter-spike'},
+    );
+    // The journaled scrollback the restore echo carries after the raw
+    // tail is gone: prefix bytes with no `raw_output` at all.
+    const prefixLine = 'restored journal prefix line';
+    client.restoreHistoryPrefix['flutter-spike'] = utf8.encode(
+      '$prefixLine\r\n',
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Precondition: the restore echo size must mismatch the attach
+    // snapshot size (24x80), or the fallback gate never runs. Both the
+    // estimated size and any leaked fitted size satisfy this; assert it
+    // so a harness change fails loudly instead of vacuously.
+    expect(client.restoreSessionCalls, contains('flutter-spike'));
+    expect(client.restoreSessionSizes['flutter-spike'], isNot('80x24'));
+
+    // The raw-only gate would discard the prefix-only prepared snapshot
+    // as history-less; the helper gate adopts it and the terminal paints
+    // the prefix. Reverting the call site to the raw-only check must
+    // fail this test. The load stages history until the view fits a real
+    // grid, which never happens under FLUTTER_TEST, so drive the fit
+    // directly like the reclaim tests do.
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+
+    final terminal = tester
+        .widget<TerminalPane>(find.byType(TerminalPane))
+        .terminal;
+    final seen = StringBuffer();
+    for (var i = 0; i < terminal.buffer.lines.length; i++) {
+      seen.writeln(terminal.buffer.lines[i].toString());
+    }
+    expect(seen.toString(), contains(prefixLine));
   });
 
   testWidgets('refreshes selected remote session from daemon snapshot', (
@@ -5559,6 +5674,33 @@ void main() {
   });
 
   group('history paging', () {
+    test('barren-page predicate truth table', () {
+      // A page continues past itself only when it added nothing while
+      // the user is still near the top; every other combination
+      // re-seats on the landed content. Shared by both pane
+      // implementations, so this pins the web behavior too.
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 0, nearTop: true),
+        isTrue,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: -3, nearTop: true),
+        isTrue,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 1, nearTop: true),
+        isFalse,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 0, nearTop: false),
+        isFalse,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 5, nearTop: false),
+        isFalse,
+      );
+    });
+
     List<int> historyLines(int from, int to) {
       final buf = StringBuffer();
       for (var i = from; i < to; i++) {

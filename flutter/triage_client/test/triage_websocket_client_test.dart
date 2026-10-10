@@ -1309,6 +1309,38 @@ void main() {
       expect(rawOutputFromSnapshot({'raw_output': null}), isEmpty);
     });
 
+    test('history gate counts either the raw tail or the prefix', () {
+      final raw = Uint8List.fromList([1, 2, 3]);
+      final prefix = Uint8List.fromList([4, 5]);
+      expect(
+        snapshotCarriesHistory({'raw_output': raw, 'raw_output_prefix': prefix}),
+        isTrue,
+      );
+      expect(snapshotCarriesHistory({'raw_output': raw}), isTrue);
+      // A prefix-only restore snapshot still carries history: dropping
+      // the prefix leg silently discards it as history-less.
+      expect(snapshotCarriesHistory({'raw_output_prefix': prefix}), isTrue);
+      expect(snapshotCarriesHistory({'raw_output': Uint8List(0)}), isFalse);
+      expect(snapshotCarriesHistory({}), isFalse);
+    });
+
+    test('prefix extractor reads raw_output_prefix with the same encodings', () {
+      final original = utf8.encode('journaled old line\n');
+      final encoded = base64Encode(GZipEncoder().encode(original));
+      expect(
+        rawOutputPrefixFromSnapshot({'raw_output_prefix': encoded}),
+        equals(Uint8List.fromList(original)),
+      );
+      expect(rawOutputPrefixFromSnapshot({}), isEmpty);
+      expect(rawOutputPrefixFromSnapshot({'raw_output_prefix': null}), isEmpty);
+      // The raw tail key must not leak into the prefix: a wrong key
+      // string fails silent as an empty prefix at every attach site.
+      expect(
+        rawOutputPrefixFromSnapshot({'raw_output': encoded}),
+        isEmpty,
+      );
+    });
+
     test('rejects corrupted gzip stream and returns empty Uint8List', () {
       final corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
       final encoded = base64Encode(corrupt);
