@@ -69,6 +69,11 @@ const _: () = assert!(
 );
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
+/// Bound on one actor's context reply inside the `list_session_contexts`
+/// fan-out. A leg past this is wedged, not slow (~40ms was the per-leg cost
+/// at load 150), so the batch degrades that row to `None` rather than
+/// hanging every client's rail load behind one stuck session.
+const SESSION_CONTEXT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
 /// Maximum number of recent judge decisions retained in memory for the settings
@@ -3940,43 +3945,145 @@ impl SessionApi for SessionManager {
         // serial per-connection queue). Replies are collected back in
         // session order, and a live actor mid-shutdown still yields no
         // context rather than failing the whole batch.
-        enum PendingContext {
-            Ready(Option<SessionContext>),
-            Live(mpsc::Receiver<ActorResult<Option<SessionContext>>>),
-        }
-        let pending: Vec<(SessionId, PendingContext, SessionStamps)> = sources
-            .into_iter()
-            .map(|(session_id, source, stamps)| {
-                let pending_source = match source {
-                    ContextSource::Ready(context) => PendingContext::Ready(context),
-                    ContextSource::Live(tx) => {
-                        let (resp_tx, resp_rx) = mpsc::channel();
-                        match tx.send(ActorCommand::Context { response: resp_tx }) {
-                            Ok(()) => PendingContext::Live(resp_rx),
-                            Err(_) => PendingContext::Ready(None),
+        // Split the already-resolved rows from the legs still awaiting an
+        // actor reply; only the latter need a collection thread. Live legs
+        // start as `None` placeholders so a timed-out reply degrades the row
+        // instead of failing the batch.
+        let mut rows = Vec::with_capacity(sources.len());
+        let mut live = Vec::new();
+        for (session_id, source, stamps) in sources {
+            let row = SessionContextRow {
+                session_id: session_id.clone(),
+                context: None,
+                last_activity_ms: stamps.activity_ms,
+                last_input_ms: stamps.input_ms,
+            };
+            match source {
+                ContextSource::Ready(context) => {
+                    rows.push(SessionContextRow { context, ..row });
+                }
+                ContextSource::Live(tx) => {
+                    let (resp_tx, resp_rx) = mpsc::channel();
+                    match tx.send(ActorCommand::Context { response: resp_tx }) {
+                        Ok(()) => {
+                            live.push((rows.len(), session_id, resp_rx));
+                            rows.push(row);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                %err,
+                                "failed to send context command to session actor; degrading to None"
+                            );
+                            rows.push(row);
                         }
                     }
-                };
-                (session_id, pending_source, stamps)
-            })
-            .collect();
-        Ok(pending
-            .into_iter()
-            .map(|(session_id, source, stamps)| {
-                let context = match source {
-                    PendingContext::Ready(context) => context,
-                    PendingContext::Live(rx) => recv_actor_result(rx, "reading session context")
-                        .ok()
-                        .flatten(),
-                };
-                SessionContextRow {
-                    session_id,
-                    context,
-                    last_activity_ms: stamps.activity_ms,
-                    last_input_ms: stamps.input_ms,
                 }
-            })
-            .collect())
+            }
+        }
+        // Collect concurrently: sequential `recv` costs the SUM of every
+        // actor's scheduling latency (2.8s for 68 sessions at load 150), one
+        // thread per pending reply costs the MAX. Each leg is also
+        // timeout-bounded, so a wedged actor yields `None` like the
+        // mid-shutdown case instead of hanging the whole batch forever.
+        // Joins land back in `rows` order, never by arrival, so a slow
+        // session cannot file its context under another session's id.
+        let live_slots: Vec<_> = live
+            .into_iter()
+            .map(|(index, session_id, rx)| (index, session_id, Mutex::new(Some(rx))))
+            .collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(live_slots.len());
+            let mut fallbacks = Vec::new();
+
+            for (index, session_id, rx_slot) in &live_slots {
+                let thread_name = format!("ctx-fanout-{session_id}");
+                let sid = session_id.clone();
+                let spawn_res = std::thread::Builder::new()
+                    .name(thread_name)
+                    .spawn_scoped(scope, move || {
+                        let rx = rx_slot.lock().ok().and_then(|mut g| g.take())?;
+                        match rx.recv_timeout(SESSION_CONTEXT_REQUEST_TIMEOUT) {
+                            Ok(Ok(context)) => context,
+                            Ok(Err(err)) => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    %err,
+                                    "actor returned error for context request; degrading to None"
+                                );
+                                None
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    timeout_secs = SESSION_CONTEXT_REQUEST_TIMEOUT.as_secs(),
+                                    "timed out waiting for session context reply; degrading to None"
+                                );
+                                None
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    "session actor disconnected before replying to context request; degrading to None"
+                                );
+                                None
+                            }
+                        }
+                    });
+
+                match spawn_res {
+                    Ok(handle) => handles.push((*index, handle)),
+                    Err(err) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            %err,
+                            "failed to spawn context fanout thread; falling back to synchronous receive"
+                        );
+                        fallbacks.push((*index, session_id, rx_slot));
+                    }
+                }
+            }
+
+            for (index, handle) in handles {
+                if let Ok(context) = handle.join() {
+                    rows[index].context = context;
+                }
+            }
+
+            for (index, session_id, rx_slot) in fallbacks {
+                let Some(rx) = rx_slot.lock().ok().and_then(|mut g| g.take()) else {
+                    continue;
+                };
+                let context = match rx.recv_timeout(SESSION_CONTEXT_REQUEST_TIMEOUT) {
+                    Ok(Ok(context)) => context,
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            %err,
+                            "actor returned error for context request during fallback; degrading to None"
+                        );
+                        None
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            timeout_secs = SESSION_CONTEXT_REQUEST_TIMEOUT.as_secs(),
+                            "timed out waiting for session context reply during fallback; degrading to None"
+                        );
+                        None
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "session actor disconnected during fallback; degrading to None"
+                        );
+                        None
+                    }
+                };
+                rows[index].context = context;
+            }
+        });
+        Ok(rows)
     }
 
     fn session_judge_policy(
@@ -11750,6 +11857,104 @@ mod tests {
         }
 
         for (id, _, repo) in session_data {
+            let _ = manager.shutdown_session(id);
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// A wedged actor must degrade its row to `None`, not hang the batch: one
+    /// stuck session used to wedge every client's rail load behind an
+    /// unbounded sequential `recv` in `list_session_contexts`.
+    #[test]
+    fn list_session_contexts_survives_a_wedged_actor() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        // Hermetic git repos for healthy sessions before and after the wedged actor.
+        let mut healthy_sessions = Vec::new();
+        for (i, branch) in [("1", "feat/healthy-1"), ("2", "feat/healthy-2")] {
+            let repo = unique_log_dir();
+            std::fs::create_dir_all(&repo).expect("create repo dir");
+            git_test_command(&repo, &["init", &format!("--initial-branch={branch}")]);
+            git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+            git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+            std::fs::write(repo.join("README.md"), format!("{i}\n")).expect("write test file");
+            git_test_command(&repo, &["add", "README.md"]);
+            git_test_command(&repo, &["commit", "-m", "initial"]);
+
+            let mut req = StartSessionRequest::new(long_running_shell_command());
+            req.cwd = Some(repo.clone());
+            let id = manager.start_session(req).expect("start session");
+            healthy_sessions.push((id, branch, repo));
+        }
+
+        // A live session whose actor channel nobody drains.
+        // Naming it session-0 ensures it sorts before generated sessions
+        // (session-1, session-2), testing that a wedged actor at the head
+        // of the batch does not block concurrent resolution of subsequent handles.
+        let (tx, _never_drained) = mpsc::channel();
+        let wedged_id = SessionId::new("session-0").expect("session id");
+        {
+            let mut sessions = manager.sessions().expect("lock sessions");
+            sessions.insert(
+                wedged_id.clone(),
+                ManagedSession::Live {
+                    actor: SessionActor {
+                        tx,
+                        worker: None,
+                        reader: None,
+                        writer: None,
+                        last_activity_ms: Arc::new(AtomicU64::new(0)),
+                        last_input_ms: Arc::new(AtomicU64::new(0)),
+                    },
+                    lease: InputLeaseState::default(),
+                    launch: PersistedSessionLaunch {
+                        command: "true".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        size: SessionSize::default(),
+                        log_path: log_dir.join("wedged.log"),
+                    },
+                    last_known_cwd: None,
+                },
+            );
+        }
+
+        let start = Instant::now();
+        let rows = manager.list_session_contexts().expect("list contexts");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= SESSION_CONTEXT_REQUEST_TIMEOUT - Duration::from_millis(250),
+            "batch returned before timeout elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SESSION_CONTEXT_REQUEST_TIMEOUT + Duration::from_secs(10),
+            "wedged actor hung the batch: {elapsed:?}"
+        );
+        assert_eq!(rows.len(), 3, "three rows returned, wedged included");
+
+        // Verify that rows[0] is session-0 (the wedged actor at the head)
+        // and degraded to None without preventing subsequent healthy sessions
+        // from resolving their git contexts concurrently.
+        assert_eq!(rows[0].session_id, wedged_id);
+        assert!(rows[0].context.is_none(), "wedged actor degrades to None");
+
+        assert_eq!(rows[1].session_id, healthy_sessions[0].0);
+        assert_eq!(
+            rows[1].context.as_ref().and_then(|c| c.branch.as_deref()),
+            Some("feat/healthy-1"),
+            "healthy session 1 resolves its context"
+        );
+
+        assert_eq!(rows[2].session_id, healthy_sessions[1].0);
+        assert_eq!(
+            rows[2].context.as_ref().and_then(|c| c.branch.as_deref()),
+            Some("feat/healthy-2"),
+            "healthy session 2 resolves its context"
+        );
+
+        for (id, _, repo) in healthy_sessions {
             let _ = manager.shutdown_session(id);
             let _ = std::fs::remove_dir_all(&repo);
         }
