@@ -2214,13 +2214,33 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           generation != _connectGeneration ||
           serverId != _activeServerId ||
           !_client.isConnected ||
+          stats == null ||
           !isUsableDaemonStats(stats)) {
         return;
       }
       // A null or zero-total read is a failed poll (or a daemon predating
       // stats): keep the last reading rather than flickering the line in
-      // and out.
-      setState(() => _daemonStats = stats);
+      // and out. When a poll arrives with partial legs (such as a transient
+      // CPU tick miss), merge non-null legs onto existing readings.
+      setState(() {
+        if (_daemonStats == null) {
+          _daemonStats = stats;
+        } else {
+          _daemonStats = (
+            diskFreeBytes: stats.diskTotalBytes > 0
+                ? stats.diskFreeBytes
+                : _daemonStats!.diskFreeBytes,
+            diskTotalBytes: stats.diskTotalBytes > 0
+                ? stats.diskTotalBytes
+                : _daemonStats!.diskTotalBytes,
+            cpuPercent: stats.cpuPercent ?? _daemonStats!.cpuPercent,
+            batteryPercent: stats.batteryPercent ?? _daemonStats!.batteryPercent,
+            batteryState: stats.batteryPercent != null
+                ? stats.batteryState
+                : _daemonStats!.batteryState,
+          );
+        }
+      });
     });
   }
 

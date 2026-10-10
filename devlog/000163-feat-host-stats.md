@@ -1,8 +1,8 @@
-# 000163 — feat/host-stats
+# 000163: feat/host-stats
 
 ## Agent
 
-Muse Code powered by Meta Muse Spark, session fern-metis.
+2026-10-05T10:16-0700.
 
 ## Intent
 
@@ -41,7 +41,9 @@ pegged or about to die. Builds on the existing 60s `getDaemonStats` poll.
 
 ## Commits
 
-- HEAD — feat(stats): host CPU and battery in the daemon selector
+- 494e380: feat(stats): host CPU and battery in the daemon selector
+- d171064: docs(devlog): record 192 deploy verification
+- HEAD: fix(stats): review findings from host-stats audit
 
 ## Progress
 
@@ -55,6 +57,18 @@ pegged or about to die. Builds on the existing 60s `getDaemonStats` poll.
   cpu/battery (60→31→26 settling, 100/full steady); served bundle md5
   matches. Charging/discharging/unknown states covered by parser tests
   (this Mac sits at full on AC).
+- 2026-10-09T22:49-0700: Rebased onto feat/session-lifecycle-push (5ea5853).
+  Completed 8-pillar code review audit and resolved findings: deallocated
+  Mach host port send rights via mach_port_deallocate, declared tick array
+  as unsigned [0u32; CPU_STATE_MAX] to prevent signed overflow, rate-limited
+  CPU sampling (1s) and battery reading (15s) via CachedReading to eliminate
+  pmset fork overhead and cross-client jitter, prioritized "not charg"
+  substring checks before affirmative "charg", made Linux multi-battery
+  bay iteration resilient against unreadable bays, checked Windows
+  BatteryFlag charging bit, merged partial poll metrics in Flutter client
+  to prevent UI flickering, added serde(other) and wire-omission attributes,
+  and added unit/widget regression tests. Round 2 confirmation review
+  completed cleanly with zero findings across all 8 pillars.
 
 ## Research & Discoveries
 
@@ -66,4 +80,4 @@ pegged or about to die. Builds on the existing 60s `getDaemonStats` poll.
 
 ## Next Steps
 
-- Discover DaemonStats shape + selector UI; write plan 000163-01.
+- Cascade rebase to PR 193 (fix/scrollback-paging).

@@ -8,13 +8,13 @@ use triage_core::session::{
 };
 
 /// Host percent to the wire: unknown encodes as -1 (0 is a valid reading).
-fn percent_to_wire(percent: Option<u8>) -> i16 {
+pub(crate) fn percent_to_wire(percent: Option<u8>) -> i16 {
     percent.map_or(-1, |percent| percent as i16)
 }
 
 /// Wire percent back to a reading. Negative is unknown; above 100 clamps
 /// rather than failing the whole result on one corrupt field.
-fn percent_from_wire(raw: i16) -> Option<u8> {
+pub(crate) fn percent_from_wire(raw: i16) -> Option<u8> {
     if raw < 0 {
         None
     } else {

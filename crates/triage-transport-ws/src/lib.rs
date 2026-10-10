@@ -902,7 +902,10 @@ pub enum ServerResult {
         cpu_percent: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         battery_percent: Option<u8>,
-        #[serde(default)]
+        #[serde(
+            default,
+            skip_serializing_if = "triage_core::host::BatteryState::is_unknown"
+        )]
         battery_state: triage_core::host::BatteryState,
     },
     Paired {
@@ -970,7 +973,10 @@ pub enum ServerResult {
         cpu_percent: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         battery_percent: Option<u8>,
-        #[serde(default)]
+        #[serde(
+            default,
+            skip_serializing_if = "triage_core::host::BatteryState::is_unknown"
+        )]
         battery_state: triage_core::host::BatteryState,
     },
 }
@@ -1863,11 +1869,16 @@ mod tests {
         // reports this build with nothing newer known.
         assert_eq!(hello.server_version().unwrap(), env!("CARGO_PKG_VERSION"));
         assert!(!hello.update_available());
-        assert!(hello.latest_version().is_none());
-        // Disk fields ride the handshake too, as a live probe: assert the
-        // invariant, not exact bytes.
+        // Disk and host stats ride the handshake too, as a live probe:
+        // assert the invariants, not exact bytes.
         assert_disk_invariant(hello.disk_free_bytes(), hello.disk_total_bytes());
         assert!(!hello.tailscale_pairing_available());
+        if let Some(cpu) = flatbuffers_proto::percent_from_wire(hello.cpu_percent()) {
+            assert!(cpu <= 100);
+        }
+        if let Some(battery) = flatbuffers_proto::percent_from_wire(hello.battery_percent()) {
+            assert!(battery <= 100);
+        }
     }
 
     #[test]
@@ -2697,5 +2708,41 @@ mod tests {
                 "msg.kind() does not match serde type tag for {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn unknown_battery_state_is_omitted_from_json_results() {
+        let stats_unknown = ServerResult::DaemonStats {
+            disk_free_bytes: 100,
+            disk_total_bytes: 200,
+            cpu_percent: None,
+            battery_percent: None,
+            battery_state: triage_core::host::BatteryState::Unknown,
+        };
+        let serialized = serde_json::to_value(&stats_unknown).unwrap();
+        assert!(serialized.get("battery_state").is_none());
+        assert!(serialized.get("cpu_percent").is_none());
+        assert!(serialized.get("battery_percent").is_none());
+
+        let stats_charging = ServerResult::DaemonStats {
+            disk_free_bytes: 100,
+            disk_total_bytes: 200,
+            cpu_percent: Some(25),
+            battery_percent: Some(80),
+            battery_state: triage_core::host::BatteryState::Charging,
+        };
+        let serialized_charging = serde_json::to_value(&stats_charging).unwrap();
+        assert_eq!(
+            serialized_charging
+                .get("battery_state")
+                .and_then(Value::as_str),
+            Some("charging")
+        );
+        assert_eq!(
+            serialized_charging
+                .get("cpu_percent")
+                .and_then(Value::as_u64),
+            Some(25)
+        );
     }
 }

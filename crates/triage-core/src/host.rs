@@ -19,11 +19,18 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BatteryState {
-    #[default]
-    Unknown,
     Charging,
     Discharging,
     Full,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl BatteryState {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
 }
 
 /// Point-in-time battery reading. `percent` is 0-100.
@@ -47,7 +54,7 @@ pub struct HostStats {
 pub fn daemon_host_stats() -> HostStats {
     HostStats {
         cpu_percent: cpu_percent(),
-        battery: battery_status(),
+        battery: cached_battery_status(),
     }
 }
 
@@ -73,13 +80,66 @@ fn cpu_percent_between(before: CpuSample, after: CpuSample) -> Option<u8> {
     u8::try_from(busy.saturating_mul(100) / total).ok()
 }
 
-static LAST_CPU_SAMPLE: OnceLock<Mutex<Option<CpuSample>>> = OnceLock::new();
+#[derive(Clone, Copy)]
+struct CachedReading<T> {
+    sampled_at: std::time::Instant,
+    value: T,
+}
+
+impl<T: Copy> CachedReading<T> {
+    fn new(value: T) -> Self {
+        Self {
+            sampled_at: std::time::Instant::now(),
+            value,
+        }
+    }
+
+    fn fresh(&self, ttl: std::time::Duration) -> Option<T> {
+        (self.sampled_at.elapsed() < ttl).then_some(self.value)
+    }
+}
+
+struct CpuSampler {
+    last_sample: Option<CpuSample>,
+    last_reading: Option<CachedReading<Option<u8>>>,
+}
+
+static CPU_SAMPLER: OnceLock<Mutex<CpuSampler>> = OnceLock::new();
 
 fn cpu_percent() -> Option<u8> {
-    let now = sample_cpu_ticks()?;
-    let slot = LAST_CPU_SAMPLE.get_or_init(|| Mutex::new(None));
-    let previous = slot.lock().ok()?.replace(now);
-    previous.and_then(|before| cpu_percent_between(before, now))
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+    let slot = CPU_SAMPLER.get_or_init(|| {
+        Mutex::new(CpuSampler {
+            last_sample: None,
+            last_reading: None,
+        })
+    });
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = guard.last_reading.and_then(|r| r.fresh(CACHE_TTL)) {
+        return cached;
+    }
+    let now_sample = sample_cpu_ticks()?;
+    let percent = guard
+        .last_sample
+        .and_then(|before| cpu_percent_between(before, now_sample));
+    guard.last_sample = Some(now_sample);
+    guard.last_reading = Some(CachedReading::new(percent));
+    percent
+}
+
+static BATTERY_CACHE: OnceLock<Mutex<Option<CachedReading<Option<BatteryStatus>>>>> =
+    OnceLock::new();
+
+fn cached_battery_status() -> Option<BatteryStatus> {
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+    let slot = BATTERY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = guard.and_then(|r| r.fresh(CACHE_TTL)) {
+        return cached;
+    }
+    let reading = probe_battery_status();
+    *guard = Some(CachedReading::new(reading));
+    reading
 }
 
 #[cfg(target_os = "macos")]
@@ -99,37 +159,52 @@ fn sample_cpu_ticks() -> Option<CpuSample> {
     #[link(name = "System")]
     unsafe extern "C" {
         fn mach_host_self() -> u32;
+        fn mach_task_self() -> u32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
         fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
     }
 
     // SAFETY: `mach_host_self` returns a valid send right to the host
     // port; `host_statistics64` writes at most `CPU_STATE_MAX` integers
     // into the caller buffer when `count` starts at its capacity.
+    // The acquired send right must be deallocated with `mach_port_deallocate`
+    // to avoid leaking Mach port user references in long-running daemons.
     let host = unsafe { mach_host_self() };
-    let mut ticks = [0i32; CPU_STATE_MAX];
+    let mut ticks = [0u32; CPU_STATE_MAX];
     let mut count = CPU_STATE_MAX as u32;
-    let result =
-        unsafe { host_statistics64(host, HOST_CPU_LOAD_INFO, ticks.as_mut_ptr(), &mut count) };
+    let result = unsafe {
+        host_statistics64(
+            host,
+            HOST_CPU_LOAD_INFO,
+            ticks.as_mut_ptr() as *mut i32,
+            &mut count,
+        )
+    };
+    unsafe {
+        mach_port_deallocate(mach_task_self(), host);
+    }
     if result != KERN_SUCCESS || count as usize != CPU_STATE_MAX {
         return None;
     }
-    let tick = |index: usize| u64::try_from(ticks[index]).unwrap_or(0);
-    let idle = tick(CPU_STATE_IDLE);
-    let total = tick(CPU_STATE_USER) + tick(CPU_STATE_SYSTEM) + idle + tick(CPU_STATE_NICE);
+    let idle = ticks[CPU_STATE_IDLE] as u64;
+    let total = ticks[CPU_STATE_USER] as u64
+        + ticks[CPU_STATE_SYSTEM] as u64
+        + idle
+        + ticks[CPU_STATE_NICE] as u64;
     Some(CpuSample {
         busy_ticks: total.saturating_sub(idle),
         total_ticks: total,
     })
 }
 
-/// Parses the aggregate `cpu` line of `/proc/stat` into cumulative ticks.
-/// Split from the file read so the field mapping is unit-testable.
 #[cfg(target_os = "linux")]
 fn sample_cpu_ticks() -> Option<CpuSample> {
     let text = std::fs::read_to_string("/proc/stat").ok()?;
     parse_proc_stat_cpu(&text)
 }
 
+/// Parses the aggregate `cpu` line of `/proc/stat` into cumulative ticks.
+/// Split from the file read so the field mapping is unit-testable.
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat_cpu(text: &str) -> Option<CpuSample> {
     let mut fields = text.lines().next()?.split_whitespace();
@@ -183,9 +258,9 @@ fn sample_cpu_ticks() -> Option<CpuSample> {
 }
 
 #[cfg(target_os = "macos")]
-fn battery_status() -> Option<BatteryStatus> {
+fn probe_battery_status() -> Option<BatteryStatus> {
     // IOKit would need new FFI deps; `pmset`'s battery line has been
-    // stable for a decade and one fork per 60s poll is negligible.
+    // stable for a decade and one fork per 15s cache is negligible.
     let output = std::process::Command::new("pmset")
         .args(["-g", "batt"])
         .output()
@@ -211,9 +286,12 @@ fn parse_pmset_batt(text: &str) -> Option<BatteryStatus> {
         return None;
     }
     let rest = rest.to_lowercase();
-    // Order matters: "discharging" contains "charging".
+    // Order matters: "discharging" contains "charging", and "not charging"
+    // contains "charg". Check "not charg" before "charg".
     let state = if rest.contains("discharging") {
         BatteryState::Discharging
+    } else if rest.contains("not charg") {
+        BatteryState::Unknown
     } else if rest.contains("charged") {
         BatteryState::Full
     } else if rest.contains("charg") {
@@ -225,32 +303,46 @@ fn parse_pmset_batt(text: &str) -> Option<BatteryStatus> {
 }
 
 #[cfg(target_os = "linux")]
-fn battery_status() -> Option<BatteryStatus> {
-    let mut percents = Vec::new();
-    let mut statuses = Vec::new();
-    let entries = std::fs::read_dir("/sys/class/power_supply").ok()?;
-    for entry in entries.flatten() {
+fn probe_battery_status() -> Option<BatteryStatus> {
+    let mut entries = Vec::new();
+    let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
+    for entry in dir.flatten() {
         if !entry.file_name().to_string_lossy().starts_with("BAT") {
             continue;
         }
-        let capacity: u8 = std::fs::read_to_string(entry.path().join("capacity"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-        percents.push(capacity.min(100));
-        statuses.push(status);
+        let capacity_str = std::fs::read_to_string(entry.path().join("capacity")).ok();
+        let status_str = std::fs::read_to_string(entry.path().join("status")).ok();
+        if let (Some(cap), Some(stat)) = (capacity_str, status_str) {
+            if let Ok(capacity) = cap.trim().parse::<u8>() {
+                entries.push((capacity, stat));
+            }
+        }
     }
-    if percents.is_empty() {
+    parse_linux_batteries(&entries)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_batteries(entries: &[(u8, String)]) -> Option<BatteryStatus> {
+    if entries.is_empty() {
         return None;
     }
-    let percent =
-        (percents.iter().map(|&percent| percent as u32).sum::<u32>() / percents.len() as u32) as u8;
-    let joined = statuses.join(" ").to_lowercase();
-    // Order matters: "discharging" contains "charging".
+    let percent = (entries
+        .iter()
+        .map(|(capacity, _)| *capacity.min(&100) as u32)
+        .sum::<u32>()
+        / entries.len() as u32) as u8;
+    let joined = entries
+        .iter()
+        .map(|(_, status)| status.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    // Order matters: "discharging" contains "charging", and "not charging"
+    // contains "charging".
     let state = if joined.contains("discharging") {
         BatteryState::Discharging
+    } else if joined.contains("not charging") {
+        BatteryState::Unknown
     } else if joined.contains("charging") {
         BatteryState::Charging
     } else if joined.contains("full") {
@@ -263,7 +355,7 @@ fn battery_status() -> Option<BatteryStatus> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn battery_status() -> Option<BatteryStatus> {
+fn probe_battery_status() -> Option<BatteryStatus> {
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 
     let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
@@ -273,21 +365,26 @@ fn battery_status() -> Option<BatteryStatus> {
     }
     // 128 = no system battery, 255 = unknown percent: desktops and
     // UPS-backed machines report unknown (hidden), never 0%.
-    if status.BatteryFlag == 128 || status.BatteryLifePercent == 255 {
+    if (status.BatteryFlag & 128) != 0 || status.BatteryLifePercent == 255 {
         return None;
     }
     let percent = status.BatteryLifePercent.min(100);
-    let state = match status.ACLineStatus {
-        1 if percent >= 100 => BatteryState::Full,
-        1 => BatteryState::Charging,
-        0 => BatteryState::Discharging,
-        _ => BatteryState::Unknown,
+    // BatteryFlag bit 3 (value 8) indicates active charging.
+    let is_charging = (status.BatteryFlag & 8) != 0;
+    let state = if percent >= 100 {
+        BatteryState::Full
+    } else if is_charging {
+        BatteryState::Charging
+    } else if status.ACLineStatus == 0 {
+        BatteryState::Discharging
+    } else {
+        BatteryState::Unknown
     };
     Some(BatteryStatus { percent, state })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn battery_status() -> Option<BatteryStatus> {
+fn probe_battery_status() -> Option<BatteryStatus> {
     None
 }
 
@@ -401,5 +498,51 @@ mod tests {
         if let Some(percent) = second.battery.map(|battery| battery.percent) {
             assert!(percent <= 100);
         }
+    }
+
+    #[test]
+    fn pmset_parses_not_charging() {
+        let not_charging = parse_pmset_batt(
+            "Now drawing from 'AC Power'\n -InternalBattery-0 (id=40960099)\t80%; AC attached; not charging; 0:00 remaining present: true\n",
+        )
+        .expect("not charging line parses");
+        assert_eq!(not_charging.percent, 80);
+        assert_eq!(not_charging.state, BatteryState::Unknown);
+    }
+
+    #[test]
+    fn linux_batteries_parse_single_and_multiple_bays() {
+        let single = parse_linux_batteries(&[(85, "Charging\n".to_string())])
+            .expect("single battery parses");
+        assert_eq!(single.percent, 85);
+        assert_eq!(single.state, BatteryState::Charging);
+
+        let multi = parse_linux_batteries(&[
+            (80, "Discharging\n".to_string()),
+            (60, "Discharging\n".to_string()),
+        ])
+        .expect("multi battery parses");
+        assert_eq!(multi.percent, 70);
+        assert_eq!(multi.state, BatteryState::Discharging);
+
+        let not_charging = parse_linux_batteries(&[(80, "Not charging\n".to_string())])
+            .expect("not charging parses");
+        assert_eq!(not_charging.percent, 80);
+        assert_eq!(not_charging.state, BatteryState::Unknown);
+
+        let empty = parse_linux_batteries(&[]);
+        assert_eq!(empty, None);
+    }
+
+    #[test]
+    fn battery_state_serde_and_unknown() {
+        assert!(BatteryState::Unknown.is_unknown());
+        assert!(!BatteryState::Charging.is_unknown());
+        assert!(!BatteryState::Discharging.is_unknown());
+        assert!(!BatteryState::Full.is_unknown());
+
+        let unknown_json = "\"something_new\"";
+        let parsed: BatteryState = serde_json::from_str(unknown_json).unwrap();
+        assert_eq!(parsed, BatteryState::Unknown);
     }
 }
